@@ -43,6 +43,16 @@ impl PerfSummary {
     }
 }
 
+impl PerfSampleStack {
+    fn count(&self, options: FoldOptions) -> u64 {
+        if options.count_periods {
+            self.period.unwrap_or(1)
+        } else {
+            1
+        }
+    }
+}
+
 /// Summarizes record counts and parsed sample callchains from `perf.data`.
 ///
 /// # Errors
@@ -123,7 +133,7 @@ pub fn fold_perfdata_callchains_with_options(
     let mut counts = BTreeMap::<Vec<String>, u64>::new();
     for sample in &summary.sample_stacks {
         let frames = folded_frames_for_sample(sample, &summary.comms_by_pid);
-        *counts.entry(frames).or_insert(0) += sample_count(sample, options);
+        *counts.entry(frames).or_insert(0) += sample.count(options);
     }
 
     let mut folded = String::new();
@@ -135,14 +145,6 @@ pub fn fold_perfdata_callchains_with_options(
         folded.push('\n');
     }
     Ok(folded)
-}
-
-fn sample_count(sample: &PerfSampleStack, options: FoldOptions) -> u64 {
-    if options.count_periods {
-        sample.period.unwrap_or(1)
-    } else {
-        1
-    }
 }
 
 fn folded_frames_for_sample(
