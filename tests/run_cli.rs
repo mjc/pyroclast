@@ -49,7 +49,7 @@ fn fold_command_reads_perfdata_directly() {
     let output = pyroclast::run_cli(["pyroclast", "fold", perfdata.to_str().unwrap()])
         .expect("fold command");
 
-    assert_eq!(output.stdout, "0x2000 1\n");
+    assert_eq!(output.stdout, "app;0x2000 1\n");
 }
 
 #[test]

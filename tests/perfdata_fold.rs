@@ -105,6 +105,25 @@ fn drops_perf_context_marker_frames_when_folding() {
     assert_eq!(folded, "0x2000 1\n");
 }
 
+#[test]
+fn prefixes_folded_stacks_with_matching_comm_name() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(3, &comm_payload(11, 11, "sftp-s3")),
+            record_bytes(9, &sample_payload(0x1000, 11, 12, [0x2000])),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, "sftp-s3;0x2000 1\n");
+}
+
 fn perfdata_with_records_and_attrs<const A: usize, const R: usize>(
     attrs: [[u8; 144]; A],
     records: [Vec<u8>; R],

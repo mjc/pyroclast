@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::folded::render_address_stack;
+use crate::folded::render_folded_stack;
 use crate::perfdata::attrs::parse_file_attrs;
 use crate::perfdata::header::parse_header;
 use crate::perfdata::records::{
@@ -18,8 +18,16 @@ pub struct PerfSummary {
     pub total_records: usize,
     pub record_counts: BTreeMap<u32, usize>,
     pub comms: Vec<String>,
+    pub comms_by_pid: BTreeMap<u32, String>,
     pub mmaps: Vec<String>,
     pub sample_callchains: Vec<Vec<u64>>,
+    pub sample_stacks: Vec<PerfSampleStack>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PerfSampleStack {
+    pub pid: Option<u32>,
+    pub callchain: Vec<u64>,
 }
 
 impl PerfSummary {
@@ -43,8 +51,10 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
         total_records: 0,
         record_counts: BTreeMap::new(),
         comms: Vec::new(),
+        comms_by_pid: BTreeMap::new(),
         mmaps: Vec::new(),
         sample_callchains: Vec::new(),
+        sample_stacks: Vec::new(),
     };
 
     for record in records {
@@ -55,15 +65,17 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
             .or_insert(0) += 1;
         let record_result: Result<(), String> = match record.header.record_type {
             PERF_RECORD_COMM => parse_comm_record(record.payload).map(|record| {
+                summary.comms_by_pid.insert(record.pid, record.comm.clone());
                 summary.comms.push(record.comm);
             }),
             PERF_RECORD_MMAP => parse_mmap_record(record.payload).map(|record| {
                 summary.mmaps.push(record.path);
             }),
             PERF_RECORD_SAMPLE => {
-                parse_sample_for_summary(record.payload, sample_layout).map(|callchain| {
-                    if let Some(callchain) = callchain {
-                        summary.sample_callchains.push(callchain);
+                parse_sample_for_summary(record.payload, sample_layout).map(|sample| {
+                    if let Some(sample) = sample {
+                        summary.sample_callchains.push(sample.callchain.clone());
+                        summary.sample_stacks.push(sample);
                     }
                 })
             }
@@ -90,18 +102,29 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
 /// Returns an error when the `perf.data` input cannot be parsed.
 pub fn fold_perfdata_callchains(bytes: &[u8]) -> Result<String, String> {
     let summary = summarize_perfdata(bytes)?;
-    let mut counts = BTreeMap::<Vec<u64>, u64>::new();
-    for callchain in summary.sample_callchains {
-        let frames = callchain
+    let mut counts = BTreeMap::<Vec<String>, u64>::new();
+    for sample in summary.sample_stacks {
+        let address_frames = sample
+            .callchain
             .into_iter()
             .filter(|frame| !is_perf_context_marker(*frame))
-            .collect::<Vec<_>>();
+            .map(|frame| format!("0x{frame:x}"));
+        let mut frames =
+            if let Some(comm) = sample.pid.and_then(|pid| summary.comms_by_pid.get(&pid)) {
+                vec![comm.clone()]
+            } else {
+                Vec::new()
+            };
+        frames.extend(address_frames);
         *counts.entry(frames).or_insert(0) += 1;
     }
 
     let mut folded = String::new();
     for (callchain, count) in counts {
-        folded.push_str(&render_address_stack(callchain, count));
+        folded.push_str(&render_folded_stack(
+            callchain.iter().map(String::as_str),
+            count,
+        ));
         folded.push('\n');
     }
     Ok(folded)
@@ -110,9 +133,14 @@ pub fn fold_perfdata_callchains(bytes: &[u8]) -> Result<String, String> {
 fn parse_sample_for_summary(
     payload: &[u8],
     sample_layout: Option<SampleLayout>,
-) -> Result<Option<Vec<u64>>, String> {
+) -> Result<Option<PerfSampleStack>, String> {
     if let Some(layout) = sample_layout {
-        parse_sample_record(payload, layout).map(|record| Some(record.callchain))
+        parse_sample_record(payload, layout).map(|record| {
+            Some(PerfSampleStack {
+                pid: record.pid,
+                callchain: record.callchain,
+            })
+        })
     } else {
         Ok(None)
     }
