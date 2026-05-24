@@ -15,7 +15,8 @@
         "x86_64-linux"
       ];
 
-      forAllSystems = f:
+      forAllSystems =
+        f:
         nixpkgs.lib.genAttrs systems (
           system:
           f {
@@ -34,9 +35,11 @@
             hyperfine
             inferno
             jq
+            nixfmt
             rustc
             rust-analyzer
             rustfmt
+            shellcheck
             tokio-console
           ];
           linuxTools = with pkgs; [
@@ -56,6 +59,8 @@
             RUST_BACKTRACE = "1";
 
             shellHook = ''
+              git config --local core.hooksPath .githooks
+
               if [ "$(uname -s)" = Darwin ] && ! command -v xctrace >/dev/null 2>&1; then
                 echo "warning: xctrace not found; install Xcode or Command Line Tools for macOS profiling" >&2
               fi

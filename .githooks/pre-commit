@@ -1,0 +1,7 @@
+#!/usr/bin/env sh
+set -eu
+
+repo="$(git rev-parse --show-toplevel)"
+cd "$repo"
+
+exec nix develop "$repo" --command cargo run --quiet --bin pyroclast-precommit --
