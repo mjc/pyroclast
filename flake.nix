@@ -1,0 +1,65 @@
+{
+  description = "pyroclast development shell";
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  };
+
+  outputs =
+    { nixpkgs, ... }:
+    let
+      systems = [
+        "aarch64-darwin"
+        "aarch64-linux"
+        "x86_64-darwin"
+        "x86_64-linux"
+      ];
+
+      forAllSystems = f:
+        nixpkgs.lib.genAttrs systems (
+          system:
+          f {
+            inherit system;
+            pkgs = import nixpkgs { inherit system; };
+          }
+        );
+    in
+    {
+      devShells = forAllSystems (
+        { pkgs, ... }:
+        {
+          default = pkgs.mkShell {
+            packages =
+              with pkgs;
+              [
+                cargo
+                clippy
+                hyperfine
+                inferno
+                jq
+                rustc
+                rust-analyzer
+                rustfmt
+              ]
+              ++ lib.optionals stdenv.isLinux [
+                binutils
+                bpftrace
+                elfutils
+                heaptrack
+                perf
+                strace
+                valgrind
+              ];
+
+            RUST_BACKTRACE = "1";
+
+            shellHook = ''
+              if [ "$(uname -s)" = Darwin ] && ! command -v xctrace >/dev/null 2>&1; then
+                echo "warning: xctrace not found; install Xcode or Command Line Tools for macOS profiling" >&2
+              fi
+            '';
+          };
+        }
+      );
+    };
+}
