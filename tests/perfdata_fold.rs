@@ -54,3 +54,20 @@ fn summarizes_sample_callchain_counts_using_file_attr_layout() {
 
     assert_eq!(summary.sample_callchains, vec![vec![0x2000, 0x3000]]);
 }
+
+#[test]
+fn includes_record_context_when_sample_parsing_fails() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [record_bytes(9, &[0; 8])],
+    );
+
+    let error = summarize_perfdata(&bytes).expect_err("bad sample");
+
+    assert!(error.contains("record type 9"));
+    assert!(error.contains("offset"));
+}

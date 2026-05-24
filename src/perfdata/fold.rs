@@ -45,22 +45,45 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
             .record_counts
             .entry(record.header.record_type)
             .or_insert(0) += 1;
-        match record.header.record_type {
-            PERF_RECORD_COMM => summary.comms.push(parse_comm_record(record.payload)?.comm),
-            PERF_RECORD_MMAP => summary.mmaps.push(parse_mmap_record(record.payload)?.path),
+        let record_result: Result<(), String> = match record.header.record_type {
+            PERF_RECORD_COMM => parse_comm_record(record.payload).map(|record| {
+                summary.comms.push(record.comm);
+            }),
+            PERF_RECORD_MMAP => parse_mmap_record(record.payload).map(|record| {
+                summary.mmaps.push(record.path);
+            }),
             PERF_RECORD_SAMPLE => {
-                if let Some(layout) = sample_layout {
-                    summary
-                        .sample_callchains
-                        .push(parse_sample_record(record.payload, layout)?.callchain);
-                }
+                parse_sample_for_summary(record.payload, sample_layout).map(|callchain| {
+                    if let Some(callchain) = callchain {
+                        summary.sample_callchains.push(callchain);
+                    }
+                })
             }
-            PERF_RECORD_MMAP2 => summary.mmaps.push(parse_mmap2_record(record.payload)?.path),
-            _ => {}
-        }
+            PERF_RECORD_MMAP2 => parse_mmap2_record(record.payload).map(|record| {
+                summary.mmaps.push(record.path);
+            }),
+            _ => Ok(()),
+        };
+        record_result.map_err(|error| {
+            format!(
+                "failed to parse record type {} at offset {}: {error}",
+                record.header.record_type, record.offset
+            )
+        })?;
     }
 
     Ok(summary)
+}
+
+fn parse_sample_for_summary(
+    payload: &[u8],
+    sample_layout: Option<SampleLayout>,
+) -> Result<Option<Vec<u64>>, String> {
+    if let Some(layout) = sample_layout {
+        parse_sample_record(payload, layout).map(|record| Some(record.callchain))
+    } else {
+        Ok(None)
+    }
 }
 
 fn first_sample_layout(
