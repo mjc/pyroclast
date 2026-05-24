@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use crate::folded::render_folded_stack;
 use crate::perfdata::attrs::parse_file_attrs;
@@ -8,6 +9,7 @@ use crate::perfdata::records::{
     iter_records, parse_comm_record, parse_mmap_record, parse_mmap2_record,
 };
 use crate::perfdata::samples::{SampleLayout, is_perf_context_marker, parse_sample_record};
+use crate::symbols::{SymbolCache, SymbolRequest, SymbolResolver};
 
 const PERF_RECORD_MMAP: u32 = 1;
 const PERF_RECORD_COMM: u32 = 3;
@@ -135,10 +137,40 @@ pub fn fold_perfdata_callchains_with_options(
     options: FoldOptions,
 ) -> Result<String, String> {
     let summary = summarize_perfdata(bytes)?;
+    fold_summary::<NoopSymbolResolver>(&summary, options, None)
+}
+
+/// Collapses parsed perf sample callchains, symbolizing mapped frames through
+/// the provided resolver.
+///
+/// # Errors
+///
+/// Returns an error when `perf.data` parsing or symbol resolution fails.
+pub fn fold_perfdata_callchains_with_symbols<R>(
+    bytes: &[u8],
+    options: FoldOptions,
+    symbol_resolver: &R,
+) -> Result<String, String>
+where
+    R: SymbolResolver,
+{
+    let summary = summarize_perfdata(bytes)?;
+    let mut symbol_cache = SymbolCache::new(symbol_resolver);
+    fold_summary(&summary, options, Some(&mut symbol_cache))
+}
+
+fn fold_summary<R>(
+    summary: &PerfSummary,
+    options: FoldOptions,
+    mut symbol_cache: Option<&mut SymbolCache<'_, R>>,
+) -> Result<String, String>
+where
+    R: SymbolResolver,
+{
     let mut counts = BTreeMap::<Vec<String>, u64>::new();
-    let frame_resolver = FoldFrameResolver::new(&summary);
+    let frame_resolver = FoldFrameResolver::new(summary);
     for sample in &summary.sample_stacks {
-        let frames = frame_resolver.frames_for_sample(sample);
+        let frames = frame_resolver.frames_for_sample(sample, symbol_cache.as_deref_mut())?;
         *counts.entry(frames).or_insert(0) += sample.count(options);
     }
 
@@ -158,6 +190,14 @@ struct FoldFrameResolver<'a> {
     mmap_table: &'a MmapTable,
 }
 
+struct NoopSymbolResolver;
+
+impl SymbolResolver for NoopSymbolResolver {
+    fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
+        Ok(vec![None; requests.len()])
+    }
+}
+
 impl<'a> FoldFrameResolver<'a> {
     fn new(summary: &'a PerfSummary) -> Self {
         Self {
@@ -166,29 +206,53 @@ impl<'a> FoldFrameResolver<'a> {
         }
     }
 
-    fn frames_for_sample(&self, sample: &PerfSampleStack) -> Vec<String> {
+    fn frames_for_sample<R>(
+        &self,
+        sample: &PerfSampleStack,
+        mut symbol_cache: Option<&mut SymbolCache<'_, R>>,
+    ) -> Result<Vec<String>, String>
+    where
+        R: SymbolResolver,
+    {
         let mut frames = if let Some(comm) = sample.pid.and_then(|pid| self.comms_by_pid.get(&pid))
         {
             vec![comm.clone()]
         } else {
             Vec::new()
         };
-        frames.extend(
-            sample
-                .callchain
-                .iter()
-                .copied()
-                .filter(|frame| !is_perf_context_marker(*frame))
-                .map(|frame| self.format_frame(sample.pid, frame)),
-        );
-        frames
+        for frame in sample
+            .callchain
+            .iter()
+            .copied()
+            .filter(|frame| !is_perf_context_marker(*frame))
+        {
+            frames.push(self.format_frame(sample.pid, frame, symbol_cache.as_deref_mut())?);
+        }
+        Ok(frames)
     }
 
-    fn format_frame(&self, pid: Option<u32>, frame: u64) -> String {
+    fn format_frame<R>(
+        &self,
+        pid: Option<u32>,
+        frame: u64,
+        symbol_cache: Option<&mut SymbolCache<'_, R>>,
+    ) -> Result<String, String>
+    where
+        R: SymbolResolver,
+    {
         if let Some(mapping) = pid.and_then(|pid| self.mmap_table.resolve(pid, frame)) {
-            format!("{}+0x{:x}", mapping.path, mapping.relative_address)
+            if let Some(cache) = symbol_cache {
+                let request = SymbolRequest {
+                    path: PathBuf::from(&mapping.path),
+                    relative_address: mapping.relative_address,
+                };
+                return Ok(cache.resolve(&request)?.unwrap_or_else(|| {
+                    format!("{}+0x{:x}", mapping.path, mapping.relative_address)
+                }));
+            }
+            Ok(format!("{}+0x{:x}", mapping.path, mapping.relative_address))
         } else {
-            format!("0x{frame:x}")
+            Ok(format!("0x{frame:x}"))
         }
     }
 }
