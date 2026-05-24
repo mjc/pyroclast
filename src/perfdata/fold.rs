@@ -3,6 +3,9 @@ use std::collections::BTreeMap;
 use crate::perfdata::header::parse_header;
 use crate::perfdata::records::{iter_records, parse_comm_record, parse_mmap_record};
 
+const PERF_RECORD_MMAP: u32 = 1;
+const PERF_RECORD_COMM: u32 = 3;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PerfSummary {
     pub total_records: usize,
@@ -33,11 +36,10 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
             .record_counts
             .entry(record.header.record_type)
             .or_insert(0) += 1;
-        if record.header.record_type == 3 {
-            summary.comms.push(parse_comm_record(record.payload)?.comm);
-        }
-        if record.header.record_type == 1 {
-            summary.mmaps.push(parse_mmap_record(record.payload)?.path);
+        match record.header.record_type {
+            PERF_RECORD_COMM => summary.comms.push(parse_comm_record(record.payload)?.comm),
+            PERF_RECORD_MMAP => summary.mmaps.push(parse_mmap_record(record.payload)?.path),
+            _ => {}
         }
     }
 
