@@ -27,29 +27,30 @@
     {
       devShells = forAllSystems (
         { pkgs, ... }:
+        let
+          commonTools = with pkgs; [
+            cargo
+            clippy
+            hyperfine
+            inferno
+            jq
+            rustc
+            rust-analyzer
+            rustfmt
+          ];
+          linuxTools = with pkgs; [
+            binutils
+            bpftrace
+            elfutils
+            heaptrack
+            perf
+            strace
+            valgrind
+          ];
+        in
         {
           default = pkgs.mkShell {
-            packages =
-              with pkgs;
-              [
-                cargo
-                clippy
-                hyperfine
-                inferno
-                jq
-                rustc
-                rust-analyzer
-                rustfmt
-              ]
-              ++ lib.optionals stdenv.isLinux [
-                binutils
-                bpftrace
-                elfutils
-                heaptrack
-                perf
-                strace
-                valgrind
-              ];
+            packages = commonTools ++ pkgs.lib.optionals pkgs.stdenv.isLinux linuxTools;
 
             RUST_BACKTRACE = "1";
 
