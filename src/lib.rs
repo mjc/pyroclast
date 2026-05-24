@@ -24,8 +24,10 @@ use flamegraph::{FlamegraphRenderer, FlamegraphRequest, InfernoFlamegraphRendere
 pub use output::{CliOutput, write_cli_output};
 use perfdata::fold::{
     FoldOptions, fold_perfdata_callchains, fold_perfdata_callchains_with_options,
+    fold_perfdata_callchains_with_symbols,
 };
 use process::{CommandRunner, RealCommandRunner};
+use symbols::Addr2lineResolver;
 
 /// Parses command-line arguments and runs the requested Pyroclast command.
 ///
@@ -88,13 +90,17 @@ where
     match cli.command {
         CliCommand::Fold(command) => {
             let bytes = std::fs::read(command.input)?;
+            let options = FoldOptions {
+                count_periods: command.count_periods,
+            };
+            let stdout = if command.symbols {
+                let symbol_resolver = Addr2lineResolver::new(runner);
+                fold_perfdata_callchains_with_symbols(&bytes, options, &symbol_resolver)?
+            } else {
+                fold_perfdata_callchains_with_options(&bytes, options)?
+            };
             Ok(CliOutput {
-                stdout: fold_perfdata_callchains_with_options(
-                    &bytes,
-                    FoldOptions {
-                        count_periods: command.count_periods,
-                    },
-                )?,
+                stdout,
                 stderr: String::new(),
             })
         }

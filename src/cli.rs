@@ -124,6 +124,9 @@ pub struct FoldArgs {
     #[arg(long)]
     pub count_periods: bool,
 
+    #[arg(long)]
+    pub symbols: bool,
+
     pub input: PathBuf,
 }
 

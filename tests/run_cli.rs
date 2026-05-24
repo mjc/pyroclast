@@ -53,6 +53,41 @@ fn fold_command_reads_perfdata_directly() {
 }
 
 #[test]
+fn fold_command_can_symbolize_mapped_frames() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    std::fs::write(
+        &perfdata,
+        perfdata_with_records_and_attrs(
+            [file_attr_bytes(
+                PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+                0,
+                0,
+            )],
+            [
+                record_bytes(3, &comm_payload(1, 2, "app")),
+                record_bytes(1, &mmap_payload(1, 2, 0x1000, 0x2000, 0, "/bin/app")),
+                record_bytes(9, &sample_payload(0x1000, 1, 2, [0x2000])),
+            ],
+        ),
+    )
+    .expect("write perfdata");
+    let runner = RecordingRunner::default();
+    let cli = pyroclast::cli::Cli::parse_from([
+        "pyroclast",
+        "fold",
+        "--symbols",
+        perfdata.to_str().unwrap(),
+    ]);
+
+    let output = pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("fold command");
+
+    assert_eq!(output.stdout, "app;app::work 1\n");
+    assert_eq!(runner.programs(), vec!["addr2line"]);
+    assert_eq!(runner.stdins(), vec![Some(b"0x1000\n".to_vec())]);
+}
+
+#[test]
 fn flamegraph_command_folds_perfdata_without_perf_script() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
@@ -150,10 +185,10 @@ impl pyroclast::process::CommandRunner for RecordingRunner {
         if let Some(output_path) = perf_output_path(command) {
             std::fs::write(output_path, tiny_perfdata())?;
         }
-        let stdout = if command.program == "inferno-flamegraph" {
-            b"<svg></svg>\n".to_vec()
-        } else {
-            Vec::new()
+        let stdout = match command.program.as_str() {
+            "addr2line" => b"app::work\n/bin/app.rs:10\n".to_vec(),
+            "inferno-flamegraph" => b"<svg></svg>\n".to_vec(),
+            _ => Vec::new(),
         };
         Ok(pyroclast::process::CommandOutput {
             status_code: Some(0),
