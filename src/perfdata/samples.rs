@@ -34,6 +34,8 @@ pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<Sampl
     if layout.has(PERF_SAMPLE_IP) {
         sample.ip = Some(cursor.read_u64()?);
     }
+    // PERF_RECORD_SAMPLE fields are serialized in this kernel-defined order,
+    // not in ascending flag order.
     if layout.has(PERF_SAMPLE_TID) {
         sample.pid = Some(cursor.read_u32()?);
         sample.tid = Some(cursor.read_u32()?);
