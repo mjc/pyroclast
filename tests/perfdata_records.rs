@@ -1,6 +1,3 @@
-mod common;
-
-use common::{perfdata_with_records, record_bytes};
 use pyroclast::perfdata::header::parse_header;
 use pyroclast::perfdata::records::{
     PerfRecordHeader, iter_records, parse_comm_record, parse_mmap_record, parse_mmap2_record,
@@ -111,4 +108,31 @@ fn parses_mmap2_record_payload() {
     assert_eq!(mmap.prot, 5);
     assert_eq!(mmap.flags, 2);
     assert_eq!(mmap.path, "/usr/lib/libssl.so");
+}
+
+fn perfdata_with_records<const N: usize>(records: [Vec<u8>; N]) -> Vec<u8> {
+    let data_size = records.iter().map(Vec::len).sum::<usize>();
+    let mut bytes = vec![0; 104];
+    bytes[..8].copy_from_slice(b"PERFILE2");
+    put_u64(&mut bytes, 8, 104);
+    put_u64(&mut bytes, 40, 104);
+    put_u64(&mut bytes, 48, data_size as u64);
+    for record in records {
+        bytes.extend(record);
+    }
+    bytes
+}
+
+fn record_bytes(record_type: u32, payload: &[u8]) -> Vec<u8> {
+    let size = 8 + payload.len();
+    let mut bytes = Vec::with_capacity(size);
+    bytes.extend(record_type.to_le_bytes());
+    bytes.extend(0u16.to_le_bytes());
+    bytes.extend((size as u16).to_le_bytes());
+    bytes.extend(payload);
+    bytes
+}
+
+fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
