@@ -1,6 +1,6 @@
 use pyroclast::perfdata::header::parse_header;
 use pyroclast::perfdata::records::{
-    PerfRecordHeader, iter_records, parse_comm_record, parse_record_header,
+    PerfRecordHeader, iter_records, parse_comm_record, parse_mmap_record, parse_record_header,
 };
 
 #[test]
@@ -55,6 +55,26 @@ fn parses_comm_record_payload() {
     assert_eq!(comm.pid, 123);
     assert_eq!(comm.tid, 456);
     assert_eq!(comm.comm, "sftp-s3");
+}
+
+#[test]
+fn parses_mmap_record_payload() {
+    let mut payload = Vec::new();
+    payload.extend(123u32.to_le_bytes());
+    payload.extend(456u32.to_le_bytes());
+    payload.extend(0x7f00u64.to_le_bytes());
+    payload.extend(0x1000u64.to_le_bytes());
+    payload.extend(0x40u64.to_le_bytes());
+    payload.extend(b"/usr/bin/sftp-s3\0");
+
+    let mmap = parse_mmap_record(&payload).expect("mmap record");
+
+    assert_eq!(mmap.pid, 123);
+    assert_eq!(mmap.tid, 456);
+    assert_eq!(mmap.start, 0x7f00);
+    assert_eq!(mmap.len, 0x1000);
+    assert_eq!(mmap.pgoff, 0x40);
+    assert_eq!(mmap.path, "/usr/bin/sftp-s3");
 }
 
 fn perfdata_with_records<const N: usize>(records: [Vec<u8>; N]) -> Vec<u8> {

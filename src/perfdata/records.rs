@@ -1,4 +1,4 @@
-use crate::perfdata::endian::{read_u16, read_u32};
+use crate::perfdata::endian::{read_u16, read_u32, read_u64};
 use crate::perfdata::header::PerfHeader;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,6 +20,16 @@ pub struct CommRecord {
     pub pid: u32,
     pub tid: u32,
     pub comm: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MmapRecord {
+    pub pid: u32,
+    pub tid: u32,
+    pub start: u64,
+    pub len: u64,
+    pub pgoff: u64,
+    pub path: String,
 }
 
 pub fn parse_record_header(bytes: &[u8]) -> Result<PerfRecordHeader, String> {
@@ -90,4 +100,30 @@ pub fn parse_comm_record(payload: &[u8]) -> Result<CommRecord, String> {
     let comm = String::from_utf8_lossy(&comm_bytes[..end]).into_owned();
 
     Ok(CommRecord { pid, tid, comm })
+}
+
+pub fn parse_mmap_record(payload: &[u8]) -> Result<MmapRecord, String> {
+    if payload.len() < 32 {
+        return Err("PERF_RECORD_MMAP payload is shorter than 32 bytes".to_string());
+    }
+    let pid = read_u32(payload, 0)?;
+    let tid = read_u32(payload, 4)?;
+    let start = read_u64(payload, 8)?;
+    let len = read_u64(payload, 16)?;
+    let pgoff = read_u64(payload, 24)?;
+    let path_bytes = &payload[32..];
+    let end = path_bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(path_bytes.len());
+    let path = String::from_utf8_lossy(&path_bytes[..end]).into_owned();
+
+    Ok(MmapRecord {
+        pid,
+        tid,
+        start,
+        len,
+        pgoff,
+        path,
+    })
 }
