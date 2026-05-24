@@ -24,6 +24,10 @@ fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
     assert_eq!(result.manifest.actual_backend, BackendName::LinuxPerf);
     assert_eq!(runner.programs(), vec!["perf"]);
     assert!(result.layout.raw_profile("perf.data").is_file());
+    assert_eq!(
+        std::fs::read(result.layout.raw_profile("perf.data")).expect("perf data"),
+        b"real perf data"
+    );
     assert!(result.layout.run_json().is_file());
     assert!(result.layout.stderr_log().is_file());
 }
@@ -47,10 +51,21 @@ impl RecordingRunner {
 impl CommandRunner for RecordingRunner {
     fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
         self.commands.lock().unwrap().push(command.clone());
+        if let Some(output_path) = perf_output_path(command) {
+            std::fs::write(output_path, b"real perf data")?;
+        }
         Ok(CommandOutput {
             status_code: Some(0),
             stdout: b"perf stdout".to_vec(),
             stderr: b"perf stderr".to_vec(),
         })
     }
+}
+
+fn perf_output_path(command: &CommandSpec) -> Option<&str> {
+    command
+        .args
+        .windows(2)
+        .find(|window| window[0] == "-o")
+        .map(|window| window[1].as_str())
 }

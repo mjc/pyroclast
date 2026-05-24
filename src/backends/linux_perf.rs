@@ -52,7 +52,6 @@ where
         std::fs::write(layout.stdout_log(), &output.stdout)?;
         std::fs::write(layout.stderr_log(), &output.stderr)?;
         std::fs::write(layout.command_txt(), request.command.join(" "))?;
-        std::fs::write(&perf_data, b"")?;
         std::fs::write(layout.summary_txt(), "linux perf profile recorded\n")?;
         std::fs::write(layout.summary_json(), "{}\n")?;
         std::fs::write(layout.tool_errors_log(), "")?;
