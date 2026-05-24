@@ -48,6 +48,15 @@ pub struct Mmap2Record {
     pub path: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MmapRange {
+    pid: u32,
+    tid: u32,
+    start: u64,
+    len: u64,
+    pgoff: u64,
+}
+
 pub fn parse_record_header(bytes: &[u8]) -> Result<PerfRecordHeader, String> {
     if bytes.len() < 8 {
         return Err("perf record header is shorter than 8 bytes".to_string());
@@ -117,19 +126,15 @@ pub fn parse_mmap_record(payload: &[u8]) -> Result<MmapRecord, String> {
     if payload.len() < 32 {
         return Err("PERF_RECORD_MMAP payload is shorter than 32 bytes".to_string());
     }
-    let pid = read_u32(payload, 0)?;
-    let tid = read_u32(payload, 4)?;
-    let start = read_u64(payload, 8)?;
-    let len = read_u64(payload, 16)?;
-    let pgoff = read_u64(payload, 24)?;
+    let range = parse_mmap_range(payload)?;
     let path = parse_c_string(&payload[32..]);
 
     Ok(MmapRecord {
-        pid,
-        tid,
-        start,
-        len,
-        pgoff,
+        pid: range.pid,
+        tid: range.tid,
+        start: range.start,
+        len: range.len,
+        pgoff: range.pgoff,
         path,
     })
 }
@@ -138,11 +143,7 @@ pub fn parse_mmap2_record(payload: &[u8]) -> Result<Mmap2Record, String> {
     if payload.len() < 64 {
         return Err("PERF_RECORD_MMAP2 payload is shorter than 64 bytes".to_string());
     }
-    let pid = read_u32(payload, 0)?;
-    let tid = read_u32(payload, 4)?;
-    let start = read_u64(payload, 8)?;
-    let len = read_u64(payload, 16)?;
-    let pgoff = read_u64(payload, 24)?;
+    let range = parse_mmap_range(payload)?;
     let major = read_u32(payload, 32)?;
     let minor = read_u32(payload, 36)?;
     let inode = read_u64(payload, 40)?;
@@ -152,11 +153,11 @@ pub fn parse_mmap2_record(payload: &[u8]) -> Result<Mmap2Record, String> {
     let path = parse_c_string(&payload[64..]);
 
     Ok(Mmap2Record {
-        pid,
-        tid,
-        start,
-        len,
-        pgoff,
+        pid: range.pid,
+        tid: range.tid,
+        start: range.start,
+        len: range.len,
+        pgoff: range.pgoff,
         major,
         minor,
         inode,
@@ -164,6 +165,16 @@ pub fn parse_mmap2_record(payload: &[u8]) -> Result<Mmap2Record, String> {
         prot,
         flags,
         path,
+    })
+}
+
+fn parse_mmap_range(payload: &[u8]) -> Result<MmapRange, String> {
+    Ok(MmapRange {
+        pid: read_u32(payload, 0)?,
+        tid: read_u32(payload, 4)?,
+        start: read_u64(payload, 8)?,
+        len: read_u64(payload, 16)?,
+        pgoff: read_u64(payload, 24)?,
     })
 }
 
