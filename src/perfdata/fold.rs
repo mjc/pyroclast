@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::folded::render_folded_stack;
+use crate::folded::render_address_stack;
 use crate::perfdata::attrs::parse_file_attrs;
 use crate::perfdata::header::parse_header;
 use crate::perfdata::records::{
@@ -85,14 +85,7 @@ pub fn fold_perfdata_callchains(bytes: &[u8]) -> Result<String, String> {
 
     let mut folded = String::new();
     for (callchain, count) in counts {
-        let frames = callchain
-            .iter()
-            .map(|frame| format!("0x{frame:x}"))
-            .collect::<Vec<_>>();
-        folded.push_str(&render_folded_stack(
-            frames.iter().map(String::as_str),
-            count,
-        ));
+        folded.push_str(&render_address_stack(callchain, count));
         folded.push('\n');
     }
     Ok(folded)
