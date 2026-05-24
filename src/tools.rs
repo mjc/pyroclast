@@ -10,6 +10,7 @@ pub struct ToolSpec {
     pub kind: ToolKind,
 }
 
+#[must_use]
 pub fn required_tools(platform: &str) -> Vec<ToolSpec> {
     match platform {
         "linux" => LINUX_TOOLS.to_vec(),

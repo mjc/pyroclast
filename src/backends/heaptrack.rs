@@ -1,9 +1,9 @@
-use std::path::PathBuf;
+use std::path::Path;
 
 use crate::process::CommandSpec;
 
 pub fn build_heaptrack_command(
-    output_prefix: PathBuf,
+    output_prefix: &Path,
     profiled_command: impl IntoIterator<Item = String>,
 ) -> CommandSpec {
     CommandSpec::new("heaptrack")

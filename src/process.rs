@@ -6,6 +6,7 @@ pub struct CommandSpec {
 }
 
 impl CommandSpec {
+    #[must_use]
     pub fn new(program: impl Into<String>) -> Self {
         Self {
             program: program.into(),
@@ -14,16 +15,19 @@ impl CommandSpec {
         }
     }
 
+    #[must_use]
     pub fn arg(mut self, arg: impl Into<String>) -> Self {
         self.args.push(arg.into());
         self
     }
 
+    #[must_use]
     pub fn args(mut self, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.args.extend(args.into_iter().map(Into::into));
         self
     }
 
+    #[must_use]
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.push((key.into(), value.into()));
         self
@@ -38,6 +42,11 @@ pub struct CommandOutput {
 }
 
 pub trait CommandRunner {
+    /// Runs a command and captures its exit status and output.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the command cannot be spawned or waited on.
     fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput>;
 }
 

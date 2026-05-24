@@ -10,7 +10,7 @@ fn builds_linux_perf_record_command() {
     let command = build_perf_record_command(
         997,
         "fp",
-        PathBuf::from("run/profile.raw.perf.data"),
+        &PathBuf::from("run/profile.raw.perf.data"),
         ["cargo".to_string(), "check".to_string()],
     );
 
@@ -36,7 +36,7 @@ fn builds_linux_perf_record_command() {
 #[test]
 fn builds_heaptrack_command() {
     let command = build_heaptrack_command(
-        PathBuf::from("run/profile.raw.heaptrack"),
+        &PathBuf::from("run/profile.raw.heaptrack"),
         ["target/release/app".to_string(), "--serve".to_string()],
     );
 
@@ -55,7 +55,7 @@ fn builds_heaptrack_command() {
 #[test]
 fn builds_inferno_flamegraph_command() {
     let command =
-        build_inferno_flamegraph_command("CPU profile", PathBuf::from("run/stacks.folded"));
+        build_inferno_flamegraph_command("CPU profile", &PathBuf::from("run/stacks.folded"));
 
     assert_eq!(command.program, "inferno-flamegraph");
     assert_eq!(
@@ -67,8 +67,8 @@ fn builds_inferno_flamegraph_command() {
 #[test]
 fn builds_macos_xctrace_record_command() {
     let command = build_xctrace_record_command(
-        PathBuf::from("run/profile.raw.xctrace.trace"),
-        PathBuf::from("run/xctrace-target.pid"),
+        &PathBuf::from("run/profile.raw.xctrace.trace"),
+        &PathBuf::from("run/xctrace-target.pid"),
         ["target/release/app".to_string(), "--serve".to_string()],
     );
 

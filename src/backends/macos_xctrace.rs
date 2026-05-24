@@ -1,12 +1,12 @@
-use std::path::PathBuf;
+use std::path::Path;
 
 use crate::process::CommandSpec;
 
 pub const XCTRACE_PID_ENV: &str = "PYROCLAST_XCTRACE_TARGET_PID";
 
 pub fn build_xctrace_record_command(
-    trace_path: PathBuf,
-    target_pid_path: PathBuf,
+    trace_path: &Path,
+    target_pid_path: &Path,
     profiled_command: impl IntoIterator<Item = String>,
 ) -> CommandSpec {
     CommandSpec::new("xctrace")

@@ -4,6 +4,7 @@ pub struct HeaptrackSummary {
     pub peak_heap_bytes: Option<u64>,
 }
 
+#[must_use]
 pub fn parse_heaptrack_summary(text: &str) -> HeaptrackSummary {
     let mut summary = HeaptrackSummary {
         total_allocations: None,

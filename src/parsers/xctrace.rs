@@ -10,6 +10,7 @@ pub struct XctraceCpuRow {
     pub weight: f64,
 }
 
+#[must_use]
 pub fn parse_cpu_profile(xml: &str) -> XctraceCpuProfile {
     let mut rows = Vec::new();
 

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::artifacts::ArtifactLayout;
@@ -11,7 +11,7 @@ use crate::process::{CommandRunner, CommandSpec};
 pub fn build_perf_record_command(
     frequency: u32,
     callgraph: &str,
-    output: PathBuf,
+    output: &Path,
     profiled_command: impl IntoIterator<Item = String>,
 ) -> CommandSpec {
     CommandSpec::new("perf")
@@ -48,8 +48,7 @@ where
         std::fs::create_dir_all(layout.root())?;
 
         let perf_data = layout.raw_profile("perf.data");
-        let command =
-            build_perf_record_command(997, "fp", perf_data.clone(), request.command.clone());
+        let command = build_perf_record_command(997, "fp", &perf_data, request.command.clone());
         let output = self.runner.run(&command)?;
         let perf_bytes = std::fs::read(&perf_data)?;
         std::fs::write(
@@ -57,7 +56,7 @@ where
             fold_perfdata_callchains(&perf_bytes)?,
         )?;
         let flamegraph_command =
-            build_inferno_flamegraph_command("CPU profile", layout.stacks_folded());
+            build_inferno_flamegraph_command("CPU profile", &layout.stacks_folded());
         let flamegraph_output = self.runner.run(&flamegraph_command)?;
         std::fs::write(layout.flamegraph_svg(), &flamegraph_output.stdout)?;
 

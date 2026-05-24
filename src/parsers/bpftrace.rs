@@ -26,10 +26,10 @@ pub fn collapse_offcpu(input: &str) -> Vec<String> {
             continue;
         }
 
-        if line.starts_with(char::is_whitespace) {
-            if let Some(frame) = parse_frame(line) {
-                current.push(frame.to_string());
-            }
+        if line.starts_with(char::is_whitespace)
+            && let Some(frame) = parse_frame(line)
+        {
+            current.push(frame.to_string());
         }
     }
 
@@ -46,13 +46,11 @@ fn parse_frame(line: &str) -> Option<&str> {
     let frame = frame
         .rfind(" (")
         .filter(|_| frame.ends_with(')'))
-        .map(|idx| &frame[..idx])
-        .unwrap_or(frame);
+        .map_or(frame, |idx| &frame[..idx]);
     let frame = frame
         .rfind('+')
         .filter(|idx| frame[*idx + 1..].chars().all(|ch| ch.is_ascii_digit()))
-        .map(|idx| &frame[..idx])
-        .unwrap_or(frame);
+        .map_or(frame, |idx| &frame[..idx]);
     if frame.is_empty() || frame.ends_with("([unknown])") {
         None
     } else {

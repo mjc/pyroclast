@@ -1,7 +1,9 @@
+#[must_use]
 pub fn escape_frame(frame: &str) -> String {
     frame.replace(';', "\\;").replace(['\r', '\n'], " ")
 }
 
+#[must_use]
 pub fn render_folded_stack<'a>(frames: impl IntoIterator<Item = &'a str>, count: u64) -> String {
     let mut rendered = String::new();
     for frame in frames {
@@ -15,6 +17,7 @@ pub fn render_folded_stack<'a>(frames: impl IntoIterator<Item = &'a str>, count:
     rendered
 }
 
+#[must_use]
 pub fn render_address_stack(frames: impl IntoIterator<Item = u64>, count: u64) -> String {
     let rendered_frames = frames
         .into_iter()

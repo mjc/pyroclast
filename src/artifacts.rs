@@ -16,54 +16,67 @@ pub struct ArtifactLayout {
 }
 
 impl ArtifactLayout {
+    #[must_use]
     pub fn new(root: PathBuf) -> Self {
         Self { root }
     }
 
+    #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    #[must_use]
     pub fn run_json(&self) -> PathBuf {
         self.root.join(RUN_JSON)
     }
 
+    #[must_use]
     pub fn stdout_log(&self) -> PathBuf {
         self.root.join(STDOUT_LOG)
     }
 
+    #[must_use]
     pub fn stderr_log(&self) -> PathBuf {
         self.root.join(STDERR_LOG)
     }
 
+    #[must_use]
     pub fn command_txt(&self) -> PathBuf {
         self.root.join(COMMAND_TXT)
     }
 
+    #[must_use]
     pub fn raw_profile(&self, extension: &str) -> PathBuf {
         self.root.join(format!("profile.raw.{extension}"))
     }
 
+    #[must_use]
     pub fn stacks_folded(&self) -> PathBuf {
         self.root.join(STACKS_FOLDED)
     }
 
+    #[must_use]
     pub fn flamegraph_svg(&self) -> PathBuf {
         self.root.join(FLAMEGRAPH_SVG)
     }
 
+    #[must_use]
     pub fn summary_txt(&self) -> PathBuf {
         self.root.join(SUMMARY_TXT)
     }
 
+    #[must_use]
     pub fn summary_json(&self) -> PathBuf {
         self.root.join(SUMMARY_JSON)
     }
 
+    #[must_use]
     pub fn tool_errors_log(&self) -> PathBuf {
         self.root.join(TOOL_ERRORS_LOG)
     }
 
+    #[must_use]
     pub fn standard_manifest_artifacts(&self) -> Vec<PathBuf> {
         vec![
             self.run_json(),

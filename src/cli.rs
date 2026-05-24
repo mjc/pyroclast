@@ -69,6 +69,7 @@ pub struct ProfileInvocation {
 }
 
 impl CliCommand {
+    #[must_use]
     pub fn profile_invocation(&self) -> Option<ProfileInvocation> {
         match self {
             Self::Memory(args) => Some(ProfileInvocation::from_run(ProfileKind::Memory, args)),

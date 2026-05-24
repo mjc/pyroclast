@@ -32,6 +32,7 @@ impl StraceSummary {
     }
 }
 
+#[must_use]
 pub fn parse_strace_summary(input: &str) -> StraceSummary {
     let mut summary = StraceSummary {
         total_calls: 0,
