@@ -32,6 +32,22 @@ pub struct MmapRecord {
     pub path: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Mmap2Record {
+    pub pid: u32,
+    pub tid: u32,
+    pub start: u64,
+    pub len: u64,
+    pub pgoff: u64,
+    pub major: u32,
+    pub minor: u32,
+    pub inode: u64,
+    pub inode_generation: u64,
+    pub prot: u32,
+    pub flags: u32,
+    pub path: String,
+}
+
 pub fn parse_record_header(bytes: &[u8]) -> Result<PerfRecordHeader, String> {
     if bytes.len() < 8 {
         return Err("perf record header is shorter than 8 bytes".to_string());
@@ -114,6 +130,39 @@ pub fn parse_mmap_record(payload: &[u8]) -> Result<MmapRecord, String> {
         start,
         len,
         pgoff,
+        path,
+    })
+}
+
+pub fn parse_mmap2_record(payload: &[u8]) -> Result<Mmap2Record, String> {
+    if payload.len() < 64 {
+        return Err("PERF_RECORD_MMAP2 payload is shorter than 64 bytes".to_string());
+    }
+    let pid = read_u32(payload, 0)?;
+    let tid = read_u32(payload, 4)?;
+    let start = read_u64(payload, 8)?;
+    let len = read_u64(payload, 16)?;
+    let pgoff = read_u64(payload, 24)?;
+    let major = read_u32(payload, 32)?;
+    let minor = read_u32(payload, 36)?;
+    let inode = read_u64(payload, 40)?;
+    let inode_generation = read_u64(payload, 48)?;
+    let prot = read_u32(payload, 56)?;
+    let flags = read_u32(payload, 60)?;
+    let path = parse_c_string(&payload[64..]);
+
+    Ok(Mmap2Record {
+        pid,
+        tid,
+        start,
+        len,
+        pgoff,
+        major,
+        minor,
+        inode,
+        inode_generation,
+        prot,
+        flags,
         path,
     })
 }

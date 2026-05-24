@@ -1,6 +1,7 @@
 use pyroclast::perfdata::header::parse_header;
 use pyroclast::perfdata::records::{
-    PerfRecordHeader, iter_records, parse_comm_record, parse_mmap_record, parse_record_header,
+    PerfRecordHeader, iter_records, parse_comm_record, parse_mmap_record, parse_mmap2_record,
+    parse_record_header,
 };
 
 #[test]
@@ -75,6 +76,38 @@ fn parses_mmap_record_payload() {
     assert_eq!(mmap.len, 0x1000);
     assert_eq!(mmap.pgoff, 0x40);
     assert_eq!(mmap.path, "/usr/bin/sftp-s3");
+}
+
+#[test]
+fn parses_mmap2_record_payload() {
+    let mut payload = Vec::new();
+    payload.extend(123u32.to_le_bytes());
+    payload.extend(456u32.to_le_bytes());
+    payload.extend(0x7f00u64.to_le_bytes());
+    payload.extend(0x1000u64.to_le_bytes());
+    payload.extend(0x40u64.to_le_bytes());
+    payload.extend(8u32.to_le_bytes());
+    payload.extend(1u32.to_le_bytes());
+    payload.extend(99u64.to_le_bytes());
+    payload.extend(7u64.to_le_bytes());
+    payload.extend(5u32.to_le_bytes());
+    payload.extend(2u32.to_le_bytes());
+    payload.extend(b"/usr/lib/libssl.so\0");
+
+    let mmap = parse_mmap2_record(&payload).expect("mmap2 record");
+
+    assert_eq!(mmap.pid, 123);
+    assert_eq!(mmap.tid, 456);
+    assert_eq!(mmap.start, 0x7f00);
+    assert_eq!(mmap.len, 0x1000);
+    assert_eq!(mmap.pgoff, 0x40);
+    assert_eq!(mmap.major, 8);
+    assert_eq!(mmap.minor, 1);
+    assert_eq!(mmap.inode, 99);
+    assert_eq!(mmap.inode_generation, 7);
+    assert_eq!(mmap.prot, 5);
+    assert_eq!(mmap.flags, 2);
+    assert_eq!(mmap.path, "/usr/lib/libssl.so");
 }
 
 fn perfdata_with_records<const N: usize>(records: [Vec<u8>; N]) -> Vec<u8> {
