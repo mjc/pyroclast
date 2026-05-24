@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use crate::folded::render_folded_stack;
 use crate::perfdata::attrs::parse_file_attrs;
 use crate::perfdata::header::parse_header;
+use crate::perfdata::mappings::MmapTable;
 use crate::perfdata::records::{
     iter_records, parse_comm_record, parse_mmap_record, parse_mmap2_record,
 };
@@ -20,6 +21,7 @@ pub struct PerfSummary {
     pub comms: Vec<String>,
     pub comms_by_pid: BTreeMap<u32, String>,
     pub mmaps: Vec<String>,
+    pub mmap_table: MmapTable,
     pub sample_callchains: Vec<Vec<u64>>,
     pub sample_stacks: Vec<PerfSampleStack>,
 }
@@ -69,6 +71,7 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
         comms: Vec::new(),
         comms_by_pid: BTreeMap::new(),
         mmaps: Vec::new(),
+        mmap_table: MmapTable::default(),
         sample_callchains: Vec::new(),
         sample_stacks: Vec::new(),
     };
@@ -85,7 +88,8 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
                 summary.comms.push(record.comm);
             }),
             PERF_RECORD_MMAP => parse_mmap_record(record.payload).map(|record| {
-                summary.mmaps.push(record.path);
+                summary.mmaps.push(record.path.clone());
+                summary.mmap_table.insert_mmap(record);
             }),
             PERF_RECORD_SAMPLE => {
                 parse_sample_for_summary(record.payload, sample_layout).map(|sample| {
@@ -96,7 +100,8 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
                 })
             }
             PERF_RECORD_MMAP2 => parse_mmap2_record(record.payload).map(|record| {
-                summary.mmaps.push(record.path);
+                summary.mmaps.push(record.path.clone());
+                summary.mmap_table.insert_mmap2(record);
             }),
             _ => Ok(()),
         };
@@ -132,7 +137,7 @@ pub fn fold_perfdata_callchains_with_options(
     let summary = summarize_perfdata(bytes)?;
     let mut counts = BTreeMap::<Vec<String>, u64>::new();
     for sample in &summary.sample_stacks {
-        let frames = folded_frames_for_sample(sample, &summary.comms_by_pid);
+        let frames = folded_frames_for_sample(sample, &summary.comms_by_pid, &summary.mmap_table);
         *counts.entry(frames).or_insert(0) += sample.count(options);
     }
 
@@ -150,6 +155,7 @@ pub fn fold_perfdata_callchains_with_options(
 fn folded_frames_for_sample(
     sample: &PerfSampleStack,
     comms_by_pid: &BTreeMap<u32, String>,
+    mmap_table: &MmapTable,
 ) -> Vec<String> {
     let mut frames = if let Some(comm) = sample.pid.and_then(|pid| comms_by_pid.get(&pid)) {
         vec![comm.clone()]
@@ -162,9 +168,17 @@ fn folded_frames_for_sample(
             .iter()
             .copied()
             .filter(|frame| !is_perf_context_marker(*frame))
-            .map(|frame| format!("0x{frame:x}")),
+            .map(|frame| format_frame(sample.pid, frame, mmap_table)),
     );
     frames
+}
+
+fn format_frame(pid: Option<u32>, frame: u64, mmap_table: &MmapTable) -> String {
+    if let Some(mapping) = pid.and_then(|pid| mmap_table.resolve(pid, frame)) {
+        format!("{}+0x{:x}", mapping.path, mapping.relative_address)
+    } else {
+        format!("0x{frame:x}")
+    }
 }
 
 fn parse_sample_for_summary(

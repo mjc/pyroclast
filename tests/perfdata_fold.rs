@@ -154,6 +154,25 @@ fn can_fold_samples_weighted_by_period() {
     assert_eq!(folded, "0x2000 10\n");
 }
 
+#[test]
+fn folds_mapped_user_frames_as_file_relative_addresses() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(1, &mmap_payload(11, 11, 0x1000, 0x100, 0, "/bin/app")),
+            record_bytes(9, &sample_payload(0x1000, 11, 12, [0x1010])),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, "/bin/app+0x10 1\n");
+}
+
 fn perfdata_with_records_and_attrs<const A: usize, const R: usize>(
     attrs: [[u8; 144]; A],
     records: [Vec<u8>; R],
