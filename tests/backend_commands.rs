@@ -2,6 +2,7 @@ use pyroclast::backends::heaptrack::build_heaptrack_command;
 use pyroclast::backends::linux_perf::build_perf_record_command;
 use pyroclast::backends::macos_xctrace::build_xctrace_record_command;
 use pyroclast::flamegraph::build_inferno_flamegraph_command;
+use pyroclast::symbols::{SymbolRequest, build_addr2line_command};
 use std::path::PathBuf;
 
 #[test]
@@ -96,4 +97,25 @@ fn builds_macos_xctrace_record_command() {
             "run/xctrace-target.pid".to_string()
         )]
     );
+}
+
+#[test]
+fn builds_batched_addr2line_command() {
+    let command = build_addr2line_command(
+        &PathBuf::from("/bin/app"),
+        &[
+            SymbolRequest {
+                path: PathBuf::from("/bin/app"),
+                relative_address: 0x10,
+            },
+            SymbolRequest {
+                path: PathBuf::from("/bin/app"),
+                relative_address: 0x20,
+            },
+        ],
+    );
+
+    assert_eq!(command.program, "addr2line");
+    assert_eq!(command.args, vec!["-f", "-C", "-e", "/bin/app"]);
+    assert_eq!(command.stdin, Some(b"0x10\n0x20\n".to_vec()));
 }

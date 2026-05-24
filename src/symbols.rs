@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::fmt::Write;
+use std::path::{Path, PathBuf};
+
+use crate::process::CommandSpec;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SymbolRequest {
@@ -19,6 +22,18 @@ pub trait SymbolResolver {
 pub struct SymbolCache<'a, R> {
     resolver: &'a R,
     resolved: BTreeMap<SymbolRequest, Option<String>>,
+}
+
+#[must_use]
+pub fn build_addr2line_command(path: &Path, requests: &[SymbolRequest]) -> CommandSpec {
+    let mut stdin = String::new();
+    for request in requests {
+        writeln!(stdin, "0x{:x}", request.relative_address)
+            .expect("writing to a string cannot fail");
+    }
+    CommandSpec::new("addr2line")
+        .args(["-f", "-C", "-e", path.to_string_lossy().as_ref()])
+        .stdin(stdin.into_bytes())
 }
 
 impl<'a, R> SymbolCache<'a, R>
