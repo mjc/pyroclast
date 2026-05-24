@@ -11,28 +11,11 @@ pub struct ToolSpec {
 }
 
 pub fn required_tools(platform: &str) -> Vec<ToolSpec> {
-    let mut tools = vec![ToolSpec {
-        name: "inferno-flamegraph",
-        kind: ToolKind::NixManaged,
-    }];
-
     match platform {
-        "linux" => tools.extend([
-            nix_tool("perf"),
-            nix_tool("heaptrack"),
-            nix_tool("heaptrack_print"),
-            nix_tool("strace"),
-            nix_tool("bpftrace"),
-            nix_tool("valgrind"),
-        ]),
-        "macos" => tools.push(ToolSpec {
-            name: "xctrace",
-            kind: ToolKind::AppleProvided,
-        }),
-        _ => {}
+        "linux" => LINUX_TOOLS.to_vec(),
+        "macos" => MACOS_TOOLS.to_vec(),
+        _ => COMMON_TOOLS.to_vec(),
     }
-
-    tools
 }
 
 const fn nix_tool(name: &'static str) -> ToolSpec {
@@ -41,3 +24,23 @@ const fn nix_tool(name: &'static str) -> ToolSpec {
         kind: ToolKind::NixManaged,
     }
 }
+
+const COMMON_TOOLS: &[ToolSpec] = &[nix_tool("inferno-flamegraph")];
+
+const LINUX_TOOLS: &[ToolSpec] = &[
+    nix_tool("inferno-flamegraph"),
+    nix_tool("perf"),
+    nix_tool("heaptrack"),
+    nix_tool("heaptrack_print"),
+    nix_tool("strace"),
+    nix_tool("bpftrace"),
+    nix_tool("valgrind"),
+];
+
+const MACOS_TOOLS: &[ToolSpec] = &[
+    nix_tool("inferno-flamegraph"),
+    ToolSpec {
+        name: "xctrace",
+        kind: ToolKind::AppleProvided,
+    },
+];
