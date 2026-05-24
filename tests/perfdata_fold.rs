@@ -142,7 +142,11 @@ fn record_bytes(record_type: u32, payload: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(size);
     bytes.extend(record_type.to_le_bytes());
     bytes.extend(0u16.to_le_bytes());
-    bytes.extend((size as u16).to_le_bytes());
+    bytes.extend(
+        u16::try_from(size)
+            .expect("record fits in u16")
+            .to_le_bytes(),
+    );
     bytes.extend(payload);
     bytes
 }

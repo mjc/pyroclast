@@ -13,9 +13,7 @@ fn fake_backend_writes_required_artifacts() {
         json: false,
     };
 
-    let result = FakeBackend::default()
-        .profile(&request)
-        .expect("fake profile");
+    let result = FakeBackend.profile(&request).expect("fake profile");
 
     assert_eq!(
         result.manifest.actual_backend,

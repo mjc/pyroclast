@@ -60,15 +60,12 @@ fn parses_top_level_profiler_commands() {
     for (verb, kind) in cases {
         let cli = Cli::parse_from(["pyroclast", verb, "--", "cargo", "check"]);
 
-        match cli.command {
-            command => {
-                let profile = command
-                    .profile_invocation()
-                    .unwrap_or_else(|| panic!("expected profile invocation for {verb}"));
-                assert_eq!(profile.kind, kind, "verb {verb}");
-                assert_eq!(profile.command, vec!["cargo", "check"]);
-            }
-        }
+        let command = cli.command;
+        let profile = command
+            .profile_invocation()
+            .unwrap_or_else(|| panic!("expected profile invocation for {verb}"));
+        assert_eq!(profile.kind, kind, "verb {verb}");
+        assert_eq!(profile.command, vec!["cargo", "check"]);
     }
 }
 
@@ -76,16 +73,16 @@ fn parses_top_level_profiler_commands() {
 fn parses_analysis_commands() {
     let fold = Cli::parse_from(["pyroclast", "fold", "perf.data"]);
     assert!(
-        matches!(fold.command, CliCommand::Fold(command) if command.input == PathBuf::from("perf.data"))
+        matches!(fold.command, CliCommand::Fold(command) if command.input == std::path::Path::new("perf.data"))
     );
 
     let summarize = Cli::parse_from(["pyroclast", "summarize", "--json", "run-dir"]);
     assert!(
-        matches!(summarize.command, CliCommand::Summarize(command) if command.json && command.artifact_dir == PathBuf::from("run-dir"))
+        matches!(summarize.command, CliCommand::Summarize(command) if command.json && command.artifact_dir == std::path::Path::new("run-dir"))
     );
 
     let flamegraph = Cli::parse_from(["pyroclast", "flamegraph", "perf.data", "-o", "out.svg"]);
     assert!(
-        matches!(flamegraph.command, CliCommand::Flamegraph(command) if command.input == PathBuf::from("perf.data") && command.output == Some(PathBuf::from("out.svg")))
+        matches!(flamegraph.command, CliCommand::Flamegraph(command) if command.input == std::path::Path::new("perf.data") && command.output.as_deref() == Some(std::path::Path::new("out.svg")))
     );
 }
