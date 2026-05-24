@@ -1,6 +1,10 @@
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::process::CommandSpec;
+use crate::artifacts::ArtifactLayout;
+use crate::backends::{BackendResult, ProfileRequest, ProfileResult, ProfilerBackend};
+use crate::manifest::{BackendName, RunManifest};
+use crate::process::{CommandRunner, CommandSpec};
 
 pub fn build_perf_record_command(
     frequency: u32,
@@ -21,4 +25,65 @@ pub fn build_perf_record_command(
             "--".to_string(),
         ])
         .args(profiled_command)
+}
+
+pub struct LinuxPerfBackend<'a, R> {
+    runner: &'a R,
+}
+
+impl<'a, R> LinuxPerfBackend<'a, R> {
+    pub fn new(runner: &'a R) -> Self {
+        Self { runner }
+    }
+}
+
+impl<R> ProfilerBackend for LinuxPerfBackend<'_, R>
+where
+    R: CommandRunner,
+{
+    fn profile(&self, request: &ProfileRequest) -> BackendResult<ProfileResult> {
+        let layout = ArtifactLayout::new(request.out_dir.clone());
+        std::fs::create_dir_all(layout.root())?;
+
+        let perf_data = layout.raw_profile("perf.data");
+        let command = build_perf_record_command(997, "fp", perf_data.clone(), request.command.clone());
+        let output = self.runner.run(&command)?;
+
+        std::fs::write(layout.stdout_log(), &output.stdout)?;
+        std::fs::write(layout.stderr_log(), &output.stderr)?;
+        std::fs::write(layout.command_txt(), request.command.join(" "))?;
+        std::fs::write(&perf_data, b"")?;
+        std::fs::write(layout.summary_txt(), "linux perf profile recorded\n")?;
+        std::fs::write(layout.summary_json(), "{}\n")?;
+        std::fs::write(layout.tool_errors_log(), "")?;
+
+        let manifest = RunManifest {
+            command: request.command.clone(),
+            cwd: std::env::current_dir()?,
+            profile_kind: request.kind,
+            requested_backend: BackendName::LinuxPerf,
+            actual_backend: BackendName::LinuxPerf,
+            fallback_reason: None,
+            platform: std::env::consts::OS.to_string(),
+            started_at_unix_ms: unix_ms_now(),
+            ended_at_unix_ms: Some(unix_ms_now()),
+            exit_status: output.status_code,
+            artifacts: {
+                let mut artifacts = layout.standard_manifest_artifacts();
+                artifacts.push(perf_data);
+                artifacts
+            },
+            diagnostics: vec!["perf record executed".to_string()],
+        };
+        std::fs::write(layout.run_json(), serde_json::to_string_pretty(&manifest)?)?;
+
+        Ok(ProfileResult { layout, manifest })
+    }
+}
+
+fn unix_ms_now() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
 }
