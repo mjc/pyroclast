@@ -1,10 +1,13 @@
 use std::collections::BTreeMap;
 
 use crate::perfdata::header::parse_header;
-use crate::perfdata::records::{iter_records, parse_comm_record, parse_mmap_record};
+use crate::perfdata::records::{
+    iter_records, parse_comm_record, parse_mmap_record, parse_mmap2_record,
+};
 
 const PERF_RECORD_MMAP: u32 = 1;
 const PERF_RECORD_COMM: u32 = 3;
+const PERF_RECORD_MMAP2: u32 = 10;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PerfSummary {
@@ -39,6 +42,7 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
         match record.header.record_type {
             PERF_RECORD_COMM => summary.comms.push(parse_comm_record(record.payload)?.comm),
             PERF_RECORD_MMAP => summary.mmaps.push(parse_mmap_record(record.payload)?.path),
+            PERF_RECORD_MMAP2 => summary.mmaps.push(parse_mmap2_record(record.payload)?.path),
             _ => {}
         }
     }

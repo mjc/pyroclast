@@ -8,17 +8,22 @@ fn summarizes_record_counts_and_comm_names() {
             1,
             &mmap_payload(1, 2, 0x1000, 0x2000, 0, "/usr/bin/sftp-s3"),
         ),
+        record_bytes(
+            10,
+            &mmap2_payload(1, 2, 0x3000, 0x4000, 0, "/usr/lib/libc.so"),
+        ),
         record_bytes(9, b"sample"),
     ]);
 
     let summary = summarize_perfdata(&bytes).expect("summary");
 
-    assert_eq!(summary.total_records, 3);
+    assert_eq!(summary.total_records, 4);
     assert_eq!(summary.record_count(1), 1);
     assert_eq!(summary.record_count(3), 1);
     assert_eq!(summary.record_count(9), 1);
+    assert_eq!(summary.record_count(10), 1);
     assert_eq!(summary.comms, vec!["sftp-s3"]);
-    assert_eq!(summary.mmaps, vec!["/usr/bin/sftp-s3"]);
+    assert_eq!(summary.mmaps, vec!["/usr/bin/sftp-s3", "/usr/lib/libc.so"]);
 }
 
 fn perfdata_with_records<const N: usize>(records: [Vec<u8>; N]) -> Vec<u8> {
@@ -60,6 +65,20 @@ fn mmap_payload(pid: u32, tid: u32, start: u64, len: u64, pgoff: u64, path: &str
     payload.extend(start.to_le_bytes());
     payload.extend(len.to_le_bytes());
     payload.extend(pgoff.to_le_bytes());
+    payload.extend(path.as_bytes());
+    payload.push(0);
+    payload
+}
+
+fn mmap2_payload(pid: u32, tid: u32, start: u64, len: u64, pgoff: u64, path: &str) -> Vec<u8> {
+    let mut payload = mmap_payload(pid, tid, start, len, pgoff, "");
+    payload.pop();
+    payload.extend(8u32.to_le_bytes());
+    payload.extend(1u32.to_le_bytes());
+    payload.extend(99u64.to_le_bytes());
+    payload.extend(7u64.to_le_bytes());
+    payload.extend(5u32.to_le_bytes());
+    payload.extend(2u32.to_le_bytes());
     payload.extend(path.as_bytes());
     payload.push(0);
     payload
