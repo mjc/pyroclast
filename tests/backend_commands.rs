@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use pyroclast::backends::linux_perf::build_perf_record_command;
 use pyroclast::backends::macos_xctrace::build_xctrace_record_command;
+use pyroclast::flamegraph::build_inferno_flamegraph_command;
 
 #[test]
 fn builds_linux_perf_record_command() {
@@ -27,6 +28,27 @@ fn builds_linux_perf_record_command() {
             "--",
             "cargo",
             "check",
+        ]
+    );
+}
+
+#[test]
+fn builds_inferno_flamegraph_command() {
+    let command = build_inferno_flamegraph_command(
+        "CPU profile",
+        PathBuf::from("run/stacks.folded"),
+        PathBuf::from("run/flamegraph.svg"),
+    );
+
+    assert_eq!(command.program, "inferno-flamegraph");
+    assert_eq!(
+        command.args,
+        vec![
+            "--title",
+            "CPU profile",
+            "run/stacks.folded",
+            "--output",
+            "run/flamegraph.svg"
         ]
     );
 }
