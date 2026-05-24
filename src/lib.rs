@@ -93,12 +93,7 @@ where
             let options = FoldOptions {
                 count_periods: command.count_periods,
             };
-            let stdout = if command.symbols {
-                let symbol_resolver = Addr2lineResolver::new(runner);
-                fold_perfdata_callchains_with_symbols(&bytes, options, &symbol_resolver)?
-            } else {
-                fold_perfdata_callchains_with_options(&bytes, options)?
-            };
+            let stdout = fold_perfdata_for_cli(&bytes, options, command.symbols, runner)?;
             Ok(CliOutput {
                 stdout,
                 stderr: String::new(),
@@ -109,16 +104,8 @@ where
             let output = command
                 .output
                 .unwrap_or_else(|| std::path::PathBuf::from("flamegraph.svg"));
-            let folded_stacks = if command.symbols {
-                let symbol_resolver = Addr2lineResolver::new(runner);
-                fold_perfdata_callchains_with_symbols(
-                    &bytes,
-                    FoldOptions::default(),
-                    &symbol_resolver,
-                )?
-            } else {
-                fold_perfdata_callchains(&bytes)?
-            };
+            let folded_stacks =
+                fold_perfdata_for_cli(&bytes, FoldOptions::default(), command.symbols, runner)?;
             let render = InfernoFlamegraphRenderer::new(runner).render(&FlamegraphRequest {
                 title: command.title,
                 folded_stacks,
@@ -136,5 +123,28 @@ where
         | CliCommand::Latency(_)
         | CliCommand::Async(_)
         | CliCommand::Profile(_) => unreachable!("profile invocations returned earlier"),
+    }
+}
+
+fn fold_perfdata_for_cli<R>(
+    bytes: &[u8],
+    options: FoldOptions,
+    symbols: bool,
+    runner: &R,
+) -> backends::BackendResult<String>
+where
+    R: CommandRunner,
+{
+    if symbols {
+        let symbol_resolver = Addr2lineResolver::new(runner);
+        Ok(fold_perfdata_callchains_with_symbols(
+            bytes,
+            options,
+            &symbol_resolver,
+        )?)
+    } else if options == FoldOptions::default() {
+        Ok(fold_perfdata_callchains(bytes)?)
+    } else {
+        Ok(fold_perfdata_callchains_with_options(bytes, options)?)
     }
 }
