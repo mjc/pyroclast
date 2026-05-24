@@ -79,6 +79,9 @@ where
             for comm in summary.comms {
                 stdout.push_str(&format!("comm={comm}\n"));
             }
+            for mmap in summary.mmaps {
+                stdout.push_str(&format!("mmap={mmap}\n"));
+            }
             Ok(CliOutput {
                 stdout,
                 stderr: String::new(),

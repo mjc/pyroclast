@@ -30,15 +30,19 @@ fn fold_command_reads_perfdata_directly() {
     let perfdata = root.path().join("perf.data");
     std::fs::write(
         &perfdata,
-        perfdata_with_records([record_bytes(3, &comm_payload(1, 2, "app"))]),
+        perfdata_with_records([
+            record_bytes(3, &comm_payload(1, 2, "app")),
+            record_bytes(1, &mmap_payload(1, 2, 0x1000, 0x2000, 0, "/bin/app")),
+        ]),
     )
     .expect("write perfdata");
 
     let output = pyroclast::run_cli(["pyroclast", "fold", perfdata.to_str().unwrap()])
         .expect("fold command");
 
-    assert!(output.stdout.contains("total_records=1"));
+    assert!(output.stdout.contains("total_records=2"));
     assert!(output.stdout.contains("comm=app"));
+    assert!(output.stdout.contains("mmap=/bin/app"));
 }
 
 #[test]
@@ -120,6 +124,18 @@ fn comm_payload(pid: u32, tid: u32, comm: &str) -> Vec<u8> {
     payload.extend(pid.to_le_bytes());
     payload.extend(tid.to_le_bytes());
     payload.extend(comm.as_bytes());
+    payload.push(0);
+    payload
+}
+
+fn mmap_payload(pid: u32, tid: u32, start: u64, len: u64, pgoff: u64, path: &str) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(pid.to_le_bytes());
+    payload.extend(tid.to_le_bytes());
+    payload.extend(start.to_le_bytes());
+    payload.extend(len.to_le_bytes());
+    payload.extend(pgoff.to_le_bytes());
+    payload.extend(path.as_bytes());
     payload.push(0);
     payload
 }
