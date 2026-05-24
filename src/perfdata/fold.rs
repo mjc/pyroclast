@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use crate::folded::render_folded_stack;
 use crate::perfdata::attrs::parse_file_attrs;
 use crate::perfdata::header::parse_header;
-use crate::perfdata::mappings::MmapTable;
+use crate::perfdata::mappings::{MmapTable, ResolvedMapping};
 use crate::perfdata::records::{
     iter_records, parse_comm_record, parse_mmap_record, parse_mmap2_record,
 };
@@ -242,19 +242,26 @@ impl<'a> FoldFrameResolver<'a> {
     {
         if let Some(mapping) = pid.and_then(|pid| self.mmap_table.resolve(pid, frame)) {
             if let Some(cache) = symbol_cache {
-                let request = SymbolRequest {
-                    path: PathBuf::from(&mapping.path),
-                    relative_address: mapping.relative_address,
-                };
-                return Ok(cache.resolve(&request)?.unwrap_or_else(|| {
-                    format!("{}+0x{:x}", mapping.path, mapping.relative_address)
-                }));
+                return Ok(cache
+                    .resolve(&symbol_request(&mapping))?
+                    .unwrap_or_else(|| mapped_frame_label(&mapping)));
             }
-            Ok(format!("{}+0x{:x}", mapping.path, mapping.relative_address))
+            Ok(mapped_frame_label(&mapping))
         } else {
             Ok(format!("0x{frame:x}"))
         }
     }
+}
+
+fn symbol_request(mapping: &ResolvedMapping) -> SymbolRequest {
+    SymbolRequest {
+        path: PathBuf::from(&mapping.path),
+        relative_address: mapping.relative_address,
+    }
+}
+
+fn mapped_frame_label(mapping: &ResolvedMapping) -> String {
+    format!("{}+0x{:x}", mapping.path, mapping.relative_address)
 }
 
 fn parse_sample_for_summary(
