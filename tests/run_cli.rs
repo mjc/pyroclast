@@ -65,11 +65,21 @@ fn flamegraph_command_folds_perfdata_without_perf_script() {
         perfdata.to_str().expect("perfdata path"),
         "-o",
         output_svg.to_str().expect("svg path"),
+        "--title",
+        "sftp-s3 CPU",
     ]);
 
     pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("flamegraph command");
 
     assert_eq!(runner.programs(), vec!["inferno-flamegraph"]);
+    assert_eq!(
+        runner.first_args(),
+        Some(vec![
+            "--title".to_string(),
+            "sftp-s3 CPU".to_string(),
+            "-".to_string()
+        ])
+    );
     assert_eq!(runner.stdins(), vec![Some(b"0x2000 1\n".to_vec())]);
     assert_eq!(
         std::fs::read_to_string(output_svg).expect("svg"),
@@ -120,6 +130,14 @@ impl RecordingRunner {
             .iter()
             .map(|command| command.stdin.clone())
             .collect()
+    }
+
+    fn first_args(&self) -> Option<Vec<String>> {
+        self.commands
+            .lock()
+            .unwrap()
+            .first()
+            .map(|command| command.args.clone())
     }
 }
 

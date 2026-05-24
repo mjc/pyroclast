@@ -98,7 +98,7 @@ where
                 .unwrap_or_else(|| std::path::PathBuf::from("flamegraph.svg"));
             let folded_stacks = fold_perfdata_callchains(&bytes)?;
             let render = InfernoFlamegraphRenderer::new(runner).render(&FlamegraphRequest {
-                title: "CPU profile".to_string(),
+                title: command.title,
                 folded_stacks,
                 output,
             })?;
