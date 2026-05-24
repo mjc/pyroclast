@@ -39,10 +39,10 @@ pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<Sampl
         sample.tid = Some(cursor.read_u32()?);
     }
     if layout.has(PERF_SAMPLE_TIME) {
-        cursor.read_u64()?;
+        cursor.skip_u64()?;
     }
     if layout.has(PERF_SAMPLE_ADDR) {
-        cursor.read_u64()?;
+        cursor.skip_u64()?;
     }
     if layout.has(PERF_SAMPLE_CALLCHAIN) {
         let callchain_len = cursor.read_u64()? as usize;
@@ -51,14 +51,14 @@ pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<Sampl
         }
     }
     if layout.has(PERF_SAMPLE_ID) {
-        cursor.read_u64()?;
+        cursor.skip_u64()?;
     }
     if layout.has(PERF_SAMPLE_CPU) {
-        cursor.read_u32()?;
-        cursor.read_u32()?;
+        cursor.skip_u32()?;
+        cursor.skip_u32()?;
     }
     if layout.has(PERF_SAMPLE_PERIOD) {
-        cursor.read_u64()?;
+        cursor.skip_u64()?;
     }
 
     Ok(sample)
@@ -90,5 +90,13 @@ impl<'a> SampleCursor<'a> {
         let value = read_u64(self.payload, self.offset)?;
         self.offset += 8;
         Ok(value)
+    }
+
+    fn skip_u32(&mut self) -> Result<(), String> {
+        self.read_u32().map(|_| ())
+    }
+
+    fn skip_u64(&mut self) -> Result<(), String> {
+        self.read_u64().map(|_| ())
     }
 }
