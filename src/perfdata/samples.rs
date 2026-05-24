@@ -22,6 +22,11 @@ pub struct SampleRecord {
     pub callchain: Vec<u64>,
 }
 
+/// Parses a `PERF_RECORD_SAMPLE` payload according to the provided layout.
+///
+/// # Errors
+///
+/// Returns an error when a field requested by the sample layout is truncated.
 pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<SampleRecord, String> {
     let mut cursor = SampleCursor::new(payload);
     let mut sample = SampleRecord {
@@ -57,7 +62,8 @@ pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<Sampl
         cursor.skip_u64()?;
     }
     if layout.has(PERF_SAMPLE_CALLCHAIN) {
-        let callchain_len = cursor.read_u64()? as usize;
+        let callchain_len = usize::try_from(cursor.read_u64()?)
+            .map_err(|_| "perf sample callchain length does not fit in usize".to_string())?;
         for _ in 0..callchain_len {
             sample.callchain.push(cursor.read_u64()?);
         }
@@ -66,6 +72,7 @@ pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<Sampl
     Ok(sample)
 }
 
+#[must_use]
 pub fn is_perf_context_marker(frame: u64) -> bool {
     frame >= 0xffff_ffff_ffff_f000
 }

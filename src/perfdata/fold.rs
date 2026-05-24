@@ -23,11 +23,18 @@ pub struct PerfSummary {
 }
 
 impl PerfSummary {
+    #[must_use]
     pub fn record_count(&self, record_type: u32) -> usize {
         self.record_counts.get(&record_type).copied().unwrap_or(0)
     }
 }
 
+/// Summarizes record counts and parsed sample callchains from `perf.data`.
+///
+/// # Errors
+///
+/// Returns an error when the file header, attr section, record stream, or a
+/// supported record payload is malformed.
 pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
     let header = parse_header(bytes)?;
     let sample_layout = first_sample_layout(bytes, header)?;
@@ -76,6 +83,11 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
     Ok(summary)
 }
 
+/// Collapses parsed perf sample callchains into folded stack lines.
+///
+/// # Errors
+///
+/// Returns an error when the `perf.data` input cannot be parsed.
 pub fn fold_perfdata_callchains(bytes: &[u8]) -> Result<String, String> {
     let summary = summarize_perfdata(bytes)?;
     let mut counts = BTreeMap::<Vec<u64>, u64>::new();

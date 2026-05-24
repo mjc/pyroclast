@@ -8,6 +8,12 @@ pub struct PerfFileAttr {
     pub ids_size: u64,
 }
 
+/// Parses the `perf_file_attr` records from the attr section.
+///
+/// # Errors
+///
+/// Returns an error when the attr section points outside the file or contains
+/// truncated attr records.
 pub fn parse_file_attrs(bytes: &[u8], header: PerfHeader) -> Result<Vec<PerfFileAttr>, String> {
     let offset = to_usize(header.attr_offset, "perf attr section offset")?;
     let size = to_usize(header.attr_size, "perf attr section size")?;

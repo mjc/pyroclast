@@ -24,6 +24,12 @@ pub use output::{CliOutput, write_cli_output};
 use perfdata::fold::fold_perfdata_callchains;
 use process::{CommandRunner, RealCommandRunner};
 
+/// Parses command-line arguments and runs the requested Pyroclast command.
+///
+/// # Errors
+///
+/// Returns an error when command execution, artifact I/O, or input parsing
+/// fails.
 pub fn run_cli<I, T>(args: I) -> backends::BackendResult<CliOutput>
 where
     I: IntoIterator<Item = T>,
@@ -33,10 +39,22 @@ where
     run_parsed_cli(cli)
 }
 
+/// Runs a parsed CLI command with the real process runner.
+///
+/// # Errors
+///
+/// Returns an error when command execution, artifact I/O, or input parsing
+/// fails.
 pub fn run_parsed_cli(cli: Cli) -> backends::BackendResult<CliOutput> {
     run_parsed_cli_with_runner(cli, &RealCommandRunner)
 }
 
+/// Runs a parsed CLI command with an injected process runner.
+///
+/// # Errors
+///
+/// Returns an error when command execution, artifact I/O, or input parsing
+/// fails.
 pub fn run_parsed_cli_with_runner<R>(cli: Cli, runner: &R) -> backends::BackendResult<CliOutput>
 where
     R: CommandRunner,

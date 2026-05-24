@@ -29,5 +29,11 @@ pub struct ProfileResult {
 }
 
 pub trait ProfilerBackend {
+    /// Profiles a command and writes Pyroclast artifacts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when backend setup, process execution, artifact
+    /// writing, or backend-specific parsing fails.
     fn profile(&self, request: &ProfileRequest) -> BackendResult<ProfileResult>;
 }

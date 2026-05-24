@@ -9,7 +9,7 @@ fn ignores_broken_pipe_when_writing_stdout() {
         stderr: String::new(),
     };
 
-    write_cli_output(output, BrokenPipeWriter, Vec::new()).expect("broken pipe is ignored");
+    write_cli_output(&output, BrokenPipeWriter, Vec::new()).expect("broken pipe is ignored");
 }
 
 struct BrokenPipeWriter;

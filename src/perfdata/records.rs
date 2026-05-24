@@ -57,6 +57,11 @@ struct MmapRange {
     pgoff: u64,
 }
 
+/// Parses a perf record header.
+///
+/// # Errors
+///
+/// Returns an error when fewer than eight bytes are available.
 pub fn parse_record_header(bytes: &[u8]) -> Result<PerfRecordHeader, String> {
     if bytes.len() < 8 {
         return Err("perf record header is shorter than 8 bytes".to_string());
@@ -69,11 +74,18 @@ pub fn parse_record_header(bytes: &[u8]) -> Result<PerfRecordHeader, String> {
     })
 }
 
+/// Iterates over records in the perf data section.
+///
+/// # Errors
+///
+/// Returns an error when the data section offsets are invalid or a contained
+/// record is truncated.
 pub fn iter_records(bytes: &[u8], header: PerfHeader) -> Result<Vec<PerfRecord<'_>>, String> {
     let mut records = Vec::new();
-    let mut offset = header.data_offset as usize;
+    let mut offset = to_usize(header.data_offset, "perf data section offset")?;
+    let data_size = to_usize(header.data_size, "perf data section size")?;
     let end = offset
-        .checked_add(header.data_size as usize)
+        .checked_add(data_size)
         .ok_or_else(|| "perf data section size overflows usize".to_string())?;
 
     if end > bytes.len() {
@@ -111,6 +123,11 @@ pub fn iter_records(bytes: &[u8], header: PerfHeader) -> Result<Vec<PerfRecord<'
     Ok(records)
 }
 
+/// Parses a `PERF_RECORD_COMM` payload.
+///
+/// # Errors
+///
+/// Returns an error when the fixed pid/tid fields are missing.
 pub fn parse_comm_record(payload: &[u8]) -> Result<CommRecord, String> {
     if payload.len() < 8 {
         return Err("PERF_RECORD_COMM payload is shorter than 8 bytes".to_string());
@@ -122,6 +139,11 @@ pub fn parse_comm_record(payload: &[u8]) -> Result<CommRecord, String> {
     Ok(CommRecord { pid, tid, comm })
 }
 
+/// Parses a `PERF_RECORD_MMAP` payload.
+///
+/// # Errors
+///
+/// Returns an error when the fixed mapping fields are missing.
 pub fn parse_mmap_record(payload: &[u8]) -> Result<MmapRecord, String> {
     if payload.len() < 32 {
         return Err("PERF_RECORD_MMAP payload is shorter than 32 bytes".to_string());
@@ -139,6 +161,11 @@ pub fn parse_mmap_record(payload: &[u8]) -> Result<MmapRecord, String> {
     })
 }
 
+/// Parses a `PERF_RECORD_MMAP2` payload.
+///
+/// # Errors
+///
+/// Returns an error when the fixed mapping and inode fields are missing.
 pub fn parse_mmap2_record(payload: &[u8]) -> Result<Mmap2Record, String> {
     if payload.len() < 64 {
         return Err("PERF_RECORD_MMAP2 payload is shorter than 64 bytes".to_string());
@@ -184,4 +211,8 @@ fn parse_c_string(bytes: &[u8]) -> String {
         .position(|byte| *byte == 0)
         .unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+fn to_usize(value: u64, name: &str) -> Result<usize, String> {
+    usize::try_from(value).map_err(|_| format!("{name} does not fit in usize"))
 }

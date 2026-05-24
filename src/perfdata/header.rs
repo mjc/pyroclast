@@ -11,6 +11,12 @@ pub struct PerfHeader {
     pub data_size: u64,
 }
 
+/// Parses the fixed-size `perf.data` file header.
+///
+/// # Errors
+///
+/// Returns an error when the file is too short, has the wrong magic, or
+/// contains invalid section offsets.
 pub fn parse_header(bytes: &[u8]) -> Result<PerfHeader, String> {
     if bytes.len() < 104 {
         return Err("perf.data header is shorter than 104 bytes".to_string());

@@ -6,8 +6,14 @@ pub struct CliOutput {
     pub stderr: String,
 }
 
+/// Writes CLI output to the provided streams.
+///
+/// # Errors
+///
+/// Returns an I/O error when writing to either stream fails for a reason other
+/// than a broken pipe.
 pub fn write_cli_output(
-    output: CliOutput,
+    output: &CliOutput,
     mut stdout: impl Write,
     mut stderr: impl Write,
 ) -> std::io::Result<()> {

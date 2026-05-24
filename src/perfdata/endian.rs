@@ -1,3 +1,8 @@
+/// Reads a little-endian `u16` from a byte slice.
+///
+/// # Errors
+///
+/// Returns an error when the requested two-byte range is not present.
 pub fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, String> {
     let data = bytes
         .get(offset..offset + 2)
@@ -8,6 +13,11 @@ pub fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, String> {
     ))
 }
 
+/// Reads a little-endian `u32` from a byte slice.
+///
+/// # Errors
+///
+/// Returns an error when the requested four-byte range is not present.
 pub fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, String> {
     let data = bytes
         .get(offset..offset + 4)
@@ -18,6 +28,11 @@ pub fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, String> {
     ))
 }
 
+/// Reads a little-endian `u64` from a byte slice.
+///
+/// # Errors
+///
+/// Returns an error when the requested eight-byte range is not present.
 pub fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, String> {
     let data = bytes
         .get(offset..offset + 8)
