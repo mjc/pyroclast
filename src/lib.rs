@@ -15,8 +15,11 @@ pub mod symbols;
 pub mod tools;
 
 use backends::fake::FakeBackend;
+use backends::linux_perf::LinuxPerfBackend;
 use backends::{ProfileRequest, ProfilerBackend};
+use cli::ProfileKind;
 use cli::{Cli, CliCommand};
+use process::{CommandRunner, RealCommandRunner};
 
 pub fn run_cli<I, T>(args: I) -> backends::BackendResult<()>
 where
@@ -28,6 +31,13 @@ where
 }
 
 pub fn run_parsed_cli(cli: Cli) -> backends::BackendResult<()> {
+    run_parsed_cli_with_runner(cli, &RealCommandRunner)
+}
+
+pub fn run_parsed_cli_with_runner<R>(cli: Cli, runner: &R) -> backends::BackendResult<()>
+where
+    R: CommandRunner,
+{
     if let Some(invocation) = cli.command.profile_invocation() {
         let out_dir = invocation
             .out
@@ -40,7 +50,14 @@ pub fn run_parsed_cli(cli: Cli) -> backends::BackendResult<()> {
             name: invocation.name,
             json: invocation.json,
         };
-        FakeBackend.profile(&request)?;
+        match request.kind {
+            ProfileKind::Cpu if std::env::consts::OS == "linux" => {
+                LinuxPerfBackend::new(runner).profile(&request)?;
+            }
+            _ => {
+                FakeBackend.profile(&request)?;
+            }
+        }
         return Ok(());
     }
 
