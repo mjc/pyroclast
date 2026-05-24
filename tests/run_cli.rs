@@ -98,12 +98,34 @@ impl pyroclast::process::CommandRunner for RecordingRunner {
         command: &pyroclast::process::CommandSpec,
     ) -> std::io::Result<pyroclast::process::CommandOutput> {
         self.commands.lock().unwrap().push(command.clone());
+        if let Some(output_path) = perf_output_path(command) {
+            std::fs::write(output_path, tiny_perfdata())?;
+        }
         Ok(pyroclast::process::CommandOutput {
             status_code: Some(0),
             stdout: Vec::new(),
             stderr: Vec::new(),
         })
     }
+}
+
+fn perf_output_path(command: &pyroclast::process::CommandSpec) -> Option<&str> {
+    command
+        .args
+        .windows(2)
+        .find(|window| window[0] == "-o")
+        .map(|window| window[1].as_str())
+}
+
+fn tiny_perfdata() -> Vec<u8> {
+    perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [record_bytes(9, &sample_payload(0x1000, 1, 2, [0x2000]))],
+    )
 }
 
 fn comm_payload(pid: u32, tid: u32, comm: &str) -> Vec<u8> {

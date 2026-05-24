@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::artifacts::ArtifactLayout;
 use crate::backends::{BackendResult, ProfileRequest, ProfileResult, ProfilerBackend};
 use crate::manifest::{BackendName, RunManifest};
+use crate::perfdata::fold::fold_perfdata_callchains;
 use crate::process::{CommandRunner, CommandSpec};
 
 pub fn build_perf_record_command(
@@ -49,6 +50,11 @@ where
         let command =
             build_perf_record_command(997, "fp", perf_data.clone(), request.command.clone());
         let output = self.runner.run(&command)?;
+        let perf_bytes = std::fs::read(&perf_data)?;
+        std::fs::write(
+            layout.stacks_folded(),
+            fold_perfdata_callchains(&perf_bytes)?,
+        )?;
 
         std::fs::write(layout.stdout_log(), &output.stdout)?;
         std::fs::write(layout.stderr_log(), &output.stderr)?;
@@ -71,6 +77,7 @@ where
             artifacts: {
                 let mut artifacts = layout.standard_manifest_artifacts();
                 artifacts.push(perf_data);
+                artifacts.push(layout.stacks_folded());
                 artifacts
             },
             diagnostics: vec!["perf record executed".to_string()],
