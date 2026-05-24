@@ -4,7 +4,7 @@ use common::{
     comm_payload, file_attr_bytes, mmap_payload, mmap2_payload, perfdata_with_records_and_attrs,
     record_bytes, sample_payload,
 };
-use pyroclast::perfdata::fold::summarize_perfdata;
+use pyroclast::perfdata::fold::{fold_perfdata_callchains, summarize_perfdata};
 use pyroclast::perfdata::samples::{PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_TID};
 
 #[test]
@@ -70,4 +70,24 @@ fn includes_record_context_when_sample_parsing_fails() {
 
     assert!(error.contains("record type 9"));
     assert!(error.contains("offset"));
+}
+
+#[test]
+fn folds_identical_sample_callchains_as_hex_frames() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(9, &sample_payload(0x1000, 11, 12, [0x2000, 0x3000])),
+            record_bytes(9, &sample_payload(0x1000, 11, 12, [0x2000, 0x3000])),
+            record_bytes(9, &sample_payload(0x1000, 11, 12, [0x4000])),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, "0x2000;0x3000 2\n0x4000 1\n");
 }

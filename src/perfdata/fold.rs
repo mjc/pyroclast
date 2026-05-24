@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use crate::folded::render_folded_stack;
 use crate::perfdata::attrs::parse_file_attrs;
 use crate::perfdata::header::parse_header;
 use crate::perfdata::records::{
@@ -73,6 +74,28 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
     }
 
     Ok(summary)
+}
+
+pub fn fold_perfdata_callchains(bytes: &[u8]) -> Result<String, String> {
+    let summary = summarize_perfdata(bytes)?;
+    let mut counts = BTreeMap::<Vec<u64>, u64>::new();
+    for callchain in summary.sample_callchains {
+        *counts.entry(callchain).or_insert(0) += 1;
+    }
+
+    let mut folded = String::new();
+    for (callchain, count) in counts {
+        let frames = callchain
+            .iter()
+            .map(|frame| format!("0x{frame:x}"))
+            .collect::<Vec<_>>();
+        folded.push_str(&render_folded_stack(
+            frames.iter().map(String::as_str),
+            count,
+        ));
+        folded.push('\n');
+    }
+    Ok(folded)
 }
 
 fn parse_sample_for_summary(
