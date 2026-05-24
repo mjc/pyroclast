@@ -28,8 +28,11 @@ fn top_level_memory_command_creates_fake_artifacts() {
 fn fold_command_reads_perfdata_directly() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
-    std::fs::write(&perfdata, perfdata_with_records([record_bytes(3, &comm_payload(1, 2, "app"))]))
-        .expect("write perfdata");
+    std::fs::write(
+        &perfdata,
+        perfdata_with_records([record_bytes(3, &comm_payload(1, 2, "app"))]),
+    )
+    .expect("write perfdata");
 
     let output = pyroclast::run_cli(["pyroclast", "fold", perfdata.to_str().unwrap()])
         .expect("fold command");

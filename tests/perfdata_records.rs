@@ -31,10 +31,7 @@ fn rejects_short_perf_record_header() {
 
 #[test]
 fn iterates_records_from_perfdata_data_section() {
-    let bytes = perfdata_with_records([
-        record_bytes(3, b"comm"),
-        record_bytes(9, b"sample"),
-    ]);
+    let bytes = perfdata_with_records([record_bytes(3, b"comm"), record_bytes(9, b"sample")]);
     let header = parse_header(&bytes).expect("perf header");
 
     let records = iter_records(&bytes, header).expect("records");

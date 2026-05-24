@@ -47,18 +47,23 @@ pub fn iter_records(bytes: &[u8], header: PerfHeader) -> Result<Vec<PerfRecord<'
 
     while offset < end {
         let record_header = parse_record_header(
-            bytes.get(offset..offset + 8)
+            bytes
+                .get(offset..offset + 8)
                 .ok_or_else(|| format!("truncated perf record header at offset {offset}"))?,
         )?;
         let size = record_header.size as usize;
         if size < 8 {
-            return Err(format!("invalid perf record size {size} at offset {offset}"));
+            return Err(format!(
+                "invalid perf record size {size} at offset {offset}"
+            ));
         }
         let next = offset
             .checked_add(size)
             .ok_or_else(|| format!("perf record size overflows at offset {offset}"))?;
         if next > end {
-            return Err(format!("perf record overruns data section at offset {offset}"));
+            return Err(format!(
+                "perf record overruns data section at offset {offset}"
+            ));
         }
         records.push(PerfRecord {
             offset,
