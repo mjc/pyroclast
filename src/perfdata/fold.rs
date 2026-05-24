@@ -29,11 +29,7 @@ impl PerfSummary {
 
 pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
     let header = parse_header(bytes)?;
-    let sample_layout = parse_file_attrs(bytes, header)?
-        .first()
-        .map(|attr| SampleLayout {
-            sample_type: attr.sample_type,
-        });
+    let sample_layout = first_sample_layout(bytes, header)?;
     let records = iter_records(bytes, header)?;
     let mut summary = PerfSummary {
         total_records: 0,
@@ -65,4 +61,15 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
     }
 
     Ok(summary)
+}
+
+fn first_sample_layout(
+    bytes: &[u8],
+    header: crate::perfdata::header::PerfHeader,
+) -> Result<Option<SampleLayout>, String> {
+    Ok(parse_file_attrs(bytes, header)?
+        .first()
+        .map(|attr| SampleLayout {
+            sample_type: attr.sample_type,
+        }))
 }
