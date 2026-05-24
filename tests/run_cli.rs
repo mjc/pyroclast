@@ -68,7 +68,7 @@ fn top_level_cpu_command_uses_injected_perf_runner() {
 
     pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("run cli");
 
-    assert_eq!(runner.programs(), vec!["perf"]);
+    assert_eq!(runner.programs(), vec!["perf", "inferno-flamegraph"]);
     let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
     assert!(run_json.contains("\"actual_backend\": \"linux_perf\""));
 }

@@ -23,7 +23,7 @@ fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
     let result = backend.profile(&request).expect("profile");
 
     assert_eq!(result.manifest.actual_backend, BackendName::LinuxPerf);
-    assert_eq!(runner.programs(), vec!["perf"]);
+    assert_eq!(runner.programs(), vec!["perf", "inferno-flamegraph"]);
     assert!(result.layout.raw_profile("perf.data").is_file());
     assert_eq!(
         std::fs::read(result.layout.raw_profile("perf.data")).expect("perf data"),
@@ -32,6 +32,10 @@ fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
     assert_eq!(
         std::fs::read_to_string(result.layout.stacks_folded()).expect("stacks folded"),
         "0x2000 1\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(result.layout.flamegraph_svg()).expect("flamegraph svg"),
+        "<svg></svg>\n"
     );
     assert!(result.layout.run_json().is_file());
     assert!(result.layout.stderr_log().is_file());
@@ -59,12 +63,23 @@ impl CommandRunner for RecordingRunner {
         if let Some(output_path) = perf_output_path(command) {
             std::fs::write(output_path, tiny_perfdata())?;
         }
+        if let Some(output_path) = inferno_output_path(command) {
+            std::fs::write(output_path, "<svg></svg>\n")?;
+        }
         Ok(CommandOutput {
             status_code: Some(0),
             stdout: b"perf stdout".to_vec(),
             stderr: b"perf stderr".to_vec(),
         })
     }
+}
+
+fn inferno_output_path(command: &CommandSpec) -> Option<&str> {
+    command
+        .args
+        .windows(2)
+        .find(|window| window[0] == "--output")
+        .map(|window| window[1].as_str())
 }
 
 fn perf_output_path(command: &CommandSpec) -> Option<&str> {

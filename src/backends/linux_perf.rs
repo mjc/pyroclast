@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::artifacts::ArtifactLayout;
 use crate::backends::{BackendResult, ProfileRequest, ProfileResult, ProfilerBackend};
+use crate::flamegraph::build_inferno_flamegraph_command;
 use crate::manifest::{BackendName, RunManifest};
 use crate::perfdata::fold::fold_perfdata_callchains;
 use crate::process::{CommandRunner, CommandSpec};
@@ -55,9 +56,17 @@ where
             layout.stacks_folded(),
             fold_perfdata_callchains(&perf_bytes)?,
         )?;
+        let flamegraph_command = build_inferno_flamegraph_command(
+            "CPU profile",
+            layout.stacks_folded(),
+            layout.flamegraph_svg(),
+        );
+        let flamegraph_output = self.runner.run(&flamegraph_command)?;
 
         std::fs::write(layout.stdout_log(), &output.stdout)?;
-        std::fs::write(layout.stderr_log(), &output.stderr)?;
+        let mut stderr = output.stderr;
+        stderr.extend(flamegraph_output.stderr);
+        std::fs::write(layout.stderr_log(), &stderr)?;
         std::fs::write(layout.command_txt(), request.command.join(" "))?;
         std::fs::write(layout.summary_txt(), "linux perf profile recorded\n")?;
         std::fs::write(layout.summary_json(), "{}\n")?;
@@ -78,6 +87,7 @@ where
                 let mut artifacts = layout.standard_manifest_artifacts();
                 artifacts.push(perf_data);
                 artifacts.push(layout.stacks_folded());
+                artifacts.push(layout.flamegraph_svg());
                 artifacts
             },
             diagnostics: vec!["perf record executed".to_string()],
