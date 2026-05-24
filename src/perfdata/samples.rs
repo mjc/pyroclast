@@ -18,7 +18,7 @@ pub struct SampleRecord {
 }
 
 pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<SampleRecord, String> {
-    let mut offset = 0;
+    let mut cursor = SampleCursor::new(payload);
     let mut sample = SampleRecord {
         ip: None,
         pid: None,
@@ -27,20 +27,16 @@ pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<Sampl
     };
 
     if layout.has(PERF_SAMPLE_IP) {
-        sample.ip = Some(read_u64(payload, offset)?);
-        offset += 8;
+        sample.ip = Some(cursor.read_u64()?);
     }
     if layout.has(PERF_SAMPLE_TID) {
-        sample.pid = Some(read_u32(payload, offset)?);
-        sample.tid = Some(read_u32(payload, offset + 4)?);
-        offset += 8;
+        sample.pid = Some(cursor.read_u32()?);
+        sample.tid = Some(cursor.read_u32()?);
     }
     if layout.has(PERF_SAMPLE_CALLCHAIN) {
-        let callchain_len = read_u64(payload, offset)? as usize;
-        offset += 8;
+        let callchain_len = cursor.read_u64()? as usize;
         for _ in 0..callchain_len {
-            sample.callchain.push(read_u64(payload, offset)?);
-            offset += 8;
+            sample.callchain.push(cursor.read_u64()?);
         }
     }
 
@@ -50,5 +46,28 @@ pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<Sampl
 impl SampleLayout {
     fn has(self, flag: u64) -> bool {
         self.sample_type & flag != 0
+    }
+}
+
+struct SampleCursor<'a> {
+    payload: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> SampleCursor<'a> {
+    fn new(payload: &'a [u8]) -> Self {
+        Self { payload, offset: 0 }
+    }
+
+    fn read_u32(&mut self) -> Result<u32, String> {
+        let value = read_u32(self.payload, self.offset)?;
+        self.offset += 4;
+        Ok(value)
+    }
+
+    fn read_u64(&mut self) -> Result<u64, String> {
+        let value = read_u64(self.payload, self.offset)?;
+        self.offset += 8;
+        Ok(value)
     }
 }
