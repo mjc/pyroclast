@@ -52,10 +52,7 @@ fn fold_command_reads_perfdata_directly() {
     let output = pyroclast::run_cli(["pyroclast", "fold", perfdata.to_str().unwrap()])
         .expect("fold command");
 
-    assert!(output.stdout.contains("total_records=3"));
-    assert!(output.stdout.contains("comm=app"));
-    assert!(output.stdout.contains("mmap=/bin/app"));
-    assert!(output.stdout.contains("sample_callchains=1"));
+    assert_eq!(output.stdout, "0x2000 1\n");
 }
 
 #[test]
