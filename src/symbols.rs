@@ -53,25 +53,9 @@ where
         &mut self,
         requests: &[SymbolRequest],
     ) -> Result<Vec<Option<String>>, String> {
-        let missing = requests
-            .iter()
-            .filter(|request| !self.resolved.contains_key(*request))
-            .cloned()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
+        let missing = self.unique_misses(requests);
         if !missing.is_empty() {
-            let resolved = self.resolver.resolve_batch(&missing)?;
-            if resolved.len() != missing.len() {
-                return Err(format!(
-                    "symbol resolver returned {} results for {} requests",
-                    resolved.len(),
-                    missing.len()
-                ));
-            }
-            for (request, symbol) in missing.into_iter().zip(resolved) {
-                self.resolved.insert(request, symbol);
-            }
+            self.resolve_missing(missing)?;
         }
 
         requests
@@ -83,5 +67,30 @@ where
                     .ok_or_else(|| "symbol cache lookup missed after resolution".to_string())
             })
             .collect()
+    }
+
+    fn unique_misses(&self, requests: &[SymbolRequest]) -> Vec<SymbolRequest> {
+        requests
+            .iter()
+            .filter(|request| !self.resolved.contains_key(*request))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn resolve_missing(&mut self, missing: Vec<SymbolRequest>) -> Result<(), String> {
+        let resolved = self.resolver.resolve_batch(&missing)?;
+        if resolved.len() != missing.len() {
+            return Err(format!(
+                "symbol resolver returned {} results for {} requests",
+                resolved.len(),
+                missing.len()
+            ));
+        }
+        for (request, symbol) in missing.into_iter().zip(resolved) {
+            self.resolved.insert(request, symbol);
+        }
+        Ok(())
     }
 }
