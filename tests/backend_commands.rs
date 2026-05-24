@@ -1,9 +1,8 @@
-use std::path::PathBuf;
-
 use pyroclast::backends::heaptrack::build_heaptrack_command;
 use pyroclast::backends::linux_perf::build_perf_record_command;
 use pyroclast::backends::macos_xctrace::build_xctrace_record_command;
 use pyroclast::flamegraph::build_inferno_flamegraph_command;
+use std::path::PathBuf;
 
 #[test]
 fn builds_linux_perf_record_command() {
@@ -54,14 +53,10 @@ fn builds_heaptrack_command() {
 
 #[test]
 fn builds_inferno_flamegraph_command() {
-    let command =
-        build_inferno_flamegraph_command("CPU profile", &PathBuf::from("run/stacks.folded"));
+    let command = build_inferno_flamegraph_command("CPU profile");
 
     assert_eq!(command.program, "inferno-flamegraph");
-    assert_eq!(
-        command.args,
-        vec!["--title", "CPU profile", "run/stacks.folded"]
-    );
+    assert_eq!(command.args, vec!["--title", "CPU profile", "-"]);
 }
 
 #[test]

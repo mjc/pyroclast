@@ -20,6 +20,7 @@ use backends::linux_perf::LinuxPerfBackend;
 use backends::{ProfileRequest, ProfilerBackend};
 use cli::ProfileKind;
 use cli::{Cli, CliCommand};
+use flamegraph::{FlamegraphRenderer, FlamegraphRequest, InfernoFlamegraphRenderer};
 pub use output::{CliOutput, write_cli_output};
 use perfdata::fold::fold_perfdata_callchains;
 use process::{CommandRunner, RealCommandRunner};
@@ -90,7 +91,23 @@ where
                 stderr: String::new(),
             })
         }
-        CliCommand::Summarize(_) | CliCommand::Flamegraph(_) => Ok(CliOutput::default()),
+        CliCommand::Flamegraph(command) => {
+            let bytes = std::fs::read(command.input)?;
+            let output = command
+                .output
+                .unwrap_or_else(|| std::path::PathBuf::from("flamegraph.svg"));
+            let folded_stacks = fold_perfdata_callchains(&bytes)?;
+            let render = InfernoFlamegraphRenderer::new(runner).render(&FlamegraphRequest {
+                title: "CPU profile".to_string(),
+                folded_stacks,
+                output,
+            })?;
+            Ok(CliOutput {
+                stdout: String::new(),
+                stderr: String::from_utf8_lossy(&render.stderr).into_owned(),
+            })
+        }
+        CliCommand::Summarize(_) => Ok(CliOutput::default()),
         CliCommand::Memory(_)
         | CliCommand::Cpu(_)
         | CliCommand::Offpcu(_)

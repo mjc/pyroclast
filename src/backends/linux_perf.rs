@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::artifacts::ArtifactLayout;
 use crate::backends::{BackendResult, ProfileRequest, ProfileResult, ProfilerBackend};
-use crate::flamegraph::build_inferno_flamegraph_command;
+use crate::flamegraph::{FlamegraphRenderer, FlamegraphRequest, InfernoFlamegraphRenderer};
 use crate::manifest::{BackendName, RunManifest};
 use crate::perfdata::fold::fold_perfdata_callchains;
 use crate::process::{CommandRunner, CommandSpec};
@@ -51,14 +51,14 @@ where
         let command = build_perf_record_command(997, "fp", &perf_data, request.command.clone());
         let output = self.runner.run(&command)?;
         let perf_bytes = std::fs::read(&perf_data)?;
-        std::fs::write(
-            layout.stacks_folded(),
-            fold_perfdata_callchains(&perf_bytes)?,
-        )?;
-        let flamegraph_command =
-            build_inferno_flamegraph_command("CPU profile", &layout.stacks_folded());
-        let flamegraph_output = self.runner.run(&flamegraph_command)?;
-        std::fs::write(layout.flamegraph_svg(), &flamegraph_output.stdout)?;
+        let folded_stacks = fold_perfdata_callchains(&perf_bytes)?;
+        std::fs::write(layout.stacks_folded(), &folded_stacks)?;
+        let flamegraph_output =
+            InfernoFlamegraphRenderer::new(self.runner).render(&FlamegraphRequest {
+                title: "CPU profile".to_string(),
+                folded_stacks,
+                output: layout.flamegraph_svg(),
+            })?;
 
         std::fs::write(layout.stdout_log(), &output.stdout)?;
         let mut stderr = output.stderr;

@@ -53,6 +53,31 @@ fn fold_command_reads_perfdata_directly() {
 }
 
 #[test]
+fn flamegraph_command_folds_perfdata_without_perf_script() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    let output_svg = root.path().join("flamegraph.svg");
+    std::fs::write(&perfdata, tiny_perfdata()).expect("write perfdata");
+    let runner = RecordingRunner::default();
+    let cli = pyroclast::cli::Cli::parse_from([
+        "pyroclast",
+        "flamegraph",
+        perfdata.to_str().expect("perfdata path"),
+        "-o",
+        output_svg.to_str().expect("svg path"),
+    ]);
+
+    pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("flamegraph command");
+
+    assert_eq!(runner.programs(), vec!["inferno-flamegraph"]);
+    assert_eq!(runner.stdins(), vec![Some(b"0x2000 1\n".to_vec())]);
+    assert_eq!(
+        std::fs::read_to_string(output_svg).expect("svg"),
+        "<svg></svg>\n"
+    );
+}
+
+#[test]
 fn top_level_cpu_command_uses_injected_perf_runner() {
     let root = tempfile::tempdir().expect("tempdir");
     let out = root.path().join("cpu-run");
@@ -87,6 +112,15 @@ impl RecordingRunner {
             .map(|command| command.program.clone())
             .collect()
     }
+
+    fn stdins(&self) -> Vec<Option<Vec<u8>>> {
+        self.commands
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|command| command.stdin.clone())
+            .collect()
+    }
 }
 
 impl pyroclast::process::CommandRunner for RecordingRunner {
@@ -98,9 +132,14 @@ impl pyroclast::process::CommandRunner for RecordingRunner {
         if let Some(output_path) = perf_output_path(command) {
             std::fs::write(output_path, tiny_perfdata())?;
         }
+        let stdout = if command.program == "inferno-flamegraph" {
+            b"<svg></svg>\n".to_vec()
+        } else {
+            Vec::new()
+        };
         Ok(pyroclast::process::CommandOutput {
             status_code: Some(0),
-            stdout: Vec::new(),
+            stdout,
             stderr: Vec::new(),
         })
     }

@@ -3,6 +3,7 @@ pub struct CommandSpec {
     pub program: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    pub stdin: Option<Vec<u8>>,
 }
 
 impl CommandSpec {
@@ -12,6 +13,7 @@ impl CommandSpec {
             program: program.into(),
             args: Vec::new(),
             env: Vec::new(),
+            stdin: None,
         }
     }
 
@@ -30,6 +32,12 @@ impl CommandSpec {
     #[must_use]
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.push((key.into(), value.into()));
+        self
+    }
+
+    #[must_use]
+    pub fn stdin(mut self, bytes: impl Into<Vec<u8>>) -> Self {
+        self.stdin = Some(bytes.into());
         self
     }
 }
@@ -57,10 +65,25 @@ impl CommandRunner for RealCommandRunner {
     fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
         let mut std_command = std::process::Command::new(&command.program);
         std_command.args(&command.args);
+        std_command.stdout(std::process::Stdio::piped());
+        std_command.stderr(std::process::Stdio::piped());
         for (key, value) in &command.env {
             std_command.env(key, value);
         }
-        let output = std_command.output()?;
+        if command.stdin.is_some() {
+            std_command.stdin(std::process::Stdio::piped());
+        }
+        let mut child = std_command.spawn()?;
+        if let Some(stdin) = &command.stdin {
+            use std::io::Write;
+
+            child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("failed to open child stdin"))?
+                .write_all(stdin)?;
+        }
+        let output = child.wait_with_output()?;
         Ok(CommandOutput {
             status_code: output.status.code(),
             stdout: output.stdout,

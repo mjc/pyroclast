@@ -10,3 +10,13 @@ fn real_runner_captures_status_stdout_and_stderr() {
     assert_eq!(output.stdout, b"out");
     assert_eq!(output.stderr, b"err");
 }
+
+#[test]
+fn real_runner_writes_configured_stdin() {
+    let output = RealCommandRunner
+        .run(&CommandSpec::new("cat").stdin(b"folded stacks".to_vec()))
+        .expect("run command");
+
+    assert_eq!(output.status_code, Some(0));
+    assert_eq!(output.stdout, b"folded stacks");
+}
