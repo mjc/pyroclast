@@ -136,8 +136,9 @@ pub fn fold_perfdata_callchains_with_options(
 ) -> Result<String, String> {
     let summary = summarize_perfdata(bytes)?;
     let mut counts = BTreeMap::<Vec<String>, u64>::new();
+    let frame_resolver = FoldFrameResolver::new(&summary);
     for sample in &summary.sample_stacks {
-        let frames = folded_frames_for_sample(sample, &summary.comms_by_pid, &summary.mmap_table);
+        let frames = frame_resolver.frames_for_sample(sample);
         *counts.entry(frames).or_insert(0) += sample.count(options);
     }
 
@@ -152,32 +153,43 @@ pub fn fold_perfdata_callchains_with_options(
     Ok(folded)
 }
 
-fn folded_frames_for_sample(
-    sample: &PerfSampleStack,
-    comms_by_pid: &BTreeMap<u32, String>,
-    mmap_table: &MmapTable,
-) -> Vec<String> {
-    let mut frames = if let Some(comm) = sample.pid.and_then(|pid| comms_by_pid.get(&pid)) {
-        vec![comm.clone()]
-    } else {
-        Vec::new()
-    };
-    frames.extend(
-        sample
-            .callchain
-            .iter()
-            .copied()
-            .filter(|frame| !is_perf_context_marker(*frame))
-            .map(|frame| format_frame(sample.pid, frame, mmap_table)),
-    );
-    frames
+struct FoldFrameResolver<'a> {
+    comms_by_pid: &'a BTreeMap<u32, String>,
+    mmap_table: &'a MmapTable,
 }
 
-fn format_frame(pid: Option<u32>, frame: u64, mmap_table: &MmapTable) -> String {
-    if let Some(mapping) = pid.and_then(|pid| mmap_table.resolve(pid, frame)) {
-        format!("{}+0x{:x}", mapping.path, mapping.relative_address)
-    } else {
-        format!("0x{frame:x}")
+impl<'a> FoldFrameResolver<'a> {
+    fn new(summary: &'a PerfSummary) -> Self {
+        Self {
+            comms_by_pid: &summary.comms_by_pid,
+            mmap_table: &summary.mmap_table,
+        }
+    }
+
+    fn frames_for_sample(&self, sample: &PerfSampleStack) -> Vec<String> {
+        let mut frames = if let Some(comm) = sample.pid.and_then(|pid| self.comms_by_pid.get(&pid))
+        {
+            vec![comm.clone()]
+        } else {
+            Vec::new()
+        };
+        frames.extend(
+            sample
+                .callchain
+                .iter()
+                .copied()
+                .filter(|frame| !is_perf_context_marker(*frame))
+                .map(|frame| self.format_frame(sample.pid, frame)),
+        );
+        frames
+    }
+
+    fn format_frame(&self, pid: Option<u32>, frame: u64) -> String {
+        if let Some(mapping) = pid.and_then(|pid| self.mmap_table.resolve(pid, frame)) {
+            format!("{}+0x{:x}", mapping.path, mapping.relative_address)
+        } else {
+            format!("0x{frame:x}")
+        }
     }
 }
 
