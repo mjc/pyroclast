@@ -1,1 +1,15 @@
+pub mod artifacts;
+pub mod backends;
 pub mod cli;
+pub mod config;
+pub mod errors;
+pub mod flamegraph;
+pub mod folded;
+pub mod manifest;
+pub mod parsers;
+pub mod perfdata;
+pub mod platform;
+pub mod process;
+pub mod summary;
+pub mod symbols;
+pub mod tools;
