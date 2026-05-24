@@ -25,10 +25,11 @@ const fn nix_tool(name: &'static str) -> ToolSpec {
     }
 }
 
-const COMMON_TOOLS: &[ToolSpec] = &[nix_tool("inferno-flamegraph")];
+const COMMON_TOOLS: &[ToolSpec] = &[nix_tool("inferno-flamegraph"), nix_tool("tokio-console")];
 
 const LINUX_TOOLS: &[ToolSpec] = &[
     nix_tool("inferno-flamegraph"),
+    nix_tool("tokio-console"),
     nix_tool("perf"),
     nix_tool("heaptrack"),
     nix_tool("heaptrack_print"),
@@ -39,6 +40,7 @@ const LINUX_TOOLS: &[ToolSpec] = &[
 
 const MACOS_TOOLS: &[ToolSpec] = &[
     nix_tool("inferno-flamegraph"),
+    nix_tool("tokio-console"),
     ToolSpec {
         name: "xctrace",
         kind: ToolKind::AppleProvided,

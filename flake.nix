@@ -37,6 +37,7 @@
             rustc
             rust-analyzer
             rustfmt
+            tokio-console
           ];
           linuxTools = with pkgs; [
             binutils
