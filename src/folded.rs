@@ -6,10 +6,14 @@ pub fn render_folded_stack<'a>(
     frames: impl IntoIterator<Item = &'a str>,
     count: u64,
 ) -> String {
-    let stack = frames
-        .into_iter()
-        .map(escape_frame)
-        .collect::<Vec<_>>()
-        .join(";");
-    format!("{stack} {count}")
+    let mut rendered = String::new();
+    for frame in frames {
+        if !rendered.is_empty() {
+            rendered.push(';');
+        }
+        rendered.push_str(&escape_frame(frame));
+    }
+    rendered.push(' ');
+    rendered.push_str(&count.to_string());
+    rendered
 }
