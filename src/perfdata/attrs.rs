@@ -9,8 +9,8 @@ pub struct PerfFileAttr {
 }
 
 pub fn parse_file_attrs(bytes: &[u8], header: PerfHeader) -> Result<Vec<PerfFileAttr>, String> {
-    let offset = header.attr_offset as usize;
-    let size = header.attr_size as usize;
+    let offset = to_usize(header.attr_offset, "perf attr section offset")?;
+    let size = to_usize(header.attr_size, "perf attr section size")?;
     if size == 0 {
         return Ok(Vec::new());
     }
@@ -47,4 +47,8 @@ pub fn parse_file_attrs(bytes: &[u8], header: PerfHeader) -> Result<Vec<PerfFile
     }
 
     Ok(attrs)
+}
+
+fn to_usize(value: u64, name: &str) -> Result<usize, String> {
+    usize::try_from(value).map_err(|_| format!("{name} does not fit in usize"))
 }
