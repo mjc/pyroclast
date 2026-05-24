@@ -19,9 +19,16 @@ use backends::linux_perf::LinuxPerfBackend;
 use backends::{ProfileRequest, ProfilerBackend};
 use cli::ProfileKind;
 use cli::{Cli, CliCommand};
+use perfdata::fold::summarize_perfdata;
 use process::{CommandRunner, RealCommandRunner};
 
-pub fn run_cli<I, T>(args: I) -> backends::BackendResult<()>
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CliOutput {
+    pub stdout: String,
+    pub stderr: String,
+}
+
+pub fn run_cli<I, T>(args: I) -> backends::BackendResult<CliOutput>
 where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
@@ -30,11 +37,11 @@ where
     run_parsed_cli(cli)
 }
 
-pub fn run_parsed_cli(cli: Cli) -> backends::BackendResult<()> {
+pub fn run_parsed_cli(cli: Cli) -> backends::BackendResult<CliOutput> {
     run_parsed_cli_with_runner(cli, &RealCommandRunner)
 }
 
-pub fn run_parsed_cli_with_runner<R>(cli: Cli, runner: &R) -> backends::BackendResult<()>
+pub fn run_parsed_cli_with_runner<R>(cli: Cli, runner: &R) -> backends::BackendResult<CliOutput>
 where
     R: CommandRunner,
 {
@@ -58,11 +65,26 @@ where
                 FakeBackend.profile(&request)?;
             }
         }
-        return Ok(());
+        return Ok(CliOutput::default());
     }
 
     match cli.command {
-        CliCommand::Fold(_) | CliCommand::Summarize(_) | CliCommand::Flamegraph(_) => Ok(()),
+        CliCommand::Fold(command) => {
+            let bytes = std::fs::read(command.input)?;
+            let summary = summarize_perfdata(&bytes)?;
+            let mut stdout = format!("total_records={}\n", summary.total_records);
+            for (record_type, count) in summary.record_counts {
+                stdout.push_str(&format!("record_type_{record_type}={count}\n"));
+            }
+            for comm in summary.comms {
+                stdout.push_str(&format!("comm={comm}\n"));
+            }
+            Ok(CliOutput {
+                stdout,
+                stderr: String::new(),
+            })
+        }
+        CliCommand::Summarize(_) | CliCommand::Flamegraph(_) => Ok(CliOutput::default()),
         CliCommand::Memory(_)
         | CliCommand::Cpu(_)
         | CliCommand::Offpcu(_)
