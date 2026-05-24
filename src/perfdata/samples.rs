@@ -2,7 +2,12 @@ use crate::perfdata::endian::{read_u32, read_u64};
 
 pub const PERF_SAMPLE_IP: u64 = 1 << 0;
 pub const PERF_SAMPLE_TID: u64 = 1 << 1;
+pub const PERF_SAMPLE_TIME: u64 = 1 << 2;
+pub const PERF_SAMPLE_ADDR: u64 = 1 << 3;
 pub const PERF_SAMPLE_CALLCHAIN: u64 = 1 << 5;
+pub const PERF_SAMPLE_ID: u64 = 1 << 6;
+pub const PERF_SAMPLE_CPU: u64 = 1 << 7;
+pub const PERF_SAMPLE_PERIOD: u64 = 1 << 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SampleLayout {
@@ -33,11 +38,27 @@ pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<Sampl
         sample.pid = Some(cursor.read_u32()?);
         sample.tid = Some(cursor.read_u32()?);
     }
+    if layout.has(PERF_SAMPLE_TIME) {
+        cursor.read_u64()?;
+    }
+    if layout.has(PERF_SAMPLE_ADDR) {
+        cursor.read_u64()?;
+    }
     if layout.has(PERF_SAMPLE_CALLCHAIN) {
         let callchain_len = cursor.read_u64()? as usize;
         for _ in 0..callchain_len {
             sample.callchain.push(cursor.read_u64()?);
         }
+    }
+    if layout.has(PERF_SAMPLE_ID) {
+        cursor.read_u64()?;
+    }
+    if layout.has(PERF_SAMPLE_CPU) {
+        cursor.read_u32()?;
+        cursor.read_u32()?;
+    }
+    if layout.has(PERF_SAMPLE_PERIOD) {
+        cursor.read_u64()?;
     }
 
     Ok(sample)
