@@ -80,7 +80,11 @@ pub fn fold_perfdata_callchains(bytes: &[u8]) -> Result<String, String> {
     let summary = summarize_perfdata(bytes)?;
     let mut counts = BTreeMap::<Vec<u64>, u64>::new();
     for callchain in summary.sample_callchains {
-        *counts.entry(callchain).or_insert(0) += 1;
+        let frames = callchain
+            .into_iter()
+            .filter(|frame| !is_perf_context_marker(*frame))
+            .collect::<Vec<_>>();
+        *counts.entry(frames).or_insert(0) += 1;
     }
 
     let mut folded = String::new();
@@ -89,6 +93,10 @@ pub fn fold_perfdata_callchains(bytes: &[u8]) -> Result<String, String> {
         folded.push('\n');
     }
     Ok(folded)
+}
+
+fn is_perf_context_marker(frame: u64) -> bool {
+    frame >= 0xffff_ffff_ffff_f000
 }
 
 fn parse_sample_for_summary(

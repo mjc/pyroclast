@@ -91,3 +91,22 @@ fn folds_identical_sample_callchains_as_hex_frames() {
 
     assert_eq!(folded, "0x2000;0x3000 2\n0x4000 1\n");
 }
+
+#[test]
+fn drops_perf_context_marker_frames_when_folding() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [record_bytes(
+            9,
+            &sample_payload(0x1000, 11, 12, [0xffff_ffff_ffff_fe00, 0x2000]),
+        )],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, "0x2000 1\n");
+}
