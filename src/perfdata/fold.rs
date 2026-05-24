@@ -103,19 +103,8 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
 pub fn fold_perfdata_callchains(bytes: &[u8]) -> Result<String, String> {
     let summary = summarize_perfdata(bytes)?;
     let mut counts = BTreeMap::<Vec<String>, u64>::new();
-    for sample in summary.sample_stacks {
-        let address_frames = sample
-            .callchain
-            .into_iter()
-            .filter(|frame| !is_perf_context_marker(*frame))
-            .map(|frame| format!("0x{frame:x}"));
-        let mut frames =
-            if let Some(comm) = sample.pid.and_then(|pid| summary.comms_by_pid.get(&pid)) {
-                vec![comm.clone()]
-            } else {
-                Vec::new()
-            };
-        frames.extend(address_frames);
+    for sample in &summary.sample_stacks {
+        let frames = folded_frames_for_sample(sample, &summary.comms_by_pid);
         *counts.entry(frames).or_insert(0) += 1;
     }
 
@@ -128,6 +117,26 @@ pub fn fold_perfdata_callchains(bytes: &[u8]) -> Result<String, String> {
         folded.push('\n');
     }
     Ok(folded)
+}
+
+fn folded_frames_for_sample(
+    sample: &PerfSampleStack,
+    comms_by_pid: &BTreeMap<u32, String>,
+) -> Vec<String> {
+    let mut frames = if let Some(comm) = sample.pid.and_then(|pid| comms_by_pid.get(&pid)) {
+        vec![comm.clone()]
+    } else {
+        Vec::new()
+    };
+    frames.extend(
+        sample
+            .callchain
+            .iter()
+            .copied()
+            .filter(|frame| !is_perf_context_marker(*frame))
+            .map(|frame| format!("0x{frame:x}")),
+    );
+    frames
 }
 
 fn parse_sample_for_summary(
