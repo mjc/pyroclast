@@ -24,7 +24,7 @@ fn parses_profile_options() {
         "pyroclast",
         "profile",
         "--kind",
-        "heap",
+        "memory",
         "--out",
         "runs/h",
         "--name",
@@ -37,13 +37,38 @@ fn parses_profile_options() {
 
     match cli.command {
         CliCommand::Profile(profile) => {
-            assert_eq!(profile.kind, ProfileKind::Heap);
+            assert_eq!(profile.kind, ProfileKind::Memory);
             assert_eq!(profile.out, Some(PathBuf::from("runs/h")));
             assert_eq!(profile.name.as_deref(), Some("heap-run"));
             assert!(profile.json);
             assert_eq!(profile.command, vec!["cargo", "check"]);
         }
         other => panic!("expected profile command, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_top_level_profiler_commands() {
+    let cases = [
+        ("memory", ProfileKind::Memory),
+        ("cpu", ProfileKind::Cpu),
+        ("offpcu", ProfileKind::Offcpu),
+        ("latency", ProfileKind::Latency),
+        ("async", ProfileKind::Async),
+    ];
+
+    for (verb, kind) in cases {
+        let cli = Cli::parse_from(["pyroclast", verb, "--", "cargo", "check"]);
+
+        match cli.command {
+            command => {
+                let profile = command
+                    .profile_invocation()
+                    .unwrap_or_else(|| panic!("expected profile invocation for {verb}"));
+                assert_eq!(profile.kind, kind, "verb {verb}");
+                assert_eq!(profile.command, vec!["cargo", "check"]);
+            }
+        }
     }
 }
 

@@ -23,6 +23,11 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum CliCommand {
+    Memory(RunArgs),
+    Cpu(RunArgs),
+    Offpcu(RunArgs),
+    Latency(RunArgs),
+    Async(RunArgs),
     Profile(ProfileArgs),
     Fold(FoldArgs),
     Summarize(SummarizeArgs),
@@ -33,9 +38,66 @@ pub enum CliCommand {
 #[serde(rename_all = "snake_case")]
 pub enum ProfileKind {
     Cpu,
-    Heap,
+    Memory,
     Offcpu,
-    Syscalls,
+    Latency,
+    Async,
+}
+
+#[derive(Debug, Args)]
+pub struct RunArgs {
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+
+    #[arg(long)]
+    pub name: Option<String>,
+
+    #[arg(long)]
+    pub json: bool,
+
+    #[arg(last = true, required = true)]
+    pub command: Vec<String>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct ProfileInvocation {
+    pub kind: ProfileKind,
+    pub out: Option<PathBuf>,
+    pub name: Option<String>,
+    pub json: bool,
+    pub command: Vec<String>,
+}
+
+impl CliCommand {
+    pub fn profile_invocation(&self) -> Option<ProfileInvocation> {
+        match self {
+            Self::Memory(args) => Some(ProfileInvocation::from_run(ProfileKind::Memory, args)),
+            Self::Cpu(args) => Some(ProfileInvocation::from_run(ProfileKind::Cpu, args)),
+            Self::Offpcu(args) => Some(ProfileInvocation::from_run(ProfileKind::Offcpu, args)),
+            Self::Latency(args) => Some(ProfileInvocation::from_run(ProfileKind::Latency, args)),
+            Self::Async(args) => Some(ProfileInvocation::from_run(ProfileKind::Async, args)),
+            Self::Profile(args) => Some(ProfileInvocation {
+                kind: args.kind,
+                out: args.out.clone(),
+                name: args.name.clone(),
+                json: args.json,
+                command: args.command.clone(),
+            }),
+            Self::Fold(_) | Self::Summarize(_) | Self::Flamegraph(_) => None,
+        }
+    }
+}
+
+impl ProfileInvocation {
+    fn from_run(kind: ProfileKind, args: &RunArgs) -> Self {
+        Self {
+            kind,
+            out: args.out.clone(),
+            name: args.name.clone(),
+            json: args.json,
+            command: args.command.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Args)]
