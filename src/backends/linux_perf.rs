@@ -46,7 +46,8 @@ where
         std::fs::create_dir_all(layout.root())?;
 
         let perf_data = layout.raw_profile("perf.data");
-        let command = build_perf_record_command(997, "fp", perf_data.clone(), request.command.clone());
+        let command =
+            build_perf_record_command(997, "fp", perf_data.clone(), request.command.clone());
         let output = self.runner.run(&command)?;
 
         std::fs::write(layout.stdout_log(), &output.stdout)?;
