@@ -15,6 +15,13 @@ pub struct PerfRecord<'a> {
     pub payload: &'a [u8],
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommRecord {
+    pub pid: u32,
+    pub tid: u32,
+    pub comm: String,
+}
+
 pub fn parse_record_header(bytes: &[u8]) -> Result<PerfRecordHeader, String> {
     if bytes.len() < 8 {
         return Err("perf record header is shorter than 8 bytes".to_string());
@@ -62,4 +69,20 @@ pub fn iter_records(bytes: &[u8], header: PerfHeader) -> Result<Vec<PerfRecord<'
     }
 
     Ok(records)
+}
+
+pub fn parse_comm_record(payload: &[u8]) -> Result<CommRecord, String> {
+    if payload.len() < 8 {
+        return Err("PERF_RECORD_COMM payload is shorter than 8 bytes".to_string());
+    }
+    let pid = read_u32(payload, 0)?;
+    let tid = read_u32(payload, 4)?;
+    let comm_bytes = &payload[8..];
+    let end = comm_bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(comm_bytes.len());
+    let comm = String::from_utf8_lossy(&comm_bytes[..end]).into_owned();
+
+    Ok(CommRecord { pid, tid, comm })
 }

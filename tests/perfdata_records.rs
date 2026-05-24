@@ -1,5 +1,7 @@
 use pyroclast::perfdata::header::parse_header;
-use pyroclast::perfdata::records::{PerfRecordHeader, iter_records, parse_record_header};
+use pyroclast::perfdata::records::{
+    PerfRecordHeader, iter_records, parse_comm_record, parse_record_header,
+};
 
 #[test]
 fn parses_perf_record_header() {
@@ -42,6 +44,20 @@ fn iterates_records_from_perfdata_data_section() {
     assert_eq!(records[0].payload, b"comm");
     assert_eq!(records[1].header.record_type, 9);
     assert_eq!(records[1].payload, b"sample");
+}
+
+#[test]
+fn parses_comm_record_payload() {
+    let mut payload = Vec::new();
+    payload.extend(123u32.to_le_bytes());
+    payload.extend(456u32.to_le_bytes());
+    payload.extend(b"sftp-s3\0");
+
+    let comm = parse_comm_record(&payload).expect("comm record");
+
+    assert_eq!(comm.pid, 123);
+    assert_eq!(comm.tid, 456);
+    assert_eq!(comm.comm, "sftp-s3");
 }
 
 fn perfdata_with_records<const N: usize>(records: [Vec<u8>; N]) -> Vec<u8> {
