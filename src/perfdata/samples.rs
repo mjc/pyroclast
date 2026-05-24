@@ -66,6 +66,10 @@ pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<Sampl
     Ok(sample)
 }
 
+pub fn is_perf_context_marker(frame: u64) -> bool {
+    frame >= 0xffff_ffff_ffff_f000
+}
+
 impl SampleLayout {
     fn has(self, flag: u64) -> bool {
         self.sample_type & flag != 0

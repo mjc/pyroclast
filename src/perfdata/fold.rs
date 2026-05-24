@@ -6,7 +6,7 @@ use crate::perfdata::header::parse_header;
 use crate::perfdata::records::{
     iter_records, parse_comm_record, parse_mmap_record, parse_mmap2_record,
 };
-use crate::perfdata::samples::{SampleLayout, parse_sample_record};
+use crate::perfdata::samples::{SampleLayout, is_perf_context_marker, parse_sample_record};
 
 const PERF_RECORD_MMAP: u32 = 1;
 const PERF_RECORD_COMM: u32 = 3;
@@ -93,10 +93,6 @@ pub fn fold_perfdata_callchains(bytes: &[u8]) -> Result<String, String> {
         folded.push('\n');
     }
     Ok(folded)
-}
-
-fn is_perf_context_marker(frame: u64) -> bool {
-    frame >= 0xffff_ffff_ffff_f000
 }
 
 fn parse_sample_for_summary(
