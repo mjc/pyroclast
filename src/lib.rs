@@ -94,5 +94,9 @@ fn format_perf_summary(summary: PerfSummary) -> String {
     for mmap in summary.mmaps {
         stdout.push_str(&format!("mmap={mmap}\n"));
     }
+    stdout.push_str(&format!(
+        "sample_callchains={}\n",
+        summary.sample_callchains.len()
+    ));
     stdout
 }

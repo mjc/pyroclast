@@ -1,3 +1,7 @@
+mod common;
+
+use common::{file_attr_bytes, perfdata_with_records_and_attrs, record_bytes, sample_payload};
+use pyroclast::perfdata::samples::{PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_TID};
 use std::sync::Mutex;
 
 #[test]
@@ -30,19 +34,28 @@ fn fold_command_reads_perfdata_directly() {
     let perfdata = root.path().join("perf.data");
     std::fs::write(
         &perfdata,
-        perfdata_with_records([
-            record_bytes(3, &comm_payload(1, 2, "app")),
-            record_bytes(1, &mmap_payload(1, 2, 0x1000, 0x2000, 0, "/bin/app")),
-        ]),
+        perfdata_with_records_and_attrs(
+            [file_attr_bytes(
+                PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+                0,
+                0,
+            )],
+            [
+                record_bytes(3, &comm_payload(1, 2, "app")),
+                record_bytes(1, &mmap_payload(1, 2, 0x1000, 0x2000, 0, "/bin/app")),
+                record_bytes(9, &sample_payload(0x1000, 1, 2, [0x2000])),
+            ],
+        ),
     )
     .expect("write perfdata");
 
     let output = pyroclast::run_cli(["pyroclast", "fold", perfdata.to_str().unwrap()])
         .expect("fold command");
 
-    assert!(output.stdout.contains("total_records=2"));
+    assert!(output.stdout.contains("total_records=3"));
     assert!(output.stdout.contains("comm=app"));
     assert!(output.stdout.contains("mmap=/bin/app"));
+    assert!(output.stdout.contains("sample_callchains=1"));
 }
 
 #[test]
@@ -96,29 +109,6 @@ impl pyroclast::process::CommandRunner for RecordingRunner {
     }
 }
 
-fn perfdata_with_records<const N: usize>(records: [Vec<u8>; N]) -> Vec<u8> {
-    let data_size = records.iter().map(Vec::len).sum::<usize>();
-    let mut bytes = vec![0; 104];
-    bytes[..8].copy_from_slice(b"PERFILE2");
-    put_u64(&mut bytes, 8, 104);
-    put_u64(&mut bytes, 40, 104);
-    put_u64(&mut bytes, 48, data_size as u64);
-    for record in records {
-        bytes.extend(record);
-    }
-    bytes
-}
-
-fn record_bytes(record_type: u32, payload: &[u8]) -> Vec<u8> {
-    let size = 8 + payload.len();
-    let mut bytes = Vec::with_capacity(size);
-    bytes.extend(record_type.to_le_bytes());
-    bytes.extend(0u16.to_le_bytes());
-    bytes.extend((size as u16).to_le_bytes());
-    bytes.extend(payload);
-    bytes
-}
-
 fn comm_payload(pid: u32, tid: u32, comm: &str) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.extend(pid.to_le_bytes());
@@ -138,8 +128,4 @@ fn mmap_payload(pid: u32, tid: u32, start: u64, len: u64, pgoff: u64, path: &str
     payload.extend(path.as_bytes());
     payload.push(0);
     payload
-}
-
-fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
-    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
