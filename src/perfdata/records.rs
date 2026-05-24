@@ -92,12 +92,7 @@ pub fn parse_comm_record(payload: &[u8]) -> Result<CommRecord, String> {
     }
     let pid = read_u32(payload, 0)?;
     let tid = read_u32(payload, 4)?;
-    let comm_bytes = &payload[8..];
-    let end = comm_bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(comm_bytes.len());
-    let comm = String::from_utf8_lossy(&comm_bytes[..end]).into_owned();
+    let comm = parse_c_string(&payload[8..]);
 
     Ok(CommRecord { pid, tid, comm })
 }
@@ -111,12 +106,7 @@ pub fn parse_mmap_record(payload: &[u8]) -> Result<MmapRecord, String> {
     let start = read_u64(payload, 8)?;
     let len = read_u64(payload, 16)?;
     let pgoff = read_u64(payload, 24)?;
-    let path_bytes = &payload[32..];
-    let end = path_bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(path_bytes.len());
-    let path = String::from_utf8_lossy(&path_bytes[..end]).into_owned();
+    let path = parse_c_string(&payload[32..]);
 
     Ok(MmapRecord {
         pid,
@@ -126,4 +116,12 @@ pub fn parse_mmap_record(payload: &[u8]) -> Result<MmapRecord, String> {
         pgoff,
         path,
     })
+}
+
+fn parse_c_string(bytes: &[u8]) -> String {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
