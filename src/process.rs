@@ -29,3 +29,33 @@ impl CommandSpec {
         self
     }
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandOutput {
+    pub status_code: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+pub trait CommandRunner {
+    fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RealCommandRunner;
+
+impl CommandRunner for RealCommandRunner {
+    fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
+        let mut std_command = std::process::Command::new(&command.program);
+        std_command.args(&command.args);
+        for (key, value) in &command.env {
+            std_command.env(key, value);
+        }
+        let output = std_command.output()?;
+        Ok(CommandOutput {
+            status_code: output.status.code(),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
+    }
+}
