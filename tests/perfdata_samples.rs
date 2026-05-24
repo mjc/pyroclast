@@ -35,13 +35,13 @@ fn consumes_perf_record_default_sample_fields_before_callchain() {
     payload.extend(456u32.to_le_bytes());
     payload.extend(99u64.to_le_bytes());
     payload.extend(0xfeedu64.to_le_bytes());
-    payload.extend(2u64.to_le_bytes());
-    payload.extend(0x2000u64.to_le_bytes());
-    payload.extend(0x3000u64.to_le_bytes());
     payload.extend(77u64.to_le_bytes());
     payload.extend(3u32.to_le_bytes());
     payload.extend(0u32.to_le_bytes());
     payload.extend(1u64.to_le_bytes());
+    payload.extend(2u64.to_le_bytes());
+    payload.extend(0x2000u64.to_le_bytes());
+    payload.extend(0x3000u64.to_le_bytes());
 
     let sample = parse_sample_record(
         &payload,

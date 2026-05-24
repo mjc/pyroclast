@@ -44,12 +44,6 @@ pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<Sampl
     if layout.has(PERF_SAMPLE_ADDR) {
         cursor.skip_u64()?;
     }
-    if layout.has(PERF_SAMPLE_CALLCHAIN) {
-        let callchain_len = cursor.read_u64()? as usize;
-        for _ in 0..callchain_len {
-            sample.callchain.push(cursor.read_u64()?);
-        }
-    }
     if layout.has(PERF_SAMPLE_ID) {
         cursor.skip_u64()?;
     }
@@ -59,6 +53,12 @@ pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<Sampl
     }
     if layout.has(PERF_SAMPLE_PERIOD) {
         cursor.skip_u64()?;
+    }
+    if layout.has(PERF_SAMPLE_CALLCHAIN) {
+        let callchain_len = cursor.read_u64()? as usize;
+        for _ in 0..callchain_len {
+            sample.callchain.push(cursor.read_u64()?);
+        }
     }
 
     Ok(sample)
