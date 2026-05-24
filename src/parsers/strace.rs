@@ -13,6 +13,25 @@ pub struct StraceSummary {
     pub by_syscall: BTreeMap<String, SyscallStats>,
 }
 
+impl StraceSummary {
+    fn add_call(&mut self, syscall: Option<&str>, seconds: f64) {
+        self.total_calls += 1;
+        self.total_seconds += seconds;
+
+        if let Some(syscall) = syscall {
+            let stats = self
+                .by_syscall
+                .entry(syscall.to_string())
+                .or_insert(SyscallStats {
+                    calls: 0,
+                    total_seconds: 0.0,
+                });
+            stats.calls += 1;
+            stats.total_seconds += seconds;
+        }
+    }
+}
+
 pub fn parse_strace_summary(input: &str) -> StraceSummary {
     let mut summary = StraceSummary {
         total_calls: 0,
@@ -22,19 +41,7 @@ pub fn parse_strace_summary(input: &str) -> StraceSummary {
 
     for line in input.lines() {
         if let Some(seconds) = parse_duration(line) {
-            summary.total_calls += 1;
-            summary.total_seconds += seconds;
-            if let Some(syscall) = parse_syscall_name(line) {
-                let stats = summary
-                    .by_syscall
-                    .entry(syscall.to_string())
-                    .or_insert(SyscallStats {
-                        calls: 0,
-                        total_seconds: 0.0,
-                    });
-                stats.calls += 1;
-                stats.total_seconds += seconds;
-            }
+            summary.add_call(parse_syscall_name(line), seconds);
         }
     }
 
