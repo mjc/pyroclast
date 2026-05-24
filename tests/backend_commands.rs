@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use pyroclast::backends::heaptrack::build_heaptrack_command;
 use pyroclast::backends::linux_perf::build_perf_record_command;
 use pyroclast::backends::macos_xctrace::build_xctrace_record_command;
 use pyroclast::flamegraph::build_inferno_flamegraph_command;
@@ -28,6 +29,25 @@ fn builds_linux_perf_record_command() {
             "--",
             "cargo",
             "check",
+        ]
+    );
+}
+
+#[test]
+fn builds_heaptrack_command() {
+    let command = build_heaptrack_command(
+        PathBuf::from("run/profile.raw.heaptrack"),
+        ["target/release/app".to_string(), "--serve".to_string()],
+    );
+
+    assert_eq!(command.program, "heaptrack");
+    assert_eq!(
+        command.args,
+        vec![
+            "-o",
+            "run/profile.raw.heaptrack",
+            "target/release/app",
+            "--serve"
         ]
     );
 }
