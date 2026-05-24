@@ -1,4 +1,4 @@
-use pyroclast::perfdata::records::{parse_record_header, PerfRecordHeader};
+use pyroclast::perfdata::records::{PerfRecordHeader, parse_record_header};
 
 #[test]
 fn parses_perf_record_header() {

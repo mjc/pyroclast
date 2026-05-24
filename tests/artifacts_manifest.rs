@@ -11,11 +11,23 @@ fn artifact_layout_uses_required_file_names() {
     assert_eq!(layout.stdout_log(), root.path().join("run-1/stdout.log"));
     assert_eq!(layout.stderr_log(), root.path().join("run-1/stderr.log"));
     assert_eq!(layout.command_txt(), root.path().join("run-1/command.txt"));
-    assert_eq!(layout.stacks_folded(), root.path().join("run-1/stacks.folded"));
-    assert_eq!(layout.flamegraph_svg(), root.path().join("run-1/flamegraph.svg"));
+    assert_eq!(
+        layout.stacks_folded(),
+        root.path().join("run-1/stacks.folded")
+    );
+    assert_eq!(
+        layout.flamegraph_svg(),
+        root.path().join("run-1/flamegraph.svg")
+    );
     assert_eq!(layout.summary_txt(), root.path().join("run-1/summary.txt"));
-    assert_eq!(layout.summary_json(), root.path().join("run-1/summary.json"));
-    assert_eq!(layout.tool_errors_log(), root.path().join("run-1/tool-errors.log"));
+    assert_eq!(
+        layout.summary_json(),
+        root.path().join("run-1/summary.json")
+    );
+    assert_eq!(
+        layout.tool_errors_log(),
+        root.path().join("run-1/tool-errors.log")
+    );
     assert_eq!(
         layout.raw_profile("perf.data"),
         root.path().join("run-1/profile.raw.perf.data")

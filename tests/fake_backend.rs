@@ -17,7 +17,10 @@ fn fake_backend_writes_required_artifacts() {
         .profile(&request)
         .expect("fake profile");
 
-    assert_eq!(result.manifest.actual_backend, pyroclast::manifest::BackendName::Fake);
+    assert_eq!(
+        result.manifest.actual_backend,
+        pyroclast::manifest::BackendName::Fake
+    );
     assert!(result.layout.run_json().is_file());
     assert!(result.layout.stdout_log().is_file());
     assert!(result.layout.stderr_log().is_file());

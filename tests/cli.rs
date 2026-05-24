@@ -50,7 +50,9 @@ fn parses_profile_options() {
 #[test]
 fn parses_analysis_commands() {
     let fold = Cli::parse_from(["pyroclast", "fold", "perf.data"]);
-    assert!(matches!(fold.command, CliCommand::Fold(command) if command.input == PathBuf::from("perf.data")));
+    assert!(
+        matches!(fold.command, CliCommand::Fold(command) if command.input == PathBuf::from("perf.data"))
+    );
 
     let summarize = Cli::parse_from(["pyroclast", "summarize", "--json", "run-dir"]);
     assert!(

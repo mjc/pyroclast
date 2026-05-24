@@ -1,4 +1,4 @@
-use pyroclast::tools::{required_tools, ToolKind};
+use pyroclast::tools::{ToolKind, required_tools};
 
 #[test]
 fn linux_required_tools_include_nix_managed_profilers() {

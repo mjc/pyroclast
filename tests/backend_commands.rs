@@ -82,18 +82,26 @@ fn builds_macos_xctrace_record_command() {
     );
 
     assert_eq!(command.program, "xctrace");
-    assert_eq!(&command.args[..8], [
-        "record",
-        "--quiet",
-        "--template",
-        "CPU Profiler",
-        "--output",
-        "run/profile.raw.xctrace.trace",
-        "--no-prompt",
-        "--launch",
-    ]);
+    assert_eq!(
+        &command.args[..8],
+        [
+            "record",
+            "--quiet",
+            "--template",
+            "CPU Profiler",
+            "--output",
+            "run/profile.raw.xctrace.trace",
+            "--no-prompt",
+            "--launch",
+        ]
+    );
     assert!(command.args.contains(&"/bin/sh".to_string()));
-    assert!(command.args.iter().any(|arg| arg.contains("PYROCLAST_XCTRACE_TARGET_PID")));
+    assert!(
+        command
+            .args
+            .iter()
+            .any(|arg| arg.contains("PYROCLAST_XCTRACE_TARGET_PID"))
+    );
     assert!(command.args.contains(&"target/release/app".to_string()));
     assert_eq!(
         command.env,

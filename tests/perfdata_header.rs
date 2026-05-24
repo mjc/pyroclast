@@ -1,4 +1,4 @@
-use pyroclast::perfdata::header::{parse_header, PerfHeader};
+use pyroclast::perfdata::header::{PerfHeader, parse_header};
 
 #[test]
 fn parses_perfdata_header_sections() {
