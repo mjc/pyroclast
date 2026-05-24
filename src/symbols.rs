@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
-use crate::process::CommandSpec;
+use crate::process::{CommandRunner, CommandSpec};
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SymbolRequest {
@@ -22,6 +22,20 @@ pub trait SymbolResolver {
 pub struct SymbolCache<'a, R> {
     resolver: &'a R,
     resolved: BTreeMap<SymbolRequest, Option<String>>,
+}
+
+pub struct Addr2lineResolver<'a, R> {
+    runner: &'a R,
+}
+
+impl<'a, R> Addr2lineResolver<'a, R>
+where
+    R: CommandRunner,
+{
+    #[must_use]
+    pub fn new(runner: &'a R) -> Self {
+        Self { runner }
+    }
 }
 
 #[must_use]
@@ -107,5 +121,76 @@ where
             self.resolved.insert(request, symbol);
         }
         Ok(())
+    }
+}
+
+impl<R> SymbolResolver for Addr2lineResolver<'_, R>
+where
+    R: CommandRunner,
+{
+    fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
+        let mut resolved_by_request = BTreeMap::<SymbolRequest, Option<String>>::new();
+        for (path, indexes) in grouped_request_indexes(requests) {
+            let grouped_requests = indexes
+                .iter()
+                .map(|index| requests[*index].clone())
+                .collect::<Vec<_>>();
+            let output = self
+                .runner
+                .run(&build_addr2line_command(&path, &grouped_requests))
+                .map_err(|error| format!("failed to run addr2line: {error}"))?;
+            if output.status_code != Some(0) {
+                return Err(format!("addr2line exited with {:?}", output.status_code));
+            }
+            let symbols = parse_addr2line_stdout(&output.stdout, grouped_requests.len())?;
+            for (request, symbol) in grouped_requests.into_iter().zip(symbols) {
+                resolved_by_request.insert(request, symbol);
+            }
+        }
+
+        requests
+            .iter()
+            .map(|request| {
+                resolved_by_request
+                    .get(request)
+                    .cloned()
+                    .ok_or_else(|| "missing addr2line result for request".to_string())
+            })
+            .collect()
+    }
+}
+
+fn grouped_request_indexes(requests: &[SymbolRequest]) -> BTreeMap<PathBuf, Vec<usize>> {
+    let mut grouped = BTreeMap::<PathBuf, Vec<usize>>::new();
+    for (index, request) in requests.iter().enumerate() {
+        grouped.entry(request.path.clone()).or_default().push(index);
+    }
+    grouped
+}
+
+fn parse_addr2line_stdout(
+    stdout: &[u8],
+    expected_symbols: usize,
+) -> Result<Vec<Option<String>>, String> {
+    let text = String::from_utf8_lossy(stdout);
+    let lines = text.lines().collect::<Vec<_>>();
+    if lines.len() < expected_symbols.saturating_mul(2) {
+        return Err(format!(
+            "addr2line returned {} lines for {expected_symbols} symbols",
+            lines.len()
+        ));
+    }
+    Ok(lines
+        .chunks(2)
+        .take(expected_symbols)
+        .map(|chunk| function_name(chunk[0]))
+        .collect())
+}
+
+fn function_name(line: &str) -> Option<String> {
+    if line == "??" || line.is_empty() {
+        None
+    } else {
+        Some(line.to_string())
     }
 }

@@ -1,8 +1,10 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
-use pyroclast::symbols::{SymbolCache, SymbolRequest, SymbolResolver};
+use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
+use pyroclast::symbols::{Addr2lineResolver, SymbolCache, SymbolRequest, SymbolResolver};
 
 #[test]
 fn resolves_each_unique_symbol_address_once() {
@@ -105,6 +107,35 @@ fn batches_only_uncached_symbol_addresses() {
     );
 }
 
+#[test]
+fn addr2line_resolver_batches_requests_by_binary() {
+    let runner = Addr2lineRunner::new(b"app::main\n/bin/app.rs:10\napp::work\n/bin/app.rs:20\n");
+    let resolver = Addr2lineResolver::new(&runner);
+
+    let symbols = resolver
+        .resolve_batch(&[
+            SymbolRequest {
+                path: PathBuf::from("/bin/app"),
+                relative_address: 0x10,
+            },
+            SymbolRequest {
+                path: PathBuf::from("/bin/app"),
+                relative_address: 0x20,
+            },
+        ])
+        .expect("symbols");
+
+    assert_eq!(
+        symbols,
+        vec![Some("app::main".to_string()), Some("app::work".to_string())]
+    );
+    assert_eq!(runner.commands().len(), 1);
+    assert_eq!(
+        runner.commands()[0].stdin.as_deref(),
+        Some(&b"0x10\n0x20\n"[..])
+    );
+}
+
 #[derive(Default)]
 struct RecordingResolver {
     symbols: BTreeMap<SymbolRequest, String>,
@@ -131,5 +162,34 @@ impl SymbolResolver for RecordingResolver {
             .iter()
             .map(|request| self.symbols.get(request).cloned())
             .collect())
+    }
+}
+
+struct Addr2lineRunner {
+    stdout: Vec<u8>,
+    commands: Mutex<Vec<CommandSpec>>,
+}
+
+impl Addr2lineRunner {
+    fn new(stdout: &[u8]) -> Self {
+        Self {
+            stdout: stdout.to_vec(),
+            commands: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn commands(&self) -> Vec<CommandSpec> {
+        self.commands.lock().unwrap().clone()
+    }
+}
+
+impl CommandRunner for Addr2lineRunner {
+    fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
+        self.commands.lock().unwrap().push(command.clone());
+        Ok(CommandOutput {
+            status_code: Some(0),
+            stdout: self.stdout.clone(),
+            stderr: Vec::new(),
+        })
     }
 }
