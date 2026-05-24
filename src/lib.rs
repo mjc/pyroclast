@@ -75,6 +75,7 @@ where
             out_dir,
             name: invocation.name,
             json: invocation.json,
+            symbols: invocation.symbols,
         };
         match request.kind {
             ProfileKind::Cpu if std::env::consts::OS == "linux" => {

@@ -11,6 +11,7 @@ fn fake_backend_writes_required_artifacts() {
         out_dir: root.path().join("fake-run"),
         name: Some("fake".to_string()),
         json: false,
+        symbols: false,
     };
 
     let result = FakeBackend.profile(&request).expect("fake profile");

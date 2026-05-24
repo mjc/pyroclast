@@ -55,6 +55,9 @@ pub struct RunArgs {
     #[arg(long)]
     pub json: bool,
 
+    #[arg(long)]
+    pub symbols: bool,
+
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
 }
@@ -65,6 +68,7 @@ pub struct ProfileInvocation {
     pub out: Option<PathBuf>,
     pub name: Option<String>,
     pub json: bool,
+    pub symbols: bool,
     pub command: Vec<String>,
 }
 
@@ -82,6 +86,7 @@ impl CliCommand {
                 out: args.out.clone(),
                 name: args.name.clone(),
                 json: args.json,
+                symbols: args.symbols,
                 command: args.command.clone(),
             }),
             Self::Fold(_) | Self::Summarize(_) | Self::Flamegraph(_) => None,
@@ -96,6 +101,7 @@ impl ProfileInvocation {
             out: args.out.clone(),
             name: args.name.clone(),
             json: args.json,
+            symbols: args.symbols,
             command: args.command.clone(),
         }
     }
@@ -114,6 +120,9 @@ pub struct ProfileArgs {
 
     #[arg(long)]
     pub json: bool,
+
+    #[arg(long)]
+    pub symbols: bool,
 
     #[arg(last = true, required = true)]
     pub command: Vec<String>,

@@ -18,6 +18,7 @@ fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
         out_dir: root.path().join("cpu"),
         name: None,
         json: false,
+        symbols: false,
     };
 
     let result = backend.profile(&request).expect("profile");
@@ -31,7 +32,7 @@ fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
     );
     assert_eq!(
         std::fs::read_to_string(result.layout.stacks_folded()).expect("stacks folded"),
-        "0x2000 1\n"
+        "app;/bin/app+0x1000 1\n"
     );
     assert_eq!(
         std::fs::read_to_string(result.layout.flamegraph_svg()).expect("flamegraph svg"),
@@ -39,6 +40,32 @@ fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
     );
     assert!(result.layout.run_json().is_file());
     assert!(result.layout.stderr_log().is_file());
+}
+
+#[test]
+fn linux_perf_backend_can_symbolize_folded_stacks() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let runner = RecordingRunner::default();
+    let backend = LinuxPerfBackend::new(&runner);
+    let request = ProfileRequest {
+        kind: ProfileKind::Cpu,
+        command: vec!["true".to_string()],
+        out_dir: root.path().join("cpu"),
+        name: None,
+        json: false,
+        symbols: true,
+    };
+
+    let result = backend.profile(&request).expect("profile");
+
+    assert_eq!(
+        runner.programs(),
+        vec!["perf", "addr2line", "inferno-flamegraph"]
+    );
+    assert_eq!(
+        std::fs::read_to_string(result.layout.stacks_folded()).expect("stacks folded"),
+        "app;app::work 1\n"
+    );
 }
 
 #[derive(Default)]
@@ -63,10 +90,10 @@ impl CommandRunner for RecordingRunner {
         if let Some(output_path) = perf_output_path(command) {
             std::fs::write(output_path, tiny_perfdata())?;
         }
-        let stdout = if command.program == "inferno-flamegraph" {
-            b"<svg></svg>\n".to_vec()
-        } else {
-            b"perf stdout".to_vec()
+        let stdout = match command.program.as_str() {
+            "addr2line" => b"app::work\n/bin/app.rs:10\n".to_vec(),
+            "inferno-flamegraph" => b"<svg></svg>\n".to_vec(),
+            _ => b"perf stdout".to_vec(),
         };
         Ok(CommandOutput {
             status_code: Some(0),
@@ -91,7 +118,11 @@ fn tiny_perfdata() -> Vec<u8> {
             0,
             0,
         )],
-        [record_bytes(9, &sample_payload(0x1000, 1, 2, [0x2000]))],
+        [
+            record_bytes(3, &comm_payload(1, 2, "app")),
+            record_bytes(1, &mmap_payload(1, 2, 0x1000, 0x2000, 0, "/bin/app")),
+            record_bytes(9, &sample_payload(0x1000, 1, 2, [0x2000])),
+        ],
     )
 }
 
@@ -150,6 +181,27 @@ fn sample_payload<const N: usize>(ip: u64, pid: u32, tid: u32, callchain: [u64; 
     for frame in callchain {
         payload.extend(frame.to_le_bytes());
     }
+    payload
+}
+
+fn comm_payload(pid: u32, tid: u32, comm: &str) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(pid.to_le_bytes());
+    payload.extend(tid.to_le_bytes());
+    payload.extend(comm.as_bytes());
+    payload.push(0);
+    payload
+}
+
+fn mmap_payload(pid: u32, tid: u32, start: u64, len: u64, pgoff: u64, path: &str) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(pid.to_le_bytes());
+    payload.extend(tid.to_le_bytes());
+    payload.extend(start.to_le_bytes());
+    payload.extend(len.to_le_bytes());
+    payload.extend(pgoff.to_le_bytes());
+    payload.extend(path.as_bytes());
+    payload.push(0);
     payload
 }
 

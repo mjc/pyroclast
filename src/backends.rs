@@ -20,6 +20,7 @@ pub struct ProfileRequest {
     pub out_dir: PathBuf,
     pub name: Option<String>,
     pub json: bool,
+    pub symbols: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

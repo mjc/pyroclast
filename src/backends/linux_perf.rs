@@ -5,8 +5,11 @@ use crate::artifacts::ArtifactLayout;
 use crate::backends::{BackendResult, ProfileRequest, ProfileResult, ProfilerBackend};
 use crate::flamegraph::{FlamegraphRenderer, FlamegraphRequest, InfernoFlamegraphRenderer};
 use crate::manifest::{BackendName, RunManifest};
-use crate::perfdata::fold::fold_perfdata_callchains;
+use crate::perfdata::fold::{
+    FoldOptions, fold_perfdata_callchains, fold_perfdata_callchains_with_symbols,
+};
 use crate::process::{CommandRunner, CommandSpec};
+use crate::symbols::Addr2lineResolver;
 
 pub fn build_perf_record_command(
     frequency: u32,
@@ -51,7 +54,16 @@ where
         let command = build_perf_record_command(997, "fp", &perf_data, request.command.clone());
         let output = self.runner.run(&command)?;
         let perf_bytes = std::fs::read(&perf_data)?;
-        let folded_stacks = fold_perfdata_callchains(&perf_bytes)?;
+        let folded_stacks = if request.symbols {
+            let symbol_resolver = Addr2lineResolver::new(self.runner);
+            fold_perfdata_callchains_with_symbols(
+                &perf_bytes,
+                FoldOptions::default(),
+                &symbol_resolver,
+            )?
+        } else {
+            fold_perfdata_callchains(&perf_bytes)?
+        };
         std::fs::write(layout.stacks_folded(), &folded_stacks)?;
         let flamegraph_output =
             InfernoFlamegraphRenderer::new(self.runner).render(&FlamegraphRequest {
