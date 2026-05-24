@@ -63,4 +63,16 @@ impl ArtifactLayout {
     pub fn tool_errors_log(&self) -> PathBuf {
         self.root.join(TOOL_ERRORS_LOG)
     }
+
+    pub fn standard_manifest_artifacts(&self) -> Vec<PathBuf> {
+        vec![
+            self.run_json(),
+            self.stdout_log(),
+            self.stderr_log(),
+            self.command_txt(),
+            self.summary_txt(),
+            self.summary_json(),
+            self.tool_errors_log(),
+        ]
+    }
 }

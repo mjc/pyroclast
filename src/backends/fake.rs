@@ -32,15 +32,7 @@ impl ProfilerBackend for FakeBackend {
             started_at_unix_ms: unix_ms_now(),
             ended_at_unix_ms: Some(unix_ms_now()),
             exit_status: Some(0),
-            artifacts: vec![
-                layout.run_json(),
-                layout.stdout_log(),
-                layout.stderr_log(),
-                layout.command_txt(),
-                layout.summary_txt(),
-                layout.summary_json(),
-                layout.tool_errors_log(),
-            ],
+            artifacts: layout.standard_manifest_artifacts(),
             diagnostics: vec!["fake backend used".to_string()],
         };
 
