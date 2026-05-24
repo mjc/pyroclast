@@ -123,6 +123,49 @@ fn flamegraph_command_folds_perfdata_without_perf_script() {
 }
 
 #[test]
+fn flamegraph_command_can_symbolize_mapped_frames() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    let output_svg = root.path().join("flamegraph.svg");
+    std::fs::write(
+        &perfdata,
+        perfdata_with_records_and_attrs(
+            [file_attr_bytes(
+                PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+                0,
+                0,
+            )],
+            [
+                record_bytes(3, &comm_payload(1, 2, "app")),
+                record_bytes(1, &mmap_payload(1, 2, 0x1000, 0x2000, 0, "/bin/app")),
+                record_bytes(9, &sample_payload(0x1000, 1, 2, [0x2000])),
+            ],
+        ),
+    )
+    .expect("write perfdata");
+    let runner = RecordingRunner::default();
+    let cli = pyroclast::cli::Cli::parse_from([
+        "pyroclast",
+        "flamegraph",
+        "--symbols",
+        perfdata.to_str().expect("perfdata path"),
+        "-o",
+        output_svg.to_str().expect("svg path"),
+    ]);
+
+    pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("flamegraph command");
+
+    assert_eq!(runner.programs(), vec!["addr2line", "inferno-flamegraph"]);
+    assert_eq!(
+        runner.stdins(),
+        vec![
+            Some(b"0x1000\n".to_vec()),
+            Some(b"app;app::work 1\n".to_vec()),
+        ]
+    );
+}
+
+#[test]
 fn top_level_cpu_command_uses_injected_perf_runner() {
     let root = tempfile::tempdir().expect("tempdir");
     let out = root.path().join("cpu-run");

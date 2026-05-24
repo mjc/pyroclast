@@ -93,6 +93,12 @@ fn parses_analysis_commands() {
 
     let flamegraph = Cli::parse_from(["pyroclast", "flamegraph", "perf.data", "-o", "out.svg"]);
     assert!(
-        matches!(flamegraph.command, CliCommand::Flamegraph(command) if command.input == std::path::Path::new("perf.data") && command.output.as_deref() == Some(std::path::Path::new("out.svg")))
+        matches!(flamegraph.command, CliCommand::Flamegraph(command) if command.input == std::path::Path::new("perf.data") && command.output.as_deref() == Some(std::path::Path::new("out.svg")) && !command.symbols)
+    );
+
+    let symbolized_flamegraph =
+        Cli::parse_from(["pyroclast", "flamegraph", "--symbols", "perf.data"]);
+    assert!(
+        matches!(symbolized_flamegraph.command, CliCommand::Flamegraph(command) if command.input == std::path::Path::new("perf.data") && command.symbols)
     );
 }

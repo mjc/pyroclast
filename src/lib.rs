@@ -109,7 +109,16 @@ where
             let output = command
                 .output
                 .unwrap_or_else(|| std::path::PathBuf::from("flamegraph.svg"));
-            let folded_stacks = fold_perfdata_callchains(&bytes)?;
+            let folded_stacks = if command.symbols {
+                let symbol_resolver = Addr2lineResolver::new(runner);
+                fold_perfdata_callchains_with_symbols(
+                    &bytes,
+                    FoldOptions::default(),
+                    &symbol_resolver,
+                )?
+            } else {
+                fold_perfdata_callchains(&bytes)?
+            };
             let render = InfernoFlamegraphRenderer::new(runner).render(&FlamegraphRequest {
                 title: command.title,
                 folded_stacks,

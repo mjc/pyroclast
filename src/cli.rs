@@ -145,6 +145,9 @@ pub struct FlamegraphArgs {
     #[arg(short = 'o', long)]
     pub output: Option<PathBuf>,
 
+    #[arg(long)]
+    pub symbols: bool,
+
     #[arg(long, default_value = "CPU profile")]
     pub title: String,
 }
