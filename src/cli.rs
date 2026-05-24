@@ -7,7 +7,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[command(about = "Rust-only profiling orchestration and analysis")]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Command,
+    pub command: CliCommand,
 }
 
 impl Cli {
@@ -21,7 +21,7 @@ impl Cli {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum Command {
+pub enum CliCommand {
     Profile(ProfileArgs),
     Fold(FoldArgs),
     Summarize(SummarizeArgs),
