@@ -25,6 +25,7 @@ fn parses_ip_tid_and_callchain_sample_payload() {
     assert_eq!(sample.ip, Some(0x1000));
     assert_eq!(sample.pid, Some(123));
     assert_eq!(sample.tid, Some(456));
+    assert_eq!(sample.period, None);
     assert_eq!(sample.callchain, vec![0x2000, 0x3000]);
 }
 
@@ -62,6 +63,7 @@ fn consumes_perf_record_default_sample_fields_before_callchain() {
     assert_eq!(sample.ip, Some(0x1000));
     assert_eq!(sample.pid, Some(123));
     assert_eq!(sample.tid, Some(456));
+    assert_eq!(sample.period, Some(1));
     assert_eq!(sample.callchain, vec![0x2000, 0x3000]);
 }
 

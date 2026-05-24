@@ -19,6 +19,7 @@ pub struct SampleRecord {
     pub ip: Option<u64>,
     pub pid: Option<u32>,
     pub tid: Option<u32>,
+    pub period: Option<u64>,
     pub callchain: Vec<u64>,
 }
 
@@ -33,6 +34,7 @@ pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<Sampl
         ip: None,
         pid: None,
         tid: None,
+        period: None,
         callchain: Vec::new(),
     };
 
@@ -59,7 +61,7 @@ pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<Sampl
         cursor.skip_u32()?;
     }
     if layout.has(PERF_SAMPLE_PERIOD) {
-        cursor.skip_u64()?;
+        sample.period = Some(cursor.read_u64()?);
     }
     if layout.has(PERF_SAMPLE_CALLCHAIN) {
         let callchain_len = usize::try_from(cursor.read_u64()?)
