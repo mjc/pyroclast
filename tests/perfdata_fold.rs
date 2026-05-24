@@ -4,15 +4,21 @@ use pyroclast::perfdata::fold::summarize_perfdata;
 fn summarizes_record_counts_and_comm_names() {
     let bytes = perfdata_with_records([
         record_bytes(3, &comm_payload(1, 2, "sftp-s3")),
+        record_bytes(
+            1,
+            &mmap_payload(1, 2, 0x1000, 0x2000, 0, "/usr/bin/sftp-s3"),
+        ),
         record_bytes(9, b"sample"),
     ]);
 
     let summary = summarize_perfdata(&bytes).expect("summary");
 
-    assert_eq!(summary.total_records, 2);
+    assert_eq!(summary.total_records, 3);
+    assert_eq!(summary.record_count(1), 1);
     assert_eq!(summary.record_count(3), 1);
     assert_eq!(summary.record_count(9), 1);
     assert_eq!(summary.comms, vec!["sftp-s3"]);
+    assert_eq!(summary.mmaps, vec!["/usr/bin/sftp-s3"]);
 }
 
 fn perfdata_with_records<const N: usize>(records: [Vec<u8>; N]) -> Vec<u8> {
@@ -43,6 +49,18 @@ fn comm_payload(pid: u32, tid: u32, comm: &str) -> Vec<u8> {
     payload.extend(pid.to_le_bytes());
     payload.extend(tid.to_le_bytes());
     payload.extend(comm.as_bytes());
+    payload.push(0);
+    payload
+}
+
+fn mmap_payload(pid: u32, tid: u32, start: u64, len: u64, pgoff: u64, path: &str) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(pid.to_le_bytes());
+    payload.extend(tid.to_le_bytes());
+    payload.extend(start.to_le_bytes());
+    payload.extend(len.to_le_bytes());
+    payload.extend(pgoff.to_le_bytes());
+    payload.extend(path.as_bytes());
     payload.push(0);
     payload
 }
