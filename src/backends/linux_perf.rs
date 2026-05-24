@@ -56,11 +56,8 @@ where
             layout.stacks_folded(),
             fold_perfdata_callchains(&perf_bytes)?,
         )?;
-        let flamegraph_command = build_inferno_flamegraph_command(
-            "CPU profile",
-            layout.stacks_folded(),
-            layout.flamegraph_svg(),
-        );
+        let flamegraph_command =
+            build_inferno_flamegraph_command("CPU profile", layout.stacks_folded());
         let flamegraph_output = self.runner.run(&flamegraph_command)?;
         std::fs::write(layout.flamegraph_svg(), &flamegraph_output.stdout)?;
 

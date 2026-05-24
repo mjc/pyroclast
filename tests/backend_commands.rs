@@ -54,11 +54,8 @@ fn builds_heaptrack_command() {
 
 #[test]
 fn builds_inferno_flamegraph_command() {
-    let command = build_inferno_flamegraph_command(
-        "CPU profile",
-        PathBuf::from("run/stacks.folded"),
-        PathBuf::from("run/flamegraph.svg"),
-    );
+    let command =
+        build_inferno_flamegraph_command("CPU profile", PathBuf::from("run/stacks.folded"));
 
     assert_eq!(command.program, "inferno-flamegraph");
     assert_eq!(
