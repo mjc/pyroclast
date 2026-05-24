@@ -59,20 +59,14 @@ fn comm_payload(pid: u32, tid: u32, comm: &str) -> Vec<u8> {
 }
 
 fn mmap_payload(pid: u32, tid: u32, start: u64, len: u64, pgoff: u64, path: &str) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend(pid.to_le_bytes());
-    payload.extend(tid.to_le_bytes());
-    payload.extend(start.to_le_bytes());
-    payload.extend(len.to_le_bytes());
-    payload.extend(pgoff.to_le_bytes());
+    let mut payload = mmap_range_payload(pid, tid, start, len, pgoff);
     payload.extend(path.as_bytes());
     payload.push(0);
     payload
 }
 
 fn mmap2_payload(pid: u32, tid: u32, start: u64, len: u64, pgoff: u64, path: &str) -> Vec<u8> {
-    let mut payload = mmap_payload(pid, tid, start, len, pgoff, "");
-    payload.pop();
+    let mut payload = mmap_range_payload(pid, tid, start, len, pgoff);
     payload.extend(8u32.to_le_bytes());
     payload.extend(1u32.to_le_bytes());
     payload.extend(99u64.to_le_bytes());
@@ -81,6 +75,16 @@ fn mmap2_payload(pid: u32, tid: u32, start: u64, len: u64, pgoff: u64, path: &st
     payload.extend(2u32.to_le_bytes());
     payload.extend(path.as_bytes());
     payload.push(0);
+    payload
+}
+
+fn mmap_range_payload(pid: u32, tid: u32, start: u64, len: u64, pgoff: u64) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(pid.to_le_bytes());
+    payload.extend(tid.to_le_bytes());
+    payload.extend(start.to_le_bytes());
+    payload.extend(len.to_le_bytes());
+    payload.extend(pgoff.to_le_bytes());
     payload
 }
 
