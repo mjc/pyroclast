@@ -121,6 +121,9 @@ pub struct ProfileArgs {
 
 #[derive(Debug, Args)]
 pub struct FoldArgs {
+    #[arg(long)]
+    pub count_periods: bool,
+
     pub input: PathBuf,
 }
 

@@ -73,7 +73,12 @@ fn parses_top_level_profiler_commands() {
 fn parses_analysis_commands() {
     let fold = Cli::parse_from(["pyroclast", "fold", "perf.data"]);
     assert!(
-        matches!(fold.command, CliCommand::Fold(command) if command.input == std::path::Path::new("perf.data"))
+        matches!(fold.command, CliCommand::Fold(command) if command.input == std::path::Path::new("perf.data") && !command.count_periods)
+    );
+
+    let weighted_fold = Cli::parse_from(["pyroclast", "fold", "--count-periods", "perf.data"]);
+    assert!(
+        matches!(weighted_fold.command, CliCommand::Fold(command) if command.input == std::path::Path::new("perf.data") && command.count_periods)
     );
 
     let summarize = Cli::parse_from(["pyroclast", "summarize", "--json", "run-dir"]);

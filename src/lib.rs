@@ -22,7 +22,9 @@ use cli::ProfileKind;
 use cli::{Cli, CliCommand};
 use flamegraph::{FlamegraphRenderer, FlamegraphRequest, InfernoFlamegraphRenderer};
 pub use output::{CliOutput, write_cli_output};
-use perfdata::fold::fold_perfdata_callchains;
+use perfdata::fold::{
+    FoldOptions, fold_perfdata_callchains, fold_perfdata_callchains_with_options,
+};
 use process::{CommandRunner, RealCommandRunner};
 
 /// Parses command-line arguments and runs the requested Pyroclast command.
@@ -87,7 +89,12 @@ where
         CliCommand::Fold(command) => {
             let bytes = std::fs::read(command.input)?;
             Ok(CliOutput {
-                stdout: fold_perfdata_callchains(&bytes)?,
+                stdout: fold_perfdata_callchains_with_options(
+                    &bytes,
+                    FoldOptions {
+                        count_periods: command.count_periods,
+                    },
+                )?,
                 stderr: String::new(),
             })
         }

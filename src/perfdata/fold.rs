@@ -27,7 +27,13 @@ pub struct PerfSummary {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PerfSampleStack {
     pub pid: Option<u32>,
+    pub period: Option<u64>,
     pub callchain: Vec<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FoldOptions {
+    pub count_periods: bool,
 }
 
 impl PerfSummary {
@@ -101,11 +107,23 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
 ///
 /// Returns an error when the `perf.data` input cannot be parsed.
 pub fn fold_perfdata_callchains(bytes: &[u8]) -> Result<String, String> {
+    fold_perfdata_callchains_with_options(bytes, FoldOptions::default())
+}
+
+/// Collapses parsed perf sample callchains into folded stack lines.
+///
+/// # Errors
+///
+/// Returns an error when the `perf.data` input cannot be parsed.
+pub fn fold_perfdata_callchains_with_options(
+    bytes: &[u8],
+    options: FoldOptions,
+) -> Result<String, String> {
     let summary = summarize_perfdata(bytes)?;
     let mut counts = BTreeMap::<Vec<String>, u64>::new();
     for sample in &summary.sample_stacks {
         let frames = folded_frames_for_sample(sample, &summary.comms_by_pid);
-        *counts.entry(frames).or_insert(0) += 1;
+        *counts.entry(frames).or_insert(0) += sample_count(sample, options);
     }
 
     let mut folded = String::new();
@@ -117,6 +135,14 @@ pub fn fold_perfdata_callchains(bytes: &[u8]) -> Result<String, String> {
         folded.push('\n');
     }
     Ok(folded)
+}
+
+fn sample_count(sample: &PerfSampleStack, options: FoldOptions) -> u64 {
+    if options.count_periods {
+        sample.period.unwrap_or(1)
+    } else {
+        1
+    }
 }
 
 fn folded_frames_for_sample(
@@ -147,6 +173,7 @@ fn parse_sample_for_summary(
         parse_sample_record(payload, layout).map(|record| {
             Some(PerfSampleStack {
                 pid: record.pid,
+                period: record.period,
                 callchain: record.callchain,
             })
         })
