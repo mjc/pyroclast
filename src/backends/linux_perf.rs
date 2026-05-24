@@ -54,16 +54,7 @@ where
         let command = build_perf_record_command(997, "fp", &perf_data, request.command.clone());
         let output = self.runner.run(&command)?;
         let perf_bytes = std::fs::read(&perf_data)?;
-        let folded_stacks = if request.symbols {
-            let symbol_resolver = Addr2lineResolver::new(self.runner);
-            fold_perfdata_callchains_with_symbols(
-                &perf_bytes,
-                FoldOptions::default(),
-                &symbol_resolver,
-            )?
-        } else {
-            fold_perfdata_callchains(&perf_bytes)?
-        };
+        let folded_stacks = fold_linux_perfdata(&perf_bytes, request.symbols, self.runner)?;
         std::fs::write(layout.stacks_folded(), &folded_stacks)?;
         let flamegraph_output =
             InfernoFlamegraphRenderer::new(self.runner).render(&FlamegraphRequest {
@@ -104,6 +95,22 @@ where
         std::fs::write(layout.run_json(), serde_json::to_string_pretty(&manifest)?)?;
 
         Ok(ProfileResult { layout, manifest })
+    }
+}
+
+fn fold_linux_perfdata<R>(perf_bytes: &[u8], symbols: bool, runner: &R) -> BackendResult<String>
+where
+    R: CommandRunner,
+{
+    if symbols {
+        let symbol_resolver = Addr2lineResolver::new(runner);
+        Ok(fold_perfdata_callchains_with_symbols(
+            perf_bytes,
+            FoldOptions::default(),
+            &symbol_resolver,
+        )?)
+    } else {
+        Ok(fold_perfdata_callchains(perf_bytes)?)
     }
 }
 
