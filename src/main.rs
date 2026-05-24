@@ -1,5 +1,6 @@
-use pyroclast::cli::Cli;
-
 fn main() {
-    let _cli = Cli::parse_from(std::env::args_os());
+    if let Err(error) = pyroclast::run_cli(std::env::args_os()) {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    }
 }
