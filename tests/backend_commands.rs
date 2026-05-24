@@ -63,13 +63,7 @@ fn builds_inferno_flamegraph_command() {
     assert_eq!(command.program, "inferno-flamegraph");
     assert_eq!(
         command.args,
-        vec![
-            "--title",
-            "CPU profile",
-            "run/stacks.folded",
-            "--output",
-            "run/flamegraph.svg"
-        ]
+        vec!["--title", "CPU profile", "run/stacks.folded"]
     );
 }
 

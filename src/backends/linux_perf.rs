@@ -62,6 +62,7 @@ where
             layout.flamegraph_svg(),
         );
         let flamegraph_output = self.runner.run(&flamegraph_command)?;
+        std::fs::write(layout.flamegraph_svg(), &flamegraph_output.stdout)?;
 
         std::fs::write(layout.stdout_log(), &output.stdout)?;
         let mut stderr = output.stderr;
