@@ -1,3 +1,23 @@
+pub fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, String> {
+    let data = bytes
+        .get(offset..offset + 2)
+        .ok_or_else(|| format!("unexpected end of perf.data at offset {offset}"))?;
+    Ok(u16::from_le_bytes(
+        data.try_into()
+            .map_err(|_| "failed to read u16".to_string())?,
+    ))
+}
+
+pub fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, String> {
+    let data = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| format!("unexpected end of perf.data at offset {offset}"))?;
+    Ok(u32::from_le_bytes(
+        data.try_into()
+            .map_err(|_| "failed to read u32".to_string())?,
+    ))
+}
+
 pub fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, String> {
     let data = bytes
         .get(offset..offset + 8)
