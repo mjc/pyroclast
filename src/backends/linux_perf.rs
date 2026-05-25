@@ -10,6 +10,7 @@ use crate::perfdata::fold::{
 };
 use crate::process::{CommandRunner, CommandSpec};
 use crate::symbols::Addr2lineResolver;
+use crate::tools::{ToolKind, ToolSpec, collect_tool_versions};
 
 pub fn build_perf_record_command(
     frequency: u32,
@@ -92,6 +93,7 @@ where
             sample_frequency: request.frequency,
             call_graph: request.call_graph,
             symbols: request.symbols,
+            tool_versions: collect_tool_versions(self.runner, &linux_perf_tools(request.symbols)),
             artifacts: {
                 let mut artifacts = layout.standard_manifest_artifacts();
                 artifacts.push(perf_data);
@@ -105,6 +107,26 @@ where
 
         Ok(ProfileResult { layout, manifest })
     }
+}
+
+fn linux_perf_tools(symbols: bool) -> Vec<ToolSpec> {
+    let mut tools = vec![
+        ToolSpec {
+            name: "perf",
+            kind: ToolKind::NixManaged,
+        },
+        ToolSpec {
+            name: "inferno-flamegraph",
+            kind: ToolKind::NixManaged,
+        },
+    ];
+    if symbols {
+        tools.push(ToolSpec {
+            name: "addr2line",
+            kind: ToolKind::NixManaged,
+        });
+    }
+    tools
 }
 
 fn fold_linux_perfdata<R>(perf_bytes: &[u8], symbols: bool, runner: &R) -> BackendResult<String>

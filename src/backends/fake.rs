@@ -35,6 +35,7 @@ impl ProfilerBackend for FakeBackend {
             sample_frequency: request.frequency,
             call_graph: request.call_graph,
             symbols: request.symbols,
+            tool_versions: Vec::new(),
             artifacts: layout.standard_manifest_artifacts(),
             diagnostics: vec!["fake backend used".to_string()],
         };

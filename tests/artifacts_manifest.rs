@@ -1,6 +1,7 @@
 use pyroclast::artifacts::ArtifactLayout;
 use pyroclast::cli::{PerfCallGraph, ProfileKind};
 use pyroclast::manifest::{BackendName, RunManifest};
+use pyroclast::tools::ToolVersion;
 
 #[test]
 fn artifact_layout_uses_required_file_names() {
@@ -50,6 +51,11 @@ fn manifest_serializes_core_run_fields() {
         sample_frequency: 997,
         call_graph: PerfCallGraph::Dwarf,
         symbols: true,
+        tool_versions: vec![ToolVersion {
+            name: "perf".to_string(),
+            version: Some("perf version 6.9".to_string()),
+            error: None,
+        }],
         artifacts: vec!["run.json".into(), "summary.json".into()],
         diagnostics: vec!["direct perf parser used".to_string()],
     };
@@ -65,4 +71,6 @@ fn manifest_serializes_core_run_fields() {
     assert_eq!(json["sample_frequency"], 997);
     assert_eq!(json["call_graph"], "dwarf");
     assert_eq!(json["symbols"], true);
+    assert_eq!(json["tool_versions"][0]["name"], "perf");
+    assert_eq!(json["tool_versions"][0]["version"], "perf version 6.9");
 }

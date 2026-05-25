@@ -29,7 +29,19 @@ fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
     assert_eq!(result.manifest.sample_frequency, 199);
     assert_eq!(result.manifest.call_graph, PerfCallGraph::Dwarf);
     assert!(!result.manifest.symbols);
-    assert_eq!(runner.programs(), vec!["perf", "inferno-flamegraph"]);
+    assert_eq!(
+        result
+            .manifest
+            .tool_versions
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["perf", "inferno-flamegraph"]
+    );
+    assert_eq!(
+        runner.programs(),
+        vec!["perf", "inferno-flamegraph", "perf", "inferno-flamegraph"]
+    );
     assert_eq!(runner.perf_frequency(), Some("199".to_string()));
     assert_eq!(runner.perf_call_graph(), Some("dwarf".to_string()));
     assert!(result.layout.raw_profile("perf.data").is_file());
@@ -69,7 +81,14 @@ fn linux_perf_backend_can_symbolize_folded_stacks() {
 
     assert_eq!(
         runner.programs(),
-        vec!["perf", "addr2line", "inferno-flamegraph"]
+        vec![
+            "perf",
+            "addr2line",
+            "inferno-flamegraph",
+            "perf",
+            "inferno-flamegraph",
+            "addr2line"
+        ]
     );
     assert_eq!(
         std::fs::read_to_string(result.layout.stacks_folded()).expect("stacks folded"),
@@ -126,6 +145,13 @@ impl RecordingRunner {
 impl CommandRunner for RecordingRunner {
     fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
         self.commands.lock().unwrap().push(command.clone());
+        if command.args == ["--version"] {
+            return Ok(CommandOutput {
+                status_code: Some(0),
+                stdout: format!("{} fake version\n", command.program).into_bytes(),
+                stderr: Vec::new(),
+            });
+        }
         if let Some(output_path) = perf_output_path(command) {
             std::fs::write(output_path, tiny_perfdata())?;
         }

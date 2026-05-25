@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 
 use crate::cli::{PerfCallGraph, ProfileKind};
+use crate::tools::ToolVersion;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -30,6 +31,7 @@ pub struct RunManifest {
     pub sample_frequency: u32,
     pub call_graph: PerfCallGraph,
     pub symbols: bool,
+    pub tool_versions: Vec<ToolVersion>,
     pub artifacts: Vec<PathBuf>,
     pub diagnostics: Vec<String>,
 }
