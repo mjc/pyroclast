@@ -39,6 +39,11 @@ pub struct Kallsyms {
     symbols: BTreeMap<u64, String>,
 }
 
+#[must_use]
+pub fn perf_debug_dir(home: &Path) -> PathBuf {
+    home.join(".debug")
+}
+
 impl<'a, R> Addr2lineResolver<'a, R>
 where
     R: CommandRunner,

@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
-use pyroclast::symbols::{Addr2lineResolver, Kallsyms, SymbolCache, SymbolRequest, SymbolResolver};
+use pyroclast::symbols::{
+    Addr2lineResolver, Kallsyms, SymbolCache, SymbolRequest, SymbolResolver, perf_debug_dir,
+};
 
 #[test]
 fn resolves_each_unique_symbol_address_once() {
@@ -330,6 +332,14 @@ fn perf_symbol_resolver_loads_perfdata_kernel_build_id_cache_from_file() {
 
     assert_eq!(symbols, vec![Some("asm_exc_page_fault".to_string())]);
     assert!(runner.commands().is_empty());
+}
+
+#[test]
+fn perf_debug_dir_uses_home_debug_cache() {
+    assert_eq!(
+        perf_debug_dir(&PathBuf::from("/home/mjc")),
+        PathBuf::from("/home/mjc/.debug")
+    );
 }
 
 #[derive(Default)]
