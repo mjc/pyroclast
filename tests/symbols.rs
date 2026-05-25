@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
-use pyroclast::symbols::{Addr2lineResolver, SymbolCache, SymbolRequest, SymbolResolver};
+use pyroclast::symbols::{Addr2lineResolver, Kallsyms, SymbolCache, SymbolRequest, SymbolResolver};
 
 #[test]
 fn resolves_each_unique_symbol_address_once() {
@@ -156,6 +156,40 @@ fn addr2line_resolver_treats_failed_batches_as_unresolved() {
 
     assert_eq!(symbols, vec![None, None]);
     assert_eq!(runner.commands().len(), 1);
+}
+
+#[test]
+fn kallsyms_resolves_nearest_lower_kernel_symbol() {
+    let symbols = Kallsyms::parse(
+        "\
+ffffffff88000000 T startup_64
+ffffffff88000080 t asm_exc_page_fault
+ffffffff88000100 T exc_page_fault
+",
+    )
+    .expect("kallsyms");
+
+    assert_eq!(
+        symbols.resolve(0xffff_ffff_8800_008f).as_deref(),
+        Some("asm_exc_page_fault")
+    );
+    assert_eq!(symbols.resolve(0xffff_ffff_87ff_ffff), None);
+}
+
+#[test]
+fn kallsyms_ignores_malformed_lines() {
+    let symbols = Kallsyms::parse(
+        "\
+not an address T nope
+ffffffff88000080 t asm_exc_page_fault
+",
+    )
+    .expect("kallsyms");
+
+    assert_eq!(
+        symbols.resolve(0xffff_ffff_8800_0080).as_deref(),
+        Some("asm_exc_page_fault")
+    );
 }
 
 #[derive(Default)]

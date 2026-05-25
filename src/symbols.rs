@@ -28,6 +28,11 @@ pub struct Addr2lineResolver<'a, R> {
     runner: &'a R,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Kallsyms {
+    symbols: BTreeMap<u64, String>,
+}
+
 impl<'a, R> Addr2lineResolver<'a, R>
 where
     R: CommandRunner,
@@ -35,6 +40,32 @@ where
     #[must_use]
     pub fn new(runner: &'a R) -> Self {
         Self { runner }
+    }
+}
+
+impl Kallsyms {
+    /// Parses `/proc/kallsyms`-style text.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no valid symbols are present.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let symbols = text
+            .lines()
+            .filter_map(parse_kallsyms_line)
+            .collect::<BTreeMap<_, _>>();
+        if symbols.is_empty() {
+            return Err("kallsyms did not contain any parseable symbols".to_string());
+        }
+        Ok(Self { symbols })
+    }
+
+    #[must_use]
+    pub fn resolve(&self, address: u64) -> Option<String> {
+        self.symbols
+            .range(..=address)
+            .next_back()
+            .map(|(_, symbol)| symbol.clone())
     }
 }
 
@@ -194,4 +225,12 @@ fn function_name(line: &str) -> Option<String> {
     } else {
         Some(line.to_string())
     }
+}
+
+fn parse_kallsyms_line(line: &str) -> Option<(u64, String)> {
+    let mut fields = line.split_whitespace();
+    let address = u64::from_str_radix(fields.next()?, 16).ok()?;
+    let _symbol_type = fields.next()?;
+    let symbol = fields.next()?;
+    Some((address, symbol.to_string()))
 }
