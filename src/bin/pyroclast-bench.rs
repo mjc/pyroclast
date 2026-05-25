@@ -20,7 +20,11 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    match pyroclast::benchmarks::run_fold_benchmark(&input) {
+    match pyroclast::benchmarks::run_fold_benchmark_with_runner(
+        &input,
+        &RealCommandRunner,
+        args.symbols,
+    ) {
         Ok(report) => {
             print_report("pyroclast_fold", &report);
             let perf_script = match args.export_perf_script {
@@ -46,10 +50,11 @@ fn main() -> ExitCode {
                 ) {
                     Ok(report) => {
                         print_report("inferno_collapse_perf", &report);
-                        match pyroclast::benchmarks::compare_with_inferno_collapse(
+                        match pyroclast::benchmarks::compare_with_inferno_collapse_with_symbols(
                             &input,
                             &perf_script,
                             &RealCommandRunner,
+                            args.symbols,
                         ) {
                             Ok(report) => print!(
                                 "{}",

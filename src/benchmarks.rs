@@ -177,7 +177,33 @@ pub fn compare_with_inferno_collapse<R>(
 where
     R: CommandRunner,
 {
-    let pyroclast_folded = fold_perfdata_file(perf_data)?;
+    compare_with_inferno_collapse_with_symbols(perf_data, perf_script, runner, false)
+}
+
+/// Compares Pyroclast's direct folded stacks with the old
+/// `perf script | inferno-collapse-perf` folded-stack output, optionally using
+/// Pyroclast's symbolizing fold path.
+///
+/// # Errors
+///
+/// Returns an error when Pyroclast cannot fold the `perf.data`, Inferno cannot
+/// collapse the saved script, either SVG render fails, or either folded output
+/// is malformed.
+pub fn compare_with_inferno_collapse_with_symbols<R>(
+    perf_data: &Path,
+    perf_script: &Path,
+    runner: &R,
+    symbols: bool,
+) -> Result<FoldComparisonReport, String>
+where
+    R: CommandRunner,
+{
+    let pyroclast_folded = if symbols {
+        let resolver = Addr2lineResolver::new(runner);
+        fold_perfdata_file_with_symbols(perf_data, FoldOptions::default(), &resolver)?
+    } else {
+        fold_perfdata_file(perf_data)?
+    };
     let inferno_output = runner
         .run(&CommandSpec::new("inferno-collapse-perf").arg(perf_script.display().to_string()))
         .map_err(|error| format!("failed to run inferno-collapse-perf: {error}"))?;

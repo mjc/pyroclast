@@ -1,8 +1,9 @@
 use std::sync::Mutex;
 
 use pyroclast::benchmarks::{
-    BenchArgs, compare_with_inferno_collapse, export_perf_script, format_comparison_report,
-    run_fold_benchmark, run_fold_benchmark_with_runner, run_inferno_collapse_benchmark,
+    BenchArgs, compare_with_inferno_collapse, compare_with_inferno_collapse_with_symbols,
+    export_perf_script, format_comparison_report, run_fold_benchmark,
+    run_fold_benchmark_with_runner, run_inferno_collapse_benchmark,
 };
 use pyroclast::perfdata::samples::{PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_TID};
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
@@ -122,6 +123,45 @@ fn compares_pyroclast_folded_stacks_with_inferno_collapse() {
     assert_eq!(report.inferno_svg_bytes, 21);
     assert_eq!(report.only_pyroclast, Vec::<String>::new());
     assert_eq!(report.only_inferno, Vec::<String>::new());
+}
+
+#[test]
+fn compares_symbolized_pyroclast_folded_stacks_with_inferno_collapse() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    let perf_script = root.path().join("perf-script.txt");
+    std::fs::write(
+        &perfdata,
+        perfdata_with_records_and_attrs(
+            [file_attr_bytes(
+                PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+                0,
+                0,
+            )],
+            [
+                record_bytes(1, &mmap_payload(11, 11, 0x1000, 0x100, 0, "/bin/app")),
+                record_bytes(9, &sample_payload(0x1000, 11, 12, [0x1010])),
+            ],
+        ),
+    )
+    .expect("write perfdata");
+    std::fs::write(&perf_script, "sample script\n").expect("write perf script");
+    let runner = SymbolizedCompareRunner::default();
+
+    let report = compare_with_inferno_collapse_with_symbols(&perfdata, &perf_script, &runner, true)
+        .expect("comparison");
+
+    assert!(report.matches);
+    assert!(report.svg_matches);
+    assert_eq!(
+        runner.programs(),
+        vec![
+            "addr2line",
+            "inferno-collapse-perf",
+            "inferno-flamegraph",
+            "inferno-flamegraph"
+        ]
+    );
 }
 
 #[test]
@@ -282,6 +322,44 @@ impl CommandRunner for Addr2lineRunner {
         Ok(CommandOutput {
             status_code: Some(0),
             stdout: b"app::main\n/bin/app.rs:10\n".to_vec(),
+            stderr: Vec::new(),
+        })
+    }
+}
+
+#[derive(Default)]
+struct SymbolizedCompareRunner {
+    commands: Mutex<Vec<CommandSpec>>,
+}
+
+impl SymbolizedCompareRunner {
+    fn programs(&self) -> Vec<String> {
+        self.commands
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|command| command.program.clone())
+            .collect()
+    }
+}
+
+impl CommandRunner for SymbolizedCompareRunner {
+    fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
+        self.commands.lock().unwrap().push(command.clone());
+        let stdout = match command.program.as_str() {
+            "addr2line" => b"app::main\n/bin/app.rs:10\n".to_vec(),
+            "inferno-collapse-perf" => b"app::main 1\n".to_vec(),
+            "inferno-flamegraph" => {
+                let mut svg = b"<svg>".to_vec();
+                svg.extend(command.stdin.as_deref().unwrap_or_default());
+                svg.extend(b"</svg>\n");
+                svg
+            }
+            _ => Vec::new(),
+        };
+        Ok(CommandOutput {
+            status_code: Some(0),
+            stdout,
             stderr: Vec::new(),
         })
     }
