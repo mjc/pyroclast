@@ -234,7 +234,7 @@ fn summarize_folded_artifact(
     if json {
         Ok(format!("{}\n", serde_json::to_string_pretty(&summary)?))
     } else {
-        Ok(render_folded_stack_summary_text(summary))
+        Ok(render_folded_stack_summary_text(&summary))
     }
 }
 

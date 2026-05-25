@@ -92,7 +92,7 @@ where
         let summary = summarize_folded_stacks(&folded_stacks);
         std::fs::write(
             layout.summary_txt(),
-            render_folded_stack_summary_text(summary),
+            render_folded_stack_summary_text(&summary),
         )?;
         std::fs::write(
             layout.summary_json(),

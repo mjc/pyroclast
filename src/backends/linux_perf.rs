@@ -157,7 +157,7 @@ where
         std::fs::write(layout.command_txt(), command_text(request, &target))?;
         std::fs::write(
             layout.summary_txt(),
-            render_folded_stack_summary_text(folded_summary),
+            render_folded_stack_summary_text(&folded_summary),
         )?;
         std::fs::write(
             layout.summary_json(),
