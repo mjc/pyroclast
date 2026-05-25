@@ -20,6 +20,7 @@ use artifacts::ArtifactLayout;
 use backends::fake::FakeBackend;
 use backends::heaptrack::HeaptrackBackend;
 use backends::linux_perf::LinuxPerfBackend;
+use backends::macos_xctrace::MacosXctraceBackend;
 use backends::offcpu::OffcpuBackend;
 use backends::strace::StraceBackend;
 use backends::{ProfileRequest, ProfilerBackend};
@@ -88,6 +89,30 @@ where
     R: CommandRunner,
     F: FlamegraphRenderer,
 {
+    run_parsed_cli_with_runner_and_renderer_on_platform(
+        cli,
+        runner,
+        flamegraph_renderer,
+        std::env::consts::OS,
+    )
+}
+
+/// Runs a parsed CLI command with injected dependencies and platform routing.
+///
+/// # Errors
+///
+/// Returns an error when command execution, artifact I/O, rendering, or input
+/// parsing fails.
+pub fn run_parsed_cli_with_runner_and_renderer_on_platform<R, F>(
+    cli: Cli,
+    runner: &R,
+    flamegraph_renderer: F,
+    platform: &str,
+) -> backends::BackendResult<CliOutput>
+where
+    R: CommandRunner,
+    F: FlamegraphRenderer,
+{
     if let Some(invocation) = cli.command.profile_invocation() {
         let out_dir = invocation
             .out
@@ -109,16 +134,19 @@ where
             duration_secs: invocation.duration_secs,
         };
         match request.kind {
-            ProfileKind::Cpu if std::env::consts::OS == "linux" => {
+            ProfileKind::Cpu if platform == "linux" => {
                 LinuxPerfBackend::with_renderer(runner, flamegraph_renderer).profile(&request)?;
             }
-            ProfileKind::Latency if std::env::consts::OS == "linux" => {
+            ProfileKind::Cpu if platform == "macos" => {
+                MacosXctraceBackend::new(runner).profile(&request)?;
+            }
+            ProfileKind::Latency if platform == "linux" => {
                 StraceBackend::new(runner).profile(&request)?;
             }
-            ProfileKind::Memory if std::env::consts::OS == "linux" => {
+            ProfileKind::Memory if platform == "linux" => {
                 HeaptrackBackend::new(runner).profile(&request)?;
             }
-            ProfileKind::Offcpu if std::env::consts::OS == "linux" => {
+            ProfileKind::Offcpu if platform == "linux" => {
                 OffcpuBackend::new(runner).profile(&request)?;
             }
             _ => {

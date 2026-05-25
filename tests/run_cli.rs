@@ -328,6 +328,35 @@ fn top_level_cpu_command_uses_injected_perf_runner() {
 }
 
 #[test]
+fn top_level_cpu_command_uses_xctrace_on_macos() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let out = root.path().join("macos-cpu-run");
+    let runner = RecordingRunner::default();
+    let cli = pyroclast::cli::Cli::parse_from([
+        "pyroclast",
+        "cpu",
+        "--out",
+        out.to_str().expect("utf8 path"),
+        "--",
+        "true",
+    ]);
+
+    pyroclast::run_parsed_cli_with_runner_and_renderer_on_platform(
+        cli,
+        &runner,
+        pyroclast::flamegraph::InfernoFlamegraphRenderer::new(&runner),
+        "macos",
+    )
+    .expect("run cli");
+
+    assert_eq!(runner.programs(), vec!["xctrace", "xctrace", "xctrace"]);
+    let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
+    assert!(run_json.contains("\"actual_backend\": \"macos_xctrace\""));
+    assert!(out.join("profile.raw.xctrace.trace").is_dir());
+    assert!(out.join("profile.raw.xctrace.xml").is_file());
+}
+
+#[test]
 fn top_level_latency_command_uses_injected_strace_runner() {
     let root = tempfile::tempdir().expect("tempdir");
     let out = root.path().join("latency-run");
@@ -437,6 +466,15 @@ impl pyroclast::process::CommandRunner for RecordingRunner {
         if let Some(output_path) = heaptrack_output_path(command) {
             std::fs::write(output_path, b"raw heaptrack bytes")?;
         }
+        if let Some(trace_path) = xctrace_record_output_path(command) {
+            std::fs::create_dir_all(trace_path)?;
+        }
+        if let Some(xml_path) = xctrace_export_output_path(command) {
+            std::fs::write(
+                xml_path,
+                "<table><row><symbol>app::main</symbol><weight>12.5</weight></row></table>",
+            )?;
+        }
         let stdout = match command.program.as_str() {
             "addr2line" => b"app::work\n/bin/app.rs:10\n".to_vec(),
             "bpftrace" => {
@@ -508,6 +546,30 @@ fn heaptrack_output_path(command: &pyroclast::process::CommandSpec) -> Option<&s
                 .args
                 .windows(2)
                 .find(|window| window[0] == "-o")
+                .map(|window| window[1].as_str())
+        })
+        .flatten()
+}
+
+fn xctrace_record_output_path(command: &pyroclast::process::CommandSpec) -> Option<&str> {
+    (command.program == "xctrace" && command.args.first().map(String::as_str) == Some("record"))
+        .then(|| {
+            command
+                .args
+                .windows(2)
+                .find(|window| window[0] == "--output")
+                .map(|window| window[1].as_str())
+        })
+        .flatten()
+}
+
+fn xctrace_export_output_path(command: &pyroclast::process::CommandSpec) -> Option<&str> {
+    (command.program == "xctrace" && command.args.first().map(String::as_str) == Some("export"))
+        .then(|| {
+            command
+                .args
+                .windows(2)
+                .find(|window| window[0] == "--output")
                 .map(|window| window[1].as_str())
         })
         .flatten()
