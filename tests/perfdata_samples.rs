@@ -1,3 +1,4 @@
+use proptest::prelude::*;
 use pyroclast::perfdata::samples::{
     PERF_FORMAT_GROUP, PERF_FORMAT_ID, PERF_FORMAT_LOST, PERF_FORMAT_TOTAL_TIME_ENABLED,
     PERF_FORMAT_TOTAL_TIME_RUNNING, PERF_SAMPLE_ADDR, PERF_SAMPLE_AUX, PERF_SAMPLE_BRANCH_COUNTERS,
@@ -435,4 +436,37 @@ fn detects_kernel_space_frames() {
     assert!(is_kernel_space_frame(0xffff_ffff_8800_1280));
     assert!(!is_kernel_space_frame(0x0000_7fff_ffff_f000));
     assert!(!is_kernel_space_frame(0xffff_ffff_ffff_fe00));
+}
+
+proptest! {
+    #[test]
+    fn parses_generated_callchain_sample_payloads(
+        ip in any::<u64>(),
+        pid in any::<u32>(),
+        tid in any::<u32>(),
+        period in any::<u64>(),
+        frames in proptest::collection::vec(any::<u64>(), 0..64),
+    ) {
+        let mut payload = Vec::new();
+        payload.extend(ip.to_le_bytes());
+        payload.extend(pid.to_le_bytes());
+        payload.extend(tid.to_le_bytes());
+        payload.extend(period.to_le_bytes());
+        payload.extend((frames.len() as u64).to_le_bytes());
+        for frame in &frames {
+            payload.extend(frame.to_le_bytes());
+        }
+
+        let sample = parse_sample_record(
+            &payload,
+            layout(PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN),
+        )
+        .expect("sample");
+
+        prop_assert_eq!(sample.ip, Some(ip));
+        prop_assert_eq!(sample.pid, Some(pid));
+        prop_assert_eq!(sample.tid, Some(tid));
+        prop_assert_eq!(sample.period, Some(period));
+        prop_assert_eq!(sample.callchain, frames);
+    }
 }
