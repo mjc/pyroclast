@@ -77,11 +77,16 @@ impl CommandRunner for RealCommandRunner {
         if let Some(stdin) = &command.stdin {
             use std::io::Write;
 
-            child
+            match child
                 .stdin
                 .as_mut()
                 .ok_or_else(|| std::io::Error::other("failed to open child stdin"))?
-                .write_all(stdin)?;
+                .write_all(stdin)
+            {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+                Err(error) => return Err(error),
+            }
         }
         let output = child.wait_with_output()?;
         Ok(CommandOutput {
