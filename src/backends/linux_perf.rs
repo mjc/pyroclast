@@ -122,7 +122,10 @@ where
             ended_at_unix_ms: Some(unix_ms_now()),
             exit_status: output.status_code,
             sample_frequency: request.frequency,
+            sample_event: request.event,
             call_graph: request.call_graph,
+            record_target: record_target_label(request).to_string(),
+            duration_secs: attach_duration(request),
             symbols: request.symbols,
             tool_versions: collect_tool_versions(self.runner, &linux_perf_tools(request.symbols)),
             artifacts: {
@@ -147,6 +150,24 @@ fn perf_record_target(request: &ProfileRequest) -> PerfRecordTarget {
         PerfRecordTarget::Command(request.command.clone())
     } else {
         PerfRecordTarget::Threads(request.tids.clone())
+    }
+}
+
+fn record_target_label(request: &ProfileRequest) -> &'static str {
+    if request.pid.is_some() {
+        "process"
+    } else if request.tids.is_empty() {
+        "command"
+    } else {
+        "threads"
+    }
+}
+
+fn attach_duration(request: &ProfileRequest) -> Option<u32> {
+    if request.pid.is_some() || !request.tids.is_empty() {
+        Some(request.duration_secs)
+    } else {
+        None
     }
 }
 

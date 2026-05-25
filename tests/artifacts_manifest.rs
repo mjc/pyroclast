@@ -1,5 +1,5 @@
 use pyroclast::artifacts::ArtifactLayout;
-use pyroclast::cli::{PerfCallGraph, ProfileKind};
+use pyroclast::cli::{PerfCallGraph, PerfEvent, ProfileKind};
 use pyroclast::manifest::{BackendName, RunManifest};
 use pyroclast::tools::ToolVersion;
 
@@ -49,7 +49,10 @@ fn manifest_serializes_core_run_fields() {
         ended_at_unix_ms: Some(20),
         exit_status: Some(0),
         sample_frequency: 997,
+        sample_event: PerfEvent::CpuClock,
         call_graph: PerfCallGraph::Dwarf,
+        record_target: "command".to_string(),
+        duration_secs: None,
         symbols: true,
         tool_versions: vec![ToolVersion {
             name: "perf".to_string(),
@@ -69,7 +72,10 @@ fn manifest_serializes_core_run_fields() {
     assert_eq!(json["fallback_reason"], serde_json::Value::Null);
     assert_eq!(json["exit_status"], 0);
     assert_eq!(json["sample_frequency"], 997);
+    assert_eq!(json["sample_event"], "cpu-clock");
     assert_eq!(json["call_graph"], "dwarf");
+    assert_eq!(json["record_target"], "command");
+    assert_eq!(json["duration_secs"], serde_json::Value::Null);
     assert_eq!(json["symbols"], true);
     assert_eq!(json["tool_versions"][0]["name"], "perf");
     assert_eq!(json["tool_versions"][0]["version"], "perf version 6.9");
