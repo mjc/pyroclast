@@ -32,6 +32,9 @@ impl ProfilerBackend for FakeBackend {
             started_at_unix_ms: unix_ms_now(),
             ended_at_unix_ms: Some(unix_ms_now()),
             exit_status: Some(0),
+            sample_frequency: request.frequency,
+            call_graph: request.call_graph,
+            symbols: request.symbols,
             artifacts: layout.standard_manifest_artifacts(),
             diagnostics: vec!["fake backend used".to_string()],
         };

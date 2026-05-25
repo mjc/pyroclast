@@ -26,6 +26,9 @@ fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
     let result = backend.profile(&request).expect("profile");
 
     assert_eq!(result.manifest.actual_backend, BackendName::LinuxPerf);
+    assert_eq!(result.manifest.sample_frequency, 199);
+    assert_eq!(result.manifest.call_graph, PerfCallGraph::Dwarf);
+    assert!(!result.manifest.symbols);
     assert_eq!(runner.programs(), vec!["perf", "inferno-flamegraph"]);
     assert_eq!(runner.perf_frequency(), Some("199".to_string()));
     assert_eq!(runner.perf_call_graph(), Some("dwarf".to_string()));

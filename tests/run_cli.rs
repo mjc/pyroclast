@@ -184,6 +184,9 @@ fn top_level_cpu_command_uses_injected_perf_runner() {
     assert_eq!(runner.programs(), vec!["perf", "inferno-flamegraph"]);
     let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
     assert!(run_json.contains("\"actual_backend\": \"linux_perf\""));
+    assert!(run_json.contains("\"sample_frequency\": 997"));
+    assert!(run_json.contains("\"call_graph\": \"fp\""));
+    assert!(run_json.contains("\"symbols\": false"));
 }
 
 #[derive(Default)]

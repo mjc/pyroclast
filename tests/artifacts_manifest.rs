@@ -1,5 +1,5 @@
 use pyroclast::artifacts::ArtifactLayout;
-use pyroclast::cli::ProfileKind;
+use pyroclast::cli::{PerfCallGraph, ProfileKind};
 use pyroclast::manifest::{BackendName, RunManifest};
 
 #[test]
@@ -47,6 +47,9 @@ fn manifest_serializes_core_run_fields() {
         started_at_unix_ms: 10,
         ended_at_unix_ms: Some(20),
         exit_status: Some(0),
+        sample_frequency: 997,
+        call_graph: PerfCallGraph::Dwarf,
+        symbols: true,
         artifacts: vec!["run.json".into(), "summary.json".into()],
         diagnostics: vec!["direct perf parser used".to_string()],
     };
@@ -59,4 +62,7 @@ fn manifest_serializes_core_run_fields() {
     assert_eq!(json["actual_backend"], "linux_perf");
     assert_eq!(json["fallback_reason"], serde_json::Value::Null);
     assert_eq!(json["exit_status"], 0);
+    assert_eq!(json["sample_frequency"], 997);
+    assert_eq!(json["call_graph"], "dwarf");
+    assert_eq!(json["symbols"], true);
 }

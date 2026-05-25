@@ -89,6 +89,9 @@ where
             started_at_unix_ms: unix_ms_now(),
             ended_at_unix_ms: Some(unix_ms_now()),
             exit_status: output.status_code,
+            sample_frequency: request.frequency,
+            call_graph: request.call_graph,
+            symbols: request.symbols,
             artifacts: {
                 let mut artifacts = layout.standard_manifest_artifacts();
                 artifacts.push(perf_data);
