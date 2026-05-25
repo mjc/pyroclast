@@ -243,7 +243,7 @@ impl<'a> SampleCursor<'a> {
 
     fn skip_read_format(&mut self, read_format: u64) -> Result<(), String> {
         if read_format & PERF_FORMAT_GROUP != 0 {
-            return Err("group PERF_SAMPLE_READ payloads are not supported yet".to_string());
+            return self.skip_group_read_format(read_format);
         }
 
         self.skip_u64()?;
@@ -258,6 +258,29 @@ impl<'a> SampleCursor<'a> {
         }
         if read_format & PERF_FORMAT_LOST != 0 {
             self.skip_u64()?;
+        }
+
+        Ok(())
+    }
+
+    fn skip_group_read_format(&mut self, read_format: u64) -> Result<(), String> {
+        let values = usize::try_from(self.read_u64()?)
+            .map_err(|_| "perf sample read group count does not fit in usize".to_string())?;
+        if read_format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0 {
+            self.skip_u64()?;
+        }
+        if read_format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0 {
+            self.skip_u64()?;
+        }
+
+        for _ in 0..values {
+            self.skip_u64()?;
+            if read_format & PERF_FORMAT_ID != 0 {
+                self.skip_u64()?;
+            }
+            if read_format & PERF_FORMAT_LOST != 0 {
+                self.skip_u64()?;
+            }
         }
 
         Ok(())

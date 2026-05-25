@@ -1,5 +1,5 @@
 use pyroclast::perfdata::samples::{
-    PERF_FORMAT_ID, PERF_FORMAT_LOST, PERF_FORMAT_TOTAL_TIME_ENABLED,
+    PERF_FORMAT_GROUP, PERF_FORMAT_ID, PERF_FORMAT_LOST, PERF_FORMAT_TOTAL_TIME_ENABLED,
     PERF_FORMAT_TOTAL_TIME_RUNNING, PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU,
     PERF_SAMPLE_ID, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_READ, PERF_SAMPLE_STREAM_ID,
     PERF_SAMPLE_TID, PERF_SAMPLE_TIME, SampleLayout, is_kernel_space_frame, is_perf_context_marker,
@@ -123,6 +123,39 @@ fn skips_single_read_format_before_callchain() {
     .expect("sample");
 
     assert_eq!(sample.callchain, vec![0x2000, 0x3000]);
+}
+
+#[test]
+fn skips_group_read_format_before_callchain() {
+    let mut payload = Vec::new();
+    payload.extend(2u64.to_le_bytes());
+    payload.extend(77u64.to_le_bytes());
+    payload.extend(88u64.to_le_bytes());
+    payload.extend(11u64.to_le_bytes());
+    payload.extend(12u64.to_le_bytes());
+    payload.extend(13u64.to_le_bytes());
+    payload.extend(21u64.to_le_bytes());
+    payload.extend(22u64.to_le_bytes());
+    payload.extend(23u64.to_le_bytes());
+    payload.extend(2u64.to_le_bytes());
+    payload.extend(0x2000u64.to_le_bytes());
+    payload.extend(0x3000u64.to_le_bytes());
+
+    let sample = parse_sample_record_callchain(
+        &payload,
+        SampleLayout {
+            sample_type: PERF_SAMPLE_READ | PERF_SAMPLE_CALLCHAIN,
+            read_format: PERF_FORMAT_GROUP
+                | PERF_FORMAT_TOTAL_TIME_ENABLED
+                | PERF_FORMAT_TOTAL_TIME_RUNNING
+                | PERF_FORMAT_ID
+                | PERF_FORMAT_LOST,
+        },
+    )
+    .expect("sample")
+    .expect("callchain");
+
+    assert_eq!(sample.frames.collect::<Vec<_>>(), vec![0x2000, 0x3000]);
 }
 
 #[test]
