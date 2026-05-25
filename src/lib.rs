@@ -80,6 +80,9 @@ where
             frequency: invocation.frequency,
             event: invocation.event,
             call_graph: invocation.call_graph,
+            pid: invocation.pid,
+            tids: invocation.tids,
+            duration_secs: invocation.duration_secs,
         };
         match request.kind {
             ProfileKind::Cpu if std::env::consts::OS == "linux" => {

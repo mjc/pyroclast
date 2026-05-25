@@ -24,6 +24,9 @@ pub struct ProfileRequest {
     pub frequency: u32,
     pub event: PerfEvent,
     pub call_graph: PerfCallGraph,
+    pub pid: Option<u32>,
+    pub tids: Vec<u32>,
+    pub duration_secs: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

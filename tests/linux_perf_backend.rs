@@ -22,6 +22,9 @@ fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
         frequency: 199,
         event: PerfEvent::CpuClock,
         call_graph: PerfCallGraph::Dwarf,
+        pid: None,
+        tids: Vec::new(),
+        duration_secs: 3600,
     };
 
     let result = backend.profile(&request).expect("profile");
@@ -77,6 +80,9 @@ fn linux_perf_backend_can_symbolize_folded_stacks() {
         frequency: 997,
         event: PerfEvent::CpuClock,
         call_graph: PerfCallGraph::Fp,
+        pid: None,
+        tids: Vec::new(),
+        duration_secs: 3600,
     };
 
     let result = backend.profile(&request).expect("profile");
@@ -96,6 +102,85 @@ fn linux_perf_backend_can_symbolize_folded_stacks() {
         std::fs::read_to_string(result.layout.stacks_folded()).expect("stacks folded"),
         "app;app::work 1\n"
     );
+}
+
+#[test]
+fn linux_perf_backend_records_attached_process() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let runner = RecordingRunner::default();
+    let backend = LinuxPerfBackend::new(&runner);
+    let request = ProfileRequest {
+        kind: ProfileKind::Cpu,
+        command: Vec::new(),
+        out_dir: root.path().join("cpu"),
+        name: None,
+        json: false,
+        symbols: false,
+        frequency: 199,
+        event: PerfEvent::CpuClock,
+        call_graph: PerfCallGraph::Fp,
+        pid: Some(99),
+        tids: Vec::new(),
+        duration_secs: 5,
+    };
+
+    backend.profile(&request).expect("profile");
+
+    assert_eq!(
+        runner.first_perf_args(),
+        vec![
+            "record",
+            "-e",
+            "cpu-clock",
+            "-F",
+            "199",
+            "-g",
+            "--call-graph",
+            "fp",
+            "-p",
+            "99",
+            "-o",
+            root.path()
+                .join("cpu/profile.raw.perf.data")
+                .display()
+                .to_string()
+                .as_str(),
+            "--",
+            "sleep",
+            "5",
+        ]
+    );
+}
+
+#[test]
+fn linux_perf_backend_records_attached_threads() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let runner = RecordingRunner::default();
+    let backend = LinuxPerfBackend::new(&runner);
+    let request = ProfileRequest {
+        kind: ProfileKind::Cpu,
+        command: Vec::new(),
+        out_dir: root.path().join("cpu"),
+        name: None,
+        json: false,
+        symbols: false,
+        frequency: 997,
+        event: PerfEvent::CpuClock,
+        call_graph: PerfCallGraph::Fp,
+        pid: None,
+        tids: vec![101, 102],
+        duration_secs: 7,
+    };
+
+    backend.profile(&request).expect("profile");
+
+    assert!(runner.first_perf_args().contains(&"-t".to_string()));
+    assert!(runner.first_perf_args().contains(&"101,102".to_string()));
+    assert!(runner.first_perf_args().ends_with(&[
+        "--".to_string(),
+        "sleep".to_string(),
+        "7".to_string()
+    ]));
 }
 
 #[derive(Default)]
@@ -141,6 +226,16 @@ impl RecordingRunner {
                     .find(|window| window[0] == "--call-graph")
                     .map(|window| window[1].clone())
             })
+    }
+
+    fn first_perf_args(&self) -> Vec<String> {
+        self.commands
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|command| command.program == "perf")
+            .map(|command| command.args.clone())
+            .unwrap_or_default()
     }
 }
 

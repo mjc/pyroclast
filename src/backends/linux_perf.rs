@@ -24,6 +24,7 @@ pub fn build_perf_record_command(
     callgraph: &str,
     output: &Path,
     target: PerfRecordTarget,
+    duration_secs: u32,
 ) -> CommandSpec {
     let mut command = CommandSpec::new("perf").args([
         "record".to_string(),
@@ -57,7 +58,7 @@ pub fn build_perf_record_command(
     match target {
         PerfRecordTarget::Command(profiled_command) => command.args(profiled_command),
         PerfRecordTarget::Process(_) | PerfRecordTarget::Threads(_) => {
-            command.args(["sleep".to_string(), "3600".to_string()])
+            command.args(["sleep".to_string(), duration_secs.to_string()])
         }
     }
 }
@@ -87,7 +88,8 @@ where
             request.frequency,
             &call_graph,
             &perf_data,
-            PerfRecordTarget::Command(request.command.clone()),
+            perf_record_target(request),
+            request.duration_secs,
         );
         let output = self.runner.run(&command)?;
         let folded_stacks = fold_linux_perfdata(&perf_data, request.symbols, self.runner)?;
@@ -135,6 +137,16 @@ where
         std::fs::write(layout.run_json(), serde_json::to_string_pretty(&manifest)?)?;
 
         Ok(ProfileResult { layout, manifest })
+    }
+}
+
+fn perf_record_target(request: &ProfileRequest) -> PerfRecordTarget {
+    if let Some(pid) = request.pid {
+        PerfRecordTarget::Process(pid)
+    } else if request.tids.is_empty() {
+        PerfRecordTarget::Command(request.command.clone())
+    } else {
+        PerfRecordTarget::Threads(request.tids.clone())
     }
 }
 

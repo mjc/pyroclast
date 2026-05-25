@@ -14,6 +14,7 @@ fn builds_linux_perf_record_command() {
         "fp",
         &PathBuf::from("run/profile.raw.perf.data"),
         PerfRecordTarget::Command(vec!["cargo".to_string(), "check".to_string()]),
+        3600,
     );
 
     assert_eq!(command.program, "perf");
@@ -45,6 +46,7 @@ fn builds_linux_perf_thread_record_command() {
         "dwarf",
         &PathBuf::from("run/profile.raw.perf.data"),
         PerfRecordTarget::Threads(vec![101, 102, 103]),
+        15,
     );
 
     assert_eq!(command.program, "perf");
@@ -65,7 +67,7 @@ fn builds_linux_perf_thread_record_command() {
             "run/profile.raw.perf.data",
             "--",
             "sleep",
-            "3600",
+            "15",
         ]
     );
 }
@@ -78,6 +80,7 @@ fn builds_linux_perf_process_record_command() {
         "fp",
         &PathBuf::from("run/profile.raw.perf.data"),
         PerfRecordTarget::Process(99),
+        30,
     );
 
     assert_eq!(command.program, "perf");
@@ -98,7 +101,7 @@ fn builds_linux_perf_process_record_command() {
             "run/profile.raw.perf.data",
             "--",
             "sleep",
-            "3600",
+            "30",
         ]
     );
 }

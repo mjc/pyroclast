@@ -15,6 +15,9 @@ fn fake_backend_writes_required_artifacts() {
         frequency: 997,
         event: PerfEvent::CpuClock,
         call_graph: PerfCallGraph::Fp,
+        pid: None,
+        tids: Vec::new(),
+        duration_secs: 3600,
     };
 
     let result = FakeBackend.profile(&request).expect("fake profile");
