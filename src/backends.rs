@@ -21,6 +21,7 @@ pub struct ProfileRequest {
     pub name: Option<String>,
     pub json: bool,
     pub symbols: bool,
+    pub frequency: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

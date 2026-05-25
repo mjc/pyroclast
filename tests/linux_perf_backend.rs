@@ -19,12 +19,14 @@ fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
         name: None,
         json: false,
         symbols: false,
+        frequency: 199,
     };
 
     let result = backend.profile(&request).expect("profile");
 
     assert_eq!(result.manifest.actual_backend, BackendName::LinuxPerf);
     assert_eq!(runner.programs(), vec!["perf", "inferno-flamegraph"]);
+    assert_eq!(runner.perf_frequency(), Some("199".to_string()));
     assert!(result.layout.raw_profile("perf.data").is_file());
     assert_eq!(
         std::fs::read(result.layout.raw_profile("perf.data")).expect("perf data"),
@@ -54,6 +56,7 @@ fn linux_perf_backend_can_symbolize_folded_stacks() {
         name: None,
         json: false,
         symbols: true,
+        frequency: 997,
     };
 
     let result = backend.profile(&request).expect("profile");
@@ -81,6 +84,21 @@ impl RecordingRunner {
             .iter()
             .map(|command| command.program.clone())
             .collect()
+    }
+
+    fn perf_frequency(&self) -> Option<String> {
+        self.commands
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|command| command.program == "perf")
+            .and_then(|command| {
+                command
+                    .args
+                    .windows(2)
+                    .find(|window| window[0] == "-F")
+                    .map(|window| window[1].clone())
+            })
     }
 }
 

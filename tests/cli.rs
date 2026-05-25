@@ -13,6 +13,7 @@ fn parses_profile_defaults() {
             assert_eq!(profile.name, None);
             assert!(!profile.json);
             assert!(!profile.symbols);
+            assert_eq!(profile.frequency, 997);
             assert_eq!(profile.command, vec!["true"]);
         }
         other => panic!("expected profile command, got {other:?}"),
@@ -32,6 +33,8 @@ fn parses_profile_options() {
         "heap-run",
         "--json",
         "--symbols",
+        "--frequency",
+        "199",
         "--",
         "cargo",
         "check",
@@ -44,6 +47,7 @@ fn parses_profile_options() {
             assert_eq!(profile.name.as_deref(), Some("heap-run"));
             assert!(profile.json);
             assert!(profile.symbols);
+            assert_eq!(profile.frequency, 199);
             assert_eq!(profile.command, vec!["cargo", "check"]);
         }
         other => panic!("expected profile command, got {other:?}"),
@@ -69,15 +73,26 @@ fn parses_top_level_profiler_commands() {
             .unwrap_or_else(|| panic!("expected profile invocation for {verb}"));
         assert_eq!(profile.kind, kind, "verb {verb}");
         assert!(!profile.symbols, "verb {verb}");
+        assert_eq!(profile.frequency, 997, "verb {verb}");
         assert_eq!(profile.command, vec!["cargo", "check"]);
     }
 
-    let cpu = Cli::parse_from(["pyroclast", "cpu", "--symbols", "--", "cargo", "check"]);
+    let cpu = Cli::parse_from([
+        "pyroclast",
+        "cpu",
+        "--symbols",
+        "--frequency",
+        "199",
+        "--",
+        "cargo",
+        "check",
+    ]);
     let profile = cpu
         .command
         .profile_invocation()
         .expect("expected profile invocation");
     assert!(profile.symbols);
+    assert_eq!(profile.frequency, 199);
 }
 
 #[test]

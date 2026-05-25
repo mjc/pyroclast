@@ -58,6 +58,9 @@ pub struct RunArgs {
     #[arg(long)]
     pub symbols: bool,
 
+    #[arg(long, default_value_t = 997)]
+    pub frequency: u32,
+
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
 }
@@ -69,6 +72,7 @@ pub struct ProfileInvocation {
     pub name: Option<String>,
     pub json: bool,
     pub symbols: bool,
+    pub frequency: u32,
     pub command: Vec<String>,
 }
 
@@ -87,6 +91,7 @@ impl CliCommand {
                 name: args.name.clone(),
                 json: args.json,
                 symbols: args.symbols,
+                frequency: args.frequency,
                 command: args.command.clone(),
             }),
             Self::Fold(_) | Self::Summarize(_) | Self::Flamegraph(_) => None,
@@ -102,6 +107,7 @@ impl ProfileInvocation {
             name: args.name.clone(),
             json: args.json,
             symbols: args.symbols,
+            frequency: args.frequency,
             command: args.command.clone(),
         }
     }
@@ -123,6 +129,9 @@ pub struct ProfileArgs {
 
     #[arg(long)]
     pub symbols: bool,
+
+    #[arg(long, default_value_t = 997)]
+    pub frequency: u32,
 
     #[arg(last = true, required = true)]
     pub command: Vec<String>,

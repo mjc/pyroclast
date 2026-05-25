@@ -12,6 +12,7 @@ fn fake_backend_writes_required_artifacts() {
         name: Some("fake".to_string()),
         json: false,
         symbols: false,
+        frequency: 997,
     };
 
     let result = FakeBackend.profile(&request).expect("fake profile");
