@@ -20,6 +20,14 @@ impl ToolSpec {
             kind: ToolKind::NixManaged,
         }
     }
+
+    #[must_use]
+    pub const fn apple_provided(name: &'static str) -> Self {
+        Self {
+            name,
+            kind: ToolKind::AppleProvided,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -101,8 +109,5 @@ const LINUX_TOOLS: &[ToolSpec] = &[
 const MACOS_TOOLS: &[ToolSpec] = &[
     nix_tool("inferno-flamegraph"),
     nix_tool("tokio-console"),
-    ToolSpec {
-        name: "xctrace",
-        kind: ToolKind::AppleProvided,
-    },
+    ToolSpec::apple_provided("xctrace"),
 ];
