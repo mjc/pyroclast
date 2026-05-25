@@ -11,6 +11,7 @@ use crate::perfdata::records::{
 };
 use crate::perfdata::samples::{
     SampleLayout, is_kernel_space_frame, is_perf_context_marker, parse_sample_record,
+    parse_sample_record_callchain,
 };
 use crate::symbols::{SymbolCache, SymbolRequest, SymbolResolver};
 
@@ -52,16 +53,6 @@ impl PerfSummary {
     #[must_use]
     pub fn record_count(&self, record_type: u32) -> usize {
         self.record_counts.get(&record_type).copied().unwrap_or(0)
-    }
-}
-
-impl PerfSampleStack {
-    fn count(&self, options: FoldOptions) -> u64 {
-        if options.count_periods {
-            self.period.unwrap_or(1)
-        } else {
-            1
-        }
     }
 }
 
@@ -233,21 +224,16 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
             PERF_RECORD_MMAP => parse_mmap_record(record.payload).map(|record| {
                 mmap_table.insert_mmap(record);
             }),
-            PERF_RECORD_SAMPLE => {
-                parse_sample_for_summary(record.payload, sample_layout).map(|sample| {
-                    if let Some(sample) = sample {
+            PERF_RECORD_SAMPLE => parse_sample_for_fold(record.payload, sample_layout, options)
+                .map(|sample| {
+                    if let Some((pid, count, frames)) = sample {
                         raw_stacks.add(
-                            sample.pid,
-                            sample
-                                .callchain
-                                .iter()
-                                .copied()
-                                .filter(|frame| !is_perf_context_marker(*frame)),
-                            sample.count(options),
+                            pid,
+                            frames.filter(|frame| !is_perf_context_marker(*frame)),
+                            count,
                         );
                     }
-                })
-            }
+                }),
             PERF_RECORD_MMAP2 => parse_mmap2_record(record.payload).map(|record| {
                 mmap_table.insert_mmap2(record);
             }),
@@ -418,6 +404,27 @@ fn parse_sample_for_summary(
                 pid: record.pid,
                 period: record.period,
                 callchain: record.callchain,
+            })
+        })
+    } else {
+        Ok(None)
+    }
+}
+
+fn parse_sample_for_fold(
+    payload: &[u8],
+    sample_layout: Option<SampleLayout>,
+    options: FoldOptions,
+) -> Result<Option<(Option<u32>, u64, impl Iterator<Item = u64>)>, String> {
+    if let Some(layout) = sample_layout {
+        parse_sample_record_callchain(payload, layout).map(|sample| {
+            sample.map(|sample| {
+                let count = if options.count_periods {
+                    sample.period.unwrap_or(1)
+                } else {
+                    1
+                };
+                (sample.pid, count, sample.frames)
             })
         })
     } else {
