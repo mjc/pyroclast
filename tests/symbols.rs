@@ -196,6 +196,22 @@ ffffffff88000080 t asm_exc_page_fault
 }
 
 #[test]
+fn kallsyms_parses_system_map_lines() {
+    let symbols = Kallsyms::parse(
+        "\
+ffffffff81001280 T asm_exc_page_fault
+ffffffff812f5920 t do_user_addr_fault
+",
+    )
+    .expect("system map");
+
+    assert_eq!(
+        symbols.resolve(0xffff_ffff_8100_1280).as_deref(),
+        Some("asm_exc_page_fault")
+    );
+}
+
+#[test]
 fn kallsyms_rejects_address_masked_tables() {
     let result = Kallsyms::parse(
         "\
