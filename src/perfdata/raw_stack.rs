@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollapsedRawStack {
@@ -15,7 +15,7 @@ struct RawStackKey {
 
 #[derive(Debug, Default)]
 pub struct RawStackAccumulator {
-    counts: HashMap<RawStackKey, u64>,
+    counts: FxHashMap<RawStackKey, u64>,
 }
 
 impl RawStackAccumulator {
