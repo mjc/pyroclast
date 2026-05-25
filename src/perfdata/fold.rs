@@ -461,6 +461,7 @@ fn symbol_request(mapping: &ResolvedMapping) -> SymbolRequest {
     SymbolRequest {
         path: PathBuf::from(&mapping.path),
         relative_address: mapping.relative_address,
+        kernel_relocation: mapping.kernel_relocation.clone(),
     }
 }
 

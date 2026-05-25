@@ -15,6 +15,7 @@ pub struct KernelRelocation {
 pub struct SymbolRequest {
     pub path: PathBuf,
     pub relative_address: u64,
+    pub kernel_relocation: Option<KernelRelocation>,
 }
 
 pub trait SymbolResolver {
@@ -405,12 +406,13 @@ where
                     kernel_elf_requests.push(SymbolRequest {
                         path: kernel_elf.clone(),
                         relative_address: request.relative_address,
+                        kernel_relocation: None,
                     });
                 } else {
                     resolved[index] = self
                         .kallsyms
                         .as_ref()
-                        .and_then(|kallsyms| kallsyms.resolve(request.relative_address));
+                        .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request));
                 }
             } else {
                 user_indexes.push(index);
@@ -478,6 +480,18 @@ fn grouped_request_indexes(requests: &[SymbolRequest]) -> BTreeMap<PathBuf, Vec<
         grouped.entry(request.path.clone()).or_default().push(index);
     }
     grouped
+}
+
+fn resolve_kernel_kallsyms(kallsyms: &Kallsyms, request: &SymbolRequest) -> Option<String> {
+    if let Some(relocation) = &request.kernel_relocation {
+        kallsyms.resolve_relocated(
+            request.relative_address,
+            &relocation.reference_symbol,
+            relocation.recorded_reference_address,
+        )
+    } else {
+        kallsyms.resolve(request.relative_address)
+    }
 }
 
 fn parse_addr2line_stdout(

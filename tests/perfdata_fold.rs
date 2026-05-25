@@ -430,10 +430,12 @@ fn prefetches_unique_symbol_requests_before_folding() {
             SymbolRequest {
                 path: std::path::PathBuf::from("/bin/app"),
                 relative_address: 0x10,
+                kernel_relocation: None,
             },
             SymbolRequest {
                 path: std::path::PathBuf::from("/bin/app"),
                 relative_address: 0x20,
+                kernel_relocation: None,
             }
         ]]
     );
