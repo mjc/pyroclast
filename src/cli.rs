@@ -23,10 +23,12 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum CliCommand {
+    #[command(alias = "heap")]
     Memory(RunArgs),
     Cpu(RunArgs),
     #[command(alias = "offcpu")]
     Offpcu(RunArgs),
+    #[command(alias = "syscalls")]
     Latency(RunArgs),
     Async(RunArgs),
     Profile(ProfileArgs),

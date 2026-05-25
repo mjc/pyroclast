@@ -205,10 +205,12 @@ fn top_level_cpu_accepts_threads_of_pid() {
 fn parses_top_level_profiler_commands() {
     let cases = [
         ("memory", ProfileKind::Memory),
+        ("heap", ProfileKind::Memory),
         ("cpu", ProfileKind::Cpu),
         ("offpcu", ProfileKind::Offcpu),
         ("offcpu", ProfileKind::Offcpu),
         ("latency", ProfileKind::Latency),
+        ("syscalls", ProfileKind::Latency),
         ("async", ProfileKind::Async),
     ];
 
