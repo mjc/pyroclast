@@ -8,6 +8,7 @@ pub const PERF_RECORD_EXIT: u32 = 4;
 pub const PERF_RECORD_THROTTLE: u32 = 5;
 pub const PERF_RECORD_UNTHROTTLE: u32 = 6;
 pub const PERF_RECORD_FORK: u32 = 7;
+pub const PERF_RECORD_READ: u32 = 8;
 pub const PERF_RECORD_SAMPLE: u32 = 9;
 pub const PERF_RECORD_MMAP2: u32 = 10;
 pub const PERF_RECORD_LOST_SAMPLES: u32 = 13;
@@ -39,6 +40,7 @@ pub enum ParsedRecord {
     LostSamples(LostSamplesRecord),
     Throttle(ThrottleRecord),
     Unthrottle(UnthrottleRecord),
+    Read(ReadRecord),
     Unsupported { record_type: u32 },
 }
 
@@ -130,6 +132,13 @@ pub struct UnthrottleRecord {
     pub time: u64,
     pub id: u64,
     pub stream_id: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadRecord {
+    pub pid: u32,
+    pub tid: u32,
+    pub values: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -246,6 +255,7 @@ pub fn parse_record(record: PerfRecord<'_>) -> Result<ParsedRecord, String> {
         }
         PERF_RECORD_EXIT => parse_exit_record(record.payload).map(ParsedRecord::Exit),
         PERF_RECORD_FORK => parse_fork_record(record.payload).map(ParsedRecord::Fork),
+        PERF_RECORD_READ => parse_read_record(record.payload).map(ParsedRecord::Read),
         record_type => Ok(ParsedRecord::Unsupported { record_type }),
     }
 }
@@ -433,6 +443,26 @@ pub fn parse_unthrottle_record(payload: &[u8]) -> Result<UnthrottleRecord, Strin
     let record = parse_throttle_event_record(payload, "PERF_RECORD_UNTHROTTLE")?;
 
     Ok(UnthrottleRecord::from(record))
+}
+
+/// Parses a `PERF_RECORD_READ` payload.
+///
+/// The nested `read_format` bytes depend on `perf_event_attr.read_format`, so
+/// this parser preserves them losslessly for an attr-aware layer to decode.
+///
+/// # Errors
+///
+/// Returns an error when the fixed `pid`/`tid` fields are missing.
+pub fn parse_read_record(payload: &[u8]) -> Result<ReadRecord, String> {
+    if payload.len() < 8 {
+        return Err("PERF_RECORD_READ payload is shorter than 8 bytes".to_string());
+    }
+
+    Ok(ReadRecord {
+        pid: read_u32(payload, 0)?,
+        tid: read_u32(payload, 4)?,
+        values: payload[8..].to_vec(),
+    })
 }
 
 fn parse_throttle_event_record(

@@ -3,8 +3,8 @@ use pyroclast::perfdata::header::parse_header;
 use pyroclast::perfdata::records::{
     ParsedRecord, PerfRecord, PerfRecordHeader, iter_records, parse_comm_record, parse_exit_record,
     parse_fork_record, parse_lost_record, parse_lost_samples_record, parse_mmap_record,
-    parse_mmap2_build_id_record, parse_mmap2_record, parse_record, parse_record_header,
-    parse_throttle_record, parse_unthrottle_record,
+    parse_mmap2_build_id_record, parse_mmap2_record, parse_read_record, parse_record,
+    parse_record_header, parse_throttle_record, parse_unthrottle_record,
 };
 
 #[test]
@@ -452,6 +452,35 @@ fn dispatches_unthrottle_record_by_perf_record_type() {
     assert!(matches!(parsed, ParsedRecord::Unthrottle(_)));
 }
 
+#[test]
+fn parses_read_record_payload_from_perf_event_header_shape() {
+    let payload = read_payload();
+
+    let read = parse_read_record(&payload).expect("read record");
+
+    assert_eq!(read.pid, 123);
+    assert_eq!(read.tid, 456);
+    assert_eq!(read.values, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+}
+
+#[test]
+fn dispatches_read_record_by_perf_record_type() {
+    let payload = read_payload();
+    let record = PerfRecord {
+        offset: 104,
+        header: PerfRecordHeader {
+            record_type: 8,
+            misc: 0,
+            size: u16::try_from(8 + payload.len()).expect("record size"),
+        },
+        payload: &payload,
+    };
+
+    let parsed = parse_record(record).expect("parsed record");
+
+    assert!(matches!(parsed, ParsedRecord::Read(_)));
+}
+
 fn perfdata_with_records<const N: usize>(records: [Vec<u8>; N]) -> Vec<u8> {
     let data_size = records.iter().map(Vec::len).sum::<usize>();
     let mut bytes = vec![0; 104];
@@ -533,6 +562,14 @@ fn throttle_payload() -> Vec<u8> {
     payload.extend(10_000u64.to_le_bytes());
     payload.extend(77u64.to_le_bytes());
     payload.extend(88u64.to_le_bytes());
+    payload
+}
+
+fn read_payload() -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(123u32.to_le_bytes());
+    payload.extend(456u32.to_le_bytes());
+    payload.extend([1, 2, 3, 4, 5, 6, 7, 8]);
     payload
 }
 
