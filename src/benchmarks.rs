@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::flamegraph::build_inferno_flamegraph_command;
 use crate::perfdata::fold::fold_perfdata_file;
 use crate::process::{CommandRunner, CommandSpec};
 
@@ -43,6 +44,9 @@ pub struct FoldComparisonReport {
     pub pyroclast_folded_lines: usize,
     pub inferno_folded_lines: usize,
     pub matches: bool,
+    pub svg_matches: bool,
+    pub pyroclast_svg_bytes: usize,
+    pub inferno_svg_bytes: usize,
     pub only_pyroclast: Vec<String>,
     pub only_inferno: Vec<String>,
 }
@@ -127,11 +131,17 @@ where
     let inferno = parse_folded_counts(&inferno_folded)?;
     let only_pyroclast = folded_difference(&pyroclast, &inferno);
     let only_inferno = folded_difference(&inferno, &pyroclast);
+    let pyroclast_svg = render_inferno_svg("Pyroclast comparison", &pyroclast_folded, runner)?;
+    let inferno_svg = render_inferno_svg("Pyroclast comparison", &inferno_folded, runner)?;
+    let svg_matches = pyroclast_svg == inferno_svg;
 
     Ok(FoldComparisonReport {
         pyroclast_folded_lines: pyroclast.len(),
         inferno_folded_lines: inferno.len(),
-        matches: only_pyroclast.is_empty() && only_inferno.is_empty(),
+        matches: only_pyroclast.is_empty() && only_inferno.is_empty() && svg_matches,
+        svg_matches,
+        pyroclast_svg_bytes: pyroclast_svg.len(),
+        inferno_svg_bytes: inferno_svg.len(),
         only_pyroclast,
         only_inferno,
     })
@@ -185,4 +195,21 @@ fn folded_difference(left: &BTreeMap<String, u64>, right: &BTreeMap<String, u64>
         .filter(|(stack, count)| right.get(*stack).copied().unwrap_or(0) != **count)
         .map(|(stack, count)| format!("{stack} {count}"))
         .collect()
+}
+
+fn render_inferno_svg<R>(title: &str, folded: &str, runner: &R) -> Result<Vec<u8>, String>
+where
+    R: CommandRunner,
+{
+    let command = build_inferno_flamegraph_command(title).stdin(folded.as_bytes().to_vec());
+    let output = runner
+        .run(&command)
+        .map_err(|error| format!("failed to run inferno-flamegraph: {error}"))?;
+    if output.status_code != Some(0) {
+        return Err(format!(
+            "inferno-flamegraph exited with {:?}",
+            output.status_code
+        ));
+    }
+    Ok(output.stdout)
 }

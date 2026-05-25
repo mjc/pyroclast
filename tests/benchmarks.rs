@@ -90,6 +90,9 @@ fn compares_pyroclast_folded_stacks_with_inferno_collapse() {
     assert_eq!(report.pyroclast_folded_lines, 1);
     assert_eq!(report.inferno_folded_lines, 1);
     assert!(report.matches);
+    assert!(report.svg_matches);
+    assert_eq!(report.pyroclast_svg_bytes, 21);
+    assert_eq!(report.inferno_svg_bytes, 21);
     assert_eq!(report.only_pyroclast, Vec::<String>::new());
     assert_eq!(report.only_inferno, Vec::<String>::new());
 }
@@ -185,6 +188,13 @@ struct MatchingCollapseRunner {
 impl CommandRunner for MatchingCollapseRunner {
     fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
         self.commands.lock().unwrap().push(command.clone());
+        if command.program == "inferno-flamegraph" {
+            return Ok(CommandOutput {
+                status_code: Some(0),
+                stdout: b"<svg>0x2000 2\n</svg>\n".to_vec(),
+                stderr: Vec::new(),
+            });
+        }
         Ok(CommandOutput {
             status_code: Some(0),
             stdout: b"0x2000 2\n".to_vec(),
