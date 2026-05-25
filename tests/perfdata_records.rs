@@ -1,8 +1,8 @@
 use pyroclast::perfdata::header::parse_header;
 use pyroclast::perfdata::records::{
     PerfRecordHeader, iter_records, parse_comm_record, parse_exit_record, parse_fork_record,
-    parse_lost_record, parse_lost_samples_record, parse_mmap_record, parse_mmap2_record,
-    parse_record_header, parse_throttle_record, parse_unthrottle_record,
+    parse_lost_record, parse_lost_samples_record, parse_mmap_record, parse_mmap2_build_id_record,
+    parse_mmap2_record, parse_record_header, parse_throttle_record, parse_unthrottle_record,
 };
 
 #[test]
@@ -106,6 +106,37 @@ fn parses_mmap2_record_payload() {
     assert_eq!(mmap.minor, 1);
     assert_eq!(mmap.inode, 99);
     assert_eq!(mmap.inode_generation, 7);
+    assert_eq!(mmap.prot, 5);
+    assert_eq!(mmap.flags, 2);
+    assert_eq!(mmap.path, "/usr/lib/libssl.so");
+}
+
+#[test]
+fn parses_mmap2_build_id_payload_from_perf_event_header_shape() {
+    let mut payload = Vec::new();
+    payload.extend(123u32.to_le_bytes());
+    payload.extend(456u32.to_le_bytes());
+    payload.extend(0x7f00u64.to_le_bytes());
+    payload.extend(0x1000u64.to_le_bytes());
+    payload.extend(0x40u64.to_le_bytes());
+    payload.push(4);
+    payload.push(0);
+    payload.extend(0u16.to_le_bytes());
+    payload.extend([0xaa, 0xbb, 0xcc, 0xdd]);
+    payload.extend([0; 16]);
+    payload.extend(5u32.to_le_bytes());
+    payload.extend(2u32.to_le_bytes());
+    payload.extend(b"/usr/lib/libssl.so\0");
+
+    let mmap = parse_mmap2_build_id_record(&payload).expect("mmap2 build id record");
+
+    assert_eq!(mmap.pid, 123);
+    assert_eq!(mmap.tid, 456);
+    assert_eq!(mmap.start, 0x7f00);
+    assert_eq!(mmap.len, 0x1000);
+    assert_eq!(mmap.pgoff, 0x40);
+    assert_eq!(mmap.build_id_size, 4);
+    assert_eq!(mmap.build_id, vec![0xaa, 0xbb, 0xcc, 0xdd]);
     assert_eq!(mmap.prot, 5);
     assert_eq!(mmap.flags, 2);
     assert_eq!(mmap.path, "/usr/lib/libssl.so");

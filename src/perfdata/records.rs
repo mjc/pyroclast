@@ -48,6 +48,20 @@ pub struct Mmap2Record {
     pub path: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Mmap2BuildIdRecord {
+    pub pid: u32,
+    pub tid: u32,
+    pub start: u64,
+    pub len: u64,
+    pub pgoff: u64,
+    pub build_id_size: u8,
+    pub build_id: Vec<u8>,
+    pub prot: u32,
+    pub flags: u32,
+    pub path: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ForkRecord {
     pub pid: u32,
@@ -248,6 +262,44 @@ pub fn parse_mmap2_record(payload: &[u8]) -> Result<Mmap2Record, String> {
         minor,
         inode,
         inode_generation,
+        prot,
+        flags,
+        path,
+    })
+}
+
+/// Parses a `PERF_RECORD_MMAP2` payload carrying build-id data.
+///
+/// # Errors
+///
+/// Returns an error when the fixed mapping or build-id fields are missing.
+pub fn parse_mmap2_build_id_record(payload: &[u8]) -> Result<Mmap2BuildIdRecord, String> {
+    if payload.len() < 64 {
+        return Err("PERF_RECORD_MMAP2 build-id payload is shorter than 64 bytes".to_string());
+    }
+    let range = parse_mmap_range(payload)?;
+    let build_id_size = payload[32];
+    let build_id_end = 36usize
+        .checked_add(usize::from(build_id_size))
+        .ok_or_else(|| "PERF_RECORD_MMAP2 build-id size overflows usize".to_string())?;
+    if build_id_end > 56 {
+        return Err(format!(
+            "PERF_RECORD_MMAP2 build-id size {build_id_size} exceeds 20 bytes"
+        ));
+    }
+    let build_id = payload[36..build_id_end].to_vec();
+    let prot = read_u32(payload, 56)?;
+    let flags = read_u32(payload, 60)?;
+    let path = parse_c_string(&payload[64..]);
+
+    Ok(Mmap2BuildIdRecord {
+        pid: range.pid,
+        tid: range.tid,
+        start: range.start,
+        len: range.len,
+        pgoff: range.pgoff,
+        build_id_size,
+        build_id,
         prot,
         flags,
         path,
