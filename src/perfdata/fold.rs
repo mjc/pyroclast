@@ -26,7 +26,6 @@ pub struct PerfSummary {
     pub comms_by_pid: BTreeMap<u32, String>,
     pub mmaps: Vec<String>,
     pub mmap_table: MmapTable,
-    pub sample_callchains: Vec<Vec<u64>>,
     pub sample_stacks: Vec<PerfSampleStack>,
 }
 
@@ -89,7 +88,6 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
         comms_by_pid: BTreeMap::new(),
         mmaps: Vec::new(),
         mmap_table: MmapTable::default(),
-        sample_callchains: Vec::new(),
         sample_stacks: Vec::new(),
     };
 
@@ -111,7 +109,6 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
             PERF_RECORD_SAMPLE => {
                 parse_sample_for_summary(record.payload, sample_layout).map(|sample| {
                     if let Some(sample) = sample {
-                        summary.sample_callchains.push(sample.callchain.clone());
                         summary.sample_stacks.push(sample);
                     }
                 })

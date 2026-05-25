@@ -54,7 +54,8 @@ fn summarizes_sample_callchain_counts_using_file_attr_layout() {
 
     let summary = summarize_perfdata(&bytes).expect("summary");
 
-    assert_eq!(summary.sample_callchains, vec![vec![0x2000, 0x3000]]);
+    assert_eq!(summary.sample_stacks.len(), 1);
+    assert_eq!(summary.sample_stacks[0].callchain, vec![0x2000, 0x3000]);
 }
 
 #[test]
