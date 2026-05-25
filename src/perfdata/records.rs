@@ -30,6 +30,7 @@ pub struct PerfRecord<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParsedRecord {
     Comm(CommRecord),
+    Mmap(MmapRecord),
     Unsupported { record_type: u32 },
 }
 
@@ -221,6 +222,7 @@ pub fn iter_records(bytes: &[u8], header: PerfHeader) -> Result<Vec<PerfRecord<'
 /// Returns an error when a supported record payload is malformed.
 pub fn parse_record(record: PerfRecord<'_>) -> Result<ParsedRecord, String> {
     match record.header.record_type {
+        PERF_RECORD_MMAP => parse_mmap_record(record.payload).map(ParsedRecord::Mmap),
         PERF_RECORD_COMM => parse_comm_record(record.payload).map(ParsedRecord::Comm),
         record_type => Ok(ParsedRecord::Unsupported { record_type }),
     }

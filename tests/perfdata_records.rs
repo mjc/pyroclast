@@ -112,6 +112,34 @@ fn parses_mmap_record_payload() {
 }
 
 #[test]
+fn dispatches_mmap_record_by_perf_record_type() {
+    let payload = mmap_payload();
+    let record = PerfRecord {
+        offset: 104,
+        header: PerfRecordHeader {
+            record_type: 1,
+            misc: 0,
+            size: u16::try_from(8 + payload.len()).expect("record size"),
+        },
+        payload: &payload,
+    };
+
+    let parsed = parse_record(record).expect("parsed record");
+
+    assert_eq!(
+        parsed,
+        ParsedRecord::Mmap(pyroclast::perfdata::records::MmapRecord {
+            pid: 123,
+            tid: 456,
+            start: 0x7f00,
+            len: 0x1000,
+            pgoff: 0x40,
+            path: "/usr/bin/sftp-s3".to_string(),
+        })
+    );
+}
+
+#[test]
 fn parses_mmap2_record_payload() {
     let mut payload = Vec::new();
     payload.extend(123u32.to_le_bytes());
@@ -270,6 +298,17 @@ fn perfdata_with_records<const N: usize>(records: [Vec<u8>; N]) -> Vec<u8> {
         bytes.extend(record);
     }
     bytes
+}
+
+fn mmap_payload() -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(123u32.to_le_bytes());
+    payload.extend(456u32.to_le_bytes());
+    payload.extend(0x7f00u64.to_le_bytes());
+    payload.extend(0x1000u64.to_le_bytes());
+    payload.extend(0x40u64.to_le_bytes());
+    payload.extend(b"/usr/bin/sftp-s3\0");
+    payload
 }
 
 fn record_bytes(record_type: u32, payload: &[u8]) -> Vec<u8> {
