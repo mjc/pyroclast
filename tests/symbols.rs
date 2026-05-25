@@ -275,10 +275,83 @@ ffffffff88000080 t asm_exc_page_fault
     assert_eq!(runner.commands()[0].stdin.as_deref(), Some(&b"0x10\n"[..]));
 }
 
+#[test]
+fn perf_symbol_resolver_loads_perfdata_kernel_build_id_cache() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let build_id = "16ed3d5317ad219c89d0e3c5ea0ea2caa3cd4949";
+    let cached = root
+        .path()
+        .join("[kernel.kallsyms]")
+        .join(build_id)
+        .join("kallsyms");
+    std::fs::create_dir_all(cached.parent().expect("parent")).expect("cache dir");
+    std::fs::write(&cached, "ffffffff88000080 t asm_exc_page_fault\n").expect("kallsyms");
+
+    let runner = Addr2lineRunner::new(b"");
+    let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
+        .with_perfdata_kernel_cache(&perfdata_with_kernel_build_id(), root.path());
+
+    let symbols = resolver
+        .resolve_batch(&[SymbolRequest {
+            path: PathBuf::from("[kernel.kallsyms]"),
+            relative_address: 0xffff_ffff_8800_008f,
+        }])
+        .expect("symbols");
+
+    assert_eq!(symbols, vec![Some("asm_exc_page_fault".to_string())]);
+    assert!(runner.commands().is_empty());
+}
+
 #[derive(Default)]
 struct RecordingResolver {
     symbols: BTreeMap<SymbolRequest, String>,
     calls: RefCell<Vec<Vec<SymbolRequest>>>,
+}
+
+fn perfdata_with_kernel_build_id() -> Vec<u8> {
+    let build_id = [
+        0x16, 0xed, 0x3d, 0x53, 0x17, 0xad, 0x21, 0x9c, 0x89, 0xd0, 0xe3, 0xc5, 0xea, 0x0e, 0xa2,
+        0xca, 0xa3, 0xcd, 0x49, 0x49,
+    ];
+    let payload = build_id_event_payload(u32::MAX, &build_id, "[kernel.kallsyms]");
+    perfdata_with_build_id_feature(&payload)
+}
+
+fn build_id_event_payload(pid: u32, build_id: &[u8; 20], filename: &str) -> Vec<u8> {
+    let size = 36 + filename.len() + 1;
+    let mut payload = Vec::new();
+    payload.extend(67_u32.to_le_bytes());
+    payload.extend(0_u16.to_le_bytes());
+    payload.extend(u16::try_from(size).expect("event size").to_le_bytes());
+    payload.extend(pid.to_le_bytes());
+    payload.extend(build_id);
+    payload.extend([0; 4]);
+    payload.extend(filename.as_bytes());
+    payload.push(0);
+    payload
+}
+
+fn perfdata_with_build_id_feature(payload: &[u8]) -> Vec<u8> {
+    let feature_table_offset = 128;
+    let payload_offset = 160;
+    let mut bytes = vec![0; payload_offset + payload.len()];
+    bytes[..8].copy_from_slice(b"PERFILE2");
+    put_u64(&mut bytes, 8, 104);
+    put_u64(&mut bytes, 40, 128);
+    put_u64(&mut bytes, 48, 0);
+    put_u64(&mut bytes, 56, 1 << 2);
+    put_u64(&mut bytes, feature_table_offset, payload_offset as u64);
+    put_u64(
+        &mut bytes,
+        feature_table_offset + 8,
+        u64::try_from(payload.len()).expect("payload size"),
+    );
+    bytes[payload_offset..].copy_from_slice(payload);
+    bytes
+}
+
+fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 impl RecordingResolver {

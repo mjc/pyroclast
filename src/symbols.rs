@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
+use crate::perfdata::build_id::kernel_build_id_from_perfdata;
 use crate::process::{CommandRunner, CommandSpec};
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -64,6 +65,18 @@ where
     pub fn with_kallsyms(mut self, kallsyms: Kallsyms) -> Self {
         self.kallsyms = Some(kallsyms);
         self
+    }
+
+    #[must_use]
+    pub fn with_perfdata_kernel_cache(self, perfdata: &[u8], debug_dir: &Path) -> Self {
+        match kernel_build_id_from_perfdata(perfdata)
+            .ok()
+            .flatten()
+            .and_then(|build_id| Kallsyms::load_perf_build_id_cache(debug_dir, &build_id))
+        {
+            Some(kallsyms) => self.with_kallsyms(kallsyms),
+            None => self,
+        }
     }
 
     #[must_use]
