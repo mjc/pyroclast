@@ -50,10 +50,10 @@ pub fn parse_file_attrs(bytes: &[u8], header: PerfHeader) -> Result<Vec<PerfFile
 
         attrs.push(PerfFileAttr {
             sample_type: read_u64(bytes, cursor + 24)?,
-            read_format: read_u64(bytes, cursor + 32)?,
-            branch_sample_type: read_u64(bytes, cursor + 72)?,
-            sample_regs_user: read_u64(bytes, cursor + 80)?,
-            sample_regs_intr: read_u64(bytes, cursor + 96)?,
+            read_format: read_optional_attr_u64(bytes, cursor, attr_size, 32)?,
+            branch_sample_type: read_optional_attr_u64(bytes, cursor, attr_size, 72)?,
+            sample_regs_user: read_optional_attr_u64(bytes, cursor, attr_size, 80)?,
+            sample_regs_intr: read_optional_attr_u64(bytes, cursor, attr_size, 96)?,
             ids_offset: read_u64(bytes, cursor + attr_size)?,
             ids_size: read_u64(bytes, cursor + attr_size + 8)?,
         });
@@ -61,6 +61,19 @@ pub fn parse_file_attrs(bytes: &[u8], header: PerfHeader) -> Result<Vec<PerfFile
     }
 
     Ok(attrs)
+}
+
+fn read_optional_attr_u64(
+    bytes: &[u8],
+    attr_start: usize,
+    attr_size: usize,
+    field_offset: usize,
+) -> Result<u64, String> {
+    if attr_size >= field_offset + 8 {
+        read_u64(bytes, attr_start + field_offset)
+    } else {
+        Ok(0)
+    }
 }
 
 fn to_usize(value: u64, name: &str) -> Result<usize, String> {
