@@ -1,7 +1,8 @@
 use pyroclast::perfdata::samples::{
     PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_ID, PERF_SAMPLE_IP,
-    PERF_SAMPLE_PERIOD, PERF_SAMPLE_TID, PERF_SAMPLE_TIME, SampleLayout, is_kernel_space_frame,
-    is_perf_context_marker, parse_sample_record, parse_sample_record_callchain,
+    PERF_SAMPLE_PERIOD, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME, SampleLayout,
+    is_kernel_space_frame, is_perf_context_marker, parse_sample_record,
+    parse_sample_record_callchain,
 };
 
 #[test]
@@ -64,6 +65,32 @@ fn consumes_perf_record_default_sample_fields_before_callchain() {
     assert_eq!(sample.pid, Some(123));
     assert_eq!(sample.tid, Some(456));
     assert_eq!(sample.period, Some(1));
+    assert_eq!(sample.callchain, vec![0x2000, 0x3000]);
+}
+
+#[test]
+fn skips_stream_id_before_cpu_period_and_callchain() {
+    let mut payload = Vec::new();
+    payload.extend(99u64.to_le_bytes());
+    payload.extend(3u32.to_le_bytes());
+    payload.extend(0u32.to_le_bytes());
+    payload.extend(7u64.to_le_bytes());
+    payload.extend(2u64.to_le_bytes());
+    payload.extend(0x2000u64.to_le_bytes());
+    payload.extend(0x3000u64.to_le_bytes());
+
+    let sample = parse_sample_record(
+        &payload,
+        SampleLayout {
+            sample_type: PERF_SAMPLE_STREAM_ID
+                | PERF_SAMPLE_CPU
+                | PERF_SAMPLE_PERIOD
+                | PERF_SAMPLE_CALLCHAIN,
+        },
+    )
+    .expect("sample");
+
+    assert_eq!(sample.period, Some(7));
     assert_eq!(sample.callchain, vec![0x2000, 0x3000]);
 }
 

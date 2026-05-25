@@ -8,6 +8,7 @@ pub const PERF_SAMPLE_CALLCHAIN: u64 = 1 << 5;
 pub const PERF_SAMPLE_ID: u64 = 1 << 6;
 pub const PERF_SAMPLE_CPU: u64 = 1 << 7;
 pub const PERF_SAMPLE_PERIOD: u64 = 1 << 8;
+pub const PERF_SAMPLE_STREAM_ID: u64 = 1 << 9;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SampleLayout {
@@ -68,6 +69,9 @@ pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<Sampl
     if layout.has(PERF_SAMPLE_ID) {
         cursor.skip_u64()?;
     }
+    if layout.has(PERF_SAMPLE_STREAM_ID) {
+        cursor.skip_u64()?;
+    }
     if layout.has(PERF_SAMPLE_CPU) {
         cursor.skip_u32()?;
         cursor.skip_u32()?;
@@ -113,6 +117,9 @@ pub fn parse_sample_record_callchain(
         cursor.skip_u64()?;
     }
     if layout.has(PERF_SAMPLE_ID) {
+        cursor.skip_u64()?;
+    }
+    if layout.has(PERF_SAMPLE_STREAM_ID) {
         cursor.skip_u64()?;
     }
     if layout.has(PERF_SAMPLE_CPU) {
