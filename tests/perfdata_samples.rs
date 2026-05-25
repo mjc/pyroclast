@@ -3,8 +3,8 @@ use pyroclast::perfdata::samples::{
     PERF_FORMAT_TOTAL_TIME_RUNNING, PERF_SAMPLE_ADDR, PERF_SAMPLE_BRANCH_STACK,
     PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_DATA_SRC, PERF_SAMPLE_ID,
     PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_RAW, PERF_SAMPLE_READ,
-    PERF_SAMPLE_REGS_USER, PERF_SAMPLE_STACK_USER, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID,
-    PERF_SAMPLE_TIME, PERF_SAMPLE_TRANSACTION, PERF_SAMPLE_WEIGHT, SampleLayout,
+    PERF_SAMPLE_REGS_INTR, PERF_SAMPLE_REGS_USER, PERF_SAMPLE_STACK_USER, PERF_SAMPLE_STREAM_ID,
+    PERF_SAMPLE_TID, PERF_SAMPLE_TIME, PERF_SAMPLE_TRANSACTION, PERF_SAMPLE_WEIGHT, SampleLayout,
     is_kernel_space_frame, is_perf_context_marker, parse_sample_record,
     parse_sample_record_callchain,
 };
@@ -326,6 +326,26 @@ fn rejects_truncated_transaction_sample_payload() {
         },
     )
     .expect_err("truncated transaction sample");
+
+    assert!(error.contains("truncated"));
+}
+
+#[test]
+fn rejects_truncated_intr_regs_sample_payload() {
+    let mut payload = Vec::new();
+    payload.extend(1u64.to_le_bytes());
+    payload.extend(0xaaaa_u64.to_le_bytes());
+
+    let error = parse_sample_record(
+        &payload,
+        SampleLayout {
+            sample_type: PERF_SAMPLE_REGS_INTR,
+            read_format: 0,
+            sample_regs_user: 0,
+            sample_regs_intr: 0b11,
+        },
+    )
+    .expect_err("truncated regs intr sample");
 
     assert!(error.contains("truncated"));
 }
