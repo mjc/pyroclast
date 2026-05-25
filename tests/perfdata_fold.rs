@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+
 use pyroclast::perfdata::fold::{
     FoldOptions, fold_perfdata_callchains, fold_perfdata_callchains_with_options,
     fold_perfdata_callchains_with_symbols, summarize_perfdata,
@@ -195,6 +197,41 @@ fn folds_mapped_user_frames_with_symbol_names() {
     assert_eq!(folded, "app::main;app::main 1\n");
 }
 
+#[test]
+fn prefetches_unique_symbol_requests_before_folding() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(1, &mmap_payload(11, 11, 0x1000, 0x100, 0, "/bin/app")),
+            record_bytes(9, &sample_payload(0x1000, 11, 12, [0x1010, 0x1020])),
+            record_bytes(9, &sample_payload(0x1000, 11, 12, [0x1010, 0x1020])),
+        ],
+    );
+    let resolver = RecordingSymbolResolver::default();
+
+    let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
+        .expect("folded");
+
+    assert_eq!(folded, "app::main;app::work 2\n");
+    assert_eq!(
+        resolver.calls(),
+        vec![vec![
+            SymbolRequest {
+                path: std::path::PathBuf::from("/bin/app"),
+                relative_address: 0x10,
+            },
+            SymbolRequest {
+                path: std::path::PathBuf::from("/bin/app"),
+                relative_address: 0x20,
+            }
+        ]]
+    );
+}
+
 fn perfdata_with_records_and_attrs<const A: usize, const R: usize>(
     attrs: [[u8; 144]; A],
     records: [Vec<u8>; R],
@@ -329,6 +366,41 @@ impl SymbolResolver for StaticSymbolResolver {
                 (request.path == std::path::Path::new("/bin/app")
                     && request.relative_address == 0x10)
                     .then(|| "app::main".to_string())
+                    .or_else(|| {
+                        (request.path == std::path::Path::new("/bin/app")
+                            && request.relative_address == 0x20)
+                            .then(|| "app::work".to_string())
+                    })
+            })
+            .collect())
+    }
+}
+
+#[derive(Default)]
+struct RecordingSymbolResolver {
+    calls: RefCell<Vec<Vec<SymbolRequest>>>,
+}
+
+impl RecordingSymbolResolver {
+    fn calls(&self) -> Vec<Vec<SymbolRequest>> {
+        self.calls.borrow().clone()
+    }
+}
+
+impl SymbolResolver for RecordingSymbolResolver {
+    fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
+        self.calls.borrow_mut().push(requests.to_vec());
+        Ok(requests
+            .iter()
+            .map(|request| {
+                (request.path == std::path::Path::new("/bin/app")
+                    && request.relative_address == 0x10)
+                    .then(|| "app::main".to_string())
+                    .or_else(|| {
+                        (request.path == std::path::Path::new("/bin/app")
+                            && request.relative_address == 0x20)
+                            .then(|| "app::work".to_string())
+                    })
             })
             .collect())
     }

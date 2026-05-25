@@ -167,6 +167,9 @@ fn fold_summary<R>(
 where
     R: SymbolResolver,
 {
+    if let Some(cache) = symbol_cache.as_deref_mut() {
+        prefetch_symbols(summary, cache)?;
+    }
     let mut counts = BTreeMap::<Vec<String>, u64>::new();
     let frame_resolver = FoldFrameResolver::new(summary);
     for sample in &summary.sample_stacks {
@@ -183,6 +186,39 @@ where
         folded.push('\n');
     }
     Ok(folded)
+}
+
+fn prefetch_symbols<R>(
+    summary: &PerfSummary,
+    symbol_cache: &mut SymbolCache<'_, R>,
+) -> Result<(), String>
+where
+    R: SymbolResolver,
+{
+    let requests = summary
+        .sample_stacks
+        .iter()
+        .flat_map(|sample| symbol_requests_for_sample(sample, &summary.mmap_table))
+        .collect::<Vec<_>>();
+    symbol_cache.resolve_many(&requests).map(|_| ())
+}
+
+fn symbol_requests_for_sample(
+    sample: &PerfSampleStack,
+    mmap_table: &MmapTable,
+) -> Vec<SymbolRequest> {
+    sample
+        .callchain
+        .iter()
+        .copied()
+        .filter(|frame| !is_perf_context_marker(*frame))
+        .filter_map(|frame| {
+            sample
+                .pid
+                .and_then(|pid| mmap_table.resolve(pid, frame))
+                .map(|mapping| symbol_request(&mapping))
+        })
+        .collect()
 }
 
 struct FoldFrameResolver<'a> {
