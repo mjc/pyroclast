@@ -10,6 +10,7 @@ pub const PERF_SAMPLE_ID: u64 = 1 << 6;
 pub const PERF_SAMPLE_CPU: u64 = 1 << 7;
 pub const PERF_SAMPLE_PERIOD: u64 = 1 << 8;
 pub const PERF_SAMPLE_STREAM_ID: u64 = 1 << 9;
+pub const PERF_SAMPLE_IDENTIFIER: u64 = 1 << 16;
 pub const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
 pub const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 1 << 1;
 pub const PERF_FORMAT_ID: u64 = 1 << 2;
@@ -58,6 +59,9 @@ pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<Sampl
         callchain: Vec::new(),
     };
 
+    if layout.has(PERF_SAMPLE_IDENTIFIER) {
+        cursor.skip_u64()?;
+    }
     if layout.has(PERF_SAMPLE_IP) {
         sample.ip = Some(cursor.read_u64()?);
     }
@@ -113,6 +117,9 @@ pub fn parse_sample_record_callchain(
     let mut pid = None;
     let mut period = None;
 
+    if layout.has(PERF_SAMPLE_IDENTIFIER) {
+        cursor.skip_u64()?;
+    }
     if layout.has(PERF_SAMPLE_IP) {
         cursor.skip_u64()?;
     }
