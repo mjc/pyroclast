@@ -1,6 +1,8 @@
 use std::sync::Mutex;
 
-use pyroclast::benchmarks::{BenchArgs, run_fold_benchmark, run_inferno_collapse_benchmark};
+use pyroclast::benchmarks::{
+    BenchArgs, export_perf_script, run_fold_benchmark, run_inferno_collapse_benchmark,
+};
 use pyroclast::perfdata::samples::{PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_TID};
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
 
@@ -59,6 +61,30 @@ fn inferno_collapse_benchmark_reports_folded_output_size() {
 }
 
 #[test]
+fn exports_perf_script_for_old_pipeline_benchmarks() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    let perf_script = root.path().join("perf-script.txt");
+    std::fs::write(&perfdata, b"PERFILE2 placeholder").expect("write perfdata");
+    let runner = PerfScriptRunner::default();
+
+    export_perf_script(&perfdata, &perf_script, &runner).expect("export perf script");
+
+    assert_eq!(
+        std::fs::read_to_string(&perf_script).unwrap(),
+        "perf script\n"
+    );
+    assert_eq!(
+        runner.commands(),
+        vec![
+            CommandSpec::new("perf")
+                .args(["script", "-i"])
+                .arg(perfdata.to_str().expect("perfdata path should be utf8"))
+        ]
+    );
+}
+
+#[test]
 fn parses_benchmark_inputs() {
     let args = BenchArgs::parse(vec![
         "profile.perf.data".into(),
@@ -68,6 +94,28 @@ fn parses_benchmark_inputs() {
 
     assert_eq!(args.perf_data, Some("profile.perf.data".into()));
     assert_eq!(args.perf_script, Some("perf-script.txt".into()));
+}
+
+#[derive(Default)]
+struct PerfScriptRunner {
+    commands: Mutex<Vec<CommandSpec>>,
+}
+
+impl PerfScriptRunner {
+    fn commands(&self) -> Vec<CommandSpec> {
+        self.commands.lock().unwrap().clone()
+    }
+}
+
+impl CommandRunner for PerfScriptRunner {
+    fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
+        self.commands.lock().unwrap().push(command.clone());
+        Ok(CommandOutput {
+            status_code: Some(0),
+            stdout: b"perf script\n".to_vec(),
+            stderr: Vec::new(),
+        })
+    }
 }
 
 #[derive(Default)]

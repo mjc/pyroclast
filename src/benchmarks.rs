@@ -83,3 +83,32 @@ where
         folded_lines: folded.lines().count(),
     })
 }
+
+/// Exports `perf script` text for old-pipeline benchmarking.
+///
+/// This is intentionally benchmark-only; Pyroclast's normal fold path parses
+/// `perf.data` directly.
+///
+/// # Errors
+///
+/// Returns an error when `perf script` cannot run, exits nonzero, or the output
+/// file cannot be written.
+pub fn export_perf_script<R>(perf_data: &Path, output: &Path, runner: &R) -> Result<(), String>
+where
+    R: CommandRunner,
+{
+    let command = CommandSpec::new("perf")
+        .args(["script", "-i"])
+        .arg(perf_data.display().to_string());
+    let command_output = runner
+        .run(&command)
+        .map_err(|error| format!("failed to run perf script: {error}"))?;
+    if command_output.status_code != Some(0) {
+        return Err(format!(
+            "perf script exited with {:?}",
+            command_output.status_code
+        ));
+    }
+    std::fs::write(output, command_output.stdout)
+        .map_err(|error| format!("failed to write perf script output: {error}"))
+}
