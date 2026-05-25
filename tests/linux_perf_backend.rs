@@ -5,6 +5,7 @@ use pyroclast::backends::{ProfileRequest, ProfilerBackend};
 use pyroclast::cli::{PerfCallGraph, PerfEvent, ProfileKind};
 use pyroclast::manifest::BackendName;
 use pyroclast::perfdata::samples::{PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_TID};
+use pyroclast::platform::ThreadLister;
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
 
 #[test]
@@ -209,12 +210,8 @@ fn linux_perf_backend_records_attached_threads() {
 #[test]
 fn linux_perf_backend_records_threads_discovered_from_pid() {
     let root = tempfile::tempdir().expect("tempdir");
-    let proc_root = tempfile::tempdir().expect("proc root");
-    let task_dir = proc_root.path().join("99/task");
-    std::fs::create_dir_all(task_dir.join("101")).expect("thread 101");
-    std::fs::create_dir_all(task_dir.join("102")).expect("thread 102");
     let runner = RecordingRunner::default();
-    let backend = LinuxPerfBackend::with_proc_root(&runner, proc_root.path());
+    let backend = LinuxPerfBackend::with_thread_lister(&runner, FakeThreadLister::new([101, 102]));
     let request = ProfileRequest {
         kind: ProfileKind::Cpu,
         command: Vec::new(),
@@ -245,10 +242,8 @@ fn linux_perf_backend_records_threads_discovered_from_pid() {
 #[test]
 fn linux_perf_backend_reports_missing_threads_of_pid() {
     let root = tempfile::tempdir().expect("tempdir");
-    let proc_root = tempfile::tempdir().expect("proc root");
-    std::fs::create_dir_all(proc_root.path().join("99/task")).expect("empty task dir");
     let runner = RecordingRunner::default();
-    let backend = LinuxPerfBackend::with_proc_root(&runner, proc_root.path());
+    let backend = LinuxPerfBackend::with_thread_lister(&runner, FakeThreadLister::empty());
     let request = ProfileRequest {
         kind: ProfileKind::Cpu,
         command: Vec::new(),
@@ -269,6 +264,36 @@ fn linux_perf_backend_reports_missing_threads_of_pid() {
 
     assert!(error.to_string().contains("no thread ids found"));
     assert!(runner.programs().is_empty());
+}
+
+struct FakeThreadLister {
+    tids: std::io::Result<Vec<u32>>,
+}
+
+impl FakeThreadLister {
+    fn new<const N: usize>(tids: [u32; N]) -> Self {
+        Self {
+            tids: Ok(tids.to_vec()),
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
+            tids: Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no thread ids found",
+            )),
+        }
+    }
+}
+
+impl ThreadLister for FakeThreadLister {
+    fn thread_ids(&self, _pid: u32) -> std::io::Result<Vec<u32>> {
+        self.tids
+            .as_ref()
+            .map(std::clone::Clone::clone)
+            .map_err(|error| std::io::Error::new(error.kind(), error.to_string()))
+    }
 }
 
 #[derive(Default)]

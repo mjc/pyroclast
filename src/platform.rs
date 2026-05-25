@@ -1,6 +1,41 @@
 // Platform detection and platform-specific tool expectations.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+pub trait ThreadLister {
+    /// Returns thread IDs for a process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the platform cannot enumerate threads for `pid`.
+    fn thread_ids(&self, pid: u32) -> std::io::Result<Vec<u32>>;
+}
+
+#[derive(Clone, Debug)]
+pub struct LinuxProcfsThreadLister {
+    proc_root: PathBuf,
+}
+
+impl LinuxProcfsThreadLister {
+    #[must_use]
+    pub fn new(proc_root: impl Into<PathBuf>) -> Self {
+        Self {
+            proc_root: proc_root.into(),
+        }
+    }
+}
+
+impl Default for LinuxProcfsThreadLister {
+    fn default() -> Self {
+        Self::new("/proc")
+    }
+}
+
+impl ThreadLister for LinuxProcfsThreadLister {
+    fn thread_ids(&self, pid: u32) -> std::io::Result<Vec<u32>> {
+        linux_thread_ids_from_proc(&self.proc_root, pid)
+    }
+}
 
 /// Reads Linux thread IDs from a procfs root, usually `/proc`.
 ///

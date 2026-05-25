@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::artifacts::ArtifactLayout;
@@ -7,7 +7,7 @@ use crate::cli::PerfEvent;
 use crate::flamegraph::{FlamegraphRenderer, FlamegraphRequest, InfernoFlamegraphRenderer};
 use crate::manifest::{BackendName, RunManifest};
 use crate::perfdata::fold::{FoldOptions, fold_perfdata_file, fold_perfdata_file_with_symbols};
-use crate::platform::linux_thread_ids_from_proc;
+use crate::platform::{LinuxProcfsThreadLister, ThreadLister};
 use crate::process::{CommandRunner, CommandSpec};
 use crate::summary::threads::{FoldedStackSummary, summarize_folded_stacks};
 use crate::symbols::Addr2lineResolver;
@@ -65,30 +65,33 @@ pub fn build_perf_record_command(
     }
 }
 
-pub struct LinuxPerfBackend<'a, R> {
+pub struct LinuxPerfBackend<'a, R, T = LinuxProcfsThreadLister> {
     runner: &'a R,
-    proc_root: PathBuf,
+    thread_lister: T,
 }
 
-impl<'a, R> LinuxPerfBackend<'a, R> {
+impl<'a, R> LinuxPerfBackend<'a, R, LinuxProcfsThreadLister> {
     pub fn new(runner: &'a R) -> Self {
         Self {
             runner,
-            proc_root: PathBuf::from("/proc"),
-        }
-    }
-
-    pub fn with_proc_root(runner: &'a R, proc_root: impl Into<PathBuf>) -> Self {
-        Self {
-            runner,
-            proc_root: proc_root.into(),
+            thread_lister: LinuxProcfsThreadLister::default(),
         }
     }
 }
 
-impl<R> ProfilerBackend for LinuxPerfBackend<'_, R>
+impl<'a, R, T> LinuxPerfBackend<'a, R, T> {
+    pub fn with_thread_lister(runner: &'a R, thread_lister: T) -> Self {
+        Self {
+            runner,
+            thread_lister,
+        }
+    }
+}
+
+impl<R, T> ProfilerBackend for LinuxPerfBackend<'_, R, T>
 where
     R: CommandRunner,
+    T: ThreadLister,
 {
     fn profile(&self, request: &ProfileRequest) -> BackendResult<ProfileResult> {
         let layout = ArtifactLayout::new(request.out_dir.clone());
@@ -168,15 +171,17 @@ fn render_summary_text(summary: FoldedStackSummary) -> String {
     )
 }
 
-impl<R> LinuxPerfBackend<'_, R> {
+impl<R, T> LinuxPerfBackend<'_, R, T>
+where
+    T: ThreadLister,
+{
     fn perf_record_target(&self, request: &ProfileRequest) -> BackendResult<PerfRecordTarget> {
         if let Some(pid) = request.pid {
             Ok(PerfRecordTarget::Process(pid))
         } else if let Some(pid) = request.threads_of_pid {
-            Ok(PerfRecordTarget::Threads(linux_thread_ids_from_proc(
-                &self.proc_root,
-                pid,
-            )?))
+            Ok(PerfRecordTarget::Threads(
+                self.thread_lister.thread_ids(pid)?,
+            ))
         } else if request.tids.is_empty() {
             Ok(PerfRecordTarget::Command(request.command.clone()))
         } else {
