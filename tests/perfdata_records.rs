@@ -1,7 +1,7 @@
 use pyroclast::perfdata::header::parse_header;
 use pyroclast::perfdata::records::{
-    PerfRecordHeader, iter_records, parse_comm_record, parse_mmap_record, parse_mmap2_record,
-    parse_record_header,
+    PerfRecordHeader, iter_records, parse_comm_record, parse_fork_record, parse_mmap_record,
+    parse_mmap2_record, parse_record_header,
 };
 
 #[test]
@@ -108,6 +108,24 @@ fn parses_mmap2_record_payload() {
     assert_eq!(mmap.prot, 5);
     assert_eq!(mmap.flags, 2);
     assert_eq!(mmap.path, "/usr/lib/libssl.so");
+}
+
+#[test]
+fn parses_fork_record_payload_from_perf_event_header_shape() {
+    let mut payload = Vec::new();
+    payload.extend(123u32.to_le_bytes());
+    payload.extend(12u32.to_le_bytes());
+    payload.extend(456u32.to_le_bytes());
+    payload.extend(45u32.to_le_bytes());
+    payload.extend(99_000u64.to_le_bytes());
+
+    let fork = parse_fork_record(&payload).expect("fork record");
+
+    assert_eq!(fork.pid, 123);
+    assert_eq!(fork.ppid, 12);
+    assert_eq!(fork.tid, 456);
+    assert_eq!(fork.ptid, 45);
+    assert_eq!(fork.time, 99_000);
 }
 
 fn perfdata_with_records<const N: usize>(records: [Vec<u8>; N]) -> Vec<u8> {
