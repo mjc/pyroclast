@@ -247,6 +247,27 @@ ffffffff82000000 T later_kernel_symbol
 }
 
 #[test]
+fn kallsyms_relocation_keeps_duplicate_address_aliases() {
+    let symbols = Kallsyms::parse(
+        "\
+ffffffff81000000 T __pi__text
+ffffffff81000000 T _stext
+ffffffff81000000 T _text
+ffffffff81000000 T srso_alias_untrain_ret
+ffffffff81001280 T asm_exc_page_fault
+",
+    )
+    .expect("system map");
+
+    assert_eq!(
+        symbols
+            .resolve_relocated(0xffff_ffff_8800_1280, "_text", 0xffff_ffff_8800_0000,)
+            .as_deref(),
+        Some("asm_exc_page_fault")
+    );
+}
+
+#[test]
 fn kallsyms_rejects_address_masked_tables() {
     let result = Kallsyms::parse(
         "\

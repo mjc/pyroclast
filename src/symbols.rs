@@ -45,6 +45,7 @@ pub struct PerfSymbolResolver<'a, R> {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Kallsyms {
     symbols: BTreeMap<u64, String>,
+    addresses_by_name: BTreeMap<String, u64>,
 }
 
 #[must_use]
@@ -247,15 +248,23 @@ impl Kallsyms {
     ///
     /// Returns an error when no valid symbols are present.
     pub fn parse(text: &str) -> Result<Self, String> {
-        let symbols = text
+        let mut symbols = BTreeMap::new();
+        let mut addresses_by_name = BTreeMap::new();
+        for (address, symbol) in text
             .lines()
             .filter_map(parse_kallsyms_line)
             .filter(|(address, _)| *address != 0)
-            .collect::<BTreeMap<_, _>>();
+        {
+            symbols.insert(address, symbol.clone());
+            addresses_by_name.entry(symbol).or_insert(address);
+        }
         if symbols.is_empty() {
             return Err("kallsyms did not contain any parseable symbols".to_string());
         }
-        Ok(Self { symbols })
+        Ok(Self {
+            symbols,
+            addresses_by_name,
+        })
     }
 
     #[must_use]
@@ -296,9 +305,7 @@ impl Kallsyms {
     }
 
     fn address_of(&self, name: &str) -> Option<u64> {
-        self.symbols
-            .iter()
-            .find_map(|(address, symbol)| (symbol == name).then_some(*address))
+        self.addresses_by_name.get(name).copied()
     }
 }
 
