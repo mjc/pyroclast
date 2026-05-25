@@ -73,7 +73,7 @@ fn resolves_wildcard_pid_kernel_mapping() {
         table.resolve(42, 0xffff_ffff_8800_0010),
         Some(ResolvedMapping {
             path: "[kernel.kallsyms]".to_string(),
-            relative_address: 0x10,
+            relative_address: 0xffff_ffff_8800_0010,
         })
     );
 }

@@ -59,7 +59,7 @@ impl MmapTable {
             .max_by_key(|mapping| mapping.start)
             .map(|mapping| ResolvedMapping {
                 path: mapping.path.clone(),
-                relative_address: ip - mapping.start + mapping.pgoff,
+                relative_address: mapping.relative_address(ip),
             })
     }
 }
@@ -69,5 +69,13 @@ impl Mapping {
         (self.pid == pid || self.pid == u32::MAX)
             && ip >= self.start
             && ip < self.start.saturating_add(self.len)
+    }
+
+    fn relative_address(&self, ip: u64) -> u64 {
+        if self.path.starts_with("[kernel") || self.path == "[guest.kernel]" {
+            ip
+        } else {
+            ip - self.start + self.pgoff
+        }
     }
 }

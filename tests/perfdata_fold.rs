@@ -690,7 +690,7 @@ impl SymbolResolver for StaticSymbolResolver {
                     })
                     .or_else(|| {
                         (request.path == std::path::Path::new("[kernel.kallsyms]")
-                            && request.relative_address == 0x10)
+                            && request.relative_address == 0xffff_ffff_8800_0010)
                             .then(|| "asm_exc_page_fault".to_string())
                     })
             })
