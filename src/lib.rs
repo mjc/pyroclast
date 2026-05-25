@@ -1,5 +1,6 @@
 pub mod artifacts;
 pub mod backends;
+pub mod benchmarks;
 pub mod cli;
 pub mod config;
 pub mod errors;
