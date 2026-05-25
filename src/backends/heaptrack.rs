@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::artifacts::ArtifactLayout;
@@ -63,9 +63,10 @@ where
             return Err(error.into());
         }
 
+        let raw_output = locate_heaptrack_output(&raw_heaptrack)?;
         let print_output = self
             .runner
-            .run(&build_heaptrack_print_command(&raw_heaptrack))?;
+            .run(&build_heaptrack_print_command(&raw_output))?;
         if print_output.status_code != Some(0) {
             let error = format!(
                 "heaptrack_print exited with {:?}: {}",
@@ -111,7 +112,7 @@ where
             ),
             artifacts: {
                 let mut artifacts = layout.standard_manifest_artifacts();
-                artifacts.push(raw_heaptrack);
+                artifacts.push(raw_output);
                 artifacts
             },
             diagnostics: vec!["heaptrack executed".to_string()],
@@ -120,6 +121,29 @@ where
 
         Ok(ProfileResult { layout, manifest })
     }
+}
+
+fn locate_heaptrack_output(output_prefix: &Path) -> std::io::Result<PathBuf> {
+    if output_prefix.is_file() {
+        return Ok(output_prefix.to_path_buf());
+    }
+
+    let Some(directory) = output_prefix.parent() else {
+        return Ok(output_prefix.to_path_buf());
+    };
+    let Some(prefix_name) = output_prefix.file_name().and_then(std::ffi::OsStr::to_str) else {
+        return Ok(output_prefix.to_path_buf());
+    };
+
+    std::fs::read_dir(directory)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| name.starts_with(prefix_name))
+        })
+        .map_or_else(|| Ok(output_prefix.to_path_buf()), Ok)
 }
 
 fn unix_ms_now() -> u128 {
