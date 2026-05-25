@@ -1,4 +1,4 @@
-use crate::perfdata::records::{Mmap2Record, MmapRecord};
+use crate::perfdata::records::{Mmap2BuildIdRecord, Mmap2Record, MmapRecord};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MmapTable {
@@ -32,6 +32,16 @@ impl MmapTable {
     }
 
     pub fn insert_mmap2(&mut self, record: Mmap2Record) {
+        self.mappings.push(Mapping {
+            pid: record.pid,
+            start: record.start,
+            len: record.len,
+            pgoff: record.pgoff,
+            path: record.path,
+        });
+    }
+
+    pub fn insert_mmap2_build_id(&mut self, record: Mmap2BuildIdRecord) {
         self.mappings.push(Mapping {
             pid: record.pid,
             start: record.start,

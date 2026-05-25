@@ -6,11 +6,7 @@ use crate::perfdata::attrs::parse_file_attrs;
 use crate::perfdata::header::parse_header;
 use crate::perfdata::mappings::{MmapTable, ResolvedMapping};
 use crate::perfdata::raw_stack::{CollapsedRawStack, RawStackAccumulator};
-use crate::perfdata::records::{
-    PERF_RECORD_COMM, PERF_RECORD_LOST, PERF_RECORD_LOST_SAMPLES, PERF_RECORD_MMAP,
-    PERF_RECORD_MMAP2, PERF_RECORD_SAMPLE, iter_records, parse_comm_record, parse_lost_record,
-    parse_lost_samples_record, parse_mmap_record, parse_mmap2_record,
-};
+use crate::perfdata::records::{ParsedRecord, PerfRecord, iter_records, parse_record};
 use crate::perfdata::samples::{
     SampleCallchainFrames, SampleLayout, is_kernel_space_frame, is_perf_context_marker,
     parse_sample_record, parse_sample_record_callchain,
@@ -81,33 +77,60 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
             .record_counts
             .entry(record.header.record_type)
             .or_insert(0) += 1;
-        let record_result: Result<(), String> = match record.header.record_type {
-            PERF_RECORD_COMM => parse_comm_record(record.payload).map(|record| {
+        let parsed_record = parse_record_with_context(record)?;
+        let record_result: Result<(), String> = match parsed_record {
+            ParsedRecord::Comm(record) => {
                 summary.comms_by_pid.insert(record.pid, record.comm.clone());
                 summary.comms.push(record.comm);
-            }),
-            PERF_RECORD_LOST => parse_lost_record(record.payload).map(|record| {
+                Ok(())
+            }
+            ParsedRecord::Lost(record) => {
                 summary.lost_records = summary.lost_records.saturating_add(record.lost);
-            }),
-            PERF_RECORD_LOST_SAMPLES => parse_lost_samples_record(record.payload).map(|record| {
+                Ok(())
+            }
+            ParsedRecord::LostSamples(record) => {
                 summary.lost_records = summary.lost_records.saturating_add(record.lost);
-            }),
-            PERF_RECORD_MMAP => parse_mmap_record(record.payload).map(|record| {
+                Ok(())
+            }
+            ParsedRecord::Mmap(record) => {
                 summary.mmaps.push(record.path.clone());
                 summary.mmap_table.insert_mmap(record);
-            }),
-            PERF_RECORD_SAMPLE => {
-                parse_sample_for_summary(record.payload, sample_layout).map(|sample| {
+                Ok(())
+            }
+            ParsedRecord::Sample(record) => {
+                parse_sample_for_summary(&record.payload, sample_layout).map(|sample| {
                     if let Some(sample) = sample {
                         summary.sample_stacks.push(sample);
                     }
                 })
             }
-            PERF_RECORD_MMAP2 => parse_mmap2_record(record.payload).map(|record| {
+            ParsedRecord::Mmap2(record) => {
                 summary.mmaps.push(record.path.clone());
                 summary.mmap_table.insert_mmap2(record);
-            }),
-            _ => Ok(()),
+                Ok(())
+            }
+            ParsedRecord::Mmap2BuildId(record) => {
+                summary.mmaps.push(record.path.clone());
+                summary.mmap_table.insert_mmap2_build_id(record);
+                Ok(())
+            }
+            ParsedRecord::Unsupported { .. }
+            | ParsedRecord::Fork(_)
+            | ParsedRecord::Exit(_)
+            | ParsedRecord::Throttle(_)
+            | ParsedRecord::Unthrottle(_)
+            | ParsedRecord::Read(_)
+            | ParsedRecord::Aux(_)
+            | ParsedRecord::ItraceStart(_)
+            | ParsedRecord::Switch(_)
+            | ParsedRecord::SwitchCpuWide(_)
+            | ParsedRecord::Namespaces(_)
+            | ParsedRecord::Ksymbol(_)
+            | ParsedRecord::BpfEvent(_)
+            | ParsedRecord::Cgroup(_)
+            | ParsedRecord::TextPoke(_)
+            | ParsedRecord::AuxOutputHwId(_)
+            | ParsedRecord::CallchainDeferred(_) => Ok(()),
         };
         record_result.map_err(|error| {
             format!(
@@ -213,6 +236,15 @@ fn map_perfdata_file(file: &std::fs::File) -> Result<memmap2::Mmap, String> {
         .map_err(|error| format!("failed to map perf.data: {error}"))
 }
 
+fn parse_record_with_context(record: PerfRecord<'_>) -> Result<ParsedRecord, String> {
+    parse_record(record).map_err(|error| {
+        format!(
+            "failed to parse record type {} at offset {}: {error}",
+            record.header.record_type, record.offset
+        )
+    })
+}
+
 fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData, String> {
     let header = parse_header(bytes)?;
     let sample_layout = first_sample_layout(bytes, header)?;
@@ -223,26 +255,53 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
     let mut callchain = Vec::new();
 
     for record in records {
-        let record_result: Result<(), String> = match record.header.record_type {
-            PERF_RECORD_COMM => parse_comm_record(record.payload).map(|record| {
+        let parsed_record = parse_record_with_context(record)?;
+        let record_result: Result<(), String> = match parsed_record {
+            ParsedRecord::Comm(record) => {
                 comms_by_pid.insert(record.pid, record.comm);
-            }),
-            PERF_RECORD_MMAP => parse_mmap_record(record.payload).map(|record| {
+                Ok(())
+            }
+            ParsedRecord::Mmap(record) => {
                 mmap_table.insert_mmap(record);
-            }),
-            PERF_RECORD_SAMPLE => parse_sample_for_fold(record.payload, sample_layout, options)
-                .map(|sample| {
+                Ok(())
+            }
+            ParsedRecord::Sample(record) => {
+                parse_sample_for_fold(&record.payload, sample_layout, options).map(|sample| {
                     if let Some((pid, count, frames)) = sample {
                         callchain.clear();
                         callchain.reserve(frames.len());
                         callchain.extend(frames.filter(|frame| !is_perf_context_marker(*frame)));
                         raw_stacks.add_slice(pid, &callchain, count);
                     }
-                }),
-            PERF_RECORD_MMAP2 => parse_mmap2_record(record.payload).map(|record| {
+                })
+            }
+            ParsedRecord::Mmap2(record) => {
                 mmap_table.insert_mmap2(record);
-            }),
-            _ => Ok(()),
+                Ok(())
+            }
+            ParsedRecord::Mmap2BuildId(record) => {
+                mmap_table.insert_mmap2_build_id(record);
+                Ok(())
+            }
+            ParsedRecord::Unsupported { .. }
+            | ParsedRecord::Lost(_)
+            | ParsedRecord::LostSamples(_)
+            | ParsedRecord::Fork(_)
+            | ParsedRecord::Exit(_)
+            | ParsedRecord::Throttle(_)
+            | ParsedRecord::Unthrottle(_)
+            | ParsedRecord::Read(_)
+            | ParsedRecord::Aux(_)
+            | ParsedRecord::ItraceStart(_)
+            | ParsedRecord::Switch(_)
+            | ParsedRecord::SwitchCpuWide(_)
+            | ParsedRecord::Namespaces(_)
+            | ParsedRecord::Ksymbol(_)
+            | ParsedRecord::BpfEvent(_)
+            | ParsedRecord::Cgroup(_)
+            | ParsedRecord::TextPoke(_)
+            | ParsedRecord::AuxOutputHwId(_)
+            | ParsedRecord::CallchainDeferred(_) => Ok(()),
         };
         record_result.map_err(|error| {
             format!(
