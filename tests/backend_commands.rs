@@ -1,6 +1,8 @@
 use pyroclast::backends::heaptrack::build_heaptrack_command;
 use pyroclast::backends::linux_perf::{PerfRecordTarget, build_perf_record_command};
-use pyroclast::backends::macos_xctrace::build_xctrace_record_command;
+use pyroclast::backends::macos_xctrace::{
+    build_xctrace_export_cpu_command, build_xctrace_record_command,
+};
 use pyroclast::backends::offcpu::build_bpftrace_offcpu_command;
 use pyroclast::backends::strace::build_strace_command;
 use pyroclast::cli::PerfEvent;
@@ -207,6 +209,28 @@ fn builds_macos_xctrace_record_command() {
             "PYROCLAST_XCTRACE_TARGET_PID".to_string(),
             "run/xctrace-target.pid".to_string()
         )]
+    );
+}
+
+#[test]
+fn builds_macos_xctrace_export_command() {
+    let command = build_xctrace_export_cpu_command(
+        &PathBuf::from("run/profile.raw.xctrace.trace"),
+        &PathBuf::from("run/profile.raw.xctrace.xml"),
+    );
+
+    assert_eq!(command.program, "xctrace");
+    assert_eq!(
+        command.args,
+        vec![
+            "export",
+            "--input",
+            "run/profile.raw.xctrace.trace",
+            "--output",
+            "run/profile.raw.xctrace.xml",
+            "--xpath",
+            "//table",
+        ]
     );
 }
 

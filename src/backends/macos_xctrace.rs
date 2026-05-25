@@ -28,3 +28,16 @@ pub fn build_xctrace_record_command(
         .env(XCTRACE_PID_ENV, target_pid_path.display().to_string())
         .args(profiled_command)
 }
+
+#[must_use]
+pub fn build_xctrace_export_cpu_command(trace_path: &Path, output_xml: &Path) -> CommandSpec {
+    CommandSpec::new("xctrace").args([
+        "export".to_string(),
+        "--input".to_string(),
+        trace_path.display().to_string(),
+        "--output".to_string(),
+        output_xml.display().to_string(),
+        "--xpath".to_string(),
+        "//table".to_string(),
+    ])
+}
