@@ -105,7 +105,7 @@ where
         let mut stderr = output.stderr;
         stderr.extend(flamegraph_output.stderr);
         std::fs::write(layout.stderr_log(), &stderr)?;
-        std::fs::write(layout.command_txt(), request.command.join(" "))?;
+        std::fs::write(layout.command_txt(), command_text(request))?;
         std::fs::write(layout.summary_txt(), "linux perf profile recorded\n")?;
         std::fs::write(layout.summary_json(), "{}\n")?;
         std::fs::write(layout.tool_errors_log(), "")?;
@@ -168,6 +168,24 @@ fn attach_duration(request: &ProfileRequest) -> Option<u32> {
         Some(request.duration_secs)
     } else {
         None
+    }
+}
+
+fn command_text(request: &ProfileRequest) -> String {
+    if let Some(pid) = request.pid {
+        format!("pid:{pid}\n")
+    } else if request.tids.is_empty() {
+        format!("{}\n", request.command.join(" "))
+    } else {
+        format!(
+            "tids:{}\n",
+            request
+                .tids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        )
     }
 }
 

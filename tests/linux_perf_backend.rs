@@ -127,6 +127,10 @@ fn linux_perf_backend_records_attached_process() {
     backend.profile(&request).expect("profile");
 
     assert_eq!(
+        std::fs::read_to_string(root.path().join("cpu/command.txt")).expect("command txt"),
+        "pid:99\n"
+    );
+    assert_eq!(
         runner.first_perf_args(),
         vec![
             "record",
@@ -174,6 +178,10 @@ fn linux_perf_backend_records_attached_threads() {
 
     backend.profile(&request).expect("profile");
 
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("cpu/command.txt")).expect("command txt"),
+        "tids:101,102\n"
+    );
     assert!(runner.first_perf_args().contains(&"-t".to_string()));
     assert!(runner.first_perf_args().contains(&"101,102".to_string()));
     assert!(runner.first_perf_args().ends_with(&[
