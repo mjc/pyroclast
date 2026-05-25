@@ -51,6 +51,24 @@ pub enum PerfCallGraph {
     Dwarf,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum PerfEvent {
+    CpuClock,
+    TaskClock,
+    Cycles,
+}
+
+impl std::fmt::Display for PerfEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CpuClock => formatter.write_str("cpu-clock"),
+            Self::TaskClock => formatter.write_str("task-clock"),
+            Self::Cycles => formatter.write_str("cycles"),
+        }
+    }
+}
+
 impl std::fmt::Display for PerfCallGraph {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -77,6 +95,9 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 997)]
     pub frequency: u32,
 
+    #[arg(long, value_enum, default_value_t = PerfEvent::CpuClock)]
+    pub event: PerfEvent,
+
     #[arg(long, value_enum, default_value_t = PerfCallGraph::Fp)]
     pub call_graph: PerfCallGraph,
 
@@ -92,6 +113,7 @@ pub struct ProfileInvocation {
     pub json: bool,
     pub symbols: bool,
     pub frequency: u32,
+    pub event: PerfEvent,
     pub call_graph: PerfCallGraph,
     pub command: Vec<String>,
 }
@@ -112,6 +134,7 @@ impl CliCommand {
                 json: args.json,
                 symbols: args.symbols,
                 frequency: args.frequency,
+                event: args.event,
                 call_graph: args.call_graph,
                 command: args.command.clone(),
             }),
@@ -129,6 +152,7 @@ impl ProfileInvocation {
             json: args.json,
             symbols: args.symbols,
             frequency: args.frequency,
+            event: args.event,
             call_graph: args.call_graph,
             command: args.command.clone(),
         }
@@ -154,6 +178,9 @@ pub struct ProfileArgs {
 
     #[arg(long, default_value_t = 997)]
     pub frequency: u32,
+
+    #[arg(long, value_enum, default_value_t = PerfEvent::CpuClock)]
+    pub event: PerfEvent,
 
     #[arg(long, value_enum, default_value_t = PerfCallGraph::Fp)]
     pub call_graph: PerfCallGraph,

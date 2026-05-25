@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use pyroclast::cli::{Cli, CliCommand, PerfCallGraph, ProfileKind};
+use pyroclast::cli::{Cli, CliCommand, PerfCallGraph, PerfEvent, ProfileKind};
 
 #[test]
 fn parses_profile_defaults() {
@@ -14,6 +14,7 @@ fn parses_profile_defaults() {
             assert!(!profile.json);
             assert!(!profile.symbols);
             assert_eq!(profile.frequency, 997);
+            assert_eq!(profile.event, PerfEvent::CpuClock);
             assert_eq!(profile.call_graph, PerfCallGraph::Fp);
             assert_eq!(profile.command, vec!["true"]);
         }
@@ -36,6 +37,8 @@ fn parses_profile_options() {
         "--symbols",
         "--frequency",
         "199",
+        "--event",
+        "cycles",
         "--call-graph",
         "dwarf",
         "--",
@@ -51,6 +54,7 @@ fn parses_profile_options() {
             assert!(profile.json);
             assert!(profile.symbols);
             assert_eq!(profile.frequency, 199);
+            assert_eq!(profile.event, PerfEvent::Cycles);
             assert_eq!(profile.call_graph, PerfCallGraph::Dwarf);
             assert_eq!(profile.command, vec!["cargo", "check"]);
         }
@@ -78,6 +82,7 @@ fn parses_top_level_profiler_commands() {
         assert_eq!(profile.kind, kind, "verb {verb}");
         assert!(!profile.symbols, "verb {verb}");
         assert_eq!(profile.frequency, 997, "verb {verb}");
+        assert_eq!(profile.event, PerfEvent::CpuClock, "verb {verb}");
         assert_eq!(profile.call_graph, PerfCallGraph::Fp, "verb {verb}");
         assert_eq!(profile.command, vec!["cargo", "check"]);
     }
@@ -88,6 +93,8 @@ fn parses_top_level_profiler_commands() {
         "--symbols",
         "--frequency",
         "199",
+        "--event",
+        "task-clock",
         "--call-graph",
         "dwarf",
         "--",
@@ -100,6 +107,7 @@ fn parses_top_level_profiler_commands() {
         .expect("expected profile invocation");
     assert!(profile.symbols);
     assert_eq!(profile.frequency, 199);
+    assert_eq!(profile.event, PerfEvent::TaskClock);
     assert_eq!(profile.call_graph, PerfCallGraph::Dwarf);
 }
 

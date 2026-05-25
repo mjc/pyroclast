@@ -2,7 +2,7 @@ use std::sync::Mutex;
 
 use pyroclast::backends::linux_perf::LinuxPerfBackend;
 use pyroclast::backends::{ProfileRequest, ProfilerBackend};
-use pyroclast::cli::{PerfCallGraph, ProfileKind};
+use pyroclast::cli::{PerfCallGraph, PerfEvent, ProfileKind};
 use pyroclast::manifest::BackendName;
 use pyroclast::perfdata::samples::{PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_TID};
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
@@ -20,6 +20,7 @@ fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
         json: false,
         symbols: false,
         frequency: 199,
+        event: PerfEvent::CpuClock,
         call_graph: PerfCallGraph::Dwarf,
     };
 
@@ -74,6 +75,7 @@ fn linux_perf_backend_can_symbolize_folded_stacks() {
         json: false,
         symbols: true,
         frequency: 997,
+        event: PerfEvent::CpuClock,
         call_graph: PerfCallGraph::Fp,
     };
 

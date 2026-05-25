@@ -78,6 +78,7 @@ where
             json: invocation.json,
             symbols: invocation.symbols,
             frequency: invocation.frequency,
+            event: invocation.event,
             call_graph: invocation.call_graph,
         };
         match request.kind {
