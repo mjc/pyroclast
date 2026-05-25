@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::folded::render_folded_stack;
 use crate::perfdata::attrs::parse_file_attrs;
@@ -140,6 +140,30 @@ pub fn fold_perfdata_callchains_with_options(
     fold_summary::<NoopSymbolResolver>(&summary, options, None)
 }
 
+/// Collapses perf sample callchains from a `perf.data` file path.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be opened, mapped, or parsed.
+pub fn fold_perfdata_file(path: &Path) -> Result<String, String> {
+    fold_perfdata_file_with_options(path, FoldOptions::default())
+}
+
+/// Collapses perf sample callchains from a `perf.data` file path.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be opened, mapped, or parsed.
+pub fn fold_perfdata_file_with_options(
+    path: &Path,
+    options: FoldOptions,
+) -> Result<String, String> {
+    let file =
+        std::fs::File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
+    let mapping = map_perfdata_file(&file)?;
+    fold_perfdata_callchains_with_options(&mapping, options)
+}
+
 /// Collapses parsed perf sample callchains, symbolizing mapped frames through
 /// the provided resolver.
 ///
@@ -157,6 +181,34 @@ where
     let summary = summarize_perfdata(bytes)?;
     let mut symbol_cache = SymbolCache::new(symbol_resolver);
     fold_summary(&summary, options, Some(&mut symbol_cache))
+}
+
+/// Collapses symbolized perf sample callchains from a `perf.data` file path.
+///
+/// # Errors
+///
+/// Returns an error when file mapping, `perf.data` parsing, or symbol
+/// resolution fails.
+pub fn fold_perfdata_file_with_symbols<R>(
+    path: &Path,
+    options: FoldOptions,
+    symbol_resolver: &R,
+) -> Result<String, String>
+where
+    R: SymbolResolver,
+{
+    let file =
+        std::fs::File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
+    let mapping = map_perfdata_file(&file)?;
+    fold_perfdata_callchains_with_symbols(&mapping, options, symbol_resolver)
+}
+
+fn map_perfdata_file(file: &std::fs::File) -> Result<memmap2::Mmap, String> {
+    // SAFETY: The returned mapping is read-only and is only exposed as an
+    // immutable byte slice while the file handle and mapping are alive in this
+    // function's callers.
+    unsafe { memmap2::MmapOptions::new().map(file) }
+        .map_err(|error| format!("failed to map perf.data: {error}"))
 }
 
 fn fold_summary<R>(

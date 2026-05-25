@@ -2,7 +2,7 @@ use std::cell::RefCell;
 
 use pyroclast::perfdata::fold::{
     FoldOptions, fold_perfdata_callchains, fold_perfdata_callchains_with_options,
-    fold_perfdata_callchains_with_symbols, summarize_perfdata,
+    fold_perfdata_callchains_with_symbols, fold_perfdata_file_with_options, summarize_perfdata,
 };
 use pyroclast::perfdata::samples::{
     PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_TID,
@@ -148,6 +148,34 @@ fn can_fold_samples_weighted_by_period() {
 
     let folded = fold_perfdata_callchains_with_options(
         &bytes,
+        FoldOptions {
+            count_periods: true,
+        },
+    )
+    .expect("folded");
+
+    assert_eq!(folded, "0x2000 10\n");
+}
+
+#[test]
+fn folds_perfdata_from_file_path() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(9, &sample_payload_with_period(0x1000, 11, 12, 7, [0x2000])),
+            record_bytes(9, &sample_payload_with_period(0x1000, 11, 12, 3, [0x2000])),
+        ],
+    );
+    std::fs::write(&perfdata, bytes).expect("write perfdata");
+
+    let folded = fold_perfdata_file_with_options(
+        &perfdata,
         FoldOptions {
             count_periods: true,
         },
