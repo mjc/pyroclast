@@ -389,7 +389,7 @@ fn top_level_offcpu_command_uses_injected_bpftrace_runner() {
     let runner = RecordingRunner::default();
     let cli = pyroclast::cli::Cli::parse_from([
         "pyroclast",
-        "offpcu",
+        "offcpu",
         "--out",
         out.to_str().expect("utf8 path"),
         "--",
