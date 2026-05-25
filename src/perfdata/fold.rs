@@ -37,6 +37,19 @@ pub struct PerfSampleStack {
     pub callchain: Vec<u64>,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RawStackKey {
+    pid: Option<u32>,
+    callchain: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CollapsedRawStack {
+    pid: Option<u32>,
+    callchain: Vec<u64>,
+    count: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FoldOptions {
     pub count_periods: bool,
@@ -226,9 +239,13 @@ where
     }
     let mut counts = BTreeMap::<Vec<String>, u64>::new();
     let frame_resolver = FoldFrameResolver::new(summary);
-    for sample in &summary.sample_stacks {
-        let frames = frame_resolver.frames_for_sample(sample, symbol_cache.as_deref_mut())?;
-        *counts.entry(frames).or_insert(0) += sample.count(options);
+    for stack in collapse_raw_stacks(&summary.sample_stacks, options) {
+        let frames = frame_resolver.frames_for_stack(
+            stack.pid,
+            &stack.callchain,
+            symbol_cache.as_deref_mut(),
+        )?;
+        *counts.entry(frames).or_insert(0) += stack.count;
     }
 
     let mut folded = String::new();
@@ -240,6 +257,34 @@ where
         folded.push('\n');
     }
     Ok(folded)
+}
+
+fn collapse_raw_stacks(
+    samples: &[PerfSampleStack],
+    options: FoldOptions,
+) -> Vec<CollapsedRawStack> {
+    let mut counts = BTreeMap::<RawStackKey, u64>::new();
+    for sample in samples {
+        let key = RawStackKey {
+            pid: sample.pid,
+            callchain: sample
+                .callchain
+                .iter()
+                .copied()
+                .filter(|frame| !is_perf_context_marker(*frame))
+                .collect(),
+        };
+        *counts.entry(key).or_insert(0) += sample.count(options);
+    }
+
+    counts
+        .into_iter()
+        .map(|(key, count)| CollapsedRawStack {
+            pid: key.pid,
+            callchain: key.callchain,
+            count,
+        })
+        .collect()
 }
 
 fn prefetch_symbols<R>(
@@ -297,27 +342,22 @@ impl<'a> FoldFrameResolver<'a> {
         }
     }
 
-    fn frames_for_sample<R>(
+    fn frames_for_stack<R>(
         &self,
-        sample: &PerfSampleStack,
+        pid: Option<u32>,
+        callchain: &[u64],
         mut symbol_cache: Option<&mut SymbolCache<'_, R>>,
     ) -> Result<Vec<String>, String>
     where
         R: SymbolResolver,
     {
-        let mut frames = if let Some(comm) = sample.pid.and_then(|pid| self.comms_by_pid.get(&pid))
-        {
+        let mut frames = if let Some(comm) = pid.and_then(|pid| self.comms_by_pid.get(&pid)) {
             vec![comm.clone()]
         } else {
             Vec::new()
         };
-        for frame in sample
-            .callchain
-            .iter()
-            .copied()
-            .filter(|frame| !is_perf_context_marker(*frame))
-        {
-            frames.push(self.format_frame(sample.pid, frame, symbol_cache.as_deref_mut())?);
+        for frame in callchain.iter().copied() {
+            frames.push(self.format_frame(pid, frame, symbol_cache.as_deref_mut())?);
         }
         Ok(frames)
     }
@@ -384,4 +424,39 @@ fn first_sample_layout(
         .map(|attr| SampleLayout {
             sample_type: attr.sample_type,
         }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FoldOptions, PerfSampleStack, collapse_raw_stacks};
+
+    #[test]
+    fn collapses_identical_raw_stacks_before_rendering() {
+        let samples = vec![
+            PerfSampleStack {
+                pid: Some(7),
+                period: None,
+                callchain: vec![0x1000, 0x2000],
+            },
+            PerfSampleStack {
+                pid: Some(7),
+                period: None,
+                callchain: vec![0x1000, 0x2000],
+            },
+            PerfSampleStack {
+                pid: Some(8),
+                period: None,
+                callchain: vec![0x1000, 0x2000],
+            },
+        ];
+
+        let collapsed = collapse_raw_stacks(&samples, FoldOptions::default());
+
+        assert_eq!(collapsed.len(), 2);
+        assert_eq!(collapsed[0].pid, Some(7));
+        assert_eq!(collapsed[0].callchain, vec![0x1000, 0x2000]);
+        assert_eq!(collapsed[0].count, 2);
+        assert_eq!(collapsed[1].pid, Some(8));
+        assert_eq!(collapsed[1].count, 1);
+    }
 }
