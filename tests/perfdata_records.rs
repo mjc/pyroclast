@@ -1,7 +1,7 @@
 use pyroclast::perfdata::header::parse_header;
 use pyroclast::perfdata::records::{
     PerfRecordHeader, iter_records, parse_comm_record, parse_exit_record, parse_fork_record,
-    parse_mmap_record, parse_mmap2_record, parse_record_header,
+    parse_lost_record, parse_mmap_record, parse_mmap2_record, parse_record_header,
 };
 
 #[test]
@@ -144,6 +144,18 @@ fn parses_exit_record_payload_from_perf_event_header_shape() {
     assert_eq!(exit.tid, 456);
     assert_eq!(exit.ptid, 45);
     assert_eq!(exit.time, 99_000);
+}
+
+#[test]
+fn parses_lost_record_payload_from_perf_event_header_shape() {
+    let mut payload = Vec::new();
+    payload.extend(77u64.to_le_bytes());
+    payload.extend(1234u64.to_le_bytes());
+
+    let lost = parse_lost_record(&payload).expect("lost record");
+
+    assert_eq!(lost.id, 77);
+    assert_eq!(lost.lost, 1234);
 }
 
 fn perfdata_with_records<const N: usize>(records: [Vec<u8>; N]) -> Vec<u8> {

@@ -67,6 +67,12 @@ pub struct ExitRecord {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LostRecord {
+    pub id: u64,
+    pub lost: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProcessLifecycleRecord {
     pid: u32,
     ppid: u32,
@@ -242,6 +248,22 @@ pub fn parse_exit_record(payload: &[u8]) -> Result<ExitRecord, String> {
     let record = parse_process_lifecycle_record(payload, "PERF_RECORD_EXIT")?;
 
     Ok(ExitRecord::from(record))
+}
+
+/// Parses a `PERF_RECORD_LOST` payload.
+///
+/// # Errors
+///
+/// Returns an error when the fixed id/lost fields are missing.
+pub fn parse_lost_record(payload: &[u8]) -> Result<LostRecord, String> {
+    if payload.len() < 16 {
+        return Err("PERF_RECORD_LOST payload is shorter than 16 bytes".to_string());
+    }
+
+    Ok(LostRecord {
+        id: read_u64(payload, 0)?,
+        lost: read_u64(payload, 8)?,
+    })
 }
 
 fn parse_process_lifecycle_record(
