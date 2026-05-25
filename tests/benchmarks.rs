@@ -1,7 +1,8 @@
 use std::sync::Mutex;
 
 use pyroclast::benchmarks::{
-    BenchArgs, export_perf_script, run_fold_benchmark, run_inferno_collapse_benchmark,
+    BenchArgs, compare_with_inferno_collapse, export_perf_script, run_fold_benchmark,
+    run_inferno_collapse_benchmark,
 };
 use pyroclast::perfdata::samples::{PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_TID};
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
@@ -58,6 +59,39 @@ fn inferno_collapse_benchmark_reports_folded_output_size() {
             )
         ]
     );
+}
+
+#[test]
+fn compares_pyroclast_folded_stacks_with_inferno_collapse() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    let perf_script = root.path().join("perf-script.txt");
+    std::fs::write(
+        &perfdata,
+        perfdata_with_records_and_attrs(
+            [file_attr_bytes(
+                PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+                0,
+                0,
+            )],
+            [
+                record_bytes(9, &sample_payload(0x1000, 1, 2, [0x2000])),
+                record_bytes(9, &sample_payload(0x1000, 1, 2, [0x2000])),
+            ],
+        ),
+    )
+    .expect("write perfdata");
+    std::fs::write(&perf_script, "sample script\n").expect("write perf script");
+    let runner = MatchingCollapseRunner::default();
+
+    let report =
+        compare_with_inferno_collapse(&perfdata, &perf_script, &runner).expect("comparison");
+
+    assert_eq!(report.pyroclast_folded_lines, 1);
+    assert_eq!(report.inferno_folded_lines, 1);
+    assert!(report.matches);
+    assert_eq!(report.only_pyroclast, Vec::<String>::new());
+    assert_eq!(report.only_inferno, Vec::<String>::new());
 }
 
 #[test]
@@ -138,6 +172,22 @@ impl CommandRunner for CollapseRunner {
         Ok(CommandOutput {
             status_code: Some(0),
             stdout: b"app;work 2\napp;io 1\n".to_vec(),
+            stderr: Vec::new(),
+        })
+    }
+}
+
+#[derive(Default)]
+struct MatchingCollapseRunner {
+    commands: Mutex<Vec<CommandSpec>>,
+}
+
+impl CommandRunner for MatchingCollapseRunner {
+    fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
+        self.commands.lock().unwrap().push(command.clone());
+        Ok(CommandOutput {
+            status_code: Some(0),
+            stdout: b"0x2000 2\n".to_vec(),
             stderr: Vec::new(),
         })
     }

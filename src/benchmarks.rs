@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,15 @@ pub struct FoldBenchmarkReport {
     pub elapsed: Duration,
     pub folded_bytes: usize,
     pub folded_lines: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FoldComparisonReport {
+    pub pyroclast_folded_lines: usize,
+    pub inferno_folded_lines: usize,
+    pub matches: bool,
+    pub only_pyroclast: Vec<String>,
+    pub only_inferno: Vec<String>,
 }
 
 /// Folds a `perf.data` file and returns timing and output-size metadata.
@@ -87,6 +97,46 @@ where
     })
 }
 
+/// Compares Pyroclast's direct folded stacks with the old
+/// `perf script | inferno-collapse-perf` folded-stack output.
+///
+/// # Errors
+///
+/// Returns an error when Pyroclast cannot fold the `perf.data`, Inferno cannot
+/// collapse the saved script, or either folded output is malformed.
+pub fn compare_with_inferno_collapse<R>(
+    perf_data: &Path,
+    perf_script: &Path,
+    runner: &R,
+) -> Result<FoldComparisonReport, String>
+where
+    R: CommandRunner,
+{
+    let pyroclast_folded = fold_perfdata_file(perf_data)?;
+    let inferno_output = runner
+        .run(&CommandSpec::new("inferno-collapse-perf").arg(perf_script.display().to_string()))
+        .map_err(|error| format!("failed to run inferno-collapse-perf: {error}"))?;
+    if inferno_output.status_code != Some(0) {
+        return Err(format!(
+            "inferno-collapse-perf exited with {:?}",
+            inferno_output.status_code
+        ));
+    }
+    let inferno_folded = String::from_utf8_lossy(&inferno_output.stdout);
+    let pyroclast = parse_folded_counts(&pyroclast_folded)?;
+    let inferno = parse_folded_counts(&inferno_folded)?;
+    let only_pyroclast = folded_difference(&pyroclast, &inferno);
+    let only_inferno = folded_difference(&inferno, &pyroclast);
+
+    Ok(FoldComparisonReport {
+        pyroclast_folded_lines: pyroclast.len(),
+        inferno_folded_lines: inferno.len(),
+        matches: only_pyroclast.is_empty() && only_inferno.is_empty(),
+        only_pyroclast,
+        only_inferno,
+    })
+}
+
 /// Exports `perf script` text for old-pipeline benchmarking.
 ///
 /// This is intentionally benchmark-only; Pyroclast's normal fold path parses
@@ -114,4 +164,25 @@ where
     }
     std::fs::write(output, command_output.stdout)
         .map_err(|error| format!("failed to write perf script output: {error}"))
+}
+
+fn parse_folded_counts(folded: &str) -> Result<BTreeMap<String, u64>, String> {
+    let mut counts = BTreeMap::new();
+    for line in folded.lines().filter(|line| !line.trim().is_empty()) {
+        let (stack, count) = line
+            .rsplit_once(' ')
+            .ok_or_else(|| format!("folded stack line is missing count: {line}"))?;
+        let count = count
+            .parse::<u64>()
+            .map_err(|error| format!("folded stack count is invalid: {error}"))?;
+        *counts.entry(stack.to_string()).or_insert(0) += count;
+    }
+    Ok(counts)
+}
+
+fn folded_difference(left: &BTreeMap<String, u64>, right: &BTreeMap<String, u64>) -> Vec<String> {
+    left.iter()
+        .filter(|(stack, count)| right.get(*stack).copied().unwrap_or(0) != **count)
+        .map(|(stack, count)| format!("{stack} {count}"))
+        .collect()
 }
