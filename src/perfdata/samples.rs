@@ -13,6 +13,7 @@ pub const PERF_SAMPLE_STREAM_ID: u64 = 1 << 9;
 pub const PERF_SAMPLE_RAW: u64 = 1 << 10;
 pub const PERF_SAMPLE_BRANCH_STACK: u64 = 1 << 11;
 pub const PERF_SAMPLE_REGS_USER: u64 = 1 << 12;
+pub const PERF_SAMPLE_STACK_USER: u64 = 1 << 13;
 pub const PERF_SAMPLE_IDENTIFIER: u64 = 1 << 16;
 pub const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
 pub const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 1 << 1;
@@ -113,6 +114,9 @@ pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<Sampl
     }
     if layout.has(PERF_SAMPLE_REGS_USER) {
         cursor.skip_regs(layout.sample_regs_user)?;
+    }
+    if layout.has(PERF_SAMPLE_STACK_USER) {
+        cursor.skip_user_stack()?;
     }
 
     Ok(sample)
@@ -230,13 +234,15 @@ impl<'a> SampleCursor<'a> {
     }
 
     fn read_u32(&mut self) -> Result<u32, String> {
-        let value = read_u32(self.payload, self.offset)?;
+        let value = read_u32(self.payload, self.offset)
+            .map_err(|_| "perf sample payload is truncated".to_string())?;
         self.offset += 4;
         Ok(value)
     }
 
     fn read_u64(&mut self) -> Result<u64, String> {
-        let value = read_u64(self.payload, self.offset)?;
+        let value = read_u64(self.payload, self.offset)
+            .map_err(|_| "perf sample payload is truncated".to_string())?;
         self.offset += 8;
         Ok(value)
     }
@@ -284,6 +290,13 @@ impl<'a> SampleCursor<'a> {
             .checked_mul(8)
             .ok_or_else(|| "perf sample register byte length overflows usize".to_string())?;
         self.read_bytes(byte_len).map(|_| ())
+    }
+
+    fn skip_user_stack(&mut self) -> Result<(), String> {
+        let size = usize::try_from(self.read_u64()?)
+            .map_err(|_| "perf sample user stack size does not fit in usize".to_string())?;
+        self.read_bytes(size)?;
+        self.skip_u64()
     }
 
     fn skip_read_format(&mut self, read_format: u64) -> Result<(), String> {

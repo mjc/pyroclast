@@ -3,8 +3,9 @@ use pyroclast::perfdata::samples::{
     PERF_FORMAT_TOTAL_TIME_RUNNING, PERF_SAMPLE_ADDR, PERF_SAMPLE_BRANCH_STACK,
     PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP,
     PERF_SAMPLE_PERIOD, PERF_SAMPLE_RAW, PERF_SAMPLE_READ, PERF_SAMPLE_REGS_USER,
-    PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME, SampleLayout, is_kernel_space_frame,
-    is_perf_context_marker, parse_sample_record, parse_sample_record_callchain,
+    PERF_SAMPLE_STACK_USER, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME, SampleLayout,
+    is_kernel_space_frame, is_perf_context_marker, parse_sample_record,
+    parse_sample_record_callchain,
 };
 
 #[test]
@@ -256,6 +257,26 @@ fn rejects_truncated_user_regs_sample_payload() {
         },
     )
     .expect_err("truncated regs user sample");
+
+    assert!(error.contains("truncated"));
+}
+
+#[test]
+fn rejects_truncated_user_stack_sample_payload() {
+    let mut payload = Vec::new();
+    payload.extend(4u64.to_le_bytes());
+    payload.extend([1, 2, 3, 4]);
+
+    let error = parse_sample_record(
+        &payload,
+        SampleLayout {
+            sample_type: PERF_SAMPLE_STACK_USER,
+            read_format: 0,
+            sample_regs_user: 0,
+            sample_regs_intr: 0,
+        },
+    )
+    .expect_err("truncated stack user sample");
 
     assert!(error.contains("truncated"));
 }
