@@ -29,6 +29,7 @@ use perfdata::fold::{
     fold_perfdata_file_with_symbols,
 };
 use process::{CommandRunner, RealCommandRunner};
+use summary::threads::{render_folded_stack_summary_text, summarize_folded_stacks};
 use symbols::Addr2lineResolver;
 
 /// Parses command-line arguments and runs the requested Pyroclast command.
@@ -169,7 +170,26 @@ fn summarize_artifact_dir(path: &std::path::Path, json: bool) -> backends::Backe
     } else {
         layout.summary_txt()
     };
-    Ok(std::fs::read_to_string(summary_path)?)
+    match std::fs::read_to_string(&summary_path) {
+        Ok(summary) => Ok(summary),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            summarize_folded_artifact(&layout, json)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn summarize_folded_artifact(
+    layout: &ArtifactLayout,
+    json: bool,
+) -> backends::BackendResult<String> {
+    let folded_stacks = std::fs::read_to_string(layout.stacks_folded())?;
+    let summary = summarize_folded_stacks(&folded_stacks);
+    if json {
+        Ok(format!("{}\n", serde_json::to_string_pretty(&summary)?))
+    } else {
+        Ok(render_folded_stack_summary_text(summary))
+    }
 }
 
 fn fold_perfdata_for_cli<R>(

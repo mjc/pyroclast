@@ -226,6 +226,22 @@ fn summarize_command_prints_summary_json() {
 }
 
 #[test]
+fn summarize_command_computes_text_from_folded_stacks_when_summary_is_missing() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let run_dir = root.path().join("run");
+    std::fs::create_dir(&run_dir).expect("run dir");
+    std::fs::write(run_dir.join("stacks.folded"), "a;b 2\nc 3\n").expect("folded stacks");
+
+    let output = pyroclast::run_cli(["pyroclast", "summarize", run_dir.to_str().unwrap()])
+        .expect("summarize command");
+
+    assert_eq!(
+        output.stdout,
+        "folded lines: 2\nfolded bytes: 10\ntotal count: 5\n"
+    );
+}
+
+#[test]
 fn top_level_cpu_command_uses_injected_perf_runner() {
     let root = tempfile::tempdir().expect("tempdir");
     let out = root.path().join("cpu-run");

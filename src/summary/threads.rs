@@ -19,3 +19,11 @@ pub fn summarize_folded_stacks(folded_stacks: &str) -> FoldedStackSummary {
             .sum(),
     }
 }
+
+#[must_use]
+pub fn render_folded_stack_summary_text(summary: FoldedStackSummary) -> String {
+    format!(
+        "folded lines: {}\nfolded bytes: {}\ntotal count: {}\n",
+        summary.folded_lines, summary.folded_bytes, summary.total_count
+    )
+}
