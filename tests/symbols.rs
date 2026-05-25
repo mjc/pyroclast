@@ -205,6 +205,42 @@ fn kallsyms_rejects_address_masked_tables() {
 }
 
 #[test]
+fn kallsyms_loads_perf_build_id_cache_layout() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let build_id = "16ed3d5317ad219c89d0e3c5ea0ea2caa3cd4949";
+    let cached = root
+        .path()
+        .join("[kernel.kallsyms]")
+        .join(build_id)
+        .join("kallsyms");
+    std::fs::create_dir_all(cached.parent().expect("parent")).expect("cache dir");
+    std::fs::write(&cached, "ffffffff88000080 t asm_exc_page_fault\n").expect("kallsyms");
+
+    let symbols = Kallsyms::load_perf_build_id_cache(root.path(), build_id).expect("cache");
+
+    assert_eq!(
+        symbols.resolve(0xffff_ffff_8800_008f).as_deref(),
+        Some("asm_exc_page_fault")
+    );
+}
+
+#[test]
+fn kallsyms_loads_old_perf_build_id_cache_layout() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let build_id = "16ed3d5317ad219c89d0e3c5ea0ea2caa3cd4949";
+    let cached = root.path().join("[kernel.kallsyms]").join(build_id);
+    std::fs::create_dir_all(cached.parent().expect("parent")).expect("cache dir");
+    std::fs::write(&cached, "ffffffff88000080 t asm_exc_page_fault\n").expect("kallsyms");
+
+    let symbols = Kallsyms::load_perf_build_id_cache(root.path(), build_id).expect("cache");
+
+    assert_eq!(
+        symbols.resolve(0xffff_ffff_8800_008f).as_deref(),
+        Some("asm_exc_page_fault")
+    );
+}
+
+#[test]
 fn perf_symbol_resolver_routes_kernel_requests_to_kallsyms() {
     let runner = Addr2lineRunner::new(b"app::main\n/bin/app.rs:10\n");
     let kallsyms = Kallsyms::parse(

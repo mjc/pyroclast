@@ -97,6 +97,14 @@ impl Kallsyms {
     }
 
     #[must_use]
+    pub fn load_perf_build_id_cache(debug_dir: &Path, build_id: &str) -> Option<Self> {
+        perf_build_id_kallsyms_paths(debug_dir, build_id)
+            .into_iter()
+            .filter_map(|path| std::fs::read_to_string(path).ok())
+            .find_map(|text| Self::parse(&text).ok())
+    }
+
+    #[must_use]
     pub fn resolve(&self, address: u64) -> Option<String> {
         self.symbols
             .range(..=address)
@@ -298,6 +306,11 @@ fn is_kernel_symbol_path(path: &Path) -> bool {
     path == Path::new("[kernel.kallsyms]")
         || path == Path::new("[kernel]")
         || path == Path::new("[guest.kernel]")
+}
+
+fn perf_build_id_kallsyms_paths(debug_dir: &Path, build_id: &str) -> [PathBuf; 2] {
+    let base = debug_dir.join("[kernel.kallsyms]").join(build_id);
+    [base.join("kallsyms"), base]
 }
 
 fn parse_kallsyms_line(line: &str) -> Option<(u64, String)> {
