@@ -1,9 +1,10 @@
 use pyroclast::perfdata::samples::{
     PERF_FORMAT_GROUP, PERF_FORMAT_ID, PERF_FORMAT_LOST, PERF_FORMAT_TOTAL_TIME_ENABLED,
     PERF_FORMAT_TOTAL_TIME_RUNNING, PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU,
-    PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_READ,
-    PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME, SampleLayout, is_kernel_space_frame,
-    is_perf_context_marker, parse_sample_record, parse_sample_record_callchain,
+    PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_RAW,
+    PERF_SAMPLE_READ, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME, SampleLayout,
+    is_kernel_space_frame, is_perf_context_marker, parse_sample_record,
+    parse_sample_record_callchain,
 };
 
 #[test]
@@ -185,6 +186,24 @@ fn skips_identifier_before_ip_tid_and_callchain() {
     assert_eq!(sample.pid, Some(123));
     assert_eq!(sample.tid, Some(456));
     assert_eq!(sample.callchain, vec![0x2000, 0x3000]);
+}
+
+#[test]
+fn rejects_truncated_raw_sample_payload() {
+    let mut payload = Vec::new();
+    payload.extend(4u32.to_le_bytes());
+    payload.extend([1, 2]);
+
+    let error = parse_sample_record(
+        &payload,
+        SampleLayout {
+            sample_type: PERF_SAMPLE_RAW,
+            read_format: 0,
+        },
+    )
+    .expect_err("truncated raw sample");
+
+    assert!(error.contains("truncated"));
 }
 
 #[test]

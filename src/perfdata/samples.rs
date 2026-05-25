@@ -10,6 +10,7 @@ pub const PERF_SAMPLE_ID: u64 = 1 << 6;
 pub const PERF_SAMPLE_CPU: u64 = 1 << 7;
 pub const PERF_SAMPLE_PERIOD: u64 = 1 << 8;
 pub const PERF_SAMPLE_STREAM_ID: u64 = 1 << 9;
+pub const PERF_SAMPLE_RAW: u64 = 1 << 10;
 pub const PERF_SAMPLE_IDENTIFIER: u64 = 1 << 16;
 pub const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
 pub const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 1 << 1;
@@ -99,6 +100,9 @@ pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<Sampl
         for _ in 0..callchain_len {
             sample.callchain.push(cursor.read_u64()?);
         }
+    }
+    if layout.has(PERF_SAMPLE_RAW) {
+        cursor.skip_sized_u32_payload()?;
     }
 
     Ok(sample)
@@ -246,6 +250,12 @@ impl<'a> SampleCursor<'a> {
             .ok_or_else(|| "perf sample payload is truncated".to_string())?;
         self.offset = end;
         Ok(bytes)
+    }
+
+    fn skip_sized_u32_payload(&mut self) -> Result<(), String> {
+        let size = usize::try_from(self.read_u32()?)
+            .map_err(|_| "perf sample raw size does not fit in usize".to_string())?;
+        self.read_bytes(size).map(|_| ())
     }
 
     fn skip_read_format(&mut self, read_format: u64) -> Result<(), String> {
