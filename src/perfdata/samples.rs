@@ -23,6 +23,7 @@ pub const PERF_SAMPLE_PHYS_ADDR: u64 = 1 << 19;
 pub const PERF_SAMPLE_AUX: u64 = 1 << 20;
 pub const PERF_SAMPLE_CGROUP: u64 = 1 << 21;
 pub const PERF_SAMPLE_DATA_PAGE_SIZE: u64 = 1 << 22;
+pub const PERF_SAMPLE_CODE_PAGE_SIZE: u64 = 1 << 23;
 pub const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
 pub const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 1 << 1;
 pub const PERF_FORMAT_ID: u64 = 1 << 2;
@@ -148,6 +149,9 @@ pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<Sampl
         cursor.skip_u64()?;
     }
     if layout.has(PERF_SAMPLE_DATA_PAGE_SIZE) {
+        cursor.skip_u64()?;
+    }
+    if layout.has(PERF_SAMPLE_CODE_PAGE_SIZE) {
         cursor.skip_u64()?;
     }
 
