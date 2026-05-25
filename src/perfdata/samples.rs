@@ -17,6 +17,7 @@ pub const PERF_SAMPLE_STACK_USER: u64 = 1 << 13;
 pub const PERF_SAMPLE_WEIGHT: u64 = 1 << 14;
 pub const PERF_SAMPLE_DATA_SRC: u64 = 1 << 15;
 pub const PERF_SAMPLE_IDENTIFIER: u64 = 1 << 16;
+pub const PERF_SAMPLE_TRANSACTION: u64 = 1 << 17;
 pub const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
 pub const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 1 << 1;
 pub const PERF_FORMAT_ID: u64 = 1 << 2;
@@ -124,6 +125,9 @@ pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<Sampl
         cursor.skip_u64()?;
     }
     if layout.has(PERF_SAMPLE_DATA_SRC) {
+        cursor.skip_u64()?;
+    }
+    if layout.has(PERF_SAMPLE_TRANSACTION) {
         cursor.skip_u64()?;
     }
 

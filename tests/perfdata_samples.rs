@@ -4,8 +4,9 @@ use pyroclast::perfdata::samples::{
     PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_DATA_SRC, PERF_SAMPLE_ID,
     PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_RAW, PERF_SAMPLE_READ,
     PERF_SAMPLE_REGS_USER, PERF_SAMPLE_STACK_USER, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID,
-    PERF_SAMPLE_TIME, PERF_SAMPLE_WEIGHT, SampleLayout, is_kernel_space_frame,
-    is_perf_context_marker, parse_sample_record, parse_sample_record_callchain,
+    PERF_SAMPLE_TIME, PERF_SAMPLE_TRANSACTION, PERF_SAMPLE_WEIGHT, SampleLayout,
+    is_kernel_space_frame, is_perf_context_marker, parse_sample_record,
+    parse_sample_record_callchain,
 };
 
 #[test]
@@ -309,6 +310,22 @@ fn rejects_truncated_data_src_sample_payload() {
         },
     )
     .expect_err("truncated data source sample");
+
+    assert!(error.contains("truncated"));
+}
+
+#[test]
+fn rejects_truncated_transaction_sample_payload() {
+    let error = parse_sample_record(
+        &[1, 2, 3, 4],
+        SampleLayout {
+            sample_type: PERF_SAMPLE_TRANSACTION,
+            read_format: 0,
+            sample_regs_user: 0,
+            sample_regs_intr: 0,
+        },
+    )
+    .expect_err("truncated transaction sample");
 
     assert!(error.contains("truncated"));
 }
