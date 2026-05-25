@@ -188,9 +188,17 @@ fn top_level_cpu_command_uses_injected_perf_runner() {
     let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
     assert!(run_json.contains("\"actual_backend\": \"linux_perf\""));
     assert!(run_json.contains("\"sample_frequency\": 997"));
+    assert!(run_json.contains("\"sample_event\": \"cpu-clock\""));
     assert!(run_json.contains("\"call_graph\": \"fp\""));
+    assert!(run_json.contains("\"record_target\": \"command\""));
+    assert!(run_json.contains("\"duration_secs\": null"));
     assert!(run_json.contains("\"symbols\": false"));
     assert!(run_json.contains("\"tool_versions\""));
+    let summary_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("summary.json")).unwrap())
+            .expect("summary json");
+    assert_eq!(summary_json["folded_lines"], 1);
+    assert_eq!(summary_json["total_count"], 1);
 }
 
 #[derive(Default)]
