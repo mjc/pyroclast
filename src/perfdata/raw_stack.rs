@@ -1,4 +1,8 @@
-use rustc_hash::FxHashMap;
+use std::hash::{Hash, Hasher};
+
+use hashbrown::HashMap;
+use hashbrown::hash_map::RawEntryMut;
+use rustc_hash::{FxBuildHasher, FxHasher};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollapsedRawStack {
@@ -15,7 +19,7 @@ struct RawStackKey {
 
 #[derive(Debug, Default)]
 pub struct RawStackAccumulator {
-    counts: FxHashMap<RawStackKey, u64>,
+    counts: HashMap<RawStackKey, u64, FxBuildHasher>,
 }
 
 impl RawStackAccumulator {
@@ -36,6 +40,28 @@ impl RawStackAccumulator {
         *self.counts.entry(key).or_insert(0) += count;
     }
 
+    pub fn add_slice(&mut self, pid: Option<u32>, callchain: &[u64], count: u64) {
+        let hash = raw_stack_hash(pid, callchain);
+        match self
+            .counts
+            .raw_entry_mut()
+            .from_hash(hash, |key| key.pid == pid && key.callchain == callchain)
+        {
+            RawEntryMut::Occupied(mut entry) => {
+                *entry.get_mut() += count;
+            }
+            RawEntryMut::Vacant(entry) => {
+                entry.insert(
+                    RawStackKey {
+                        pid,
+                        callchain: callchain.to_vec(),
+                    },
+                    count,
+                );
+            }
+        }
+    }
+
     #[must_use]
     pub fn into_collapsed(self) -> Vec<CollapsedRawStack> {
         let mut collapsed = self
@@ -54,6 +80,13 @@ impl RawStackAccumulator {
         });
         collapsed
     }
+}
+
+fn raw_stack_hash(pid: Option<u32>, callchain: &[u64]) -> u64 {
+    let mut hasher = FxHasher::default();
+    pid.hash(&mut hasher);
+    callchain.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[cfg(test)]
@@ -84,6 +117,21 @@ mod tests {
 
         accumulator.add_vec(Some(7), vec![0x1000, 0x2000], 1);
         accumulator.add_vec(Some(7), vec![0x1000, 0x2000], 2);
+
+        let collapsed = accumulator.into_collapsed();
+
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].callchain, vec![0x1000, 0x2000]);
+        assert_eq!(collapsed[0].count, 3);
+    }
+
+    #[test]
+    fn accumulates_borrowed_raw_stack_slices() {
+        let mut accumulator = RawStackAccumulator::new();
+        let stack = vec![0x1000, 0x2000];
+
+        accumulator.add_slice(Some(7), &stack, 1);
+        accumulator.add_slice(Some(7), &stack, 2);
 
         let collapsed = accumulator.into_collapsed();
 
