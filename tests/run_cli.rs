@@ -314,6 +314,32 @@ fn top_level_cpu_command_uses_injected_perf_runner() {
     assert_eq!(summary_json["total_count"], 1);
 }
 
+#[test]
+fn top_level_latency_command_uses_injected_strace_runner() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let out = root.path().join("latency-run");
+    let runner = RecordingRunner::default();
+    let cli = pyroclast::cli::Cli::parse_from([
+        "pyroclast",
+        "latency",
+        "--out",
+        out.to_str().expect("utf8 path"),
+        "--",
+        "true",
+    ]);
+
+    pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("run cli");
+
+    assert_eq!(runner.programs(), vec!["strace", "strace"]);
+    let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
+    assert!(run_json.contains("\"actual_backend\": \"strace\""));
+    assert!(out.join("profile.raw.strace").is_file());
+    let summary_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("summary.json")).unwrap())
+            .expect("summary json");
+    assert_eq!(summary_json["total_calls"], 2);
+}
+
 #[derive(Default)]
 struct RecordingRunner {
     commands: Mutex<Vec<pyroclast::process::CommandSpec>>,
@@ -363,6 +389,12 @@ impl pyroclast::process::CommandRunner for RecordingRunner {
         if let Some(output_path) = perf_output_path(command) {
             std::fs::write(output_path, tiny_perfdata())?;
         }
+        if let Some(output_path) = strace_output_path(command) {
+            std::fs::write(
+                output_path,
+                "123 12:00:00.000000 read(3, \"abc\", 3) = 3 <0.001000>\n123 12:00:00.002000 write(1, \"x\", 1) = 1 <0.002500>\n",
+            )?;
+        }
         let stdout = match command.program.as_str() {
             "addr2line" => b"app::work\n/bin/app.rs:10\n".to_vec(),
             "inferno-flamegraph" => b"<svg></svg>\n".to_vec(),
@@ -407,6 +439,18 @@ fn perf_output_path(command: &pyroclast::process::CommandSpec) -> Option<&str> {
         .windows(2)
         .find(|window| window[0] == "-o")
         .map(|window| window[1].as_str())
+}
+
+fn strace_output_path(command: &pyroclast::process::CommandSpec) -> Option<&str> {
+    (command.program == "strace")
+        .then(|| {
+            command
+                .args
+                .windows(2)
+                .find(|window| window[0] == "-o")
+                .map(|window| window[1].as_str())
+        })
+        .flatten()
 }
 
 fn tiny_perfdata() -> Vec<u8> {

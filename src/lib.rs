@@ -19,6 +19,7 @@ pub mod tools;
 use artifacts::ArtifactLayout;
 use backends::fake::FakeBackend;
 use backends::linux_perf::LinuxPerfBackend;
+use backends::strace::StraceBackend;
 use backends::{ProfileRequest, ProfilerBackend};
 use cli::ProfileKind;
 use cli::{Cli, CliCommand};
@@ -108,6 +109,9 @@ where
         match request.kind {
             ProfileKind::Cpu if std::env::consts::OS == "linux" => {
                 LinuxPerfBackend::with_renderer(runner, flamegraph_renderer).profile(&request)?;
+            }
+            ProfileKind::Latency if std::env::consts::OS == "linux" => {
+                StraceBackend::new(runner).profile(&request)?;
             }
             _ => {
                 FakeBackend.profile(&request)?;
