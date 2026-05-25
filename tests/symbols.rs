@@ -371,6 +371,41 @@ fn perf_build_id_elf_path_uses_standard_cache_link_layout() {
 }
 
 #[test]
+fn nixos_system_map_path_sits_next_to_kernel_image_symlink_target() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let kernel_dir = root.path().join("nix/store/example-linux-6.18.32");
+    std::fs::create_dir_all(&kernel_dir).expect("kernel dir");
+    let kernel = kernel_dir.join("bzImage");
+    std::fs::write(&kernel, b"kernel").expect("kernel image");
+    let system_map = kernel_dir.join("System.map");
+    std::fs::write(&system_map, "ffffffff81001280 T asm_exc_page_fault\n").expect("system map");
+
+    assert_eq!(
+        pyroclast::symbols::nixos_system_map_path(&kernel),
+        Some(system_map)
+    );
+}
+
+#[test]
+fn linux_system_map_candidates_include_common_distribution_paths() {
+    let candidates = pyroclast::symbols::linux_system_map_candidates(
+        Some(&PathBuf::from("/nix/store/example-linux/bzImage")),
+        "6.18.32",
+    );
+
+    assert_eq!(
+        candidates,
+        vec![
+            PathBuf::from("/nix/store/example-linux/System.map"),
+            PathBuf::from("/boot/System.map-6.18.32"),
+            PathBuf::from("/usr/lib/debug/boot/System.map-6.18.32"),
+            PathBuf::from("/lib/modules/6.18.32/System.map"),
+            PathBuf::from("/usr/lib/debug/lib/modules/6.18.32/System.map"),
+        ]
+    );
+}
+
+#[test]
 fn perf_symbol_resolver_constructor_uses_perfdata_cache_before_system_kallsyms() {
     let home = tempfile::tempdir().expect("home");
     let perfdata = home.path().join("perf.data");

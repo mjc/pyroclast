@@ -56,6 +56,36 @@ pub fn perf_build_id_elf_path(debug_dir: &Path, build_id: &str) -> PathBuf {
 }
 
 #[must_use]
+pub fn nixos_system_map_path(kernel_image: &Path) -> Option<PathBuf> {
+    linux_system_map_candidates(Some(&std::fs::canonicalize(kernel_image).ok()?), "")
+        .into_iter()
+        .next()
+        .filter(|path| path.exists())
+}
+
+#[must_use]
+pub fn linux_system_map_candidates(
+    kernel_image: Option<&Path>,
+    kernel_release: &str,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(kernel_image) = kernel_image
+        && let Some(parent) = kernel_image.parent()
+    {
+        candidates.push(parent.join("System.map"));
+    }
+    candidates.extend([
+        PathBuf::from(format!("/boot/System.map-{kernel_release}")),
+        PathBuf::from(format!("/usr/lib/debug/boot/System.map-{kernel_release}")),
+        PathBuf::from(format!("/lib/modules/{kernel_release}/System.map")),
+        PathBuf::from(format!(
+            "/usr/lib/debug/lib/modules/{kernel_release}/System.map"
+        )),
+    ]);
+    candidates
+}
+
+#[must_use]
 pub fn perf_symbol_resolver_for_perfdata_file<'a, R>(
     runner: &'a R,
     perfdata: &Path,
