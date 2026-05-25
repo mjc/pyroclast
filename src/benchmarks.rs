@@ -11,6 +11,7 @@ pub struct BenchArgs {
     pub perf_data: Option<PathBuf>,
     pub perf_script: Option<PathBuf>,
     pub export_perf_script: Option<PathBuf>,
+    pub symbols: bool,
 }
 
 impl BenchArgs {
@@ -23,6 +24,8 @@ impl BenchArgs {
                 parsed.perf_script = iter.next();
             } else if arg.as_os_str() == "--export-perf-script" {
                 parsed.export_perf_script = iter.next();
+            } else if arg.as_os_str() == "--symbols" {
+                parsed.symbols = true;
             } else {
                 parsed.perf_data = Some(arg);
             }

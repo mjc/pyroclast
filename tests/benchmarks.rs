@@ -153,6 +153,7 @@ fn formats_fold_and_svg_comparison_report() {
 fn parses_benchmark_inputs() {
     let args = BenchArgs::parse(vec![
         "profile.perf.data".into(),
+        "--symbols".into(),
         "--export-perf-script".into(),
         "exported-script.txt".into(),
         "--perf-script".into(),
@@ -160,6 +161,7 @@ fn parses_benchmark_inputs() {
     ]);
 
     assert_eq!(args.perf_data, Some("profile.perf.data".into()));
+    assert!(args.symbols);
     assert_eq!(args.export_perf_script, Some("exported-script.txt".into()));
     assert_eq!(args.perf_script, Some("perf-script.txt".into()));
 }
