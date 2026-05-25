@@ -66,6 +66,8 @@ impl MmapTable {
 
 impl Mapping {
     fn contains(&self, pid: u32, ip: u64) -> bool {
-        self.pid == pid && ip >= self.start && ip < self.start.saturating_add(self.len)
+        (self.pid == pid || self.pid == u32::MAX)
+            && ip >= self.start
+            && ip < self.start.saturating_add(self.len)
     }
 }

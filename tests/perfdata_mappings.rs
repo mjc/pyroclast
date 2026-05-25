@@ -58,6 +58,27 @@ fn prefers_most_specific_mapping_for_overlapping_ranges() {
 }
 
 #[test]
+fn resolves_wildcard_pid_kernel_mapping() {
+    let mut table = MmapTable::default();
+    table.insert_mmap(MmapRecord {
+        pid: u32::MAX,
+        tid: u32::MAX,
+        start: 0xffff_ffff_8800_0000,
+        len: 0x2000,
+        pgoff: 0,
+        path: "[kernel.kallsyms]".to_string(),
+    });
+
+    assert_eq!(
+        table.resolve(42, 0xffff_ffff_8800_0010),
+        Some(ResolvedMapping {
+            path: "[kernel.kallsyms]".to_string(),
+            relative_address: 0x10,
+        })
+    );
+}
+
+#[test]
 fn does_not_resolve_other_pids_or_out_of_range_ips() {
     let mut table = MmapTable::default();
     table.insert_mmap(MmapRecord {

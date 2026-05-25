@@ -374,6 +374,37 @@ fn leaves_kernel_space_frames_as_hex_without_symbol_lookup() {
 }
 
 #[test]
+fn symbolized_fold_resolves_mapped_kernel_frames() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(
+                1,
+                &mmap_payload(
+                    u32::MAX,
+                    u32::MAX,
+                    0xffff_ffff_8800_0000,
+                    0x2000,
+                    0,
+                    "[kernel.kallsyms]",
+                ),
+            ),
+            record_bytes(9, &sample_payload(0x1000, 11, 12, [0xffff_ffff_8800_0010])),
+        ],
+    );
+    let resolver = StaticSymbolResolver;
+
+    let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
+        .expect("folded");
+
+    assert_eq!(folded, "asm_exc_page_fault 1\n");
+}
+
+#[test]
 fn prefetches_unique_symbol_requests_before_folding() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
@@ -656,6 +687,11 @@ impl SymbolResolver for StaticSymbolResolver {
                         (request.path == std::path::Path::new("/bin/app")
                             && request.relative_address == 0x20)
                             .then(|| "app::work".to_string())
+                    })
+                    .or_else(|| {
+                        (request.path == std::path::Path::new("[kernel.kallsyms]")
+                            && request.relative_address == 0x10)
+                            .then(|| "asm_exc_page_fault".to_string())
                     })
             })
             .collect())

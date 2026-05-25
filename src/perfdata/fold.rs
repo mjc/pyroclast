@@ -380,9 +380,9 @@ fn symbol_requests_for_stack(
     callchain
         .iter()
         .copied()
-        .filter(|frame| !is_kernel_space_frame(*frame))
         .filter_map(|frame| {
             pid.and_then(|pid| mmap_table.resolve(pid, frame))
+                .filter(|mapping| !is_kernel_space_frame(frame) || is_kernel_mapping(mapping))
                 .map(|mapping| symbol_request(&mapping))
         })
         .collect()
@@ -438,14 +438,17 @@ impl<'a> FoldFrameResolver<'a> {
     where
         R: SymbolResolver,
     {
-        if is_kernel_space_frame(frame) {
-            return Ok(format!("0x{frame:x}"));
-        }
         if let Some(mapping) = pid.and_then(|pid| self.mmap_table.resolve(pid, frame)) {
+            if is_kernel_space_frame(frame) && !is_kernel_mapping(&mapping) {
+                return Ok(format!("0x{frame:x}"));
+            }
             if let Some(cache) = symbol_cache {
                 return Ok(cache
                     .resolve(&symbol_request(&mapping))?
                     .unwrap_or_else(|| mapped_frame_label(&mapping)));
+            }
+            if is_kernel_space_frame(frame) {
+                return Ok(format!("0x{frame:x}"));
             }
             Ok(mapped_frame_label(&mapping))
         } else {
@@ -463,6 +466,10 @@ fn symbol_request(mapping: &ResolvedMapping) -> SymbolRequest {
 
 fn mapped_frame_label(mapping: &ResolvedMapping) -> String {
     format!("{}+0x{:x}", mapping.path, mapping.relative_address)
+}
+
+fn is_kernel_mapping(mapping: &ResolvedMapping) -> bool {
+    mapping.path.starts_with("[kernel") || mapping.path == "[guest.kernel]"
 }
 
 fn parse_sample_for_summary(
