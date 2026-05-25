@@ -44,6 +44,22 @@ pub enum ProfileKind {
     Async,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum PerfCallGraph {
+    Fp,
+    Dwarf,
+}
+
+impl std::fmt::Display for PerfCallGraph {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fp => formatter.write_str("fp"),
+            Self::Dwarf => formatter.write_str("dwarf"),
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct RunArgs {
     #[arg(long)]
@@ -61,6 +77,9 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 997)]
     pub frequency: u32,
 
+    #[arg(long, value_enum, default_value_t = PerfCallGraph::Fp)]
+    pub call_graph: PerfCallGraph,
+
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
 }
@@ -73,6 +92,7 @@ pub struct ProfileInvocation {
     pub json: bool,
     pub symbols: bool,
     pub frequency: u32,
+    pub call_graph: PerfCallGraph,
     pub command: Vec<String>,
 }
 
@@ -92,6 +112,7 @@ impl CliCommand {
                 json: args.json,
                 symbols: args.symbols,
                 frequency: args.frequency,
+                call_graph: args.call_graph,
                 command: args.command.clone(),
             }),
             Self::Fold(_) | Self::Summarize(_) | Self::Flamegraph(_) => None,
@@ -108,6 +129,7 @@ impl ProfileInvocation {
             json: args.json,
             symbols: args.symbols,
             frequency: args.frequency,
+            call_graph: args.call_graph,
             command: args.command.clone(),
         }
     }
@@ -132,6 +154,9 @@ pub struct ProfileArgs {
 
     #[arg(long, default_value_t = 997)]
     pub frequency: u32,
+
+    #[arg(long, value_enum, default_value_t = PerfCallGraph::Fp)]
+    pub call_graph: PerfCallGraph,
 
     #[arg(last = true, required = true)]
     pub command: Vec<String>,

@@ -77,6 +77,7 @@ where
             json: invocation.json,
             symbols: invocation.symbols,
             frequency: invocation.frequency,
+            call_graph: invocation.call_graph,
         };
         match request.kind {
             ProfileKind::Cpu if std::env::consts::OS == "linux" => {

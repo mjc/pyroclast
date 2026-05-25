@@ -2,7 +2,7 @@ use std::sync::Mutex;
 
 use pyroclast::backends::linux_perf::LinuxPerfBackend;
 use pyroclast::backends::{ProfileRequest, ProfilerBackend};
-use pyroclast::cli::ProfileKind;
+use pyroclast::cli::{PerfCallGraph, ProfileKind};
 use pyroclast::manifest::BackendName;
 use pyroclast::perfdata::samples::{PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_TID};
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
@@ -20,6 +20,7 @@ fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
         json: false,
         symbols: false,
         frequency: 199,
+        call_graph: PerfCallGraph::Dwarf,
     };
 
     let result = backend.profile(&request).expect("profile");
@@ -27,6 +28,7 @@ fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
     assert_eq!(result.manifest.actual_backend, BackendName::LinuxPerf);
     assert_eq!(runner.programs(), vec!["perf", "inferno-flamegraph"]);
     assert_eq!(runner.perf_frequency(), Some("199".to_string()));
+    assert_eq!(runner.perf_call_graph(), Some("dwarf".to_string()));
     assert!(result.layout.raw_profile("perf.data").is_file());
     assert_eq!(
         std::fs::read(result.layout.raw_profile("perf.data")).expect("perf data"),
@@ -57,6 +59,7 @@ fn linux_perf_backend_can_symbolize_folded_stacks() {
         json: false,
         symbols: true,
         frequency: 997,
+        call_graph: PerfCallGraph::Fp,
     };
 
     let result = backend.profile(&request).expect("profile");
@@ -97,6 +100,21 @@ impl RecordingRunner {
                     .args
                     .windows(2)
                     .find(|window| window[0] == "-F")
+                    .map(|window| window[1].clone())
+            })
+    }
+
+    fn perf_call_graph(&self) -> Option<String> {
+        self.commands
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|command| command.program == "perf")
+            .and_then(|command| {
+                command
+                    .args
+                    .windows(2)
+                    .find(|window| window[0] == "--call-graph")
                     .map(|window| window[1].clone())
             })
     }

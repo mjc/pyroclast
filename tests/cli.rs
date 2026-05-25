@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use pyroclast::cli::{Cli, CliCommand, ProfileKind};
+use pyroclast::cli::{Cli, CliCommand, PerfCallGraph, ProfileKind};
 
 #[test]
 fn parses_profile_defaults() {
@@ -14,6 +14,7 @@ fn parses_profile_defaults() {
             assert!(!profile.json);
             assert!(!profile.symbols);
             assert_eq!(profile.frequency, 997);
+            assert_eq!(profile.call_graph, PerfCallGraph::Fp);
             assert_eq!(profile.command, vec!["true"]);
         }
         other => panic!("expected profile command, got {other:?}"),
@@ -35,6 +36,8 @@ fn parses_profile_options() {
         "--symbols",
         "--frequency",
         "199",
+        "--call-graph",
+        "dwarf",
         "--",
         "cargo",
         "check",
@@ -48,6 +51,7 @@ fn parses_profile_options() {
             assert!(profile.json);
             assert!(profile.symbols);
             assert_eq!(profile.frequency, 199);
+            assert_eq!(profile.call_graph, PerfCallGraph::Dwarf);
             assert_eq!(profile.command, vec!["cargo", "check"]);
         }
         other => panic!("expected profile command, got {other:?}"),
@@ -74,6 +78,7 @@ fn parses_top_level_profiler_commands() {
         assert_eq!(profile.kind, kind, "verb {verb}");
         assert!(!profile.symbols, "verb {verb}");
         assert_eq!(profile.frequency, 997, "verb {verb}");
+        assert_eq!(profile.call_graph, PerfCallGraph::Fp, "verb {verb}");
         assert_eq!(profile.command, vec!["cargo", "check"]);
     }
 
@@ -83,6 +88,8 @@ fn parses_top_level_profiler_commands() {
         "--symbols",
         "--frequency",
         "199",
+        "--call-graph",
+        "dwarf",
         "--",
         "cargo",
         "check",
@@ -93,6 +100,7 @@ fn parses_top_level_profiler_commands() {
         .expect("expected profile invocation");
     assert!(profile.symbols);
     assert_eq!(profile.frequency, 199);
+    assert_eq!(profile.call_graph, PerfCallGraph::Dwarf);
 }
 
 #[test]

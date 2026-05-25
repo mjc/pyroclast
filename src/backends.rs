@@ -8,7 +8,7 @@ pub mod strace;
 use std::path::PathBuf;
 
 use crate::artifacts::ArtifactLayout;
-use crate::cli::ProfileKind;
+use crate::cli::{PerfCallGraph, ProfileKind};
 use crate::manifest::RunManifest;
 
 pub type BackendResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -22,6 +22,7 @@ pub struct ProfileRequest {
     pub json: bool,
     pub symbols: bool,
     pub frequency: u32,
+    pub call_graph: PerfCallGraph,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

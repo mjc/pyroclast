@@ -51,8 +51,13 @@ where
         std::fs::create_dir_all(layout.root())?;
 
         let perf_data = layout.raw_profile("perf.data");
-        let command =
-            build_perf_record_command(request.frequency, "fp", &perf_data, request.command.clone());
+        let call_graph = request.call_graph.to_string();
+        let command = build_perf_record_command(
+            request.frequency,
+            &call_graph,
+            &perf_data,
+            request.command.clone(),
+        );
         let output = self.runner.run(&command)?;
         let perf_bytes = std::fs::read(&perf_data)?;
         let folded_stacks = fold_linux_perfdata(&perf_bytes, request.symbols, self.runner)?;
