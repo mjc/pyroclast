@@ -204,10 +204,8 @@ fn map_perfdata_file(file: &std::fs::File) -> Result<memmap2::Mmap, String> {
     // SAFETY: The returned mapping is read-only and is only exposed as an
     // immutable byte slice while the file handle and mapping are alive in this
     // function's callers.
-    let mapping = unsafe { memmap2::MmapOptions::new().map(file) }
-        .map_err(|error| format!("failed to map perf.data: {error}"))?;
-    let _ignored = mapping.advise(memmap2::Advice::Sequential);
-    Ok(mapping)
+    unsafe { memmap2::MmapOptions::new().map(file) }
+        .map_err(|error| format!("failed to map perf.data: {error}"))
 }
 
 fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData, String> {
