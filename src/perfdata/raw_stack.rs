@@ -28,10 +28,11 @@ impl RawStackAccumulator {
     where
         I: IntoIterator<Item = u64>,
     {
-        let key = RawStackKey {
-            pid,
-            callchain: callchain.into_iter().collect(),
-        };
+        self.add_vec(pid, callchain.into_iter().collect(), count);
+    }
+
+    pub fn add_vec(&mut self, pid: Option<u32>, callchain: Vec<u64>, count: u64) {
+        let key = RawStackKey { pid, callchain };
         *self.counts.entry(key).or_insert(0) += count;
     }
 
@@ -75,5 +76,19 @@ mod tests {
         assert_eq!(collapsed[0].count, 4);
         assert_eq!(collapsed[1].pid, Some(8));
         assert_eq!(collapsed[1].count, 1);
+    }
+
+    #[test]
+    fn accumulates_owned_raw_stack_vectors() {
+        let mut accumulator = RawStackAccumulator::new();
+
+        accumulator.add_vec(Some(7), vec![0x1000, 0x2000], 1);
+        accumulator.add_vec(Some(7), vec![0x1000, 0x2000], 2);
+
+        let collapsed = accumulator.into_collapsed();
+
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].callchain, vec![0x1000, 0x2000]);
+        assert_eq!(collapsed[0].count, 3);
     }
 }
