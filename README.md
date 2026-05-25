@@ -11,8 +11,10 @@ Nix flake; Pyroclast owns orchestration, manifests, folding, summaries, and comm
 ```sh
 pyroclast profile -- <command...>
 pyroclast profile --kind cpu -- <command...>
+pyroclast profile --kind heap -- <command...>
 pyroclast profile --kind memory -- <command...>
 pyroclast profile --kind offcpu -- <command...>
+pyroclast profile --kind syscalls -- <command...>
 pyroclast profile --kind latency -- <command...>
 
 pyroclast fold <perf.data>
@@ -24,8 +26,10 @@ Top-level profiler aliases are also available:
 
 ```sh
 pyroclast cpu -- <command...>
+pyroclast heap -- <command...>
 pyroclast memory -- <command...>
 pyroclast offcpu -- <command...>
+pyroclast syscalls -- <command...>
 pyroclast latency -- <command...>
 ```
 
