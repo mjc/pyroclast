@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
 use pyroclast::symbols::{
     Addr2lineResolver, Kallsyms, SymbolCache, SymbolRequest, SymbolResolver, perf_debug_dir,
+    perf_symbol_resolver_for_perfdata_file,
 };
 
 #[test]
@@ -340,6 +341,36 @@ fn perf_debug_dir_uses_home_debug_cache() {
         perf_debug_dir(&PathBuf::from("/home/mjc")),
         PathBuf::from("/home/mjc/.debug")
     );
+}
+
+#[test]
+fn perf_symbol_resolver_constructor_uses_perfdata_cache_before_system_kallsyms() {
+    let home = tempfile::tempdir().expect("home");
+    let perfdata = home.path().join("perf.data");
+    std::fs::write(&perfdata, perfdata_with_kernel_build_id()).expect("perfdata");
+
+    let build_id = "16ed3d5317ad219c89d0e3c5ea0ea2caa3cd4949";
+    let cached = home
+        .path()
+        .join(".debug")
+        .join("[kernel.kallsyms]")
+        .join(build_id)
+        .join("kallsyms");
+    std::fs::create_dir_all(cached.parent().expect("parent")).expect("cache dir");
+    std::fs::write(&cached, "ffffffff88000080 t cached_kernel_symbol\n").expect("kallsyms");
+
+    let runner = Addr2lineRunner::new(b"");
+    let resolver = perf_symbol_resolver_for_perfdata_file(&runner, &perfdata, home.path());
+
+    let symbols = resolver
+        .resolve_batch(&[SymbolRequest {
+            path: PathBuf::from("[kernel.kallsyms]"),
+            relative_address: 0xffff_ffff_8800_008f,
+        }])
+        .expect("symbols");
+
+    assert_eq!(symbols, vec![Some("cached_kernel_symbol".to_string())]);
+    assert!(runner.commands().is_empty());
 }
 
 #[derive(Default)]

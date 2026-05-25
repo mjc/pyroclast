@@ -44,6 +44,20 @@ pub fn perf_debug_dir(home: &Path) -> PathBuf {
     home.join(".debug")
 }
 
+#[must_use]
+pub fn perf_symbol_resolver_for_perfdata_file<'a, R>(
+    runner: &'a R,
+    perfdata: &Path,
+    home: &Path,
+) -> PerfSymbolResolver<'a, R>
+where
+    R: CommandRunner,
+{
+    PerfSymbolResolver::new(runner)
+        .with_perfdata_file_kernel_cache(perfdata, &perf_debug_dir(home))
+        .with_system_kallsyms()
+}
+
 impl<'a, R> Addr2lineResolver<'a, R>
 where
     R: CommandRunner,
