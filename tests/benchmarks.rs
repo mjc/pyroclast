@@ -1,5 +1,8 @@
-use pyroclast::benchmarks::run_fold_benchmark;
+use std::sync::Mutex;
+
+use pyroclast::benchmarks::{run_fold_benchmark, run_inferno_collapse_benchmark};
 use pyroclast::perfdata::samples::{PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_TID};
+use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
 
 #[test]
 fn fold_benchmark_reports_folded_output_size() {
@@ -27,6 +30,54 @@ fn fold_benchmark_reports_folded_output_size() {
     assert_eq!(report.folded_bytes, 9);
     assert_eq!(report.folded_lines, 1);
     assert!(report.elapsed.as_nanos() > 0);
+}
+
+#[test]
+fn inferno_collapse_benchmark_reports_folded_output_size() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perf_script = root.path().join("perf-script.txt");
+    std::fs::write(&perf_script, "sample script\n").expect("write perf script");
+    let runner = CollapseRunner::default();
+
+    let report = run_inferno_collapse_benchmark(&perf_script, &runner).expect("benchmark");
+
+    assert_eq!(report.input, perf_script);
+    assert_eq!(report.folded_bytes, 20);
+    assert_eq!(report.folded_lines, 2);
+    assert!(report.elapsed.as_nanos() > 0);
+    assert_eq!(
+        runner.commands(),
+        vec![
+            CommandSpec::new("inferno-collapse-perf").arg(
+                report
+                    .input
+                    .to_str()
+                    .expect("perf script path should be utf8")
+            )
+        ]
+    );
+}
+
+#[derive(Default)]
+struct CollapseRunner {
+    commands: Mutex<Vec<CommandSpec>>,
+}
+
+impl CollapseRunner {
+    fn commands(&self) -> Vec<CommandSpec> {
+        self.commands.lock().unwrap().clone()
+    }
+}
+
+impl CommandRunner for CollapseRunner {
+    fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
+        self.commands.lock().unwrap().push(command.clone());
+        Ok(CommandOutput {
+            status_code: Some(0),
+            stdout: b"app;work 2\napp;io 1\n".to_vec(),
+            stderr: Vec::new(),
+        })
+    }
 }
 
 fn perfdata_with_records_and_attrs<const A: usize, const R: usize>(
