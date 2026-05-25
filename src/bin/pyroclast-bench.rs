@@ -44,7 +44,26 @@ fn main() -> ExitCode {
                     &perf_script,
                     &RealCommandRunner,
                 ) {
-                    Ok(report) => print_report("inferno_collapse_perf", &report),
+                    Ok(report) => {
+                        print_report("inferno_collapse_perf", &report);
+                        match pyroclast::benchmarks::compare_with_inferno_collapse(
+                            &input,
+                            &perf_script,
+                            &RealCommandRunner,
+                        ) {
+                            Ok(report) => print!(
+                                "{}",
+                                pyroclast::benchmarks::format_comparison_report(
+                                    "inferno_compare",
+                                    &report
+                                )
+                            ),
+                            Err(error) => {
+                                eprintln!("inferno comparison failed: {error}");
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                    }
                     Err(error) => {
                         eprintln!("inferno benchmark failed: {error}");
                         return ExitCode::FAILURE;

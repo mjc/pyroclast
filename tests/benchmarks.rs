@@ -1,8 +1,8 @@
 use std::sync::Mutex;
 
 use pyroclast::benchmarks::{
-    BenchArgs, compare_with_inferno_collapse, export_perf_script, run_fold_benchmark,
-    run_inferno_collapse_benchmark,
+    BenchArgs, compare_with_inferno_collapse, export_perf_script, format_comparison_report,
+    run_fold_benchmark, run_inferno_collapse_benchmark,
 };
 use pyroclast::perfdata::samples::{PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_TID};
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
@@ -118,6 +118,34 @@ fn exports_perf_script_for_old_pipeline_benchmarks() {
                 .args(["script", "-i"])
                 .arg(perfdata.to_str().expect("perfdata path should be utf8"))
         ]
+    );
+}
+
+#[test]
+fn formats_fold_and_svg_comparison_report() {
+    let report = pyroclast::benchmarks::FoldComparisonReport {
+        pyroclast_folded_lines: 3,
+        inferno_folded_lines: 3,
+        matches: true,
+        svg_matches: true,
+        pyroclast_svg_bytes: 123,
+        inferno_svg_bytes: 123,
+        only_pyroclast: Vec::new(),
+        only_inferno: Vec::new(),
+    };
+
+    assert_eq!(
+        format_comparison_report("inferno_compare", &report),
+        concat!(
+            "inferno_compare.matches=true\n",
+            "inferno_compare.svg_matches=true\n",
+            "inferno_compare.pyroclast_folded_lines=3\n",
+            "inferno_compare.inferno_folded_lines=3\n",
+            "inferno_compare.pyroclast_svg_bytes=123\n",
+            "inferno_compare.inferno_svg_bytes=123\n",
+            "inferno_compare.only_pyroclast=0\n",
+            "inferno_compare.only_inferno=0\n",
+        )
     );
 }
 

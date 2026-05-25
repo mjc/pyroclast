@@ -101,6 +101,31 @@ where
     })
 }
 
+#[must_use]
+pub fn format_comparison_report(name: &str, report: &FoldComparisonReport) -> String {
+    format!(
+        concat!(
+            "{name}.matches={matches}\n",
+            "{name}.svg_matches={svg_matches}\n",
+            "{name}.pyroclast_folded_lines={pyroclast_folded_lines}\n",
+            "{name}.inferno_folded_lines={inferno_folded_lines}\n",
+            "{name}.pyroclast_svg_bytes={pyroclast_svg_bytes}\n",
+            "{name}.inferno_svg_bytes={inferno_svg_bytes}\n",
+            "{name}.only_pyroclast={only_pyroclast}\n",
+            "{name}.only_inferno={only_inferno}\n",
+        ),
+        name = name,
+        matches = report.matches,
+        svg_matches = report.svg_matches,
+        pyroclast_folded_lines = report.pyroclast_folded_lines,
+        inferno_folded_lines = report.inferno_folded_lines,
+        pyroclast_svg_bytes = report.pyroclast_svg_bytes,
+        inferno_svg_bytes = report.inferno_svg_bytes,
+        only_pyroclast = report.only_pyroclast.len(),
+        only_inferno = report.only_inferno.len(),
+    )
+}
+
 /// Compares Pyroclast's direct folded stacks with the old
 /// `perf script | inferno-collapse-perf` folded-stack output.
 ///
