@@ -20,6 +20,7 @@ pub const PERF_SAMPLE_IDENTIFIER: u64 = 1 << 16;
 pub const PERF_SAMPLE_TRANSACTION: u64 = 1 << 17;
 pub const PERF_SAMPLE_REGS_INTR: u64 = 1 << 18;
 pub const PERF_SAMPLE_PHYS_ADDR: u64 = 1 << 19;
+pub const PERF_SAMPLE_AUX: u64 = 1 << 20;
 pub const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
 pub const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 1 << 1;
 pub const PERF_FORMAT_ID: u64 = 1 << 2;
@@ -137,6 +138,9 @@ pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<Sampl
     }
     if layout.has(PERF_SAMPLE_PHYS_ADDR) {
         cursor.skip_u64()?;
+    }
+    if layout.has(PERF_SAMPLE_AUX) {
+        cursor.skip_sized_u64_payload()?;
     }
 
     Ok(sample)
@@ -291,6 +295,12 @@ impl<'a> SampleCursor<'a> {
     fn skip_sized_u32_payload(&mut self) -> Result<(), String> {
         let size = usize::try_from(self.read_u32()?)
             .map_err(|_| "perf sample raw size does not fit in usize".to_string())?;
+        self.read_bytes(size).map(|_| ())
+    }
+
+    fn skip_sized_u64_payload(&mut self) -> Result<(), String> {
+        let size = usize::try_from(self.read_u64()?)
+            .map_err(|_| "perf sample aux size does not fit in usize".to_string())?;
         self.read_bytes(size).map(|_| ())
     }
 

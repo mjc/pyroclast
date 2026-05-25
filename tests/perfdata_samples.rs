@@ -1,6 +1,6 @@
 use pyroclast::perfdata::samples::{
     PERF_FORMAT_GROUP, PERF_FORMAT_ID, PERF_FORMAT_LOST, PERF_FORMAT_TOTAL_TIME_ENABLED,
-    PERF_FORMAT_TOTAL_TIME_RUNNING, PERF_SAMPLE_ADDR, PERF_SAMPLE_BRANCH_STACK,
+    PERF_FORMAT_TOTAL_TIME_RUNNING, PERF_SAMPLE_ADDR, PERF_SAMPLE_AUX, PERF_SAMPLE_BRANCH_STACK,
     PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_DATA_SRC, PERF_SAMPLE_ID,
     PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_PHYS_ADDR,
     PERF_SAMPLE_RAW, PERF_SAMPLE_READ, PERF_SAMPLE_REGS_INTR, PERF_SAMPLE_REGS_USER,
@@ -362,6 +362,26 @@ fn rejects_truncated_phys_addr_sample_payload() {
         },
     )
     .expect_err("truncated physical address sample");
+
+    assert!(error.contains("truncated"));
+}
+
+#[test]
+fn rejects_truncated_aux_sample_payload() {
+    let mut payload = Vec::new();
+    payload.extend(4u64.to_le_bytes());
+    payload.extend([1, 2]);
+
+    let error = parse_sample_record(
+        &payload,
+        SampleLayout {
+            sample_type: PERF_SAMPLE_AUX,
+            read_format: 0,
+            sample_regs_user: 0,
+            sample_regs_intr: 0,
+        },
+    )
+    .expect_err("truncated aux sample");
 
     assert!(error.contains("truncated"));
 }
