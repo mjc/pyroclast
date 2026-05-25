@@ -53,6 +53,7 @@ pub enum ParsedRecord {
     Throttle(ThrottleRecord),
     Unthrottle(UnthrottleRecord),
     Read(ReadRecord),
+    Sample(SamplePayloadRecord),
     Aux(AuxRecord),
     ItraceStart(ItraceStartRecord),
     Switch(SwitchRecord),
@@ -162,6 +163,11 @@ pub struct ReadRecord {
     pub pid: u32,
     pub tid: u32,
     pub values: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SamplePayloadRecord {
+    pub payload: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -368,6 +374,7 @@ pub fn parse_record(record: PerfRecord<'_>) -> Result<ParsedRecord, String> {
         PERF_RECORD_EXIT => parse_exit_record(record.payload).map(ParsedRecord::Exit),
         PERF_RECORD_FORK => parse_fork_record(record.payload).map(ParsedRecord::Fork),
         PERF_RECORD_READ => parse_read_record(record.payload).map(ParsedRecord::Read),
+        PERF_RECORD_SAMPLE => parse_sample_payload_record(record.payload).map(ParsedRecord::Sample),
         PERF_RECORD_AUX => parse_aux_record(record.payload).map(ParsedRecord::Aux),
         PERF_RECORD_ITRACE_START => {
             parse_itrace_start_record(record.payload).map(ParsedRecord::ItraceStart)
@@ -595,6 +602,20 @@ pub fn parse_read_record(payload: &[u8]) -> Result<ReadRecord, String> {
         pid: read_u32(payload, 0)?,
         tid: read_u32(payload, 4)?,
         values: payload[8..].to_vec(),
+    })
+}
+
+/// Parses a `PERF_RECORD_SAMPLE` payload losslessly.
+///
+/// Field interpretation depends on `perf_event_attr.sample_type`; callers that
+/// have attr context should use the sample module to decode the payload.
+///
+/// # Errors
+///
+/// This parser currently has no fixed fields to reject.
+pub fn parse_sample_payload_record(payload: &[u8]) -> Result<SamplePayloadRecord, String> {
+    Ok(SamplePayloadRecord {
+        payload: payload.to_vec(),
     })
 }
 

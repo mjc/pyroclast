@@ -6,8 +6,8 @@ use pyroclast::perfdata::records::{
     parse_comm_record, parse_exit_record, parse_fork_record, parse_itrace_start_record,
     parse_ksymbol_record, parse_lost_record, parse_lost_samples_record, parse_mmap_record,
     parse_mmap2_build_id_record, parse_mmap2_record, parse_namespaces_record, parse_read_record,
-    parse_record, parse_record_header, parse_switch_cpu_wide_record, parse_switch_record,
-    parse_text_poke_record, parse_throttle_record, parse_unthrottle_record,
+    parse_record, parse_record_header, parse_sample_payload_record, parse_switch_cpu_wide_record,
+    parse_switch_record, parse_text_poke_record, parse_throttle_record, parse_unthrottle_record,
 };
 
 #[test]
@@ -484,6 +484,14 @@ fn dispatches_read_record_by_perf_record_type() {
     assert!(matches!(parsed, ParsedRecord::Read(_)));
 }
 
+#[test]
+fn dispatches_sample_record_by_perf_record_type() {
+    let payload = vec![1, 2, 3, 4];
+    let parsed = parse_record(perf_record(9, &payload)).expect("parsed record");
+
+    assert!(matches!(parsed, ParsedRecord::Sample(_)));
+}
+
 proptest! {
     #[test]
     fn parses_aux_record_payload_from_little_endian_fields(
@@ -571,6 +579,15 @@ proptest! {
 
         prop_assert_eq!(record.hw_id, hw_id);
         prop_assert_eq!(record.sample_id, sample_id);
+    }
+
+    #[test]
+    fn parses_sample_record_payload_losslessly(
+        payload in prop::collection::vec(any::<u8>(), 0..64),
+    ) {
+        let record = parse_sample_payload_record(&payload).expect("sample record");
+
+        prop_assert_eq!(record.payload, payload);
     }
 
     #[test]
