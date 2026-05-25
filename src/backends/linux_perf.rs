@@ -10,7 +10,7 @@ use crate::perfdata::fold::{
 };
 use crate::process::{CommandRunner, CommandSpec};
 use crate::symbols::Addr2lineResolver;
-use crate::tools::{ToolKind, ToolSpec, collect_tool_versions};
+use crate::tools::{ToolSpec, collect_tool_versions};
 
 pub fn build_perf_record_command(
     frequency: u32,
@@ -111,20 +111,11 @@ where
 
 fn linux_perf_tools(symbols: bool) -> Vec<ToolSpec> {
     let mut tools = vec![
-        ToolSpec {
-            name: "perf",
-            kind: ToolKind::NixManaged,
-        },
-        ToolSpec {
-            name: "inferno-flamegraph",
-            kind: ToolKind::NixManaged,
-        },
+        ToolSpec::nix_managed("perf"),
+        ToolSpec::nix_managed("inferno-flamegraph"),
     ];
     if symbols {
-        tools.push(ToolSpec {
-            name: "addr2line",
-            kind: ToolKind::NixManaged,
-        });
+        tools.push(ToolSpec::nix_managed("addr2line"));
     }
     tools
 }

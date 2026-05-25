@@ -12,6 +12,16 @@ pub struct ToolSpec {
     pub kind: ToolKind,
 }
 
+impl ToolSpec {
+    #[must_use]
+    pub const fn nix_managed(name: &'static str) -> Self {
+        Self {
+            name,
+            kind: ToolKind::NixManaged,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct ToolVersion {
     pub name: String,
@@ -72,10 +82,7 @@ fn first_output_line(stdout: &[u8], stderr: &[u8]) -> Option<String> {
 }
 
 const fn nix_tool(name: &'static str) -> ToolSpec {
-    ToolSpec {
-        name,
-        kind: ToolKind::NixManaged,
-    }
+    ToolSpec::nix_managed(name)
 }
 
 const COMMON_TOOLS: &[ToolSpec] = &[nix_tool("inferno-flamegraph"), nix_tool("tokio-console")];
