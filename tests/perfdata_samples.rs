@@ -5,9 +5,9 @@ use pyroclast::perfdata::samples::{
     PERF_SAMPLE_DATA_PAGE_SIZE, PERF_SAMPLE_DATA_SRC, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER,
     PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_PHYS_ADDR, PERF_SAMPLE_RAW, PERF_SAMPLE_READ,
     PERF_SAMPLE_REGS_INTR, PERF_SAMPLE_REGS_USER, PERF_SAMPLE_STACK_USER, PERF_SAMPLE_STREAM_ID,
-    PERF_SAMPLE_TID, PERF_SAMPLE_TIME, PERF_SAMPLE_TRANSACTION, PERF_SAMPLE_WEIGHT, SampleLayout,
-    is_kernel_space_frame, is_perf_context_marker, parse_sample_record,
-    parse_sample_record_callchain,
+    PERF_SAMPLE_TID, PERF_SAMPLE_TIME, PERF_SAMPLE_TRANSACTION, PERF_SAMPLE_WEIGHT,
+    PERF_SAMPLE_WEIGHT_STRUCT, SampleLayout, is_kernel_space_frame, is_perf_context_marker,
+    parse_sample_record, parse_sample_record_callchain,
 };
 
 #[test]
@@ -431,6 +431,22 @@ fn rejects_truncated_code_page_size_sample_payload() {
         },
     )
     .expect_err("truncated code page size sample");
+
+    assert!(error.contains("truncated"));
+}
+
+#[test]
+fn rejects_truncated_weight_struct_sample_payload() {
+    let error = parse_sample_record(
+        &[1, 2, 3, 4],
+        SampleLayout {
+            sample_type: PERF_SAMPLE_WEIGHT_STRUCT,
+            read_format: 0,
+            sample_regs_user: 0,
+            sample_regs_intr: 0,
+        },
+    )
+    .expect_err("truncated weight struct sample");
 
     assert!(error.contains("truncated"));
 }
