@@ -80,6 +80,14 @@ where
     }
 
     #[must_use]
+    pub fn with_perfdata_file_kernel_cache(self, perfdata: &Path, debug_dir: &Path) -> Self {
+        match std::fs::read(perfdata) {
+            Ok(bytes) => self.with_perfdata_kernel_cache(&bytes, debug_dir),
+            Err(_) => self,
+        }
+    }
+
+    #[must_use]
     pub fn with_system_kallsyms(self) -> Self {
         match std::fs::read_to_string("/proc/kallsyms")
             .ok()

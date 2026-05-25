@@ -302,6 +302,36 @@ fn perf_symbol_resolver_loads_perfdata_kernel_build_id_cache() {
     assert!(runner.commands().is_empty());
 }
 
+#[test]
+fn perf_symbol_resolver_loads_perfdata_kernel_build_id_cache_from_file() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    std::fs::write(&perfdata, perfdata_with_kernel_build_id()).expect("perfdata");
+
+    let build_id = "16ed3d5317ad219c89d0e3c5ea0ea2caa3cd4949";
+    let cached = root
+        .path()
+        .join("[kernel.kallsyms]")
+        .join(build_id)
+        .join("kallsyms");
+    std::fs::create_dir_all(cached.parent().expect("parent")).expect("cache dir");
+    std::fs::write(&cached, "ffffffff88000080 t asm_exc_page_fault\n").expect("kallsyms");
+
+    let runner = Addr2lineRunner::new(b"");
+    let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
+        .with_perfdata_file_kernel_cache(&perfdata, root.path());
+
+    let symbols = resolver
+        .resolve_batch(&[SymbolRequest {
+            path: PathBuf::from("[kernel.kallsyms]"),
+            relative_address: 0xffff_ffff_8800_008f,
+        }])
+        .expect("symbols");
+
+    assert_eq!(symbols, vec![Some("asm_exc_page_fault".to_string())]);
+    assert!(runner.commands().is_empty());
+}
+
 #[derive(Default)]
 struct RecordingResolver {
     symbols: BTreeMap<SymbolRequest, String>,
