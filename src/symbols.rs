@@ -28,6 +28,11 @@ pub struct Addr2lineResolver<'a, R> {
     runner: &'a R,
 }
 
+pub struct PerfSymbolResolver<'a, R> {
+    addr2line: Addr2lineResolver<'a, R>,
+    kallsyms: Option<Kallsyms>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Kallsyms {
     symbols: BTreeMap<u64, String>,
@@ -40,6 +45,36 @@ where
     #[must_use]
     pub fn new(runner: &'a R) -> Self {
         Self { runner }
+    }
+}
+
+impl<'a, R> PerfSymbolResolver<'a, R>
+where
+    R: CommandRunner,
+{
+    #[must_use]
+    pub fn new(runner: &'a R) -> Self {
+        Self {
+            addr2line: Addr2lineResolver::new(runner),
+            kallsyms: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_kallsyms(mut self, kallsyms: Kallsyms) -> Self {
+        self.kallsyms = Some(kallsyms);
+        self
+    }
+
+    #[must_use]
+    pub fn with_system_kallsyms(self) -> Self {
+        match std::fs::read_to_string("/proc/kallsyms")
+            .ok()
+            .and_then(|text| Kallsyms::parse(&text).ok())
+        {
+            Some(kallsyms) => self.with_kallsyms(kallsyms),
+            None => self,
+        }
     }
 }
 
@@ -155,6 +190,37 @@ where
     }
 }
 
+impl<R> SymbolResolver for PerfSymbolResolver<'_, R>
+where
+    R: CommandRunner,
+{
+    fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
+        let mut resolved = vec![None; requests.len()];
+        let mut user_requests = Vec::new();
+        let mut user_indexes = Vec::new();
+
+        for (index, request) in requests.iter().enumerate() {
+            if is_kernel_symbol_path(&request.path) {
+                resolved[index] = self
+                    .kallsyms
+                    .as_ref()
+                    .and_then(|kallsyms| kallsyms.resolve(request.relative_address));
+            } else {
+                user_indexes.push(index);
+                user_requests.push(request.clone());
+            }
+        }
+
+        if !user_requests.is_empty() {
+            let user_symbols = self.addr2line.resolve_batch(&user_requests)?;
+            for (index, symbol) in user_indexes.into_iter().zip(user_symbols) {
+                resolved[index] = symbol;
+            }
+        }
+        Ok(resolved)
+    }
+}
+
 impl<R> SymbolResolver for Addr2lineResolver<'_, R>
 where
     R: CommandRunner,
@@ -225,6 +291,12 @@ fn function_name(line: &str) -> Option<String> {
     } else {
         Some(line.to_string())
     }
+}
+
+fn is_kernel_symbol_path(path: &Path) -> bool {
+    path == Path::new("[kernel.kallsyms]")
+        || path == Path::new("[kernel]")
+        || path == Path::new("[guest.kernel]")
 }
 
 fn parse_kallsyms_line(line: &str) -> Option<(u64, String)> {

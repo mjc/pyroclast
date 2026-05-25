@@ -192,6 +192,41 @@ ffffffff88000080 t asm_exc_page_fault
     );
 }
 
+#[test]
+fn perf_symbol_resolver_routes_kernel_requests_to_kallsyms() {
+    let runner = Addr2lineRunner::new(b"app::main\n/bin/app.rs:10\n");
+    let kallsyms = Kallsyms::parse(
+        "\
+ffffffff88000080 t asm_exc_page_fault
+",
+    )
+    .expect("kallsyms");
+    let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner).with_kallsyms(kallsyms);
+
+    let symbols = resolver
+        .resolve_batch(&[
+            SymbolRequest {
+                path: PathBuf::from("[kernel.kallsyms]"),
+                relative_address: 0xffff_ffff_8800_008f,
+            },
+            SymbolRequest {
+                path: PathBuf::from("/bin/app"),
+                relative_address: 0x10,
+            },
+        ])
+        .expect("symbols");
+
+    assert_eq!(
+        symbols,
+        vec![
+            Some("asm_exc_page_fault".to_string()),
+            Some("app::main".to_string())
+        ]
+    );
+    assert_eq!(runner.commands().len(), 1);
+    assert_eq!(runner.commands()[0].stdin.as_deref(), Some(&b"0x10\n"[..]));
+}
+
 #[derive(Default)]
 struct RecordingResolver {
     symbols: BTreeMap<SymbolRequest, String>,
