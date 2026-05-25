@@ -7,18 +7,14 @@ use crate::perfdata::header::parse_header;
 use crate::perfdata::mappings::{MmapTable, ResolvedMapping};
 use crate::perfdata::raw_stack::{CollapsedRawStack, RawStackAccumulator};
 use crate::perfdata::records::{
-    iter_records, parse_comm_record, parse_mmap_record, parse_mmap2_record,
+    PERF_RECORD_COMM, PERF_RECORD_MMAP, PERF_RECORD_MMAP2, PERF_RECORD_SAMPLE, iter_records,
+    parse_comm_record, parse_mmap_record, parse_mmap2_record,
 };
 use crate::perfdata::samples::{
     SampleCallchainFrames, SampleLayout, is_kernel_space_frame, is_perf_context_marker,
     parse_sample_record, parse_sample_record_callchain,
 };
 use crate::symbols::{SymbolCache, SymbolRequest, SymbolResolver};
-
-const PERF_RECORD_MMAP: u32 = 1;
-const PERF_RECORD_COMM: u32 = 3;
-const PERF_RECORD_SAMPLE: u32 = 9;
-const PERF_RECORD_MMAP2: u32 = 10;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PerfSummary {
