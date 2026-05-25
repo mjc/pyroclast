@@ -521,7 +521,7 @@ fn perf_symbol_resolver_uses_system_map_candidates_when_cache_is_missing() {
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
-            path: PathBuf::from("[kernel.kallsyms]"),
+            path: PathBuf::from("[kernel.kallsyms]_text"),
             relative_address: 0xffff_ffff_8100_1280,
         }])
         .expect("symbols");

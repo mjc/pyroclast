@@ -484,9 +484,11 @@ fn function_name(line: &str) -> Option<String> {
 }
 
 fn is_kernel_symbol_path(path: &Path) -> bool {
-    path == Path::new("[kernel.kallsyms]")
-        || path == Path::new("[kernel]")
-        || path == Path::new("[guest.kernel]")
+    path.to_str().is_some_and(|path| {
+        path.starts_with("[kernel.kallsyms]")
+            || path.starts_with("[kernel]")
+            || path.starts_with("[guest.kernel]")
+    })
 }
 
 fn perf_build_id_kallsyms_paths(debug_dir: &Path, build_id: &str) -> [PathBuf; 2] {
