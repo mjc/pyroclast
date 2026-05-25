@@ -12,7 +12,7 @@ use crate::perfdata::fold::{
 use crate::platform::{NativeThreadLister, ThreadLister};
 use crate::process::{CommandRunner, CommandSpec};
 use crate::summary::threads::{render_folded_stack_summary_text, summarize_folded_stacks};
-use crate::symbols::PerfSymbolResolver;
+use crate::symbols::perf_symbol_resolver_for_current_home;
 use crate::tools::{ToolSpec, collect_tool_versions};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -295,7 +295,7 @@ where
         count_periods: true,
     };
     if symbols {
-        let symbol_resolver = PerfSymbolResolver::new(runner).with_system_kallsyms();
+        let symbol_resolver = perf_symbol_resolver_for_current_home(runner, perf_data);
         Ok(fold_perfdata_file_with_symbols(
             perf_data,
             options,

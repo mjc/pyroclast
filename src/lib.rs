@@ -34,7 +34,7 @@ use perfdata::fold::{
 };
 use process::{CommandRunner, RealCommandRunner};
 use summary::threads::{render_folded_stack_summary_text, summarize_folded_stacks};
-use symbols::PerfSymbolResolver;
+use symbols::perf_symbol_resolver_for_current_home;
 
 /// Parses command-line arguments and runs the requested Pyroclast command.
 ///
@@ -250,7 +250,7 @@ where
     R: CommandRunner,
 {
     if symbols {
-        let symbol_resolver = PerfSymbolResolver::new(runner).with_system_kallsyms();
+        let symbol_resolver = perf_symbol_resolver_for_current_home(runner, path);
         Ok(fold_perfdata_file_with_symbols(
             path,
             options,

@@ -7,7 +7,7 @@ use crate::perfdata::fold::{
     FoldOptions, fold_perfdata_file_with_options, fold_perfdata_file_with_symbols,
 };
 use crate::process::{CommandRunner, CommandSpec};
-use crate::symbols::PerfSymbolResolver;
+use crate::symbols::perf_symbol_resolver_for_current_home;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BenchArgs {
@@ -84,7 +84,7 @@ where
     R: CommandRunner,
 {
     if symbols {
-        let resolver = PerfSymbolResolver::new(runner).with_system_kallsyms();
+        let resolver = perf_symbol_resolver_for_current_home(runner, input);
         run_fold_benchmark_with_folded(input, || {
             fold_perfdata_file_with_symbols(input, benchmark_fold_options(), &resolver)
         })
@@ -203,7 +203,7 @@ where
     R: CommandRunner,
 {
     let pyroclast_folded = if symbols {
-        let resolver = PerfSymbolResolver::new(runner).with_system_kallsyms();
+        let resolver = perf_symbol_resolver_for_current_home(runner, perf_data);
         fold_perfdata_file_with_symbols(perf_data, benchmark_fold_options(), &resolver)?
     } else {
         fold_perfdata_file_with_options(perf_data, benchmark_fold_options())?

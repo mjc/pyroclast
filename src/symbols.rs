@@ -58,6 +58,20 @@ where
         .with_system_kallsyms()
 }
 
+#[must_use]
+pub fn perf_symbol_resolver_for_current_home<'a, R>(
+    runner: &'a R,
+    perfdata: &Path,
+) -> PerfSymbolResolver<'a, R>
+where
+    R: CommandRunner,
+{
+    match std::env::var_os("HOME") {
+        Some(home) => perf_symbol_resolver_for_perfdata_file(runner, perfdata, Path::new(&home)),
+        None => PerfSymbolResolver::new(runner).with_system_kallsyms(),
+    }
+}
+
 impl<'a, R> Addr2lineResolver<'a, R>
 where
     R: CommandRunner,
