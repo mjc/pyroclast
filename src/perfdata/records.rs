@@ -78,6 +78,13 @@ pub struct LostSamplesRecord {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ThrottleRecord {
+    pub time: u64,
+    pub id: u64,
+    pub stream_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProcessLifecycleRecord {
     pid: u32,
     ppid: u32,
@@ -283,6 +290,23 @@ pub fn parse_lost_samples_record(payload: &[u8]) -> Result<LostSamplesRecord, St
 
     Ok(LostSamplesRecord {
         lost: read_u64(payload, 0)?,
+    })
+}
+
+/// Parses a `PERF_RECORD_THROTTLE` payload.
+///
+/// # Errors
+///
+/// Returns an error when the fixed `time`/`id`/`stream_id` fields are missing.
+pub fn parse_throttle_record(payload: &[u8]) -> Result<ThrottleRecord, String> {
+    if payload.len() < 24 {
+        return Err("PERF_RECORD_THROTTLE payload is shorter than 24 bytes".to_string());
+    }
+
+    Ok(ThrottleRecord {
+        time: read_u64(payload, 0)?,
+        id: read_u64(payload, 8)?,
+        stream_id: read_u64(payload, 16)?,
     })
 }
 
