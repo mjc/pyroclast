@@ -39,6 +39,22 @@ fn summarizes_record_counts_and_comm_names() {
 }
 
 #[test]
+fn summarizes_lost_record_counts() {
+    let bytes = perfdata_with_records_and_attrs(
+        [],
+        [
+            record_bytes(2, &lost_payload(7, 10)),
+            record_bytes(2, &lost_payload(8, 20)),
+        ],
+    );
+
+    let summary = summarize_perfdata(&bytes).expect("summary");
+
+    assert_eq!(summary.record_count(2), 2);
+    assert_eq!(summary.lost_records, 30);
+}
+
+#[test]
 fn summarizes_sample_callchain_counts_using_file_attr_layout() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
@@ -389,6 +405,13 @@ fn mmap2_payload(pid: u32, tid: u32, start: u64, len: u64, pgoff: u64, path: &st
     payload.extend(2u32.to_le_bytes());
     payload.extend(path.as_bytes());
     payload.push(0);
+    payload
+}
+
+fn lost_payload(id: u64, lost: u64) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(id.to_le_bytes());
+    payload.extend(lost.to_le_bytes());
     payload
 }
 
