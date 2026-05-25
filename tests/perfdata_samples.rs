@@ -1,7 +1,7 @@
 use pyroclast::perfdata::samples::{
     PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_ID, PERF_SAMPLE_IP,
     PERF_SAMPLE_PERIOD, PERF_SAMPLE_TID, PERF_SAMPLE_TIME, SampleLayout, is_kernel_space_frame,
-    is_perf_context_marker, parse_sample_record,
+    is_perf_context_marker, parse_sample_record, parse_sample_record_callchain,
 };
 
 #[test]
@@ -65,6 +65,34 @@ fn consumes_perf_record_default_sample_fields_before_callchain() {
     assert_eq!(sample.tid, Some(456));
     assert_eq!(sample.period, Some(1));
     assert_eq!(sample.callchain, vec![0x2000, 0x3000]);
+}
+
+#[test]
+fn parses_sample_callchain_without_building_sample_record() {
+    let mut payload = Vec::new();
+    payload.extend(0x1000u64.to_le_bytes());
+    payload.extend(123u32.to_le_bytes());
+    payload.extend(456u32.to_le_bytes());
+    payload.extend(9u64.to_le_bytes());
+    payload.extend(2u64.to_le_bytes());
+    payload.extend(0x2000u64.to_le_bytes());
+    payload.extend(0x3000u64.to_le_bytes());
+
+    let sample = parse_sample_record_callchain(
+        &payload,
+        SampleLayout {
+            sample_type: PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_PERIOD
+                | PERF_SAMPLE_CALLCHAIN,
+        },
+    )
+    .expect("sample")
+    .expect("callchain");
+
+    assert_eq!(sample.pid, Some(123));
+    assert_eq!(sample.period, Some(9));
+    assert_eq!(sample.frames.collect::<Vec<_>>(), vec![0x2000, 0x3000]);
 }
 
 #[test]

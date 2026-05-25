@@ -23,6 +23,18 @@ pub struct SampleRecord {
     pub callchain: Vec<u64>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SampleCallchain<'a> {
+    pub pid: Option<u32>,
+    pub period: Option<u64>,
+    pub frames: SampleCallchainFrames<'a>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SampleCallchainFrames<'a> {
+    payload: &'a [u8],
+}
+
 /// Parses a `PERF_RECORD_SAMPLE` payload according to the provided layout.
 ///
 /// # Errors
@@ -74,6 +86,60 @@ pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<Sampl
     Ok(sample)
 }
 
+/// Parses only the sample metadata and callchain frames needed for folding.
+///
+/// # Errors
+///
+/// Returns an error when a field requested by the sample layout is truncated.
+pub fn parse_sample_record_callchain(
+    payload: &[u8],
+    layout: SampleLayout,
+) -> Result<Option<SampleCallchain<'_>>, String> {
+    let mut cursor = SampleCursor::new(payload);
+    let mut pid = None;
+    let mut period = None;
+
+    if layout.has(PERF_SAMPLE_IP) {
+        cursor.skip_u64()?;
+    }
+    if layout.has(PERF_SAMPLE_TID) {
+        pid = Some(cursor.read_u32()?);
+        cursor.skip_u32()?;
+    }
+    if layout.has(PERF_SAMPLE_TIME) {
+        cursor.skip_u64()?;
+    }
+    if layout.has(PERF_SAMPLE_ADDR) {
+        cursor.skip_u64()?;
+    }
+    if layout.has(PERF_SAMPLE_ID) {
+        cursor.skip_u64()?;
+    }
+    if layout.has(PERF_SAMPLE_CPU) {
+        cursor.skip_u32()?;
+        cursor.skip_u32()?;
+    }
+    if layout.has(PERF_SAMPLE_PERIOD) {
+        period = Some(cursor.read_u64()?);
+    }
+    if !layout.has(PERF_SAMPLE_CALLCHAIN) {
+        return Ok(None);
+    }
+
+    let callchain_len = usize::try_from(cursor.read_u64()?)
+        .map_err(|_| "perf sample callchain length does not fit in usize".to_string())?;
+    let callchain_bytes = callchain_len
+        .checked_mul(8)
+        .ok_or_else(|| "perf sample callchain byte length overflows usize".to_string())?;
+    let frames = cursor.read_bytes(callchain_bytes)?;
+
+    Ok(Some(SampleCallchain {
+        pid,
+        period,
+        frames: SampleCallchainFrames { payload: frames },
+    }))
+}
+
 #[must_use]
 pub fn is_perf_context_marker(frame: u64) -> bool {
     frame >= 0xffff_ffff_ffff_f000
@@ -87,6 +153,28 @@ pub fn is_kernel_space_frame(frame: u64) -> bool {
 impl SampleLayout {
     fn has(self, flag: u64) -> bool {
         self.sample_type & flag != 0
+    }
+}
+
+impl SampleCallchainFrames<'_> {
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.payload.len() / 8
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.payload.is_empty()
+    }
+}
+
+impl Iterator for SampleCallchainFrames<'_> {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (frame, remaining) = self.payload.split_first_chunk::<8>()?;
+        self.payload = remaining;
+        Some(u64::from_le_bytes(*frame))
     }
 }
 
@@ -118,5 +206,18 @@ impl<'a> SampleCursor<'a> {
 
     fn skip_u64(&mut self) -> Result<(), String> {
         self.read_u64().map(|_| ())
+    }
+
+    fn read_bytes(&mut self, len: usize) -> Result<&'a [u8], String> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| "perf sample field offset overflows usize".to_string())?;
+        let bytes = self
+            .payload
+            .get(self.offset..end)
+            .ok_or_else(|| "perf sample payload is truncated".to_string())?;
+        self.offset = end;
+        Ok(bytes)
     }
 }
