@@ -260,6 +260,22 @@ fn kallsyms_loads_old_perf_build_id_cache_layout() {
 }
 
 #[test]
+fn kallsyms_loads_first_parseable_system_map_candidate() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let masked = root.path().join("masked.map");
+    let valid = root.path().join("System.map");
+    std::fs::write(&masked, "0000000000000000 T masked\n").expect("masked map");
+    std::fs::write(&valid, "ffffffff81001280 T asm_exc_page_fault\n").expect("system map");
+
+    let symbols = Kallsyms::load_first_system_map_candidate([masked, valid]).expect("system map");
+
+    assert_eq!(
+        symbols.resolve(0xffff_ffff_8100_1280).as_deref(),
+        Some("asm_exc_page_fault")
+    );
+}
+
+#[test]
 fn perf_symbol_resolver_routes_kernel_requests_to_kallsyms() {
     let runner = Addr2lineRunner::new(b"app::main\n/bin/app.rs:10\n");
     let kallsyms = Kallsyms::parse(

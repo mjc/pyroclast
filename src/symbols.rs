@@ -209,6 +209,15 @@ impl Kallsyms {
             .find_map(|text| Self::parse(&text).ok())
     }
 
+    pub fn load_first_system_map_candidate(
+        candidates: impl IntoIterator<Item = PathBuf>,
+    ) -> Option<Self> {
+        candidates
+            .into_iter()
+            .filter_map(|path| std::fs::read_to_string(path).ok())
+            .find_map(|text| Self::parse(&text).ok())
+    }
+
     #[must_use]
     pub fn resolve(&self, address: u64) -> Option<String> {
         self.symbols
