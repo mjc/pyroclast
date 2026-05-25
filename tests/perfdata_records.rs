@@ -494,6 +494,209 @@ fn dispatches_sample_record_by_perf_record_type() {
 
 proptest! {
     #[test]
+    fn parses_comm_record_payload_from_little_endian_fields(
+        pid in any::<u32>(),
+        tid in any::<u32>(),
+        comm in "[ -~]{0,32}",
+    ) {
+        let payload = comm_payload_from(pid, tid, &comm);
+
+        let record = parse_comm_record(&payload).expect("comm record");
+
+        prop_assert_eq!(record.pid, pid);
+        prop_assert_eq!(record.tid, tid);
+        prop_assert_eq!(record.comm, comm);
+    }
+
+    #[test]
+    fn parses_mmap_record_payload_from_little_endian_fields(
+        pid in any::<u32>(),
+        tid in any::<u32>(),
+        start in any::<u64>(),
+        len in any::<u64>(),
+        pgoff in any::<u64>(),
+        path in "[ -~]{0,32}",
+    ) {
+        let payload = mmap_payload_from(pid, tid, start, len, pgoff, &path);
+
+        let record = parse_mmap_record(&payload).expect("mmap record");
+
+        prop_assert_eq!(record.pid, pid);
+        prop_assert_eq!(record.tid, tid);
+        prop_assert_eq!(record.start, start);
+        prop_assert_eq!(record.len, len);
+        prop_assert_eq!(record.pgoff, pgoff);
+        prop_assert_eq!(record.path, path);
+    }
+
+    #[test]
+    fn parses_mmap2_inode_record_payload_from_little_endian_fields(
+        pid in any::<u32>(),
+        tid in any::<u32>(),
+        start in any::<u64>(),
+        len in any::<u64>(),
+        pgoff in any::<u64>(),
+        major in any::<u32>(),
+        minor in any::<u32>(),
+        inode in any::<u64>(),
+        inode_generation in any::<u64>(),
+        prot in any::<u32>(),
+        flags in any::<u32>(),
+        path in "[ -~]{0,32}",
+    ) {
+        let payload = mmap2_inode_payload_from(&Mmap2InodePayload {
+            pid,
+            tid,
+            start,
+            len,
+            pgoff,
+            major,
+            minor,
+            inode,
+            inode_generation,
+            prot,
+            flags,
+            path: &path,
+        });
+
+        let record = parse_mmap2_record(&payload).expect("mmap2 record");
+
+        prop_assert_eq!(record.pid, pid);
+        prop_assert_eq!(record.tid, tid);
+        prop_assert_eq!(record.start, start);
+        prop_assert_eq!(record.len, len);
+        prop_assert_eq!(record.pgoff, pgoff);
+        prop_assert_eq!(record.major, major);
+        prop_assert_eq!(record.minor, minor);
+        prop_assert_eq!(record.inode, inode);
+        prop_assert_eq!(record.inode_generation, inode_generation);
+        prop_assert_eq!(record.prot, prot);
+        prop_assert_eq!(record.flags, flags);
+        prop_assert_eq!(record.path, path);
+    }
+
+    #[test]
+    fn parses_mmap2_build_id_record_payload_from_little_endian_fields(
+        pid in any::<u32>(),
+        tid in any::<u32>(),
+        start in any::<u64>(),
+        len in any::<u64>(),
+        pgoff in any::<u64>(),
+        build_id in prop::collection::vec(any::<u8>(), 0..=20),
+        prot in any::<u32>(),
+        flags in any::<u32>(),
+        path in "[ -~]{0,32}",
+    ) {
+        let payload = mmap2_build_id_payload_from(&Mmap2BuildIdPayload {
+            pid,
+            tid,
+            start,
+            len,
+            pgoff,
+            build_id: &build_id,
+            prot,
+            flags,
+            path: &path,
+        });
+
+        let record = parse_mmap2_build_id_record(&payload).expect("mmap2 build id record");
+
+        prop_assert_eq!(record.pid, pid);
+        prop_assert_eq!(record.tid, tid);
+        prop_assert_eq!(record.start, start);
+        prop_assert_eq!(record.len, len);
+        prop_assert_eq!(record.pgoff, pgoff);
+        prop_assert_eq!(usize::from(record.build_id_size), build_id.len());
+        prop_assert_eq!(record.build_id, build_id);
+        prop_assert_eq!(record.prot, prot);
+        prop_assert_eq!(record.flags, flags);
+        prop_assert_eq!(record.path, path);
+    }
+
+    #[test]
+    fn parses_fork_and_exit_record_payloads_from_little_endian_fields(
+        pid in any::<u32>(),
+        ppid in any::<u32>(),
+        tid in any::<u32>(),
+        ptid in any::<u32>(),
+        time in any::<u64>(),
+    ) {
+        let payload = lifecycle_payload_from(pid, ppid, tid, ptid, time);
+
+        let fork = parse_fork_record(&payload).expect("fork record");
+        let exit = parse_exit_record(&payload).expect("exit record");
+
+        prop_assert_eq!(fork.pid, pid);
+        prop_assert_eq!(fork.ppid, ppid);
+        prop_assert_eq!(fork.tid, tid);
+        prop_assert_eq!(fork.ptid, ptid);
+        prop_assert_eq!(fork.time, time);
+        prop_assert_eq!(exit.pid, pid);
+        prop_assert_eq!(exit.ppid, ppid);
+        prop_assert_eq!(exit.tid, tid);
+        prop_assert_eq!(exit.ptid, ptid);
+        prop_assert_eq!(exit.time, time);
+    }
+
+    #[test]
+    fn parses_lost_record_payload_from_little_endian_fields(
+        id in any::<u64>(),
+        lost in any::<u64>(),
+    ) {
+        let payload = lost_payload_from(id, lost);
+
+        let record = parse_lost_record(&payload).expect("lost record");
+
+        prop_assert_eq!(record.id, id);
+        prop_assert_eq!(record.lost, lost);
+    }
+
+    #[test]
+    fn parses_lost_samples_record_payload_from_little_endian_fields(
+        lost in any::<u64>(),
+    ) {
+        let payload = lost.to_le_bytes();
+
+        let record = parse_lost_samples_record(&payload).expect("lost samples record");
+
+        prop_assert_eq!(record.lost, lost);
+    }
+
+    #[test]
+    fn parses_throttle_and_unthrottle_record_payloads_from_little_endian_fields(
+        time in any::<u64>(),
+        id in any::<u64>(),
+        stream_id in any::<u64>(),
+    ) {
+        let payload = throttle_payload_from(time, id, stream_id);
+
+        let throttle = parse_throttle_record(&payload).expect("throttle record");
+        let unthrottle = parse_unthrottle_record(&payload).expect("unthrottle record");
+
+        prop_assert_eq!(throttle.time, time);
+        prop_assert_eq!(throttle.id, id);
+        prop_assert_eq!(throttle.stream_id, stream_id);
+        prop_assert_eq!(unthrottle.time, time);
+        prop_assert_eq!(unthrottle.id, id);
+        prop_assert_eq!(unthrottle.stream_id, stream_id);
+    }
+
+    #[test]
+    fn parses_read_record_payload_from_little_endian_fields(
+        pid in any::<u32>(),
+        tid in any::<u32>(),
+        values in prop::collection::vec(any::<u8>(), 0..32),
+    ) {
+        let payload = read_payload_from(pid, tid, &values);
+
+        let record = parse_read_record(&payload).expect("read record");
+
+        prop_assert_eq!(record.pid, pid);
+        prop_assert_eq!(record.tid, tid);
+        prop_assert_eq!(record.values, values);
+    }
+
+    #[test]
     fn parses_aux_record_payload_from_little_endian_fields(
         aux_offset in any::<u64>(),
         aux_size in any::<u64>(),
@@ -848,81 +1051,177 @@ fn perfdata_with_records<const N: usize>(records: [Vec<u8>; N]) -> Vec<u8> {
 }
 
 fn mmap_payload() -> Vec<u8> {
+    mmap_payload_from(123, 456, 0x7f00, 0x1000, 0x40, "/usr/bin/sftp-s3")
+}
+
+fn comm_payload_from(pid: u32, tid: u32, comm: &str) -> Vec<u8> {
     let mut payload = Vec::new();
-    payload.extend(123u32.to_le_bytes());
-    payload.extend(456u32.to_le_bytes());
-    payload.extend(0x7f00u64.to_le_bytes());
-    payload.extend(0x1000u64.to_le_bytes());
-    payload.extend(0x40u64.to_le_bytes());
-    payload.extend(b"/usr/bin/sftp-s3\0");
+    payload.extend(pid.to_le_bytes());
+    payload.extend(tid.to_le_bytes());
+    payload.extend(comm.as_bytes());
+    payload.push(0);
+    payload
+}
+
+fn mmap_payload_from(pid: u32, tid: u32, start: u64, len: u64, pgoff: u64, path: &str) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(pid.to_le_bytes());
+    payload.extend(tid.to_le_bytes());
+    payload.extend(start.to_le_bytes());
+    payload.extend(len.to_le_bytes());
+    payload.extend(pgoff.to_le_bytes());
+    payload.extend(path.as_bytes());
+    payload.push(0);
     payload
 }
 
 fn mmap2_inode_payload() -> Vec<u8> {
+    mmap2_inode_payload_from(&Mmap2InodePayload {
+        pid: 123,
+        tid: 456,
+        start: 0x7f00,
+        len: 0x1000,
+        pgoff: 0x40,
+        major: 8,
+        minor: 1,
+        inode: 99,
+        inode_generation: 7,
+        prot: 5,
+        flags: 2,
+        path: "/usr/lib/libssl.so",
+    })
+}
+
+struct Mmap2InodePayload<'a> {
+    pid: u32,
+    tid: u32,
+    start: u64,
+    len: u64,
+    pgoff: u64,
+    major: u32,
+    minor: u32,
+    inode: u64,
+    inode_generation: u64,
+    prot: u32,
+    flags: u32,
+    path: &'a str,
+}
+
+fn mmap2_inode_payload_from(fields: &Mmap2InodePayload<'_>) -> Vec<u8> {
     let mut payload = Vec::new();
-    payload.extend(123u32.to_le_bytes());
-    payload.extend(456u32.to_le_bytes());
-    payload.extend(0x7f00u64.to_le_bytes());
-    payload.extend(0x1000u64.to_le_bytes());
-    payload.extend(0x40u64.to_le_bytes());
-    payload.extend(8u32.to_le_bytes());
-    payload.extend(1u32.to_le_bytes());
-    payload.extend(99u64.to_le_bytes());
-    payload.extend(7u64.to_le_bytes());
-    payload.extend(5u32.to_le_bytes());
-    payload.extend(2u32.to_le_bytes());
-    payload.extend(b"/usr/lib/libssl.so\0");
+    payload.extend(fields.pid.to_le_bytes());
+    payload.extend(fields.tid.to_le_bytes());
+    payload.extend(fields.start.to_le_bytes());
+    payload.extend(fields.len.to_le_bytes());
+    payload.extend(fields.pgoff.to_le_bytes());
+    payload.extend(fields.major.to_le_bytes());
+    payload.extend(fields.minor.to_le_bytes());
+    payload.extend(fields.inode.to_le_bytes());
+    payload.extend(fields.inode_generation.to_le_bytes());
+    payload.extend(fields.prot.to_le_bytes());
+    payload.extend(fields.flags.to_le_bytes());
+    payload.extend(fields.path.as_bytes());
+    payload.push(0);
     payload
 }
 
 fn mmap2_build_id_payload() -> Vec<u8> {
+    mmap2_build_id_payload_from(&Mmap2BuildIdPayload {
+        pid: 123,
+        tid: 456,
+        start: 0x7f00,
+        len: 0x1000,
+        pgoff: 0x40,
+        build_id: &[0xaa, 0xbb, 0xcc, 0xdd],
+        prot: 5,
+        flags: 2,
+        path: "/usr/lib/libssl.so",
+    })
+}
+
+struct Mmap2BuildIdPayload<'a> {
+    pid: u32,
+    tid: u32,
+    start: u64,
+    len: u64,
+    pgoff: u64,
+    build_id: &'a [u8],
+    prot: u32,
+    flags: u32,
+    path: &'a str,
+}
+
+fn mmap2_build_id_payload_from(fields: &Mmap2BuildIdPayload<'_>) -> Vec<u8> {
     let mut payload = Vec::new();
-    payload.extend(123u32.to_le_bytes());
-    payload.extend(456u32.to_le_bytes());
-    payload.extend(0x7f00u64.to_le_bytes());
-    payload.extend(0x1000u64.to_le_bytes());
-    payload.extend(0x40u64.to_le_bytes());
-    payload.push(4);
+    payload.extend(fields.pid.to_le_bytes());
+    payload.extend(fields.tid.to_le_bytes());
+    payload.extend(fields.start.to_le_bytes());
+    payload.extend(fields.len.to_le_bytes());
+    payload.extend(fields.pgoff.to_le_bytes());
+    payload.push(u8::try_from(fields.build_id.len()).expect("build id length"));
     payload.push(0);
     payload.extend(0u16.to_le_bytes());
-    payload.extend([0xaa, 0xbb, 0xcc, 0xdd]);
-    payload.extend([0; 16]);
-    payload.extend(5u32.to_le_bytes());
-    payload.extend(2u32.to_le_bytes());
-    payload.extend(b"/usr/lib/libssl.so\0");
+    payload.extend(fields.build_id);
+    payload.extend(vec![0; 20 - fields.build_id.len()]);
+    payload.extend(fields.prot.to_le_bytes());
+    payload.extend(fields.flags.to_le_bytes());
+    payload.extend(fields.path.as_bytes());
+    payload.push(0);
     payload
 }
 
 fn lifecycle_payload() -> Vec<u8> {
+    lifecycle_payload_from(123, 12, 456, 45, 99_000)
+}
+
+fn lifecycle_payload_from(
+    process_id: u32,
+    parent_process_id: u32,
+    thread_id: u32,
+    parent_thread_id: u32,
+    time: u64,
+) -> Vec<u8> {
     let mut payload = Vec::new();
-    payload.extend(123u32.to_le_bytes());
-    payload.extend(12u32.to_le_bytes());
-    payload.extend(456u32.to_le_bytes());
-    payload.extend(45u32.to_le_bytes());
-    payload.extend(99_000u64.to_le_bytes());
+    payload.extend(process_id.to_le_bytes());
+    payload.extend(parent_process_id.to_le_bytes());
+    payload.extend(thread_id.to_le_bytes());
+    payload.extend(parent_thread_id.to_le_bytes());
+    payload.extend(time.to_le_bytes());
     payload
 }
 
 fn lost_payload() -> Vec<u8> {
+    lost_payload_from(77, 1234)
+}
+
+fn lost_payload_from(id: u64, lost: u64) -> Vec<u8> {
     let mut payload = Vec::new();
-    payload.extend(77u64.to_le_bytes());
-    payload.extend(1234u64.to_le_bytes());
+    payload.extend(id.to_le_bytes());
+    payload.extend(lost.to_le_bytes());
     payload
 }
 
 fn throttle_payload() -> Vec<u8> {
+    throttle_payload_from(10_000, 77, 88)
+}
+
+fn throttle_payload_from(time: u64, id: u64, stream_id: u64) -> Vec<u8> {
     let mut payload = Vec::new();
-    payload.extend(10_000u64.to_le_bytes());
-    payload.extend(77u64.to_le_bytes());
-    payload.extend(88u64.to_le_bytes());
+    payload.extend(time.to_le_bytes());
+    payload.extend(id.to_le_bytes());
+    payload.extend(stream_id.to_le_bytes());
     payload
 }
 
 fn read_payload() -> Vec<u8> {
+    read_payload_from(123, 456, &[1, 2, 3, 4, 5, 6, 7, 8])
+}
+
+fn read_payload_from(pid: u32, tid: u32, values: &[u8]) -> Vec<u8> {
     let mut payload = Vec::new();
-    payload.extend(123u32.to_le_bytes());
-    payload.extend(456u32.to_le_bytes());
-    payload.extend([1, 2, 3, 4, 5, 6, 7, 8]);
+    payload.extend(pid.to_le_bytes());
+    payload.extend(tid.to_le_bytes());
+    payload.extend(values);
     payload
 }
 
