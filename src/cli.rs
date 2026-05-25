@@ -39,8 +39,10 @@ pub enum CliCommand {
 #[serde(rename_all = "snake_case")]
 pub enum ProfileKind {
     Cpu,
+    #[value(alias = "heap")]
     Memory,
     Offcpu,
+    #[value(alias = "syscalls")]
     Latency,
     Async,
 }

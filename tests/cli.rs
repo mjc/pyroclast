@@ -64,6 +64,28 @@ fn parses_profile_options() {
 }
 
 #[test]
+fn parses_profile_kind_aliases_from_plan() {
+    let heap = Cli::parse_from(["pyroclast", "profile", "--kind", "heap", "--", "true"]);
+    let syscalls = Cli::parse_from(["pyroclast", "profile", "--kind", "syscalls", "--", "true"]);
+
+    assert_eq!(
+        heap.command
+            .profile_invocation()
+            .expect("heap invocation")
+            .kind,
+        ProfileKind::Memory
+    );
+    assert_eq!(
+        syscalls
+            .command
+            .profile_invocation()
+            .expect("syscalls invocation")
+            .kind,
+        ProfileKind::Latency
+    );
+}
+
+#[test]
 fn parses_profile_process_attach_options() {
     let cli = Cli::parse_from([
         "pyroclast",
