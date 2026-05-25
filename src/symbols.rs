@@ -31,6 +31,7 @@ pub struct Addr2lineResolver<'a, R> {
 
 pub struct PerfSymbolResolver<'a, R> {
     addr2line: Addr2lineResolver<'a, R>,
+    kernel_elf: Option<PathBuf>,
     kallsyms: Option<Kallsyms>,
 }
 
@@ -100,8 +101,15 @@ where
     pub fn new(runner: &'a R) -> Self {
         Self {
             addr2line: Addr2lineResolver::new(runner),
+            kernel_elf: None,
             kallsyms: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_kernel_elf(mut self, path: PathBuf) -> Self {
+        self.kernel_elf = Some(path);
+        self
     }
 
     #[must_use]
@@ -112,11 +120,14 @@ where
 
     #[must_use]
     pub fn with_perfdata_kernel_cache(self, perfdata: &[u8], debug_dir: &Path) -> Self {
-        match kernel_build_id_from_perfdata(perfdata)
-            .ok()
-            .flatten()
-            .and_then(|build_id| Kallsyms::load_perf_build_id_cache(debug_dir, &build_id))
-        {
+        let Some(build_id) = kernel_build_id_from_perfdata(perfdata).ok().flatten() else {
+            return self;
+        };
+        let kernel_elf = perf_build_id_elf_path(debug_dir, &build_id);
+        if kernel_elf.exists() {
+            return self.with_kernel_elf(kernel_elf);
+        }
+        match Kallsyms::load_perf_build_id_cache(debug_dir, &build_id) {
             Some(kallsyms) => self.with_kallsyms(kallsyms),
             None => self,
         }
@@ -269,18 +280,35 @@ where
 {
     fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
         let mut resolved = vec![None; requests.len()];
+        let mut kernel_elf_requests = Vec::new();
+        let mut kernel_elf_indexes = Vec::new();
         let mut user_requests = Vec::new();
         let mut user_indexes = Vec::new();
 
         for (index, request) in requests.iter().enumerate() {
             if is_kernel_symbol_path(&request.path) {
-                resolved[index] = self
-                    .kallsyms
-                    .as_ref()
-                    .and_then(|kallsyms| kallsyms.resolve(request.relative_address));
+                if let Some(kernel_elf) = &self.kernel_elf {
+                    kernel_elf_indexes.push(index);
+                    kernel_elf_requests.push(SymbolRequest {
+                        path: kernel_elf.clone(),
+                        relative_address: request.relative_address,
+                    });
+                } else {
+                    resolved[index] = self
+                        .kallsyms
+                        .as_ref()
+                        .and_then(|kallsyms| kallsyms.resolve(request.relative_address));
+                }
             } else {
                 user_indexes.push(index);
                 user_requests.push(request.clone());
+            }
+        }
+
+        if !kernel_elf_requests.is_empty() {
+            let kernel_symbols = self.addr2line.resolve_batch(&kernel_elf_requests)?;
+            for (index, symbol) in kernel_elf_indexes.into_iter().zip(kernel_symbols) {
+                resolved[index] = symbol;
             }
         }
 
