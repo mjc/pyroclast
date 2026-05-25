@@ -185,6 +185,7 @@ fn parses_top_level_profiler_commands() {
         ("memory", ProfileKind::Memory),
         ("cpu", ProfileKind::Cpu),
         ("offpcu", ProfileKind::Offcpu),
+        ("offcpu", ProfileKind::Offcpu),
         ("latency", ProfileKind::Latency),
         ("async", ProfileKind::Async),
     ];

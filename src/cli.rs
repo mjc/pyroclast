@@ -25,6 +25,7 @@ impl Cli {
 pub enum CliCommand {
     Memory(RunArgs),
     Cpu(RunArgs),
+    #[command(alias = "offcpu")]
     Offpcu(RunArgs),
     Latency(RunArgs),
     Async(RunArgs),
