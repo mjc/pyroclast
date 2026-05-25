@@ -61,6 +61,14 @@ where
         let command = build_inferno_flamegraph_command(&request.title)
             .stdin(request.folded_stacks.as_bytes().to_vec());
         let output = self.runner.run(&command)?;
+        if output.status_code != Some(0) {
+            return Err(format!(
+                "inferno-flamegraph exited with {:?}: {}",
+                output.status_code,
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
         std::fs::write(&request.output, &output.stdout)?;
         Ok(FlamegraphRenderResult {
             stderr: output.stderr,
