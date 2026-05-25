@@ -63,6 +63,34 @@ pub fn parse_file_attrs(bytes: &[u8], header: PerfHeader) -> Result<Vec<PerfFile
     Ok(attrs)
 }
 
+/// Parses the event IDs referenced by a `perf_file_attr`.
+///
+/// # Errors
+///
+/// Returns an error when the ID section is not `u64` aligned or points outside
+/// the file.
+pub fn parse_file_attr_ids(bytes: &[u8], attr: &PerfFileAttr) -> Result<Vec<u64>, String> {
+    if !attr.ids_size.is_multiple_of(8) {
+        return Err("perf attr id section size is not a multiple of 8".to_string());
+    }
+    let offset = to_usize(attr.ids_offset, "perf attr id section offset")?;
+    let size = to_usize(attr.ids_size, "perf attr id section size")?;
+    let end = offset
+        .checked_add(size)
+        .ok_or_else(|| "perf attr id section size overflows usize".to_string())?;
+    if end > bytes.len() {
+        return Err("perf attr id section extends past end of file".to_string());
+    }
+
+    let mut ids = Vec::with_capacity(size / 8);
+    let mut cursor = offset;
+    while cursor < end {
+        ids.push(read_u64(bytes, cursor)?);
+        cursor += 8;
+    }
+    Ok(ids)
+}
+
 fn read_optional_attr_u64(
     bytes: &[u8],
     attr_start: usize,

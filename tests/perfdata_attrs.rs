@@ -1,4 +1,4 @@
-use pyroclast::perfdata::attrs::{PerfFileAttr, parse_file_attrs};
+use pyroclast::perfdata::attrs::{PerfFileAttr, parse_file_attr_ids, parse_file_attrs};
 use pyroclast::perfdata::header::PerfHeader;
 use pyroclast::perfdata::samples::{PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_TID};
 
@@ -87,6 +87,26 @@ fn parses_mixed_file_attr_sizes() {
     assert_eq!(attrs[0].ids_offset, 512);
     assert_eq!(attrs[1].sample_type, PERF_SAMPLE_TID);
     assert_eq!(attrs[1].ids_offset, 1024);
+}
+
+#[test]
+fn parses_file_attr_id_lists() {
+    let mut bytes = vec![0; 256];
+    bytes[200..208].copy_from_slice(&11u64.to_le_bytes());
+    bytes[208..216].copy_from_slice(&22u64.to_le_bytes());
+    let attr = PerfFileAttr {
+        sample_type: PERF_SAMPLE_IP,
+        read_format: 0,
+        branch_sample_type: 0,
+        sample_regs_user: 0,
+        sample_regs_intr: 0,
+        ids_offset: 200,
+        ids_size: 16,
+    };
+
+    let ids = parse_file_attr_ids(&bytes, &attr).expect("ids");
+
+    assert_eq!(ids, vec![11, 22]);
 }
 
 #[test]
