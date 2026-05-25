@@ -1,5 +1,6 @@
 use pyroclast::perfdata::mappings::{MmapTable, ResolvedMapping};
 use pyroclast::perfdata::records::{Mmap2Record, MmapRecord};
+use pyroclast::symbols::KernelRelocation;
 
 #[test]
 fn resolves_user_ip_to_mapping_relative_address() {
@@ -18,6 +19,7 @@ fn resolves_user_ip_to_mapping_relative_address() {
         Some(ResolvedMapping {
             path: "/bin/app".to_string(),
             relative_address: 0x50,
+            kernel_relocation: None,
         })
     );
 }
@@ -53,6 +55,7 @@ fn prefers_most_specific_mapping_for_overlapping_ranges() {
         Some(ResolvedMapping {
             path: "/bin/plugin.so".to_string(),
             relative_address: 0x30,
+            kernel_relocation: None,
         })
     );
 }
@@ -74,6 +77,32 @@ fn resolves_wildcard_pid_kernel_mapping() {
         Some(ResolvedMapping {
             path: "[kernel.kallsyms]".to_string(),
             relative_address: 0xffff_ffff_8800_0010,
+            kernel_relocation: None,
+        })
+    );
+}
+
+#[test]
+fn resolves_kernel_relocation_from_suffixed_mapping_name() {
+    let mut table = MmapTable::default();
+    table.insert_mmap(MmapRecord {
+        pid: u32::MAX,
+        tid: u32::MAX,
+        start: 0xffff_ffff_8800_0000,
+        len: 0x2000,
+        pgoff: 0xffff_ffff_8800_0000,
+        path: "[kernel.kallsyms]_text".to_string(),
+    });
+
+    assert_eq!(
+        table.resolve(42, 0xffff_ffff_8800_1280),
+        Some(ResolvedMapping {
+            path: "[kernel.kallsyms]_text".to_string(),
+            relative_address: 0xffff_ffff_8800_1280,
+            kernel_relocation: Some(KernelRelocation {
+                reference_symbol: "_text".to_string(),
+                recorded_reference_address: 0xffff_ffff_8800_0000,
+            }),
         })
     );
 }

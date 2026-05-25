@@ -1,4 +1,5 @@
 use crate::perfdata::records::{Mmap2BuildIdRecord, Mmap2Record, MmapRecord};
+use crate::symbols::KernelRelocation;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MmapTable {
@@ -9,6 +10,7 @@ pub struct MmapTable {
 pub struct ResolvedMapping {
     pub path: String,
     pub relative_address: u64,
+    pub kernel_relocation: Option<KernelRelocation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,6 +62,7 @@ impl MmapTable {
             .map(|mapping| ResolvedMapping {
                 path: mapping.path.clone(),
                 relative_address: mapping.relative_address(ip),
+                kernel_relocation: mapping.kernel_relocation(),
             })
     }
 }
@@ -77,5 +80,15 @@ impl Mapping {
         } else {
             ip - self.start + self.pgoff
         }
+    }
+
+    fn kernel_relocation(&self) -> Option<KernelRelocation> {
+        self.path
+            .strip_prefix("[kernel.kallsyms]")
+            .filter(|reference_symbol| !reference_symbol.is_empty())
+            .map(|reference_symbol| KernelRelocation {
+                reference_symbol: reference_symbol.to_string(),
+                recorded_reference_address: self.pgoff,
+            })
     }
 }

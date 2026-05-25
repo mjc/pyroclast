@@ -6,6 +6,12 @@ use crate::perfdata::build_id::kernel_build_id_from_perfdata;
 use crate::process::{CommandRunner, CommandSpec};
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct KernelRelocation {
+    pub reference_symbol: String,
+    pub recorded_reference_address: u64,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SymbolRequest {
     pub path: PathBuf,
     pub relative_address: u64,
