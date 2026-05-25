@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use clap::Parser;
 use pyroclast::cli::{Cli, CliCommand, PerfCallGraph, PerfEvent, ProfileKind};
 
 #[test]
@@ -129,6 +130,53 @@ fn parses_profile_threads_of_pid_option() {
         }
         other => panic!("expected profile command, got {other:?}"),
     }
+}
+
+#[test]
+fn rejects_conflicting_attach_targets() {
+    let pid_and_tid = Cli::try_parse_from(["pyroclast", "profile", "--pid", "99", "--tid", "101"]);
+    assert!(pid_and_tid.is_err());
+
+    let pid_and_threads = Cli::try_parse_from([
+        "pyroclast",
+        "profile",
+        "--pid",
+        "99",
+        "--threads-of-pid",
+        "99",
+    ]);
+    assert!(pid_and_threads.is_err());
+
+    let tid_and_threads = Cli::try_parse_from([
+        "pyroclast",
+        "profile",
+        "--tid",
+        "101",
+        "--threads-of-pid",
+        "99",
+    ]);
+    assert!(tid_and_threads.is_err());
+}
+
+#[test]
+fn top_level_cpu_accepts_threads_of_pid() {
+    let cli = Cli::parse_from([
+        "pyroclast",
+        "cpu",
+        "--threads-of-pid",
+        "99",
+        "--duration-secs",
+        "10",
+    ]);
+
+    let profile = cli
+        .command
+        .profile_invocation()
+        .expect("profile invocation");
+    assert_eq!(profile.kind, ProfileKind::Cpu);
+    assert_eq!(profile.threads_of_pid, Some(99));
+    assert_eq!(profile.duration_secs, 10);
+    assert!(profile.command.is_empty());
 }
 
 #[test]
