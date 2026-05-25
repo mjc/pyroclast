@@ -67,6 +67,15 @@ pub struct ExitRecord {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProcessLifecycleRecord {
+    pid: u32,
+    ppid: u32,
+    tid: u32,
+    ptid: u32,
+    time: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MmapRange {
     pid: u32,
     tid: u32,
@@ -219,17 +228,9 @@ pub fn parse_mmap2_record(payload: &[u8]) -> Result<Mmap2Record, String> {
 ///
 /// Returns an error when the fixed process/thread fields are missing.
 pub fn parse_fork_record(payload: &[u8]) -> Result<ForkRecord, String> {
-    if payload.len() < 24 {
-        return Err("PERF_RECORD_FORK payload is shorter than 24 bytes".to_string());
-    }
+    let record = parse_process_lifecycle_record(payload, "PERF_RECORD_FORK")?;
 
-    Ok(ForkRecord {
-        pid: read_u32(payload, 0)?,
-        ppid: read_u32(payload, 4)?,
-        tid: read_u32(payload, 8)?,
-        ptid: read_u32(payload, 12)?,
-        time: read_u64(payload, 16)?,
-    })
+    Ok(ForkRecord::from(record))
 }
 
 /// Parses a `PERF_RECORD_EXIT` payload.
@@ -238,17 +239,50 @@ pub fn parse_fork_record(payload: &[u8]) -> Result<ForkRecord, String> {
 ///
 /// Returns an error when the fixed process/thread fields are missing.
 pub fn parse_exit_record(payload: &[u8]) -> Result<ExitRecord, String> {
+    let record = parse_process_lifecycle_record(payload, "PERF_RECORD_EXIT")?;
+
+    Ok(ExitRecord::from(record))
+}
+
+fn parse_process_lifecycle_record(
+    payload: &[u8],
+    record_name: &str,
+) -> Result<ProcessLifecycleRecord, String> {
     if payload.len() < 24 {
-        return Err("PERF_RECORD_EXIT payload is shorter than 24 bytes".to_string());
+        return Err(format!("{record_name} payload is shorter than 24 bytes"));
     }
 
-    Ok(ExitRecord {
+    Ok(ProcessLifecycleRecord {
         pid: read_u32(payload, 0)?,
         ppid: read_u32(payload, 4)?,
         tid: read_u32(payload, 8)?,
         ptid: read_u32(payload, 12)?,
         time: read_u64(payload, 16)?,
     })
+}
+
+impl From<ProcessLifecycleRecord> for ForkRecord {
+    fn from(record: ProcessLifecycleRecord) -> Self {
+        Self {
+            pid: record.pid,
+            ppid: record.ppid,
+            tid: record.tid,
+            ptid: record.ptid,
+            time: record.time,
+        }
+    }
+}
+
+impl From<ProcessLifecycleRecord> for ExitRecord {
+    fn from(record: ProcessLifecycleRecord) -> Self {
+        Self {
+            pid: record.pid,
+            ppid: record.ppid,
+            tid: record.tid,
+            ptid: record.ptid,
+            time: record.time,
+        }
+    }
 }
 
 fn parse_mmap_range(payload: &[u8]) -> Result<MmapRange, String> {
