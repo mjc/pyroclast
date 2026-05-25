@@ -20,6 +20,7 @@ use artifacts::ArtifactLayout;
 use backends::fake::FakeBackend;
 use backends::heaptrack::HeaptrackBackend;
 use backends::linux_perf::LinuxPerfBackend;
+use backends::offcpu::OffcpuBackend;
 use backends::strace::StraceBackend;
 use backends::{ProfileRequest, ProfilerBackend};
 use cli::ProfileKind;
@@ -116,6 +117,9 @@ where
             }
             ProfileKind::Memory if std::env::consts::OS == "linux" => {
                 HeaptrackBackend::new(runner).profile(&request)?;
+            }
+            ProfileKind::Offcpu if std::env::consts::OS == "linux" => {
+                OffcpuBackend::new(runner).profile(&request)?;
             }
             _ => {
                 FakeBackend.profile(&request)?;

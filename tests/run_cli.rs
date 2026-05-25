@@ -353,6 +353,32 @@ fn top_level_latency_command_uses_injected_strace_runner() {
     assert_eq!(summary_json["total_calls"], 2);
 }
 
+#[test]
+fn top_level_offcpu_command_uses_injected_bpftrace_runner() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let out = root.path().join("offcpu-run");
+    let runner = RecordingRunner::default();
+    let cli = pyroclast::cli::Cli::parse_from([
+        "pyroclast",
+        "offpcu",
+        "--out",
+        out.to_str().expect("utf8 path"),
+        "--",
+        "true",
+    ]);
+
+    pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("run cli");
+
+    assert_eq!(runner.programs(), vec!["bpftrace", "bpftrace"]);
+    let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
+    assert!(run_json.contains("\"actual_backend\": \"offcpu\""));
+    assert!(out.join("profile.raw.bpftrace").is_file());
+    assert_eq!(
+        std::fs::read_to_string(out.join("stacks.folded")).expect("folded"),
+        "app::serve;tokio::runtime::park 1500\n"
+    );
+}
+
 #[derive(Default)]
 struct RecordingRunner {
     commands: Mutex<Vec<pyroclast::process::CommandSpec>>,
@@ -413,6 +439,9 @@ impl pyroclast::process::CommandRunner for RecordingRunner {
         }
         let stdout = match command.program.as_str() {
             "addr2line" => b"app::work\n/bin/app.rs:10\n".to_vec(),
+            "bpftrace" => {
+                b"@offcpu[\n    55 tokio::runtime::park+12 (/bin/app)\n    44 app::serve+7 (/bin/app)\n]: 1500\n".to_vec()
+            }
             "heaptrack_print" => {
                 b"total allocations: 42\npeak heap memory consumption: 1024 bytes\n".to_vec()
             }
