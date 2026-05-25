@@ -1,4 +1,6 @@
-use pyroclast::perfdata::samples::{PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_TID};
+use pyroclast::perfdata::samples::{
+    PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_TID,
+};
 use std::sync::Mutex;
 
 #[test]
@@ -133,6 +135,26 @@ fn flamegraph_command_folds_perfdata_without_perf_script() {
         std::fs::read_to_string(output_svg).expect("svg"),
         "<svg></svg>\n"
     );
+}
+
+#[test]
+fn flamegraph_command_weights_perf_sample_periods() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    let output_svg = root.path().join("flamegraph.svg");
+    std::fs::write(&perfdata, tiny_period_perfdata()).expect("write perfdata");
+    let runner = RecordingRunner::default();
+    let cli = pyroclast::cli::Cli::parse_from([
+        "pyroclast",
+        "flamegraph",
+        perfdata.to_str().expect("perfdata path"),
+        "-o",
+        output_svg.to_str().expect("svg path"),
+    ]);
+
+    pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("flamegraph command");
+
+    assert_eq!(runner.stdins(), vec![Some(b"0x2000 144\n".to_vec())]);
 }
 
 #[test]
@@ -586,6 +608,20 @@ fn tiny_perfdata() -> Vec<u8> {
     )
 }
 
+fn tiny_period_perfdata() -> Vec<u8> {
+    perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [record_bytes(
+            9,
+            &sample_payload_with_period(0x1000, 1, 2, 144, [0x2000]),
+        )],
+    )
+}
+
 fn perfdata_with_records_and_attrs<const A: usize, const R: usize>(
     attrs: [[u8; 144]; A],
     records: [Vec<u8>; R],
@@ -637,6 +673,25 @@ fn sample_payload<const N: usize>(ip: u64, pid: u32, tid: u32, callchain: [u64; 
     payload.extend(ip.to_le_bytes());
     payload.extend(pid.to_le_bytes());
     payload.extend(tid.to_le_bytes());
+    payload.extend((callchain.len() as u64).to_le_bytes());
+    for frame in callchain {
+        payload.extend(frame.to_le_bytes());
+    }
+    payload
+}
+
+fn sample_payload_with_period<const N: usize>(
+    ip: u64,
+    pid: u32,
+    tid: u32,
+    period: u64,
+    callchain: [u64; N],
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(ip.to_le_bytes());
+    payload.extend(pid.to_le_bytes());
+    payload.extend(tid.to_le_bytes());
+    payload.extend(period.to_le_bytes());
     payload.extend((callchain.len() as u64).to_le_bytes());
     for frame in callchain {
         payload.extend(frame.to_le_bytes());

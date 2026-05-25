@@ -5,7 +5,9 @@ use pyroclast::benchmarks::{
     export_perf_script, format_comparison_report, run_fold_benchmark,
     run_fold_benchmark_with_runner, run_inferno_collapse_benchmark,
 };
-use pyroclast::perfdata::samples::{PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_TID};
+use pyroclast::perfdata::samples::{
+    PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_TID,
+};
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
 
 #[test]
@@ -34,6 +36,31 @@ fn fold_benchmark_reports_folded_output_size() {
     assert_eq!(report.folded_bytes, 9);
     assert_eq!(report.folded_lines, 1);
     assert!(report.elapsed.as_nanos() > 0);
+}
+
+#[test]
+fn fold_benchmark_weights_perf_sample_periods() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    std::fs::write(
+        &perfdata,
+        perfdata_with_records_and_attrs(
+            [file_attr_bytes(
+                PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN,
+                0,
+                0,
+            )],
+            [record_bytes(
+                9,
+                &sample_payload_with_period(0x1000, 1, 2, 144, [0x2000]),
+            )],
+        ),
+    )
+    .expect("write perfdata");
+
+    let report = run_fold_benchmark(&perfdata).expect("benchmark");
+
+    assert_eq!(report.folded_bytes, "0x2000 144\n".len());
 }
 
 #[test]
@@ -416,6 +443,25 @@ fn sample_payload<const N: usize>(ip: u64, pid: u32, tid: u32, callchain: [u64; 
     payload.extend(ip.to_le_bytes());
     payload.extend(pid.to_le_bytes());
     payload.extend(tid.to_le_bytes());
+    payload.extend((callchain.len() as u64).to_le_bytes());
+    for frame in callchain {
+        payload.extend(frame.to_le_bytes());
+    }
+    payload
+}
+
+fn sample_payload_with_period<const N: usize>(
+    ip: u64,
+    pid: u32,
+    tid: u32,
+    period: u64,
+    callchain: [u64; N],
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(ip.to_le_bytes());
+    payload.extend(pid.to_le_bytes());
+    payload.extend(tid.to_le_bytes());
+    payload.extend(period.to_le_bytes());
     payload.extend((callchain.len() as u64).to_le_bytes());
     for frame in callchain {
         payload.extend(frame.to_le_bytes());

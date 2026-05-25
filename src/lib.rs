@@ -173,7 +173,9 @@ where
                 .unwrap_or_else(|| std::path::PathBuf::from("flamegraph.svg"));
             let folded_stacks = fold_perfdata_for_cli(
                 &command.input,
-                FoldOptions::default(),
+                FoldOptions {
+                    count_periods: true,
+                },
                 command.symbols,
                 runner,
             )?;

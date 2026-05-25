@@ -6,7 +6,9 @@ use crate::backends::{BackendResult, ProfileRequest, ProfileResult, ProfilerBack
 use crate::cli::PerfEvent;
 use crate::flamegraph::{FlamegraphRenderer, FlamegraphRequest, InfernoFlamegraphRenderer};
 use crate::manifest::{BackendName, RunManifest};
-use crate::perfdata::fold::{FoldOptions, fold_perfdata_file, fold_perfdata_file_with_symbols};
+use crate::perfdata::fold::{
+    FoldOptions, fold_perfdata_file_with_options, fold_perfdata_file_with_symbols,
+};
 use crate::platform::{NativeThreadLister, ThreadLister};
 use crate::process::{CommandRunner, CommandSpec};
 use crate::summary::threads::{render_folded_stack_summary_text, summarize_folded_stacks};
@@ -289,15 +291,18 @@ fn fold_linux_perfdata<R>(perf_data: &Path, symbols: bool, runner: &R) -> Backen
 where
     R: CommandRunner,
 {
+    let options = FoldOptions {
+        count_periods: true,
+    };
     if symbols {
         let symbol_resolver = Addr2lineResolver::new(runner);
         Ok(fold_perfdata_file_with_symbols(
             perf_data,
-            FoldOptions::default(),
+            options,
             &symbol_resolver,
         )?)
     } else {
-        Ok(fold_perfdata_file(perf_data)?)
+        Ok(fold_perfdata_file_with_options(perf_data, options)?)
     }
 }
 

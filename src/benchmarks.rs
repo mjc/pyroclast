@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::flamegraph::build_inferno_flamegraph_command;
-use crate::perfdata::fold::{FoldOptions, fold_perfdata_file, fold_perfdata_file_with_symbols};
+use crate::perfdata::fold::{
+    FoldOptions, fold_perfdata_file_with_options, fold_perfdata_file_with_symbols,
+};
 use crate::process::{CommandRunner, CommandSpec};
 use crate::symbols::Addr2lineResolver;
 
@@ -61,7 +63,9 @@ pub struct FoldComparisonReport {
 ///
 /// Returns an error when the input file cannot be mapped or parsed.
 pub fn run_fold_benchmark(input: &Path) -> Result<FoldBenchmarkReport, String> {
-    run_fold_benchmark_with_folded(input, || fold_perfdata_file(input))
+    run_fold_benchmark_with_folded(input, || {
+        fold_perfdata_file_with_options(input, benchmark_fold_options())
+    })
 }
 
 /// Folds a `perf.data` file with an optional symbolizing runner and returns
@@ -82,7 +86,7 @@ where
     if symbols {
         let resolver = Addr2lineResolver::new(runner);
         run_fold_benchmark_with_folded(input, || {
-            fold_perfdata_file_with_symbols(input, FoldOptions::default(), &resolver)
+            fold_perfdata_file_with_symbols(input, benchmark_fold_options(), &resolver)
         })
     } else {
         run_fold_benchmark(input)
@@ -200,9 +204,9 @@ where
 {
     let pyroclast_folded = if symbols {
         let resolver = Addr2lineResolver::new(runner);
-        fold_perfdata_file_with_symbols(perf_data, FoldOptions::default(), &resolver)?
+        fold_perfdata_file_with_symbols(perf_data, benchmark_fold_options(), &resolver)?
     } else {
-        fold_perfdata_file(perf_data)?
+        fold_perfdata_file_with_options(perf_data, benchmark_fold_options())?
     };
     let inferno_output = runner
         .run(&CommandSpec::new("inferno-collapse-perf").arg(perf_script.display().to_string()))
@@ -299,4 +303,10 @@ where
         ));
     }
     Ok(output.stdout)
+}
+
+fn benchmark_fold_options() -> FoldOptions {
+    FoldOptions {
+        count_periods: true,
+    }
 }
