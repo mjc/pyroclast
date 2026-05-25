@@ -88,6 +88,7 @@ impl Kallsyms {
         let symbols = text
             .lines()
             .filter_map(parse_kallsyms_line)
+            .filter(|(address, _)| *address != 0)
             .collect::<BTreeMap<_, _>>();
         if symbols.is_empty() {
             return Err("kallsyms did not contain any parseable symbols".to_string());

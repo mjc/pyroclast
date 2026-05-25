@@ -193,6 +193,18 @@ ffffffff88000080 t asm_exc_page_fault
 }
 
 #[test]
+fn kallsyms_rejects_address_masked_tables() {
+    let result = Kallsyms::parse(
+        "\
+0000000000000000 T _stext
+0000000000000000 T asm_exc_page_fault
+",
+    );
+
+    assert!(result.is_err());
+}
+
+#[test]
 fn perf_symbol_resolver_routes_kernel_requests_to_kallsyms() {
     let runner = Addr2lineRunner::new(b"app::main\n/bin/app.rs:10\n");
     let kallsyms = Kallsyms::parse(
