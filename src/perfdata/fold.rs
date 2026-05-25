@@ -215,6 +215,7 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
     let mut comms_by_pid = BTreeMap::new();
     let mut mmap_table = MmapTable::default();
     let mut raw_stacks = RawStackAccumulator::new();
+    let mut callchain = Vec::new();
 
     for record in records {
         let record_result: Result<(), String> = match record.header.record_type {
@@ -227,9 +228,10 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
             PERF_RECORD_SAMPLE => parse_sample_for_fold(record.payload, sample_layout, options)
                 .map(|sample| {
                     if let Some((pid, count, frames)) = sample {
-                        let mut callchain = Vec::with_capacity(frames.len());
+                        callchain.clear();
+                        callchain.reserve(frames.len());
                         callchain.extend(frames.filter(|frame| !is_perf_context_marker(*frame)));
-                        raw_stacks.add_vec(pid, callchain, count);
+                        raw_stacks.add_slice(pid, &callchain, count);
                     }
                 }),
             PERF_RECORD_MMAP2 => parse_mmap2_record(record.payload).map(|record| {
