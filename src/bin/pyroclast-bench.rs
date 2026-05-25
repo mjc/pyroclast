@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use pyroclast::benchmarks::BenchArgs;
 use pyroclast::process::RealCommandRunner;
 
 const DEFAULT_INPUT: &str = "target/benchmarks/biggest.perf.data";
@@ -43,30 +44,6 @@ fn main() -> ExitCode {
         Err(error) => {
             eprintln!("benchmark failed: {error}");
             ExitCode::FAILURE
-        }
-    }
-}
-
-struct BenchArgs {
-    perf_data: Option<PathBuf>,
-    perf_script: Option<PathBuf>,
-}
-
-impl BenchArgs {
-    fn parse(args: Vec<PathBuf>) -> Self {
-        let mut perf_data = None;
-        let mut perf_script = None;
-        let mut iter = args.into_iter();
-        while let Some(arg) = iter.next() {
-            if arg.as_os_str() == "--perf-script" {
-                perf_script = iter.next();
-            } else {
-                perf_data = Some(arg);
-            }
-        }
-        Self {
-            perf_data,
-            perf_script,
         }
     }
 }

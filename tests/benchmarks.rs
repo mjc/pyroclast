@@ -1,6 +1,6 @@
 use std::sync::Mutex;
 
-use pyroclast::benchmarks::{run_fold_benchmark, run_inferno_collapse_benchmark};
+use pyroclast::benchmarks::{BenchArgs, run_fold_benchmark, run_inferno_collapse_benchmark};
 use pyroclast::perfdata::samples::{PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_TID};
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
 
@@ -56,6 +56,18 @@ fn inferno_collapse_benchmark_reports_folded_output_size() {
             )
         ]
     );
+}
+
+#[test]
+fn parses_benchmark_inputs() {
+    let args = BenchArgs::parse(vec![
+        "profile.perf.data".into(),
+        "--perf-script".into(),
+        "perf-script.txt".into(),
+    ]);
+
+    assert_eq!(args.perf_data, Some("profile.perf.data".into()));
+    assert_eq!(args.perf_script, Some("perf-script.txt".into()));
 }
 
 #[derive(Default)]

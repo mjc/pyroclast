@@ -4,6 +4,28 @@ use std::time::{Duration, Instant};
 use crate::perfdata::fold::fold_perfdata_file;
 use crate::process::{CommandRunner, CommandSpec};
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BenchArgs {
+    pub perf_data: Option<PathBuf>,
+    pub perf_script: Option<PathBuf>,
+}
+
+impl BenchArgs {
+    #[must_use]
+    pub fn parse(args: Vec<PathBuf>) -> Self {
+        let mut parsed = Self::default();
+        let mut iter = args.into_iter();
+        while let Some(arg) = iter.next() {
+            if arg.as_os_str() == "--perf-script" {
+                parsed.perf_script = iter.next();
+            } else {
+                parsed.perf_data = Some(arg);
+            }
+        }
+        parsed
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FoldBenchmarkReport {
     pub input: PathBuf,
