@@ -23,8 +23,8 @@ use cli::{Cli, CliCommand};
 use flamegraph::{FlamegraphRenderer, FlamegraphRequest, InfernoFlamegraphRenderer};
 pub use output::{CliOutput, write_cli_output};
 use perfdata::fold::{
-    FoldOptions, fold_perfdata_callchains, fold_perfdata_callchains_with_options,
-    fold_perfdata_callchains_with_symbols,
+    FoldOptions, fold_perfdata_file, fold_perfdata_file_with_options,
+    fold_perfdata_file_with_symbols,
 };
 use process::{CommandRunner, RealCommandRunner};
 use symbols::Addr2lineResolver;
@@ -92,23 +92,25 @@ where
 
     match cli.command {
         CliCommand::Fold(command) => {
-            let bytes = std::fs::read(command.input)?;
             let options = FoldOptions {
                 count_periods: command.count_periods,
             };
-            let stdout = fold_perfdata_for_cli(&bytes, options, command.symbols, runner)?;
+            let stdout = fold_perfdata_for_cli(&command.input, options, command.symbols, runner)?;
             Ok(CliOutput {
                 stdout,
                 stderr: String::new(),
             })
         }
         CliCommand::Flamegraph(command) => {
-            let bytes = std::fs::read(command.input)?;
             let output = command
                 .output
                 .unwrap_or_else(|| std::path::PathBuf::from("flamegraph.svg"));
-            let folded_stacks =
-                fold_perfdata_for_cli(&bytes, FoldOptions::default(), command.symbols, runner)?;
+            let folded_stacks = fold_perfdata_for_cli(
+                &command.input,
+                FoldOptions::default(),
+                command.symbols,
+                runner,
+            )?;
             let render = InfernoFlamegraphRenderer::new(runner).render(&FlamegraphRequest {
                 title: command.title,
                 folded_stacks,
@@ -130,7 +132,7 @@ where
 }
 
 fn fold_perfdata_for_cli<R>(
-    bytes: &[u8],
+    path: &std::path::Path,
     options: FoldOptions,
     symbols: bool,
     runner: &R,
@@ -140,14 +142,14 @@ where
 {
     if symbols {
         let symbol_resolver = Addr2lineResolver::new(runner);
-        Ok(fold_perfdata_callchains_with_symbols(
-            bytes,
+        Ok(fold_perfdata_file_with_symbols(
+            path,
             options,
             &symbol_resolver,
         )?)
     } else if options == FoldOptions::default() {
-        Ok(fold_perfdata_callchains(bytes)?)
+        Ok(fold_perfdata_file(path)?)
     } else {
-        Ok(fold_perfdata_callchains_with_options(bytes, options)?)
+        Ok(fold_perfdata_file_with_options(path, options)?)
     }
 }

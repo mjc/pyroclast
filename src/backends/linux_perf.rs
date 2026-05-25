@@ -5,9 +5,7 @@ use crate::artifacts::ArtifactLayout;
 use crate::backends::{BackendResult, ProfileRequest, ProfileResult, ProfilerBackend};
 use crate::flamegraph::{FlamegraphRenderer, FlamegraphRequest, InfernoFlamegraphRenderer};
 use crate::manifest::{BackendName, RunManifest};
-use crate::perfdata::fold::{
-    FoldOptions, fold_perfdata_callchains, fold_perfdata_callchains_with_symbols,
-};
+use crate::perfdata::fold::{FoldOptions, fold_perfdata_file, fold_perfdata_file_with_symbols};
 use crate::process::{CommandRunner, CommandSpec};
 use crate::symbols::Addr2lineResolver;
 use crate::tools::{ToolSpec, collect_tool_versions};
@@ -60,8 +58,7 @@ where
             request.command.clone(),
         );
         let output = self.runner.run(&command)?;
-        let perf_bytes = std::fs::read(&perf_data)?;
-        let folded_stacks = fold_linux_perfdata(&perf_bytes, request.symbols, self.runner)?;
+        let folded_stacks = fold_linux_perfdata(&perf_data, request.symbols, self.runner)?;
         std::fs::write(layout.stacks_folded(), &folded_stacks)?;
         let flamegraph_output =
             InfernoFlamegraphRenderer::new(self.runner).render(&FlamegraphRequest {
@@ -120,19 +117,19 @@ fn linux_perf_tools(symbols: bool) -> Vec<ToolSpec> {
     tools
 }
 
-fn fold_linux_perfdata<R>(perf_bytes: &[u8], symbols: bool, runner: &R) -> BackendResult<String>
+fn fold_linux_perfdata<R>(perf_data: &Path, symbols: bool, runner: &R) -> BackendResult<String>
 where
     R: CommandRunner,
 {
     if symbols {
         let symbol_resolver = Addr2lineResolver::new(runner);
-        Ok(fold_perfdata_callchains_with_symbols(
-            perf_bytes,
+        Ok(fold_perfdata_file_with_symbols(
+            perf_data,
             FoldOptions::default(),
             &symbol_resolver,
         )?)
     } else {
-        Ok(fold_perfdata_callchains(perf_bytes)?)
+        Ok(fold_perfdata_file(perf_data)?)
     }
 }
 
