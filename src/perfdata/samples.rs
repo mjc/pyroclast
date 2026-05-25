@@ -60,31 +60,6 @@ const SUPPORTED_PERF_SAMPLE_FLAGS: &[u64] = &[
     PERF_SAMPLE_CODE_PAGE_SIZE,
     PERF_SAMPLE_WEIGHT_STRUCT,
 ];
-const SUPPORTED_PERF_SAMPLE_MASK: u64 = PERF_SAMPLE_IP
-    | PERF_SAMPLE_TID
-    | PERF_SAMPLE_TIME
-    | PERF_SAMPLE_ADDR
-    | PERF_SAMPLE_READ
-    | PERF_SAMPLE_CALLCHAIN
-    | PERF_SAMPLE_ID
-    | PERF_SAMPLE_CPU
-    | PERF_SAMPLE_PERIOD
-    | PERF_SAMPLE_STREAM_ID
-    | PERF_SAMPLE_RAW
-    | PERF_SAMPLE_BRANCH_STACK
-    | PERF_SAMPLE_REGS_USER
-    | PERF_SAMPLE_STACK_USER
-    | PERF_SAMPLE_WEIGHT
-    | PERF_SAMPLE_DATA_SRC
-    | PERF_SAMPLE_IDENTIFIER
-    | PERF_SAMPLE_TRANSACTION
-    | PERF_SAMPLE_REGS_INTR
-    | PERF_SAMPLE_PHYS_ADDR
-    | PERF_SAMPLE_AUX
-    | PERF_SAMPLE_CGROUP
-    | PERF_SAMPLE_DATA_PAGE_SIZE
-    | PERF_SAMPLE_CODE_PAGE_SIZE
-    | PERF_SAMPLE_WEIGHT_STRUCT;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SampleLayout {
@@ -306,13 +281,20 @@ impl SampleLayout {
     }
 
     fn reject_unsupported_flags(self) -> Result<(), String> {
-        let unsupported = self.sample_type & !SUPPORTED_PERF_SAMPLE_MASK;
+        let unsupported = self.sample_type & !supported_perf_sample_mask();
         if unsupported == 0 {
             Ok(())
         } else {
             Err(format!("unsupported perf sample flags: 0x{unsupported:x}"))
         }
     }
+}
+
+fn supported_perf_sample_mask() -> u64 {
+    SUPPORTED_PERF_SAMPLE_FLAGS
+        .iter()
+        .copied()
+        .fold(0, |mask, flag| mask | flag)
 }
 
 impl SampleCallchainFrames<'_> {
