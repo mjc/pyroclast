@@ -25,6 +25,30 @@ pub const PERF_RECORD_AUX_OUTPUT_HW_ID: u32 = 21;
 pub const PERF_RECORD_CALLCHAIN_DEFERRED: u32 = 22;
 pub const PERF_RECORD_MISC_MMAP_BUILD_ID: u16 = 1 << 14;
 const BPF_TAG_SIZE: usize = 8;
+const SUPPORTED_PERF_RECORD_TYPES: &[u32] = &[
+    PERF_RECORD_MMAP,
+    PERF_RECORD_LOST,
+    PERF_RECORD_COMM,
+    PERF_RECORD_EXIT,
+    PERF_RECORD_THROTTLE,
+    PERF_RECORD_UNTHROTTLE,
+    PERF_RECORD_FORK,
+    PERF_RECORD_READ,
+    PERF_RECORD_SAMPLE,
+    PERF_RECORD_MMAP2,
+    PERF_RECORD_AUX,
+    PERF_RECORD_ITRACE_START,
+    PERF_RECORD_LOST_SAMPLES,
+    PERF_RECORD_SWITCH,
+    PERF_RECORD_SWITCH_CPU_WIDE,
+    PERF_RECORD_NAMESPACES,
+    PERF_RECORD_KSYMBOL,
+    PERF_RECORD_BPF_EVENT,
+    PERF_RECORD_CGROUP,
+    PERF_RECORD_TEXT_POKE,
+    PERF_RECORD_AUX_OUTPUT_HW_ID,
+    PERF_RECORD_CALLCHAIN_DEFERRED,
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PerfRecordHeader {
@@ -66,6 +90,11 @@ pub enum ParsedRecord {
     AuxOutputHwId(AuxOutputHwIdRecord),
     CallchainDeferred(CallchainDeferredRecord),
     Unsupported { record_type: u32 },
+}
+
+#[must_use]
+pub const fn supported_perf_record_types() -> &'static [u32] {
+    SUPPORTED_PERF_RECORD_TYPES
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

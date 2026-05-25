@@ -8,6 +8,7 @@ use pyroclast::perfdata::records::{
     parse_mmap2_build_id_record, parse_mmap2_record, parse_namespaces_record, parse_read_record,
     parse_record, parse_record_header, parse_sample_payload_record, parse_switch_cpu_wide_record,
     parse_switch_record, parse_text_poke_record, parse_throttle_record, parse_unthrottle_record,
+    supported_perf_record_types,
 };
 
 #[test]
@@ -34,6 +35,13 @@ fn rejects_short_perf_record_header() {
     let error = parse_record_header(&[0; 7]).expect_err("short header");
 
     assert!(error.contains("record header"));
+}
+
+#[test]
+fn supports_every_known_linux_perf_record_type() {
+    let expected = (1..=22).collect::<Vec<_>>();
+
+    assert_eq!(supported_perf_record_types(), expected);
 }
 
 proptest! {
