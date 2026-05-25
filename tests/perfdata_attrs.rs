@@ -68,6 +68,28 @@ fn defaults_newer_attr_fields_when_file_attr_is_older() {
 }
 
 #[test]
+fn parses_mixed_file_attr_sizes() {
+    let mut bytes = vec![0; 104];
+    bytes.extend(file_attr_bytes_with_attr_size(PERF_SAMPLE_IP, 64, 512, 24));
+    bytes.extend(file_attr_bytes(PERF_SAMPLE_TID, 1024, 8));
+    let header = PerfHeader {
+        header_size: 104,
+        attr_offset: 104,
+        attr_size: 224,
+        data_offset: 328,
+        data_size: 0,
+    };
+
+    let attrs = parse_file_attrs(&bytes, header).expect("attrs");
+
+    assert_eq!(attrs.len(), 2);
+    assert_eq!(attrs[0].sample_type, PERF_SAMPLE_IP);
+    assert_eq!(attrs[0].ids_offset, 512);
+    assert_eq!(attrs[1].sample_type, PERF_SAMPLE_TID);
+    assert_eq!(attrs[1].ids_offset, 1024);
+}
+
+#[test]
 fn parses_sample_register_masks_from_file_attr_section() {
     let mut attr = file_attr_bytes(PERF_SAMPLE_IP, 512, 24);
     put_u64(&mut attr, 80, 0b101);
