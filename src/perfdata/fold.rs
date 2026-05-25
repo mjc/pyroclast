@@ -8,7 +8,8 @@ use crate::perfdata::mappings::{MmapTable, ResolvedMapping};
 use crate::perfdata::raw_stack::{CollapsedRawStack, RawStackAccumulator};
 use crate::perfdata::records::{ParsedRecord, PerfRecord, iter_records, parse_record};
 use crate::perfdata::samples::{
-    PERF_SAMPLE_IDENTIFIER, SampleCallchainFrames, SampleLayout, is_kernel_space_frame,
+    PERF_SAMPLE_ADDR, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_TID,
+    PERF_SAMPLE_TIME, SampleCallchainFrames, SampleLayout, is_kernel_space_frame,
     is_perf_context_marker, parse_sample_record, parse_sample_record_callchain,
 };
 use crate::symbols::{SymbolCache, SymbolRequest, SymbolResolver};
@@ -538,17 +539,50 @@ impl SampleLayouts {
         let Some(fallback) = self.fallback else {
             return Ok(None);
         };
-        if fallback.sample_type & PERF_SAMPLE_IDENTIFIER == 0 {
-            return Ok(Some(fallback));
+        if let Some(identifier) = sample_event_id(payload, fallback)? {
+            return Ok(self
+                .by_identifier
+                .get(&identifier)
+                .copied()
+                .or(Some(fallback)));
         }
-        let identifier = payload
-            .get(..8)
-            .ok_or_else(|| "perf sample payload is truncated".to_string())
-            .map(|bytes| u64::from_le_bytes(bytes.try_into().expect("slice has 8 bytes")))?;
-        Ok(self
-            .by_identifier
-            .get(&identifier)
-            .copied()
-            .or(Some(fallback)))
+        Ok(Some(fallback))
     }
+}
+
+fn sample_event_id(payload: &[u8], layout: SampleLayout) -> Result<Option<u64>, String> {
+    if layout.sample_type & PERF_SAMPLE_IDENTIFIER != 0 {
+        return read_sample_u64(payload, 0).map(Some);
+    }
+    if layout.sample_type & PERF_SAMPLE_ID == 0 {
+        return Ok(None);
+    }
+
+    let mut offset = 0usize;
+    if layout.sample_type & PERF_SAMPLE_IP != 0 {
+        offset += 8;
+    }
+    if layout.sample_type & PERF_SAMPLE_TID != 0 {
+        offset += 8;
+    }
+    if layout.sample_type & PERF_SAMPLE_TIME != 0 {
+        offset += 8;
+    }
+    if layout.sample_type & PERF_SAMPLE_ADDR != 0 {
+        offset += 8;
+    }
+    read_sample_u64(payload, offset).map(Some)
+}
+
+fn read_sample_u64(payload: &[u8], offset: usize) -> Result<u64, String> {
+    let end = offset
+        .checked_add(8)
+        .ok_or_else(|| "perf sample field offset overflows usize".to_string())?;
+    let bytes = payload
+        .get(offset..end)
+        .ok_or_else(|| "perf sample payload is truncated".to_string())?;
+    let bytes: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| "perf sample payload is truncated".to_string())?;
+    Ok(u64::from_le_bytes(bytes))
 }

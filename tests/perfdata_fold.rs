@@ -5,8 +5,8 @@ use pyroclast::perfdata::fold::{
     fold_perfdata_callchains_with_symbols, fold_perfdata_file_with_options, summarize_perfdata,
 };
 use pyroclast::perfdata::samples::{
-    PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD,
-    PERF_SAMPLE_TID,
+    PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP,
+    PERF_SAMPLE_PERIOD, PERF_SAMPLE_TID,
 };
 use pyroclast::symbols::{SymbolRequest, SymbolResolver};
 
@@ -207,6 +207,42 @@ fn selects_sample_layout_by_identifier() {
         [record_bytes(
             9,
             &sample_payload_with_identifier_and_period(222, 0x1000, 11, 12, 7, [0x2000]),
+        )],
+    );
+
+    let folded = fold_perfdata_callchains_with_options(
+        &bytes,
+        FoldOptions {
+            count_periods: true,
+        },
+    )
+    .expect("folded");
+
+    assert_eq!(folded, "0x2000 7\n");
+}
+
+#[test]
+fn selects_sample_layout_by_id_field() {
+    let attr1 = file_attr_bytes_with_ids(
+        PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_ID | PERF_SAMPLE_CALLCHAIN,
+        392,
+        [111],
+    );
+    let attr2 = file_attr_bytes_with_ids(
+        PERF_SAMPLE_IP
+            | PERF_SAMPLE_TID
+            | PERF_SAMPLE_ID
+            | PERF_SAMPLE_PERIOD
+            | PERF_SAMPLE_CALLCHAIN,
+        400,
+        [222],
+    );
+    let bytes = perfdata_with_attrs_ids_and_records(
+        [attr1, attr2],
+        [111, 222],
+        [record_bytes(
+            9,
+            &sample_payload_with_id_and_period(0x1000, 11, 12, 222, 7, [0x2000]),
         )],
     );
 
@@ -502,6 +538,27 @@ fn sample_payload_with_identifier_and_period<const N: usize>(
     payload.extend(ip.to_le_bytes());
     payload.extend(pid.to_le_bytes());
     payload.extend(tid.to_le_bytes());
+    payload.extend(period.to_le_bytes());
+    payload.extend((callchain.len() as u64).to_le_bytes());
+    for frame in callchain {
+        payload.extend(frame.to_le_bytes());
+    }
+    payload
+}
+
+fn sample_payload_with_id_and_period<const N: usize>(
+    ip: u64,
+    pid: u32,
+    tid: u32,
+    id: u64,
+    period: u64,
+    callchain: [u64; N],
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(ip.to_le_bytes());
+    payload.extend(pid.to_le_bytes());
+    payload.extend(tid.to_le_bytes());
+    payload.extend(id.to_le_bytes());
     payload.extend(period.to_le_bytes());
     payload.extend((callchain.len() as u64).to_le_bytes());
     for frame in callchain {
