@@ -1,10 +1,13 @@
 use proptest::prelude::*;
 use pyroclast::perfdata::header::parse_header;
 use pyroclast::perfdata::records::{
-    ParsedRecord, PerfRecord, PerfRecordHeader, iter_records, parse_comm_record, parse_exit_record,
-    parse_fork_record, parse_lost_record, parse_lost_samples_record, parse_mmap_record,
-    parse_mmap2_build_id_record, parse_mmap2_record, parse_read_record, parse_record,
-    parse_record_header, parse_throttle_record, parse_unthrottle_record,
+    ParsedRecord, PerfRecord, PerfRecordHeader, iter_records, parse_aux_output_hw_id_record,
+    parse_aux_record, parse_bpf_event_record, parse_callchain_deferred_record, parse_cgroup_record,
+    parse_comm_record, parse_exit_record, parse_fork_record, parse_itrace_start_record,
+    parse_ksymbol_record, parse_lost_record, parse_lost_samples_record, parse_mmap_record,
+    parse_mmap2_build_id_record, parse_mmap2_record, parse_namespaces_record, parse_read_record,
+    parse_record, parse_record_header, parse_switch_cpu_wide_record, parse_switch_record,
+    parse_text_poke_record, parse_throttle_record, parse_unthrottle_record,
 };
 
 #[test]
@@ -481,6 +484,249 @@ fn dispatches_read_record_by_perf_record_type() {
     assert!(matches!(parsed, ParsedRecord::Read(_)));
 }
 
+proptest! {
+    #[test]
+    fn parses_aux_record_payload_from_little_endian_fields(
+        aux_offset in any::<u64>(),
+        aux_size in any::<u64>(),
+        flags in any::<u64>(),
+        sample_id in prop::collection::vec(any::<u8>(), 0..32),
+    ) {
+        let payload = aux_payload(aux_offset, aux_size, flags, &sample_id);
+
+        let aux = parse_aux_record(&payload).expect("aux record");
+
+        prop_assert_eq!(aux.aux_offset, aux_offset);
+        prop_assert_eq!(aux.aux_size, aux_size);
+        prop_assert_eq!(aux.flags, flags);
+        prop_assert_eq!(aux.sample_id, sample_id);
+    }
+
+    #[test]
+    fn parses_itrace_start_record_payload_from_little_endian_fields(
+        pid in any::<u32>(),
+        tid in any::<u32>(),
+        sample_id in prop::collection::vec(any::<u8>(), 0..32),
+    ) {
+        let payload = two_u32_payload(pid, tid, &sample_id);
+
+        let itrace_start = parse_itrace_start_record(&payload).expect("itrace start record");
+
+        prop_assert_eq!(itrace_start.pid, pid);
+        prop_assert_eq!(itrace_start.tid, tid);
+        prop_assert_eq!(itrace_start.sample_id, sample_id);
+    }
+
+    #[test]
+    fn parses_switch_record_payload_losslessly(
+        sample_id in prop::collection::vec(any::<u8>(), 0..32),
+    ) {
+        let switch = parse_switch_record(&sample_id).expect("switch record");
+
+        prop_assert_eq!(switch.sample_id, sample_id);
+    }
+
+    #[test]
+    fn parses_switch_cpu_wide_record_payload_from_little_endian_fields(
+        next_prev_pid in any::<u32>(),
+        next_prev_tid in any::<u32>(),
+        sample_id in prop::collection::vec(any::<u8>(), 0..32),
+    ) {
+        let payload = two_u32_payload(next_prev_pid, next_prev_tid, &sample_id);
+
+        let switch = parse_switch_cpu_wide_record(&payload).expect("switch cpu wide record");
+
+        prop_assert_eq!(switch.next_prev_pid, next_prev_pid);
+        prop_assert_eq!(switch.next_prev_tid, next_prev_tid);
+        prop_assert_eq!(switch.sample_id, sample_id);
+    }
+
+    #[test]
+    fn parses_bpf_event_record_payload_from_little_endian_fields(
+        event_type in any::<u16>(),
+        flags in any::<u16>(),
+        id in any::<u32>(),
+        tag in any::<[u8; 8]>(),
+        sample_id in prop::collection::vec(any::<u8>(), 0..32),
+    ) {
+        let payload = bpf_event_payload(event_type, flags, id, tag, &sample_id);
+
+        let event = parse_bpf_event_record(&payload).expect("bpf event record");
+
+        prop_assert_eq!(event.event_type, event_type);
+        prop_assert_eq!(event.flags, flags);
+        prop_assert_eq!(event.id, id);
+        prop_assert_eq!(event.tag, tag);
+        prop_assert_eq!(event.sample_id, sample_id);
+    }
+
+    #[test]
+    fn parses_aux_output_hw_id_record_payload_from_little_endian_fields(
+        hw_id in any::<u64>(),
+        sample_id in prop::collection::vec(any::<u8>(), 0..32),
+    ) {
+        let payload = one_u64_payload(hw_id, &sample_id);
+
+        let record = parse_aux_output_hw_id_record(&payload).expect("aux output hw id record");
+
+        prop_assert_eq!(record.hw_id, hw_id);
+        prop_assert_eq!(record.sample_id, sample_id);
+    }
+}
+
+#[test]
+fn dispatches_aux_record_by_perf_record_type() {
+    let payload = aux_payload(1, 2, 3, &[4, 5]);
+    let parsed = parse_record(perf_record(11, &payload)).expect("parsed record");
+
+    assert!(matches!(parsed, ParsedRecord::Aux(_)));
+}
+
+#[test]
+fn dispatches_itrace_start_record_by_perf_record_type() {
+    let payload = two_u32_payload(123, 456, &[7, 8]);
+    let parsed = parse_record(perf_record(12, &payload)).expect("parsed record");
+
+    assert!(matches!(parsed, ParsedRecord::ItraceStart(_)));
+}
+
+#[test]
+fn dispatches_switch_record_by_perf_record_type() {
+    let payload = vec![1, 2, 3];
+    let parsed = parse_record(perf_record(14, &payload)).expect("parsed record");
+
+    assert!(matches!(parsed, ParsedRecord::Switch(_)));
+}
+
+#[test]
+fn dispatches_switch_cpu_wide_record_by_perf_record_type() {
+    let payload = two_u32_payload(123, 456, &[7, 8]);
+    let parsed = parse_record(perf_record(15, &payload)).expect("parsed record");
+
+    assert!(matches!(parsed, ParsedRecord::SwitchCpuWide(_)));
+}
+
+#[test]
+fn parses_namespaces_record_payload_from_perf_event_header_shape() {
+    let payload = namespaces_payload();
+
+    let namespaces = parse_namespaces_record(&payload).expect("namespaces record");
+
+    assert_eq!(namespaces.pid, 123);
+    assert_eq!(namespaces.tid, 456);
+    assert_eq!(namespaces.namespaces.len(), 2);
+    assert_eq!(namespaces.namespaces[0].dev, 11);
+    assert_eq!(namespaces.namespaces[0].inode, 22);
+    assert_eq!(namespaces.namespaces[1].dev, 33);
+    assert_eq!(namespaces.namespaces[1].inode, 44);
+    assert_eq!(namespaces.sample_id, vec![9, 8]);
+}
+
+#[test]
+fn dispatches_namespaces_record_by_perf_record_type() {
+    let payload = namespaces_payload();
+    let parsed = parse_record(perf_record(16, &payload)).expect("parsed record");
+
+    assert!(matches!(parsed, ParsedRecord::Namespaces(_)));
+}
+
+#[test]
+fn parses_ksymbol_record_payload_from_perf_event_header_shape() {
+    let payload = ksymbol_payload();
+
+    let ksymbol = parse_ksymbol_record(&payload).expect("ksymbol record");
+
+    assert_eq!(ksymbol.addr, 0xfeed);
+    assert_eq!(ksymbol.len, 64);
+    assert_eq!(ksymbol.ksym_type, 1);
+    assert_eq!(ksymbol.flags, 2);
+    assert_eq!(ksymbol.name, "bpf_prog");
+    assert_eq!(ksymbol.sample_id, vec![7, 6]);
+}
+
+#[test]
+fn dispatches_ksymbol_record_by_perf_record_type() {
+    let payload = ksymbol_payload();
+    let parsed = parse_record(perf_record(17, &payload)).expect("parsed record");
+
+    assert!(matches!(parsed, ParsedRecord::Ksymbol(_)));
+}
+
+#[test]
+fn dispatches_bpf_event_record_by_perf_record_type() {
+    let payload = bpf_event_payload(1, 2, 3, [4; 8], &[5, 6]);
+    let parsed = parse_record(perf_record(18, &payload)).expect("parsed record");
+
+    assert!(matches!(parsed, ParsedRecord::BpfEvent(_)));
+}
+
+#[test]
+fn parses_cgroup_record_payload_from_perf_event_header_shape() {
+    let payload = cgroup_payload();
+
+    let cgroup = parse_cgroup_record(&payload).expect("cgroup record");
+
+    assert_eq!(cgroup.id, 77);
+    assert_eq!(cgroup.path, "/sys/fs/cgroup/work");
+    assert_eq!(cgroup.sample_id, vec![1, 3, 5]);
+}
+
+#[test]
+fn dispatches_cgroup_record_by_perf_record_type() {
+    let payload = cgroup_payload();
+    let parsed = parse_record(perf_record(19, &payload)).expect("parsed record");
+
+    assert!(matches!(parsed, ParsedRecord::Cgroup(_)));
+}
+
+#[test]
+fn parses_text_poke_record_payload_from_perf_event_header_shape() {
+    let payload = text_poke_payload();
+
+    let text_poke = parse_text_poke_record(&payload).expect("text poke record");
+
+    assert_eq!(text_poke.addr, 0xabc);
+    assert_eq!(text_poke.old_len, 2);
+    assert_eq!(text_poke.new_len, 3);
+    assert_eq!(text_poke.bytes, vec![0x90, 0x90, 0xcc, 0xcc, 0xcc]);
+    assert_eq!(text_poke.sample_id, vec![4, 2]);
+}
+
+#[test]
+fn dispatches_text_poke_record_by_perf_record_type() {
+    let payload = text_poke_payload();
+    let parsed = parse_record(perf_record(20, &payload)).expect("parsed record");
+
+    assert!(matches!(parsed, ParsedRecord::TextPoke(_)));
+}
+
+#[test]
+fn dispatches_aux_output_hw_id_record_by_perf_record_type() {
+    let payload = one_u64_payload(123, &[4, 5]);
+    let parsed = parse_record(perf_record(21, &payload)).expect("parsed record");
+
+    assert!(matches!(parsed, ParsedRecord::AuxOutputHwId(_)));
+}
+
+#[test]
+fn parses_callchain_deferred_record_payload_from_perf_event_header_shape() {
+    let payload = callchain_deferred_payload();
+
+    let callchain = parse_callchain_deferred_record(&payload).expect("callchain deferred record");
+
+    assert_eq!(callchain.cookie, 42);
+    assert_eq!(callchain.ips, vec![0x1000, 0x2000]);
+    assert_eq!(callchain.sample_id, vec![9, 9]);
+}
+
+#[test]
+fn dispatches_callchain_deferred_record_by_perf_record_type() {
+    let payload = callchain_deferred_payload();
+    let parsed = parse_record(perf_record(22, &payload)).expect("parsed record");
+
+    assert!(matches!(parsed, ParsedRecord::CallchainDeferred(_)));
+}
+
 fn perfdata_with_records<const N: usize>(records: [Vec<u8>; N]) -> Vec<u8> {
     let data_size = records.iter().map(Vec::len).sum::<usize>();
     let mut bytes = vec![0; 104];
@@ -571,6 +817,110 @@ fn read_payload() -> Vec<u8> {
     payload.extend(456u32.to_le_bytes());
     payload.extend([1, 2, 3, 4, 5, 6, 7, 8]);
     payload
+}
+
+fn aux_payload(aux_offset: u64, aux_size: u64, flags: u64, sample_id: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(aux_offset.to_le_bytes());
+    payload.extend(aux_size.to_le_bytes());
+    payload.extend(flags.to_le_bytes());
+    payload.extend(sample_id);
+    payload
+}
+
+fn one_u64_payload(value: u64, sample_id: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(value.to_le_bytes());
+    payload.extend(sample_id);
+    payload
+}
+
+fn two_u32_payload(first: u32, second: u32, sample_id: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(first.to_le_bytes());
+    payload.extend(second.to_le_bytes());
+    payload.extend(sample_id);
+    payload
+}
+
+fn namespaces_payload() -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(123u32.to_le_bytes());
+    payload.extend(456u32.to_le_bytes());
+    payload.extend(2u64.to_le_bytes());
+    payload.extend(11u64.to_le_bytes());
+    payload.extend(22u64.to_le_bytes());
+    payload.extend(33u64.to_le_bytes());
+    payload.extend(44u64.to_le_bytes());
+    payload.extend([9, 8]);
+    payload
+}
+
+fn ksymbol_payload() -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(0xfeedu64.to_le_bytes());
+    payload.extend(64u32.to_le_bytes());
+    payload.extend(1u16.to_le_bytes());
+    payload.extend(2u16.to_le_bytes());
+    payload.extend(b"bpf_prog\0");
+    payload.extend([7, 6]);
+    payload
+}
+
+fn bpf_event_payload(
+    event_type: u16,
+    flags: u16,
+    id: u32,
+    tag: [u8; 8],
+    sample_id: &[u8],
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(event_type.to_le_bytes());
+    payload.extend(flags.to_le_bytes());
+    payload.extend(id.to_le_bytes());
+    payload.extend(tag);
+    payload.extend(sample_id);
+    payload
+}
+
+fn cgroup_payload() -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(77u64.to_le_bytes());
+    payload.extend(b"/sys/fs/cgroup/work\0");
+    payload.extend([1, 3, 5]);
+    payload
+}
+
+fn text_poke_payload() -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(0xabcu64.to_le_bytes());
+    payload.extend(2u16.to_le_bytes());
+    payload.extend(3u16.to_le_bytes());
+    payload.extend([0x90, 0x90, 0xcc, 0xcc, 0xcc]);
+    payload.extend([4, 2]);
+    payload
+}
+
+fn callchain_deferred_payload() -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(42u64.to_le_bytes());
+    payload.extend(2u64.to_le_bytes());
+    payload.extend(0x1000u64.to_le_bytes());
+    payload.extend(0x2000u64.to_le_bytes());
+    payload.extend([9, 9]);
+    payload
+}
+
+fn perf_record(record_type: u32, payload: &[u8]) -> PerfRecord<'_> {
+    PerfRecord {
+        offset: 104,
+        header: PerfRecordHeader {
+            record_type,
+            misc: 0,
+            size: u16::try_from(8 + payload.len()).expect("record size"),
+        },
+        payload,
+    }
 }
 
 fn record_bytes(record_type: u32, payload: &[u8]) -> Vec<u8> {
