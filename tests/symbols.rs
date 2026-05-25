@@ -136,6 +136,28 @@ fn addr2line_resolver_batches_requests_by_binary() {
     );
 }
 
+#[test]
+fn addr2line_resolver_treats_failed_batches_as_unresolved() {
+    let runner = Addr2lineRunner::failed();
+    let resolver = Addr2lineResolver::new(&runner);
+
+    let symbols = resolver
+        .resolve_batch(&[
+            SymbolRequest {
+                path: PathBuf::from("/bin/app"),
+                relative_address: 0x10,
+            },
+            SymbolRequest {
+                path: PathBuf::from("/bin/app"),
+                relative_address: 0x20,
+            },
+        ])
+        .expect("failed addr2line should degrade");
+
+    assert_eq!(symbols, vec![None, None]);
+    assert_eq!(runner.commands().len(), 1);
+}
+
 #[derive(Default)]
 struct RecordingResolver {
     symbols: BTreeMap<SymbolRequest, String>,
@@ -166,6 +188,7 @@ impl SymbolResolver for RecordingResolver {
 }
 
 struct Addr2lineRunner {
+    status_code: Option<i32>,
     stdout: Vec<u8>,
     commands: Mutex<Vec<CommandSpec>>,
 }
@@ -173,7 +196,16 @@ struct Addr2lineRunner {
 impl Addr2lineRunner {
     fn new(stdout: &[u8]) -> Self {
         Self {
+            status_code: Some(0),
             stdout: stdout.to_vec(),
+            commands: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn failed() -> Self {
+        Self {
+            status_code: Some(1),
+            stdout: Vec::new(),
             commands: Mutex::new(Vec::new()),
         }
     }
@@ -187,7 +219,7 @@ impl CommandRunner for Addr2lineRunner {
     fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
         self.commands.lock().unwrap().push(command.clone());
         Ok(CommandOutput {
-            status_code: Some(0),
+            status_code: self.status_code,
             stdout: self.stdout.clone(),
             stderr: Vec::new(),
         })

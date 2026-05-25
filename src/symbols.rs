@@ -139,10 +139,11 @@ where
                 .runner
                 .run(&build_addr2line_command(&path, &grouped_requests))
                 .map_err(|error| format!("failed to run addr2line: {error}"))?;
-            if output.status_code != Some(0) {
-                return Err(format!("addr2line exited with {:?}", output.status_code));
-            }
-            let symbols = parse_addr2line_stdout(&output.stdout, grouped_requests.len())?;
+            let symbols = if output.status_code == Some(0) {
+                parse_addr2line_stdout(&output.stdout, grouped_requests.len())?
+            } else {
+                vec![None; grouped_requests.len()]
+            };
             for (request, symbol) in grouped_requests.into_iter().zip(symbols) {
                 resolved_by_request.insert(request, symbol);
             }
