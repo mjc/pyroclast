@@ -485,6 +485,29 @@ fn perf_symbol_resolver_uses_kernel_build_id_elf_before_kallsyms() {
     );
 }
 
+#[test]
+fn perf_symbol_resolver_uses_system_map_candidates_when_cache_is_missing() {
+    let home = tempfile::tempdir().expect("home");
+    let perfdata = home.path().join("perf.data");
+    std::fs::write(&perfdata, perfdata_with_kernel_build_id()).expect("perfdata");
+    let system_map = home.path().join("System.map");
+    std::fs::write(&system_map, "ffffffff81001280 T asm_exc_page_fault\n").expect("system map");
+
+    let runner = Addr2lineRunner::new(b"");
+    let resolver = perf_symbol_resolver_for_perfdata_file(&runner, &perfdata, home.path())
+        .with_system_map_candidates([system_map]);
+
+    let symbols = resolver
+        .resolve_batch(&[SymbolRequest {
+            path: PathBuf::from("[kernel.kallsyms]"),
+            relative_address: 0xffff_ffff_8100_1280,
+        }])
+        .expect("symbols");
+
+    assert_eq!(symbols, vec![Some("asm_exc_page_fault".to_string())]);
+    assert!(runner.commands().is_empty());
+}
+
 #[derive(Default)]
 struct RecordingResolver {
     symbols: BTreeMap<SymbolRequest, String>,

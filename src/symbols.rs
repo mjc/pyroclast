@@ -149,6 +149,17 @@ where
     }
 
     #[must_use]
+    pub fn with_system_map_candidates(self, candidates: impl IntoIterator<Item = PathBuf>) -> Self {
+        if self.kernel_elf.is_some() || self.kallsyms.is_some() {
+            return self;
+        }
+        match Kallsyms::load_first_system_map_candidate(candidates) {
+            Some(kallsyms) => self.with_kallsyms(kallsyms),
+            None => self,
+        }
+    }
+
+    #[must_use]
     pub fn with_perfdata_kernel_cache(self, perfdata: &[u8], debug_dir: &Path) -> Self {
         let Some(build_id) = kernel_build_id_from_perfdata(perfdata).ok().flatten() else {
             return self;
