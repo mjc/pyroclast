@@ -31,6 +31,34 @@ pub const PERF_FORMAT_ID: u64 = 1 << 2;
 pub const PERF_FORMAT_GROUP: u64 = 1 << 3;
 pub const PERF_FORMAT_LOST: u64 = 1 << 4;
 
+const SUPPORTED_PERF_SAMPLE_FLAGS: &[u64] = &[
+    PERF_SAMPLE_IP,
+    PERF_SAMPLE_TID,
+    PERF_SAMPLE_TIME,
+    PERF_SAMPLE_ADDR,
+    PERF_SAMPLE_READ,
+    PERF_SAMPLE_CALLCHAIN,
+    PERF_SAMPLE_ID,
+    PERF_SAMPLE_CPU,
+    PERF_SAMPLE_PERIOD,
+    PERF_SAMPLE_STREAM_ID,
+    PERF_SAMPLE_RAW,
+    PERF_SAMPLE_BRANCH_STACK,
+    PERF_SAMPLE_REGS_USER,
+    PERF_SAMPLE_STACK_USER,
+    PERF_SAMPLE_WEIGHT,
+    PERF_SAMPLE_DATA_SRC,
+    PERF_SAMPLE_IDENTIFIER,
+    PERF_SAMPLE_TRANSACTION,
+    PERF_SAMPLE_REGS_INTR,
+    PERF_SAMPLE_PHYS_ADDR,
+    PERF_SAMPLE_AUX,
+    PERF_SAMPLE_CGROUP,
+    PERF_SAMPLE_DATA_PAGE_SIZE,
+    PERF_SAMPLE_CODE_PAGE_SIZE,
+    PERF_SAMPLE_WEIGHT_STRUCT,
+];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SampleLayout {
     pub sample_type: u64,
@@ -58,6 +86,11 @@ pub struct SampleCallchain<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SampleCallchainFrames<'a> {
     payload: &'a [u8],
+}
+
+#[must_use]
+pub fn supported_perf_sample_flags() -> Vec<u64> {
+    SUPPORTED_PERF_SAMPLE_FLAGS.to_vec()
 }
 
 /// Parses a `PERF_RECORD_SAMPLE` payload according to the provided layout.

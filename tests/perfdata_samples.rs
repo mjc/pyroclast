@@ -7,8 +7,15 @@ use pyroclast::perfdata::samples::{
     PERF_SAMPLE_REGS_INTR, PERF_SAMPLE_REGS_USER, PERF_SAMPLE_STACK_USER, PERF_SAMPLE_STREAM_ID,
     PERF_SAMPLE_TID, PERF_SAMPLE_TIME, PERF_SAMPLE_TRANSACTION, PERF_SAMPLE_WEIGHT,
     PERF_SAMPLE_WEIGHT_STRUCT, SampleLayout, is_kernel_space_frame, is_perf_context_marker,
-    parse_sample_record, parse_sample_record_callchain,
+    parse_sample_record, parse_sample_record_callchain, supported_perf_sample_flags,
 };
+
+#[test]
+fn supports_every_known_linux_perf_sample_flag() {
+    let expected = (0..=24).map(|bit| 1u64 << bit).collect::<Vec<_>>();
+
+    assert_eq!(supported_perf_sample_flags(), expected);
+}
 
 #[test]
 fn parses_ip_tid_and_callchain_sample_payload() {
