@@ -1,6 +1,7 @@
 use pyroclast::backends::heaptrack::build_heaptrack_command;
 use pyroclast::backends::linux_perf::{PerfRecordTarget, build_perf_record_command};
 use pyroclast::backends::macos_xctrace::build_xctrace_record_command;
+use pyroclast::backends::offcpu::build_bpftrace_offcpu_command;
 use pyroclast::backends::strace::build_strace_command;
 use pyroclast::cli::PerfEvent;
 use pyroclast::flamegraph::build_inferno_flamegraph_command;
@@ -146,6 +147,19 @@ fn builds_strace_command() {
             "target/release/app",
             "--serve",
         ]
+    );
+}
+
+#[test]
+fn builds_bpftrace_offcpu_command() {
+    let command = build_bpftrace_offcpu_command("target/release/app --serve".to_string(), 30);
+
+    assert_eq!(command.program, "bpftrace");
+    assert_eq!(command.args[0], "-e");
+    assert!(command.args[1].contains("sched:sched_switch"));
+    assert_eq!(
+        &command.args[2..],
+        ["-c", "target/release/app --serve", "--unsafe"]
     );
 }
 
