@@ -92,6 +92,13 @@ pub struct UnthrottleRecord {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ThrottleEventRecord {
+    time: u64,
+    id: u64,
+    stream_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProcessLifecycleRecord {
     pid: u32,
     ppid: u32,
@@ -306,15 +313,9 @@ pub fn parse_lost_samples_record(payload: &[u8]) -> Result<LostSamplesRecord, St
 ///
 /// Returns an error when the fixed `time`/`id`/`stream_id` fields are missing.
 pub fn parse_throttle_record(payload: &[u8]) -> Result<ThrottleRecord, String> {
-    if payload.len() < 24 {
-        return Err("PERF_RECORD_THROTTLE payload is shorter than 24 bytes".to_string());
-    }
+    let record = parse_throttle_event_record(payload, "PERF_RECORD_THROTTLE")?;
 
-    Ok(ThrottleRecord {
-        time: read_u64(payload, 0)?,
-        id: read_u64(payload, 8)?,
-        stream_id: read_u64(payload, 16)?,
-    })
+    Ok(ThrottleRecord::from(record))
 }
 
 /// Parses a `PERF_RECORD_UNTHROTTLE` payload.
@@ -323,15 +324,44 @@ pub fn parse_throttle_record(payload: &[u8]) -> Result<ThrottleRecord, String> {
 ///
 /// Returns an error when the fixed `time`/`id`/`stream_id` fields are missing.
 pub fn parse_unthrottle_record(payload: &[u8]) -> Result<UnthrottleRecord, String> {
+    let record = parse_throttle_event_record(payload, "PERF_RECORD_UNTHROTTLE")?;
+
+    Ok(UnthrottleRecord::from(record))
+}
+
+fn parse_throttle_event_record(
+    payload: &[u8],
+    record_name: &str,
+) -> Result<ThrottleEventRecord, String> {
     if payload.len() < 24 {
-        return Err("PERF_RECORD_UNTHROTTLE payload is shorter than 24 bytes".to_string());
+        return Err(format!("{record_name} payload is shorter than 24 bytes"));
     }
 
-    Ok(UnthrottleRecord {
+    Ok(ThrottleEventRecord {
         time: read_u64(payload, 0)?,
         id: read_u64(payload, 8)?,
         stream_id: read_u64(payload, 16)?,
     })
+}
+
+impl From<ThrottleEventRecord> for ThrottleRecord {
+    fn from(record: ThrottleEventRecord) -> Self {
+        Self {
+            time: record.time,
+            id: record.id,
+            stream_id: record.stream_id,
+        }
+    }
+}
+
+impl From<ThrottleEventRecord> for UnthrottleRecord {
+    fn from(record: ThrottleEventRecord) -> Self {
+        Self {
+            time: record.time,
+            id: record.id,
+            stream_id: record.stream_id,
+        }
+    }
 }
 
 fn parse_process_lifecycle_record(
