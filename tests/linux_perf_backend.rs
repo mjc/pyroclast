@@ -196,6 +196,41 @@ fn linux_perf_backend_writes_tool_errors_when_renderer_fails() {
 }
 
 #[test]
+fn linux_perf_backend_stops_when_perf_record_fails() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let runner = FailingPerfRunner;
+    let backend = LinuxPerfBackend::new(&runner);
+    let request = ProfileRequest {
+        kind: ProfileKind::Cpu,
+        command: vec!["true".to_string()],
+        out_dir: root.path().join("cpu"),
+        name: None,
+        json: false,
+        symbols: false,
+        frequency: 997,
+        event: PerfEvent::CpuClock,
+        call_graph: PerfCallGraph::Fp,
+        pid: None,
+        tids: Vec::new(),
+        threads_of_pid: None,
+        duration_secs: 3600,
+    };
+
+    let error = backend.profile(&request).expect_err("perf failure");
+
+    assert!(
+        error
+            .to_string()
+            .contains("perf record exited with Some(13)")
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("cpu/tool-errors.log")).expect("tool errors log"),
+        "perf record exited with Some(13): permission denied\n"
+    );
+    assert!(!root.path().join("cpu/stacks.folded").exists());
+}
+
+#[test]
 fn linux_perf_backend_records_attached_process() {
     let root = tempfile::tempdir().expect("tempdir");
     let runner = RecordingRunner::default();
@@ -400,6 +435,25 @@ struct FailingRenderer;
 impl FlamegraphRenderer for FailingRenderer {
     fn render(&self, _request: &FlamegraphRequest) -> BackendResult<FlamegraphRenderResult> {
         Err("render failed".into())
+    }
+}
+
+struct FailingPerfRunner;
+
+impl CommandRunner for FailingPerfRunner {
+    fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
+        if command.program == "perf" && command.args.first().is_some_and(|arg| arg == "record") {
+            return Ok(CommandOutput {
+                status_code: Some(13),
+                stdout: Vec::new(),
+                stderr: b"permission denied".to_vec(),
+            });
+        }
+        Ok(CommandOutput {
+            status_code: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        })
     }
 }
 

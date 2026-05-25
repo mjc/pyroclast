@@ -124,6 +124,17 @@ where
             request.duration_secs,
         );
         let output = self.runner.run(&command)?;
+        if output.status_code != Some(0) {
+            std::fs::write(layout.stdout_log(), &output.stdout)?;
+            std::fs::write(layout.stderr_log(), &output.stderr)?;
+            let error = format!(
+                "perf record exited with {:?}: {}",
+                output.status_code,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            std::fs::write(layout.tool_errors_log(), format!("{error}\n"))?;
+            return Err(error.into());
+        }
         let folded_stacks = fold_linux_perfdata(&perf_data, request.symbols, self.runner)?;
         let folded_summary = summarize_folded_stacks(&folded_stacks);
         std::fs::write(layout.stacks_folded(), &folded_stacks)?;
