@@ -88,11 +88,14 @@ fn exports_perf_script_for_old_pipeline_benchmarks() {
 fn parses_benchmark_inputs() {
     let args = BenchArgs::parse(vec![
         "profile.perf.data".into(),
+        "--export-perf-script".into(),
+        "exported-script.txt".into(),
         "--perf-script".into(),
         "perf-script.txt".into(),
     ]);
 
     assert_eq!(args.perf_data, Some("profile.perf.data".into()));
+    assert_eq!(args.export_perf_script, Some("exported-script.txt".into()));
     assert_eq!(args.perf_script, Some("perf-script.txt".into()));
 }
 

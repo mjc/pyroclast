@@ -8,6 +8,7 @@ use crate::process::{CommandRunner, CommandSpec};
 pub struct BenchArgs {
     pub perf_data: Option<PathBuf>,
     pub perf_script: Option<PathBuf>,
+    pub export_perf_script: Option<PathBuf>,
 }
 
 impl BenchArgs {
@@ -18,6 +19,8 @@ impl BenchArgs {
         while let Some(arg) = iter.next() {
             if arg.as_os_str() == "--perf-script" {
                 parsed.perf_script = iter.next();
+            } else if arg.as_os_str() == "--export-perf-script" {
+                parsed.export_perf_script = iter.next();
             } else {
                 parsed.perf_data = Some(arg);
             }

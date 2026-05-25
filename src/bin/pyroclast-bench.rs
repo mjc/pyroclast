@@ -23,7 +23,19 @@ fn main() -> ExitCode {
     match pyroclast::benchmarks::run_fold_benchmark(&input) {
         Ok(report) => {
             print_report("pyroclast_fold", &report);
-            if let Some(perf_script) = args.perf_script {
+            let perf_script = match args.export_perf_script {
+                Some(path) => {
+                    if let Err(error) =
+                        pyroclast::benchmarks::export_perf_script(&input, &path, &RealCommandRunner)
+                    {
+                        eprintln!("perf script export failed: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                    Some(path)
+                }
+                None => args.perf_script,
+            };
+            if let Some(perf_script) = perf_script {
                 if !perf_script.is_file() {
                     eprintln!("perf script input not found: {}", perf_script.display());
                     return ExitCode::FAILURE;
