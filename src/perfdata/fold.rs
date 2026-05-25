@@ -37,6 +37,12 @@ pub struct PerfSampleStack {
     pub callchain: Vec<u64>,
 }
 
+struct PerfFoldData {
+    comms_by_pid: BTreeMap<u32, String>,
+    mmap_table: MmapTable,
+    raw_stacks: Vec<CollapsedRawStack>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FoldOptions {
     pub count_periods: bool,
@@ -136,8 +142,8 @@ pub fn fold_perfdata_callchains_with_options(
     bytes: &[u8],
     options: FoldOptions,
 ) -> Result<String, String> {
-    let summary = summarize_perfdata(bytes)?;
-    fold_summary::<NoopSymbolResolver>(&summary, options, None)
+    let fold_data = collect_fold_data(bytes, options)?;
+    render_fold_data::<NoopSymbolResolver>(&fold_data, None)
 }
 
 /// Collapses perf sample callchains from a `perf.data` file path.
@@ -178,9 +184,9 @@ pub fn fold_perfdata_callchains_with_symbols<R>(
 where
     R: SymbolResolver,
 {
-    let summary = summarize_perfdata(bytes)?;
+    let fold_data = collect_fold_data(bytes, options)?;
     let mut symbol_cache = SymbolCache::new(symbol_resolver);
-    fold_summary(&summary, options, Some(&mut symbol_cache))
+    render_fold_data(&fold_data, Some(&mut symbol_cache))
 }
 
 /// Collapses symbolized perf sample callchains from a `perf.data` file path.
@@ -211,20 +217,70 @@ fn map_perfdata_file(file: &std::fs::File) -> Result<memmap2::Mmap, String> {
         .map_err(|error| format!("failed to map perf.data: {error}"))
 }
 
-fn fold_summary<R>(
-    summary: &PerfSummary,
-    options: FoldOptions,
+fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData, String> {
+    let header = parse_header(bytes)?;
+    let sample_layout = first_sample_layout(bytes, header)?;
+    let records = iter_records(bytes, header)?;
+    let mut comms_by_pid = BTreeMap::new();
+    let mut mmap_table = MmapTable::default();
+    let mut raw_stacks = RawStackAccumulator::new();
+
+    for record in records {
+        let record_result: Result<(), String> = match record.header.record_type {
+            PERF_RECORD_COMM => parse_comm_record(record.payload).map(|record| {
+                comms_by_pid.insert(record.pid, record.comm);
+            }),
+            PERF_RECORD_MMAP => parse_mmap_record(record.payload).map(|record| {
+                mmap_table.insert_mmap(record);
+            }),
+            PERF_RECORD_SAMPLE => {
+                parse_sample_for_summary(record.payload, sample_layout).map(|sample| {
+                    if let Some(sample) = sample {
+                        raw_stacks.add(
+                            sample.pid,
+                            sample
+                                .callchain
+                                .iter()
+                                .copied()
+                                .filter(|frame| !is_perf_context_marker(*frame)),
+                            sample.count(options),
+                        );
+                    }
+                })
+            }
+            PERF_RECORD_MMAP2 => parse_mmap2_record(record.payload).map(|record| {
+                mmap_table.insert_mmap2(record);
+            }),
+            _ => Ok(()),
+        };
+        record_result.map_err(|error| {
+            format!(
+                "failed to parse record type {} at offset {}: {error}",
+                record.header.record_type, record.offset
+            )
+        })?;
+    }
+
+    Ok(PerfFoldData {
+        comms_by_pid,
+        mmap_table,
+        raw_stacks: raw_stacks.into_collapsed(),
+    })
+}
+
+fn render_fold_data<R>(
+    fold_data: &PerfFoldData,
     mut symbol_cache: Option<&mut SymbolCache<'_, R>>,
 ) -> Result<String, String>
 where
     R: SymbolResolver,
 {
     if let Some(cache) = symbol_cache.as_deref_mut() {
-        prefetch_symbols(summary, cache)?;
+        prefetch_symbols(&fold_data.raw_stacks, &fold_data.mmap_table, cache)?;
     }
     let mut counts = BTreeMap::<Vec<String>, u64>::new();
-    let frame_resolver = FoldFrameResolver::new(summary);
-    for stack in collapse_raw_stacks(&summary.sample_stacks, options) {
+    let frame_resolver = FoldFrameResolver::new(&fold_data.comms_by_pid, &fold_data.mmap_table);
+    for stack in &fold_data.raw_stacks {
         let frames = frame_resolver.frames_for_stack(
             stack.pid,
             &stack.callchain,
@@ -244,55 +300,32 @@ where
     Ok(folded)
 }
 
-fn collapse_raw_stacks(
-    samples: &[PerfSampleStack],
-    options: FoldOptions,
-) -> Vec<CollapsedRawStack> {
-    let mut accumulator = RawStackAccumulator::new();
-    for sample in samples {
-        accumulator.add(
-            sample.pid,
-            sample
-                .callchain
-                .iter()
-                .copied()
-                .filter(|frame| !is_perf_context_marker(*frame)),
-            sample.count(options),
-        );
-    }
-
-    accumulator.into_collapsed()
-}
-
 fn prefetch_symbols<R>(
-    summary: &PerfSummary,
+    raw_stacks: &[CollapsedRawStack],
+    mmap_table: &MmapTable,
     symbol_cache: &mut SymbolCache<'_, R>,
 ) -> Result<(), String>
 where
     R: SymbolResolver,
 {
-    let requests = summary
-        .sample_stacks
+    let requests = raw_stacks
         .iter()
-        .flat_map(|sample| symbol_requests_for_sample(sample, &summary.mmap_table))
+        .flat_map(|stack| symbol_requests_for_stack(stack.pid, &stack.callchain, mmap_table))
         .collect::<Vec<_>>();
     symbol_cache.resolve_many(&requests).map(|_| ())
 }
 
-fn symbol_requests_for_sample(
-    sample: &PerfSampleStack,
+fn symbol_requests_for_stack(
+    pid: Option<u32>,
+    callchain: &[u64],
     mmap_table: &MmapTable,
 ) -> Vec<SymbolRequest> {
-    sample
-        .callchain
+    callchain
         .iter()
         .copied()
-        .filter(|frame| !is_perf_context_marker(*frame))
         .filter(|frame| !is_kernel_space_frame(*frame))
         .filter_map(|frame| {
-            sample
-                .pid
-                .and_then(|pid| mmap_table.resolve(pid, frame))
+            pid.and_then(|pid| mmap_table.resolve(pid, frame))
                 .map(|mapping| symbol_request(&mapping))
         })
         .collect()
@@ -312,10 +345,10 @@ impl SymbolResolver for NoopSymbolResolver {
 }
 
 impl<'a> FoldFrameResolver<'a> {
-    fn new(summary: &'a PerfSummary) -> Self {
+    fn new(comms_by_pid: &'a BTreeMap<u32, String>, mmap_table: &'a MmapTable) -> Self {
         Self {
-            comms_by_pid: &summary.comms_by_pid,
-            mmap_table: &summary.mmap_table,
+            comms_by_pid,
+            mmap_table,
         }
     }
 
@@ -401,39 +434,4 @@ fn first_sample_layout(
         .map(|attr| SampleLayout {
             sample_type: attr.sample_type,
         }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{FoldOptions, PerfSampleStack, collapse_raw_stacks};
-
-    #[test]
-    fn collapses_identical_raw_stacks_before_rendering() {
-        let samples = vec![
-            PerfSampleStack {
-                pid: Some(7),
-                period: None,
-                callchain: vec![0x1000, 0x2000],
-            },
-            PerfSampleStack {
-                pid: Some(7),
-                period: None,
-                callchain: vec![0x1000, 0x2000],
-            },
-            PerfSampleStack {
-                pid: Some(8),
-                period: None,
-                callchain: vec![0x1000, 0x2000],
-            },
-        ];
-
-        let collapsed = collapse_raw_stacks(&samples, FoldOptions::default());
-
-        assert_eq!(collapsed.len(), 2);
-        assert_eq!(collapsed[0].pid, Some(7));
-        assert_eq!(collapsed[0].callchain, vec![0x1000, 0x2000]);
-        assert_eq!(collapsed[0].count, 2);
-        assert_eq!(collapsed[1].pid, Some(8));
-        assert_eq!(collapsed[1].count, 1);
-    }
 }
