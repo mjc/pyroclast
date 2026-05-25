@@ -126,6 +126,18 @@ fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 }
 
 #[must_use]
+pub fn current_linux_system_map_candidates() -> Vec<PathBuf> {
+    let kernel_release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let kernel_images = ["/run/booted-system/kernel", "/run/current-system/kernel"]
+        .into_iter()
+        .filter_map(|path| std::fs::canonicalize(path).ok());
+    linux_system_map_candidates_for_system(kernel_images, &kernel_release)
+}
+
+#[must_use]
 pub fn perf_symbol_resolver_for_current_home<'a, R>(
     runner: &'a R,
     perfdata: &Path,
@@ -134,7 +146,8 @@ where
     R: CommandRunner,
 {
     match std::env::var_os("HOME") {
-        Some(home) => perf_symbol_resolver_for_perfdata_file(runner, perfdata, Path::new(&home)),
+        Some(home) => perf_symbol_resolver_for_perfdata_file(runner, perfdata, Path::new(&home))
+            .with_system_map_candidates(current_linux_system_map_candidates()),
         None => PerfSymbolResolver::new(runner).with_system_kallsyms(),
     }
 }
