@@ -101,7 +101,16 @@ pub struct RunArgs {
     #[arg(long, value_enum, default_value_t = PerfCallGraph::Fp)]
     pub call_graph: PerfCallGraph,
 
-    #[arg(last = true, required = true)]
+    #[arg(long, conflicts_with = "tids")]
+    pub pid: Option<u32>,
+
+    #[arg(long = "tid", value_delimiter = ',', conflicts_with = "pid")]
+    pub tids: Vec<u32>,
+
+    #[arg(long, default_value_t = 3600)]
+    pub duration_secs: u32,
+
+    #[arg(last = true, required_unless_present_any = ["pid", "tids"])]
     pub command: Vec<String>,
 }
 
@@ -115,6 +124,9 @@ pub struct ProfileInvocation {
     pub frequency: u32,
     pub event: PerfEvent,
     pub call_graph: PerfCallGraph,
+    pub pid: Option<u32>,
+    pub tids: Vec<u32>,
+    pub duration_secs: u32,
     pub command: Vec<String>,
 }
 
@@ -136,6 +148,9 @@ impl CliCommand {
                 frequency: args.frequency,
                 event: args.event,
                 call_graph: args.call_graph,
+                pid: args.pid,
+                tids: args.tids.clone(),
+                duration_secs: args.duration_secs,
                 command: args.command.clone(),
             }),
             Self::Fold(_) | Self::Summarize(_) | Self::Flamegraph(_) => None,
@@ -154,6 +169,9 @@ impl ProfileInvocation {
             frequency: args.frequency,
             event: args.event,
             call_graph: args.call_graph,
+            pid: args.pid,
+            tids: args.tids.clone(),
+            duration_secs: args.duration_secs,
             command: args.command.clone(),
         }
     }
@@ -185,7 +203,16 @@ pub struct ProfileArgs {
     #[arg(long, value_enum, default_value_t = PerfCallGraph::Fp)]
     pub call_graph: PerfCallGraph,
 
-    #[arg(last = true, required = true)]
+    #[arg(long, conflicts_with = "tids")]
+    pub pid: Option<u32>,
+
+    #[arg(long = "tid", value_delimiter = ',', conflicts_with = "pid")]
+    pub tids: Vec<u32>,
+
+    #[arg(long, default_value_t = 3600)]
+    pub duration_secs: u32,
+
+    #[arg(last = true, required_unless_present_any = ["pid", "tids"])]
     pub command: Vec<String>,
 }
 

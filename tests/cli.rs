@@ -63,6 +63,52 @@ fn parses_profile_options() {
 }
 
 #[test]
+fn parses_profile_process_attach_options() {
+    let cli = Cli::parse_from([
+        "pyroclast",
+        "profile",
+        "--pid",
+        "99",
+        "--duration-secs",
+        "15",
+    ]);
+
+    match cli.command {
+        CliCommand::Profile(profile) => {
+            assert_eq!(profile.pid, Some(99));
+            assert!(profile.tids.is_empty());
+            assert_eq!(profile.duration_secs, 15);
+            assert!(profile.command.is_empty());
+        }
+        other => panic!("expected profile command, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_profile_thread_attach_options() {
+    let cli = Cli::parse_from([
+        "pyroclast",
+        "profile",
+        "--tid",
+        "101,102",
+        "--tid",
+        "103",
+        "--duration-secs",
+        "5",
+    ]);
+
+    match cli.command {
+        CliCommand::Profile(profile) => {
+            assert_eq!(profile.pid, None);
+            assert_eq!(profile.tids, vec![101, 102, 103]);
+            assert_eq!(profile.duration_secs, 5);
+            assert!(profile.command.is_empty());
+        }
+        other => panic!("expected profile command, got {other:?}"),
+    }
+}
+
+#[test]
 fn parses_top_level_profiler_commands() {
     let cases = [
         ("memory", ProfileKind::Memory),
