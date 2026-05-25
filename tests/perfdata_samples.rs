@@ -211,6 +211,18 @@ fn rejects_truncated_raw_sample_payload() {
 }
 
 #[test]
+fn rejects_trailing_sample_payload_bytes() {
+    let mut payload = Vec::new();
+    payload.extend(0x1000u64.to_le_bytes());
+    payload.push(0xff);
+
+    let error = parse_sample_record(&payload, layout(PERF_SAMPLE_IP))
+        .expect_err("sample with trailing bytes");
+
+    assert!(error.contains("trailing bytes"));
+}
+
+#[test]
 fn rejects_truncated_branch_stack_sample_payload() {
     let mut payload = Vec::new();
     payload.extend(1u64.to_le_bytes());
