@@ -1,4 +1,5 @@
 pub mod attrs;
+pub mod build_id;
 pub mod endian;
 pub mod fold;
 pub mod header;
