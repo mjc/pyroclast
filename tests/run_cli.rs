@@ -242,6 +242,22 @@ fn summarize_command_computes_text_from_folded_stacks_when_summary_is_missing() 
 }
 
 #[test]
+fn summarize_command_computes_text_from_raw_perfdata_when_summaries_are_missing() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let run_dir = root.path().join("run");
+    std::fs::create_dir(&run_dir).expect("run dir");
+    std::fs::write(run_dir.join("profile.raw.perf.data"), tiny_perfdata()).expect("perfdata");
+
+    let output = pyroclast::run_cli(["pyroclast", "summarize", run_dir.to_str().unwrap()])
+        .expect("summarize command");
+
+    assert_eq!(
+        output.stdout,
+        "folded lines: 1\nfolded bytes: 9\ntotal count: 1\n"
+    );
+}
+
+#[test]
 fn top_level_cpu_command_uses_injected_perf_runner() {
     let root = tempfile::tempdir().expect("tempdir");
     let out = root.path().join("cpu-run");

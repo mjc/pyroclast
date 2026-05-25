@@ -183,7 +183,13 @@ fn summarize_folded_artifact(
     layout: &ArtifactLayout,
     json: bool,
 ) -> backends::BackendResult<String> {
-    let folded_stacks = std::fs::read_to_string(layout.stacks_folded())?;
+    let folded_stacks = match std::fs::read_to_string(layout.stacks_folded()) {
+        Ok(folded_stacks) => folded_stacks,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fold_perfdata_file(&layout.raw_profile("perf.data"))?
+        }
+        Err(error) => return Err(error.into()),
+    };
     let summary = summarize_folded_stacks(&folded_stacks);
     if json {
         Ok(format!("{}\n", serde_json::to_string_pretty(&summary)?))
