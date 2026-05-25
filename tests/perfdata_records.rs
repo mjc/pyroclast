@@ -1,3 +1,4 @@
+use proptest::prelude::*;
 use pyroclast::perfdata::header::parse_header;
 use pyroclast::perfdata::records::{
     ParsedRecord, PerfRecord, PerfRecordHeader, iter_records, parse_comm_record, parse_exit_record,
@@ -30,6 +31,26 @@ fn rejects_short_perf_record_header() {
     let error = parse_record_header(&[0; 7]).expect_err("short header");
 
     assert!(error.contains("record header"));
+}
+
+proptest! {
+    #[test]
+    fn parses_perf_record_header_from_little_endian_fields(
+        record_type in any::<u32>(),
+        misc in any::<u16>(),
+        size in 8u16..=u16::MAX,
+    ) {
+        let mut bytes = [0; 8];
+        bytes[0..4].copy_from_slice(&record_type.to_le_bytes());
+        bytes[4..6].copy_from_slice(&misc.to_le_bytes());
+        bytes[6..8].copy_from_slice(&size.to_le_bytes());
+
+        let header = parse_record_header(&bytes).expect("record header");
+
+        prop_assert_eq!(header.record_type, record_type);
+        prop_assert_eq!(header.misc, misc);
+        prop_assert_eq!(header.size, size);
+    }
 }
 
 #[test]
