@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::artifacts::ArtifactLayout;
 use crate::backends::{BackendResult, ProfileRequest, ProfileResult, ProfilerBackend};
+use crate::cli::PerfEvent;
 use crate::flamegraph::{FlamegraphRenderer, FlamegraphRequest, InfernoFlamegraphRenderer};
 use crate::manifest::{BackendName, RunManifest};
 use crate::perfdata::fold::{FoldOptions, fold_perfdata_file, fold_perfdata_file_with_symbols};
@@ -10,25 +11,55 @@ use crate::process::{CommandRunner, CommandSpec};
 use crate::symbols::Addr2lineResolver;
 use crate::tools::{ToolSpec, collect_tool_versions};
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PerfRecordTarget {
+    Command(Vec<String>),
+    Process(u32),
+    Threads(Vec<u32>),
+}
+
 pub fn build_perf_record_command(
+    event: PerfEvent,
     frequency: u32,
     callgraph: &str,
     output: &Path,
-    profiled_command: impl IntoIterator<Item = String>,
+    target: PerfRecordTarget,
 ) -> CommandSpec {
-    CommandSpec::new("perf")
-        .args([
-            "record".to_string(),
-            "-F".to_string(),
-            frequency.to_string(),
-            "-g".to_string(),
-            "--call-graph".to_string(),
-            callgraph.to_string(),
-            "-o".to_string(),
-            output.display().to_string(),
-            "--".to_string(),
-        ])
-        .args(profiled_command)
+    let mut command = CommandSpec::new("perf").args([
+        "record".to_string(),
+        "-e".to_string(),
+        event.to_string(),
+        "-F".to_string(),
+        frequency.to_string(),
+        "-g".to_string(),
+        "--call-graph".to_string(),
+        callgraph.to_string(),
+    ]);
+
+    command = match &target {
+        PerfRecordTarget::Command(_) => command,
+        PerfRecordTarget::Process(pid) => command.args(["-p".to_string(), pid.to_string()]),
+        PerfRecordTarget::Threads(tids) => command.args([
+            "-t".to_string(),
+            tids.iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        ]),
+    };
+
+    command = command.args([
+        "-o".to_string(),
+        output.display().to_string(),
+        "--".to_string(),
+    ]);
+
+    match target {
+        PerfRecordTarget::Command(profiled_command) => command.args(profiled_command),
+        PerfRecordTarget::Process(_) | PerfRecordTarget::Threads(_) => {
+            command.args(["sleep".to_string(), "3600".to_string()])
+        }
+    }
 }
 
 pub struct LinuxPerfBackend<'a, R> {
@@ -52,10 +83,11 @@ where
         let perf_data = layout.raw_profile("perf.data");
         let call_graph = request.call_graph.to_string();
         let command = build_perf_record_command(
+            request.event,
             request.frequency,
             &call_graph,
             &perf_data,
-            request.command.clone(),
+            PerfRecordTarget::Command(request.command.clone()),
         );
         let output = self.runner.run(&command)?;
         let folded_stacks = fold_linux_perfdata(&perf_data, request.symbols, self.runner)?;

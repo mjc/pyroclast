@@ -1,6 +1,7 @@
 use pyroclast::backends::heaptrack::build_heaptrack_command;
-use pyroclast::backends::linux_perf::build_perf_record_command;
+use pyroclast::backends::linux_perf::{PerfRecordTarget, build_perf_record_command};
 use pyroclast::backends::macos_xctrace::build_xctrace_record_command;
+use pyroclast::cli::PerfEvent;
 use pyroclast::flamegraph::build_inferno_flamegraph_command;
 use pyroclast::symbols::{SymbolRequest, build_addr2line_command};
 use std::path::PathBuf;
@@ -8,10 +9,11 @@ use std::path::PathBuf;
 #[test]
 fn builds_linux_perf_record_command() {
     let command = build_perf_record_command(
+        PerfEvent::CpuClock,
         997,
         "fp",
         &PathBuf::from("run/profile.raw.perf.data"),
-        ["cargo".to_string(), "check".to_string()],
+        PerfRecordTarget::Command(vec!["cargo".to_string(), "check".to_string()]),
     );
 
     assert_eq!(command.program, "perf");
@@ -19,6 +21,8 @@ fn builds_linux_perf_record_command() {
         command.args,
         vec![
             "record",
+            "-e",
+            "cpu-clock",
             "-F",
             "997",
             "-g",
@@ -29,6 +33,72 @@ fn builds_linux_perf_record_command() {
             "--",
             "cargo",
             "check",
+        ]
+    );
+}
+
+#[test]
+fn builds_linux_perf_thread_record_command() {
+    let command = build_perf_record_command(
+        PerfEvent::TaskClock,
+        199,
+        "dwarf",
+        &PathBuf::from("run/profile.raw.perf.data"),
+        PerfRecordTarget::Threads(vec![101, 102, 103]),
+    );
+
+    assert_eq!(command.program, "perf");
+    assert_eq!(
+        command.args,
+        vec![
+            "record",
+            "-e",
+            "task-clock",
+            "-F",
+            "199",
+            "-g",
+            "--call-graph",
+            "dwarf",
+            "-t",
+            "101,102,103",
+            "-o",
+            "run/profile.raw.perf.data",
+            "--",
+            "sleep",
+            "3600",
+        ]
+    );
+}
+
+#[test]
+fn builds_linux_perf_process_record_command() {
+    let command = build_perf_record_command(
+        PerfEvent::Cycles,
+        997,
+        "fp",
+        &PathBuf::from("run/profile.raw.perf.data"),
+        PerfRecordTarget::Process(99),
+    );
+
+    assert_eq!(command.program, "perf");
+    assert_eq!(
+        command.args,
+        vec![
+            "record",
+            "-e",
+            "cycles",
+            "-F",
+            "997",
+            "-g",
+            "--call-graph",
+            "fp",
+            "-p",
+            "99",
+            "-o",
+            "run/profile.raw.perf.data",
+            "--",
+            "sleep",
+            "3600",
         ]
     );
 }
