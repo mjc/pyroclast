@@ -73,6 +73,11 @@ pub struct LostRecord {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LostSamplesRecord {
+    pub lost: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProcessLifecycleRecord {
     pid: u32,
     ppid: u32,
@@ -263,6 +268,21 @@ pub fn parse_lost_record(payload: &[u8]) -> Result<LostRecord, String> {
     Ok(LostRecord {
         id: read_u64(payload, 0)?,
         lost: read_u64(payload, 8)?,
+    })
+}
+
+/// Parses a `PERF_RECORD_LOST_SAMPLES` payload.
+///
+/// # Errors
+///
+/// Returns an error when the fixed lost field is missing.
+pub fn parse_lost_samples_record(payload: &[u8]) -> Result<LostSamplesRecord, String> {
+    if payload.len() < 8 {
+        return Err("PERF_RECORD_LOST_SAMPLES payload is shorter than 8 bytes".to_string());
+    }
+
+    Ok(LostSamplesRecord {
+        lost: read_u64(payload, 0)?,
     })
 }
 
