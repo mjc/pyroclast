@@ -1,7 +1,7 @@
 use pyroclast::perfdata::header::parse_header;
 use pyroclast::perfdata::records::{
-    PerfRecordHeader, iter_records, parse_comm_record, parse_fork_record, parse_mmap_record,
-    parse_mmap2_record, parse_record_header,
+    PerfRecordHeader, iter_records, parse_comm_record, parse_exit_record, parse_fork_record,
+    parse_mmap_record, parse_mmap2_record, parse_record_header,
 };
 
 #[test]
@@ -126,6 +126,24 @@ fn parses_fork_record_payload_from_perf_event_header_shape() {
     assert_eq!(fork.tid, 456);
     assert_eq!(fork.ptid, 45);
     assert_eq!(fork.time, 99_000);
+}
+
+#[test]
+fn parses_exit_record_payload_from_perf_event_header_shape() {
+    let mut payload = Vec::new();
+    payload.extend(123u32.to_le_bytes());
+    payload.extend(12u32.to_le_bytes());
+    payload.extend(456u32.to_le_bytes());
+    payload.extend(45u32.to_le_bytes());
+    payload.extend(99_000u64.to_le_bytes());
+
+    let exit = parse_exit_record(&payload).expect("exit record");
+
+    assert_eq!(exit.pid, 123);
+    assert_eq!(exit.ppid, 12);
+    assert_eq!(exit.tid, 456);
+    assert_eq!(exit.ptid, 45);
+    assert_eq!(exit.time, 99_000);
 }
 
 fn perfdata_with_records<const N: usize>(records: [Vec<u8>; N]) -> Vec<u8> {

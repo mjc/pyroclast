@@ -58,6 +58,15 @@ pub struct ForkRecord {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExitRecord {
+    pub pid: u32,
+    pub ppid: u32,
+    pub tid: u32,
+    pub ptid: u32,
+    pub time: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MmapRange {
     pid: u32,
     tid: u32,
@@ -215,6 +224,25 @@ pub fn parse_fork_record(payload: &[u8]) -> Result<ForkRecord, String> {
     }
 
     Ok(ForkRecord {
+        pid: read_u32(payload, 0)?,
+        ppid: read_u32(payload, 4)?,
+        tid: read_u32(payload, 8)?,
+        ptid: read_u32(payload, 12)?,
+        time: read_u64(payload, 16)?,
+    })
+}
+
+/// Parses a `PERF_RECORD_EXIT` payload.
+///
+/// # Errors
+///
+/// Returns an error when the fixed process/thread fields are missing.
+pub fn parse_exit_record(payload: &[u8]) -> Result<ExitRecord, String> {
+    if payload.len() < 24 {
+        return Err("PERF_RECORD_EXIT payload is shorter than 24 bytes".to_string());
+    }
+
+    Ok(ExitRecord {
         pid: read_u32(payload, 0)?,
         ppid: read_u32(payload, 4)?,
         tid: read_u32(payload, 8)?,
