@@ -17,6 +17,7 @@ fn fake_backend_writes_required_artifacts() {
         call_graph: PerfCallGraph::Fp,
         pid: None,
         tids: Vec::new(),
+        threads_of_pid: None,
         duration_secs: 3600,
     };
 

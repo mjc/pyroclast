@@ -26,6 +26,7 @@ pub struct ProfileRequest {
     pub call_graph: PerfCallGraph,
     pub pid: Option<u32>,
     pub tids: Vec<u32>,
+    pub threads_of_pid: Option<u32>,
     pub duration_secs: u32,
 }
 

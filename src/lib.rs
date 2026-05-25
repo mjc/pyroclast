@@ -82,6 +82,7 @@ where
             call_graph: invocation.call_graph,
             pid: invocation.pid,
             tids: invocation.tids,
+            threads_of_pid: invocation.threads_of_pid,
             duration_secs: invocation.duration_secs,
         };
         match request.kind {

@@ -24,6 +24,7 @@ fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
         call_graph: PerfCallGraph::Dwarf,
         pid: None,
         tids: Vec::new(),
+        threads_of_pid: None,
         duration_secs: 3600,
     };
 
@@ -82,6 +83,7 @@ fn linux_perf_backend_can_symbolize_folded_stacks() {
         call_graph: PerfCallGraph::Fp,
         pid: None,
         tids: Vec::new(),
+        threads_of_pid: None,
         duration_secs: 3600,
     };
 
@@ -121,6 +123,7 @@ fn linux_perf_backend_records_attached_process() {
         call_graph: PerfCallGraph::Fp,
         pid: Some(99),
         tids: Vec::new(),
+        threads_of_pid: None,
         duration_secs: 5,
     };
 
@@ -173,6 +176,7 @@ fn linux_perf_backend_records_attached_threads() {
         call_graph: PerfCallGraph::Fp,
         pid: None,
         tids: vec![101, 102],
+        threads_of_pid: None,
         duration_secs: 7,
     };
 
@@ -189,6 +193,42 @@ fn linux_perf_backend_records_attached_threads() {
         "sleep".to_string(),
         "7".to_string()
     ]));
+}
+
+#[test]
+fn linux_perf_backend_records_threads_discovered_from_pid() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let proc_root = tempfile::tempdir().expect("proc root");
+    let task_dir = proc_root.path().join("99/task");
+    std::fs::create_dir_all(task_dir.join("101")).expect("thread 101");
+    std::fs::create_dir_all(task_dir.join("102")).expect("thread 102");
+    let runner = RecordingRunner::default();
+    let backend = LinuxPerfBackend::with_proc_root(&runner, proc_root.path());
+    let request = ProfileRequest {
+        kind: ProfileKind::Cpu,
+        command: Vec::new(),
+        out_dir: root.path().join("cpu"),
+        name: None,
+        json: false,
+        symbols: false,
+        frequency: 997,
+        event: PerfEvent::CpuClock,
+        call_graph: PerfCallGraph::Fp,
+        pid: None,
+        tids: Vec::new(),
+        threads_of_pid: Some(99),
+        duration_secs: 7,
+    };
+
+    let result = backend.profile(&request).expect("profile");
+
+    assert_eq!(result.manifest.record_target, "threads_of_pid");
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("cpu/command.txt")).expect("command txt"),
+        "threads-of-pid:99 tids:101,102\n"
+    );
+    assert!(runner.first_perf_args().contains(&"-t".to_string()));
+    assert!(runner.first_perf_args().contains(&"101,102".to_string()));
 }
 
 #[derive(Default)]

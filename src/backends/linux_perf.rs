@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::artifacts::ArtifactLayout;
@@ -7,6 +7,7 @@ use crate::cli::PerfEvent;
 use crate::flamegraph::{FlamegraphRenderer, FlamegraphRequest, InfernoFlamegraphRenderer};
 use crate::manifest::{BackendName, RunManifest};
 use crate::perfdata::fold::{FoldOptions, fold_perfdata_file, fold_perfdata_file_with_symbols};
+use crate::platform::linux_thread_ids_from_proc;
 use crate::process::{CommandRunner, CommandSpec};
 use crate::symbols::Addr2lineResolver;
 use crate::tools::{ToolSpec, collect_tool_versions};
@@ -65,11 +66,22 @@ pub fn build_perf_record_command(
 
 pub struct LinuxPerfBackend<'a, R> {
     runner: &'a R,
+    proc_root: PathBuf,
 }
 
 impl<'a, R> LinuxPerfBackend<'a, R> {
     pub fn new(runner: &'a R) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            proc_root: PathBuf::from("/proc"),
+        }
+    }
+
+    pub fn with_proc_root(runner: &'a R, proc_root: impl Into<PathBuf>) -> Self {
+        Self {
+            runner,
+            proc_root: proc_root.into(),
+        }
     }
 }
 
@@ -83,12 +95,13 @@ where
 
         let perf_data = layout.raw_profile("perf.data");
         let call_graph = request.call_graph.to_string();
+        let target = self.perf_record_target(request)?;
         let command = build_perf_record_command(
             request.event,
             request.frequency,
             &call_graph,
             &perf_data,
-            perf_record_target(request),
+            target.clone(),
             request.duration_secs,
         );
         let output = self.runner.run(&command)?;
@@ -105,7 +118,7 @@ where
         let mut stderr = output.stderr;
         stderr.extend(flamegraph_output.stderr);
         std::fs::write(layout.stderr_log(), &stderr)?;
-        std::fs::write(layout.command_txt(), command_text(request))?;
+        std::fs::write(layout.command_txt(), command_text(request, &target))?;
         std::fs::write(layout.summary_txt(), "linux perf profile recorded\n")?;
         std::fs::write(layout.summary_json(), "{}\n")?;
         std::fs::write(layout.tool_errors_log(), "")?;
@@ -143,19 +156,28 @@ where
     }
 }
 
-fn perf_record_target(request: &ProfileRequest) -> PerfRecordTarget {
-    if let Some(pid) = request.pid {
-        PerfRecordTarget::Process(pid)
-    } else if request.tids.is_empty() {
-        PerfRecordTarget::Command(request.command.clone())
-    } else {
-        PerfRecordTarget::Threads(request.tids.clone())
+impl<R> LinuxPerfBackend<'_, R> {
+    fn perf_record_target(&self, request: &ProfileRequest) -> BackendResult<PerfRecordTarget> {
+        if let Some(pid) = request.pid {
+            Ok(PerfRecordTarget::Process(pid))
+        } else if let Some(pid) = request.threads_of_pid {
+            Ok(PerfRecordTarget::Threads(linux_thread_ids_from_proc(
+                &self.proc_root,
+                pid,
+            )?))
+        } else if request.tids.is_empty() {
+            Ok(PerfRecordTarget::Command(request.command.clone()))
+        } else {
+            Ok(PerfRecordTarget::Threads(request.tids.clone()))
+        }
     }
 }
 
 fn record_target_label(request: &ProfileRequest) -> &'static str {
     if request.pid.is_some() {
         "process"
+    } else if request.threads_of_pid.is_some() {
+        "threads_of_pid"
     } else if request.tids.is_empty() {
         "command"
     } else {
@@ -164,16 +186,25 @@ fn record_target_label(request: &ProfileRequest) -> &'static str {
 }
 
 fn attach_duration(request: &ProfileRequest) -> Option<u32> {
-    if request.pid.is_some() || !request.tids.is_empty() {
+    if request.pid.is_some() || request.threads_of_pid.is_some() || !request.tids.is_empty() {
         Some(request.duration_secs)
     } else {
         None
     }
 }
 
-fn command_text(request: &ProfileRequest) -> String {
+fn command_text(request: &ProfileRequest, target: &PerfRecordTarget) -> String {
     if let Some(pid) = request.pid {
         format!("pid:{pid}\n")
+    } else if let Some(pid) = request.threads_of_pid {
+        format!(
+            "threads-of-pid:{pid} tids:{}\n",
+            target
+                .thread_ids()
+                .map(|tid| tid.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        )
     } else if request.tids.is_empty() {
         format!("{}\n", request.command.join(" "))
     } else {
@@ -186,6 +217,15 @@ fn command_text(request: &ProfileRequest) -> String {
                 .collect::<Vec<_>>()
                 .join(",")
         )
+    }
+}
+
+impl PerfRecordTarget {
+    fn thread_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        match self {
+            Self::Threads(tids) => tids.iter().copied(),
+            Self::Command(_) | Self::Process(_) => [].iter().copied(),
+        }
     }
 }
 
