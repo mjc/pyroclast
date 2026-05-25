@@ -127,11 +127,17 @@ where
         let folded_stacks = fold_linux_perfdata(&perf_data, request.symbols, self.runner)?;
         let folded_summary = summarize_folded_stacks(&folded_stacks);
         std::fs::write(layout.stacks_folded(), &folded_stacks)?;
-        let flamegraph_output = self.flamegraph_renderer.render(&FlamegraphRequest {
+        let flamegraph_output = match self.flamegraph_renderer.render(&FlamegraphRequest {
             title: "CPU profile".to_string(),
             folded_stacks,
             output: layout.flamegraph_svg(),
-        })?;
+        }) {
+            Ok(output) => output,
+            Err(error) => {
+                std::fs::write(layout.tool_errors_log(), format!("{error}\n"))?;
+                return Err(error);
+            }
+        };
 
         std::fs::write(layout.stdout_log(), &output.stdout)?;
         let mut stderr = output.stderr;

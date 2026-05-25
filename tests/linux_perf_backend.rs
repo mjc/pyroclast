@@ -161,6 +161,41 @@ fn linux_perf_backend_accepts_pluggable_flamegraph_renderer() {
 }
 
 #[test]
+fn linux_perf_backend_writes_tool_errors_when_renderer_fails() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let runner = RecordingRunner::default();
+    let renderer = FailingRenderer;
+    let backend = LinuxPerfBackend::with_renderer(&runner, renderer);
+    let request = ProfileRequest {
+        kind: ProfileKind::Cpu,
+        command: vec!["true".to_string()],
+        out_dir: root.path().join("cpu"),
+        name: None,
+        json: false,
+        symbols: false,
+        frequency: 997,
+        event: PerfEvent::CpuClock,
+        call_graph: PerfCallGraph::Fp,
+        pid: None,
+        tids: Vec::new(),
+        threads_of_pid: None,
+        duration_secs: 3600,
+    };
+
+    let error = backend.profile(&request).expect_err("renderer failure");
+
+    assert!(error.to_string().contains("render failed"));
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("cpu/tool-errors.log")).expect("tool errors log"),
+        "render failed\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("cpu/stacks.folded")).expect("folded stacks"),
+        "app;/bin/app+0x1000 1\n"
+    );
+}
+
+#[test]
 fn linux_perf_backend_records_attached_process() {
     let root = tempfile::tempdir().expect("tempdir");
     let runner = RecordingRunner::default();
@@ -357,6 +392,14 @@ impl FlamegraphRenderer for &RecordingRenderer {
             .clone_from(&request.folded_stacks);
         std::fs::write(&request.output, "<svg>plugin</svg>\n")?;
         Ok(FlamegraphRenderResult { stderr: Vec::new() })
+    }
+}
+
+struct FailingRenderer;
+
+impl FlamegraphRenderer for FailingRenderer {
+    fn render(&self, _request: &FlamegraphRequest) -> BackendResult<FlamegraphRenderResult> {
+        Err("render failed".into())
     }
 }
 
