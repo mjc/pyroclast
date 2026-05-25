@@ -26,6 +26,7 @@ pub const PERF_SAMPLE_DATA_PAGE_SIZE: u64 = 1 << 22;
 pub const PERF_SAMPLE_CODE_PAGE_SIZE: u64 = 1 << 23;
 pub const PERF_SAMPLE_WEIGHT_STRUCT: u64 = 1 << 24;
 pub const PERF_SAMPLE_BRANCH_HW_INDEX: u64 = 1 << 17;
+pub const PERF_SAMPLE_BRANCH_COUNTERS: u64 = 1 << 19;
 pub const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
 pub const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 1 << 1;
 pub const PERF_FORMAT_ID: u64 = 1 << 2;
@@ -374,7 +375,14 @@ impl<'a> SampleCursor<'a> {
         let byte_len = branches
             .checked_mul(24)
             .ok_or_else(|| "perf sample branch stack byte length overflows usize".to_string())?;
-        self.read_bytes(byte_len).map(|_| ())
+        self.read_bytes(byte_len)?;
+        if branch_sample_type & PERF_SAMPLE_BRANCH_COUNTERS != 0 {
+            let counter_bytes = branches.checked_mul(8).ok_or_else(|| {
+                "perf sample branch counter byte length overflows usize".to_string()
+            })?;
+            self.read_bytes(counter_bytes)?;
+        }
+        Ok(())
     }
 
     fn skip_regs(&mut self, mask: u64) -> Result<(), String> {
