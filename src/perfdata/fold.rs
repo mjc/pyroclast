@@ -5,6 +5,7 @@ use crate::folded::render_folded_stack;
 use crate::perfdata::attrs::parse_file_attrs;
 use crate::perfdata::header::parse_header;
 use crate::perfdata::mappings::{MmapTable, ResolvedMapping};
+use crate::perfdata::raw_stack::{CollapsedRawStack, RawStackAccumulator};
 use crate::perfdata::records::{
     iter_records, parse_comm_record, parse_mmap_record, parse_mmap2_record,
 };
@@ -34,19 +35,6 @@ pub struct PerfSampleStack {
     pub pid: Option<u32>,
     pub period: Option<u64>,
     pub callchain: Vec<u64>,
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct RawStackKey {
-    pid: Option<u32>,
-    callchain: Vec<u64>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CollapsedRawStack {
-    pid: Option<u32>,
-    callchain: Vec<u64>,
-    count: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -260,28 +248,20 @@ fn collapse_raw_stacks(
     samples: &[PerfSampleStack],
     options: FoldOptions,
 ) -> Vec<CollapsedRawStack> {
-    let mut counts = BTreeMap::<RawStackKey, u64>::new();
+    let mut accumulator = RawStackAccumulator::new();
     for sample in samples {
-        let key = RawStackKey {
-            pid: sample.pid,
-            callchain: sample
+        accumulator.add(
+            sample.pid,
+            sample
                 .callchain
                 .iter()
                 .copied()
-                .filter(|frame| !is_perf_context_marker(*frame))
-                .collect(),
-        };
-        *counts.entry(key).or_insert(0) += sample.count(options);
+                .filter(|frame| !is_perf_context_marker(*frame)),
+            sample.count(options),
+        );
     }
 
-    counts
-        .into_iter()
-        .map(|(key, count)| CollapsedRawStack {
-            pid: key.pid,
-            callchain: key.callchain,
-            count,
-        })
-        .collect()
+    accumulator.into_collapsed()
 }
 
 fn prefetch_symbols<R>(

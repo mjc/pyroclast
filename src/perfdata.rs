@@ -3,5 +3,6 @@ pub mod endian;
 pub mod fold;
 pub mod header;
 pub mod mappings;
+pub mod raw_stack;
 pub mod records;
 pub mod samples;
