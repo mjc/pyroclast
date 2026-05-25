@@ -14,6 +14,7 @@ pub const PERF_SAMPLE_RAW: u64 = 1 << 10;
 pub const PERF_SAMPLE_BRANCH_STACK: u64 = 1 << 11;
 pub const PERF_SAMPLE_REGS_USER: u64 = 1 << 12;
 pub const PERF_SAMPLE_STACK_USER: u64 = 1 << 13;
+pub const PERF_SAMPLE_WEIGHT: u64 = 1 << 14;
 pub const PERF_SAMPLE_IDENTIFIER: u64 = 1 << 16;
 pub const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
 pub const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 1 << 1;
@@ -117,6 +118,9 @@ pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<Sampl
     }
     if layout.has(PERF_SAMPLE_STACK_USER) {
         cursor.skip_user_stack()?;
+    }
+    if layout.has(PERF_SAMPLE_WEIGHT) {
+        cursor.skip_u64()?;
     }
 
     Ok(sample)
