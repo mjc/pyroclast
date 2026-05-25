@@ -16,6 +16,7 @@ pub mod summary;
 pub mod symbols;
 pub mod tools;
 
+use artifacts::ArtifactLayout;
 use backends::fake::FakeBackend;
 use backends::linux_perf::LinuxPerfBackend;
 use backends::{ProfileRequest, ProfilerBackend};
@@ -145,7 +146,13 @@ where
                 stderr: String::from_utf8_lossy(&render.stderr).into_owned(),
             })
         }
-        CliCommand::Summarize(_) => Ok(CliOutput::default()),
+        CliCommand::Summarize(command) => {
+            let stdout = summarize_artifact_dir(&command.artifact_dir, command.json)?;
+            Ok(CliOutput {
+                stdout,
+                stderr: String::new(),
+            })
+        }
         CliCommand::Memory(_)
         | CliCommand::Cpu(_)
         | CliCommand::Offpcu(_)
@@ -153,6 +160,16 @@ where
         | CliCommand::Async(_)
         | CliCommand::Profile(_) => unreachable!("profile invocations returned earlier"),
     }
+}
+
+fn summarize_artifact_dir(path: &std::path::Path, json: bool) -> backends::BackendResult<String> {
+    let layout = ArtifactLayout::new(path.to_path_buf());
+    let summary_path = if json {
+        layout.summary_json()
+    } else {
+        layout.summary_txt()
+    };
+    Ok(std::fs::read_to_string(summary_path)?)
 }
 
 fn fold_perfdata_for_cli<R>(

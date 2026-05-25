@@ -193,6 +193,39 @@ fn flamegraph_command_can_symbolize_mapped_frames() {
 }
 
 #[test]
+fn summarize_command_prints_summary_text() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let run_dir = root.path().join("run");
+    std::fs::create_dir(&run_dir).expect("run dir");
+    std::fs::write(run_dir.join("summary.txt"), "folded lines: 3\n").expect("summary txt");
+    std::fs::write(run_dir.join("summary.json"), "{\"folded_lines\":3}\n").expect("summary json");
+
+    let output = pyroclast::run_cli(["pyroclast", "summarize", run_dir.to_str().unwrap()])
+        .expect("summarize command");
+
+    assert_eq!(output.stdout, "folded lines: 3\n");
+}
+
+#[test]
+fn summarize_command_prints_summary_json() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let run_dir = root.path().join("run");
+    std::fs::create_dir(&run_dir).expect("run dir");
+    std::fs::write(run_dir.join("summary.txt"), "folded lines: 3\n").expect("summary txt");
+    std::fs::write(run_dir.join("summary.json"), "{\"folded_lines\":3}\n").expect("summary json");
+
+    let output = pyroclast::run_cli([
+        "pyroclast",
+        "summarize",
+        "--json",
+        run_dir.to_str().unwrap(),
+    ])
+    .expect("summarize command");
+
+    assert_eq!(output.stdout, "{\"folded_lines\":3}\n");
+}
+
+#[test]
 fn top_level_cpu_command_uses_injected_perf_runner() {
     let root = tempfile::tempdir().expect("tempdir");
     let out = root.path().join("cpu-run");
