@@ -1,6 +1,7 @@
 use pyroclast::backends::heaptrack::build_heaptrack_command;
 use pyroclast::backends::linux_perf::{PerfRecordTarget, build_perf_record_command};
 use pyroclast::backends::macos_xctrace::build_xctrace_record_command;
+use pyroclast::backends::strace::build_strace_command;
 use pyroclast::cli::PerfEvent;
 use pyroclast::flamegraph::build_inferno_flamegraph_command;
 use pyroclast::symbols::{SymbolRequest, build_addr2line_command};
@@ -121,6 +122,29 @@ fn builds_heaptrack_command() {
             "run/profile.raw.heaptrack",
             "target/release/app",
             "--serve"
+        ]
+    );
+}
+
+#[test]
+fn builds_strace_command() {
+    let command = build_strace_command(
+        &PathBuf::from("run/profile.raw.strace"),
+        ["target/release/app".to_string(), "--serve".to_string()],
+    );
+
+    assert_eq!(command.program, "strace");
+    assert_eq!(
+        command.args,
+        vec![
+            "-f",
+            "-ttt",
+            "-T",
+            "-o",
+            "run/profile.raw.strace",
+            "--",
+            "target/release/app",
+            "--serve",
         ]
     );
 }
