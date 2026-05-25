@@ -242,6 +242,35 @@ fn linux_perf_backend_records_threads_discovered_from_pid() {
     assert!(runner.first_perf_args().contains(&"101,102".to_string()));
 }
 
+#[test]
+fn linux_perf_backend_reports_missing_threads_of_pid() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let proc_root = tempfile::tempdir().expect("proc root");
+    std::fs::create_dir_all(proc_root.path().join("99/task")).expect("empty task dir");
+    let runner = RecordingRunner::default();
+    let backend = LinuxPerfBackend::with_proc_root(&runner, proc_root.path());
+    let request = ProfileRequest {
+        kind: ProfileKind::Cpu,
+        command: Vec::new(),
+        out_dir: root.path().join("cpu"),
+        name: None,
+        json: false,
+        symbols: false,
+        frequency: 997,
+        event: PerfEvent::CpuClock,
+        call_graph: PerfCallGraph::Fp,
+        pid: None,
+        tids: Vec::new(),
+        threads_of_pid: Some(99),
+        duration_secs: 7,
+    };
+
+    let error = backend.profile(&request).expect_err("missing threads");
+
+    assert!(error.to_string().contains("no thread ids found"));
+    assert!(runner.programs().is_empty());
+}
+
 #[derive(Default)]
 struct RecordingRunner {
     commands: Mutex<Vec<CommandSpec>>,
