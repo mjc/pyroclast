@@ -21,12 +21,31 @@ fn parses_sample_type_from_file_attr_section() {
         vec![PerfFileAttr {
             sample_type,
             read_format: 0,
+            branch_sample_type: 0,
             sample_regs_user: 0,
             sample_regs_intr: 0,
             ids_offset: 512,
             ids_size: 24,
         }]
     );
+}
+
+#[test]
+fn parses_branch_sample_type_from_file_attr_section() {
+    let mut attr = file_attr_bytes(PERF_SAMPLE_IP, 512, 24);
+    put_u64(&mut attr, 72, 1 << 17);
+    let bytes = perfdata_with_attrs([attr]);
+    let header = PerfHeader {
+        header_size: 104,
+        attr_offset: 104,
+        attr_size: 144,
+        data_offset: 248,
+        data_size: 0,
+    };
+
+    let attrs = parse_file_attrs(&bytes, header).expect("attrs");
+
+    assert_eq!(attrs[0].branch_sample_type, 1 << 17);
 }
 
 #[test]
