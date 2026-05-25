@@ -10,6 +10,7 @@ pub struct MmapTable {
 pub struct ResolvedMapping {
     pub path: String,
     pub relative_address: u64,
+    pub build_id: Option<Vec<u8>>,
     pub kernel_relocation: Option<KernelRelocation>,
 }
 
@@ -20,6 +21,7 @@ struct Mapping {
     len: u64,
     pgoff: u64,
     path: String,
+    build_id: Option<Vec<u8>>,
 }
 
 impl MmapTable {
@@ -30,6 +32,7 @@ impl MmapTable {
             len: record.len,
             pgoff: record.pgoff,
             path: record.path,
+            build_id: None,
         });
     }
 
@@ -40,6 +43,7 @@ impl MmapTable {
             len: record.len,
             pgoff: record.pgoff,
             path: record.path,
+            build_id: None,
         });
     }
 
@@ -50,6 +54,7 @@ impl MmapTable {
             len: record.len,
             pgoff: record.pgoff,
             path: record.path,
+            build_id: Some(record.build_id),
         });
     }
 
@@ -62,6 +67,7 @@ impl MmapTable {
             .map(|mapping| ResolvedMapping {
                 path: mapping.path.clone(),
                 relative_address: mapping.relative_address(ip),
+                build_id: mapping.build_id.clone(),
                 kernel_relocation: mapping.kernel_relocation(),
             })
     }
