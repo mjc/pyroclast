@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::flamegraph::build_inferno_flamegraph_command;
-use crate::perfdata::fold::fold_perfdata_file;
+use crate::perfdata::fold::{FoldOptions, fold_perfdata_file, fold_perfdata_file_with_symbols};
 use crate::process::{CommandRunner, CommandSpec};
+use crate::symbols::Addr2lineResolver;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BenchArgs {
@@ -60,8 +61,40 @@ pub struct FoldComparisonReport {
 ///
 /// Returns an error when the input file cannot be mapped or parsed.
 pub fn run_fold_benchmark(input: &Path) -> Result<FoldBenchmarkReport, String> {
+    run_fold_benchmark_with_folded(input, || fold_perfdata_file(input))
+}
+
+/// Folds a `perf.data` file with an optional symbolizing runner and returns
+/// timing and output-size metadata.
+///
+/// # Errors
+///
+/// Returns an error when the input file cannot be mapped, parsed, or
+/// symbolized.
+pub fn run_fold_benchmark_with_runner<R>(
+    input: &Path,
+    runner: &R,
+    symbols: bool,
+) -> Result<FoldBenchmarkReport, String>
+where
+    R: CommandRunner,
+{
+    if symbols {
+        let resolver = Addr2lineResolver::new(runner);
+        run_fold_benchmark_with_folded(input, || {
+            fold_perfdata_file_with_symbols(input, FoldOptions::default(), &resolver)
+        })
+    } else {
+        run_fold_benchmark(input)
+    }
+}
+
+fn run_fold_benchmark_with_folded<F>(input: &Path, fold: F) -> Result<FoldBenchmarkReport, String>
+where
+    F: FnOnce() -> Result<String, String>,
+{
     let started = Instant::now();
-    let folded = fold_perfdata_file(input)?;
+    let folded = fold()?;
     let elapsed = started.elapsed();
     Ok(FoldBenchmarkReport {
         input: input.to_path_buf(),

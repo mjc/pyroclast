@@ -2,7 +2,7 @@ use std::sync::Mutex;
 
 use pyroclast::benchmarks::{
     BenchArgs, compare_with_inferno_collapse, export_perf_script, format_comparison_report,
-    run_fold_benchmark, run_inferno_collapse_benchmark,
+    run_fold_benchmark, run_fold_benchmark_with_runner, run_inferno_collapse_benchmark,
 };
 use pyroclast::perfdata::samples::{PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_TID};
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
@@ -59,6 +59,33 @@ fn inferno_collapse_benchmark_reports_folded_output_size() {
             )
         ]
     );
+}
+
+#[test]
+fn symbolized_fold_benchmark_uses_runner_addr2line() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    std::fs::write(
+        &perfdata,
+        perfdata_with_records_and_attrs(
+            [file_attr_bytes(
+                PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+                0,
+                0,
+            )],
+            [
+                record_bytes(1, &mmap_payload(11, 11, 0x1000, 0x100, 0, "/bin/app")),
+                record_bytes(9, &sample_payload(0x1000, 11, 12, [0x1010])),
+            ],
+        ),
+    )
+    .expect("write perfdata");
+    let runner = Addr2lineRunner::default();
+
+    let report = run_fold_benchmark_with_runner(&perfdata, &runner, true).expect("benchmark");
+
+    assert_eq!(report.folded_bytes, "app::main 1\n".len());
+    assert_eq!(runner.programs(), vec!["addr2line"]);
 }
 
 #[test]
@@ -233,6 +260,33 @@ impl CommandRunner for MatchingCollapseRunner {
     }
 }
 
+#[derive(Default)]
+struct Addr2lineRunner {
+    commands: Mutex<Vec<CommandSpec>>,
+}
+
+impl Addr2lineRunner {
+    fn programs(&self) -> Vec<String> {
+        self.commands
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|command| command.program.clone())
+            .collect()
+    }
+}
+
+impl CommandRunner for Addr2lineRunner {
+    fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
+        self.commands.lock().unwrap().push(command.clone());
+        Ok(CommandOutput {
+            status_code: Some(0),
+            stdout: b"app::main\n/bin/app.rs:10\n".to_vec(),
+            stderr: Vec::new(),
+        })
+    }
+}
+
 fn perfdata_with_records_and_attrs<const A: usize, const R: usize>(
     attrs: [[u8; 144]; A],
     records: [Vec<u8>; R],
@@ -288,6 +342,18 @@ fn sample_payload<const N: usize>(ip: u64, pid: u32, tid: u32, callchain: [u64; 
     for frame in callchain {
         payload.extend(frame.to_le_bytes());
     }
+    payload
+}
+
+fn mmap_payload(pid: u32, tid: u32, start: u64, len: u64, pgoff: u64, path: &str) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(pid.to_le_bytes());
+    payload.extend(tid.to_le_bytes());
+    payload.extend(start.to_le_bytes());
+    payload.extend(len.to_le_bytes());
+    payload.extend(pgoff.to_le_bytes());
+    payload.extend(path.as_bytes());
+    payload.push(0);
     payload
 }
 
