@@ -65,6 +65,24 @@ pub fn run_parsed_cli_with_runner<R>(cli: Cli, runner: &R) -> backends::BackendR
 where
     R: CommandRunner,
 {
+    run_parsed_cli_with_runner_and_renderer(cli, runner, InfernoFlamegraphRenderer::new(runner))
+}
+
+/// Runs a parsed CLI command with injected process and flamegraph renderers.
+///
+/// # Errors
+///
+/// Returns an error when command execution, artifact I/O, rendering, or input
+/// parsing fails.
+pub fn run_parsed_cli_with_runner_and_renderer<R, F>(
+    cli: Cli,
+    runner: &R,
+    flamegraph_renderer: F,
+) -> backends::BackendResult<CliOutput>
+where
+    R: CommandRunner,
+    F: FlamegraphRenderer,
+{
     if let Some(invocation) = cli.command.profile_invocation() {
         let out_dir = invocation
             .out
@@ -87,7 +105,7 @@ where
         };
         match request.kind {
             ProfileKind::Cpu if std::env::consts::OS == "linux" => {
-                LinuxPerfBackend::new(runner).profile(&request)?;
+                LinuxPerfBackend::with_renderer(runner, flamegraph_renderer).profile(&request)?;
             }
             _ => {
                 FakeBackend.profile(&request)?;
@@ -117,7 +135,7 @@ where
                 command.symbols,
                 runner,
             )?;
-            let render = InfernoFlamegraphRenderer::new(runner).render(&FlamegraphRequest {
+            let render = flamegraph_renderer.render(&FlamegraphRequest {
                 title: command.title,
                 folded_stacks,
                 output,

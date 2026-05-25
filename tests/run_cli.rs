@@ -123,6 +123,33 @@ fn flamegraph_command_folds_perfdata_without_perf_script() {
 }
 
 #[test]
+fn flamegraph_command_accepts_injected_renderer() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    let output_svg = root.path().join("flamegraph.svg");
+    std::fs::write(&perfdata, tiny_perfdata()).expect("write perfdata");
+    let runner = RecordingRunner::default();
+    let renderer = RecordingRenderer::default();
+    let cli = pyroclast::cli::Cli::parse_from([
+        "pyroclast",
+        "flamegraph",
+        perfdata.to_str().expect("perfdata path"),
+        "-o",
+        output_svg.to_str().expect("svg path"),
+    ]);
+
+    pyroclast::run_parsed_cli_with_runner_and_renderer(cli, &runner, &renderer)
+        .expect("flamegraph command");
+
+    assert_eq!(runner.programs(), Vec::<String>::new());
+    assert_eq!(renderer.folded_stacks(), "0x2000 1\n");
+    assert_eq!(
+        std::fs::read_to_string(output_svg).expect("svg"),
+        "<svg>cli plugin</svg>\n"
+    );
+}
+
+#[test]
 fn flamegraph_command_can_symbolize_mapped_frames() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
@@ -260,6 +287,31 @@ impl pyroclast::process::CommandRunner for RecordingRunner {
             stdout,
             stderr: Vec::new(),
         })
+    }
+}
+
+#[derive(Default)]
+struct RecordingRenderer {
+    folded_stacks: Mutex<String>,
+}
+
+impl RecordingRenderer {
+    fn folded_stacks(&self) -> String {
+        self.folded_stacks.lock().unwrap().clone()
+    }
+}
+
+impl pyroclast::flamegraph::FlamegraphRenderer for &RecordingRenderer {
+    fn render(
+        &self,
+        request: &pyroclast::flamegraph::FlamegraphRequest,
+    ) -> pyroclast::backends::BackendResult<pyroclast::flamegraph::FlamegraphRenderResult> {
+        self.folded_stacks
+            .lock()
+            .unwrap()
+            .clone_from(&request.folded_stacks);
+        std::fs::write(&request.output, "<svg>cli plugin</svg>\n")?;
+        Ok(pyroclast::flamegraph::FlamegraphRenderResult { stderr: Vec::new() })
     }
 }
 
