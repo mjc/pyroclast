@@ -18,6 +18,7 @@ pub mod tools;
 
 use artifacts::ArtifactLayout;
 use backends::fake::FakeBackend;
+use backends::heaptrack::HeaptrackBackend;
 use backends::linux_perf::LinuxPerfBackend;
 use backends::strace::StraceBackend;
 use backends::{ProfileRequest, ProfilerBackend};
@@ -112,6 +113,9 @@ where
             }
             ProfileKind::Latency if std::env::consts::OS == "linux" => {
                 StraceBackend::new(runner).profile(&request)?;
+            }
+            ProfileKind::Memory if std::env::consts::OS == "linux" => {
+                HeaptrackBackend::new(runner).profile(&request)?;
             }
             _ => {
                 FakeBackend.profile(&request)?;

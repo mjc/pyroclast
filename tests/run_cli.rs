@@ -2,11 +2,11 @@ use pyroclast::perfdata::samples::{PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_S
 use std::sync::Mutex;
 
 #[test]
-fn top_level_memory_command_creates_fake_artifacts() {
+fn top_level_memory_command_uses_injected_heaptrack_runner() {
     let root = tempfile::tempdir().expect("tempdir");
     let out = root.path().join("memory-run");
-
-    pyroclast::run_cli([
+    let runner = RecordingRunner::default();
+    let cli = pyroclast::cli::Cli::parse_from([
         "pyroclast",
         "memory",
         "--out",
@@ -14,15 +14,28 @@ fn top_level_memory_command_creates_fake_artifacts() {
         "--",
         "cargo",
         "check",
-    ])
-    .expect("run cli");
+    ]);
+
+    pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("run cli");
 
     assert!(out.join("run.json").is_file());
     assert!(out.join("command.txt").is_file());
     assert_eq!(
         std::fs::read_to_string(out.join("command.txt")).unwrap(),
-        "cargo check"
+        "cargo check\n"
     );
+    assert_eq!(
+        runner.programs(),
+        vec!["heaptrack", "heaptrack_print", "heaptrack"]
+    );
+    let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
+    assert!(run_json.contains("\"actual_backend\": \"heaptrack\""));
+    assert!(out.join("profile.raw.heaptrack").is_file());
+    let summary_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("summary.json")).unwrap())
+            .expect("summary json");
+    assert_eq!(summary_json["total_allocations"], 42);
+    assert_eq!(summary_json["peak_heap_bytes"], 1024);
 }
 
 #[test]
@@ -395,8 +408,14 @@ impl pyroclast::process::CommandRunner for RecordingRunner {
                 "123 12:00:00.000000 read(3, \"abc\", 3) = 3 <0.001000>\n123 12:00:00.002000 write(1, \"x\", 1) = 1 <0.002500>\n",
             )?;
         }
+        if let Some(output_path) = heaptrack_output_path(command) {
+            std::fs::write(output_path, b"raw heaptrack bytes")?;
+        }
         let stdout = match command.program.as_str() {
             "addr2line" => b"app::work\n/bin/app.rs:10\n".to_vec(),
+            "heaptrack_print" => {
+                b"total allocations: 42\npeak heap memory consumption: 1024 bytes\n".to_vec()
+            }
             "inferno-flamegraph" => b"<svg></svg>\n".to_vec(),
             _ => Vec::new(),
         };
@@ -443,6 +462,18 @@ fn perf_output_path(command: &pyroclast::process::CommandSpec) -> Option<&str> {
 
 fn strace_output_path(command: &pyroclast::process::CommandSpec) -> Option<&str> {
     (command.program == "strace")
+        .then(|| {
+            command
+                .args
+                .windows(2)
+                .find(|window| window[0] == "-o")
+                .map(|window| window[1].as_str())
+        })
+        .flatten()
+}
+
+fn heaptrack_output_path(command: &pyroclast::process::CommandSpec) -> Option<&str> {
+    (command.program == "heaptrack")
         .then(|| {
             command
                 .args
