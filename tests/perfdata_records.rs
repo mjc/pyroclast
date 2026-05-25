@@ -323,12 +323,48 @@ fn parses_lost_record_payload_from_perf_event_header_shape() {
 }
 
 #[test]
+fn dispatches_lost_record_by_perf_record_type() {
+    let payload = lost_payload();
+    let record = PerfRecord {
+        offset: 104,
+        header: PerfRecordHeader {
+            record_type: 2,
+            misc: 0,
+            size: u16::try_from(8 + payload.len()).expect("record size"),
+        },
+        payload: &payload,
+    };
+
+    let parsed = parse_record(record).expect("parsed record");
+
+    assert!(matches!(parsed, ParsedRecord::Lost(_)));
+}
+
+#[test]
 fn parses_lost_samples_record_payload_from_perf_event_header_shape() {
     let payload = 4321u64.to_le_bytes();
 
     let lost_samples = parse_lost_samples_record(&payload).expect("lost samples record");
 
     assert_eq!(lost_samples.lost, 4321);
+}
+
+#[test]
+fn dispatches_lost_samples_record_by_perf_record_type() {
+    let payload = 4321u64.to_le_bytes();
+    let record = PerfRecord {
+        offset: 104,
+        header: PerfRecordHeader {
+            record_type: 13,
+            misc: 0,
+            size: u16::try_from(8 + payload.len()).expect("record size"),
+        },
+        payload: &payload,
+    };
+
+    let parsed = parse_record(record).expect("parsed record");
+
+    assert!(matches!(parsed, ParsedRecord::LostSamples(_)));
 }
 
 #[test]
@@ -346,6 +382,24 @@ fn parses_throttle_record_payload_from_perf_event_header_shape() {
 }
 
 #[test]
+fn dispatches_throttle_record_by_perf_record_type() {
+    let payload = throttle_payload();
+    let record = PerfRecord {
+        offset: 104,
+        header: PerfRecordHeader {
+            record_type: 5,
+            misc: 0,
+            size: u16::try_from(8 + payload.len()).expect("record size"),
+        },
+        payload: &payload,
+    };
+
+    let parsed = parse_record(record).expect("parsed record");
+
+    assert!(matches!(parsed, ParsedRecord::Throttle(_)));
+}
+
+#[test]
 fn parses_unthrottle_record_payload_from_perf_event_header_shape() {
     let mut payload = Vec::new();
     payload.extend(10_000u64.to_le_bytes());
@@ -357,6 +411,24 @@ fn parses_unthrottle_record_payload_from_perf_event_header_shape() {
     assert_eq!(unthrottle.time, 10_000);
     assert_eq!(unthrottle.id, 77);
     assert_eq!(unthrottle.stream_id, 88);
+}
+
+#[test]
+fn dispatches_unthrottle_record_by_perf_record_type() {
+    let payload = throttle_payload();
+    let record = PerfRecord {
+        offset: 104,
+        header: PerfRecordHeader {
+            record_type: 6,
+            misc: 0,
+            size: u16::try_from(8 + payload.len()).expect("record size"),
+        },
+        payload: &payload,
+    };
+
+    let parsed = parse_record(record).expect("parsed record");
+
+    assert!(matches!(parsed, ParsedRecord::Unthrottle(_)));
 }
 
 fn perfdata_with_records<const N: usize>(records: [Vec<u8>; N]) -> Vec<u8> {
@@ -425,6 +497,21 @@ fn lifecycle_payload() -> Vec<u8> {
     payload.extend(456u32.to_le_bytes());
     payload.extend(45u32.to_le_bytes());
     payload.extend(99_000u64.to_le_bytes());
+    payload
+}
+
+fn lost_payload() -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(77u64.to_le_bytes());
+    payload.extend(1234u64.to_le_bytes());
+    payload
+}
+
+fn throttle_payload() -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(10_000u64.to_le_bytes());
+    payload.extend(77u64.to_le_bytes());
+    payload.extend(88u64.to_le_bytes());
     payload
 }
 

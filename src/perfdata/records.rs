@@ -35,6 +35,10 @@ pub enum ParsedRecord {
     Mmap2BuildId(Mmap2BuildIdRecord),
     Fork(ForkRecord),
     Exit(ExitRecord),
+    Lost(LostRecord),
+    LostSamples(LostSamplesRecord),
+    Throttle(ThrottleRecord),
+    Unthrottle(UnthrottleRecord),
     Unsupported { record_type: u32 },
 }
 
@@ -227,11 +231,19 @@ pub fn iter_records(bytes: &[u8], header: PerfHeader) -> Result<Vec<PerfRecord<'
 pub fn parse_record(record: PerfRecord<'_>) -> Result<ParsedRecord, String> {
     match record.header.record_type {
         PERF_RECORD_MMAP => parse_mmap_record(record.payload).map(ParsedRecord::Mmap),
+        PERF_RECORD_LOST => parse_lost_record(record.payload).map(ParsedRecord::Lost),
         PERF_RECORD_COMM => parse_comm_record(record.payload).map(ParsedRecord::Comm),
+        PERF_RECORD_THROTTLE => parse_throttle_record(record.payload).map(ParsedRecord::Throttle),
+        PERF_RECORD_UNTHROTTLE => {
+            parse_unthrottle_record(record.payload).map(ParsedRecord::Unthrottle)
+        }
         PERF_RECORD_MMAP2 if has_misc_flag(record.header.misc, PERF_RECORD_MISC_MMAP_BUILD_ID) => {
             parse_mmap2_build_id_record(record.payload).map(ParsedRecord::Mmap2BuildId)
         }
         PERF_RECORD_MMAP2 => parse_mmap2_record(record.payload).map(ParsedRecord::Mmap2),
+        PERF_RECORD_LOST_SAMPLES => {
+            parse_lost_samples_record(record.payload).map(ParsedRecord::LostSamples)
+        }
         PERF_RECORD_EXIT => parse_exit_record(record.payload).map(ParsedRecord::Exit),
         PERF_RECORD_FORK => parse_fork_record(record.payload).map(ParsedRecord::Fork),
         record_type => Ok(ParsedRecord::Unsupported { record_type }),
