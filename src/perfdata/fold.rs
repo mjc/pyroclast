@@ -10,8 +10,8 @@ use crate::perfdata::records::{
     iter_records, parse_comm_record, parse_mmap_record, parse_mmap2_record,
 };
 use crate::perfdata::samples::{
-    SampleLayout, is_kernel_space_frame, is_perf_context_marker, parse_sample_record,
-    parse_sample_record_callchain,
+    SampleCallchainFrames, SampleLayout, is_kernel_space_frame, is_perf_context_marker,
+    parse_sample_record, parse_sample_record_callchain,
 };
 use crate::symbols::{SymbolCache, SymbolRequest, SymbolResolver};
 
@@ -227,11 +227,9 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
             PERF_RECORD_SAMPLE => parse_sample_for_fold(record.payload, sample_layout, options)
                 .map(|sample| {
                     if let Some((pid, count, frames)) = sample {
-                        raw_stacks.add(
-                            pid,
-                            frames.filter(|frame| !is_perf_context_marker(*frame)),
-                            count,
-                        );
+                        let mut callchain = Vec::with_capacity(frames.len());
+                        callchain.extend(frames.filter(|frame| !is_perf_context_marker(*frame)));
+                        raw_stacks.add_vec(pid, callchain, count);
                     }
                 }),
             PERF_RECORD_MMAP2 => parse_mmap2_record(record.payload).map(|record| {
@@ -415,7 +413,7 @@ fn parse_sample_for_fold(
     payload: &[u8],
     sample_layout: Option<SampleLayout>,
     options: FoldOptions,
-) -> Result<Option<(Option<u32>, u64, impl Iterator<Item = u64>)>, String> {
+) -> Result<Option<(Option<u32>, u64, SampleCallchainFrames<'_>)>, String> {
     if let Some(layout) = sample_layout {
         parse_sample_record_callchain(payload, layout).map(|sample| {
             sample.map(|sample| {
