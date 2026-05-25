@@ -19,6 +19,13 @@ fn supports_every_known_linux_perf_sample_flag() {
     assert_eq!(supported_perf_sample_flags(), expected);
 }
 
+#[test]
+fn rejects_unsupported_perf_sample_flags() {
+    let error = parse_sample_record(&[], layout(1 << 30)).expect_err("unsupported sample flag");
+
+    assert!(error.contains("unsupported perf sample flags"));
+}
+
 fn layout(sample_type: u64) -> SampleLayout {
     SampleLayout {
         sample_type,
