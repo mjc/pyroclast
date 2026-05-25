@@ -212,6 +212,25 @@ ffffffff812f5920 t do_user_addr_fault
 }
 
 #[test]
+fn kallsyms_resolves_relocated_kernel_addresses() {
+    let symbols = Kallsyms::parse(
+        "\
+ffffffff81000000 T _text
+ffffffff81001280 T asm_exc_page_fault
+ffffffff82000000 T later_kernel_symbol
+",
+    )
+    .expect("system map");
+
+    assert_eq!(
+        symbols
+            .resolve_relocated(0xffff_ffff_8800_1280, "_text", 0xffff_ffff_8800_0000,)
+            .as_deref(),
+        Some("asm_exc_page_fault")
+    );
+}
+
+#[test]
 fn kallsyms_rejects_address_masked_tables() {
     let result = Kallsyms::parse(
         "\

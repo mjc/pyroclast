@@ -275,6 +275,24 @@ impl Kallsyms {
             .next_back()
             .map(|(_, symbol)| symbol.clone())
     }
+
+    #[must_use]
+    pub fn resolve_relocated(
+        &self,
+        address: u64,
+        reference_symbol: &str,
+        recorded_reference_address: u64,
+    ) -> Option<String> {
+        let symbol_file_address = self.address_of(reference_symbol)?;
+        let delta = symbol_file_address.wrapping_sub(recorded_reference_address);
+        self.resolve(address.wrapping_add(delta))
+    }
+
+    fn address_of(&self, name: &str) -> Option<u64> {
+        self.symbols
+            .iter()
+            .find_map(|(address, symbol)| (symbol == name).then_some(*address))
+    }
 }
 
 #[must_use]
