@@ -62,6 +62,17 @@ fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
         std::fs::read_to_string(result.layout.flamegraph_svg()).expect("flamegraph svg"),
         "<svg></svg>\n"
     );
+    let summary_json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(result.layout.summary_json()).expect("summary json"),
+    )
+    .expect("parse summary json");
+    assert_eq!(summary_json["folded_lines"], 1);
+    assert_eq!(summary_json["folded_bytes"], 22);
+    assert_eq!(summary_json["total_count"], 1);
+    assert_eq!(
+        std::fs::read_to_string(result.layout.summary_txt()).expect("summary txt"),
+        "folded lines: 1\nfolded bytes: 22\ntotal count: 1\n"
+    );
     assert!(result.layout.run_json().is_file());
     assert!(result.layout.stderr_log().is_file());
 }

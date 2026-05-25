@@ -9,6 +9,7 @@ use crate::manifest::{BackendName, RunManifest};
 use crate::perfdata::fold::{FoldOptions, fold_perfdata_file, fold_perfdata_file_with_symbols};
 use crate::platform::linux_thread_ids_from_proc;
 use crate::process::{CommandRunner, CommandSpec};
+use crate::summary::threads::{FoldedStackSummary, summarize_folded_stacks};
 use crate::symbols::Addr2lineResolver;
 use crate::tools::{ToolSpec, collect_tool_versions};
 
@@ -106,6 +107,7 @@ where
         );
         let output = self.runner.run(&command)?;
         let folded_stacks = fold_linux_perfdata(&perf_data, request.symbols, self.runner)?;
+        let folded_summary = summarize_folded_stacks(&folded_stacks);
         std::fs::write(layout.stacks_folded(), &folded_stacks)?;
         let flamegraph_output =
             InfernoFlamegraphRenderer::new(self.runner).render(&FlamegraphRequest {
@@ -119,8 +121,11 @@ where
         stderr.extend(flamegraph_output.stderr);
         std::fs::write(layout.stderr_log(), &stderr)?;
         std::fs::write(layout.command_txt(), command_text(request, &target))?;
-        std::fs::write(layout.summary_txt(), "linux perf profile recorded\n")?;
-        std::fs::write(layout.summary_json(), "{}\n")?;
+        std::fs::write(layout.summary_txt(), render_summary_text(folded_summary))?;
+        std::fs::write(
+            layout.summary_json(),
+            format!("{}\n", serde_json::to_string_pretty(&folded_summary)?),
+        )?;
         std::fs::write(layout.tool_errors_log(), "")?;
 
         let manifest = RunManifest {
@@ -154,6 +159,13 @@ where
 
         Ok(ProfileResult { layout, manifest })
     }
+}
+
+fn render_summary_text(summary: FoldedStackSummary) -> String {
+    format!(
+        "folded lines: {}\nfolded bytes: {}\ntotal count: {}\n",
+        summary.folded_lines, summary.folded_bytes, summary.total_count
+    )
 }
 
 impl<R> LinuxPerfBackend<'_, R> {
