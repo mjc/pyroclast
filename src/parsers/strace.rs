@@ -1,12 +1,15 @@
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+use serde::Serialize;
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct SyscallStats {
     pub calls: u64,
     pub total_seconds: f64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct StraceSummary {
     pub total_calls: u64,
     pub total_seconds: f64,
@@ -47,6 +50,22 @@ pub fn parse_strace_summary(input: &str) -> StraceSummary {
     }
 
     summary
+}
+
+#[must_use]
+pub fn render_strace_summary_text(summary: &StraceSummary) -> String {
+    let mut text = format!(
+        "syscall calls: {}\nsyscall seconds: {:.6}\n",
+        summary.total_calls, summary.total_seconds
+    );
+    for (syscall, stats) in &summary.by_syscall {
+        let _ = writeln!(
+            text,
+            "{syscall}: calls={} seconds={:.6}",
+            stats.calls, stats.total_seconds
+        );
+    }
+    text
 }
 
 fn parse_duration(line: &str) -> Option<f64> {
