@@ -1,8 +1,9 @@
 use pyroclast::perfdata::header::parse_header;
 use pyroclast::perfdata::records::{
-    PerfRecordHeader, iter_records, parse_comm_record, parse_exit_record, parse_fork_record,
-    parse_lost_record, parse_lost_samples_record, parse_mmap_record, parse_mmap2_build_id_record,
-    parse_mmap2_record, parse_record_header, parse_throttle_record, parse_unthrottle_record,
+    ParsedRecord, PerfRecord, PerfRecordHeader, iter_records, parse_comm_record, parse_exit_record,
+    parse_fork_record, parse_lost_record, parse_lost_samples_record, parse_mmap_record,
+    parse_mmap2_build_id_record, parse_mmap2_record, parse_record, parse_record_header,
+    parse_throttle_record, parse_unthrottle_record,
 };
 
 #[test]
@@ -57,6 +58,37 @@ fn parses_comm_record_payload() {
     assert_eq!(comm.pid, 123);
     assert_eq!(comm.tid, 456);
     assert_eq!(comm.comm, "sftp-s3");
+}
+
+#[test]
+fn dispatches_comm_record_by_perf_record_type() {
+    let payload = {
+        let mut payload = Vec::new();
+        payload.extend(123u32.to_le_bytes());
+        payload.extend(456u32.to_le_bytes());
+        payload.extend(b"sftp-s3\0");
+        payload
+    };
+    let record = PerfRecord {
+        offset: 104,
+        header: PerfRecordHeader {
+            record_type: 3,
+            misc: 0,
+            size: u16::try_from(8 + payload.len()).expect("record size"),
+        },
+        payload: &payload,
+    };
+
+    let parsed = parse_record(record).expect("parsed record");
+
+    assert_eq!(
+        parsed,
+        ParsedRecord::Comm(pyroclast::perfdata::records::CommRecord {
+            pid: 123,
+            tid: 456,
+            comm: "sftp-s3".to_string(),
+        })
+    );
 }
 
 #[test]

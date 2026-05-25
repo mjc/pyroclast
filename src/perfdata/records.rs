@@ -1,6 +1,18 @@
 use crate::perfdata::endian::{read_u16, read_u32, read_u64};
 use crate::perfdata::header::PerfHeader;
 
+pub const PERF_RECORD_MMAP: u32 = 1;
+pub const PERF_RECORD_LOST: u32 = 2;
+pub const PERF_RECORD_COMM: u32 = 3;
+pub const PERF_RECORD_EXIT: u32 = 4;
+pub const PERF_RECORD_THROTTLE: u32 = 5;
+pub const PERF_RECORD_UNTHROTTLE: u32 = 6;
+pub const PERF_RECORD_FORK: u32 = 7;
+pub const PERF_RECORD_SAMPLE: u32 = 9;
+pub const PERF_RECORD_MMAP2: u32 = 10;
+pub const PERF_RECORD_LOST_SAMPLES: u32 = 13;
+pub const PERF_RECORD_MISC_MMAP_BUILD_ID: u16 = 1 << 14;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PerfRecordHeader {
     pub record_type: u32,
@@ -13,6 +25,12 @@ pub struct PerfRecord<'a> {
     pub offset: usize,
     pub header: PerfRecordHeader,
     pub payload: &'a [u8],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParsedRecord {
+    Comm(CommRecord),
+    Unsupported { record_type: u32 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -194,6 +212,18 @@ pub fn iter_records(bytes: &[u8], header: PerfHeader) -> Result<Vec<PerfRecord<'
     }
 
     Ok(records)
+}
+
+/// Parses a perf record into a typed payload when Pyroclast supports it.
+///
+/// # Errors
+///
+/// Returns an error when a supported record payload is malformed.
+pub fn parse_record(record: PerfRecord<'_>) -> Result<ParsedRecord, String> {
+    match record.header.record_type {
+        PERF_RECORD_COMM => parse_comm_record(record.payload).map(ParsedRecord::Comm),
+        record_type => Ok(ParsedRecord::Unsupported { record_type }),
+    }
 }
 
 /// Parses a `PERF_RECORD_COMM` payload.
