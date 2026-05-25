@@ -31,6 +31,8 @@ pub struct PerfRecord<'a> {
 pub enum ParsedRecord {
     Comm(CommRecord),
     Mmap(MmapRecord),
+    Mmap2(Mmap2Record),
+    Mmap2BuildId(Mmap2BuildIdRecord),
     Unsupported { record_type: u32 },
 }
 
@@ -224,6 +226,10 @@ pub fn parse_record(record: PerfRecord<'_>) -> Result<ParsedRecord, String> {
     match record.header.record_type {
         PERF_RECORD_MMAP => parse_mmap_record(record.payload).map(ParsedRecord::Mmap),
         PERF_RECORD_COMM => parse_comm_record(record.payload).map(ParsedRecord::Comm),
+        PERF_RECORD_MMAP2 if has_misc_flag(record.header.misc, PERF_RECORD_MISC_MMAP_BUILD_ID) => {
+            parse_mmap2_build_id_record(record.payload).map(ParsedRecord::Mmap2BuildId)
+        }
+        PERF_RECORD_MMAP2 => parse_mmap2_record(record.payload).map(ParsedRecord::Mmap2),
         record_type => Ok(ParsedRecord::Unsupported { record_type }),
     }
 }
@@ -505,6 +511,10 @@ fn parse_c_string(bytes: &[u8]) -> String {
         .position(|byte| *byte == 0)
         .unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+fn has_misc_flag(misc: u16, flag: u16) -> bool {
+    misc & flag != 0
 }
 
 fn to_usize(value: u64, name: &str) -> Result<usize, String> {

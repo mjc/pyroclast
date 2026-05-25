@@ -203,6 +203,42 @@ fn parses_mmap2_build_id_payload_from_perf_event_header_shape() {
 }
 
 #[test]
+fn dispatches_mmap2_inode_record_by_perf_record_type() {
+    let payload = mmap2_inode_payload();
+    let record = PerfRecord {
+        offset: 104,
+        header: PerfRecordHeader {
+            record_type: 10,
+            misc: 0,
+            size: u16::try_from(8 + payload.len()).expect("record size"),
+        },
+        payload: &payload,
+    };
+
+    let parsed = parse_record(record).expect("parsed record");
+
+    assert!(matches!(parsed, ParsedRecord::Mmap2(_)));
+}
+
+#[test]
+fn dispatches_mmap2_build_id_record_when_misc_flag_is_set() {
+    let payload = mmap2_build_id_payload();
+    let record = PerfRecord {
+        offset: 104,
+        header: PerfRecordHeader {
+            record_type: 10,
+            misc: 1 << 14,
+            size: u16::try_from(8 + payload.len()).expect("record size"),
+        },
+        payload: &payload,
+    };
+
+    let parsed = parse_record(record).expect("parsed record");
+
+    assert!(matches!(parsed, ParsedRecord::Mmap2BuildId(_)));
+}
+
+#[test]
 fn parses_fork_record_payload_from_perf_event_header_shape() {
     let mut payload = Vec::new();
     payload.extend(123u32.to_le_bytes());
@@ -308,6 +344,41 @@ fn mmap_payload() -> Vec<u8> {
     payload.extend(0x1000u64.to_le_bytes());
     payload.extend(0x40u64.to_le_bytes());
     payload.extend(b"/usr/bin/sftp-s3\0");
+    payload
+}
+
+fn mmap2_inode_payload() -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(123u32.to_le_bytes());
+    payload.extend(456u32.to_le_bytes());
+    payload.extend(0x7f00u64.to_le_bytes());
+    payload.extend(0x1000u64.to_le_bytes());
+    payload.extend(0x40u64.to_le_bytes());
+    payload.extend(8u32.to_le_bytes());
+    payload.extend(1u32.to_le_bytes());
+    payload.extend(99u64.to_le_bytes());
+    payload.extend(7u64.to_le_bytes());
+    payload.extend(5u32.to_le_bytes());
+    payload.extend(2u32.to_le_bytes());
+    payload.extend(b"/usr/lib/libssl.so\0");
+    payload
+}
+
+fn mmap2_build_id_payload() -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(123u32.to_le_bytes());
+    payload.extend(456u32.to_le_bytes());
+    payload.extend(0x7f00u64.to_le_bytes());
+    payload.extend(0x1000u64.to_le_bytes());
+    payload.extend(0x40u64.to_le_bytes());
+    payload.push(4);
+    payload.push(0);
+    payload.extend(0u16.to_le_bytes());
+    payload.extend([0xaa, 0xbb, 0xcc, 0xdd]);
+    payload.extend([0; 16]);
+    payload.extend(5u32.to_le_bytes());
+    payload.extend(2u32.to_le_bytes());
+    payload.extend(b"/usr/lib/libssl.so\0");
     payload
 }
 
