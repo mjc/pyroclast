@@ -7,7 +7,7 @@ use crate::cli::PerfEvent;
 use crate::flamegraph::{FlamegraphRenderer, FlamegraphRequest, InfernoFlamegraphRenderer};
 use crate::manifest::{BackendName, RunManifest};
 use crate::perfdata::fold::{FoldOptions, fold_perfdata_file, fold_perfdata_file_with_symbols};
-use crate::platform::{LinuxProcfsThreadLister, ThreadLister};
+use crate::platform::{NativeThreadLister, ThreadLister};
 use crate::process::{CommandRunner, CommandSpec};
 use crate::summary::threads::{FoldedStackSummary, summarize_folded_stacks};
 use crate::symbols::Addr2lineResolver;
@@ -65,16 +65,16 @@ pub fn build_perf_record_command(
     }
 }
 
-pub struct LinuxPerfBackend<'a, R, T = LinuxProcfsThreadLister> {
+pub struct LinuxPerfBackend<'a, R, T = NativeThreadLister> {
     runner: &'a R,
     thread_lister: T,
 }
 
-impl<'a, R> LinuxPerfBackend<'a, R, LinuxProcfsThreadLister> {
+impl<'a, R> LinuxPerfBackend<'a, R, NativeThreadLister> {
     pub fn new(runner: &'a R) -> Self {
         Self {
             runner,
-            thread_lister: LinuxProcfsThreadLister::default(),
+            thread_lister: NativeThreadLister::default(),
         }
     }
 }

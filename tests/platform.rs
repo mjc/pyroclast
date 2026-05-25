@@ -1,4 +1,13 @@
-use pyroclast::platform::linux_thread_ids_from_proc;
+use pyroclast::platform::{ThreadLister, UnsupportedThreadLister, linux_thread_ids_from_proc};
+
+#[test]
+fn unsupported_thread_lister_reports_clear_error() {
+    let error = UnsupportedThreadLister
+        .thread_ids(42)
+        .expect_err("unsupported");
+
+    assert!(error.to_string().contains("thread listing is unsupported"));
+}
 
 #[test]
 fn reads_linux_thread_ids_from_proc_task_directory() {
