@@ -55,6 +55,16 @@ fn summarizes_lost_record_counts() {
 }
 
 #[test]
+fn summarizes_lost_sample_record_counts() {
+    let bytes = perfdata_with_records_and_attrs([], [record_bytes(13, &42u64.to_le_bytes())]);
+
+    let summary = summarize_perfdata(&bytes).expect("summary");
+
+    assert_eq!(summary.record_count(13), 1);
+    assert_eq!(summary.lost_records, 42);
+}
+
+#[test]
 fn summarizes_sample_callchain_counts_using_file_attr_layout() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
@@ -222,6 +232,29 @@ fn folds_mapped_user_frames_as_file_relative_addresses() {
 }
 
 #[test]
+fn folds_mmap2_build_id_records_as_mappings() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes_with_misc(
+                10,
+                1 << 14,
+                &mmap2_build_id_payload(11, 11, 0x4000, 0x100, 0x20, "/bin/build-id-app"),
+            ),
+            record_bytes(9, &sample_payload(0x1000, 11, 12, [0x4010])),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, "/bin/build-id-app+0x30 1\n");
+}
+
+#[test]
 fn folds_mapped_user_frames_with_symbol_names() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
@@ -335,10 +368,14 @@ fn file_attr_bytes(sample_type: u64, ids_offset: u64, ids_size: u64) -> [u8; 144
 }
 
 fn record_bytes(record_type: u32, payload: &[u8]) -> Vec<u8> {
+    record_bytes_with_misc(record_type, 0, payload)
+}
+
+fn record_bytes_with_misc(record_type: u32, misc: u16, payload: &[u8]) -> Vec<u8> {
     let size = 8 + payload.len();
     let mut bytes = Vec::with_capacity(size);
     bytes.extend(record_type.to_le_bytes());
-    bytes.extend(0u16.to_le_bytes());
+    bytes.extend(misc.to_le_bytes());
     bytes.extend(
         u16::try_from(size)
             .expect("record fits in u16")
@@ -401,6 +438,27 @@ fn mmap2_payload(pid: u32, tid: u32, start: u64, len: u64, pgoff: u64, path: &st
     payload.extend(1u32.to_le_bytes());
     payload.extend(99u64.to_le_bytes());
     payload.extend(7u64.to_le_bytes());
+    payload.extend(5u32.to_le_bytes());
+    payload.extend(2u32.to_le_bytes());
+    payload.extend(path.as_bytes());
+    payload.push(0);
+    payload
+}
+
+fn mmap2_build_id_payload(
+    pid: u32,
+    tid: u32,
+    start: u64,
+    len: u64,
+    pgoff: u64,
+    path: &str,
+) -> Vec<u8> {
+    let mut payload = mmap_range_payload(pid, tid, start, len, pgoff);
+    payload.push(4);
+    payload.push(0);
+    payload.extend(0u16.to_le_bytes());
+    payload.extend([0xaa, 0xbb, 0xcc, 0xdd]);
+    payload.extend([0; 16]);
     payload.extend(5u32.to_le_bytes());
     payload.extend(2u32.to_le_bytes());
     payload.extend(path.as_bytes());

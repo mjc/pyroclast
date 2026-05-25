@@ -7,8 +7,9 @@ use crate::perfdata::header::parse_header;
 use crate::perfdata::mappings::{MmapTable, ResolvedMapping};
 use crate::perfdata::raw_stack::{CollapsedRawStack, RawStackAccumulator};
 use crate::perfdata::records::{
-    PERF_RECORD_COMM, PERF_RECORD_LOST, PERF_RECORD_MMAP, PERF_RECORD_MMAP2, PERF_RECORD_SAMPLE,
-    iter_records, parse_comm_record, parse_lost_record, parse_mmap_record, parse_mmap2_record,
+    PERF_RECORD_COMM, PERF_RECORD_LOST, PERF_RECORD_LOST_SAMPLES, PERF_RECORD_MMAP,
+    PERF_RECORD_MMAP2, PERF_RECORD_SAMPLE, iter_records, parse_comm_record, parse_lost_record,
+    parse_lost_samples_record, parse_mmap_record, parse_mmap2_record,
 };
 use crate::perfdata::samples::{
     SampleCallchainFrames, SampleLayout, is_kernel_space_frame, is_perf_context_marker,
@@ -86,6 +87,9 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
                 summary.comms.push(record.comm);
             }),
             PERF_RECORD_LOST => parse_lost_record(record.payload).map(|record| {
+                summary.lost_records = summary.lost_records.saturating_add(record.lost);
+            }),
+            PERF_RECORD_LOST_SAMPLES => parse_lost_samples_record(record.payload).map(|record| {
                 summary.lost_records = summary.lost_records.saturating_add(record.lost);
             }),
             PERF_RECORD_MMAP => parse_mmap_record(record.payload).map(|record| {
