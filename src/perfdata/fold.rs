@@ -2,14 +2,14 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::folded::render_folded_stack;
-use crate::perfdata::attrs::parse_file_attrs;
+use crate::perfdata::attrs::{PerfFileAttr, parse_file_attr_ids, parse_file_attrs};
 use crate::perfdata::header::parse_header;
 use crate::perfdata::mappings::{MmapTable, ResolvedMapping};
 use crate::perfdata::raw_stack::{CollapsedRawStack, RawStackAccumulator};
 use crate::perfdata::records::{ParsedRecord, PerfRecord, iter_records, parse_record};
 use crate::perfdata::samples::{
-    SampleCallchainFrames, SampleLayout, is_kernel_space_frame, is_perf_context_marker,
-    parse_sample_record, parse_sample_record_callchain,
+    PERF_SAMPLE_IDENTIFIER, SampleCallchainFrames, SampleLayout, is_kernel_space_frame,
+    is_perf_context_marker, parse_sample_record, parse_sample_record_callchain,
 };
 use crate::symbols::{SymbolCache, SymbolRequest, SymbolResolver};
 
@@ -38,6 +38,12 @@ struct PerfFoldData {
     raw_stacks: Vec<CollapsedRawStack>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct SampleLayouts {
+    fallback: Option<SampleLayout>,
+    by_identifier: BTreeMap<u64, SampleLayout>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FoldOptions {
     pub count_periods: bool,
@@ -58,7 +64,7 @@ impl PerfSummary {
 /// supported record payload is malformed.
 pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
     let header = parse_header(bytes)?;
-    let sample_layout = first_sample_layout(bytes, header)?;
+    let sample_layouts = sample_layouts(bytes, header)?;
     let records = iter_records(bytes, header)?;
     let mut summary = PerfSummary {
         total_records: 0,
@@ -98,7 +104,7 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
                 Ok(())
             }
             ParsedRecord::Sample(record) => {
-                parse_sample_for_summary(&record.payload, sample_layout).map(|sample| {
+                parse_sample_for_summary(&record.payload, &sample_layouts).map(|sample| {
                     if let Some(sample) = sample {
                         summary.sample_stacks.push(sample);
                     }
@@ -247,7 +253,7 @@ fn parse_record_with_context(record: PerfRecord<'_>) -> Result<ParsedRecord, Str
 
 fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData, String> {
     let header = parse_header(bytes)?;
-    let sample_layout = first_sample_layout(bytes, header)?;
+    let sample_layouts = sample_layouts(bytes, header)?;
     let records = iter_records(bytes, header)?;
     let mut comms_by_pid = BTreeMap::new();
     let mut mmap_table = MmapTable::default();
@@ -266,7 +272,7 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
                 Ok(())
             }
             ParsedRecord::Sample(record) => {
-                parse_sample_for_fold(&record.payload, sample_layout, options).map(|sample| {
+                parse_sample_for_fold(&record.payload, &sample_layouts, options).map(|sample| {
                     if let Some((pid, count, frames)) = sample {
                         callchain.clear();
                         callchain.reserve(frames.len());
@@ -460,9 +466,9 @@ fn mapped_frame_label(mapping: &ResolvedMapping) -> String {
 
 fn parse_sample_for_summary(
     payload: &[u8],
-    sample_layout: Option<SampleLayout>,
+    sample_layouts: &SampleLayouts,
 ) -> Result<Option<PerfSampleStack>, String> {
-    if let Some(layout) = sample_layout {
+    if let Some(layout) = sample_layouts.layout_for_payload(payload)? {
         parse_sample_record(payload, layout).map(|record| {
             Some(PerfSampleStack {
                 pid: record.pid,
@@ -475,12 +481,12 @@ fn parse_sample_for_summary(
     }
 }
 
-fn parse_sample_for_fold(
-    payload: &[u8],
-    sample_layout: Option<SampleLayout>,
+fn parse_sample_for_fold<'a>(
+    payload: &'a [u8],
+    sample_layouts: &SampleLayouts,
     options: FoldOptions,
-) -> Result<Option<(Option<u32>, u64, SampleCallchainFrames<'_>)>, String> {
-    if let Some(layout) = sample_layout {
+) -> Result<Option<(Option<u32>, u64, SampleCallchainFrames<'a>)>, String> {
+    if let Some(layout) = sample_layouts.layout_for_payload(payload)? {
         parse_sample_record_callchain(payload, layout).map(|sample| {
             sample.map(|sample| {
                 let count = if options.count_periods {
@@ -496,17 +502,53 @@ fn parse_sample_for_fold(
     }
 }
 
-fn first_sample_layout(
+fn sample_layouts(
     bytes: &[u8],
     header: crate::perfdata::header::PerfHeader,
-) -> Result<Option<SampleLayout>, String> {
-    Ok(parse_file_attrs(bytes, header)?
-        .first()
-        .map(|attr| SampleLayout {
-            sample_type: attr.sample_type,
-            read_format: attr.read_format,
-            branch_sample_type: attr.branch_sample_type,
-            sample_regs_user: attr.sample_regs_user,
-            sample_regs_intr: attr.sample_regs_intr,
-        }))
+) -> Result<SampleLayouts, String> {
+    let attrs = parse_file_attrs(bytes, header)?;
+    let mut layouts = SampleLayouts {
+        fallback: attrs.first().map(layout_from_attr),
+        by_identifier: BTreeMap::new(),
+    };
+    for attr in &attrs {
+        let layout = layout_from_attr(attr);
+        for id in parse_file_attr_ids(bytes, attr)? {
+            layouts.by_identifier.insert(id, layout);
+        }
+    }
+    Ok(layouts)
+}
+
+fn layout_from_attr(attr: &PerfFileAttr) -> SampleLayout {
+    SampleLayout {
+        sample_type: attr.sample_type,
+        read_format: attr.read_format,
+        branch_sample_type: attr.branch_sample_type,
+        sample_regs_user: attr.sample_regs_user,
+        sample_regs_intr: attr.sample_regs_intr,
+    }
+}
+
+impl SampleLayouts {
+    fn layout_for_payload(&self, payload: &[u8]) -> Result<Option<SampleLayout>, String> {
+        if self.by_identifier.is_empty() {
+            return Ok(self.fallback);
+        }
+        let Some(fallback) = self.fallback else {
+            return Ok(None);
+        };
+        if fallback.sample_type & PERF_SAMPLE_IDENTIFIER == 0 {
+            return Ok(Some(fallback));
+        }
+        let identifier = payload
+            .get(..8)
+            .ok_or_else(|| "perf sample payload is truncated".to_string())
+            .map(|bytes| u64::from_le_bytes(bytes.try_into().expect("slice has 8 bytes")))?;
+        Ok(self
+            .by_identifier
+            .get(&identifier)
+            .copied()
+            .or(Some(fallback)))
+    }
 }
