@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollapsedRawStack {
@@ -7,7 +7,7 @@ pub struct CollapsedRawStack {
     pub count: u64,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct RawStackKey {
     pid: Option<u32>,
     callchain: Vec<u64>,
@@ -15,7 +15,7 @@ struct RawStackKey {
 
 #[derive(Debug, Default)]
 pub struct RawStackAccumulator {
-    counts: BTreeMap<RawStackKey, u64>,
+    counts: HashMap<RawStackKey, u64>,
 }
 
 impl RawStackAccumulator {
@@ -37,14 +37,21 @@ impl RawStackAccumulator {
 
     #[must_use]
     pub fn into_collapsed(self) -> Vec<CollapsedRawStack> {
-        self.counts
+        let mut collapsed = self
+            .counts
             .into_iter()
             .map(|(key, count)| CollapsedRawStack {
                 pid: key.pid,
                 callchain: key.callchain,
                 count,
             })
-            .collect()
+            .collect::<Vec<_>>();
+        collapsed.sort_by(|left, right| {
+            left.pid
+                .cmp(&right.pid)
+                .then_with(|| left.callchain.cmp(&right.callchain))
+        });
+        collapsed
     }
 }
 
