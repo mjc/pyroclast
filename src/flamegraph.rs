@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use crate::backends::BackendResult;
 use crate::process::{CommandRunner, CommandSpec};
+use crate::tools::ToolSpec;
 
 #[must_use]
 pub fn build_inferno_flamegraph_command(title: &str) -> CommandSpec {
@@ -25,6 +26,10 @@ pub struct FlamegraphRenderResult {
 }
 
 pub trait FlamegraphRenderer {
+    fn tool_specs(&self) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+
     /// Renders folded stacks to an SVG artifact.
     ///
     /// # Errors
@@ -48,6 +53,10 @@ impl<R> FlamegraphRenderer for InfernoFlamegraphRenderer<'_, R>
 where
     R: CommandRunner,
 {
+    fn tool_specs(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec::nix_managed("inferno-flamegraph")]
+    }
+
     fn render(&self, request: &FlamegraphRequest) -> BackendResult<FlamegraphRenderResult> {
         let command = build_inferno_flamegraph_command(&request.title)
             .stdin(request.folded_stacks.as_bytes().to_vec());

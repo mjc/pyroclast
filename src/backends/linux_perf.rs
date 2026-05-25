@@ -65,33 +65,48 @@ pub fn build_perf_record_command(
     }
 }
 
-pub struct LinuxPerfBackend<'a, R, T = NativeThreadLister> {
+pub struct LinuxPerfBackend<'a, R, T = NativeThreadLister, F = InfernoFlamegraphRenderer<'a, R>> {
     runner: &'a R,
     thread_lister: T,
+    flamegraph_renderer: F,
 }
 
-impl<'a, R> LinuxPerfBackend<'a, R, NativeThreadLister> {
+impl<'a, R> LinuxPerfBackend<'a, R, NativeThreadLister, InfernoFlamegraphRenderer<'a, R>> {
     pub fn new(runner: &'a R) -> Self {
         Self {
             runner,
             thread_lister: NativeThreadLister::default(),
+            flamegraph_renderer: InfernoFlamegraphRenderer::new(runner),
+        }
+    }
+
+    pub fn with_renderer<F>(
+        runner: &'a R,
+        flamegraph_renderer: F,
+    ) -> LinuxPerfBackend<'a, R, NativeThreadLister, F> {
+        LinuxPerfBackend {
+            runner,
+            thread_lister: NativeThreadLister::default(),
+            flamegraph_renderer,
         }
     }
 }
 
-impl<'a, R, T> LinuxPerfBackend<'a, R, T> {
+impl<'a, R, T> LinuxPerfBackend<'a, R, T, InfernoFlamegraphRenderer<'a, R>> {
     pub fn with_thread_lister(runner: &'a R, thread_lister: T) -> Self {
         Self {
             runner,
             thread_lister,
+            flamegraph_renderer: InfernoFlamegraphRenderer::new(runner),
         }
     }
 }
 
-impl<R, T> ProfilerBackend for LinuxPerfBackend<'_, R, T>
+impl<R, T, F> ProfilerBackend for LinuxPerfBackend<'_, R, T, F>
 where
     R: CommandRunner,
     T: ThreadLister,
+    F: FlamegraphRenderer,
 {
     fn profile(&self, request: &ProfileRequest) -> BackendResult<ProfileResult> {
         let layout = ArtifactLayout::new(request.out_dir.clone());
@@ -112,12 +127,11 @@ where
         let folded_stacks = fold_linux_perfdata(&perf_data, request.symbols, self.runner)?;
         let folded_summary = summarize_folded_stacks(&folded_stacks);
         std::fs::write(layout.stacks_folded(), &folded_stacks)?;
-        let flamegraph_output =
-            InfernoFlamegraphRenderer::new(self.runner).render(&FlamegraphRequest {
-                title: "CPU profile".to_string(),
-                folded_stacks,
-                output: layout.flamegraph_svg(),
-            })?;
+        let flamegraph_output = self.flamegraph_renderer.render(&FlamegraphRequest {
+            title: "CPU profile".to_string(),
+            folded_stacks,
+            output: layout.flamegraph_svg(),
+        })?;
 
         std::fs::write(layout.stdout_log(), &output.stdout)?;
         let mut stderr = output.stderr;
@@ -148,7 +162,10 @@ where
             record_target: record_target_label(request).to_string(),
             duration_secs: attach_duration(request),
             symbols: request.symbols,
-            tool_versions: collect_tool_versions(self.runner, &linux_perf_tools(request.symbols)),
+            tool_versions: collect_tool_versions(
+                self.runner,
+                &linux_perf_tools(request.symbols, &self.flamegraph_renderer),
+            ),
             artifacts: {
                 let mut artifacts = layout.standard_manifest_artifacts();
                 artifacts.push(perf_data);
@@ -171,7 +188,7 @@ fn render_summary_text(summary: FoldedStackSummary) -> String {
     )
 }
 
-impl<R, T> LinuxPerfBackend<'_, R, T>
+impl<R, T, F> LinuxPerfBackend<'_, R, T, F>
 where
     T: ThreadLister,
 {
@@ -246,11 +263,9 @@ impl PerfRecordTarget {
     }
 }
 
-fn linux_perf_tools(symbols: bool) -> Vec<ToolSpec> {
-    let mut tools = vec![
-        ToolSpec::nix_managed("perf"),
-        ToolSpec::nix_managed("inferno-flamegraph"),
-    ];
+fn linux_perf_tools(symbols: bool, renderer: &impl FlamegraphRenderer) -> Vec<ToolSpec> {
+    let mut tools = vec![ToolSpec::nix_managed("perf")];
+    tools.extend(renderer.tool_specs());
     if symbols {
         tools.push(ToolSpec::nix_managed("addr2line"));
     }

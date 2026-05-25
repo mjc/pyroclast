@@ -1,8 +1,9 @@
 use std::sync::Mutex;
 
 use pyroclast::backends::linux_perf::LinuxPerfBackend;
-use pyroclast::backends::{ProfileRequest, ProfilerBackend};
+use pyroclast::backends::{BackendResult, ProfileRequest, ProfilerBackend};
 use pyroclast::cli::{PerfCallGraph, PerfEvent, ProfileKind};
+use pyroclast::flamegraph::{FlamegraphRenderResult, FlamegraphRenderer, FlamegraphRequest};
 use pyroclast::manifest::BackendName;
 use pyroclast::perfdata::samples::{PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_TID};
 use pyroclast::platform::ThreadLister;
@@ -115,6 +116,47 @@ fn linux_perf_backend_can_symbolize_folded_stacks() {
     assert_eq!(
         std::fs::read_to_string(result.layout.stacks_folded()).expect("stacks folded"),
         "app;app::work 1\n"
+    );
+}
+
+#[test]
+fn linux_perf_backend_accepts_pluggable_flamegraph_renderer() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let runner = RecordingRunner::default();
+    let renderer = RecordingRenderer::default();
+    let backend = LinuxPerfBackend::with_renderer(&runner, &renderer);
+    let request = ProfileRequest {
+        kind: ProfileKind::Cpu,
+        command: vec!["true".to_string()],
+        out_dir: root.path().join("cpu"),
+        name: None,
+        json: false,
+        symbols: false,
+        frequency: 997,
+        event: PerfEvent::CpuClock,
+        call_graph: PerfCallGraph::Fp,
+        pid: None,
+        tids: Vec::new(),
+        threads_of_pid: None,
+        duration_secs: 3600,
+    };
+
+    let result = backend.profile(&request).expect("profile");
+
+    assert_eq!(renderer.folded_stacks(), "app;/bin/app+0x1000 1\n");
+    assert_eq!(
+        std::fs::read_to_string(result.layout.flamegraph_svg()).expect("flamegraph svg"),
+        "<svg>plugin</svg>\n"
+    );
+    assert_eq!(runner.programs(), vec!["perf", "perf"]);
+    assert_eq!(
+        result
+            .manifest
+            .tool_versions
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["perf"]
     );
 }
 
@@ -293,6 +335,28 @@ impl ThreadLister for FakeThreadLister {
             .as_ref()
             .map(std::clone::Clone::clone)
             .map_err(|error| std::io::Error::new(error.kind(), error.to_string()))
+    }
+}
+
+#[derive(Default)]
+struct RecordingRenderer {
+    folded_stacks: Mutex<String>,
+}
+
+impl RecordingRenderer {
+    fn folded_stacks(&self) -> String {
+        self.folded_stacks.lock().unwrap().clone()
+    }
+}
+
+impl FlamegraphRenderer for &RecordingRenderer {
+    fn render(&self, request: &FlamegraphRequest) -> BackendResult<FlamegraphRenderResult> {
+        self.folded_stacks
+            .lock()
+            .unwrap()
+            .clone_from(&request.folded_stacks);
+        std::fs::write(&request.output, "<svg>plugin</svg>\n")?;
+        Ok(FlamegraphRenderResult { stderr: Vec::new() })
     }
 }
 
