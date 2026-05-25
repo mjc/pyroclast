@@ -12,6 +12,7 @@ pub const PERF_SAMPLE_PERIOD: u64 = 1 << 8;
 pub const PERF_SAMPLE_STREAM_ID: u64 = 1 << 9;
 pub const PERF_SAMPLE_RAW: u64 = 1 << 10;
 pub const PERF_SAMPLE_BRANCH_STACK: u64 = 1 << 11;
+pub const PERF_SAMPLE_REGS_USER: u64 = 1 << 12;
 pub const PERF_SAMPLE_IDENTIFIER: u64 = 1 << 16;
 pub const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
 pub const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 1 << 1;
@@ -23,6 +24,8 @@ pub const PERF_FORMAT_LOST: u64 = 1 << 4;
 pub struct SampleLayout {
     pub sample_type: u64,
     pub read_format: u64,
+    pub sample_regs_user: u64,
+    pub sample_regs_intr: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -107,6 +110,9 @@ pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<Sampl
     }
     if layout.has(PERF_SAMPLE_BRANCH_STACK) {
         cursor.skip_branch_stack()?;
+    }
+    if layout.has(PERF_SAMPLE_REGS_USER) {
+        cursor.skip_regs(layout.sample_regs_user)?;
     }
 
     Ok(sample)
@@ -268,6 +274,15 @@ impl<'a> SampleCursor<'a> {
         let byte_len = branches
             .checked_mul(24)
             .ok_or_else(|| "perf sample branch stack byte length overflows usize".to_string())?;
+        self.read_bytes(byte_len).map(|_| ())
+    }
+
+    fn skip_regs(&mut self, mask: u64) -> Result<(), String> {
+        self.skip_u64()?;
+        let register_count = mask.count_ones() as usize;
+        let byte_len = register_count
+            .checked_mul(8)
+            .ok_or_else(|| "perf sample register byte length overflows usize".to_string())?;
         self.read_bytes(byte_len).map(|_| ())
     }
 

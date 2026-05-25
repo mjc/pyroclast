@@ -5,6 +5,8 @@ use crate::perfdata::header::PerfHeader;
 pub struct PerfFileAttr {
     pub sample_type: u64,
     pub read_format: u64,
+    pub sample_regs_user: u64,
+    pub sample_regs_intr: u64,
     pub ids_offset: u64,
     pub ids_size: u64,
 }
@@ -48,6 +50,8 @@ pub fn parse_file_attrs(bytes: &[u8], header: PerfHeader) -> Result<Vec<PerfFile
         attrs.push(PerfFileAttr {
             sample_type: read_u64(bytes, cursor + 24)?,
             read_format: read_u64(bytes, cursor + 32)?,
+            sample_regs_user: read_u64(bytes, cursor + 80)?,
+            sample_regs_intr: read_u64(bytes, cursor + 96)?,
             ids_offset: read_u64(bytes, cursor + attr_size)?,
             ids_size: read_u64(bytes, cursor + attr_size + 8)?,
         });

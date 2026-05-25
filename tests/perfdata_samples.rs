@@ -2,9 +2,9 @@ use pyroclast::perfdata::samples::{
     PERF_FORMAT_GROUP, PERF_FORMAT_ID, PERF_FORMAT_LOST, PERF_FORMAT_TOTAL_TIME_ENABLED,
     PERF_FORMAT_TOTAL_TIME_RUNNING, PERF_SAMPLE_ADDR, PERF_SAMPLE_BRANCH_STACK,
     PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP,
-    PERF_SAMPLE_PERIOD, PERF_SAMPLE_RAW, PERF_SAMPLE_READ, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID,
-    PERF_SAMPLE_TIME, SampleLayout, is_kernel_space_frame, is_perf_context_marker,
-    parse_sample_record, parse_sample_record_callchain,
+    PERF_SAMPLE_PERIOD, PERF_SAMPLE_RAW, PERF_SAMPLE_READ, PERF_SAMPLE_REGS_USER,
+    PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME, SampleLayout, is_kernel_space_frame,
+    is_perf_context_marker, parse_sample_record, parse_sample_record_callchain,
 };
 
 #[test]
@@ -22,6 +22,8 @@ fn parses_ip_tid_and_callchain_sample_payload() {
         SampleLayout {
             sample_type: PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
             read_format: 0,
+            sample_regs_user: 0,
+            sample_regs_intr: 0,
         },
     )
     .expect("sample");
@@ -61,6 +63,8 @@ fn consumes_perf_record_default_sample_fields_before_callchain() {
                 | PERF_SAMPLE_CPU
                 | PERF_SAMPLE_PERIOD,
             read_format: 0,
+            sample_regs_user: 0,
+            sample_regs_intr: 0,
         },
     )
     .expect("sample");
@@ -91,6 +95,8 @@ fn skips_stream_id_before_cpu_period_and_callchain() {
                 | PERF_SAMPLE_PERIOD
                 | PERF_SAMPLE_CALLCHAIN,
             read_format: 0,
+            sample_regs_user: 0,
+            sample_regs_intr: 0,
         },
     )
     .expect("sample");
@@ -119,6 +125,8 @@ fn skips_single_read_format_before_callchain() {
                 | PERF_FORMAT_TOTAL_TIME_RUNNING
                 | PERF_FORMAT_ID
                 | PERF_FORMAT_LOST,
+            sample_regs_user: 0,
+            sample_regs_intr: 0,
         },
     )
     .expect("sample");
@@ -151,6 +159,8 @@ fn skips_group_read_format_before_callchain() {
                 | PERF_FORMAT_TOTAL_TIME_RUNNING
                 | PERF_FORMAT_ID
                 | PERF_FORMAT_LOST,
+            sample_regs_user: 0,
+            sample_regs_intr: 0,
         },
     )
     .expect("sample")
@@ -178,6 +188,8 @@ fn skips_identifier_before_ip_tid_and_callchain() {
                 | PERF_SAMPLE_TID
                 | PERF_SAMPLE_CALLCHAIN,
             read_format: 0,
+            sample_regs_user: 0,
+            sample_regs_intr: 0,
         },
     )
     .expect("sample");
@@ -199,6 +211,8 @@ fn rejects_truncated_raw_sample_payload() {
         SampleLayout {
             sample_type: PERF_SAMPLE_RAW,
             read_format: 0,
+            sample_regs_user: 0,
+            sample_regs_intr: 0,
         },
     )
     .expect_err("truncated raw sample");
@@ -217,9 +231,31 @@ fn rejects_truncated_branch_stack_sample_payload() {
         SampleLayout {
             sample_type: PERF_SAMPLE_BRANCH_STACK,
             read_format: 0,
+            sample_regs_user: 0,
+            sample_regs_intr: 0,
         },
     )
     .expect_err("truncated branch stack sample");
+
+    assert!(error.contains("truncated"));
+}
+
+#[test]
+fn rejects_truncated_user_regs_sample_payload() {
+    let mut payload = Vec::new();
+    payload.extend(1u64.to_le_bytes());
+    payload.extend(0xaaaa_u64.to_le_bytes());
+
+    let error = parse_sample_record(
+        &payload,
+        SampleLayout {
+            sample_type: PERF_SAMPLE_REGS_USER,
+            read_format: 0,
+            sample_regs_user: 0b11,
+            sample_regs_intr: 0,
+        },
+    )
+    .expect_err("truncated regs user sample");
 
     assert!(error.contains("truncated"));
 }
@@ -243,6 +279,8 @@ fn parses_sample_callchain_without_building_sample_record() {
                 | PERF_SAMPLE_PERIOD
                 | PERF_SAMPLE_CALLCHAIN,
             read_format: 0,
+            sample_regs_user: 0,
+            sample_regs_intr: 0,
         },
     )
     .expect("sample")
