@@ -17,6 +17,15 @@ fn supports_every_known_linux_perf_sample_flag() {
     assert_eq!(supported_perf_sample_flags(), expected);
 }
 
+fn layout(sample_type: u64) -> SampleLayout {
+    SampleLayout {
+        sample_type,
+        read_format: 0,
+        sample_regs_user: 0,
+        sample_regs_intr: 0,
+    }
+}
+
 #[test]
 fn parses_ip_tid_and_callchain_sample_payload() {
     let mut payload = Vec::new();
@@ -29,12 +38,7 @@ fn parses_ip_tid_and_callchain_sample_payload() {
 
     let sample = parse_sample_record(
         &payload,
-        SampleLayout {
-            sample_type: PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
-            read_format: 0,
-            sample_regs_user: 0,
-            sample_regs_intr: 0,
-        },
+        layout(PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN),
     )
     .expect("sample");
 
@@ -63,8 +67,8 @@ fn consumes_perf_record_default_sample_fields_before_callchain() {
 
     let sample = parse_sample_record(
         &payload,
-        SampleLayout {
-            sample_type: PERF_SAMPLE_IP
+        layout(
+            PERF_SAMPLE_IP
                 | PERF_SAMPLE_TID
                 | PERF_SAMPLE_TIME
                 | PERF_SAMPLE_ADDR
@@ -72,10 +76,7 @@ fn consumes_perf_record_default_sample_fields_before_callchain() {
                 | PERF_SAMPLE_ID
                 | PERF_SAMPLE_CPU
                 | PERF_SAMPLE_PERIOD,
-            read_format: 0,
-            sample_regs_user: 0,
-            sample_regs_intr: 0,
-        },
+        ),
     )
     .expect("sample");
 
@@ -99,15 +100,9 @@ fn skips_stream_id_before_cpu_period_and_callchain() {
 
     let sample = parse_sample_record(
         &payload,
-        SampleLayout {
-            sample_type: PERF_SAMPLE_STREAM_ID
-                | PERF_SAMPLE_CPU
-                | PERF_SAMPLE_PERIOD
-                | PERF_SAMPLE_CALLCHAIN,
-            read_format: 0,
-            sample_regs_user: 0,
-            sample_regs_intr: 0,
-        },
+        layout(
+            PERF_SAMPLE_STREAM_ID | PERF_SAMPLE_CPU | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN,
+        ),
     )
     .expect("sample");
 
@@ -135,8 +130,7 @@ fn skips_single_read_format_before_callchain() {
                 | PERF_FORMAT_TOTAL_TIME_RUNNING
                 | PERF_FORMAT_ID
                 | PERF_FORMAT_LOST,
-            sample_regs_user: 0,
-            sample_regs_intr: 0,
+            ..layout(0)
         },
     )
     .expect("sample");
@@ -169,8 +163,7 @@ fn skips_group_read_format_before_callchain() {
                 | PERF_FORMAT_TOTAL_TIME_RUNNING
                 | PERF_FORMAT_ID
                 | PERF_FORMAT_LOST,
-            sample_regs_user: 0,
-            sample_regs_intr: 0,
+            ..layout(0)
         },
     )
     .expect("sample")
@@ -192,15 +185,7 @@ fn skips_identifier_before_ip_tid_and_callchain() {
 
     let sample = parse_sample_record(
         &payload,
-        SampleLayout {
-            sample_type: PERF_SAMPLE_IDENTIFIER
-                | PERF_SAMPLE_IP
-                | PERF_SAMPLE_TID
-                | PERF_SAMPLE_CALLCHAIN,
-            read_format: 0,
-            sample_regs_user: 0,
-            sample_regs_intr: 0,
-        },
+        layout(PERF_SAMPLE_IDENTIFIER | PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN),
     )
     .expect("sample");
 
@@ -216,16 +201,8 @@ fn rejects_truncated_raw_sample_payload() {
     payload.extend(4u32.to_le_bytes());
     payload.extend([1, 2]);
 
-    let error = parse_sample_record(
-        &payload,
-        SampleLayout {
-            sample_type: PERF_SAMPLE_RAW,
-            read_format: 0,
-            sample_regs_user: 0,
-            sample_regs_intr: 0,
-        },
-    )
-    .expect_err("truncated raw sample");
+    let error =
+        parse_sample_record(&payload, layout(PERF_SAMPLE_RAW)).expect_err("truncated raw sample");
 
     assert!(error.contains("truncated"));
 }
@@ -236,16 +213,8 @@ fn rejects_truncated_branch_stack_sample_payload() {
     payload.extend(1u64.to_le_bytes());
     payload.extend(0x1000u64.to_le_bytes());
 
-    let error = parse_sample_record(
-        &payload,
-        SampleLayout {
-            sample_type: PERF_SAMPLE_BRANCH_STACK,
-            read_format: 0,
-            sample_regs_user: 0,
-            sample_regs_intr: 0,
-        },
-    )
-    .expect_err("truncated branch stack sample");
+    let error = parse_sample_record(&payload, layout(PERF_SAMPLE_BRANCH_STACK))
+        .expect_err("truncated branch stack sample");
 
     assert!(error.contains("truncated"));
 }
@@ -260,9 +229,8 @@ fn rejects_truncated_user_regs_sample_payload() {
         &payload,
         SampleLayout {
             sample_type: PERF_SAMPLE_REGS_USER,
-            read_format: 0,
             sample_regs_user: 0b11,
-            sample_regs_intr: 0,
+            ..layout(0)
         },
     )
     .expect_err("truncated regs user sample");
@@ -276,64 +244,32 @@ fn rejects_truncated_user_stack_sample_payload() {
     payload.extend(4u64.to_le_bytes());
     payload.extend([1, 2, 3, 4]);
 
-    let error = parse_sample_record(
-        &payload,
-        SampleLayout {
-            sample_type: PERF_SAMPLE_STACK_USER,
-            read_format: 0,
-            sample_regs_user: 0,
-            sample_regs_intr: 0,
-        },
-    )
-    .expect_err("truncated stack user sample");
+    let error = parse_sample_record(&payload, layout(PERF_SAMPLE_STACK_USER))
+        .expect_err("truncated stack user sample");
 
     assert!(error.contains("truncated"));
 }
 
 #[test]
 fn rejects_truncated_weight_sample_payload() {
-    let error = parse_sample_record(
-        &[1, 2, 3, 4],
-        SampleLayout {
-            sample_type: PERF_SAMPLE_WEIGHT,
-            read_format: 0,
-            sample_regs_user: 0,
-            sample_regs_intr: 0,
-        },
-    )
-    .expect_err("truncated weight sample");
+    let error = parse_sample_record(&[1, 2, 3, 4], layout(PERF_SAMPLE_WEIGHT))
+        .expect_err("truncated weight sample");
 
     assert!(error.contains("truncated"));
 }
 
 #[test]
 fn rejects_truncated_data_src_sample_payload() {
-    let error = parse_sample_record(
-        &[1, 2, 3, 4],
-        SampleLayout {
-            sample_type: PERF_SAMPLE_DATA_SRC,
-            read_format: 0,
-            sample_regs_user: 0,
-            sample_regs_intr: 0,
-        },
-    )
-    .expect_err("truncated data source sample");
+    let error = parse_sample_record(&[1, 2, 3, 4], layout(PERF_SAMPLE_DATA_SRC))
+        .expect_err("truncated data source sample");
 
     assert!(error.contains("truncated"));
 }
 
 #[test]
 fn rejects_truncated_transaction_sample_payload() {
-    let error = parse_sample_record(
-        &[1, 2, 3, 4],
-        SampleLayout {
-            sample_type: PERF_SAMPLE_TRANSACTION,
-            read_format: 0,
-            sample_regs_user: 0,
-            sample_regs_intr: 0,
-        },
-    )
-    .expect_err("truncated transaction sample");
+    let error = parse_sample_record(&[1, 2, 3, 4], layout(PERF_SAMPLE_TRANSACTION))
+        .expect_err("truncated transaction sample");
 
     assert!(error.contains("truncated"));
 }
@@ -348,9 +284,8 @@ fn rejects_truncated_intr_regs_sample_payload() {
         &payload,
         SampleLayout {
             sample_type: PERF_SAMPLE_REGS_INTR,
-            read_format: 0,
-            sample_regs_user: 0,
             sample_regs_intr: 0b11,
+            ..layout(0)
         },
     )
     .expect_err("truncated regs intr sample");
@@ -360,16 +295,8 @@ fn rejects_truncated_intr_regs_sample_payload() {
 
 #[test]
 fn rejects_truncated_phys_addr_sample_payload() {
-    let error = parse_sample_record(
-        &[1, 2, 3, 4],
-        SampleLayout {
-            sample_type: PERF_SAMPLE_PHYS_ADDR,
-            read_format: 0,
-            sample_regs_user: 0,
-            sample_regs_intr: 0,
-        },
-    )
-    .expect_err("truncated physical address sample");
+    let error = parse_sample_record(&[1, 2, 3, 4], layout(PERF_SAMPLE_PHYS_ADDR))
+        .expect_err("truncated physical address sample");
 
     assert!(error.contains("truncated"));
 }
@@ -380,80 +307,40 @@ fn rejects_truncated_aux_sample_payload() {
     payload.extend(4u64.to_le_bytes());
     payload.extend([1, 2]);
 
-    let error = parse_sample_record(
-        &payload,
-        SampleLayout {
-            sample_type: PERF_SAMPLE_AUX,
-            read_format: 0,
-            sample_regs_user: 0,
-            sample_regs_intr: 0,
-        },
-    )
-    .expect_err("truncated aux sample");
+    let error =
+        parse_sample_record(&payload, layout(PERF_SAMPLE_AUX)).expect_err("truncated aux sample");
 
     assert!(error.contains("truncated"));
 }
 
 #[test]
 fn rejects_truncated_cgroup_sample_payload() {
-    let error = parse_sample_record(
-        &[1, 2, 3, 4],
-        SampleLayout {
-            sample_type: PERF_SAMPLE_CGROUP,
-            read_format: 0,
-            sample_regs_user: 0,
-            sample_regs_intr: 0,
-        },
-    )
-    .expect_err("truncated cgroup sample");
+    let error = parse_sample_record(&[1, 2, 3, 4], layout(PERF_SAMPLE_CGROUP))
+        .expect_err("truncated cgroup sample");
 
     assert!(error.contains("truncated"));
 }
 
 #[test]
 fn rejects_truncated_data_page_size_sample_payload() {
-    let error = parse_sample_record(
-        &[1, 2, 3, 4],
-        SampleLayout {
-            sample_type: PERF_SAMPLE_DATA_PAGE_SIZE,
-            read_format: 0,
-            sample_regs_user: 0,
-            sample_regs_intr: 0,
-        },
-    )
-    .expect_err("truncated data page size sample");
+    let error = parse_sample_record(&[1, 2, 3, 4], layout(PERF_SAMPLE_DATA_PAGE_SIZE))
+        .expect_err("truncated data page size sample");
 
     assert!(error.contains("truncated"));
 }
 
 #[test]
 fn rejects_truncated_code_page_size_sample_payload() {
-    let error = parse_sample_record(
-        &[1, 2, 3, 4],
-        SampleLayout {
-            sample_type: PERF_SAMPLE_CODE_PAGE_SIZE,
-            read_format: 0,
-            sample_regs_user: 0,
-            sample_regs_intr: 0,
-        },
-    )
-    .expect_err("truncated code page size sample");
+    let error = parse_sample_record(&[1, 2, 3, 4], layout(PERF_SAMPLE_CODE_PAGE_SIZE))
+        .expect_err("truncated code page size sample");
 
     assert!(error.contains("truncated"));
 }
 
 #[test]
 fn rejects_truncated_weight_struct_sample_payload() {
-    let error = parse_sample_record(
-        &[1, 2, 3, 4],
-        SampleLayout {
-            sample_type: PERF_SAMPLE_WEIGHT_STRUCT,
-            read_format: 0,
-            sample_regs_user: 0,
-            sample_regs_intr: 0,
-        },
-    )
-    .expect_err("truncated weight struct sample");
+    let error = parse_sample_record(&[1, 2, 3, 4], layout(PERF_SAMPLE_WEIGHT_STRUCT))
+        .expect_err("truncated weight struct sample");
 
     assert!(error.contains("truncated"));
 }
@@ -471,15 +358,7 @@ fn parses_sample_callchain_without_building_sample_record() {
 
     let sample = parse_sample_record_callchain(
         &payload,
-        SampleLayout {
-            sample_type: PERF_SAMPLE_IP
-                | PERF_SAMPLE_TID
-                | PERF_SAMPLE_PERIOD
-                | PERF_SAMPLE_CALLCHAIN,
-            read_format: 0,
-            sample_regs_user: 0,
-            sample_regs_intr: 0,
-        },
+        layout(PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN),
     )
     .expect("sample")
     .expect("callchain");
