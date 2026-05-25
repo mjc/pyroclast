@@ -1,13 +1,14 @@
 use pyroclast::perfdata::samples::{
     PERF_FORMAT_GROUP, PERF_FORMAT_ID, PERF_FORMAT_LOST, PERF_FORMAT_TOTAL_TIME_ENABLED,
-    PERF_FORMAT_TOTAL_TIME_RUNNING, PERF_SAMPLE_ADDR, PERF_SAMPLE_AUX, PERF_SAMPLE_BRANCH_STACK,
-    PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CGROUP, PERF_SAMPLE_CODE_PAGE_SIZE, PERF_SAMPLE_CPU,
-    PERF_SAMPLE_DATA_PAGE_SIZE, PERF_SAMPLE_DATA_SRC, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER,
-    PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_PHYS_ADDR, PERF_SAMPLE_RAW, PERF_SAMPLE_READ,
-    PERF_SAMPLE_REGS_INTR, PERF_SAMPLE_REGS_USER, PERF_SAMPLE_STACK_USER, PERF_SAMPLE_STREAM_ID,
-    PERF_SAMPLE_TID, PERF_SAMPLE_TIME, PERF_SAMPLE_TRANSACTION, PERF_SAMPLE_WEIGHT,
-    PERF_SAMPLE_WEIGHT_STRUCT, SampleLayout, is_kernel_space_frame, is_perf_context_marker,
-    parse_sample_record, parse_sample_record_callchain, supported_perf_sample_flags,
+    PERF_FORMAT_TOTAL_TIME_RUNNING, PERF_SAMPLE_ADDR, PERF_SAMPLE_AUX, PERF_SAMPLE_BRANCH_HW_INDEX,
+    PERF_SAMPLE_BRANCH_STACK, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CGROUP,
+    PERF_SAMPLE_CODE_PAGE_SIZE, PERF_SAMPLE_CPU, PERF_SAMPLE_DATA_PAGE_SIZE, PERF_SAMPLE_DATA_SRC,
+    PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD,
+    PERF_SAMPLE_PHYS_ADDR, PERF_SAMPLE_RAW, PERF_SAMPLE_READ, PERF_SAMPLE_REGS_INTR,
+    PERF_SAMPLE_REGS_USER, PERF_SAMPLE_STACK_USER, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID,
+    PERF_SAMPLE_TIME, PERF_SAMPLE_TRANSACTION, PERF_SAMPLE_WEIGHT, PERF_SAMPLE_WEIGHT_STRUCT,
+    SampleLayout, is_kernel_space_frame, is_perf_context_marker, parse_sample_record,
+    parse_sample_record_callchain, supported_perf_sample_flags,
 };
 
 #[test]
@@ -21,6 +22,7 @@ fn layout(sample_type: u64) -> SampleLayout {
     SampleLayout {
         sample_type,
         read_format: 0,
+        branch_sample_type: 0,
         sample_regs_user: 0,
         sample_regs_intr: 0,
     }
@@ -217,6 +219,31 @@ fn rejects_truncated_branch_stack_sample_payload() {
         .expect_err("truncated branch stack sample");
 
     assert!(error.contains("truncated"));
+}
+
+#[test]
+fn skips_branch_stack_hardware_index_before_following_sample_fields() {
+    let mut payload = Vec::new();
+    payload.extend(1u64.to_le_bytes());
+    payload.extend(99u64.to_le_bytes());
+    payload.extend(0x1000u64.to_le_bytes());
+    payload.extend(0x2000u64.to_le_bytes());
+    payload.extend(0u64.to_le_bytes());
+    payload.extend(1u64.to_le_bytes());
+    payload.extend(0xaaaa_u64.to_le_bytes());
+
+    let sample = parse_sample_record(
+        &payload,
+        SampleLayout {
+            sample_type: PERF_SAMPLE_BRANCH_STACK | PERF_SAMPLE_REGS_USER,
+            branch_sample_type: PERF_SAMPLE_BRANCH_HW_INDEX,
+            sample_regs_user: 0b1,
+            ..layout(0)
+        },
+    )
+    .expect("sample");
+
+    assert_eq!(sample.callchain, Vec::<u64>::new());
 }
 
 #[test]

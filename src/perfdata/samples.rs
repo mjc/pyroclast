@@ -25,6 +25,7 @@ pub const PERF_SAMPLE_CGROUP: u64 = 1 << 21;
 pub const PERF_SAMPLE_DATA_PAGE_SIZE: u64 = 1 << 22;
 pub const PERF_SAMPLE_CODE_PAGE_SIZE: u64 = 1 << 23;
 pub const PERF_SAMPLE_WEIGHT_STRUCT: u64 = 1 << 24;
+pub const PERF_SAMPLE_BRANCH_HW_INDEX: u64 = 1 << 17;
 pub const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
 pub const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 1 << 1;
 pub const PERF_FORMAT_ID: u64 = 1 << 2;
@@ -63,6 +64,7 @@ const SUPPORTED_PERF_SAMPLE_FLAGS: &[u64] = &[
 pub struct SampleLayout {
     pub sample_type: u64,
     pub read_format: u64,
+    pub branch_sample_type: u64,
     pub sample_regs_user: u64,
     pub sample_regs_intr: u64,
 }
@@ -153,7 +155,7 @@ pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<Sampl
         cursor.skip_sized_u32_payload()?;
     }
     if layout.has(PERF_SAMPLE_BRANCH_STACK) {
-        cursor.skip_branch_stack()?;
+        cursor.skip_branch_stack(layout.branch_sample_type)?;
     }
     if layout.has(PERF_SAMPLE_REGS_USER) {
         cursor.skip_regs(layout.sample_regs_user)?;
@@ -191,6 +193,8 @@ pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<Sampl
     if layout.has(PERF_SAMPLE_CODE_PAGE_SIZE) {
         cursor.skip_u64()?;
     }
+
+    cursor.finish()?;
 
     Ok(sample)
 }
@@ -341,6 +345,14 @@ impl<'a> SampleCursor<'a> {
         Ok(bytes)
     }
 
+    fn finish(&self) -> Result<(), String> {
+        if self.offset == self.payload.len() {
+            Ok(())
+        } else {
+            Err("perf sample payload has trailing bytes".to_string())
+        }
+    }
+
     fn skip_sized_u32_payload(&mut self) -> Result<(), String> {
         let size = usize::try_from(self.read_u32()?)
             .map_err(|_| "perf sample raw size does not fit in usize".to_string())?;
@@ -353,9 +365,12 @@ impl<'a> SampleCursor<'a> {
         self.read_bytes(size).map(|_| ())
     }
 
-    fn skip_branch_stack(&mut self) -> Result<(), String> {
+    fn skip_branch_stack(&mut self, branch_sample_type: u64) -> Result<(), String> {
         let branches = usize::try_from(self.read_u64()?)
             .map_err(|_| "perf sample branch count does not fit in usize".to_string())?;
+        if branch_sample_type & PERF_SAMPLE_BRANCH_HW_INDEX != 0 {
+            self.skip_u64()?;
+        }
         let byte_len = branches
             .checked_mul(24)
             .ok_or_else(|| "perf sample branch stack byte length overflows usize".to_string())?;

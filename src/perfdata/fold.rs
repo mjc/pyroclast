@@ -505,6 +505,7 @@ fn first_sample_layout(
         .map(|attr| SampleLayout {
             sample_type: attr.sample_type,
             read_format: attr.read_format,
+            branch_sample_type: 0,
             sample_regs_user: attr.sample_regs_user,
             sample_regs_intr: attr.sample_regs_intr,
         }))
