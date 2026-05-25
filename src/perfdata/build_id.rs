@@ -1,8 +1,11 @@
 use std::fmt::Write;
+use std::path::Path;
 
 use crate::perfdata::endian::{read_u16, read_u32};
+use crate::perfdata::header::{parse_feature_sections, parse_header};
 
 const PERF_RECORD_HEADER_BUILD_ID: u32 = 67;
+const HEADER_BUILD_ID: u16 = 2;
 const BUILD_ID_SIZE: usize = 20;
 const BUILD_ID_EVENT_MIN_SIZE: usize = 36;
 
@@ -41,6 +44,37 @@ pub fn parse_build_id_events(payload: &[u8]) -> Result<Vec<BuildIdEvent>, String
     Ok(events)
 }
 
+/// Extracts the kernel build ID recorded in a `perf.data` file.
+///
+/// # Errors
+///
+/// Returns an error when the `perf.data` header or build-id feature payload is
+/// malformed.
+pub fn kernel_build_id_from_perfdata(bytes: &[u8]) -> Result<Option<String>, String> {
+    let header = parse_header(bytes)?;
+    let Some(section) = parse_feature_sections(bytes, &header)?
+        .into_iter()
+        .find(|section| section.feature == HEADER_BUILD_ID)
+    else {
+        return Ok(None);
+    };
+    let start = usize::try_from(section.offset)
+        .map_err(|_| "build-id feature offset exceeds usize".to_string())?;
+    let size = usize::try_from(section.size)
+        .map_err(|_| "build-id feature size exceeds usize".to_string())?;
+    let end = start
+        .checked_add(size)
+        .ok_or_else(|| "build-id feature range overflows usize".to_string())?;
+    let payload = bytes
+        .get(start..end)
+        .ok_or_else(|| "build-id feature payload is truncated".to_string())?;
+
+    Ok(parse_build_id_events(payload)?
+        .into_iter()
+        .find(|event| is_kernel_build_id_filename(&event.filename))
+        .map(|event| event.build_id))
+}
+
 fn parse_build_id_event(record: &[u8]) -> Result<BuildIdEvent, String> {
     let record_type = read_u32(record, 0)?;
     if record_type != PERF_RECORD_HEADER_BUILD_ID {
@@ -54,6 +88,13 @@ fn parse_build_id_event(record: &[u8]) -> Result<BuildIdEvent, String> {
         build_id: build_id_hex(&record[12..12 + BUILD_ID_SIZE]),
         filename: filename(&record[BUILD_ID_EVENT_MIN_SIZE..])?,
     })
+}
+
+fn is_kernel_build_id_filename(filename: &str) -> bool {
+    let path = Path::new(filename);
+    path == Path::new("[kernel.kallsyms]")
+        || path == Path::new("[kernel]")
+        || path == Path::new("[guest.kernel]")
 }
 
 fn build_id_hex(bytes: &[u8]) -> String {
