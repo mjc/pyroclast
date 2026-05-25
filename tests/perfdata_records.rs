@@ -257,6 +257,24 @@ fn parses_fork_record_payload_from_perf_event_header_shape() {
 }
 
 #[test]
+fn dispatches_fork_record_by_perf_record_type() {
+    let payload = lifecycle_payload();
+    let record = PerfRecord {
+        offset: 104,
+        header: PerfRecordHeader {
+            record_type: 7,
+            misc: 0,
+            size: u16::try_from(8 + payload.len()).expect("record size"),
+        },
+        payload: &payload,
+    };
+
+    let parsed = parse_record(record).expect("parsed record");
+
+    assert!(matches!(parsed, ParsedRecord::Fork(_)));
+}
+
+#[test]
 fn parses_exit_record_payload_from_perf_event_header_shape() {
     let mut payload = Vec::new();
     payload.extend(123u32.to_le_bytes());
@@ -272,6 +290,24 @@ fn parses_exit_record_payload_from_perf_event_header_shape() {
     assert_eq!(exit.tid, 456);
     assert_eq!(exit.ptid, 45);
     assert_eq!(exit.time, 99_000);
+}
+
+#[test]
+fn dispatches_exit_record_by_perf_record_type() {
+    let payload = lifecycle_payload();
+    let record = PerfRecord {
+        offset: 104,
+        header: PerfRecordHeader {
+            record_type: 4,
+            misc: 0,
+            size: u16::try_from(8 + payload.len()).expect("record size"),
+        },
+        payload: &payload,
+    };
+
+    let parsed = parse_record(record).expect("parsed record");
+
+    assert!(matches!(parsed, ParsedRecord::Exit(_)));
 }
 
 #[test]
@@ -379,6 +415,16 @@ fn mmap2_build_id_payload() -> Vec<u8> {
     payload.extend(5u32.to_le_bytes());
     payload.extend(2u32.to_le_bytes());
     payload.extend(b"/usr/lib/libssl.so\0");
+    payload
+}
+
+fn lifecycle_payload() -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(123u32.to_le_bytes());
+    payload.extend(12u32.to_le_bytes());
+    payload.extend(456u32.to_le_bytes());
+    payload.extend(45u32.to_le_bytes());
+    payload.extend(99_000u64.to_le_bytes());
     payload
 }
 

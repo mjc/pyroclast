@@ -33,6 +33,8 @@ pub enum ParsedRecord {
     Mmap(MmapRecord),
     Mmap2(Mmap2Record),
     Mmap2BuildId(Mmap2BuildIdRecord),
+    Fork(ForkRecord),
+    Exit(ExitRecord),
     Unsupported { record_type: u32 },
 }
 
@@ -230,6 +232,8 @@ pub fn parse_record(record: PerfRecord<'_>) -> Result<ParsedRecord, String> {
             parse_mmap2_build_id_record(record.payload).map(ParsedRecord::Mmap2BuildId)
         }
         PERF_RECORD_MMAP2 => parse_mmap2_record(record.payload).map(ParsedRecord::Mmap2),
+        PERF_RECORD_EXIT => parse_exit_record(record.payload).map(ParsedRecord::Exit),
+        PERF_RECORD_FORK => parse_fork_record(record.payload).map(ParsedRecord::Fork),
         record_type => Ok(ParsedRecord::Unsupported { record_type }),
     }
 }
