@@ -20,6 +20,7 @@ fn parses_sample_type_from_file_attr_section() {
         attrs,
         vec![PerfFileAttr {
             sample_type,
+            read_format: 0,
             ids_offset: 512,
             ids_size: 24,
         }]

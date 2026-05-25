@@ -4,15 +4,22 @@ pub const PERF_SAMPLE_IP: u64 = 1 << 0;
 pub const PERF_SAMPLE_TID: u64 = 1 << 1;
 pub const PERF_SAMPLE_TIME: u64 = 1 << 2;
 pub const PERF_SAMPLE_ADDR: u64 = 1 << 3;
+pub const PERF_SAMPLE_READ: u64 = 1 << 4;
 pub const PERF_SAMPLE_CALLCHAIN: u64 = 1 << 5;
 pub const PERF_SAMPLE_ID: u64 = 1 << 6;
 pub const PERF_SAMPLE_CPU: u64 = 1 << 7;
 pub const PERF_SAMPLE_PERIOD: u64 = 1 << 8;
 pub const PERF_SAMPLE_STREAM_ID: u64 = 1 << 9;
+pub const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
+pub const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 1 << 1;
+pub const PERF_FORMAT_ID: u64 = 1 << 2;
+pub const PERF_FORMAT_GROUP: u64 = 1 << 3;
+pub const PERF_FORMAT_LOST: u64 = 1 << 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SampleLayout {
     pub sample_type: u64,
+    pub read_format: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -79,6 +86,9 @@ pub fn parse_sample_record(payload: &[u8], layout: SampleLayout) -> Result<Sampl
     if layout.has(PERF_SAMPLE_PERIOD) {
         sample.period = Some(cursor.read_u64()?);
     }
+    if layout.has(PERF_SAMPLE_READ) {
+        cursor.skip_read_format(layout.read_format)?;
+    }
     if layout.has(PERF_SAMPLE_CALLCHAIN) {
         let callchain_len = usize::try_from(cursor.read_u64()?)
             .map_err(|_| "perf sample callchain length does not fit in usize".to_string())?;
@@ -128,6 +138,9 @@ pub fn parse_sample_record_callchain(
     }
     if layout.has(PERF_SAMPLE_PERIOD) {
         period = Some(cursor.read_u64()?);
+    }
+    if layout.has(PERF_SAMPLE_READ) {
+        cursor.skip_read_format(layout.read_format)?;
     }
     if !layout.has(PERF_SAMPLE_CALLCHAIN) {
         return Ok(None);
@@ -226,5 +239,27 @@ impl<'a> SampleCursor<'a> {
             .ok_or_else(|| "perf sample payload is truncated".to_string())?;
         self.offset = end;
         Ok(bytes)
+    }
+
+    fn skip_read_format(&mut self, read_format: u64) -> Result<(), String> {
+        if read_format & PERF_FORMAT_GROUP != 0 {
+            return Err("group PERF_SAMPLE_READ payloads are not supported yet".to_string());
+        }
+
+        self.skip_u64()?;
+        if read_format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0 {
+            self.skip_u64()?;
+        }
+        if read_format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0 {
+            self.skip_u64()?;
+        }
+        if read_format & PERF_FORMAT_ID != 0 {
+            self.skip_u64()?;
+        }
+        if read_format & PERF_FORMAT_LOST != 0 {
+            self.skip_u64()?;
+        }
+
+        Ok(())
     }
 }

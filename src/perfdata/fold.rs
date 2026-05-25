@@ -504,5 +504,6 @@ fn first_sample_layout(
         .first()
         .map(|attr| SampleLayout {
             sample_type: attr.sample_type,
+            read_format: attr.read_format,
         }))
 }
