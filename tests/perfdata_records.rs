@@ -572,6 +572,96 @@ proptest! {
         prop_assert_eq!(record.hw_id, hw_id);
         prop_assert_eq!(record.sample_id, sample_id);
     }
+
+    #[test]
+    fn parses_namespaces_record_payload_from_little_endian_fields(
+        pid in any::<u32>(),
+        tid in any::<u32>(),
+        namespaces in prop::collection::vec((any::<u64>(), any::<u64>()), 0..8),
+        sample_id in prop::collection::vec(any::<u8>(), 0..32),
+    ) {
+        let payload = namespaces_payload_from(pid, tid, &namespaces, &sample_id);
+
+        let record = parse_namespaces_record(&payload).expect("namespaces record");
+
+        prop_assert_eq!(record.pid, pid);
+        prop_assert_eq!(record.tid, tid);
+        prop_assert_eq!(record.namespaces.len(), namespaces.len());
+        for (actual, expected) in record.namespaces.iter().zip(namespaces) {
+            prop_assert_eq!(actual.dev, expected.0);
+            prop_assert_eq!(actual.inode, expected.1);
+        }
+        prop_assert_eq!(record.sample_id, sample_id);
+    }
+
+    #[test]
+    fn parses_ksymbol_record_payload_from_little_endian_fields(
+        addr in any::<u64>(),
+        len in any::<u32>(),
+        ksym_type in any::<u16>(),
+        flags in any::<u16>(),
+        name in "[ -~]{0,32}",
+        sample_id in prop::collection::vec(any::<u8>(), 0..32),
+    ) {
+        let payload = ksymbol_payload_from(addr, len, ksym_type, flags, &name, &sample_id);
+
+        let record = parse_ksymbol_record(&payload).expect("ksymbol record");
+
+        prop_assert_eq!(record.addr, addr);
+        prop_assert_eq!(record.len, len);
+        prop_assert_eq!(record.ksym_type, ksym_type);
+        prop_assert_eq!(record.flags, flags);
+        prop_assert_eq!(record.name, name);
+        prop_assert_eq!(record.sample_id, sample_id);
+    }
+
+    #[test]
+    fn parses_cgroup_record_payload_from_little_endian_fields(
+        id in any::<u64>(),
+        path in "[ -~]{0,32}",
+        sample_id in prop::collection::vec(any::<u8>(), 0..32),
+    ) {
+        let payload = cgroup_payload_from(id, &path, &sample_id);
+
+        let record = parse_cgroup_record(&payload).expect("cgroup record");
+
+        prop_assert_eq!(record.id, id);
+        prop_assert_eq!(record.path, path);
+        prop_assert_eq!(record.sample_id, sample_id);
+    }
+
+    #[test]
+    fn parses_text_poke_record_payload_from_little_endian_fields(
+        addr in any::<u64>(),
+        old_bytes in prop::collection::vec(any::<u8>(), 0..16),
+        new_bytes in prop::collection::vec(any::<u8>(), 0..16),
+        sample_id in prop::collection::vec(any::<u8>(), 0..32),
+    ) {
+        let payload = text_poke_payload_from(addr, &old_bytes, &new_bytes, &sample_id);
+
+        let record = parse_text_poke_record(&payload).expect("text poke record");
+
+        prop_assert_eq!(record.addr, addr);
+        prop_assert_eq!(record.old_len, u16::try_from(old_bytes.len()).expect("old len"));
+        prop_assert_eq!(record.new_len, u16::try_from(new_bytes.len()).expect("new len"));
+        prop_assert_eq!(record.bytes, [old_bytes, new_bytes].concat());
+        prop_assert_eq!(record.sample_id, sample_id);
+    }
+
+    #[test]
+    fn parses_callchain_deferred_record_payload_from_little_endian_fields(
+        cookie in any::<u64>(),
+        ips in prop::collection::vec(any::<u64>(), 0..16),
+        sample_id in prop::collection::vec(any::<u8>(), 0..32),
+    ) {
+        let payload = callchain_deferred_payload_from(cookie, &ips, &sample_id);
+
+        let record = parse_callchain_deferred_record(&payload).expect("callchain deferred record");
+
+        prop_assert_eq!(record.cookie, cookie);
+        prop_assert_eq!(record.ips, ips);
+        prop_assert_eq!(record.sample_id, sample_id);
+    }
 }
 
 #[test]
@@ -844,26 +934,51 @@ fn two_u32_payload(first: u32, second: u32, sample_id: &[u8]) -> Vec<u8> {
 }
 
 fn namespaces_payload() -> Vec<u8> {
+    namespaces_payload_from(123, 456, &[(11, 22), (33, 44)], &[9, 8])
+}
+
+fn namespaces_payload_from(
+    pid: u32,
+    tid: u32,
+    namespaces: &[(u64, u64)],
+    sample_id: &[u8],
+) -> Vec<u8> {
     let mut payload = Vec::new();
-    payload.extend(123u32.to_le_bytes());
-    payload.extend(456u32.to_le_bytes());
-    payload.extend(2u64.to_le_bytes());
-    payload.extend(11u64.to_le_bytes());
-    payload.extend(22u64.to_le_bytes());
-    payload.extend(33u64.to_le_bytes());
-    payload.extend(44u64.to_le_bytes());
-    payload.extend([9, 8]);
+    payload.extend(pid.to_le_bytes());
+    payload.extend(tid.to_le_bytes());
+    payload.extend(
+        u64::try_from(namespaces.len())
+            .expect("namespace count")
+            .to_le_bytes(),
+    );
+    for (dev, inode) in namespaces {
+        payload.extend(dev.to_le_bytes());
+        payload.extend(inode.to_le_bytes());
+    }
+    payload.extend(sample_id);
     payload
 }
 
 fn ksymbol_payload() -> Vec<u8> {
+    ksymbol_payload_from(0xfeed, 64, 1, 2, "bpf_prog", &[7, 6])
+}
+
+fn ksymbol_payload_from(
+    addr: u64,
+    len: u32,
+    ksym_type: u16,
+    flags: u16,
+    name: &str,
+    sample_id: &[u8],
+) -> Vec<u8> {
     let mut payload = Vec::new();
-    payload.extend(0xfeedu64.to_le_bytes());
-    payload.extend(64u32.to_le_bytes());
-    payload.extend(1u16.to_le_bytes());
-    payload.extend(2u16.to_le_bytes());
-    payload.extend(b"bpf_prog\0");
-    payload.extend([7, 6]);
+    payload.extend(addr.to_le_bytes());
+    payload.extend(len.to_le_bytes());
+    payload.extend(ksym_type.to_le_bytes());
+    payload.extend(flags.to_le_bytes());
+    payload.extend(name.as_bytes());
+    payload.push(0);
+    payload.extend(sample_id);
     payload
 }
 
@@ -884,30 +999,62 @@ fn bpf_event_payload(
 }
 
 fn cgroup_payload() -> Vec<u8> {
+    cgroup_payload_from(77, "/sys/fs/cgroup/work", &[1, 3, 5])
+}
+
+fn cgroup_payload_from(id: u64, path: &str, sample_id: &[u8]) -> Vec<u8> {
     let mut payload = Vec::new();
-    payload.extend(77u64.to_le_bytes());
-    payload.extend(b"/sys/fs/cgroup/work\0");
-    payload.extend([1, 3, 5]);
+    payload.extend(id.to_le_bytes());
+    payload.extend(path.as_bytes());
+    payload.push(0);
+    payload.extend(sample_id);
     payload
 }
 
 fn text_poke_payload() -> Vec<u8> {
+    text_poke_payload_from(0xabc, &[0x90, 0x90], &[0xcc, 0xcc, 0xcc], &[4, 2])
+}
+
+fn text_poke_payload_from(
+    addr: u64,
+    old_bytes: &[u8],
+    new_bytes: &[u8],
+    sample_id: &[u8],
+) -> Vec<u8> {
     let mut payload = Vec::new();
-    payload.extend(0xabcu64.to_le_bytes());
-    payload.extend(2u16.to_le_bytes());
-    payload.extend(3u16.to_le_bytes());
-    payload.extend([0x90, 0x90, 0xcc, 0xcc, 0xcc]);
-    payload.extend([4, 2]);
+    payload.extend(addr.to_le_bytes());
+    payload.extend(
+        u16::try_from(old_bytes.len())
+            .expect("old bytes length")
+            .to_le_bytes(),
+    );
+    payload.extend(
+        u16::try_from(new_bytes.len())
+            .expect("new bytes length")
+            .to_le_bytes(),
+    );
+    payload.extend(old_bytes);
+    payload.extend(new_bytes);
+    payload.extend(sample_id);
     payload
 }
 
 fn callchain_deferred_payload() -> Vec<u8> {
+    callchain_deferred_payload_from(42, &[0x1000, 0x2000], &[9, 9])
+}
+
+fn callchain_deferred_payload_from(cookie: u64, ips: &[u64], sample_id: &[u8]) -> Vec<u8> {
     let mut payload = Vec::new();
-    payload.extend(42u64.to_le_bytes());
-    payload.extend(2u64.to_le_bytes());
-    payload.extend(0x1000u64.to_le_bytes());
-    payload.extend(0x2000u64.to_le_bytes());
-    payload.extend([9, 9]);
+    payload.extend(cookie.to_le_bytes());
+    payload.extend(
+        u64::try_from(ips.len())
+            .expect("callchain length")
+            .to_le_bytes(),
+    );
+    for ip in ips {
+        payload.extend(ip.to_le_bytes());
+    }
+    payload.extend(sample_id);
     payload
 }
 
