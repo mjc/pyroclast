@@ -45,6 +45,16 @@ pub fn perf_debug_dir(home: &Path) -> PathBuf {
 }
 
 #[must_use]
+pub fn perf_build_id_elf_path(debug_dir: &Path, build_id: &str) -> PathBuf {
+    let (prefix, suffix) = build_id.split_at(2);
+    debug_dir
+        .join(".build-id")
+        .join(prefix)
+        .join(suffix)
+        .join("elf")
+}
+
+#[must_use]
 pub fn perf_symbol_resolver_for_perfdata_file<'a, R>(
     runner: &'a R,
     perfdata: &Path,

@@ -344,6 +344,17 @@ fn perf_debug_dir_uses_home_debug_cache() {
 }
 
 #[test]
+fn perf_build_id_elf_path_uses_standard_cache_link_layout() {
+    assert_eq!(
+        pyroclast::symbols::perf_build_id_elf_path(
+            &PathBuf::from("/home/mjc/.debug"),
+            "16ed3d5317ad219c89d0e3c5ea0ea2caa3cd4949",
+        ),
+        PathBuf::from("/home/mjc/.debug/.build-id/16/ed3d5317ad219c89d0e3c5ea0ea2caa3cd4949/elf")
+    );
+}
+
+#[test]
 fn perf_symbol_resolver_constructor_uses_perfdata_cache_before_system_kallsyms() {
     let home = tempfile::tempdir().expect("home");
     let perfdata = home.path().join("perf.data");
