@@ -1,7 +1,7 @@
 use pyroclast::perfdata::samples::{
     PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_ID, PERF_SAMPLE_IP,
-    PERF_SAMPLE_PERIOD, PERF_SAMPLE_TID, PERF_SAMPLE_TIME, SampleLayout, is_perf_context_marker,
-    parse_sample_record,
+    PERF_SAMPLE_PERIOD, PERF_SAMPLE_TID, PERF_SAMPLE_TIME, SampleLayout, is_kernel_space_frame,
+    is_perf_context_marker, parse_sample_record,
 };
 
 #[test]
@@ -71,4 +71,11 @@ fn consumes_perf_record_default_sample_fields_before_callchain() {
 fn detects_perf_context_marker_addresses() {
     assert!(is_perf_context_marker(0xffff_ffff_ffff_fe00));
     assert!(!is_perf_context_marker(0x7fff_ffff_f000));
+}
+
+#[test]
+fn detects_kernel_space_frames() {
+    assert!(is_kernel_space_frame(0xffff_ffff_8800_1280));
+    assert!(!is_kernel_space_frame(0x0000_7fff_ffff_f000));
+    assert!(!is_kernel_space_frame(0xffff_ffff_ffff_fe00));
 }

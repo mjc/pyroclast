@@ -8,7 +8,9 @@ use crate::perfdata::mappings::{MmapTable, ResolvedMapping};
 use crate::perfdata::records::{
     iter_records, parse_comm_record, parse_mmap_record, parse_mmap2_record,
 };
-use crate::perfdata::samples::{SampleLayout, is_perf_context_marker, parse_sample_record};
+use crate::perfdata::samples::{
+    SampleLayout, is_kernel_space_frame, is_perf_context_marker, parse_sample_record,
+};
 use crate::symbols::{SymbolCache, SymbolRequest, SymbolResolver};
 
 const PERF_RECORD_MMAP: u32 = 1;
@@ -264,6 +266,7 @@ fn symbol_requests_for_sample(
         .iter()
         .copied()
         .filter(|frame| !is_perf_context_marker(*frame))
+        .filter(|frame| !is_kernel_space_frame(*frame))
         .filter_map(|frame| {
             sample
                 .pid
@@ -328,6 +331,9 @@ impl<'a> FoldFrameResolver<'a> {
     where
         R: SymbolResolver,
     {
+        if is_kernel_space_frame(frame) {
+            return Ok(format!("0x{frame:x}"));
+        }
         if let Some(mapping) = pid.and_then(|pid| self.mmap_table.resolve(pid, frame)) {
             if let Some(cache) = symbol_cache {
                 return Ok(cache

@@ -226,6 +226,31 @@ fn folds_mapped_user_frames_with_symbol_names() {
 }
 
 #[test]
+fn leaves_kernel_space_frames_as_hex_without_symbol_lookup() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(
+                1,
+                &mmap_payload(11, 11, 0xffff_ffff_8800_0000, 0x2000, 0, "/bin/app"),
+            ),
+            record_bytes(9, &sample_payload(0x1000, 11, 12, [0xffff_ffff_8800_0010])),
+        ],
+    );
+    let resolver = RecordingSymbolResolver::default();
+
+    let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
+        .expect("folded");
+
+    assert_eq!(folded, "0xffffffff88000010 1\n");
+    assert_eq!(resolver.calls(), Vec::<Vec<SymbolRequest>>::new());
+}
+
+#[test]
 fn prefetches_unique_symbol_requests_before_folding() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
