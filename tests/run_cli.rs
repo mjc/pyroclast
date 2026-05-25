@@ -258,6 +258,27 @@ fn summarize_command_computes_text_from_raw_perfdata_when_summaries_are_missing(
 }
 
 #[test]
+fn summarize_command_computes_json_from_raw_perfdata_when_summaries_are_missing() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let run_dir = root.path().join("run");
+    std::fs::create_dir(&run_dir).expect("run dir");
+    std::fs::write(run_dir.join("profile.raw.perf.data"), tiny_perfdata()).expect("perfdata");
+
+    let output = pyroclast::run_cli([
+        "pyroclast",
+        "summarize",
+        "--json",
+        run_dir.to_str().unwrap(),
+    ])
+    .expect("summarize command");
+    let summary: serde_json::Value = serde_json::from_str(&output.stdout).expect("summary json");
+
+    assert_eq!(summary["folded_lines"], 1);
+    assert_eq!(summary["folded_bytes"], 9);
+    assert_eq!(summary["total_count"], 1);
+}
+
+#[test]
 fn top_level_cpu_command_uses_injected_perf_runner() {
     let root = tempfile::tempdir().expect("tempdir");
     let out = root.path().join("cpu-run");
