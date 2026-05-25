@@ -86,6 +86,22 @@ pub fn linux_system_map_candidates(
 }
 
 #[must_use]
+pub fn linux_system_map_candidates_for_system(
+    kernel_images: impl IntoIterator<Item = PathBuf>,
+    kernel_release: &str,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    for kernel_image in kernel_images {
+        candidates.extend(linux_system_map_candidates(
+            Some(&kernel_image),
+            kernel_release,
+        ));
+    }
+    candidates.extend(linux_system_map_candidates(None, kernel_release));
+    dedup_paths(candidates)
+}
+
+#[must_use]
 pub fn perf_symbol_resolver_for_perfdata_file<'a, R>(
     runner: &'a R,
     perfdata: &Path,
@@ -97,6 +113,16 @@ where
     PerfSymbolResolver::new(runner)
         .with_perfdata_file_kernel_cache(perfdata, &perf_debug_dir(home))
         .with_system_kallsyms()
+}
+
+fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut deduped = Vec::new();
+    for path in paths {
+        if !deduped.contains(&path) {
+            deduped.push(path);
+        }
+    }
+    deduped
 }
 
 #[must_use]

@@ -422,6 +422,28 @@ fn linux_system_map_candidates_include_common_distribution_paths() {
 }
 
 #[test]
+fn linux_system_map_candidates_for_system_deduplicates_kernel_images() {
+    let candidates = pyroclast::symbols::linux_system_map_candidates_for_system(
+        [
+            PathBuf::from("/nix/store/example-linux/bzImage"),
+            PathBuf::from("/nix/store/example-linux/bzImage"),
+        ],
+        "6.18.32",
+    );
+
+    assert_eq!(
+        candidates,
+        vec![
+            PathBuf::from("/nix/store/example-linux/System.map"),
+            PathBuf::from("/boot/System.map-6.18.32"),
+            PathBuf::from("/usr/lib/debug/boot/System.map-6.18.32"),
+            PathBuf::from("/lib/modules/6.18.32/System.map"),
+            PathBuf::from("/usr/lib/debug/lib/modules/6.18.32/System.map"),
+        ]
+    );
+}
+
+#[test]
 fn perf_symbol_resolver_constructor_uses_perfdata_cache_before_system_kallsyms() {
     let home = tempfile::tempdir().expect("home");
     let perfdata = home.path().join("perf.data");
