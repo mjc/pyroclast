@@ -1,3 +1,5 @@
+use crate::process::{CommandRunner, CommandSpec};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolKind {
     NixManaged,
@@ -10,6 +12,13 @@ pub struct ToolSpec {
     pub kind: ToolKind,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct ToolVersion {
+    pub name: String,
+    pub version: Option<String>,
+    pub error: Option<String>,
+}
+
 #[must_use]
 pub fn required_tools(platform: &str) -> Vec<ToolSpec> {
     match platform {
@@ -17,6 +26,49 @@ pub fn required_tools(platform: &str) -> Vec<ToolSpec> {
         "macos" => MACOS_TOOLS.to_vec(),
         _ => COMMON_TOOLS.to_vec(),
     }
+}
+
+pub fn collect_tool_versions<R>(runner: &R, tools: &[ToolSpec]) -> Vec<ToolVersion>
+where
+    R: CommandRunner,
+{
+    tools
+        .iter()
+        .map(|tool| collect_tool_version(runner, tool))
+        .collect()
+}
+
+fn collect_tool_version<R>(runner: &R, tool: &ToolSpec) -> ToolVersion
+where
+    R: CommandRunner,
+{
+    let output = runner.run(&CommandSpec::new(tool.name).arg("--version"));
+    match output {
+        Ok(output) if output.status_code == Some(0) => ToolVersion {
+            name: tool.name.to_string(),
+            version: first_output_line(&output.stdout, &output.stderr),
+            error: None,
+        },
+        Ok(output) => ToolVersion {
+            name: tool.name.to_string(),
+            version: None,
+            error: Some(format!("--version exited with {:?}", output.status_code)),
+        },
+        Err(error) => ToolVersion {
+            name: tool.name.to_string(),
+            version: None,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+fn first_output_line(stdout: &[u8], stderr: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .chain(String::from_utf8_lossy(stderr).lines())
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 const fn nix_tool(name: &'static str) -> ToolSpec {
