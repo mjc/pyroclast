@@ -20,3 +20,15 @@ procfs = { version = "0.18.0", default-features = false }
 object = "0.39.1"
 proptest = "1.11.0"
 tempfile = "3"
+
+[profile.release]
+debug = false
+strip = true
+lto = "thin"
+codegen-units = 1
+overflow-checks = true
+
+[profile.profiling]
+inherits = "release"
+debug = 2
+strip = false
