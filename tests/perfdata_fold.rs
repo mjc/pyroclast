@@ -144,7 +144,7 @@ fn folds_dwarf_user_stack_payloads_when_callchain_is_empty() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "0x1234;0x4000 1\n");
+    assert_eq!(folded, "0x1233;0x4000 1\n");
 }
 
 #[test]
@@ -178,7 +178,7 @@ fn folds_dwarf_user_stack_payloads_before_kernel_callchain_frames() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "0x1234;0x4000;0xa000;0x9000 1\n");
+    assert_eq!(folded, "0x1233;0x4000;0xa000;0x9000 1\n");
 }
 
 #[test]
@@ -216,7 +216,7 @@ fn keeps_dwarf_user_stack_payloads_when_kernel_callchain_has_user_context_marker
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "0x1234;0x4000;[unknown];[unknown] 1\n");
+    assert_eq!(folded, "0x1233;0x4000;[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -361,7 +361,7 @@ fn keeps_unwound_user_stack_frames_from_mappings_after_sample() {
                     [
                         0, 0, 0, 0, 0, 0, 0, 0, //
                         0x40, 0, 0, 0, 0, 0, 0, 0, //
-                        0, 0x80, 0, 0, 0, 0, 0, 0,
+                        1, 0x80, 0, 0, 0, 0, 0, 0,
                     ],
                 ),
             ),

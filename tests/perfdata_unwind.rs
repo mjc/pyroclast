@@ -43,7 +43,7 @@ fn unwinds_x86_64_frame_pointer_stack_from_sampled_stack_bytes() {
 
     let frames = unwind_x86_64_stack(regs, &stack, 4);
 
-    assert_eq!(frames, vec![0x4000, 0x1234]);
+    assert_eq!(frames, vec![0x4000, 0x1233]);
 }
 
 #[test]

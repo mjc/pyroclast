@@ -35,7 +35,7 @@ pub fn unwind_x86_64_stack(regs: PerfX86_64Regs, stack: &[u8], max_frames: usize
         let Ok(Some(frame)) = iter.next() else {
             break;
         };
-        frames.push(frame.address());
+        push_perf_unwind_address(&mut frames, frame.address());
     }
     frames
 }
@@ -112,10 +112,19 @@ impl FramehopUnwinder {
             let Ok(Some(frame)) = iter.next() else {
                 break;
             };
-            frames.push(frame.address());
+            push_perf_unwind_address(&mut frames, frame.address());
         }
         frames
     }
+}
+
+fn push_perf_unwind_address(frames: &mut Vec<u64>, address: u64) {
+    let address = if frames.is_empty() {
+        address
+    } else {
+        address.saturating_sub(1)
+    };
+    frames.push(address);
 }
 
 impl PerfX86_64Regs {
