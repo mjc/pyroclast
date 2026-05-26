@@ -500,6 +500,30 @@ fn rust_addr2line_resolver_uses_perf_dwarf_names_for_inline_frames() {
 }
 
 #[test]
+fn rust_addr2line_resolver_uses_object_symbol_for_non_inline_frames_like_perf_script() {
+    let profiling_binary = PathBuf::from("target/profiling/pyroclast");
+    if !profiling_binary.exists() {
+        return;
+    }
+
+    let resolver = RustAddr2lineResolver;
+    let frames = resolver
+        .resolve_frame_batch(&[SymbolRequest {
+            path: profiling_binary,
+            relative_address: 0x0023_7098,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        }])
+        .expect("resolve frames");
+
+    assert_eq!(
+        frames,
+        vec![vec!["std::sys::fs::unix::canonicalize".to_string()]]
+    );
+}
+
+#[test]
 fn rejects_ambiguous_generic_dwarf_names_from_debug_strings() {
     let debug_strings =
         b"\0crate::make<crate::A>\0other::make<other::B>\0crate::not_make<crate::A>\0";

@@ -1045,12 +1045,13 @@ impl SymbolResolver for RustAddr2lineResolver {
                     .as_ref()
                     .and_then(|resolver| resolver.frame_names(request.relative_address))
                     .map(perf_inline_frame_order)
-                    .or_else(|| rust_addr2line_frame_names(&loader, request.relative_address))
+                    .or_else(|| object_symbol.clone().map(|name| vec![name]))
                     .or_else(|| {
                         loader
                             .find_symbol(request.relative_address)
                             .map(|name| vec![demangle_addr2line_name(name)])
                     })
+                    .or_else(|| rust_addr2line_frame_names(&loader, request.relative_address))
                     .unwrap_or_default();
                 frames = perf_frames_with_object_alias(frames, object_symbol);
                 specialize_frames_from_debug_strings(&mut frames, &debug_names);
@@ -1355,14 +1356,19 @@ where
         if let Some(name) = perf_dwarf_die_name(dwarf, unit, entry) {
             frames.push(perf_dwarf_function_name(&name));
         }
+        let mut found_inline_child = false;
         let mut children = node.children();
         while let Ok(Some(child)) = children.next() {
             if let Some(mut child_frames) =
                 perf_dwarf_frames_from_node(dwarf, unit, child, address, true)
             {
+                found_inline_child = true;
                 frames.append(&mut child_frames);
                 break;
             }
+        }
+        if !looking_for_inline && !found_inline_child {
+            return None;
         }
         return (!frames.is_empty()).then_some(frames);
     }
@@ -1578,7 +1584,7 @@ fn looks_like_cpp_qualified_name(name: &str) -> bool {
 }
 
 fn perf_script_keeps_rust_qualified_name(name: &str) -> bool {
-    name.starts_with("std::fs::") || name.starts_with("std::io::")
+    name.starts_with("std::fs::") || name.starts_with("std::io::") || name.starts_with("std::sys::")
 }
 
 fn rust_leaf_with_receiver_generics(name: &str) -> Option<String> {
