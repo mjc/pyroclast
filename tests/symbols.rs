@@ -239,7 +239,6 @@ fn rust_addr2line_resolver_reads_symbol_table_names() {
 
     let symbol_name = symbols[0].as_deref().expect("symbol name");
     assert!(!symbol_name.is_empty());
-    assert!(!symbol_name.contains("::"));
 }
 
 #[test]
@@ -278,19 +277,18 @@ fn symbolizer_selector_can_use_rust_addr2line_without_process_runner() {
 
     let symbol_name = symbols[0].as_deref().expect("symbol name");
     assert!(!symbol_name.is_empty());
-    assert!(!symbol_name.contains("::"));
     assert!(runner.commands().is_empty());
 }
 
 #[test]
-fn perf_symbol_name_shortens_qualified_paths_like_perf_script() {
+fn perf_symbol_name_preserves_language_qualified_names_like_perf_script() {
     assert_eq!(
         perf_symbol_name("pyroclast::perfdata::attrs::parse_file_attrs"),
-        "parse_file_attrs"
+        "pyroclast::perfdata::attrs::parse_file_attrs"
     );
     assert_eq!(
         perf_symbol_name("<pyroclast::cli::RunArgs as clap_builder::derive::Args>::augment_args"),
-        "augment_args"
+        "<pyroclast::cli::RunArgs as clap_builder::derive::Args>::augment_args"
     );
     assert_eq!(
         perf_symbol_name("next<core::slice::iter::Iter<clap_builder::util::id::Id>>"),
@@ -304,9 +302,12 @@ fn perf_symbol_name_shortens_qualified_paths_like_perf_script() {
     );
     assert_eq!(
         perf_symbol_name("std::vector<int, std::allocator<int>>::push_back"),
-        "push_back"
+        "std::vector<int, std::allocator<int>>::push_back"
     );
-    assert_eq!(perf_symbol_name("foo::bar<std::vector<int>>::baz"), "baz");
+    assert_eq!(
+        perf_symbol_name("foo::bar<std::vector<int>>::baz"),
+        "foo::bar<std::vector<int>>::baz"
+    );
     assert_eq!(
         perf_symbol_name("operator new(unsigned long)"),
         "operator new(unsigned long)"

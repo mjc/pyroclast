@@ -892,23 +892,7 @@ fn rust_addr2line_frame_names(loader: &addr2line::Loader, address: u64) -> Optio
 
 #[must_use]
 pub fn perf_symbol_name(name: &str) -> String {
-    let mut angle_depth = 0_u32;
-    let mut last_namespace_separator = None;
-    for (index, character) in name.char_indices() {
-        match character {
-            '<' => angle_depth = angle_depth.saturating_add(1),
-            '>' => angle_depth = angle_depth.saturating_sub(1),
-            ':' if angle_depth == 0 && name[index..].starts_with("::") => {
-                last_namespace_separator = Some(index);
-            }
-            _ => {}
-        }
-    }
-    last_namespace_separator
-        .and_then(|index| name.get(index + 2..))
-        .filter(|part| !part.is_empty())
-        .unwrap_or(name)
-        .to_string()
+    name.to_owned()
 }
 
 #[must_use]
