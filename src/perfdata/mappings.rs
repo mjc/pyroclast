@@ -1,6 +1,10 @@
 use crate::perfdata::records::{Mmap2BuildIdRecord, Mmap2Record, MmapRecord};
 use crate::symbols::KernelRelocation;
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
+
 const PROT_EXEC: u32 = 4;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -23,6 +27,17 @@ pub struct FileIdentity {
     pub minor: u32,
     pub inode: u64,
     pub inode_generation: u64,
+}
+
+#[must_use]
+#[cfg(unix)]
+pub fn file_matches_recorded_identity(path: &Path, identity: FileIdentity) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.ino() == identity.inode)
+}
+
+#[cfg(not(unix))]
+pub fn file_matches_recorded_identity(_path: &Path, _identity: FileIdentity) -> bool {
+    false
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

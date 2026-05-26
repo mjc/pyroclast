@@ -1,4 +1,8 @@
-use pyroclast::perfdata::mappings::{FileIdentity, MmapTable, ResolvedMapping};
+use std::os::unix::fs::MetadataExt;
+
+use pyroclast::perfdata::mappings::{
+    FileIdentity, MmapTable, ResolvedMapping, file_matches_recorded_identity,
+};
 use pyroclast::perfdata::records::{Mmap2BuildIdRecord, Mmap2Record, MmapRecord};
 use pyroclast::symbols::KernelRelocation;
 
@@ -175,6 +179,33 @@ fn resolves_file_identity_from_mmap2_mapping() {
             inode_generation: 7,
         })
     );
+}
+
+#[test]
+fn compares_recorded_file_identity_with_current_path() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("app");
+    std::fs::write(&path, b"binary").expect("write app");
+    let metadata = std::fs::metadata(&path).expect("metadata");
+
+    assert!(file_matches_recorded_identity(
+        &path,
+        FileIdentity {
+            major: 0,
+            minor: 0,
+            inode: metadata.ino(),
+            inode_generation: 0,
+        }
+    ));
+    assert!(!file_matches_recorded_identity(
+        &path,
+        FileIdentity {
+            major: 0,
+            minor: 0,
+            inode: metadata.ino() + 1,
+            inode_generation: 0,
+        }
+    ));
 }
 
 #[test]
