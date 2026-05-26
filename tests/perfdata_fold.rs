@@ -141,7 +141,26 @@ fn folds_dwarf_user_stack_payloads_when_callchain_is_empty() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "0x4000;0x1234 1\n");
+    assert_eq!(folded, "0x1234;0x4000 1\n");
+}
+
+#[test]
+fn folds_callchains_in_flamegraph_root_to_leaf_order() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [record_bytes(
+            9,
+            &sample_payload(0x1000, 11, 12, [0x2000, 0x3000, 0x4000]),
+        )],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, "0x4000;0x3000;0x2000 1\n");
 }
 
 #[test]
@@ -178,7 +197,7 @@ fn folds_identical_sample_callchains_as_hex_frames() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "0x2000;0x3000 2\n0x4000 1\n");
+    assert_eq!(folded, "0x3000;0x2000 2\n0x4000 1\n");
 }
 
 #[test]
@@ -566,7 +585,7 @@ fn prefetches_unique_symbol_requests_before_folding() {
     let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
         .expect("folded");
 
-    assert_eq!(folded, "app::main;app::work 2\n");
+    assert_eq!(folded, "app::work;app::main 2\n");
     assert_eq!(
         resolver.calls(),
         vec![vec![

@@ -293,6 +293,7 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
                         callchain.extend(
                             frames
                                 .into_iter()
+                                .rev()
                                 .filter(|frame| !is_perf_context_marker(*frame)),
                         );
                         raw_stacks.add_slice(pid, &callchain, count);
