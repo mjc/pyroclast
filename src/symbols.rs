@@ -201,6 +201,22 @@ where
 }
 
 #[must_use]
+pub fn perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources<O>(
+    object_resolver: O,
+    perfdata: &Path,
+    home: &Path,
+    system_map_candidates: impl IntoIterator<Item = PathBuf>,
+    kallsyms_path: &Path,
+) -> PerfSymbolResolver<O>
+where
+    O: SymbolResolver,
+{
+    perf_symbol_resolver_for_perfdata_file_with_object(object_resolver, perfdata, home)
+        .with_system_map_candidates(system_map_candidates)
+        .with_system_kallsyms_from_path(kallsyms_path)
+}
+
+#[must_use]
 pub fn perf_symbol_resolver_for_perfdata_file_with_symbolizer<'a, R>(
     runner: &'a R,
     perfdata: &Path,
@@ -274,19 +290,13 @@ where
     O: SymbolResolver,
 {
     match std::env::var_os("HOME") {
-        Some(home) => {
-            let resolver = perf_symbol_resolver_for_perfdata_file_with_object(
-                object_resolver,
-                perfdata,
-                Path::new(&home),
-            )
-            .with_system_map_candidates(current_linux_system_map_candidates());
-            if resolver.system_map_kallsyms.is_some() {
-                resolver
-            } else {
-                resolver.with_system_kallsyms()
-            }
-        }
+        Some(home) => perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+            object_resolver,
+            perfdata,
+            Path::new(&home),
+            current_linux_system_map_candidates(),
+            Path::new("/proc/kallsyms"),
+        ),
         None => PerfSymbolResolver::from_object_resolver(object_resolver).with_system_kallsyms(),
     }
 }
