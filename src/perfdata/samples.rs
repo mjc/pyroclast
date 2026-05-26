@@ -85,6 +85,20 @@ pub struct SampleCallchain<'a> {
     pub tid: Option<u32>,
     pub period: Option<u64>,
     pub frames: SampleCallchainFrames<'a>,
+    pub user_regs: Option<SampleUserRegs>,
+    pub user_stack: Option<SampleUserStack<'a>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SampleUserRegs {
+    pub abi: u64,
+    pub values: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SampleUserStack<'a> {
+    pub bytes: &'a [u8],
+    pub dynamic_size: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -259,12 +273,29 @@ pub fn parse_sample_record_callchain(
         .checked_mul(8)
         .ok_or_else(|| "perf sample callchain byte length overflows usize".to_string())?;
     let frames = cursor.read_bytes(callchain_bytes)?;
+    let mut user_regs = None;
+    let mut user_stack = None;
+
+    if layout.has(PERF_SAMPLE_RAW) {
+        cursor.skip_sized_u32_payload()?;
+    }
+    if layout.has(PERF_SAMPLE_BRANCH_STACK) {
+        cursor.skip_branch_stack(layout.branch_sample_type)?;
+    }
+    if layout.has(PERF_SAMPLE_REGS_USER) {
+        user_regs = Some(cursor.read_regs(layout.sample_regs_user)?);
+    }
+    if layout.has(PERF_SAMPLE_STACK_USER) {
+        user_stack = Some(cursor.read_user_stack()?);
+    }
 
     Ok(Some(SampleCallchain {
         pid,
         tid,
         period,
         frames: SampleCallchainFrames { payload: frames },
+        user_regs,
+        user_stack,
     }))
 }
 
@@ -407,19 +438,38 @@ impl<'a> SampleCursor<'a> {
     }
 
     fn skip_regs(&mut self, mask: u64) -> Result<(), String> {
-        self.skip_u64()?;
-        let register_count = mask.count_ones() as usize;
-        let byte_len = register_count
-            .checked_mul(8)
-            .ok_or_else(|| "perf sample register byte length overflows usize".to_string())?;
-        self.read_bytes(byte_len).map(|_| ())
+        self.read_regs(mask).map(|_| ())
     }
 
     fn skip_user_stack(&mut self) -> Result<(), String> {
+        self.read_user_stack().map(|_| ())
+    }
+
+    fn read_regs(&mut self, mask: u64) -> Result<SampleUserRegs, String> {
+        let abi = self.read_u64()?;
+        let register_count = if abi == 0 {
+            0
+        } else {
+            mask.count_ones() as usize
+        };
+        let mut values = Vec::with_capacity(register_count);
+        for _ in 0..register_count {
+            values.push(self.read_u64()?);
+        }
+        Ok(SampleUserRegs { abi, values })
+    }
+
+    fn read_user_stack(&mut self) -> Result<SampleUserStack<'a>, String> {
         let size = usize::try_from(self.read_u64()?)
             .map_err(|_| "perf sample user stack size does not fit in usize".to_string())?;
-        self.read_bytes(size)?;
-        self.skip_u64()
+        let bytes = self.read_bytes(size)?;
+        let padding = size.next_multiple_of(8) - size;
+        self.read_bytes(padding)?;
+        let dynamic_size = self.read_u64()?;
+        Ok(SampleUserStack {
+            bytes,
+            dynamic_size,
+        })
     }
 
     fn skip_read_format(&mut self, read_format: u64) -> Result<(), String> {
