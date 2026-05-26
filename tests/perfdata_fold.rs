@@ -301,6 +301,51 @@ fn skips_dwarf_user_stack_payloads_for_kernel_samples_without_user_context_marke
 }
 
 #[test]
+fn unwinds_kernel_samples_when_perf_captured_a_mapped_user_register_ip() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            (1 << 6) | (1 << 7) | (1 << 8),
+        )],
+        [
+            record_bytes(1, &mmap_payload(11, 11, 0x1200, 0x100, 0, "/tmp/app")),
+            record_bytes_with_misc(
+                9,
+                PERF_RECORD_MISC_CPUMODE_KERNEL,
+                &sample_payload_with_user_stack(
+                    0x4000,
+                    11,
+                    12,
+                    [
+                        0xffff_ffff_ffff_ff80,
+                        0xffff_ffff_8100_0000,
+                        0xffff_ffff_8200_0000,
+                    ],
+                    1,
+                    [0x7fff_0008, 0x7fff_0000, 0x1234],
+                    [
+                        0, 0, 0, 0, 0, 0, 0, 0, //
+                        0x40, 0, 0, 0, 0, 0, 0, 0, //
+                        0x34, 0x12, 0, 0, 0, 0, 0, 0,
+                    ],
+                ),
+            ),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(
+        folded,
+        "/tmp/app+0x33;/tmp/app+0x34;[unknown];[unknown] 1\n"
+    );
+}
+
+#[test]
 fn skips_dwarf_unwind_when_perf_user_stack_dynamic_size_is_zero_like_perf_script() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
