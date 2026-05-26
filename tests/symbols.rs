@@ -382,6 +382,16 @@ fn finds_unique_generic_dwarf_names_from_debug_strings() {
 }
 
 #[test]
+fn specializes_generic_placeholder_dwarf_names_from_debug_strings() {
+    let debug_strings = b"\0alloc::collections::btree::map::BTreeMap<u64, alloc::string::String, alloc::alloc::Global>::insert\0other_name\0";
+
+    assert_eq!(
+        more_specific_dwarf_name_from_debug_strings("insert<K,V,A>", debug_strings),
+        Some("insert<u64, alloc::string::String, alloc::alloc::Global>".to_string())
+    );
+}
+
+#[test]
 fn rejects_ambiguous_generic_dwarf_names_from_debug_strings() {
     let debug_strings =
         b"\0crate::make<crate::A>\0other::make<other::B>\0crate::not_make<crate::A>\0";

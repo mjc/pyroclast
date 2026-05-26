@@ -1029,10 +1029,11 @@ impl DebugStringNameIndex {
     }
 
     fn get(&self, function_leaf: &str) -> Option<String> {
-        if function_leaf.contains('<') || function_leaf.is_empty() {
+        if function_leaf.is_empty() {
             return None;
         }
-        self.names_by_leaf.get(function_leaf).cloned().flatten()
+        let lookup_leaf = generic_function_leaf(function_leaf).unwrap_or(function_leaf);
+        self.names_by_leaf.get(lookup_leaf).cloned().flatten()
     }
 }
 
