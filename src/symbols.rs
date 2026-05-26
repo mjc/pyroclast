@@ -83,6 +83,7 @@ pub struct PerfSymbolResolver<O> {
     kernel_elf: Option<PathBuf>,
     kallsyms: Option<Kallsyms>,
     live_kallsyms: Option<Kallsyms>,
+    system_map_kallsyms: Option<Kallsyms>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -316,6 +317,7 @@ where
             kernel_elf: None,
             kallsyms: None,
             live_kallsyms: None,
+            system_map_kallsyms: None,
         }
     }
 
@@ -349,12 +351,18 @@ where
     }
 
     #[must_use]
+    pub fn with_system_map_kallsyms(mut self, kallsyms: Kallsyms) -> Self {
+        self.system_map_kallsyms = Some(kallsyms);
+        self
+    }
+
+    #[must_use]
     pub fn with_system_map_candidates(self, candidates: impl IntoIterator<Item = PathBuf>) -> Self {
         if self.kernel_elf.is_some() {
             return self;
         }
         match Kallsyms::load_first_system_map_candidate(candidates) {
-            Some(kallsyms) => self.with_kallsyms(kallsyms),
+            Some(kallsyms) => self.with_system_map_kallsyms(kallsyms),
             None => self,
         }
     }
@@ -774,6 +782,11 @@ where
                 .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
                 .or_else(|| {
                     self.live_kallsyms
+                        .as_ref()
+                        .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
+                })
+                .or_else(|| {
+                    self.system_map_kallsyms
                         .as_ref()
                         .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
                 })

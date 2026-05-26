@@ -924,6 +924,32 @@ ffffffff846997a0 T __pi_memcpy
 }
 
 #[test]
+fn perf_symbol_resolver_prefers_system_kallsyms_over_system_map() {
+    let root = tempfile::tempdir().expect("root");
+    let live_kallsyms = root.path().join("kallsyms");
+    std::fs::write(&live_kallsyms, "ffffffff846997a0 T __pi_memcpy\n").expect("kallsyms");
+    let system_map = root.path().join("System.map");
+    std::fs::write(&system_map, "ffffffff846997a0 T memcpy\n").expect("system map");
+
+    let runner = Addr2lineRunner::new(b"");
+    let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
+        .with_system_kallsyms_from_path(&live_kallsyms)
+        .with_system_map_candidates([system_map]);
+
+    let symbols = resolver
+        .resolve_batch(&[SymbolRequest {
+            path: PathBuf::from("[kernel.kallsyms]"),
+            relative_address: 0xffff_ffff_8469_97ac,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        }])
+        .expect("symbols");
+
+    assert_eq!(symbols, vec![Some("__pi_memcpy".to_string())]);
+}
+
+#[test]
 fn perf_symbol_resolver_uses_module_build_id_elf() {
     let home = tempfile::tempdir().expect("home");
     let build_id = "d6ed2003b20b59c61cdc649124d920215521fc00";
