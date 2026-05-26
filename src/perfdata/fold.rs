@@ -21,7 +21,7 @@ use crate::perfdata::samples::{
     parse_sample_record_callchain,
 };
 use crate::perfdata::unwind::{FramehopUnwinder, PerfX86_64Regs, unwind_x86_64_stack};
-use crate::symbols::{SymbolFrameCache, SymbolRequest, SymbolResolver};
+use crate::symbols::{SymbolFrameCache, SymbolRequest, SymbolResolver, perf_build_id_elf_path};
 
 const UNKNOWN_FRAME: &str = "[unknown]";
 
@@ -64,6 +64,7 @@ struct FoldAccumulator {
     raw_stacks: RawStackAccumulator<FoldFrame>,
     deferred_samples: BTreeMap<u64, Vec<DeferredFoldSample>>,
     callchain: Vec<FoldFrame>,
+    unwind_debug_dir: Option<PathBuf>,
 }
 
 struct TimedRecord<'a> {
@@ -85,6 +86,15 @@ struct DeferredFoldSample {
     comm: Option<String>,
     count: u64,
     frames: Vec<FoldFrame>,
+}
+
+#[derive(Clone, Copy)]
+struct UnwindMappingRequest<'a> {
+    start: u64,
+    len: u64,
+    pgoff: u64,
+    path: &'a str,
+    build_id: &'a [u8],
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -350,6 +360,7 @@ impl FoldAccumulator {
             raw_stacks: RawStackAccumulator::<FoldFrame>::new(),
             deferred_samples: BTreeMap::new(),
             callchain: Vec::new(),
+            unwind_debug_dir: current_perf_debug_dir(),
         }
     }
 
@@ -404,14 +415,17 @@ impl FoldAccumulator {
                 Ok(())
             }
             ParsedRecord::Mmap2BuildId(record) => {
-                load_unwind_mapping(
+                load_build_id_unwind_mapping(
                     &mut self.object_unwinder,
                     &mut self.loaded_unwind_mappings,
-                    record.start,
-                    record.len,
-                    record.pgoff,
-                    &record.path,
-                    None,
+                    UnwindMappingRequest {
+                        start: record.start,
+                        len: record.len,
+                        pgoff: record.pgoff,
+                        path: &record.path,
+                        build_id: &record.build_id,
+                    },
+                    self.unwind_debug_dir.as_deref(),
                 );
                 self.mmap_table.insert_mmap2_build_id(record);
                 Ok(())
@@ -973,6 +987,40 @@ fn load_mmap2_unwind_mapping(
     );
 }
 
+fn load_build_id_unwind_mapping(
+    object_unwinder: &mut FramehopUnwinder,
+    loaded_unwind_mappings: &mut BTreeSet<(String, u64, u64, u64)>,
+    request: UnwindMappingRequest<'_>,
+    debug_dir: Option<&Path>,
+) {
+    let object_path = unwind_object_path_for_build_id(request.path, request.build_id, debug_dir);
+    if object_path.to_string_lossy().starts_with('[') {
+        return;
+    }
+    let key = (
+        object_path.to_string_lossy().into_owned(),
+        request.start,
+        request.len,
+        request.pgoff,
+    );
+    if !loaded_unwind_mappings.insert(key) {
+        return;
+    }
+    let _ =
+        object_unwinder.add_object_mapping(&object_path, request.start, request.len, request.pgoff);
+}
+
+fn unwind_object_path_for_build_id(
+    path: &str,
+    build_id: &[u8],
+    debug_dir: Option<&Path>,
+) -> PathBuf {
+    debug_dir
+        .map(|debug_dir| perf_build_id_elf_path(debug_dir, &build_id_hex(build_id)))
+        .filter(|cached| cached.exists())
+        .unwrap_or_else(|| PathBuf::from(path))
+}
+
 fn mmap2_file_identity(record: &Mmap2Record) -> FileIdentity {
     FileIdentity {
         major: record.major,
@@ -987,6 +1035,10 @@ fn should_load_unwind_object(path: &str, file_identity: Option<FileIdentity>) ->
         return false;
     }
     file_identity.is_none_or(|identity| file_matches_recorded_identity(Path::new(path), identity))
+}
+
+fn current_perf_debug_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".debug"))
 }
 
 fn sample_layouts(
@@ -1096,5 +1148,26 @@ mod tests {
                 inode_generation: 0,
             }),
         ));
+    }
+
+    #[test]
+    fn chooses_perf_build_id_cache_for_build_id_unwind_mappings() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let debug_dir = root.path().join(".debug");
+        let cached = debug_dir
+            .join(".build-id")
+            .join("aa")
+            .join("bbcc")
+            .join("elf");
+        std::fs::create_dir_all(cached.parent().expect("parent")).expect("cache dir");
+        std::fs::write(&cached, b"cached elf").expect("cached elf");
+
+        let resolved = super::unwind_object_path_for_build_id(
+            "/tmp/stale-app",
+            &[0xaa, 0xbb, 0xcc],
+            Some(&debug_dir),
+        );
+
+        assert_eq!(resolved, cached);
     }
 }
