@@ -4,6 +4,8 @@ use crate::backends::BackendResult;
 use crate::process::{CommandRunner, CommandSpec};
 use crate::tools::ToolSpec;
 
+pub mod analysis;
+
 #[must_use]
 pub fn build_inferno_flamegraph_command(title: &str) -> CommandSpec {
     CommandSpec::new("inferno-flamegraph").args([
