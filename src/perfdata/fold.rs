@@ -585,11 +585,19 @@ fn symbol_fallback_frame(mapping: &ResolvedMapping) -> String {
 
 fn symbol_request(mapping: &ResolvedMapping) -> SymbolRequest {
     SymbolRequest {
-        path: PathBuf::from(&mapping.path),
+        path: symbol_request_path(mapping),
         relative_address: mapping.relative_address,
         build_id: mapping.build_id.as_deref().map(build_id_hex),
         file_identity: mapping.file_identity,
         kernel_relocation: mapping.kernel_relocation.clone(),
+    }
+}
+
+fn symbol_request_path(mapping: &ResolvedMapping) -> PathBuf {
+    if is_kernel_mapping(mapping) {
+        PathBuf::from("[kernel.kallsyms]")
+    } else {
+        PathBuf::from(&mapping.path)
     }
 }
 
@@ -614,7 +622,7 @@ fn module_fallback_frame(path: &str) -> String {
 }
 
 fn is_kernel_mapping(mapping: &ResolvedMapping) -> bool {
-    mapping.path.starts_with("[kernel") || mapping.path == "[guest.kernel]"
+    is_kernel_space_frame(mapping.relative_address) && mapping.path.starts_with('[')
 }
 
 fn parse_sample_for_summary(

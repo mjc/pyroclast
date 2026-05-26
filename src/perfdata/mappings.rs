@@ -170,7 +170,7 @@ impl Mapping {
     }
 
     fn relative_address(&self, ip: u64) -> u64 {
-        if self.path.starts_with("[kernel") || self.path == "[guest.kernel]" {
+        if self.is_kernel_symbol_mapping() {
             ip
         } else {
             ip - self.start + self.pgoff
@@ -197,6 +197,10 @@ impl Mapping {
 
     fn may_execute(&self) -> bool {
         !self.is_known_non_executable()
+    }
+
+    fn is_kernel_symbol_mapping(&self) -> bool {
+        self.pid == u32::MAX && self.path.starts_with('[')
     }
 }
 

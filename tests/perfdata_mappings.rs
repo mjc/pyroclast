@@ -125,6 +125,30 @@ fn resolves_kernel_relocation_from_suffixed_mapping_name() {
 }
 
 #[test]
+fn resolves_kernel_module_mapping_as_absolute_kernel_address() {
+    let mut table = MmapTable::default();
+    table.insert_mmap(MmapRecord {
+        pid: u32::MAX,
+        tid: u32::MAX,
+        start: 0xffff_ffff_c000_0000,
+        len: 0x2000,
+        pgoff: 0,
+        path: "[zfs]".to_string(),
+    });
+
+    assert_eq!(
+        table.resolve(42, 0xffff_ffff_c000_0123),
+        Some(ResolvedMapping {
+            path: "[zfs]".to_string(),
+            relative_address: 0xffff_ffff_c000_0123,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        })
+    );
+}
+
+#[test]
 fn resolves_build_id_from_mmap2_build_id_mapping() {
     let mut table = MmapTable::default();
     table.insert_mmap2_build_id(Mmap2BuildIdRecord {
