@@ -63,6 +63,7 @@ pub enum PerfCallGraph {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum PerfEvent {
+    Default,
     CpuClock,
     TaskClock,
     Cycles,
@@ -71,6 +72,7 @@ pub enum PerfEvent {
 impl std::fmt::Display for PerfEvent {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Default => formatter.write_str("default"),
             Self::CpuClock => formatter.write_str("cpu-clock"),
             Self::TaskClock => formatter.write_str("task-clock"),
             Self::Cycles => formatter.write_str("cycles"),
@@ -107,7 +109,7 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 997)]
     pub frequency: u32,
 
-    #[arg(long, value_enum, default_value_t = PerfEvent::CpuClock)]
+    #[arg(long, value_enum, default_value_t = PerfEvent::Default)]
     pub event: PerfEvent,
 
     #[arg(long, value_enum, default_value_t = PerfCallGraph::Dwarf)]
@@ -225,7 +227,7 @@ pub struct ProfileArgs {
     #[arg(long, default_value_t = 997)]
     pub frequency: u32,
 
-    #[arg(long, value_enum, default_value_t = PerfEvent::CpuClock)]
+    #[arg(long, value_enum, default_value_t = PerfEvent::Default)]
     pub event: PerfEvent,
 
     #[arg(long, value_enum, default_value_t = PerfCallGraph::Dwarf)]

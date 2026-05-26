@@ -13,7 +13,7 @@ use std::path::PathBuf;
 #[test]
 fn builds_linux_perf_record_command() {
     let command = build_perf_record_command(
-        PerfEvent::CpuClock,
+        PerfEvent::Default,
         997,
         "fp",
         &PathBuf::from("run/profile.raw.perf.data"),
@@ -26,8 +26,6 @@ fn builds_linux_perf_record_command() {
         command.args,
         vec![
             "record",
-            "-e",
-            "cpu-clock",
             "-F",
             "997",
             "-g",

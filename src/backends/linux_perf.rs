@@ -30,10 +30,11 @@ pub fn build_perf_record_command(
     target: PerfRecordTarget,
     duration_secs: u32,
 ) -> CommandSpec {
-    let mut command = CommandSpec::new("perf").args([
-        "record".to_string(),
-        "-e".to_string(),
-        event.to_string(),
+    let mut command = CommandSpec::new("perf").arg("record".to_string());
+    if event != PerfEvent::Default {
+        command = command.args(["-e".to_string(), event.to_string()]);
+    }
+    command = command.args([
         "-F".to_string(),
         frequency.to_string(),
         "-g".to_string(),
