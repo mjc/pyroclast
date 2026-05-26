@@ -1533,7 +1533,8 @@ impl DebugStringNameIndex {
         if function_leaf.is_empty() {
             return None;
         }
-        let lookup_leaf = generic_function_leaf(function_leaf).unwrap_or(function_leaf);
+        let normalized = perf_dwarf_function_name(function_leaf);
+        let lookup_leaf = generic_function_leaf(&normalized).unwrap_or(&normalized);
         self.names_by_leaf.get(lookup_leaf).cloned().flatten()
     }
 }

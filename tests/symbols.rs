@@ -415,6 +415,19 @@ fn specializes_generic_placeholder_dwarf_names_from_debug_strings() {
 }
 
 #[test]
+fn specializes_qualified_generic_placeholder_dwarf_names_from_debug_strings() {
+    let debug_strings = b"\0alloc::collections::btree::map::IntoIter<u64, alloc::string::String, alloc::alloc::Global>::dying_next\0other_name\0";
+
+    assert_eq!(
+        more_specific_dwarf_name_from_debug_strings(
+            "alloc::collections::btree::map::IntoIter<K,V,A>::dying_next",
+            debug_strings
+        ),
+        Some("dying_next<u64, alloc::string::String, alloc::alloc::Global>".to_string())
+    );
+}
+
+#[test]
 fn perf_dwarf_frame_names_prefer_die_names_like_perf_script() {
     let profiling_binary = PathBuf::from("target/profiling/pyroclast");
     if !profiling_binary.exists() {
