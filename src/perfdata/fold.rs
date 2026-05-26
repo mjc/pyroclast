@@ -794,8 +794,12 @@ fn should_drop_perf_data_user_unwind_frame(
         && pid.is_some_and(|pid| {
             mmap_table
                 .resolve(pid, address)
-                .is_some_and(|mapping| is_perf_data_mapping_path(&mapping.path))
+                .is_some_and(|mapping| should_drop_user_unwind_mapping_path(&mapping.path))
         })
+}
+
+fn should_drop_user_unwind_mapping_path(path: &str) -> bool {
+    is_perf_data_mapping_path(path) || matches!(path, "[stack]" | "[heap]")
 }
 
 fn is_perf_data_mapping_path(path: &str) -> bool {
