@@ -19,6 +19,7 @@ fn resolves_each_unique_symbol_address_once() {
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
             build_id: None,
+            file_identity: None,
             kernel_relocation: None,
         },
         "app::main".to_string(),
@@ -30,6 +31,7 @@ fn resolves_each_unique_symbol_address_once() {
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
             build_id: None,
+            file_identity: None,
             kernel_relocation: None,
         })
         .expect("first symbol");
@@ -38,6 +40,7 @@ fn resolves_each_unique_symbol_address_once() {
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
             build_id: None,
+            file_identity: None,
             kernel_relocation: None,
         })
         .expect("second symbol");
@@ -50,6 +53,7 @@ fn resolves_each_unique_symbol_address_once() {
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
             build_id: None,
+            file_identity: None,
             kernel_relocation: None,
         }]]
     );
@@ -62,6 +66,7 @@ fn symbol_resolver_frame_batch_defaults_to_single_symbol_frames() {
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
             build_id: None,
+            file_identity: None,
             kernel_relocation: None,
         },
         "app::main".to_string(),
@@ -72,6 +77,7 @@ fn symbol_resolver_frame_batch_defaults_to_single_symbol_frames() {
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
             build_id: None,
+            file_identity: None,
             kernel_relocation: None,
         }])
         .expect("frames");
@@ -87,6 +93,7 @@ fn batches_only_uncached_symbol_addresses() {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x10,
                 build_id: None,
+                file_identity: None,
                 kernel_relocation: None,
             },
             "app::main".to_string(),
@@ -96,6 +103,7 @@ fn batches_only_uncached_symbol_addresses() {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x20,
                 build_id: None,
+                file_identity: None,
                 kernel_relocation: None,
             },
             "app::work".to_string(),
@@ -107,6 +115,7 @@ fn batches_only_uncached_symbol_addresses() {
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
             build_id: None,
+            file_identity: None,
             kernel_relocation: None,
         }])
         .expect("prime cache");
@@ -117,18 +126,21 @@ fn batches_only_uncached_symbol_addresses() {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x10,
                 build_id: None,
+                file_identity: None,
                 kernel_relocation: None,
             },
             SymbolRequest {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x20,
                 build_id: None,
+                file_identity: None,
                 kernel_relocation: None,
             },
             SymbolRequest {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x20,
                 build_id: None,
+                file_identity: None,
                 kernel_relocation: None,
             },
         ])
@@ -149,12 +161,14 @@ fn batches_only_uncached_symbol_addresses() {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x10,
                 build_id: None,
+                file_identity: None,
                 kernel_relocation: None,
             }],
             vec![SymbolRequest {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x20,
                 build_id: None,
+                file_identity: None,
                 kernel_relocation: None,
             }],
         ]
@@ -172,12 +186,14 @@ fn addr2line_resolver_batches_requests_by_binary() {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x10,
                 build_id: None,
+                file_identity: None,
                 kernel_relocation: None,
             },
             SymbolRequest {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x20,
                 build_id: None,
+                file_identity: None,
                 kernel_relocation: None,
             },
         ])
@@ -215,6 +231,7 @@ fn rust_addr2line_resolver_reads_symbol_table_names() {
             path: current_exe,
             relative_address: symbol.address(),
             build_id: None,
+            file_identity: None,
             kernel_relocation: None,
         }])
         .expect("symbols");
@@ -253,6 +270,7 @@ fn symbolizer_selector_can_use_rust_addr2line_without_process_runner() {
             path: current_exe,
             relative_address: symbol.address(),
             build_id: None,
+            file_identity: None,
             kernel_relocation: None,
         }])
         .expect("symbols");
@@ -317,12 +335,14 @@ fn addr2line_resolver_treats_failed_batches_as_unresolved() {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x10,
                 build_id: None,
+                file_identity: None,
                 kernel_relocation: None,
             },
             SymbolRequest {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x20,
                 build_id: None,
+                file_identity: None,
                 kernel_relocation: None,
             },
         ])
@@ -503,12 +523,14 @@ ffffffff88000080 t asm_exc_page_fault
                 path: PathBuf::from("[kernel.kallsyms]"),
                 relative_address: 0xffff_ffff_8800_008f,
                 build_id: None,
+                file_identity: None,
                 kernel_relocation: None,
             },
             SymbolRequest {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x10,
                 build_id: None,
+                file_identity: None,
                 kernel_relocation: None,
             },
         ])
@@ -543,6 +565,7 @@ ffffffff82000000 T later_kernel_symbol
             path: PathBuf::from("[kernel.kallsyms]_text"),
             relative_address: 0xffff_ffff_8800_1280,
             build_id: None,
+            file_identity: None,
             kernel_relocation: Some(pyroclast::symbols::KernelRelocation {
                 reference_symbol: "_text".to_string(),
                 recorded_reference_address: 0xffff_ffff_8800_0000,
@@ -575,6 +598,7 @@ fn perf_symbol_resolver_loads_perfdata_kernel_build_id_cache() {
             path: PathBuf::from("[kernel.kallsyms]"),
             relative_address: 0xffff_ffff_8800_008f,
             build_id: None,
+            file_identity: None,
             kernel_relocation: None,
         }])
         .expect("symbols");
@@ -607,6 +631,7 @@ fn perf_symbol_resolver_loads_perfdata_kernel_build_id_cache_from_file() {
             path: PathBuf::from("[kernel.kallsyms]"),
             relative_address: 0xffff_ffff_8800_008f,
             build_id: None,
+            file_identity: None,
             kernel_relocation: None,
         }])
         .expect("symbols");
@@ -715,6 +740,7 @@ fn perf_symbol_resolver_constructor_uses_perfdata_cache_before_system_kallsyms()
             path: PathBuf::from("[kernel.kallsyms]"),
             relative_address: 0xffff_ffff_8800_008f,
             build_id: None,
+            file_identity: None,
             kernel_relocation: None,
         }])
         .expect("symbols");
@@ -743,6 +769,7 @@ fn perf_symbol_resolver_uses_kernel_build_id_elf_before_kallsyms() {
             path: PathBuf::from("[kernel.kallsyms]"),
             relative_address: 0xffff_ffff_8800_008f,
             build_id: None,
+            file_identity: None,
             kernel_relocation: None,
         }])
         .expect("symbols");
@@ -777,6 +804,7 @@ fn perf_symbol_resolver_uses_module_build_id_elf() {
             path: PathBuf::from("[igb]"),
             relative_address: 0x30,
             build_id: Some(build_id.to_string()),
+            file_identity: None,
             kernel_relocation: None,
         }])
         .expect("symbols");
@@ -800,6 +828,7 @@ fn perf_symbol_resolver_accepts_pluggable_object_resolver() {
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
             build_id: None,
+            file_identity: None,
             kernel_relocation: None,
         },
         "app::main".to_string(),
@@ -811,6 +840,7 @@ fn perf_symbol_resolver_accepts_pluggable_object_resolver() {
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
             build_id: None,
+            file_identity: None,
             kernel_relocation: None,
         }])
         .expect("symbols");
@@ -822,6 +852,7 @@ fn perf_symbol_resolver_accepts_pluggable_object_resolver() {
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
             build_id: None,
+            file_identity: None,
             kernel_relocation: None,
         }]]
     );
@@ -834,6 +865,7 @@ fn perf_symbol_resolver_preserves_pluggable_object_frame_lists() {
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
             build_id: None,
+            file_identity: None,
             kernel_relocation: None,
         },
         vec!["app::outer".to_string(), "app::inner".to_string()],
@@ -845,6 +877,7 @@ fn perf_symbol_resolver_preserves_pluggable_object_frame_lists() {
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
             build_id: None,
+            file_identity: None,
             kernel_relocation: None,
         }])
         .expect("frames");
@@ -872,6 +905,7 @@ fn perf_symbol_resolver_uses_system_map_candidates_when_cache_is_missing() {
             path: PathBuf::from("[kernel.kallsyms]_text"),
             relative_address: 0xffff_ffff_8100_1280,
             build_id: None,
+            file_identity: None,
             kernel_relocation: None,
         }])
         .expect("symbols");

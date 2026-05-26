@@ -4,6 +4,7 @@ use pyroclast::perfdata::fold::{
     FoldOptions, fold_perfdata_callchains, fold_perfdata_callchains_with_options,
     fold_perfdata_callchains_with_symbols, fold_perfdata_file_with_options, summarize_perfdata,
 };
+use pyroclast::perfdata::mappings::FileIdentity;
 use pyroclast::perfdata::samples::{
     PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP,
     PERF_SAMPLE_PERIOD, PERF_SAMPLE_REGS_USER, PERF_SAMPLE_STACK_USER, PERF_SAMPLE_TID,
@@ -758,6 +759,46 @@ fn symbolized_fold_carries_mmap2_build_ids_to_symbol_requests() {
             path: std::path::PathBuf::from("[igb]"),
             relative_address: 0x30,
             build_id: Some("aabbccdd".to_string()),
+            file_identity: None,
+            kernel_relocation: None,
+        }]]
+    );
+}
+
+#[test]
+fn symbolized_fold_carries_mmap2_file_identity_to_symbol_requests() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(
+                10,
+                &mmap2_payload(11, 11, 0x4000, 0x100, 0x20, 5, "/bin/app"),
+            ),
+            record_bytes(9, &sample_payload(0x1000, 11, 12, [0x4010])),
+        ],
+    );
+    let resolver = RecordingSymbolResolver::default();
+
+    let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
+        .expect("folded");
+
+    assert_eq!(folded, "[app] 1\n");
+    assert_eq!(
+        resolver.calls(),
+        vec![vec![SymbolRequest {
+            path: std::path::PathBuf::from("/bin/app"),
+            relative_address: 0x30,
+            build_id: None,
+            file_identity: Some(FileIdentity {
+                major: 8,
+                minor: 1,
+                inode: 99,
+                inode_generation: 7,
+            }),
             kernel_relocation: None,
         }]]
     );
@@ -959,12 +1000,14 @@ fn prefetches_unique_symbol_requests_before_folding() {
                 path: std::path::PathBuf::from("/bin/app"),
                 relative_address: 0x10,
                 build_id: None,
+                file_identity: None,
                 kernel_relocation: None,
             },
             SymbolRequest {
                 path: std::path::PathBuf::from("/bin/app"),
                 relative_address: 0x20,
                 build_id: None,
+                file_identity: None,
                 kernel_relocation: None,
             }
         ]]

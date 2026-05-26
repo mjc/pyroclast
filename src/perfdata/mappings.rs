@@ -21,7 +21,7 @@ pub struct ResolvedMapping {
     pub kernel_relocation: Option<KernelRelocation>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct FileIdentity {
     pub major: u32,
     pub minor: u32,

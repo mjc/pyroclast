@@ -7,6 +7,7 @@ use clap::ValueEnum;
 use serde::Serialize;
 
 use crate::perfdata::build_id::kernel_build_id_from_perfdata;
+use crate::perfdata::mappings::FileIdentity;
 use crate::process::{CommandRunner, CommandSpec};
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -20,6 +21,7 @@ pub struct SymbolRequest {
     pub path: PathBuf,
     pub relative_address: u64,
     pub build_id: Option<String>,
+    pub file_identity: Option<FileIdentity>,
     pub kernel_relocation: Option<KernelRelocation>,
 }
 
@@ -632,6 +634,7 @@ where
                         path: kernel_elf.clone(),
                         relative_address: request.relative_address,
                         build_id: None,
+                        file_identity: None,
                         kernel_relocation: None,
                     });
                 } else {
@@ -677,6 +680,7 @@ where
                         path: kernel_elf.clone(),
                         relative_address: request.relative_address,
                         build_id: None,
+                        file_identity: None,
                         kernel_relocation: None,
                     });
                 } else if let Some(symbol) = self
@@ -730,6 +734,7 @@ where
             path: elf,
             relative_address: request.relative_address,
             build_id: None,
+            file_identity: None,
             kernel_relocation: None,
         }
     }

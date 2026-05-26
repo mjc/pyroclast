@@ -579,6 +579,7 @@ fn symbol_request(mapping: &ResolvedMapping) -> SymbolRequest {
         path: PathBuf::from(&mapping.path),
         relative_address: mapping.relative_address,
         build_id: mapping.build_id.as_deref().map(build_id_hex),
+        file_identity: mapping.file_identity,
         kernel_relocation: mapping.kernel_relocation.clone(),
     }
 }
