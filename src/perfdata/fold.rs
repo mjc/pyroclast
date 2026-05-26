@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::folded::render_folded_stack;
 use crate::perfdata::attrs::{PerfFileAttr, parse_file_attr_ids, parse_file_attrs};
+use crate::perfdata::build_id::build_id_events_from_perfdata;
 use crate::perfdata::endian::read_u64;
 use crate::perfdata::header::parse_header;
 use crate::perfdata::mappings::{
@@ -61,6 +62,7 @@ struct FoldAccumulator {
     mmap_table: MmapTable,
     object_unwinder: FramehopUnwinder,
     loaded_unwind_mappings: BTreeSet<(String, u64, u64, u64)>,
+    header_build_ids: BTreeMap<String, Vec<u8>>,
     raw_stacks: RawStackAccumulator<FoldFrame>,
     deferred_samples: BTreeMap<u64, Vec<DeferredFoldSample>>,
     callchain: Vec<FoldFrame>,
@@ -330,7 +332,8 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
     let header = parse_header(bytes)?;
     let sample_layouts = sample_layouts(bytes, header)?;
     let mut records = timed_records(bytes, header, &sample_layouts)?;
-    let mut accumulator = FoldAccumulator::new();
+    let header_build_ids = header_build_ids_by_filename(bytes)?;
+    let mut accumulator = FoldAccumulator::new(header_build_ids);
 
     records.sort_by_key(|record| (record.time.unwrap_or(0), record.index));
     for timed_record in records {
@@ -348,8 +351,28 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
     Ok(accumulator.into_fold_data())
 }
 
+fn header_build_ids_by_filename(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    build_id_events_from_perfdata(bytes)?
+        .into_iter()
+        .map(|event| hex_build_id_bytes(&event.build_id).map(|build_id| (event.filename, build_id)))
+        .collect()
+}
+
+fn hex_build_id_bytes(hex: &str) -> Result<Vec<u8>, String> {
+    if !hex.len().is_multiple_of(2) {
+        return Err(format!("build-id hex has odd length: {}", hex.len()));
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&hex[index..index + 2], 16)
+                .map_err(|error| format!("build-id hex is invalid at offset {index}: {error}"))
+        })
+        .collect()
+}
+
 impl FoldAccumulator {
-    fn new() -> Self {
+    fn new(header_build_ids: BTreeMap<String, Vec<u8>>) -> Self {
         Self {
             process_comms: BTreeMap::new(),
             exec_process_comms: BTreeMap::new(),
@@ -357,6 +380,7 @@ impl FoldAccumulator {
             mmap_table: MmapTable::default(),
             object_unwinder: FramehopUnwinder::new(),
             loaded_unwind_mappings: BTreeSet::new(),
+            header_build_ids,
             raw_stacks: RawStackAccumulator::<FoldFrame>::new(),
             deferred_samples: BTreeMap::new(),
             callchain: Vec::new(),
@@ -406,12 +430,30 @@ impl FoldAccumulator {
                 Ok(())
             }
             ParsedRecord::Mmap2(record) => {
-                load_mmap2_unwind_mapping(
-                    &mut self.object_unwinder,
-                    &mut self.loaded_unwind_mappings,
-                    &record,
-                );
-                self.mmap_table.insert_mmap2(record);
+                let build_id = self.header_build_ids.get(&record.path).cloned();
+                if let Some(build_id) = build_id {
+                    load_build_id_unwind_mapping(
+                        &mut self.object_unwinder,
+                        &mut self.loaded_unwind_mappings,
+                        UnwindMappingRequest {
+                            start: record.start,
+                            len: record.len,
+                            pgoff: record.pgoff,
+                            path: &record.path,
+                            build_id: &build_id,
+                        },
+                        self.unwind_debug_dir.as_deref(),
+                    );
+                    self.mmap_table
+                        .insert_mmap2_with_build_id(record, Some(build_id));
+                } else {
+                    load_mmap2_unwind_mapping(
+                        &mut self.object_unwinder,
+                        &mut self.loaded_unwind_mappings,
+                        &record,
+                    );
+                    self.mmap_table.insert_mmap2(record);
+                }
                 Ok(())
             }
             ParsedRecord::Mmap2BuildId(record) => {

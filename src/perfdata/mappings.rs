@@ -78,13 +78,17 @@ impl MmapTable {
     }
 
     pub fn insert_mmap2(&mut self, record: Mmap2Record) {
+        self.insert_mmap2_with_build_id(record, None);
+    }
+
+    pub fn insert_mmap2_with_build_id(&mut self, record: Mmap2Record, build_id: Option<Vec<u8>>) {
         self.mappings.push(Mapping {
             pid: record.pid,
             start: record.start,
             len: record.len,
             pgoff: record.pgoff,
             path: record.path,
-            build_id: None,
+            build_id,
             file_identity: Some(FileIdentity {
                 major: record.major,
                 minor: record.minor,

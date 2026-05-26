@@ -1136,6 +1136,50 @@ fn symbolized_fold_carries_mmap2_file_identity_to_symbol_requests() {
 }
 
 #[test]
+fn symbolized_fold_carries_header_build_ids_to_mmap2_symbol_requests() {
+    let build_id = [
+        0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90,
+        0xa0, 0xb0, 0xc0, 0xd0, 0xe0,
+    ];
+    let bytes = perfdata_with_records_attrs_and_build_id_feature(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(
+                10,
+                &mmap2_payload(11, 11, 0x4000, 0x100, 0x20, 5, "/tmp/stale-app"),
+            ),
+            record_bytes(9, &sample_payload(0x1000, 11, 12, [0x4010])),
+        ],
+        &build_id_event_payload(u32::MAX, &build_id, "/tmp/stale-app"),
+    );
+    let resolver = RecordingSymbolResolver::default();
+
+    let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
+        .expect("folded");
+
+    assert_eq!(folded, "[stale-app] 1\n");
+    assert_eq!(
+        resolver.calls(),
+        vec![vec![SymbolRequest {
+            path: std::path::PathBuf::from("/tmp/stale-app"),
+            relative_address: 0x30,
+            build_id: Some("aabbccddeeff102030405060708090a0b0c0d0e0".to_string()),
+            file_identity: Some(FileIdentity {
+                major: 8,
+                minor: 1,
+                inode: 99,
+                inode_generation: 7,
+            }),
+            kernel_relocation: None,
+        }]]
+    );
+}
+
+#[test]
 fn folds_mapped_user_frames_with_symbol_names() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
@@ -1497,6 +1541,45 @@ fn perfdata_with_records_and_attrs<const A: usize, const R: usize>(
     bytes
 }
 
+fn perfdata_with_records_attrs_and_build_id_feature<const A: usize, const R: usize>(
+    attrs: [[u8; 144]; A],
+    records: [Vec<u8>; R],
+    build_id_payload: &[u8],
+) -> Vec<u8> {
+    let attr_size = attrs.len() * 144;
+    let data_size = records.iter().map(Vec::len).sum::<usize>();
+    let data_offset = 104 + attr_size;
+    let feature_table_offset = data_offset + data_size;
+    let build_id_payload_offset = feature_table_offset + 16;
+    let mut bytes = vec![0; 104];
+    bytes[..8].copy_from_slice(b"PERFILE2");
+    put_u64(&mut bytes, 8, 104);
+    put_u64(&mut bytes, 24, 104);
+    put_u64(&mut bytes, 32, attr_size as u64);
+    put_u64(&mut bytes, 40, data_offset as u64);
+    put_u64(&mut bytes, 48, data_size as u64);
+    put_u64(&mut bytes, 56, 1 << 2);
+    for attr in attrs {
+        bytes.extend(attr);
+    }
+    for record in records {
+        bytes.extend(record);
+    }
+    bytes.resize(build_id_payload_offset, 0);
+    put_u64(
+        &mut bytes,
+        feature_table_offset,
+        build_id_payload_offset as u64,
+    );
+    put_u64(
+        &mut bytes,
+        feature_table_offset + 8,
+        u64::try_from(build_id_payload.len()).expect("payload size"),
+    );
+    bytes.extend(build_id_payload);
+    bytes
+}
+
 fn perfdata_with_attrs_ids_and_records<const A: usize, const I: usize, const R: usize>(
     attrs: [[u8; 144]; A],
     ids: [u64; I],
@@ -1757,6 +1840,20 @@ fn mmap2_build_id_payload(
     payload.extend(5u32.to_le_bytes());
     payload.extend(2u32.to_le_bytes());
     payload.extend(path.as_bytes());
+    payload.push(0);
+    payload
+}
+
+fn build_id_event_payload(pid: u32, build_id: &[u8; 20], filename: &str) -> Vec<u8> {
+    let size = 36 + filename.len() + 1;
+    let mut payload = Vec::new();
+    payload.extend(67_u32.to_le_bytes());
+    payload.extend(0_u16.to_le_bytes());
+    payload.extend(u16::try_from(size).expect("event size").to_le_bytes());
+    payload.extend(pid.to_le_bytes());
+    payload.extend(build_id);
+    payload.extend([0; 4]);
+    payload.extend(filename.as_bytes());
     payload.push(0);
     payload
 }
