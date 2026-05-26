@@ -549,14 +549,18 @@ fn parse_sample_for_fold(
                     1
                 };
                 let mut frames = sample.frames.collect::<Vec<_>>();
-                if frames.is_empty()
-                    && let (Some(regs), Some(stack)) = (&sample.user_regs, &sample.user_stack)
+                if let (Some(regs), Some(stack)) = (&sample.user_regs, &sample.user_stack)
                     && let Ok(regs) = PerfX86_64Regs::from_perf_masked_values(
                         layout.sample_regs_user,
                         &regs.values,
                     )
                 {
-                    frames = unwind_x86_64_stack(regs, stack.bytes, 256);
+                    let unwound_frames = unwind_x86_64_stack(regs, stack.bytes, 256);
+                    if frames.is_empty() {
+                        frames = unwound_frames;
+                    } else {
+                        frames.extend(unwound_frames);
+                    }
                 }
                 (sample.pid, count, frames)
             })
