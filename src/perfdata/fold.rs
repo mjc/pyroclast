@@ -510,7 +510,7 @@ impl<'a> FoldFrameResolver<'a> {
         R: SymbolResolver,
     {
         let mut frames = if let Some(comm) = pid.and_then(|pid| self.comms_by_pid.get(&pid)) {
-            vec![comm.clone()]
+            vec![comm.replace(' ', "_")]
         } else {
             Vec::new()
         };
