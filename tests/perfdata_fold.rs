@@ -6,7 +6,7 @@ use pyroclast::perfdata::fold::{
 };
 use pyroclast::perfdata::samples::{
     PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP,
-    PERF_SAMPLE_PERIOD, PERF_SAMPLE_TID,
+    PERF_SAMPLE_PERIOD, PERF_SAMPLE_REGS_USER, PERF_SAMPLE_STACK_USER, PERF_SAMPLE_TID,
 };
 use pyroclast::symbols::{SymbolRequest, SymbolResolver};
 
@@ -83,6 +83,31 @@ fn summarizes_sample_callchain_counts_using_file_attr_layout() {
 
     assert_eq!(summary.sample_stacks.len(), 1);
     assert_eq!(summary.sample_stacks[0].callchain, vec![0x2000, 0x3000]);
+}
+
+#[test]
+fn summarizes_dwarf_user_stack_payloads() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            0b1,
+        )],
+        [record_bytes(
+            9,
+            &sample_payload_with_user_stack(0x1000, 11, 12, [0x2000], 1, [0xaaaa], [1, 2, 3]),
+        )],
+    );
+
+    let summary = summarize_perfdata(&bytes).expect("summary");
+
+    assert_eq!(summary.sample_stacks.len(), 1);
+    assert!(summary.sample_stacks[0].has_user_stack);
+    assert_eq!(summary.sample_stacks[0].user_register_count, 1);
+    assert_eq!(summary.sample_stacks[0].user_stack_size, 3);
 }
 
 #[test]
@@ -587,6 +612,12 @@ fn file_attr_bytes(sample_type: u64, ids_offset: u64, ids_size: u64) -> [u8; 144
     bytes
 }
 
+fn file_attr_bytes_with_regs(sample_type: u64, sample_regs_user: u64) -> [u8; 144] {
+    let mut bytes = file_attr_bytes(sample_type, 0, 0);
+    put_u64(&mut bytes, 80, sample_regs_user);
+    bytes
+}
+
 fn file_attr_bytes_with_ids<const N: usize>(
     sample_type: u64,
     ids_offset: u64,
@@ -683,6 +714,27 @@ fn sample_payload_with_id_and_period<const N: usize>(
     for frame in callchain {
         payload.extend(frame.to_le_bytes());
     }
+    payload
+}
+
+fn sample_payload_with_user_stack<const C: usize, const R: usize, const S: usize>(
+    ip: u64,
+    pid: u32,
+    tid: u32,
+    callchain: [u64; C],
+    abi: u64,
+    regs: [u64; R],
+    stack: [u8; S],
+) -> Vec<u8> {
+    let mut payload = sample_payload(ip, pid, tid, callchain);
+    payload.extend(abi.to_le_bytes());
+    for reg in regs {
+        payload.extend(reg.to_le_bytes());
+    }
+    payload.extend((stack.len() as u64).to_le_bytes());
+    payload.extend(stack);
+    payload.extend(vec![0; stack.len().next_multiple_of(8) - stack.len()]);
+    payload.extend((S as u64).to_le_bytes());
     payload
 }
 

@@ -36,6 +36,9 @@ pub struct PerfSampleStack {
     pub tid: Option<u32>,
     pub period: Option<u64>,
     pub callchain: Vec<u64>,
+    pub has_user_stack: bool,
+    pub user_register_count: usize,
+    pub user_stack_size: usize,
 }
 
 struct PerfFoldData {
@@ -508,6 +511,15 @@ fn parse_sample_for_summary(
                 tid: sample.tid,
                 period: sample.period,
                 callchain: sample.frames.collect(),
+                has_user_stack: sample.user_stack.is_some(),
+                user_register_count: sample
+                    .user_regs
+                    .as_ref()
+                    .map_or(0, |regs| regs.values.len()),
+                user_stack_size: sample
+                    .user_stack
+                    .as_ref()
+                    .map_or(0, |stack| stack.bytes.len()),
             })
         })
     } else {
