@@ -25,6 +25,9 @@ pub const PERF_RECORD_AUX_OUTPUT_HW_ID: u32 = 21;
 pub const PERF_RECORD_CALLCHAIN_DEFERRED: u32 = 22;
 pub const PERF_RECORD_MISC_COMM_EXEC: u16 = 1 << 13;
 pub const PERF_RECORD_MISC_MMAP_BUILD_ID: u16 = 1 << 14;
+pub const PERF_RECORD_MISC_CPUMODE_MASK: u16 = 7;
+pub const PERF_RECORD_MISC_CPUMODE_KERNEL: u16 = 1;
+pub const PERF_RECORD_MISC_CPUMODE_USER: u16 = 2;
 const BPF_TAG_SIZE: usize = 8;
 const SUPPORTED_PERF_RECORD_TYPES: &[u32] = &[
     PERF_RECORD_MMAP,
@@ -198,6 +201,7 @@ pub struct ReadRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SamplePayloadRecord {
+    pub misc: u16,
     pub payload: Vec<u8>,
 }
 
@@ -407,7 +411,10 @@ pub fn parse_record(record: PerfRecord<'_>) -> Result<ParsedRecord, String> {
         PERF_RECORD_EXIT => parse_exit_record(record.payload).map(ParsedRecord::Exit),
         PERF_RECORD_FORK => parse_fork_record(record.payload).map(ParsedRecord::Fork),
         PERF_RECORD_READ => parse_read_record(record.payload).map(ParsedRecord::Read),
-        PERF_RECORD_SAMPLE => parse_sample_payload_record(record.payload).map(ParsedRecord::Sample),
+        PERF_RECORD_SAMPLE => Ok(ParsedRecord::Sample(parse_sample_payload_record_with_misc(
+            record.payload,
+            record.header.misc,
+        ))),
         PERF_RECORD_AUX => parse_aux_record(record.payload).map(ParsedRecord::Aux),
         PERF_RECORD_ITRACE_START => {
             parse_itrace_start_record(record.payload).map(ParsedRecord::ItraceStart)
@@ -657,9 +664,14 @@ pub fn parse_read_record(payload: &[u8]) -> Result<ReadRecord, String> {
 ///
 /// This parser currently has no fixed fields to reject.
 pub fn parse_sample_payload_record(payload: &[u8]) -> Result<SamplePayloadRecord, String> {
-    Ok(SamplePayloadRecord {
+    Ok(parse_sample_payload_record_with_misc(payload, 0))
+}
+
+fn parse_sample_payload_record_with_misc(payload: &[u8], misc: u16) -> SamplePayloadRecord {
+    SamplePayloadRecord {
+        misc,
         payload: payload.to_vec(),
-    })
+    }
 }
 
 /// Parses a `PERF_RECORD_AUX` payload.

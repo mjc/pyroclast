@@ -5,7 +5,9 @@ use pyroclast::perfdata::fold::{
     fold_perfdata_callchains_with_symbols, fold_perfdata_file_with_options, summarize_perfdata,
 };
 use pyroclast::perfdata::mappings::FileIdentity;
-use pyroclast::perfdata::records::PERF_RECORD_MISC_COMM_EXEC;
+use pyroclast::perfdata::records::{
+    PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_CPUMODE_KERNEL, PERF_RECORD_MISC_CPUMODE_USER,
+};
 use pyroclast::perfdata::samples::{
     PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP,
     PERF_SAMPLE_PERIOD, PERF_SAMPLE_REGS_USER, PERF_SAMPLE_STACK_USER, PERF_SAMPLE_TID,
@@ -230,8 +232,9 @@ fn keeps_dwarf_user_stack_payloads_when_kernel_callchain_has_no_user_context_mar
                 | PERF_SAMPLE_STACK_USER,
             (1 << 6) | (1 << 7) | (1 << 8),
         )],
-        [record_bytes(
+        [record_bytes_with_misc(
             9,
+            PERF_RECORD_MISC_CPUMODE_USER,
             &sample_payload_with_user_stack(
                 0x4000,
                 11,
@@ -255,6 +258,45 @@ fn keeps_dwarf_user_stack_payloads_when_kernel_callchain_has_no_user_context_mar
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
     assert_eq!(folded, "0x1233;0x4000;[unknown];[unknown] 1\n");
+}
+
+#[test]
+fn ignores_dwarf_user_stack_payloads_for_kernel_samples_without_user_context_marker() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            (1 << 6) | (1 << 7) | (1 << 8),
+        )],
+        [record_bytes_with_misc(
+            9,
+            PERF_RECORD_MISC_CPUMODE_KERNEL,
+            &sample_payload_with_user_stack(
+                0x4000,
+                11,
+                12,
+                [
+                    0xffff_ffff_ffff_ff80,
+                    0xffff_ffff_8100_0000,
+                    0xffff_ffff_8200_0000,
+                ],
+                1,
+                [0x7fff_0008, 0x7fff_0000, 0x4000],
+                [
+                    0, 0, 0, 0, 0, 0, 0, 0, //
+                    0x40, 0, 0, 0, 0, 0, 0, 0, //
+                    0x34, 0x12, 0, 0, 0, 0, 0, 0,
+                ],
+            ),
+        )],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, "[unknown];[unknown] 1\n");
 }
 
 #[test]
