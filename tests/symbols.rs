@@ -366,6 +366,14 @@ fn perf_dwarf_function_name_matches_perf_script_inline_names() {
         perf_dwarf_function_name("foo::bar<std::vector<int>>::baz"),
         "foo::bar<std::vector<int>>::baz"
     );
+    assert_eq!(
+        perf_dwarf_function_name("std::fs::read::inner"),
+        "std::fs::read::inner"
+    );
+    assert_eq!(
+        perf_dwarf_function_name("std::io::default_read_to_end::<std::fs::File>"),
+        "std::io::default_read_to_end::<std::fs::File>"
+    );
 }
 
 #[test]

@@ -1406,7 +1406,7 @@ pub fn perf_symbol_name(name: &str) -> String {
 
 #[must_use]
 pub fn perf_dwarf_function_name(name: &str) -> String {
-    if looks_like_cpp_qualified_name(name) {
+    if looks_like_cpp_qualified_name(name) || perf_script_keeps_rust_qualified_name(name) {
         return name.to_owned();
     }
     rust_leaf_with_receiver_generics(name).unwrap_or_else(|| name.to_owned())
@@ -1416,6 +1416,10 @@ fn looks_like_cpp_qualified_name(name: &str) -> bool {
     name.starts_with("std::vector")
         || name.starts_with("std::allocator")
         || (name.contains("std::vector") && name.contains("::"))
+}
+
+fn perf_script_keeps_rust_qualified_name(name: &str) -> bool {
+    name.starts_with("std::fs::") || name.starts_with("std::io::")
 }
 
 fn rust_leaf_with_receiver_generics(name: &str) -> Option<String> {
