@@ -37,6 +37,9 @@ pub struct Addr2lineResolver<'a, R> {
     runner: &'a R,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RustAddr2lineResolver;
+
 pub struct PerfSymbolResolver<O> {
     object_resolver: O,
     debug_dir: Option<PathBuf>,
@@ -159,6 +162,13 @@ where
         Some(home) => perf_symbol_resolver_for_perfdata_file(runner, perfdata, Path::new(&home))
             .with_system_map_candidates(current_linux_system_map_candidates()),
         None => PerfSymbolResolver::new(runner).with_system_kallsyms(),
+    }
+}
+
+impl RustAddr2lineResolver {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
     }
 }
 
@@ -529,6 +539,50 @@ where
             })
             .collect()
     }
+}
+
+impl SymbolResolver for RustAddr2lineResolver {
+    fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
+        let mut resolved_by_request = BTreeMap::<SymbolRequest, Option<String>>::new();
+        for (path, indexes) in grouped_request_indexes(requests) {
+            let Ok(loader) = addr2line::Loader::new(&path) else {
+                for index in indexes {
+                    resolved_by_request.insert(requests[index].clone(), None);
+                }
+                continue;
+            };
+            for index in indexes {
+                let request = &requests[index];
+                let symbol = loader
+                    .find_symbol(request.relative_address)
+                    .map(ToString::to_string)
+                    .or_else(|| rust_addr2line_frame_name(&loader, request.relative_address));
+                resolved_by_request.insert(request.clone(), symbol);
+            }
+        }
+
+        requests
+            .iter()
+            .map(|request| {
+                resolved_by_request
+                    .get(request)
+                    .cloned()
+                    .ok_or_else(|| "missing rust addr2line result for request".to_string())
+            })
+            .collect()
+    }
+}
+
+fn rust_addr2line_frame_name(loader: &addr2line::Loader, address: u64) -> Option<String> {
+    let mut frames = loader.find_frames(address).ok()?;
+    while let Ok(Some(frame)) = frames.next() {
+        if let Some(function) = frame.function
+            && let Ok(name) = function.raw_name()
+        {
+            return Some(name.into_owned());
+        }
+    }
+    None
 }
 
 fn grouped_request_indexes(requests: &[SymbolRequest]) -> BTreeMap<PathBuf, Vec<usize>> {

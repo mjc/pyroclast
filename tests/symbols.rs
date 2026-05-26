@@ -3,10 +3,11 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use object::{Object, ObjectSymbol};
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
 use pyroclast::symbols::{
-    Addr2lineResolver, Kallsyms, SymbolCache, SymbolRequest, SymbolResolver, perf_debug_dir,
-    perf_symbol_resolver_for_perfdata_file,
+    Addr2lineResolver, Kallsyms, RustAddr2lineResolver, SymbolCache, SymbolRequest, SymbolResolver,
+    perf_debug_dir, perf_symbol_resolver_for_perfdata_file,
 };
 
 #[test]
@@ -164,6 +165,38 @@ fn addr2line_resolver_batches_requests_by_binary() {
     assert_eq!(
         runner.commands()[0].stdin.as_deref(),
         Some(&b"0x10\n0x20\n"[..])
+    );
+}
+
+#[test]
+fn rust_addr2line_resolver_reads_symbol_table_names() {
+    let current_exe = std::env::current_exe().expect("current exe");
+    let bytes = std::fs::read(&current_exe).expect("current exe bytes");
+    let object = object::File::parse(bytes.as_slice()).expect("object file");
+    let symbol = object
+        .symbols()
+        .filter(|symbol| symbol.address() != 0)
+        .find(|symbol| {
+            symbol
+                .name()
+                .is_ok_and(|name| name.contains("rust_addr2line_resolver_reads_symbol_table_names"))
+        })
+        .expect("test symbol");
+    let resolver = RustAddr2lineResolver::new();
+
+    let symbols = resolver
+        .resolve_batch(&[SymbolRequest {
+            path: current_exe,
+            relative_address: symbol.address(),
+            build_id: None,
+            kernel_relocation: None,
+        }])
+        .expect("symbols");
+
+    assert!(
+        symbols[0]
+            .as_deref()
+            .is_some_and(|name| name.contains("rust_addr2line_resolver_reads_symbol_table_names"))
     );
 }
 

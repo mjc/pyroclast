@@ -5,6 +5,7 @@ edition = "2024"
 default-run = "pyroclast"
 
 [dependencies]
+addr2line = "0.26.1"
 clap = { version = "4", features = ["derive"] }
 hashbrown = "0.17.1"
 memmap2 = "0.9"
@@ -16,5 +17,6 @@ serde_json = "1"
 procfs = { version = "0.18.0", default-features = false }
 
 [dev-dependencies]
+object = "0.39.1"
 proptest = "1.11.0"
 tempfile = "3"
