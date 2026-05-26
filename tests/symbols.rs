@@ -4,10 +4,12 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use object::{Object, ObjectSymbol};
+use pyroclast::cli::SymbolizerKind;
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
 use pyroclast::symbols::{
     Addr2lineResolver, Kallsyms, RustAddr2lineResolver, SymbolCache, SymbolRequest, SymbolResolver,
     perf_debug_dir, perf_symbol_resolver_for_perfdata_file,
+    perf_symbol_resolver_for_perfdata_file_with_symbolizer,
 };
 
 #[test]
@@ -198,6 +200,47 @@ fn rust_addr2line_resolver_reads_symbol_table_names() {
             .as_deref()
             .is_some_and(|name| name.contains("rust_addr2line_resolver_reads_symbol_table_names"))
     );
+}
+
+#[test]
+fn symbolizer_selector_can_use_rust_addr2line_without_process_runner() {
+    let current_exe = std::env::current_exe().expect("current exe");
+    let object_bytes = std::fs::read(&current_exe).expect("current exe bytes");
+    let object = object::File::parse(object_bytes.as_slice()).expect("current exe object");
+    let symbol = object
+        .symbols()
+        .filter(|symbol| symbol.address() != 0)
+        .find(|symbol| {
+            symbol
+                .name()
+                .is_ok_and(|name| name.contains("symbolizer_selector_can_use_rust_addr2line"))
+        })
+        .expect("test symbol");
+    let runner = Addr2lineRunner::new(b"");
+    let home = tempfile::tempdir().expect("home");
+    let perfdata = home.path().join("perf.data");
+    let resolver = perf_symbol_resolver_for_perfdata_file_with_symbolizer(
+        &runner,
+        &perfdata,
+        home.path(),
+        SymbolizerKind::RustAddr2line,
+    );
+
+    let symbols = resolver
+        .resolve_batch(&[SymbolRequest {
+            path: current_exe,
+            relative_address: symbol.address(),
+            build_id: None,
+            kernel_relocation: None,
+        }])
+        .expect("symbols");
+
+    assert!(
+        symbols[0]
+            .as_deref()
+            .is_some_and(|name| name.contains("symbolizer_selector_can_use_rust_addr2line"))
+    );
+    assert!(runner.commands().is_empty());
 }
 
 #[test]

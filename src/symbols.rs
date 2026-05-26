@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
+use crate::cli::SymbolizerKind;
 use crate::perfdata::build_id::kernel_build_id_from_perfdata;
 use crate::process::{CommandRunner, CommandSpec};
 
@@ -35,6 +36,11 @@ pub struct SymbolCache<'a, R> {
 
 pub struct Addr2lineResolver<'a, R> {
     runner: &'a R,
+}
+
+pub enum SelectedObjectResolver<'a, R> {
+    Addr2line(Addr2lineResolver<'a, R>),
+    RustAddr2line(RustAddr2lineResolver),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -142,6 +148,23 @@ where
         .with_system_kallsyms()
 }
 
+#[must_use]
+pub fn perf_symbol_resolver_for_perfdata_file_with_symbolizer<'a, R>(
+    runner: &'a R,
+    perfdata: &Path,
+    home: &Path,
+    symbolizer: SymbolizerKind,
+) -> PerfSymbolResolver<SelectedObjectResolver<'a, R>>
+where
+    R: CommandRunner,
+{
+    perf_symbol_resolver_for_perfdata_file_with_object(
+        SelectedObjectResolver::new(runner, symbolizer),
+        perfdata,
+        home,
+    )
+}
+
 fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut deduped = Vec::new();
     for path in paths {
@@ -176,6 +199,21 @@ where
 }
 
 #[must_use]
+pub fn perf_symbol_resolver_for_current_home_with_symbolizer<'a, R>(
+    runner: &'a R,
+    perfdata: &Path,
+    symbolizer: SymbolizerKind,
+) -> PerfSymbolResolver<SelectedObjectResolver<'a, R>>
+where
+    R: CommandRunner,
+{
+    perf_symbol_resolver_for_current_home_with_object(
+        SelectedObjectResolver::new(runner, symbolizer),
+        perfdata,
+    )
+}
+
+#[must_use]
 pub fn perf_symbol_resolver_for_current_home_with_object<O>(
     object_resolver: O,
     perfdata: &Path,
@@ -198,6 +236,19 @@ impl RustAddr2lineResolver {
     #[must_use]
     pub fn new() -> Self {
         Self
+    }
+}
+
+impl<'a, R> SelectedObjectResolver<'a, R>
+where
+    R: CommandRunner,
+{
+    #[must_use]
+    pub fn new(runner: &'a R, symbolizer: SymbolizerKind) -> Self {
+        match symbolizer {
+            SymbolizerKind::Addr2line => Self::Addr2line(Addr2lineResolver::new(runner)),
+            SymbolizerKind::RustAddr2line => Self::RustAddr2line(RustAddr2lineResolver::new()),
+        }
     }
 }
 
@@ -567,6 +618,18 @@ where
                     .ok_or_else(|| "missing addr2line result for request".to_string())
             })
             .collect()
+    }
+}
+
+impl<R> SymbolResolver for SelectedObjectResolver<'_, R>
+where
+    R: CommandRunner,
+{
+    fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
+        match self {
+            Self::Addr2line(resolver) => resolver.resolve_batch(requests),
+            Self::RustAddr2line(resolver) => resolver.resolve_batch(requests),
+        }
     }
 }
 

@@ -12,10 +12,7 @@ use crate::perfdata::fold::{
 use crate::platform::{NativeThreadLister, ThreadLister};
 use crate::process::{CommandRunner, CommandSpec};
 use crate::summary::threads::{render_folded_stack_summary_text, summarize_folded_stacks};
-use crate::symbols::{
-    RustAddr2lineResolver, perf_symbol_resolver_for_current_home,
-    perf_symbol_resolver_for_current_home_with_object,
-};
+use crate::symbols::perf_symbol_resolver_for_current_home_with_symbolizer;
 use crate::tools::{ToolSpec, collect_tool_versions};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -312,27 +309,13 @@ where
         count_periods: true,
     };
     if symbols {
-        match symbolizer {
-            SymbolizerKind::Addr2line => {
-                let symbol_resolver = perf_symbol_resolver_for_current_home(runner, perf_data);
-                Ok(fold_perfdata_file_with_symbols(
-                    perf_data,
-                    options,
-                    &symbol_resolver,
-                )?)
-            }
-            SymbolizerKind::RustAddr2line => {
-                let symbol_resolver = perf_symbol_resolver_for_current_home_with_object(
-                    RustAddr2lineResolver::new(),
-                    perf_data,
-                );
-                Ok(fold_perfdata_file_with_symbols(
-                    perf_data,
-                    options,
-                    &symbol_resolver,
-                )?)
-            }
-        }
+        let symbol_resolver =
+            perf_symbol_resolver_for_current_home_with_symbolizer(runner, perf_data, symbolizer);
+        Ok(fold_perfdata_file_with_symbols(
+            perf_data,
+            options,
+            &symbol_resolver,
+        )?)
     } else {
         Ok(fold_perfdata_file_with_options(perf_data, options)?)
     }

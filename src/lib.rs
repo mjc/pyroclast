@@ -34,10 +34,7 @@ use perfdata::fold::{
 };
 use process::{CommandRunner, RealCommandRunner};
 use summary::threads::{render_folded_stack_summary_text, summarize_folded_stacks};
-use symbols::{
-    RustAddr2lineResolver, perf_symbol_resolver_for_current_home,
-    perf_symbol_resolver_for_current_home_with_object,
-};
+use symbols::perf_symbol_resolver_for_current_home_with_symbolizer;
 
 /// Parses command-line arguments and runs the requested Pyroclast command.
 ///
@@ -262,27 +259,13 @@ where
     R: CommandRunner,
 {
     if symbols {
-        match symbolizer {
-            SymbolizerKind::Addr2line => {
-                let symbol_resolver = perf_symbol_resolver_for_current_home(runner, path);
-                Ok(fold_perfdata_file_with_symbols(
-                    path,
-                    options,
-                    &symbol_resolver,
-                )?)
-            }
-            SymbolizerKind::RustAddr2line => {
-                let symbol_resolver = perf_symbol_resolver_for_current_home_with_object(
-                    RustAddr2lineResolver::new(),
-                    path,
-                );
-                Ok(fold_perfdata_file_with_symbols(
-                    path,
-                    options,
-                    &symbol_resolver,
-                )?)
-            }
-        }
+        let symbol_resolver =
+            perf_symbol_resolver_for_current_home_with_symbolizer(runner, path, symbolizer);
+        Ok(fold_perfdata_file_with_symbols(
+            path,
+            options,
+            &symbol_resolver,
+        )?)
     } else if options == FoldOptions::default() {
         Ok(fold_perfdata_file(path)?)
     } else {
