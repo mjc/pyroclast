@@ -82,7 +82,7 @@ impl std::fmt::Display for PerfCallGraph {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Fp => formatter.write_str("fp"),
-            Self::Dwarf => formatter.write_str("dwarf"),
+            Self::Dwarf => formatter.write_str("dwarf,64000"),
         }
     }
 }
@@ -110,7 +110,7 @@ pub struct RunArgs {
     #[arg(long, value_enum, default_value_t = PerfEvent::CpuClock)]
     pub event: PerfEvent,
 
-    #[arg(long, value_enum, default_value_t = PerfCallGraph::Fp)]
+    #[arg(long, value_enum, default_value_t = PerfCallGraph::Dwarf)]
     pub call_graph: PerfCallGraph,
 
     #[arg(long, conflicts_with_all = ["tids", "threads_of_pid"])]
@@ -228,7 +228,7 @@ pub struct ProfileArgs {
     #[arg(long, value_enum, default_value_t = PerfEvent::CpuClock)]
     pub event: PerfEvent,
 
-    #[arg(long, value_enum, default_value_t = PerfCallGraph::Fp)]
+    #[arg(long, value_enum, default_value_t = PerfCallGraph::Dwarf)]
     pub call_graph: PerfCallGraph,
 
     #[arg(long, conflicts_with_all = ["tids", "threads_of_pid"])]

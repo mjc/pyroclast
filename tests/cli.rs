@@ -19,11 +19,16 @@ fn parses_profile_defaults() {
             assert_eq!(profile.symbolizer, SymbolizerKind::Addr2line);
             assert_eq!(profile.frequency, 997);
             assert_eq!(profile.event, PerfEvent::CpuClock);
-            assert_eq!(profile.call_graph, PerfCallGraph::Fp);
+            assert_eq!(profile.call_graph, PerfCallGraph::Dwarf);
             assert_eq!(profile.command, vec!["true"]);
         }
         other => panic!("expected profile command, got {other:?}"),
     }
+}
+
+#[test]
+fn dwarf_call_graph_matches_cargo_flamegraph_record_argument() {
+    assert_eq!(PerfCallGraph::Dwarf.to_string(), "dwarf,64000");
 }
 
 #[test]
@@ -232,7 +237,7 @@ fn parses_top_level_profiler_commands() {
         assert_eq!(profile.symbolizer, SymbolizerKind::Addr2line, "verb {verb}");
         assert_eq!(profile.frequency, 997, "verb {verb}");
         assert_eq!(profile.event, PerfEvent::CpuClock, "verb {verb}");
-        assert_eq!(profile.call_graph, PerfCallGraph::Fp, "verb {verb}");
+        assert_eq!(profile.call_graph, PerfCallGraph::Dwarf, "verb {verb}");
         assert_eq!(profile.command, vec!["cargo", "check"]);
     }
 

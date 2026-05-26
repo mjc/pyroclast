@@ -51,7 +51,7 @@ fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
         vec!["perf", "inferno-flamegraph", "perf", "inferno-flamegraph"]
     );
     assert_eq!(runner.perf_frequency(), Some("199".to_string()));
-    assert_eq!(runner.perf_call_graph(), Some("dwarf".to_string()));
+    assert_eq!(runner.perf_call_graph(), Some("dwarf,64000".to_string()));
     assert!(result.layout.raw_profile("perf.data").is_file());
     assert_eq!(
         std::fs::read(result.layout.raw_profile("perf.data")).expect("perf data"),
