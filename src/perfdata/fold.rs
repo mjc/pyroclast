@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
@@ -13,7 +13,7 @@ use crate::perfdata::samples::{
     PERF_SAMPLE_TIME, SampleLayout, is_kernel_space_frame, is_perf_context_marker,
     parse_sample_record_callchain,
 };
-use crate::perfdata::unwind::{PerfX86_64Regs, unwind_x86_64_stack};
+use crate::perfdata::unwind::{FramehopUnwinder, PerfX86_64Regs, unwind_x86_64_stack};
 use crate::symbols::{SymbolCache, SymbolRequest, SymbolResolver};
 
 const UNKNOWN_FRAME: &str = "[unknown]";
@@ -271,6 +271,8 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
     let records = iter_records(bytes, header)?;
     let mut comms_by_pid = BTreeMap::new();
     let mut mmap_table = MmapTable::default();
+    let mut object_unwinder = FramehopUnwinder::new();
+    let mut loaded_unwind_mappings = BTreeSet::new();
     let mut raw_stacks = RawStackAccumulator::new();
     let mut callchain = Vec::new();
 
@@ -282,34 +284,47 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
                 Ok(())
             }
             ParsedRecord::Mmap(record) => {
+                load_unwind_mapping(
+                    &mut object_unwinder,
+                    &mut loaded_unwind_mappings,
+                    record.start,
+                    record.len,
+                    record.pgoff,
+                    &record.path,
+                );
                 mmap_table.insert_mmap(record);
                 Ok(())
             }
-            ParsedRecord::Sample(record) => {
-                parse_sample_for_fold(&record.payload, &sample_layouts, options).map(|sample| {
-                    if let Some((pid, count, frames)) = sample {
-                        callchain.clear();
-                        callchain.reserve(frames.len());
-                        callchain.extend(
-                            frames
-                                .into_iter()
-                                .rev()
-                                .filter(|frame| !is_perf_context_marker(*frame))
-                                .filter(|frame| {
-                                    pid.is_none_or(|pid| {
-                                        !mmap_table.is_known_non_executable(pid, *frame)
-                                    })
-                                }),
-                        );
-                        raw_stacks.add_slice(pid, &callchain, count);
-                    }
-                })
-            }
+            ParsedRecord::Sample(record) => parse_sample_for_fold(
+                &record.payload,
+                &sample_layouts,
+                options,
+                &mut object_unwinder,
+            )
+            .map(|sample| {
+                add_fold_sample(sample, &mmap_table, &mut raw_stacks, &mut callchain);
+            }),
             ParsedRecord::Mmap2(record) => {
+                load_unwind_mapping(
+                    &mut object_unwinder,
+                    &mut loaded_unwind_mappings,
+                    record.start,
+                    record.len,
+                    record.pgoff,
+                    &record.path,
+                );
                 mmap_table.insert_mmap2(record);
                 Ok(())
             }
             ParsedRecord::Mmap2BuildId(record) => {
+                load_unwind_mapping(
+                    &mut object_unwinder,
+                    &mut loaded_unwind_mappings,
+                    record.start,
+                    record.len,
+                    record.pgoff,
+                    &record.path,
+                );
                 mmap_table.insert_mmap2_build_id(record);
                 Ok(())
             }
@@ -346,6 +361,28 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
         mmap_table,
         raw_stacks: raw_stacks.into_collapsed(),
     })
+}
+
+fn add_fold_sample(
+    sample: Option<FoldSample>,
+    mmap_table: &MmapTable,
+    raw_stacks: &mut RawStackAccumulator,
+    callchain: &mut Vec<u64>,
+) {
+    if let Some((pid, count, frames)) = sample {
+        callchain.clear();
+        callchain.reserve(frames.len());
+        callchain.extend(
+            frames
+                .into_iter()
+                .rev()
+                .filter(|frame| !is_perf_context_marker(*frame))
+                .filter(|frame| {
+                    pid.is_none_or(|pid| !mmap_table.is_known_non_executable(pid, *frame))
+                }),
+        );
+        raw_stacks.add_slice(pid, callchain, count);
+    }
 }
 
 fn render_fold_data<R>(
@@ -547,6 +584,7 @@ fn parse_sample_for_fold(
     payload: &[u8],
     sample_layouts: &SampleLayouts,
     options: FoldOptions,
+    object_unwinder: &mut FramehopUnwinder,
 ) -> Result<Option<FoldSample>, String> {
     if let Some(layout) = sample_layouts.layout_for_payload(payload)? {
         parse_sample_record_callchain(payload, layout).map(|sample| {
@@ -563,7 +601,11 @@ fn parse_sample_for_fold(
                         &regs.values,
                     )
                 {
-                    let unwound_frames = unwind_x86_64_stack(regs, stack.bytes, 256);
+                    let unwound_frames = if object_unwinder.module_count() == 0 {
+                        unwind_x86_64_stack(regs, stack.bytes, 256)
+                    } else {
+                        object_unwinder.unwind_stack(regs, stack.bytes, 256)
+                    };
                     if frames.is_empty() {
                         frames = unwound_frames;
                     } else {
@@ -576,6 +618,24 @@ fn parse_sample_for_fold(
     } else {
         Ok(None)
     }
+}
+
+fn load_unwind_mapping(
+    object_unwinder: &mut FramehopUnwinder,
+    loaded_unwind_mappings: &mut BTreeSet<(String, u64, u64, u64)>,
+    start: u64,
+    len: u64,
+    pgoff: u64,
+    path: &str,
+) {
+    if path.starts_with('[') {
+        return;
+    }
+    let key = (path.to_string(), start, len, pgoff);
+    if !loaded_unwind_mappings.insert(key) {
+        return;
+    }
+    let _ = object_unwinder.add_object_mapping(Path::new(path), start, len, pgoff);
 }
 
 fn sample_layouts(
