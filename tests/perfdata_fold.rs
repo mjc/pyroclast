@@ -1043,6 +1043,52 @@ fn selects_sample_layout_by_id_field() {
 }
 
 #[test]
+fn folds_only_first_encountered_event_type_like_inferno_collapse_perf() {
+    let attr1 = file_attr_bytes_with_ids(
+        PERF_SAMPLE_IDENTIFIER
+            | PERF_SAMPLE_IP
+            | PERF_SAMPLE_TID
+            | PERF_SAMPLE_PERIOD
+            | PERF_SAMPLE_CALLCHAIN,
+        392,
+        [111],
+    );
+    let attr2 = file_attr_bytes_with_ids(
+        PERF_SAMPLE_IDENTIFIER
+            | PERF_SAMPLE_IP
+            | PERF_SAMPLE_TID
+            | PERF_SAMPLE_PERIOD
+            | PERF_SAMPLE_CALLCHAIN,
+        400,
+        [222],
+    );
+    let bytes = perfdata_with_attrs_ids_and_records(
+        [attr1, attr2],
+        [111, 222],
+        [
+            record_bytes(
+                9,
+                &sample_payload_with_identifier_and_period(222, 0x1000, 11, 12, 2, [0x2222]),
+            ),
+            record_bytes(
+                9,
+                &sample_payload_with_identifier_and_period(111, 0x1000, 11, 12, 1, [0x1111]),
+            ),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains_with_options(
+        &bytes,
+        FoldOptions {
+            count_periods: true,
+        },
+    )
+    .expect("folded");
+
+    assert_eq!(folded, "0x2222 2\n");
+}
+
+#[test]
 fn folds_perfdata_from_file_path() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");

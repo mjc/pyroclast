@@ -71,6 +71,7 @@ struct FoldAccumulator {
     deferred_samples: BTreeMap<u64, Vec<DeferredFoldSample>>,
     callchain: Vec<FoldFrame>,
     unwind_debug_dir: Option<PathBuf>,
+    first_event_index: Option<usize>,
 }
 
 struct TimedRecord<'a> {
@@ -85,6 +86,7 @@ struct FoldSample {
     count: u64,
     frames: Vec<FoldFrame>,
     deferred_cookie: Option<u64>,
+    event_index: usize,
 }
 
 struct DeferredFoldSample {
@@ -119,8 +121,14 @@ impl FoldFrame {
 
 #[derive(Clone, Debug, Default)]
 struct SampleLayouts {
-    fallback: Option<SampleLayout>,
-    by_identifier: BTreeMap<u64, SampleLayout>,
+    fallback: Option<SampleEventLayout>,
+    by_identifier: BTreeMap<u64, SampleEventLayout>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SampleEventLayout {
+    index: usize,
+    layout: SampleLayout,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -391,6 +399,7 @@ impl FoldAccumulator {
             deferred_samples: BTreeMap::new(),
             callchain: Vec::new(),
             unwind_debug_dir: current_perf_debug_dir(),
+            first_event_index: None,
         }
     }
 
@@ -516,16 +525,16 @@ fn record_time(
     if record.header.record_type == crate::perfdata::records::PERF_RECORD_SAMPLE {
         return sample_layouts
             .layout_for_payload(record.payload)?
-            .map_or(Ok(None), |layout| {
-                sample_payload_time(record.payload, layout)
+            .map_or(Ok(None), |event| {
+                sample_payload_time(record.payload, event.layout)
             });
     }
 
     sample_layouts
         .fallback
-        .filter(|layout| layout.sample_id_all)
-        .map_or(Ok(None), |layout| {
-            sample_id_payload_time(record.payload, layout)
+        .filter(|event| event.layout.sample_id_all)
+        .map_or(Ok(None), |event| {
+            sample_id_payload_time(record.payload, event.layout)
         })
 }
 
@@ -618,6 +627,9 @@ fn add_fold_stack(
 impl FoldAccumulator {
     fn add_fold_sample(&mut self, sample: Option<FoldSample>) {
         if let Some(sample) = sample {
+            if !self.accepts_sample_event(sample.event_index) {
+                return;
+            }
             let comm = self.comm_for_sample(&sample);
             if let Some(cookie) = sample.deferred_cookie {
                 self.deferred_samples
@@ -641,6 +653,14 @@ impl FoldAccumulator {
                 );
             }
         }
+    }
+
+    fn accepts_sample_event(&mut self, event_index: usize) -> bool {
+        if let Some(first_event_index) = self.first_event_index {
+            return event_index == first_event_index;
+        }
+        self.first_event_index = Some(event_index);
+        true
     }
 
     fn add_deferred_callchain(&mut self, cookie: u64, ips: Vec<u64>) {
@@ -915,8 +935,8 @@ fn parse_sample_for_summary(
     payload: &[u8],
     sample_layouts: &SampleLayouts,
 ) -> Result<Option<PerfSampleStack>, String> {
-    if let Some(layout) = sample_layouts.layout_for_payload(payload)? {
-        parse_sample_record_callchain(payload, layout).map(|sample| {
+    if let Some(event) = sample_layouts.layout_for_payload(payload)? {
+        parse_sample_record_callchain(payload, event.layout).map(|sample| {
             sample.map(|sample| PerfSampleStack {
                 misc: sample_misc,
                 cpumode: sample_misc & PERF_RECORD_MISC_CPUMODE_MASK,
@@ -929,10 +949,9 @@ fn parse_sample_for_summary(
                     .user_regs
                     .as_ref()
                     .map_or(0, |regs| regs.values.len()),
-                user_register_ip: sample
-                    .user_regs
-                    .as_ref()
-                    .and_then(|regs| perf_user_reg_value(layout.sample_regs_user, &regs.values, 8)),
+                user_register_ip: sample.user_regs.as_ref().and_then(|regs| {
+                    perf_user_reg_value(event.layout.sample_regs_user, &regs.values, 8)
+                }),
                 user_stack_size: sample
                     .user_stack
                     .as_ref()
@@ -963,8 +982,8 @@ fn parse_sample_for_fold(
     options: FoldOptions,
     object_unwinder: &mut FramehopUnwinder,
 ) -> Result<Option<FoldSample>, String> {
-    if let Some(layout) = sample_layouts.layout_for_payload(payload)? {
-        parse_sample_record_callchain(payload, layout).map(|sample| {
+    if let Some(event) = sample_layouts.layout_for_payload(payload)? {
+        parse_sample_record_callchain(payload, event.layout).map(|sample| {
             sample.map(|sample| {
                 let count = if options.count_periods {
                     sample.period.unwrap_or(1)
@@ -977,7 +996,7 @@ fn parse_sample_for_fold(
                     && has_perf_captured_user_stack(stack)
                     && should_unwind_sampled_user_stack(sample_misc, &frames)
                     && let Ok(regs) = PerfX86_64Regs::from_perf_masked_values(
-                        layout.sample_regs_user,
+                        event.layout.sample_regs_user,
                         &regs.values,
                     )
                 {
@@ -1002,6 +1021,7 @@ fn parse_sample_for_fold(
                     count,
                     frames,
                     deferred_cookie,
+                    event_index: event.index,
                 }
             })
         })
@@ -1131,13 +1151,19 @@ fn sample_layouts(
 ) -> Result<SampleLayouts, String> {
     let attrs = parse_file_attrs(bytes, header)?;
     let mut layouts = SampleLayouts {
-        fallback: attrs.first().map(layout_from_attr),
+        fallback: attrs.first().map(|attr| SampleEventLayout {
+            index: 0,
+            layout: layout_from_attr(attr),
+        }),
         by_identifier: BTreeMap::new(),
     };
-    for attr in &attrs {
-        let layout = layout_from_attr(attr);
+    for (index, attr) in attrs.iter().enumerate() {
+        let event = SampleEventLayout {
+            index,
+            layout: layout_from_attr(attr),
+        };
         for id in parse_file_attr_ids(bytes, attr)? {
-            layouts.by_identifier.insert(id, layout);
+            layouts.by_identifier.insert(id, event);
         }
     }
     Ok(layouts)
@@ -1155,14 +1181,14 @@ fn layout_from_attr(attr: &PerfFileAttr) -> SampleLayout {
 }
 
 impl SampleLayouts {
-    fn layout_for_payload(&self, payload: &[u8]) -> Result<Option<SampleLayout>, String> {
+    fn layout_for_payload(&self, payload: &[u8]) -> Result<Option<SampleEventLayout>, String> {
         if self.by_identifier.is_empty() {
             return Ok(self.fallback);
         }
         let Some(fallback) = self.fallback else {
             return Ok(None);
         };
-        if let Some(identifier) = sample_event_id(payload, fallback)? {
+        if let Some(identifier) = sample_event_id(payload, fallback.layout)? {
             return Ok(self
                 .by_identifier
                 .get(&identifier)
