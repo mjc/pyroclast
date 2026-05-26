@@ -26,9 +26,9 @@ const CHECKS: &[Check] = &[
         ],
     },
     Check {
-        name: "tests",
+        name: "nextest",
         program: "cargo",
-        args: &["test"],
+        args: &["nextest", "run"],
     },
     Check {
         name: "flake check",

@@ -31,6 +31,7 @@
         let
           commonTools = with pkgs; [
             cargo
+            cargo-nextest
             clippy
             hyperfine
             inferno

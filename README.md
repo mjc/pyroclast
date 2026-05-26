@@ -48,7 +48,7 @@ Use the Nix shell:
 
 ```sh
 nix develop
-cargo test
+cargo nextest run
 ```
 
-The pre-commit hook runs rustfmt, Clippy pedantic, the test suite, and `nix flake check`.
+The pre-commit hook runs rustfmt, Clippy pedantic, `cargo nextest run`, and `nix flake check`.
