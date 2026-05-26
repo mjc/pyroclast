@@ -1043,7 +1043,12 @@ impl SymbolResolver for RustAddr2lineResolver {
                 });
                 let mut frames = perf_dwarf
                     .as_ref()
-                    .and_then(|resolver| resolver.frame_names(request.relative_address))
+                    .and_then(|resolver| {
+                        resolver.frame_names_for_base_symbol(
+                            request.relative_address,
+                            object_symbol.as_deref(),
+                        )
+                    })
                     .map(perf_inline_frame_order)
                     .or_else(|| object_symbol.clone().map(|name| vec![name]))
                     .or_else(|| {
@@ -1277,11 +1282,23 @@ impl PerfDwarfNameResolver {
     }
 
     fn frame_names(&self, address: u64) -> Option<Vec<String>> {
-        perf_dwarf_frame_names(&self.dwarf, address)
+        perf_dwarf_frame_names(&self.dwarf, address, None)
+    }
+
+    fn frame_names_for_base_symbol(
+        &self,
+        address: u64,
+        base_symbol: Option<&str>,
+    ) -> Option<Vec<String>> {
+        perf_dwarf_frame_names(&self.dwarf, address, base_symbol)
     }
 }
 
-fn perf_dwarf_frame_names<R>(dwarf: &gimli::Dwarf<R>, address: u64) -> Option<Vec<String>>
+fn perf_dwarf_frame_names<R>(
+    dwarf: &gimli::Dwarf<R>,
+    address: u64,
+    base_symbol: Option<&str>,
+) -> Option<Vec<String>>
 where
     R: gimli::Reader,
 {
@@ -1293,7 +1310,7 @@ where
         if !unit_contains_address(dwarf, &unit, address) {
             continue;
         }
-        if let Some(frames) = perf_dwarf_frame_names_from_unit(dwarf, &unit, address) {
+        if let Some(frames) = perf_dwarf_frame_names_from_unit(dwarf, &unit, address, base_symbol) {
             return Some(frames);
         }
     }
@@ -1319,6 +1336,7 @@ fn perf_dwarf_frame_names_from_unit<R>(
     dwarf: &gimli::Dwarf<R>,
     unit: &gimli::Unit<R>,
     address: u64,
+    base_symbol: Option<&str>,
 ) -> Option<Vec<String>>
 where
     R: gimli::Reader,
@@ -1327,7 +1345,9 @@ where
     let root = tree.root().ok()?;
     let mut children = root.children();
     while let Ok(Some(child)) = children.next() {
-        if let Some(mut frames) = perf_dwarf_frames_from_node(dwarf, unit, child, address, false) {
+        if let Some(mut frames) =
+            perf_dwarf_frames_from_node(dwarf, unit, child, address, false, base_symbol)
+        {
             frames.reverse();
             return Some(frames);
         }
@@ -1341,6 +1361,7 @@ fn perf_dwarf_frames_from_node<R>(
     node: gimli::EntriesTreeNode<'_, '_, '_, R>,
     address: u64,
     looking_for_inline: bool,
+    base_symbol: Option<&str>,
 ) -> Option<Vec<String>>
 where
     R: gimli::Reader,
@@ -1360,14 +1381,25 @@ where
         let mut children = node.children();
         while let Ok(Some(child)) = children.next() {
             if let Some(mut child_frames) =
-                perf_dwarf_frames_from_node(dwarf, unit, child, address, true)
+                perf_dwarf_frames_from_node(dwarf, unit, child, address, true, base_symbol)
             {
                 found_inline_child = true;
                 frames.append(&mut child_frames);
                 break;
             }
         }
-        if !looking_for_inline && !found_inline_child {
+        // perf's inline replacement starts at the real subprogram DIE:
+        // tools/perf/util/dwarf-aux.c:cu_walk_functions_at calls
+        // die_find_realfunc(), then walks inline children.  The DIE is only
+        // rendered as an inline frame when srcline.c:new_inline_sym creates a
+        // synthetic symbol, which happens when dwarf_diename(die) differs from
+        // the base symbol name.
+        if !looking_for_inline
+            && !found_inline_child
+            && !frames
+                .first()
+                .is_some_and(|name| perf_realfunc_name_replaces_base_symbol(name, base_symbol))
+        {
             return None;
         }
         return (!frames.is_empty()).then_some(frames);
@@ -1375,13 +1407,22 @@ where
 
     let mut children = node.children();
     while let Ok(Some(child)) = children.next() {
-        if let Some(frames) =
-            perf_dwarf_frames_from_node(dwarf, unit, child, address, looking_for_inline)
-        {
+        if let Some(frames) = perf_dwarf_frames_from_node(
+            dwarf,
+            unit,
+            child,
+            address,
+            looking_for_inline,
+            base_symbol,
+        ) {
             return Some(frames);
         }
     }
     None
+}
+
+fn perf_realfunc_name_replaces_base_symbol(name: &str, base_symbol: Option<&str>) -> bool {
+    base_symbol.is_some_and(|base_symbol| name != base_symbol)
 }
 
 fn die_contains_address<R>(
