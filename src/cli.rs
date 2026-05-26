@@ -101,7 +101,7 @@ pub struct RunArgs {
     #[arg(long)]
     pub symbols: bool,
 
-    #[arg(long, value_enum, default_value_t = SymbolizerKind::Addr2line)]
+    #[arg(long, value_enum, default_value_t = SymbolizerKind::RustAddr2line)]
     pub symbolizer: SymbolizerKind,
 
     #[arg(long, default_value_t = 997)]
@@ -219,7 +219,7 @@ pub struct ProfileArgs {
     #[arg(long)]
     pub symbols: bool,
 
-    #[arg(long, value_enum, default_value_t = SymbolizerKind::Addr2line)]
+    #[arg(long, value_enum, default_value_t = SymbolizerKind::RustAddr2line)]
     pub symbolizer: SymbolizerKind,
 
     #[arg(long, default_value_t = 997)]
@@ -255,7 +255,7 @@ pub struct FoldArgs {
     #[arg(long)]
     pub symbols: bool,
 
-    #[arg(long, value_enum, default_value_t = SymbolizerKind::Addr2line)]
+    #[arg(long, value_enum, default_value_t = SymbolizerKind::RustAddr2line)]
     pub symbolizer: SymbolizerKind,
 
     pub input: PathBuf,
@@ -279,7 +279,7 @@ pub struct FlamegraphArgs {
     #[arg(long)]
     pub symbols: bool,
 
-    #[arg(long, value_enum, default_value_t = SymbolizerKind::Addr2line)]
+    #[arg(long, value_enum, default_value_t = SymbolizerKind::RustAddr2line)]
     pub symbolizer: SymbolizerKind,
 
     #[arg(long, default_value = "CPU profile")]

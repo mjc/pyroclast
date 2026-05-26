@@ -93,6 +93,8 @@ fn fold_command_can_symbolize_mapped_frames() {
         "pyroclast",
         "fold",
         "--symbols",
+        "--symbolizer",
+        "addr2line",
         perfdata.to_str().unwrap(),
     ]);
 
@@ -287,6 +289,8 @@ fn flamegraph_command_can_symbolize_mapped_frames() {
         "pyroclast",
         "flamegraph",
         "--symbols",
+        "--symbolizer",
+        "addr2line",
         perfdata.to_str().expect("perfdata path"),
         "-o",
         output_svg.to_str().expect("svg path"),

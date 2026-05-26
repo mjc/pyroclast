@@ -16,7 +16,7 @@ fn parses_profile_defaults() {
             assert_eq!(profile.name, None);
             assert!(!profile.json);
             assert!(!profile.symbols);
-            assert_eq!(profile.symbolizer, SymbolizerKind::Addr2line);
+            assert_eq!(profile.symbolizer, SymbolizerKind::RustAddr2line);
             assert_eq!(profile.frequency, 997);
             assert_eq!(profile.event, PerfEvent::CpuClock);
             assert_eq!(profile.call_graph, PerfCallGraph::Dwarf);
@@ -234,7 +234,11 @@ fn parses_top_level_profiler_commands() {
             .unwrap_or_else(|| panic!("expected profile invocation for {verb}"));
         assert_eq!(profile.kind, kind, "verb {verb}");
         assert!(!profile.symbols, "verb {verb}");
-        assert_eq!(profile.symbolizer, SymbolizerKind::Addr2line, "verb {verb}");
+        assert_eq!(
+            profile.symbolizer,
+            SymbolizerKind::RustAddr2line,
+            "verb {verb}"
+        );
         assert_eq!(profile.frequency, 997, "verb {verb}");
         assert_eq!(profile.event, PerfEvent::CpuClock, "verb {verb}");
         assert_eq!(profile.call_graph, PerfCallGraph::Dwarf, "verb {verb}");
@@ -282,7 +286,7 @@ fn parses_analysis_commands() {
 
     let symbolized_fold = Cli::parse_from(["pyroclast", "fold", "--symbols", "perf.data"]);
     assert!(
-        matches!(symbolized_fold.command, CliCommand::Fold(command) if command.input == std::path::Path::new("perf.data") && command.symbols && command.symbolizer == SymbolizerKind::Addr2line)
+        matches!(symbolized_fold.command, CliCommand::Fold(command) if command.input == std::path::Path::new("perf.data") && command.symbols && command.symbolizer == SymbolizerKind::RustAddr2line)
     );
 
     let rust_symbolized_fold = Cli::parse_from([
@@ -310,7 +314,7 @@ fn parses_analysis_commands() {
     let symbolized_flamegraph =
         Cli::parse_from(["pyroclast", "flamegraph", "--symbols", "perf.data"]);
     assert!(
-        matches!(symbolized_flamegraph.command, CliCommand::Flamegraph(command) if command.input == std::path::Path::new("perf.data") && command.symbols && command.symbolizer == SymbolizerKind::Addr2line)
+        matches!(symbolized_flamegraph.command, CliCommand::Flamegraph(command) if command.input == std::path::Path::new("perf.data") && command.symbols && command.symbolizer == SymbolizerKind::RustAddr2line)
     );
 
     let rust_symbolized_flamegraph = Cli::parse_from([
