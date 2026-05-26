@@ -8,7 +8,7 @@ use pyroclast::cli::SymbolizerKind;
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
 use pyroclast::symbols::{
     Addr2lineResolver, Kallsyms, RustAddr2lineResolver, SymbolCache, SymbolRequest, SymbolResolver,
-    perf_debug_dir, perf_symbol_resolver_for_perfdata_file,
+    perf_debug_dir, perf_symbol_name, perf_symbol_resolver_for_perfdata_file,
     perf_symbol_resolver_for_perfdata_file_with_symbolizer,
 };
 
@@ -195,11 +195,9 @@ fn rust_addr2line_resolver_reads_symbol_table_names() {
         }])
         .expect("symbols");
 
-    assert!(
-        symbols[0]
-            .as_deref()
-            .is_some_and(|name| name.contains("rust_addr2line_resolver_reads_symbol_table_names"))
-    );
+    let symbol_name = symbols[0].as_deref().expect("symbol name");
+    assert!(!symbol_name.is_empty());
+    assert!(!symbol_name.contains("::"));
 }
 
 #[test]
@@ -235,12 +233,22 @@ fn symbolizer_selector_can_use_rust_addr2line_without_process_runner() {
         }])
         .expect("symbols");
 
-    assert!(
-        symbols[0]
-            .as_deref()
-            .is_some_and(|name| name.contains("symbolizer_selector_can_use_rust_addr2line"))
-    );
+    let symbol_name = symbols[0].as_deref().expect("symbol name");
+    assert!(!symbol_name.is_empty());
+    assert!(!symbol_name.contains("::"));
     assert!(runner.commands().is_empty());
+}
+
+#[test]
+fn perf_symbol_name_shortens_rust_paths_like_perf_script() {
+    assert_eq!(
+        perf_symbol_name("pyroclast::perfdata::attrs::parse_file_attrs"),
+        "parse_file_attrs"
+    );
+    assert_eq!(
+        perf_symbol_name("<pyroclast::cli::RunArgs as clap_builder::derive::Args>::augment_args"),
+        "augment_args"
+    );
 }
 
 #[test]

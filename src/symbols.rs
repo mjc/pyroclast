@@ -679,7 +679,7 @@ impl SymbolResolver for RustAddr2lineResolver {
 }
 
 fn demangle_addr2line_name(name: &str) -> String {
-    addr2line::demangle_auto(Cow::Borrowed(name), None).into_owned()
+    perf_symbol_name(&addr2line::demangle_auto(Cow::Borrowed(name), None))
 }
 
 fn rust_addr2line_frame_name(loader: &addr2line::Loader, address: u64) -> Option<String> {
@@ -688,10 +688,19 @@ fn rust_addr2line_frame_name(loader: &addr2line::Loader, address: u64) -> Option
         if let Some(function) = frame.function
             && let Ok(name) = function.demangle()
         {
-            return Some(name.into_owned());
+            return Some(perf_symbol_name(&name));
         }
     }
     None
+}
+
+#[must_use]
+pub fn perf_symbol_name(name: &str) -> String {
+    name.rsplit("::")
+        .next()
+        .filter(|part| !part.is_empty())
+        .unwrap_or(name)
+        .to_string()
 }
 
 fn grouped_request_indexes(requests: &[SymbolRequest]) -> BTreeMap<PathBuf, Vec<usize>> {
