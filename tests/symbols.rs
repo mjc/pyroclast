@@ -621,6 +621,40 @@ fn perf_symbol_resolver_uses_kernel_build_id_elf_before_kallsyms() {
 }
 
 #[test]
+fn perf_symbol_resolver_uses_module_build_id_elf() {
+    let home = tempfile::tempdir().expect("home");
+    let build_id = "d6ed2003b20b59c61cdc649124d920215521fc00";
+    let module_elf =
+        pyroclast::symbols::perf_build_id_elf_path(&perf_debug_dir(home.path()), build_id);
+    std::fs::create_dir_all(module_elf.parent().expect("module elf parent")).expect("cache dir");
+    std::fs::write(&module_elf, b"not a real elf; runner is faked").expect("module elf");
+
+    let runner = Addr2lineRunner::new(b"igb_clean_rx_irq\n??:0\n");
+    let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
+        .with_debug_dir(perf_debug_dir(home.path()));
+
+    let symbols = resolver
+        .resolve_batch(&[SymbolRequest {
+            path: PathBuf::from("[igb]"),
+            relative_address: 0x30,
+            build_id: Some(build_id.to_string()),
+            kernel_relocation: None,
+        }])
+        .expect("symbols");
+
+    assert_eq!(symbols, vec![Some("igb_clean_rx_irq".to_string())]);
+    assert_eq!(
+        runner.commands()[0].args,
+        vec![
+            "-f".to_string(),
+            "-C".to_string(),
+            "-e".to_string(),
+            module_elf.display().to_string(),
+        ]
+    );
+}
+
+#[test]
 fn perf_symbol_resolver_uses_system_map_candidates_when_cache_is_missing() {
     let home = tempfile::tempdir().expect("home");
     let perfdata = home.path().join("perf.data");

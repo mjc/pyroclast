@@ -39,6 +39,7 @@ pub struct Addr2lineResolver<'a, R> {
 
 pub struct PerfSymbolResolver<'a, R> {
     addr2line: Addr2lineResolver<'a, R>,
+    debug_dir: Option<PathBuf>,
     kernel_elf: Option<PathBuf>,
     kallsyms: Option<Kallsyms>,
 }
@@ -179,9 +180,16 @@ where
     pub fn new(runner: &'a R) -> Self {
         Self {
             addr2line: Addr2lineResolver::new(runner),
+            debug_dir: None,
             kernel_elf: None,
             kallsyms: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_debug_dir(mut self, path: PathBuf) -> Self {
+        self.debug_dir = Some(path);
+        self
     }
 
     #[must_use]
@@ -210,15 +218,16 @@ where
     #[must_use]
     pub fn with_perfdata_kernel_cache(self, perfdata: &[u8], debug_dir: &Path) -> Self {
         let Some(build_id) = kernel_build_id_from_perfdata(perfdata).ok().flatten() else {
-            return self;
+            return self.with_debug_dir(debug_dir.to_path_buf());
         };
+        let self_with_debug_dir = self.with_debug_dir(debug_dir.to_path_buf());
         let kernel_elf = perf_build_id_elf_path(debug_dir, &build_id);
         if kernel_elf.exists() {
-            return self.with_kernel_elf(kernel_elf);
+            return self_with_debug_dir.with_kernel_elf(kernel_elf);
         }
         match Kallsyms::load_perf_build_id_cache(debug_dir, &build_id) {
-            Some(kallsyms) => self.with_kallsyms(kallsyms),
-            None => self,
+            Some(kallsyms) => self_with_debug_dir.with_kallsyms(kallsyms),
+            None => self_with_debug_dir,
         }
     }
 
@@ -425,7 +434,7 @@ where
                 }
             } else {
                 user_indexes.push(index);
-                user_requests.push(request.clone());
+                user_requests.push(self.object_symbol_request(request));
             }
         }
 
@@ -443,6 +452,30 @@ where
             }
         }
         Ok(resolved)
+    }
+}
+
+impl<R> PerfSymbolResolver<'_, R>
+where
+    R: CommandRunner,
+{
+    fn object_symbol_request(&self, request: &SymbolRequest) -> SymbolRequest {
+        let Some(debug_dir) = &self.debug_dir else {
+            return request.clone();
+        };
+        let Some(build_id) = &request.build_id else {
+            return request.clone();
+        };
+        let elf = perf_build_id_elf_path(debug_dir, build_id);
+        if !elf.exists() {
+            return request.clone();
+        }
+        SymbolRequest {
+            path: elf,
+            relative_address: request.relative_address,
+            build_id: None,
+            kernel_relocation: None,
+        }
     }
 }
 
