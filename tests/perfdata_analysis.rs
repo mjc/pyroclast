@@ -1,4 +1,4 @@
-use pyroclast::perfdata::analysis::analyze_perfdata;
+use pyroclast::perfdata::analysis::{analyze_perfdata, analyze_perfdata_file};
 use pyroclast::perfdata::samples::{
     PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_TID,
 };
@@ -54,6 +54,30 @@ fn ignores_perf_context_markers_when_ranking_leaf_ips() {
     assert_eq!(report.top_leaf_ips[0].ip, "0x0000000000001000");
     assert_eq!(report.top_edges[0].caller, "0x0000000000002000");
     assert_eq!(report.top_edges[0].callee, "0x0000000000001000");
+}
+
+#[test]
+fn analyzes_perfdata_from_file_without_requiring_a_byte_vec() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("perf.data");
+    std::fs::write(
+        &path,
+        perfdata_with_records_and_attrs(
+            [file_attr_bytes(
+                PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN,
+                0,
+                0,
+            )],
+            [record_bytes(9, &sample_payload(0x1000, 1, 11, 7, [0x1000]))],
+        ),
+    )
+    .expect("perfdata");
+
+    let report = analyze_perfdata_file(&path, 10).expect("file analysis");
+
+    assert_eq!(report.total_samples, 1);
+    assert_eq!(report.weighted_samples, 7);
+    assert_eq!(report.top_leaf_ips[0].ip, "0x0000000000001000");
 }
 
 fn perfdata_with_records_and_attrs<const A: usize, const R: usize>(

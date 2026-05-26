@@ -32,7 +32,7 @@ use flamegraph::analysis::{
 };
 use flamegraph::{FlamegraphRenderer, FlamegraphRequest, InfernoFlamegraphRenderer};
 pub use output::{CliOutput, write_cli_output};
-use perfdata::analysis::{PerfdataAnalysis, analyze_perfdata};
+use perfdata::analysis::{PerfdataAnalysis, analyze_perfdata_file};
 use perfdata::fold::{
     FoldOptions, fold_perfdata_file, fold_perfdata_file_with_options,
     fold_perfdata_file_with_symbols,
@@ -259,8 +259,7 @@ where
 }
 
 fn analyze_perfdata_for_cli(command: &AnalyzePerfdataArgs) -> backends::BackendResult<String> {
-    let bytes = std::fs::read(&command.input)?;
-    let analysis = analyze_perfdata(&bytes, command.limit)?;
+    let analysis = analyze_perfdata_file(&command.input, command.limit)?;
     render_perfdata_analysis(&analysis, command.json)
 }
 

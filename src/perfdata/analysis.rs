@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use serde::Serialize;
 
@@ -101,6 +102,26 @@ pub fn analyze_perfdata(bytes: &[u8], limit: usize) -> Result<PerfdataAnalysis, 
         top_leaf_ips: ranked_ips(leaf_ips, limit),
         top_edges: ranked_edges(edges, limit),
     })
+}
+
+/// Builds a compact analysis report from a Linux `perf.data` file path without
+/// copying the full file into memory.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be opened, mapped, or parsed.
+pub fn analyze_perfdata_file(path: &Path, limit: usize) -> Result<PerfdataAnalysis, String> {
+    let file =
+        std::fs::File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
+    let mapping = map_perfdata_file(&file)?;
+    analyze_perfdata(&mapping, limit)
+}
+
+fn map_perfdata_file(file: &std::fs::File) -> Result<memmap2::Mmap, String> {
+    // SAFETY: The mapping is read-only and is only borrowed immutably by the
+    // parser while both the file handle and mapping are alive.
+    unsafe { memmap2::MmapOptions::new().map(file) }
+        .map_err(|error| format!("failed to map perf.data: {error}"))
 }
 
 fn add_count(count: &mut Count, weight: u64) {
