@@ -661,6 +661,54 @@ where
         }
         Ok(resolved)
     }
+
+    fn resolve_frame_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Vec<String>>, String> {
+        let mut resolved = vec![Vec::new(); requests.len()];
+        let mut kernel_elf_requests = Vec::new();
+        let mut kernel_elf_indexes = Vec::new();
+        let mut user_requests = Vec::new();
+        let mut user_indexes = Vec::new();
+
+        for (index, request) in requests.iter().enumerate() {
+            if is_kernel_symbol_path(&request.path) {
+                if let Some(kernel_elf) = &self.kernel_elf {
+                    kernel_elf_indexes.push(index);
+                    kernel_elf_requests.push(SymbolRequest {
+                        path: kernel_elf.clone(),
+                        relative_address: request.relative_address,
+                        build_id: None,
+                        kernel_relocation: None,
+                    });
+                } else if let Some(symbol) = self
+                    .kallsyms
+                    .as_ref()
+                    .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
+                {
+                    resolved[index] = vec![symbol];
+                }
+            } else {
+                user_indexes.push(index);
+                user_requests.push(self.object_symbol_request(request));
+            }
+        }
+
+        if !kernel_elf_requests.is_empty() {
+            let kernel_frames = self
+                .object_resolver
+                .resolve_frame_batch(&kernel_elf_requests)?;
+            for (index, frames) in kernel_elf_indexes.into_iter().zip(kernel_frames) {
+                resolved[index] = frames;
+            }
+        }
+
+        if !user_requests.is_empty() {
+            let user_frames = self.object_resolver.resolve_frame_batch(&user_requests)?;
+            for (index, frames) in user_indexes.into_iter().zip(user_frames) {
+                resolved[index] = frames;
+            }
+        }
+        Ok(resolved)
+    }
 }
 
 impl<O> PerfSymbolResolver<O>

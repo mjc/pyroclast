@@ -820,6 +820,34 @@ fn perf_symbol_resolver_accepts_pluggable_object_resolver() {
 }
 
 #[test]
+fn perf_symbol_resolver_preserves_pluggable_object_frame_lists() {
+    let object_resolver = RecordingResolver::with_frames([(
+        SymbolRequest {
+            path: PathBuf::from("/bin/app"),
+            relative_address: 0x10,
+            build_id: None,
+            kernel_relocation: None,
+        },
+        vec!["app::outer".to_string(), "app::inner".to_string()],
+    )]);
+    let resolver = pyroclast::symbols::PerfSymbolResolver::from_object_resolver(object_resolver);
+
+    let frames = resolver
+        .resolve_frame_batch(&[SymbolRequest {
+            path: PathBuf::from("/bin/app"),
+            relative_address: 0x10,
+            build_id: None,
+            kernel_relocation: None,
+        }])
+        .expect("frames");
+
+    assert_eq!(
+        frames,
+        vec![vec!["app::outer".to_string(), "app::inner".to_string()]]
+    );
+}
+
+#[test]
 fn perf_symbol_resolver_uses_system_map_candidates_when_cache_is_missing() {
     let home = tempfile::tempdir().expect("home");
     let perfdata = home.path().join("perf.data");
@@ -847,6 +875,7 @@ fn perf_symbol_resolver_uses_system_map_candidates_when_cache_is_missing() {
 #[derive(Default)]
 struct RecordingResolver {
     symbols: BTreeMap<SymbolRequest, String>,
+    frames: BTreeMap<SymbolRequest, Vec<String>>,
     calls: RefCell<Vec<Vec<SymbolRequest>>>,
 }
 
@@ -900,6 +929,15 @@ impl RecordingResolver {
     fn with_symbols<const N: usize>(symbols: [(SymbolRequest, String); N]) -> Self {
         Self {
             symbols: symbols.into(),
+            frames: BTreeMap::new(),
+            calls: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn with_frames<const N: usize>(frames: [(SymbolRequest, Vec<String>); N]) -> Self {
+        Self {
+            symbols: BTreeMap::new(),
+            frames: frames.into(),
             calls: RefCell::new(Vec::new()),
         }
     }
@@ -915,6 +953,22 @@ impl SymbolResolver for RecordingResolver {
         Ok(requests
             .iter()
             .map(|request| self.symbols.get(request).cloned())
+            .collect())
+    }
+
+    fn resolve_frame_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Vec<String>>, String> {
+        if self.frames.is_empty() {
+            return self.resolve_batch(requests).map(|symbols| {
+                symbols
+                    .into_iter()
+                    .map(|symbol| symbol.into_iter().collect())
+                    .collect()
+            });
+        }
+        self.calls.borrow_mut().push(requests.to_vec());
+        Ok(requests
+            .iter()
+            .map(|request| self.frames.get(request).cloned().unwrap_or_default())
             .collect())
     }
 }
