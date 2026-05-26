@@ -874,7 +874,7 @@ fn rust_addr2line_frame_names(loader: &addr2line::Loader, address: u64) -> Optio
             names.push(perf_symbol_name(&name));
         }
     }
-    (!names.is_empty()).then_some(names)
+    (!names.is_empty()).then(|| perf_inline_frame_order(names))
 }
 
 #[must_use]
@@ -896,6 +896,12 @@ pub fn perf_symbol_name(name: &str) -> String {
         .filter(|part| !part.is_empty())
         .unwrap_or(name)
         .to_string()
+}
+
+#[must_use]
+pub fn perf_inline_frame_order(mut frames: Vec<String>) -> Vec<String> {
+    frames.reverse();
+    frames
 }
 
 fn grouped_request_indexes(requests: &[SymbolRequest]) -> BTreeMap<PathBuf, Vec<usize>> {

@@ -8,8 +8,8 @@ use pyroclast::cli::SymbolizerKind;
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
 use pyroclast::symbols::{
     Addr2lineResolver, Kallsyms, RustAddr2lineResolver, SymbolCache, SymbolRequest, SymbolResolver,
-    perf_debug_dir, perf_symbol_name, perf_symbol_resolver_for_perfdata_file,
-    perf_symbol_resolver_for_perfdata_file_with_symbolizer,
+    perf_debug_dir, perf_inline_frame_order, perf_symbol_name,
+    perf_symbol_resolver_for_perfdata_file, perf_symbol_resolver_for_perfdata_file_with_symbolizer,
 };
 
 #[test]
@@ -295,6 +295,14 @@ fn perf_symbol_name_shortens_qualified_paths_like_perf_script() {
     assert_eq!(
         perf_symbol_name("__memmove_avx_unaligned_erms"),
         "__memmove_avx_unaligned_erms"
+    );
+}
+
+#[test]
+fn perf_inline_frame_order_matches_perf_script_root_to_leaf() {
+    assert_eq!(
+        perf_inline_frame_order(vec!["value_name".to_string(), "augment_args".to_string()]),
+        vec!["augment_args".to_string(), "value_name".to_string()]
     );
 }
 
