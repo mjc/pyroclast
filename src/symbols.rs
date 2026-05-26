@@ -630,13 +630,10 @@ where
             if is_kernel_symbol_path(&request.path) {
                 if let Some(kernel_elf) = &self.kernel_elf {
                     kernel_elf_indexes.push(index);
-                    kernel_elf_requests.push(SymbolRequest {
-                        path: kernel_elf.clone(),
-                        relative_address: request.relative_address,
-                        build_id: None,
-                        file_identity: None,
-                        kernel_relocation: None,
-                    });
+                    kernel_elf_requests.push(clean_object_symbol_request(
+                        kernel_elf.clone(),
+                        request.relative_address,
+                    ));
                 } else {
                     resolved[index] = self
                         .kallsyms
@@ -676,13 +673,10 @@ where
             if is_kernel_symbol_path(&request.path) {
                 if let Some(kernel_elf) = &self.kernel_elf {
                     kernel_elf_indexes.push(index);
-                    kernel_elf_requests.push(SymbolRequest {
-                        path: kernel_elf.clone(),
-                        relative_address: request.relative_address,
-                        build_id: None,
-                        file_identity: None,
-                        kernel_relocation: None,
-                    });
+                    kernel_elf_requests.push(clean_object_symbol_request(
+                        kernel_elf.clone(),
+                        request.relative_address,
+                    ));
                 } else if let Some(symbol) = self
                     .kallsyms
                     .as_ref()
@@ -730,13 +724,7 @@ where
         if !elf.exists() {
             return Self::live_object_symbol_request(request);
         }
-        Some(SymbolRequest {
-            path: elf,
-            relative_address: request.relative_address,
-            build_id: None,
-            file_identity: None,
-            kernel_relocation: None,
-        })
+        Some(clean_object_symbol_request(elf, request.relative_address))
     }
 
     fn live_object_symbol_request(request: &SymbolRequest) -> Option<SymbolRequest> {
@@ -747,6 +735,16 @@ where
             return None;
         }
         Some(request.clone())
+    }
+}
+
+fn clean_object_symbol_request(path: PathBuf, relative_address: u64) -> SymbolRequest {
+    SymbolRequest {
+        path,
+        relative_address,
+        build_id: None,
+        file_identity: None,
+        kernel_relocation: None,
     }
 }
 
