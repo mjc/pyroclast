@@ -998,13 +998,11 @@ impl SymbolResolver for RustAddr2lineResolver {
                 let object_symbol = object_bytes.as_deref().and_then(|bytes| {
                     perf_object_symbol_name_from_object_bytes(bytes, request.relative_address)
                 });
-                let mut symbol = loader
+                let symbol = loader
                     .find_symbol(request.relative_address)
                     .map(demangle_addr2line_name)
                     .or_else(|| rust_addr2line_frame_name(&loader, request.relative_address));
-                if object_symbol.is_some() {
-                    symbol = object_symbol;
-                }
+                let mut symbol = perf_name_with_object_alias(symbol, object_symbol);
                 specialize_symbol_from_debug_strings(&mut symbol, &debug_names);
                 resolved_by_request.insert(request.clone(), symbol);
             }
@@ -1054,11 +1052,7 @@ impl SymbolResolver for RustAddr2lineResolver {
                             .map(|name| vec![demangle_addr2line_name(name)])
                     })
                     .unwrap_or_default();
-                if let Some(object_symbol) = object_symbol
-                    && frames.len() == 1
-                {
-                    frames[0] = object_symbol;
-                }
+                frames = perf_frames_with_object_alias(frames, object_symbol);
                 specialize_frames_from_debug_strings(&mut frames, &debug_names);
                 resolved_by_request.insert(request.clone(), frames);
             }
@@ -1078,6 +1072,38 @@ impl SymbolResolver for RustAddr2lineResolver {
 
 fn demangle_addr2line_name(name: &str) -> String {
     perf_dwarf_function_name(&addr2line::demangle_auto(Cow::Borrowed(name), None))
+}
+
+fn perf_name_with_object_alias(
+    name: Option<String>,
+    object_alias: Option<String>,
+) -> Option<String> {
+    match (name, object_alias) {
+        (Some(name), Some(object_alias))
+            if perf_object_alias_improves_name(&name, &object_alias) =>
+        {
+            Some(object_alias)
+        }
+        (Some(name), _) => Some(name),
+        (None, object_alias) => object_alias,
+    }
+}
+
+fn perf_frames_with_object_alias(
+    mut frames: Vec<String>,
+    object_alias: Option<String>,
+) -> Vec<String> {
+    if frames.len() == 1
+        && let Some(alias) = object_alias
+        && perf_object_alias_improves_name(&frames[0], &alias)
+    {
+        frames[0] = alias;
+    }
+    frames
+}
+
+fn perf_object_alias_improves_name(name: &str, object_alias: &str) -> bool {
+    leading_underscore_count(object_alias) < leading_underscore_count(name)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1701,7 +1727,7 @@ mod tests {
 
     use super::{
         PerfSymbolBinding, PerfSymbolCandidate, clean_object_symbol_request,
-        perf_best_duplicate_symbol,
+        perf_best_duplicate_symbol, perf_frames_with_object_alias,
     };
 
     #[test]
@@ -1742,6 +1768,21 @@ mod tests {
         assert_eq!(
             perf_best_duplicate_symbol(&internal_alias, &public_alias).name,
             "read"
+        );
+    }
+
+    #[test]
+    fn perf_object_alias_only_replaces_more_underscored_frame_names() {
+        assert_eq!(
+            perf_frames_with_object_alias(vec!["__read".to_string()], Some("read".to_string())),
+            vec!["read".to_string()]
+        );
+        assert_eq!(
+            perf_frames_with_object_alias(
+                vec!["alloc::collections::btree::map::IntoIter<K,V,A>::dying_next".to_string()],
+                Some("dying_next<u64, alloc::string::String, alloc::alloc::Global>".to_string())
+            ),
+            vec!["alloc::collections::btree::map::IntoIter<K,V,A>::dying_next".to_string()]
         );
     }
 }
