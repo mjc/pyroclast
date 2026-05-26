@@ -23,6 +23,7 @@ pub const PERF_RECORD_CGROUP: u32 = 19;
 pub const PERF_RECORD_TEXT_POKE: u32 = 20;
 pub const PERF_RECORD_AUX_OUTPUT_HW_ID: u32 = 21;
 pub const PERF_RECORD_CALLCHAIN_DEFERRED: u32 = 22;
+pub const PERF_RECORD_MISC_COMM_EXEC: u16 = 1 << 13;
 pub const PERF_RECORD_MISC_MMAP_BUILD_ID: u16 = 1 << 14;
 const BPF_TAG_SIZE: usize = 8;
 const SUPPORTED_PERF_RECORD_TYPES: &[u32] = &[
@@ -102,6 +103,7 @@ pub struct CommRecord {
     pub pid: u32,
     pub tid: u32,
     pub comm: String,
+    pub is_exec: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -388,7 +390,9 @@ pub fn parse_record(record: PerfRecord<'_>) -> Result<ParsedRecord, String> {
     match record.header.record_type {
         PERF_RECORD_MMAP => parse_mmap_record(record.payload).map(ParsedRecord::Mmap),
         PERF_RECORD_LOST => parse_lost_record(record.payload).map(ParsedRecord::Lost),
-        PERF_RECORD_COMM => parse_comm_record(record.payload).map(ParsedRecord::Comm),
+        PERF_RECORD_COMM => {
+            parse_comm_record_with_misc(record.payload, record.header.misc).map(ParsedRecord::Comm)
+        }
         PERF_RECORD_THROTTLE => parse_throttle_record(record.payload).map(ParsedRecord::Throttle),
         PERF_RECORD_UNTHROTTLE => {
             parse_unthrottle_record(record.payload).map(ParsedRecord::Unthrottle)
@@ -435,14 +439,24 @@ pub fn parse_record(record: PerfRecord<'_>) -> Result<ParsedRecord, String> {
 ///
 /// Returns an error when the fixed pid/tid fields are missing.
 pub fn parse_comm_record(payload: &[u8]) -> Result<CommRecord, String> {
+    parse_comm_record_with_misc(payload, 0)
+}
+
+fn parse_comm_record_with_misc(payload: &[u8], misc: u16) -> Result<CommRecord, String> {
     if payload.len() < 8 {
         return Err("PERF_RECORD_COMM payload is shorter than 8 bytes".to_string());
     }
     let pid = read_u32(payload, 0)?;
     let tid = read_u32(payload, 4)?;
     let comm = parse_c_string(&payload[8..]);
+    let is_exec = has_misc_flag(misc, PERF_RECORD_MISC_COMM_EXEC);
 
-    Ok(CommRecord { pid, tid, comm })
+    Ok(CommRecord {
+        pid,
+        tid,
+        comm,
+        is_exec,
+    })
 }
 
 /// Parses a `PERF_RECORD_MMAP` payload.

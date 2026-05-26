@@ -285,6 +285,7 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
     let sample_layouts = sample_layouts(bytes, header)?;
     let records = iter_records(bytes, header)?;
     let mut process_comms = BTreeMap::new();
+    let mut exec_process_comms = BTreeMap::new();
     let mut thread_comms = BTreeMap::new();
     let mut mmap_table = MmapTable::default();
     let mut object_unwinder = FramehopUnwinder::new();
@@ -296,8 +297,12 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
         let parsed_record = parse_record_with_context(record)?;
         let record_result: Result<(), String> = match parsed_record {
             ParsedRecord::Comm(record) => {
-                process_comms.insert(record.pid, record.comm.clone());
-                thread_comms.insert(record.tid, record.comm);
+                update_comm_tables(
+                    &mut process_comms,
+                    &mut exec_process_comms,
+                    &mut thread_comms,
+                    record,
+                );
                 Ok(())
             }
             ParsedRecord::Mmap(record) => {
@@ -323,6 +328,7 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
                 add_fold_sample(
                     sample,
                     &process_comms,
+                    &exec_process_comms,
                     &thread_comms,
                     &mmap_table,
                     &mut raw_stacks,
@@ -351,25 +357,7 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
                 mmap_table.insert_mmap2_build_id(record);
                 Ok(())
             }
-            ParsedRecord::Unsupported { .. }
-            | ParsedRecord::Lost(_)
-            | ParsedRecord::LostSamples(_)
-            | ParsedRecord::Fork(_)
-            | ParsedRecord::Exit(_)
-            | ParsedRecord::Throttle(_)
-            | ParsedRecord::Unthrottle(_)
-            | ParsedRecord::Read(_)
-            | ParsedRecord::Aux(_)
-            | ParsedRecord::ItraceStart(_)
-            | ParsedRecord::Switch(_)
-            | ParsedRecord::SwitchCpuWide(_)
-            | ParsedRecord::Namespaces(_)
-            | ParsedRecord::Ksymbol(_)
-            | ParsedRecord::BpfEvent(_)
-            | ParsedRecord::Cgroup(_)
-            | ParsedRecord::TextPoke(_)
-            | ParsedRecord::AuxOutputHwId(_)
-            | ParsedRecord::CallchainDeferred(_) => Ok(()),
+            _ => Ok(()),
         };
         record_result.map_err(|error| {
             format!(
@@ -385,17 +373,32 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
     })
 }
 
+fn update_comm_tables(
+    process_comms: &mut BTreeMap<u32, String>,
+    exec_process_comms: &mut BTreeMap<u32, String>,
+    thread_comms: &mut BTreeMap<u32, String>,
+    record: crate::perfdata::records::CommRecord,
+) {
+    if record.is_exec {
+        exec_process_comms.insert(record.pid, record.comm.clone());
+    }
+    process_comms.insert(record.pid, record.comm.clone());
+    thread_comms.insert(record.tid, record.comm);
+}
+
 fn add_fold_sample(
     sample: Option<FoldSample>,
     process_comms: &BTreeMap<u32, String>,
+    exec_process_comms: &BTreeMap<u32, String>,
     thread_comms: &BTreeMap<u32, String>,
     mmap_table: &MmapTable,
     raw_stacks: &mut RawStackAccumulator<FoldFrame>,
     callchain: &mut Vec<FoldFrame>,
 ) {
     if let Some((pid, tid, count, frames)) = sample {
-        let comm = tid
-            .and_then(|tid| thread_comms.get(&tid))
+        let comm = pid
+            .and_then(|pid| exec_process_comms.get(&pid))
+            .or_else(|| tid.and_then(|tid| thread_comms.get(&tid)))
             .or_else(|| pid.and_then(|pid| process_comms.get(&pid)))
             .cloned();
         callchain.clear();

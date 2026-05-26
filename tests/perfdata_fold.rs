@@ -5,6 +5,7 @@ use pyroclast::perfdata::fold::{
     fold_perfdata_callchains_with_symbols, fold_perfdata_file_with_options, summarize_perfdata,
 };
 use pyroclast::perfdata::mappings::FileIdentity;
+use pyroclast::perfdata::records::PERF_RECORD_MISC_COMM_EXEC;
 use pyroclast::perfdata::samples::{
     PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP,
     PERF_SAMPLE_PERIOD, PERF_SAMPLE_REGS_USER, PERF_SAMPLE_STACK_USER, PERF_SAMPLE_TID,
@@ -638,6 +639,30 @@ fn uses_comm_name_from_sample_time_like_perf_script() {
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
     assert_eq!(folded, "perf-exec;0x2000 1\npyroclast;0x3000 1\n");
+}
+
+#[test]
+fn exec_comm_replaces_stale_thread_comm_like_perf_script() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(3, &comm_payload(11, 12, "perf-exec")),
+            record_bytes_with_misc(
+                3,
+                PERF_RECORD_MISC_COMM_EXEC,
+                &comm_payload(11, 11, "pyroclast"),
+            ),
+            record_bytes(9, &sample_payload(0x1000, 11, 12, [0x2000])),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, "pyroclast;0x2000 1\n");
 }
 
 #[test]

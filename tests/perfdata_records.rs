@@ -1,13 +1,14 @@
 use proptest::prelude::*;
 use pyroclast::perfdata::header::parse_header;
 use pyroclast::perfdata::records::{
-    ParsedRecord, PerfRecord, PerfRecordHeader, iter_records, parse_aux_output_hw_id_record,
-    parse_aux_record, parse_bpf_event_record, parse_callchain_deferred_record, parse_cgroup_record,
-    parse_comm_record, parse_exit_record, parse_fork_record, parse_itrace_start_record,
-    parse_ksymbol_record, parse_lost_record, parse_lost_samples_record, parse_mmap_record,
-    parse_mmap2_build_id_record, parse_mmap2_record, parse_namespaces_record, parse_read_record,
-    parse_record, parse_record_header, parse_sample_payload_record, parse_switch_cpu_wide_record,
-    parse_switch_record, parse_text_poke_record, parse_throttle_record, parse_unthrottle_record,
+    PERF_RECORD_MISC_COMM_EXEC, ParsedRecord, PerfRecord, PerfRecordHeader, iter_records,
+    parse_aux_output_hw_id_record, parse_aux_record, parse_bpf_event_record,
+    parse_callchain_deferred_record, parse_cgroup_record, parse_comm_record, parse_exit_record,
+    parse_fork_record, parse_itrace_start_record, parse_ksymbol_record, parse_lost_record,
+    parse_lost_samples_record, parse_mmap_record, parse_mmap2_build_id_record, parse_mmap2_record,
+    parse_namespaces_record, parse_read_record, parse_record, parse_record_header,
+    parse_sample_payload_record, parse_switch_cpu_wide_record, parse_switch_record,
+    parse_text_poke_record, parse_throttle_record, parse_unthrottle_record,
     supported_perf_record_types,
 };
 
@@ -119,8 +120,30 @@ fn dispatches_comm_record_by_perf_record_type() {
             pid: 123,
             tid: 456,
             comm: "sftp-s3".to_string(),
+            is_exec: false,
         })
     );
+}
+
+#[test]
+fn dispatches_comm_exec_misc_flag() {
+    let payload = comm_payload_from(123, 456, "pyroclast");
+    let record = PerfRecord {
+        offset: 104,
+        header: PerfRecordHeader {
+            record_type: 3,
+            misc: PERF_RECORD_MISC_COMM_EXEC,
+            size: u16::try_from(8 + payload.len()).expect("record size"),
+        },
+        payload: &payload,
+    };
+
+    let parsed = parse_record(record).expect("parsed record");
+
+    assert!(matches!(
+        parsed,
+        ParsedRecord::Comm(pyroclast::perfdata::records::CommRecord { is_exec: true, .. })
+    ));
 }
 
 #[test]
