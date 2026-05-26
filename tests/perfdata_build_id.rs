@@ -1,5 +1,6 @@
 use pyroclast::perfdata::build_id::{
-    BuildIdEvent, kernel_build_id_from_perfdata, parse_build_id_events,
+    BuildIdEvent, build_id_events_from_perfdata, kernel_build_id_from_perfdata,
+    parse_build_id_events,
 };
 
 #[test]
@@ -39,6 +40,39 @@ fn extracts_kernel_build_id_from_perfdata_header_feature() {
     assert_eq!(
         kernel_build_id,
         Some("16ed3d5317ad219c89d0e3c5ea0ea2caa3cd4949".to_string())
+    );
+}
+
+#[test]
+fn extracts_all_build_id_events_from_perfdata_header_feature() {
+    let kernel_build_id = [
+        0x16, 0xed, 0x3d, 0x53, 0x17, 0xad, 0x21, 0x9c, 0x89, 0xd0, 0xe3, 0xc5, 0xea, 0x0e, 0xa2,
+        0xca, 0xa3, 0xcd, 0x49, 0x49,
+    ];
+    let user_build_id = [
+        0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90,
+        0xa0, 0xb0, 0xc0, 0xd0, 0xe0,
+    ];
+    let mut payload = build_id_event_payload(u32::MAX, &kernel_build_id, "[kernel.kallsyms]");
+    payload.extend(build_id_event_payload(42, &user_build_id, "/tmp/stale-app"));
+    let bytes = perfdata_with_build_id_feature(&payload);
+
+    let events = build_id_events_from_perfdata(&bytes).expect("build ids");
+
+    assert_eq!(
+        events,
+        vec![
+            BuildIdEvent {
+                pid: u32::MAX,
+                build_id: "16ed3d5317ad219c89d0e3c5ea0ea2caa3cd4949".to_string(),
+                filename: "[kernel.kallsyms]".to_string(),
+            },
+            BuildIdEvent {
+                pid: 42,
+                build_id: "aabbccddeeff102030405060708090a0b0c0d0e0".to_string(),
+                filename: "/tmp/stale-app".to_string(),
+            },
+        ]
     );
 }
 

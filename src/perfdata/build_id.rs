@@ -44,6 +44,19 @@ pub fn parse_build_id_events(payload: &[u8]) -> Result<Vec<BuildIdEvent>, String
     Ok(events)
 }
 
+/// Extracts all build IDs recorded in a `perf.data` file header.
+///
+/// # Errors
+///
+/// Returns an error when the `perf.data` header or build-id feature payload is
+/// malformed.
+pub fn build_id_events_from_perfdata(bytes: &[u8]) -> Result<Vec<BuildIdEvent>, String> {
+    let Some(payload) = build_id_feature_payload(bytes)? else {
+        return Ok(Vec::new());
+    };
+    parse_build_id_events(payload)
+}
+
 /// Extracts the kernel build ID recorded in a `perf.data` file.
 ///
 /// # Errors
@@ -51,6 +64,13 @@ pub fn parse_build_id_events(payload: &[u8]) -> Result<Vec<BuildIdEvent>, String
 /// Returns an error when the `perf.data` header or build-id feature payload is
 /// malformed.
 pub fn kernel_build_id_from_perfdata(bytes: &[u8]) -> Result<Option<String>, String> {
+    Ok(build_id_events_from_perfdata(bytes)?
+        .into_iter()
+        .find(|event| is_kernel_build_id_filename(&event.filename))
+        .map(|event| event.build_id))
+}
+
+fn build_id_feature_payload(bytes: &[u8]) -> Result<Option<&[u8]>, String> {
     let header = parse_header(bytes)?;
     let Some(section) = parse_feature_sections(bytes, &header)?
         .into_iter()
@@ -68,11 +88,7 @@ pub fn kernel_build_id_from_perfdata(bytes: &[u8]) -> Result<Option<String>, Str
     let payload = bytes
         .get(start..end)
         .ok_or_else(|| "build-id feature payload is truncated".to_string())?;
-
-    Ok(parse_build_id_events(payload)?
-        .into_iter()
-        .find(|event| is_kernel_build_id_filename(&event.filename))
-        .map(|event| event.build_id))
+    Ok(Some(payload))
 }
 
 fn parse_build_id_event(record: &[u8]) -> Result<BuildIdEvent, String> {
