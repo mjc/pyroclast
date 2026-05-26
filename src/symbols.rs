@@ -988,12 +988,14 @@ impl SymbolResolver for RustAddr2lineResolver {
                 }
                 continue;
             };
-            let debug_names = std::fs::read(&path)
-                .map(|bytes| DebugStringNameIndex::from_object_bytes(&bytes))
+            let object_bytes = std::fs::read(&path).ok();
+            let debug_names = object_bytes
+                .as_deref()
+                .map(DebugStringNameIndex::from_object_bytes)
                 .unwrap_or_default();
             for index in indexes {
                 let request = &requests[index];
-                let object_symbol = std::fs::read(&path).ok().as_deref().and_then(|bytes| {
+                let object_symbol = object_bytes.as_deref().and_then(|bytes| {
                     perf_object_symbol_name_from_object_bytes(bytes, request.relative_address)
                 });
                 let mut symbol = loader
