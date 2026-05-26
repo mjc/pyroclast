@@ -1,4 +1,4 @@
-use object::{Object, ObjectSymbol};
+use object::{Object, ObjectSegment, ObjectSymbol};
 use pyroclast::perfdata::samples::{
     PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_TID,
 };
@@ -118,6 +118,16 @@ fn fold_command_can_use_rust_symbolizer_without_addr2line() {
                 .is_ok_and(|name| name.contains("fold_command_can_use_rust_symbolizer"))
         })
         .expect("test symbol");
+    let sample_file_offset = object
+        .segments()
+        .find_map(|segment| {
+            let start = segment.address();
+            let end = start.checked_add(segment.size())?;
+            let (file_offset, _) = segment.file_range();
+            (symbol.address() >= start && symbol.address() < end)
+                .then(|| file_offset + (symbol.address() - start))
+        })
+        .expect("test symbol is in a load segment");
     let perfdata = root.path().join("perf.data");
     std::fs::write(
         &perfdata,
@@ -135,14 +145,14 @@ fn fold_command_can_use_rust_symbolizer_without_addr2line() {
                         1,
                         2,
                         0,
-                        symbol.address().saturating_add(1),
+                        sample_file_offset.saturating_add(1),
                         0,
                         &current_exe.display().to_string(),
                     ),
                 ),
                 record_bytes(
                     9,
-                    &sample_payload(symbol.address(), 1, 2, [symbol.address()]),
+                    &sample_payload(sample_file_offset, 1, 2, [sample_file_offset]),
                 ),
             ],
         ),

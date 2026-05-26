@@ -764,7 +764,10 @@ where
         {
             return None;
         }
-        Some(request.clone())
+        Some(clean_object_symbol_request(
+            request.path.clone(),
+            request.relative_address,
+        ))
     }
 
     fn resolve_kernel_symbol(&self, request: &SymbolRequest) -> Option<String> {

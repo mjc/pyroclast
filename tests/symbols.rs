@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use object::{Object, ObjectSymbol};
+use object::{Object, ObjectSegment, ObjectSymbol};
 use pyroclast::cli::SymbolizerKind;
 use pyroclast::perfdata::mappings::FileIdentity;
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
@@ -1048,6 +1048,55 @@ fn perf_symbol_resolver_accepts_pluggable_object_resolver() {
         vec![vec![SymbolRequest {
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        }]]
+    );
+}
+
+#[test]
+fn perf_symbol_resolver_translates_live_object_file_offsets_to_virtual_addresses() {
+    let path = std::env::current_exe().expect("current test binary");
+    let bytes = std::fs::read(&path).expect("current test binary bytes");
+    let object = object::File::parse(bytes.as_slice()).expect("current test binary object");
+    let (file_offset, virtual_address) = object
+        .segments()
+        .find_map(|segment| {
+            let (file_offset, file_size) = segment.file_range();
+            let virtual_address = segment.address();
+            (file_size > 8 && virtual_address != file_offset)
+                .then_some((file_offset + 8, virtual_address + 8))
+        })
+        .expect("current test binary has a biased load segment");
+    let object_resolver = RecordingResolver::with_symbols([(
+        SymbolRequest {
+            path: path.clone(),
+            relative_address: virtual_address,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        },
+        "app::main".to_string(),
+    )]);
+    let resolver = pyroclast::symbols::PerfSymbolResolver::from_object_resolver(object_resolver);
+
+    let symbols = resolver
+        .resolve_batch(&[SymbolRequest {
+            path: path.clone(),
+            relative_address: file_offset,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        }])
+        .expect("symbols");
+
+    assert_eq!(symbols, vec![Some("app::main".to_string())]);
+    assert_eq!(
+        resolver.object_resolver().batch_calls(),
+        vec![vec![SymbolRequest {
+            path,
+            relative_address: virtual_address,
             build_id: None,
             file_identity: None,
             kernel_relocation: None,
