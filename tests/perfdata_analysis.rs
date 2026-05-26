@@ -1,6 +1,8 @@
 use pyroclast::perfdata::analysis::{analyze_perfdata, analyze_perfdata_file};
+use pyroclast::perfdata::records::PERF_RECORD_MISC_CPUMODE_KERNEL;
 use pyroclast::perfdata::samples::{
-    PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_TID,
+    PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_REGS_USER,
+    PERF_SAMPLE_STACK_USER, PERF_SAMPLE_TID,
 };
 
 #[test]
@@ -54,6 +56,41 @@ fn ignores_perf_context_markers_when_ranking_leaf_ips() {
     assert_eq!(report.top_leaf_ips[0].ip, "0x0000000000001000");
     assert_eq!(report.top_edges[0].caller, "0x0000000000002000");
     assert_eq!(report.top_edges[0].callee, "0x0000000000001000");
+}
+
+#[test]
+fn analyzes_sample_modes_and_user_stack_payloads() {
+    let perfdata = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_PERIOD
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            1 << 8,
+        )],
+        [record_bytes_with_misc(
+            9,
+            PERF_RECORD_MISC_CPUMODE_KERNEL,
+            &sample_payload_with_user_stack(
+                sample_payload(0x1000, 1, 11, 7, [0x1000]),
+                [0xaaaa],
+                [1, 2, 3],
+            ),
+        )],
+    );
+
+    let report = analyze_perfdata(&perfdata, 10).expect("analysis");
+
+    assert_eq!(report.sample_modes[0].mode, "kernel");
+    assert_eq!(report.sample_modes[0].samples, 1);
+    assert_eq!(report.sample_modes[0].weighted_samples, 7);
+    assert_eq!(report.user_stack_samples, 1);
+    assert_eq!(report.user_stack_bytes, 3);
+    assert_eq!(report.user_stack_dynamic_bytes, 3);
+    assert_eq!(report.user_register_samples, 1);
+    assert_eq!(report.user_register_ip_samples, 1);
 }
 
 #[test]
@@ -112,10 +149,20 @@ fn file_attr_bytes(sample_type: u64, ids_offset: u64, ids_size: u64) -> [u8; 144
     bytes
 }
 
+fn file_attr_bytes_with_regs(sample_type: u64, sample_regs_user: u64) -> [u8; 144] {
+    let mut bytes = file_attr_bytes(sample_type, 0, 0);
+    put_u64(&mut bytes, 80, sample_regs_user);
+    bytes
+}
+
 fn record_bytes(record_type: u32, payload: &[u8]) -> Vec<u8> {
+    record_bytes_with_misc(record_type, 0, payload)
+}
+
+fn record_bytes_with_misc(record_type: u32, misc: u16, payload: &[u8]) -> Vec<u8> {
     let mut record = Vec::new();
     record.extend(record_type.to_le_bytes());
-    record.extend(0_u16.to_le_bytes());
+    record.extend(misc.to_le_bytes());
     record.extend(
         u16::try_from(8 + payload.len())
             .expect("record size")
@@ -141,6 +188,22 @@ fn sample_payload<const N: usize>(
     for frame in callchain {
         payload.extend(frame.to_le_bytes());
     }
+    payload
+}
+
+fn sample_payload_with_user_stack<const R: usize, const S: usize>(
+    mut payload: Vec<u8>,
+    regs: [u64; R],
+    stack: [u8; S],
+) -> Vec<u8> {
+    payload.extend(1_u64.to_le_bytes());
+    for reg in regs {
+        payload.extend(reg.to_le_bytes());
+    }
+    payload.extend((stack.len() as u64).to_le_bytes());
+    payload.extend(stack);
+    payload.extend(vec![0; stack.len().next_multiple_of(8) - stack.len()]);
+    payload.extend((S as u64).to_le_bytes());
     payload
 }
 

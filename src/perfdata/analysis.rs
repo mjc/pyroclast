@@ -4,6 +4,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::perfdata::fold::summarize_perfdata;
+use crate::perfdata::records::{PERF_RECORD_MISC_CPUMODE_KERNEL, PERF_RECORD_MISC_CPUMODE_USER};
 use crate::perfdata::samples::is_perf_context_marker;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -12,9 +13,22 @@ pub struct PerfdataAnalysis {
     pub total_samples: usize,
     pub weighted_samples: u64,
     pub lost_records: u64,
+    pub user_stack_samples: usize,
+    pub user_stack_bytes: usize,
+    pub user_stack_dynamic_bytes: u64,
+    pub user_register_samples: usize,
+    pub user_register_ip_samples: usize,
+    pub sample_modes: Vec<PerfdataSampleMode>,
     pub threads: Vec<PerfdataThread>,
     pub top_leaf_ips: Vec<PerfdataIpCount>,
     pub top_edges: Vec<PerfdataEdgeCount>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PerfdataSampleMode {
+    pub mode: String,
+    pub samples: usize,
+    pub weighted_samples: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -61,13 +75,32 @@ struct Count {
 pub fn analyze_perfdata(bytes: &[u8], limit: usize) -> Result<PerfdataAnalysis, String> {
     let summary = summarize_perfdata(bytes)?;
     let mut threads = BTreeMap::<u32, Count>::new();
+    let mut sample_modes = BTreeMap::<u16, Count>::new();
     let mut leaf_ips = BTreeMap::<u64, Count>::new();
     let mut edges = BTreeMap::<Edge, Count>::new();
     let mut weighted_samples = 0_u64;
+    let mut user_stack_samples = 0_usize;
+    let mut user_stack_bytes = 0_usize;
+    let mut user_stack_dynamic_bytes = 0_u64;
+    let mut user_register_samples = 0_usize;
+    let mut user_register_ip_samples = 0_usize;
 
     for sample in &summary.sample_stacks {
         let weight = sample.period.unwrap_or(1);
         weighted_samples = weighted_samples.saturating_add(weight);
+        add_count(sample_modes.entry(sample.cpumode).or_default(), weight);
+        if sample.has_user_stack {
+            user_stack_samples += 1;
+            user_stack_bytes = user_stack_bytes.saturating_add(sample.user_stack_size);
+            user_stack_dynamic_bytes =
+                user_stack_dynamic_bytes.saturating_add(sample.user_stack_dynamic_size);
+        }
+        if sample.user_register_count != 0 {
+            user_register_samples += 1;
+        }
+        if sample.user_register_ip.is_some() {
+            user_register_ip_samples += 1;
+        }
         if let Some(tid) = sample.tid.or(sample.pid) {
             add_count(threads.entry(tid).or_default(), weight);
         }
@@ -98,6 +131,12 @@ pub fn analyze_perfdata(bytes: &[u8], limit: usize) -> Result<PerfdataAnalysis, 
         total_samples: summary.sample_stacks.len(),
         weighted_samples,
         lost_records: summary.lost_records,
+        user_stack_samples,
+        user_stack_bytes,
+        user_stack_dynamic_bytes,
+        user_register_samples,
+        user_register_ip_samples,
+        sample_modes: ranked_sample_modes(sample_modes),
         threads: ranked_threads(threads, &summary.comms_by_tid, limit),
         top_leaf_ips: ranked_ips(leaf_ips, limit),
         top_edges: ranked_edges(edges, limit),
@@ -127,6 +166,35 @@ fn map_perfdata_file(file: &std::fs::File) -> Result<memmap2::Mmap, String> {
 fn add_count(count: &mut Count, weight: u64) {
     count.samples += 1;
     count.weighted_samples = count.weighted_samples.saturating_add(weight);
+}
+
+fn ranked_sample_modes(modes: BTreeMap<u16, Count>) -> Vec<PerfdataSampleMode> {
+    let mut modes = modes
+        .into_iter()
+        .map(|(mode, count)| PerfdataSampleMode {
+            mode: sample_mode_name(mode).to_owned(),
+            samples: count.samples,
+            weighted_samples: count.weighted_samples,
+        })
+        .collect::<Vec<_>>();
+    modes.sort_by(|left, right| {
+        right
+            .weighted_samples
+            .cmp(&left.weighted_samples)
+            .then_with(|| left.mode.cmp(&right.mode))
+    });
+    modes
+}
+
+fn sample_mode_name(mode: u16) -> &'static str {
+    match mode {
+        PERF_RECORD_MISC_CPUMODE_KERNEL => "kernel",
+        PERF_RECORD_MISC_CPUMODE_USER => "user",
+        3 => "hypervisor",
+        4 => "guest-kernel",
+        5 => "guest-user",
+        _ => "unknown",
+    }
 }
 
 fn ranked_threads(
