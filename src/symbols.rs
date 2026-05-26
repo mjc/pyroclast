@@ -870,14 +870,16 @@ impl SymbolResolver for RustAddr2lineResolver {
                 }
                 continue;
             };
-            let object_bytes = std::fs::read(&path).unwrap_or_default();
+            let debug_names = std::fs::read(&path)
+                .map(|bytes| DebugStringNameIndex::from_object_bytes(&bytes))
+                .unwrap_or_default();
             for index in indexes {
                 let request = &requests[index];
                 let mut symbol = loader
                     .find_symbol(request.relative_address)
                     .map(demangle_addr2line_name)
                     .or_else(|| rust_addr2line_frame_name(&loader, request.relative_address));
-                specialize_symbol_from_debug_strings(&mut symbol, &object_bytes);
+                specialize_symbol_from_debug_strings(&mut symbol, &debug_names);
                 resolved_by_request.insert(request.clone(), symbol);
             }
         }
@@ -902,7 +904,9 @@ impl SymbolResolver for RustAddr2lineResolver {
                 }
                 continue;
             };
-            let object_bytes = std::fs::read(&path).unwrap_or_default();
+            let debug_names = std::fs::read(&path)
+                .map(|bytes| DebugStringNameIndex::from_object_bytes(&bytes))
+                .unwrap_or_default();
             for index in indexes {
                 let request = &requests[index];
                 let mut frames = rust_addr2line_frame_names(&loader, request.relative_address)
@@ -912,7 +916,7 @@ impl SymbolResolver for RustAddr2lineResolver {
                             .map(|name| vec![demangle_addr2line_name(name)])
                     })
                     .unwrap_or_default();
-                specialize_frames_from_debug_strings(&mut frames, &object_bytes);
+                specialize_frames_from_debug_strings(&mut frames, &debug_names);
                 resolved_by_request.insert(request.clone(), frames);
             }
         }
@@ -950,20 +954,68 @@ fn rust_addr2line_frame_names(loader: &addr2line::Loader, address: u64) -> Optio
     (!names.is_empty()).then(|| perf_inline_frame_order(names))
 }
 
-fn specialize_symbol_from_debug_strings(symbol: &mut Option<String>, object_bytes: &[u8]) {
+fn specialize_symbol_from_debug_strings(
+    symbol: &mut Option<String>,
+    debug_names: &DebugStringNameIndex,
+) {
     if let Some(symbol) = symbol
-        && let Some(specialized) = more_specific_dwarf_name_from_debug_strings(symbol, object_bytes)
+        && let Some(specialized) = debug_names.get(symbol)
     {
         *symbol = specialized;
     }
 }
 
-fn specialize_frames_from_debug_strings(frames: &mut [String], object_bytes: &[u8]) {
+fn specialize_frames_from_debug_strings(frames: &mut [String], debug_names: &DebugStringNameIndex) {
     for frame in frames {
-        if let Some(specialized) = more_specific_dwarf_name_from_debug_strings(frame, object_bytes)
-        {
+        if let Some(specialized) = debug_names.get(frame) {
             *frame = specialized;
         }
+    }
+}
+
+#[derive(Default)]
+struct DebugStringNameIndex {
+    names_by_leaf: BTreeMap<String, Option<String>>,
+}
+
+impl DebugStringNameIndex {
+    fn from_object_bytes(object_bytes: &[u8]) -> Self {
+        let mut index = Self::default();
+        for raw in object_bytes.split(|byte| *byte == 0) {
+            if raw.len() < 4 || raw.len() > 4096 {
+                continue;
+            }
+            let Ok(candidate) = std::str::from_utf8(raw) else {
+                continue;
+            };
+            if !candidate.contains('<') {
+                continue;
+            }
+            let normalized = perf_dwarf_function_name(candidate);
+            let Some(leaf) = generic_function_leaf(&normalized) else {
+                continue;
+            };
+            if let Some(existing) = index.names_by_leaf.get_mut(leaf) {
+                if existing
+                    .as_ref()
+                    .is_some_and(|current| current != &normalized)
+                {
+                    *existing = None;
+                }
+            } else {
+                index
+                    .names_by_leaf
+                    .insert(leaf.to_string(), Some(normalized));
+            }
+        }
+        index
+    }
+
+    fn get(&self, function_leaf: &str) -> Option<String> {
+        if function_leaf.contains('<') || function_leaf.is_empty() {
+            return None;
+        }
+        self.names_by_leaf.get(function_leaf).cloned().flatten()
     }
 }
 
@@ -972,33 +1024,13 @@ pub fn more_specific_dwarf_name_from_debug_strings(
     function_leaf: &str,
     object_bytes: &[u8],
 ) -> Option<String> {
-    if function_leaf.contains('<') || function_leaf.is_empty() {
-        return None;
-    }
-    let mut matches = BTreeSet::new();
-    for raw in object_bytes.split(|byte| *byte == 0) {
-        if raw.len() < function_leaf.len() + 3 || raw.len() > 4096 {
-            continue;
-        }
-        let Ok(candidate) = std::str::from_utf8(raw) else {
-            continue;
-        };
-        if !candidate.contains('<') || !candidate.contains(function_leaf) {
-            continue;
-        }
-        let normalized = perf_dwarf_function_name(candidate);
-        if normalized
-            .strip_prefix(function_leaf)
-            .is_some_and(|suffix| suffix.starts_with('<'))
-        {
-            matches.insert(normalized);
-        }
-    }
-    if matches.len() == 1 {
-        matches.into_iter().next()
-    } else {
-        None
-    }
+    DebugStringNameIndex::from_object_bytes(object_bytes).get(function_leaf)
+}
+
+fn generic_function_leaf(name: &str) -> Option<&str> {
+    let generic_start = name.find('<')?;
+    let leaf = &name[..generic_start];
+    (!leaf.is_empty() && !leaf.contains(' ') && !leaf.contains('(')).then_some(leaf)
 }
 
 #[must_use]
