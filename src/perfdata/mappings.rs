@@ -14,6 +14,16 @@ pub struct ResolvedMapping {
     pub kernel_relocation: Option<KernelRelocation>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserMapping<'a> {
+    pub pid: u32,
+    pub start: u64,
+    pub len: u64,
+    pub pgoff: u64,
+    pub path: &'a str,
+    pub build_id: Option<&'a [u8]>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Mapping {
     pid: u32,
@@ -71,6 +81,20 @@ impl MmapTable {
                 kernel_relocation: mapping.kernel_relocation(),
             })
     }
+
+    pub fn user_mappings(&self) -> impl Iterator<Item = UserMapping<'_>> {
+        self.mappings
+            .iter()
+            .filter(|mapping| mapping.is_user_file_mapping())
+            .map(|mapping| UserMapping {
+                pid: mapping.pid,
+                start: mapping.start,
+                len: mapping.len,
+                pgoff: mapping.pgoff,
+                path: &mapping.path,
+                build_id: mapping.build_id.as_deref(),
+            })
+    }
 }
 
 impl Mapping {
@@ -96,5 +120,9 @@ impl Mapping {
                 reference_symbol: reference_symbol.to_string(),
                 recorded_reference_address: self.pgoff,
             })
+    }
+
+    fn is_user_file_mapping(&self) -> bool {
+        !self.path.starts_with('[') && self.pid != u32::MAX
     }
 }

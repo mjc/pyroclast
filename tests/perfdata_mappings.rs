@@ -153,3 +153,33 @@ fn does_not_resolve_other_pids_or_out_of_range_ips() {
     assert_eq!(table.resolve(41, 0x1010), None);
     assert_eq!(table.resolve(42, 0x1200), None);
 }
+
+#[test]
+fn exposes_user_mappings_for_unwind_module_loading() {
+    let mut table = MmapTable::default();
+    table.insert_mmap(MmapRecord {
+        pid: 42,
+        tid: 42,
+        start: 0x1000,
+        len: 0x200,
+        pgoff: 0,
+        path: "/bin/app".to_string(),
+    });
+    table.insert_mmap(MmapRecord {
+        pid: u32::MAX,
+        tid: u32::MAX,
+        start: 0xffff_ffff_8800_0000,
+        len: 0x2000,
+        pgoff: 0,
+        path: "[kernel.kallsyms]".to_string(),
+    });
+
+    let mappings = table.user_mappings().collect::<Vec<_>>();
+
+    assert_eq!(mappings.len(), 1);
+    assert_eq!(mappings[0].pid, 42);
+    assert_eq!(mappings[0].start, 0x1000);
+    assert_eq!(mappings[0].len, 0x200);
+    assert_eq!(mappings[0].pgoff, 0);
+    assert_eq!(mappings[0].path, "/bin/app");
+}
