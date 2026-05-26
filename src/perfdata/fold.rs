@@ -557,7 +557,7 @@ fn add_fold_stack(
         if is_perf_context_marker(address) {
             return false;
         }
-        if should_drop_known_non_executable_user_frame(pid, address, mmap_table) {
+        if should_drop_known_non_executable_user_unwind_frame(pid, *frame, mmap_table) {
             return false;
         }
         true
@@ -740,10 +740,10 @@ impl<'a> FoldFrameResolver<'a> {
             if symbol_cache.is_none() && !is_valid_unwound_user_frame(pid, frame, self.mmap_table) {
                 continue;
             }
-            let frame = frame.address();
-            if should_drop_known_non_executable_user_frame(pid, frame, self.mmap_table) {
+            if should_drop_known_non_executable_user_unwind_frame(pid, frame, self.mmap_table) {
                 continue;
             }
+            let frame = frame.address();
             frames.extend(self.format_frames(pid, frame, symbol_cache.as_deref_mut())?);
         }
         Ok(frames)
@@ -782,11 +782,14 @@ impl<'a> FoldFrameResolver<'a> {
     }
 }
 
-fn should_drop_known_non_executable_user_frame(
+fn should_drop_known_non_executable_user_unwind_frame(
     pid: Option<u32>,
-    address: u64,
+    frame: FoldFrame,
     mmap_table: &MmapTable,
 ) -> bool {
+    let FoldFrame::UserUnwind(address) = frame else {
+        return false;
+    };
     !is_kernel_space_frame(address)
         && pid.is_some_and(|pid| mmap_table.is_known_non_executable(pid, address))
 }
