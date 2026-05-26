@@ -782,6 +782,13 @@ where
             Self::RustAddr2line(resolver) => resolver.resolve_batch(requests),
         }
     }
+
+    fn resolve_frame_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Vec<String>>, String> {
+        match self {
+            Self::Addr2line(resolver) => resolver.resolve_frame_batch(requests),
+            Self::RustAddr2line(resolver) => resolver.resolve_frame_batch(requests),
+        }
+    }
 }
 
 impl SymbolResolver for RustAddr2lineResolver {
@@ -814,6 +821,39 @@ impl SymbolResolver for RustAddr2lineResolver {
             })
             .collect()
     }
+
+    fn resolve_frame_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Vec<String>>, String> {
+        let mut resolved_by_request = BTreeMap::<SymbolRequest, Vec<String>>::new();
+        for (path, indexes) in grouped_request_indexes(requests) {
+            let Ok(loader) = addr2line::Loader::new(&path) else {
+                for index in indexes {
+                    resolved_by_request.insert(requests[index].clone(), Vec::new());
+                }
+                continue;
+            };
+            for index in indexes {
+                let request = &requests[index];
+                let frames = rust_addr2line_frame_names(&loader, request.relative_address)
+                    .or_else(|| {
+                        loader
+                            .find_symbol(request.relative_address)
+                            .map(|name| vec![demangle_addr2line_name(name)])
+                    })
+                    .unwrap_or_default();
+                resolved_by_request.insert(request.clone(), frames);
+            }
+        }
+
+        requests
+            .iter()
+            .map(|request| {
+                resolved_by_request
+                    .get(request)
+                    .cloned()
+                    .ok_or_else(|| "missing rust addr2line frame result for request".to_string())
+            })
+            .collect()
+    }
 }
 
 fn demangle_addr2line_name(name: &str) -> String {
@@ -821,15 +861,20 @@ fn demangle_addr2line_name(name: &str) -> String {
 }
 
 fn rust_addr2line_frame_name(loader: &addr2line::Loader, address: u64) -> Option<String> {
+    rust_addr2line_frame_names(loader, address).and_then(|frames| frames.into_iter().last())
+}
+
+fn rust_addr2line_frame_names(loader: &addr2line::Loader, address: u64) -> Option<Vec<String>> {
     let mut frames = loader.find_frames(address).ok()?;
+    let mut names = Vec::new();
     while let Ok(Some(frame)) = frames.next() {
         if let Some(function) = frame.function
             && let Ok(name) = function.demangle()
         {
-            return Some(perf_symbol_name(&name));
+            names.push(perf_symbol_name(&name));
         }
     }
-    None
+    (!names.is_empty()).then_some(names)
 }
 
 #[must_use]
