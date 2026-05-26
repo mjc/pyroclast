@@ -387,10 +387,15 @@ where
 
     #[must_use]
     pub fn with_system_kallsyms(self) -> Self {
-        if self.kernel_elf.is_some() || self.live_kallsyms.is_some() {
+        self.with_system_kallsyms_from_path(Path::new("/proc/kallsyms"))
+    }
+
+    #[must_use]
+    pub fn with_system_kallsyms_from_path(self, path: &Path) -> Self {
+        if self.live_kallsyms.is_some() {
             return self;
         }
-        match std::fs::read_to_string("/proc/kallsyms")
+        match std::fs::read_to_string(path)
             .ok()
             .and_then(|text| Kallsyms::parse(&text).ok())
         {

@@ -851,7 +851,7 @@ fn perf_symbol_resolver_prefers_perfdata_kallsyms_over_kernel_elf() {
 }
 
 #[test]
-fn perf_symbol_resolver_uses_kernel_build_id_elf_before_kallsyms() {
+fn perf_symbol_resolver_uses_kernel_build_id_elf_when_kallsyms_is_missing() {
     let home = tempfile::tempdir().expect("home");
     let perfdata = home.path().join("perf.data");
     std::fs::write(&perfdata, perfdata_with_kernel_build_id()).expect("perfdata");
@@ -863,7 +863,8 @@ fn perf_symbol_resolver_uses_kernel_build_id_elf_before_kallsyms() {
     std::fs::write(&kernel_elf, b"not a real elf; runner is faked").expect("kernel elf");
 
     let runner = Addr2lineRunner::new(b"asm_exc_page_fault\n??:0\n");
-    let resolver = perf_symbol_resolver_for_perfdata_file(&runner, &perfdata, home.path());
+    let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
+        .with_perfdata_file_kernel_cache(&perfdata, &perf_debug_dir(home.path()));
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
@@ -885,6 +886,41 @@ fn perf_symbol_resolver_uses_kernel_build_id_elf_before_kallsyms() {
             kernel_elf.display().to_string(),
         ]
     );
+}
+
+#[test]
+fn perf_symbol_resolver_prefers_system_kallsyms_over_kernel_elf() {
+    let root = tempfile::tempdir().expect("root");
+    let kernel_elf = root.path().join("vmlinux");
+    std::fs::write(&kernel_elf, b"not a real elf; runner is faked").expect("kernel elf");
+    let kallsyms = root.path().join("kallsyms");
+    std::fs::write(
+        &kallsyms,
+        "\
+ffffffff846997a0 T memcpy
+ffffffff846997a0 T __memcpy
+ffffffff846997a0 T __pi_memcpy
+",
+    )
+    .expect("kallsyms");
+
+    let runner = Addr2lineRunner::new(b"memcpy\n??:0\n");
+    let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
+        .with_kernel_elf(kernel_elf)
+        .with_system_kallsyms_from_path(&kallsyms);
+
+    let symbols = resolver
+        .resolve_batch(&[SymbolRequest {
+            path: PathBuf::from("[kernel.kallsyms]"),
+            relative_address: 0xffff_ffff_8469_97ac,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        }])
+        .expect("symbols");
+
+    assert_eq!(symbols, vec![Some("__pi_memcpy".to_string())]);
+    assert!(runner.commands().is_empty());
 }
 
 #[test]
