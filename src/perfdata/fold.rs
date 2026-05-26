@@ -946,6 +946,7 @@ fn parse_sample_for_fold(
                 let deferred_cookie = take_deferred_cookie(&mut frames);
                 if let (Some(regs), Some(stack)) = (&sample.user_regs, &sample.user_stack)
                     && !stack.bytes.is_empty()
+                    && stack.dynamic_size != 0
                     && let Ok(regs) = PerfX86_64Regs::from_perf_masked_values(
                         layout.sample_regs_user,
                         &regs.values,

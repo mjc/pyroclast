@@ -301,6 +301,45 @@ fn keeps_dwarf_user_stack_payloads_for_kernel_samples_without_user_context_marke
 }
 
 #[test]
+fn skips_dwarf_unwind_when_perf_user_stack_dynamic_size_is_zero_like_perf_script() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            (1 << 6) | (1 << 7) | (1 << 8),
+        )],
+        [record_bytes_with_misc(
+            9,
+            PERF_RECORD_MISC_CPUMODE_KERNEL,
+            &sample_payload_with_zero_dynamic_user_stack(
+                0x4000,
+                11,
+                12,
+                [
+                    0xffff_ffff_ffff_ff80,
+                    0xffff_ffff_8100_0000,
+                    0xffff_ffff_8200_0000,
+                ],
+                1,
+                [0x7fff_0008, 0x7fff_0000, 0x4000],
+                [
+                    0, 0, 0, 0, 0, 0, 0, 0, //
+                    0x40, 0, 0, 0, 0, 0, 0, 0, //
+                    0x34, 0x12, 0, 0, 0, 0, 0, 0,
+                ],
+            ),
+        )],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, "[unknown];[unknown] 1\n");
+}
+
+#[test]
 fn uses_mapped_object_unwinder_for_dwarf_user_stack_frames() {
     let current_exe = std::env::current_exe().expect("current exe");
     let current_exe = current_exe.to_string_lossy();
@@ -1768,6 +1807,31 @@ fn sample_payload_with_user_stack<const C: usize, const R: usize, const S: usize
     stack: [u8; S],
 ) -> Vec<u8> {
     let mut payload = sample_payload(ip, pid, tid, callchain);
+    append_user_stack_payload(&mut payload, abi, regs, stack, S as u64);
+    payload
+}
+
+fn sample_payload_with_zero_dynamic_user_stack<const C: usize, const R: usize, const S: usize>(
+    ip: u64,
+    pid: u32,
+    tid: u32,
+    callchain: [u64; C],
+    abi: u64,
+    regs: [u64; R],
+    stack: [u8; S],
+) -> Vec<u8> {
+    let mut payload = sample_payload(ip, pid, tid, callchain);
+    append_user_stack_payload(&mut payload, abi, regs, stack, 0);
+    payload
+}
+
+fn append_user_stack_payload<const R: usize, const S: usize>(
+    payload: &mut Vec<u8>,
+    abi: u64,
+    regs: [u64; R],
+    stack: [u8; S],
+    dynamic_size: u64,
+) {
     payload.extend(abi.to_le_bytes());
     for reg in regs {
         payload.extend(reg.to_le_bytes());
@@ -1775,8 +1839,7 @@ fn sample_payload_with_user_stack<const C: usize, const R: usize, const S: usize
     payload.extend((stack.len() as u64).to_le_bytes());
     payload.extend(stack);
     payload.extend(vec![0; stack.len().next_multiple_of(8) - stack.len()]);
-    payload.extend((S as u64).to_le_bytes());
-    payload
+    payload.extend(dynamic_size.to_le_bytes());
 }
 
 fn comm_payload(pid: u32, tid: u32, comm: &str) -> Vec<u8> {
