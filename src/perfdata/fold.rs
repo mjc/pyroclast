@@ -43,7 +43,6 @@ pub struct PerfSampleStack {
 }
 
 struct PerfFoldData {
-    comms_by_pid: BTreeMap<u32, String>,
     mmap_table: MmapTable,
     raw_stacks: Vec<CollapsedRawStack<FoldFrame>>,
 }
@@ -316,7 +315,13 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
                 &mut object_unwinder,
             )
             .map(|sample| {
-                add_fold_sample(sample, &mmap_table, &mut raw_stacks, &mut callchain);
+                add_fold_sample(
+                    sample,
+                    &comms_by_pid,
+                    &mmap_table,
+                    &mut raw_stacks,
+                    &mut callchain,
+                );
             }),
             ParsedRecord::Mmap2(record) => {
                 load_unwind_mapping(
@@ -371,7 +376,6 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
     }
 
     Ok(PerfFoldData {
-        comms_by_pid,
         mmap_table,
         raw_stacks: raw_stacks.into_collapsed(),
     })
@@ -379,11 +383,13 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
 
 fn add_fold_sample(
     sample: Option<FoldSample>,
+    comms_by_pid: &BTreeMap<u32, String>,
     mmap_table: &MmapTable,
     raw_stacks: &mut RawStackAccumulator<FoldFrame>,
     callchain: &mut Vec<FoldFrame>,
 ) {
     if let Some((pid, count, frames)) = sample {
+        let comm = pid.and_then(|pid| comms_by_pid.get(&pid)).cloned();
         callchain.clear();
         callchain.reserve(frames.len());
         callchain.extend(frames.into_iter().rev().filter(|frame| {
@@ -399,7 +405,7 @@ fn add_fold_sample(
         if callchain.is_empty() {
             return;
         }
-        raw_stacks.add_slice(pid, callchain, count);
+        raw_stacks.add_slice_with_comm(pid, comm, callchain, count);
     }
 }
 
@@ -425,10 +431,11 @@ where
         prefetch_symbols(&fold_data.raw_stacks, &fold_data.mmap_table, cache)?;
     }
     let mut counts = BTreeMap::<Vec<String>, u64>::new();
-    let frame_resolver = FoldFrameResolver::new(&fold_data.comms_by_pid, &fold_data.mmap_table);
+    let frame_resolver = FoldFrameResolver::new(&fold_data.mmap_table);
     for stack in &fold_data.raw_stacks {
         let frames = frame_resolver.frames_for_stack(
             stack.pid,
+            stack.comm.as_deref(),
             &stack.callchain,
             symbol_cache.as_deref_mut(),
         )?;
@@ -480,7 +487,6 @@ fn symbol_requests_for_stack(
 }
 
 struct FoldFrameResolver<'a> {
-    comms_by_pid: &'a BTreeMap<u32, String>,
     mmap_table: &'a MmapTable,
 }
 
@@ -493,23 +499,21 @@ impl SymbolResolver for NoopSymbolResolver {
 }
 
 impl<'a> FoldFrameResolver<'a> {
-    fn new(comms_by_pid: &'a BTreeMap<u32, String>, mmap_table: &'a MmapTable) -> Self {
-        Self {
-            comms_by_pid,
-            mmap_table,
-        }
+    fn new(mmap_table: &'a MmapTable) -> Self {
+        Self { mmap_table }
     }
 
     fn frames_for_stack<R>(
         &self,
         pid: Option<u32>,
+        comm: Option<&str>,
         callchain: &[FoldFrame],
         mut symbol_cache: Option<&mut SymbolCache<'_, R>>,
     ) -> Result<Vec<String>, String>
     where
         R: SymbolResolver,
     {
-        let mut frames = if let Some(comm) = pid.and_then(|pid| self.comms_by_pid.get(&pid)) {
+        let mut frames = if let Some(comm) = comm {
             vec![comm.replace(' ', "_")]
         } else {
             Vec::new()

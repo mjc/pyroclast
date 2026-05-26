@@ -523,6 +523,27 @@ fn prefixes_folded_stacks_with_matching_comm_name() {
 }
 
 #[test]
+fn uses_comm_name_from_sample_time_like_perf_script() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(3, &comm_payload(11, 11, "perf-exec")),
+            record_bytes(9, &sample_payload(0x1000, 11, 12, [0x2000])),
+            record_bytes(3, &comm_payload(11, 11, "pyroclast")),
+            record_bytes(9, &sample_payload(0x1000, 11, 12, [0x3000])),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, "perf-exec;0x2000 1\npyroclast;0x3000 1\n");
+}
+
+#[test]
 fn normalizes_comm_spaces_like_inferno() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(

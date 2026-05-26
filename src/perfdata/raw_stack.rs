@@ -7,6 +7,7 @@ use rustc_hash::{FxBuildHasher, FxHasher};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollapsedRawStack<T = u64> {
     pub pid: Option<u32>,
+    pub comm: Option<String>,
     pub callchain: Vec<T>,
     pub count: u64,
 }
@@ -14,6 +15,7 @@ pub struct CollapsedRawStack<T = u64> {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct RawStackKey<T> {
     pid: Option<u32>,
+    comm: Option<String>,
     callchain: Vec<T>,
 }
 
@@ -47,17 +49,39 @@ where
     }
 
     pub fn add_vec(&mut self, pid: Option<u32>, callchain: Vec<T>, count: u64) {
-        let key = RawStackKey { pid, callchain };
+        self.add_vec_with_comm(pid, None, callchain, count);
+    }
+
+    pub fn add_vec_with_comm(
+        &mut self,
+        pid: Option<u32>,
+        comm: Option<String>,
+        callchain: Vec<T>,
+        count: u64,
+    ) {
+        let key = RawStackKey {
+            pid,
+            comm,
+            callchain,
+        };
         *self.counts.entry(key).or_insert(0) += count;
     }
 
     pub fn add_slice(&mut self, pid: Option<u32>, callchain: &[T], count: u64) {
-        let hash = raw_stack_hash(pid, callchain);
-        match self
-            .counts
-            .raw_entry_mut()
-            .from_hash(hash, |key| key.pid == pid && key.callchain == callchain)
-        {
+        self.add_slice_with_comm(pid, None, callchain, count);
+    }
+
+    pub fn add_slice_with_comm(
+        &mut self,
+        pid: Option<u32>,
+        comm: Option<String>,
+        callchain: &[T],
+        count: u64,
+    ) {
+        let hash = raw_stack_hash(pid, comm.as_deref(), callchain);
+        match self.counts.raw_entry_mut().from_hash(hash, |key| {
+            key.pid == pid && key.comm == comm && key.callchain == callchain
+        }) {
             RawEntryMut::Occupied(mut entry) => {
                 *entry.get_mut() += count;
             }
@@ -65,6 +89,7 @@ where
                 entry.insert(
                     RawStackKey {
                         pid,
+                        comm,
                         callchain: callchain.to_vec(),
                     },
                     count,
@@ -80,6 +105,7 @@ where
             .into_iter()
             .map(|(key, count)| CollapsedRawStack {
                 pid: key.pid,
+                comm: key.comm,
                 callchain: key.callchain,
                 count,
             })
@@ -87,15 +113,17 @@ where
         collapsed.sort_by(|left, right| {
             left.pid
                 .cmp(&right.pid)
+                .then_with(|| left.comm.cmp(&right.comm))
                 .then_with(|| left.callchain.cmp(&right.callchain))
         });
         collapsed
     }
 }
 
-fn raw_stack_hash<T: Hash>(pid: Option<u32>, callchain: &[T]) -> u64 {
+fn raw_stack_hash<T: Hash>(pid: Option<u32>, comm: Option<&str>, callchain: &[T]) -> u64 {
     let mut hasher = FxHasher::default();
     pid.hash(&mut hasher);
+    comm.hash(&mut hasher);
     callchain.hash(&mut hasher);
     hasher.finish()
 }
