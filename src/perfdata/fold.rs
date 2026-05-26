@@ -396,6 +396,9 @@ fn add_fold_sample(
             }
             true
         }));
+        if callchain.is_empty() {
+            return;
+        }
         raw_stacks.add_slice(pid, callchain, count);
     }
 }
