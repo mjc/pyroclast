@@ -366,12 +366,14 @@ where
         };
         let self_with_debug_dir = self.with_debug_dir(debug_dir.to_path_buf());
         let kernel_elf = perf_build_id_elf_path(debug_dir, &build_id);
-        if kernel_elf.exists() {
-            return self_with_debug_dir.with_kernel_elf(kernel_elf);
-        }
-        match Kallsyms::load_perf_build_id_cache(debug_dir, &build_id) {
+        let self_with_kallsyms = match Kallsyms::load_perf_build_id_cache(debug_dir, &build_id) {
             Some(kallsyms) => self_with_debug_dir.with_kallsyms(kallsyms),
             None => self_with_debug_dir,
+        };
+        if kernel_elf.exists() {
+            self_with_kallsyms.with_kernel_elf(kernel_elf)
+        } else {
+            self_with_kallsyms
         }
     }
 
@@ -643,14 +645,14 @@ where
                     resolved[index] = self.resolve_kernel_symbol(request);
                 }
             } else if is_kernel_symbol_path(&request.path) {
-                if let Some(kernel_elf) = &self.kernel_elf {
+                if let Some(symbol) = self.resolve_kernel_symbol(request) {
+                    resolved[index] = Some(symbol);
+                } else if let Some(kernel_elf) = &self.kernel_elf {
                     kernel_elf_indexes.push(index);
                     kernel_elf_requests.push(clean_object_symbol_request(
                         kernel_elf.clone(),
                         request.relative_address,
                     ));
-                } else {
-                    resolved[index] = self.resolve_kernel_symbol(request);
                 }
             } else if let Some(object_request) = self.object_symbol_request(request) {
                 user_indexes.push(index);
@@ -690,14 +692,14 @@ where
                     resolved[index] = vec![symbol];
                 }
             } else if is_kernel_symbol_path(&request.path) {
-                if let Some(kernel_elf) = &self.kernel_elf {
+                if let Some(symbol) = self.resolve_kernel_symbol(request) {
+                    resolved[index] = vec![symbol];
+                } else if let Some(kernel_elf) = &self.kernel_elf {
                     kernel_elf_indexes.push(index);
                     kernel_elf_requests.push(clean_object_symbol_request(
                         kernel_elf.clone(),
                         request.relative_address,
                     ));
-                } else if let Some(symbol) = self.resolve_kernel_symbol(request) {
-                    resolved[index] = vec![symbol];
                 }
             } else if let Some(object_request) = self.object_symbol_request(request) {
                 user_indexes.push(index);
