@@ -423,7 +423,6 @@ impl FoldAccumulator {
                 sample_layouts,
                 options,
                 &mut self.object_unwinder,
-                &self.mmap_table,
             )
             .map(|sample| self.add_fold_sample(sample)),
             ParsedRecord::CallchainDeferred(record) => {
@@ -938,7 +937,6 @@ fn parse_sample_for_fold(
     sample_layouts: &SampleLayouts,
     options: FoldOptions,
     object_unwinder: &mut FramehopUnwinder,
-    mmap_table: &MmapTable,
 ) -> Result<Option<FoldSample>, String> {
     if let Some(layout) = sample_layouts.layout_for_payload(payload)? {
         parse_sample_record_callchain(payload, layout).map(|sample| {
@@ -950,18 +948,12 @@ fn parse_sample_for_fold(
                 };
                 let mut frames = sample.frames.map(FoldFrame::Callchain).collect::<Vec<_>>();
                 let deferred_cookie = take_deferred_cookie(&mut frames);
-                if let (Some(raw_regs), Some(stack)) = (&sample.user_regs, &sample.user_stack)
+                if let (Some(regs), Some(stack)) = (&sample.user_regs, &sample.user_stack)
                     && has_perf_captured_user_stack(stack)
+                    && should_unwind_sampled_user_stack(sample_misc, &frames)
                     && let Ok(regs) = PerfX86_64Regs::from_perf_masked_values(
                         layout.sample_regs_user,
-                        &raw_regs.values,
-                    )
-                    && should_unwind_sampled_user_stack(
-                        sample.pid,
-                        regs.ip,
-                        sample_misc,
-                        &frames,
-                        mmap_table,
+                        &regs.values,
                     )
                 {
                     let unwound_frames = if object_unwinder.module_count() == 0 {
@@ -1012,26 +1004,10 @@ fn has_perf_captured_user_stack(stack: &crate::perfdata::samples::SampleUserStac
     !stack.bytes.is_empty() && stack.dynamic_size != 0
 }
 
-fn should_unwind_sampled_user_stack(
-    pid: Option<u32>,
-    user_ip: u64,
-    sample_misc: u16,
-    frames: &[FoldFrame],
-    mmap_table: &MmapTable,
-) -> bool {
+fn should_unwind_sampled_user_stack(sample_misc: u16, frames: &[FoldFrame]) -> bool {
     sample_misc & PERF_RECORD_MISC_CPUMODE_MASK != PERF_RECORD_MISC_CPUMODE_KERNEL
         || frames.iter().copied().any(|frame| {
             matches!(frame, FoldFrame::Callchain(address) if is_perf_user_context_marker(address) || is_perf_user_deferred_context_marker(address))
-        })
-        || is_mapped_user_unwind_ip(pid, user_ip, mmap_table)
-}
-
-fn is_mapped_user_unwind_ip(pid: Option<u32>, user_ip: u64, mmap_table: &MmapTable) -> bool {
-    pid.and_then(|pid| mmap_table.resolve(pid, user_ip))
-        .is_some_and(|mapping| {
-            !is_kernel_space_frame(user_ip)
-                && !is_kernel_mapping(&mapping)
-                && !should_drop_user_unwind_mapping_path(&mapping.path)
         })
 }
 
