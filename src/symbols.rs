@@ -4,6 +4,7 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
+use object::{Object, ObjectSegment};
 use serde::Serialize;
 
 use crate::perfdata::build_id::kernel_build_id_from_perfdata;
@@ -795,6 +796,8 @@ where
 }
 
 fn clean_object_symbol_request(path: PathBuf, relative_address: u64) -> SymbolRequest {
+    let relative_address =
+        object_virtual_address_for_file_offset(&path, relative_address).unwrap_or(relative_address);
     SymbolRequest {
         path,
         relative_address,
@@ -802,6 +805,17 @@ fn clean_object_symbol_request(path: PathBuf, relative_address: u64) -> SymbolRe
         file_identity: None,
         kernel_relocation: None,
     }
+}
+
+fn object_virtual_address_for_file_offset(path: &Path, file_offset: u64) -> Option<u64> {
+    let bytes = std::fs::read(path).ok()?;
+    let object = object::File::parse(bytes.as_slice()).ok()?;
+    object.segments().find_map(|segment| {
+        let (segment_offset, segment_size) = segment.file_range();
+        let segment_end = segment_offset.checked_add(segment_size)?;
+        (file_offset >= segment_offset && file_offset < segment_end)
+            .then(|| segment.address() + (file_offset - segment_offset))
+    })
 }
 
 impl<R> SymbolResolver for Addr2lineResolver<'_, R>
@@ -1151,4 +1165,31 @@ fn parse_kallsyms_line(line: &str) -> Option<(u64, String)> {
     let _symbol_type = fields.next()?;
     let symbol = fields.next()?;
     Some((address, symbol.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use object::{Object, ObjectSegment};
+
+    use super::clean_object_symbol_request;
+
+    #[test]
+    fn object_requests_use_elf_virtual_addresses_for_pie_file_offsets() {
+        let path = std::env::current_exe().expect("current test binary");
+        let bytes = std::fs::read(&path).expect("current test binary bytes");
+        let object = object::File::parse(bytes.as_slice()).expect("current test binary object");
+        let (file_offset, virtual_address) = object
+            .segments()
+            .find_map(|segment| {
+                let (file_offset, file_size) = segment.file_range();
+                let virtual_address = segment.address();
+                (file_size > 8 && virtual_address != file_offset)
+                    .then_some((file_offset + 8, virtual_address + 8))
+            })
+            .expect("current test binary has a biased load segment");
+
+        let request = clean_object_symbol_request(path, file_offset);
+
+        assert_eq!(request.relative_address, virtual_address);
+    }
 }
