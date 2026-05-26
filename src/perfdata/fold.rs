@@ -415,7 +415,6 @@ impl FoldAccumulator {
             }
             ParsedRecord::Sample(record) => parse_sample_for_fold(
                 &record.payload,
-                record.misc,
                 sample_layouts,
                 options,
                 &mut self.object_unwinder,
@@ -929,7 +928,6 @@ fn parse_sample_for_summary(
 
 fn parse_sample_for_fold(
     payload: &[u8],
-    _sample_misc: u16,
     sample_layouts: &SampleLayouts,
     options: FoldOptions,
     object_unwinder: &mut FramehopUnwinder,
