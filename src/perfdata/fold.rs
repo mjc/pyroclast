@@ -5,9 +5,11 @@ use std::path::{Path, PathBuf};
 use crate::folded::render_folded_stack;
 use crate::perfdata::attrs::{PerfFileAttr, parse_file_attr_ids, parse_file_attrs};
 use crate::perfdata::header::parse_header;
-use crate::perfdata::mappings::{MmapTable, ResolvedMapping};
+use crate::perfdata::mappings::{
+    FileIdentity, MmapTable, ResolvedMapping, file_matches_recorded_identity,
+};
 use crate::perfdata::raw_stack::{CollapsedRawStack, RawStackAccumulator};
-use crate::perfdata::records::{ParsedRecord, PerfRecord, iter_records, parse_record};
+use crate::perfdata::records::{Mmap2Record, ParsedRecord, PerfRecord, iter_records, parse_record};
 use crate::perfdata::samples::{
     PERF_SAMPLE_ADDR, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_TID,
     PERF_SAMPLE_TIME, SampleLayout, is_kernel_space_frame, is_perf_context_marker,
@@ -304,6 +306,7 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
                     record.len,
                     record.pgoff,
                     &record.path,
+                    None,
                 );
                 mmap_table.insert_mmap(record);
                 Ok(())
@@ -324,13 +327,10 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
                 );
             }),
             ParsedRecord::Mmap2(record) => {
-                load_unwind_mapping(
+                load_mmap2_unwind_mapping(
                     &mut object_unwinder,
                     &mut loaded_unwind_mappings,
-                    record.start,
-                    record.len,
-                    record.pgoff,
-                    &record.path,
+                    &record,
                 );
                 mmap_table.insert_mmap2(record);
                 Ok(())
@@ -343,6 +343,7 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
                     record.len,
                     record.pgoff,
                     &record.path,
+                    None,
                 );
                 mmap_table.insert_mmap2_build_id(record);
                 Ok(())
@@ -684,8 +685,9 @@ fn load_unwind_mapping(
     len: u64,
     pgoff: u64,
     path: &str,
+    file_identity: Option<FileIdentity>,
 ) {
-    if path.starts_with('[') {
+    if !should_load_unwind_object(path, file_identity) {
         return;
     }
     let key = (path.to_string(), start, len, pgoff);
@@ -693,6 +695,38 @@ fn load_unwind_mapping(
         return;
     }
     let _ = object_unwinder.add_object_mapping(Path::new(path), start, len, pgoff);
+}
+
+fn load_mmap2_unwind_mapping(
+    object_unwinder: &mut FramehopUnwinder,
+    loaded_unwind_mappings: &mut BTreeSet<(String, u64, u64, u64)>,
+    record: &Mmap2Record,
+) {
+    load_unwind_mapping(
+        object_unwinder,
+        loaded_unwind_mappings,
+        record.start,
+        record.len,
+        record.pgoff,
+        &record.path,
+        Some(mmap2_file_identity(record)),
+    );
+}
+
+fn mmap2_file_identity(record: &Mmap2Record) -> FileIdentity {
+    FileIdentity {
+        major: record.major,
+        minor: record.minor,
+        inode: record.inode,
+        inode_generation: record.inode_generation,
+    }
+}
+
+fn should_load_unwind_object(path: &str, file_identity: Option<FileIdentity>) -> bool {
+    if path.starts_with('[') {
+        return false;
+    }
+    file_identity.is_none_or(|identity| file_matches_recorded_identity(Path::new(path), identity))
 }
 
 fn sample_layouts(
@@ -777,4 +811,29 @@ fn read_sample_u64(payload: &[u8], offset: usize) -> Result<u64, String> {
         .try_into()
         .map_err(|_| "perf sample payload is truncated".to_string())?;
     Ok(u64::from_le_bytes(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::MetadataExt;
+
+    use crate::perfdata::mappings::FileIdentity;
+
+    #[test]
+    fn skips_unwind_object_when_recorded_file_identity_mismatches_path() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let path = root.path().join("app");
+        std::fs::write(&path, b"binary").expect("write app");
+        let inode = std::fs::metadata(&path).expect("metadata").ino();
+
+        assert!(!super::should_load_unwind_object(
+            path.to_str().expect("utf-8 path"),
+            Some(FileIdentity {
+                major: 0,
+                minor: 0,
+                inode: inode + 1,
+                inode_generation: 0,
+            }),
+        ));
+    }
 }
