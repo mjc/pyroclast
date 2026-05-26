@@ -379,6 +379,45 @@ fn drops_unwound_user_stack_frames_outside_known_mappings() {
 }
 
 #[test]
+fn symbolized_fold_renders_unmapped_user_unwind_frames_as_unknown_like_perf_script() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            (1 << 6) | (1 << 7) | (1 << 8),
+        )],
+        [
+            record_bytes(1, &mmap_payload(11, 11, 0x4000, 0x100, 0, "/tmp/app")),
+            record_bytes(
+                9,
+                &sample_payload_with_user_stack(
+                    0x4000,
+                    11,
+                    12,
+                    [],
+                    1,
+                    [0x7fff_0008, 0x7fff_0000, 0x4000],
+                    [
+                        0, 0, 0, 0, 0, 0, 0, 0, //
+                        0x40, 0, 0, 0, 0, 0, 0, 0, //
+                        0x34, 0x12, 0, 0, 0, 0, 0, 0,
+                    ],
+                ),
+            ),
+        ],
+    );
+    let resolver = RecordingSymbolResolver::default();
+
+    let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
+        .expect("folded");
+
+    assert_eq!(folded, "[unknown];[app] 1\n");
+}
+
+#[test]
 fn keeps_unwound_user_stack_frames_from_mappings_after_sample() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(

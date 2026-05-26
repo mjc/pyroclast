@@ -723,7 +723,7 @@ impl<'a> FoldFrameResolver<'a> {
             Vec::new()
         };
         for frame in callchain.iter().copied() {
-            if !is_valid_unwound_user_frame(pid, frame, self.mmap_table) {
+            if symbol_cache.is_none() && !is_valid_unwound_user_frame(pid, frame, self.mmap_table) {
                 continue;
             }
             let frame = frame.address();
