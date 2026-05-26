@@ -45,12 +45,12 @@ pub struct PerfSampleStack {
 struct PerfFoldData {
     comms_by_pid: BTreeMap<u32, String>,
     mmap_table: MmapTable,
-    raw_stacks: Vec<CollapsedRawStack>,
+    raw_stacks: Vec<CollapsedRawStack<FoldFrame>>,
 }
 
 type FoldSample = (Option<u32>, u64, Vec<FoldFrame>);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum FoldFrame {
     Callchain(u64),
     UserUnwind(u64),
@@ -287,7 +287,7 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
     let mut mmap_table = MmapTable::default();
     let mut object_unwinder = FramehopUnwinder::new();
     let mut loaded_unwind_mappings = BTreeSet::new();
-    let mut raw_stacks = RawStackAccumulator::new();
+    let mut raw_stacks = RawStackAccumulator::<FoldFrame>::new();
     let mut callchain = Vec::new();
 
     for record in records {
@@ -380,24 +380,21 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
 fn add_fold_sample(
     sample: Option<FoldSample>,
     mmap_table: &MmapTable,
-    raw_stacks: &mut RawStackAccumulator,
-    callchain: &mut Vec<u64>,
+    raw_stacks: &mut RawStackAccumulator<FoldFrame>,
+    callchain: &mut Vec<FoldFrame>,
 ) {
     if let Some((pid, count, frames)) = sample {
         callchain.clear();
         callchain.reserve(frames.len());
-        callchain.extend(frames.into_iter().rev().filter_map(|frame| {
+        callchain.extend(frames.into_iter().rev().filter(|frame| {
             let address = frame.address();
             if is_perf_context_marker(address) {
-                return None;
+                return false;
             }
             if pid.is_some_and(|pid| mmap_table.is_known_non_executable(pid, address)) {
-                return None;
+                return false;
             }
-            if !is_valid_unwound_user_frame(pid, frame, mmap_table) {
-                return None;
-            }
-            Some(address)
+            true
         }));
         raw_stacks.add_slice(pid, callchain, count);
     }
@@ -447,7 +444,7 @@ where
 }
 
 fn prefetch_symbols<R>(
-    raw_stacks: &[CollapsedRawStack],
+    raw_stacks: &[CollapsedRawStack<FoldFrame>],
     mmap_table: &MmapTable,
     symbol_cache: &mut SymbolCache<'_, R>,
 ) -> Result<(), String>
@@ -463,12 +460,14 @@ where
 
 fn symbol_requests_for_stack(
     pid: Option<u32>,
-    callchain: &[u64],
+    callchain: &[FoldFrame],
     mmap_table: &MmapTable,
 ) -> Vec<SymbolRequest> {
     callchain
         .iter()
         .copied()
+        .filter(|frame| is_valid_unwound_user_frame(pid, *frame, mmap_table))
+        .map(FoldFrame::address)
         .filter_map(|frame| {
             pid.and_then(|pid| mmap_table.resolve(pid, frame))
                 .filter(|mapping| !is_kernel_space_frame(frame) || is_kernel_mapping(mapping))
@@ -501,7 +500,7 @@ impl<'a> FoldFrameResolver<'a> {
     fn frames_for_stack<R>(
         &self,
         pid: Option<u32>,
-        callchain: &[u64],
+        callchain: &[FoldFrame],
         mut symbol_cache: Option<&mut SymbolCache<'_, R>>,
     ) -> Result<Vec<String>, String>
     where
@@ -513,6 +512,10 @@ impl<'a> FoldFrameResolver<'a> {
             Vec::new()
         };
         for frame in callchain.iter().copied() {
+            if !is_valid_unwound_user_frame(pid, frame, self.mmap_table) {
+                continue;
+            }
+            let frame = frame.address();
             if pid.is_some_and(|pid| self.mmap_table.is_known_non_executable(pid, frame)) {
                 continue;
             }

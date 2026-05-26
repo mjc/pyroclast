@@ -5,24 +5,35 @@ use hashbrown::hash_map::RawEntryMut;
 use rustc_hash::{FxBuildHasher, FxHasher};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CollapsedRawStack {
+pub struct CollapsedRawStack<T = u64> {
     pub pid: Option<u32>,
-    pub callchain: Vec<u64>,
+    pub callchain: Vec<T>,
     pub count: u64,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct RawStackKey {
+struct RawStackKey<T> {
     pid: Option<u32>,
-    callchain: Vec<u64>,
+    callchain: Vec<T>,
 }
 
-#[derive(Debug, Default)]
-pub struct RawStackAccumulator {
-    counts: HashMap<RawStackKey, u64, FxBuildHasher>,
+#[derive(Debug)]
+pub struct RawStackAccumulator<T = u64> {
+    counts: HashMap<RawStackKey<T>, u64, FxBuildHasher>,
 }
 
-impl RawStackAccumulator {
+impl<T> Default for RawStackAccumulator<T> {
+    fn default() -> Self {
+        Self {
+            counts: HashMap::default(),
+        }
+    }
+}
+
+impl<T> RawStackAccumulator<T>
+where
+    T: Clone + Eq + Hash + Ord,
+{
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -30,17 +41,17 @@ impl RawStackAccumulator {
 
     pub fn add<I>(&mut self, pid: Option<u32>, callchain: I, count: u64)
     where
-        I: IntoIterator<Item = u64>,
+        I: IntoIterator<Item = T>,
     {
         self.add_vec(pid, callchain.into_iter().collect(), count);
     }
 
-    pub fn add_vec(&mut self, pid: Option<u32>, callchain: Vec<u64>, count: u64) {
+    pub fn add_vec(&mut self, pid: Option<u32>, callchain: Vec<T>, count: u64) {
         let key = RawStackKey { pid, callchain };
         *self.counts.entry(key).or_insert(0) += count;
     }
 
-    pub fn add_slice(&mut self, pid: Option<u32>, callchain: &[u64], count: u64) {
+    pub fn add_slice(&mut self, pid: Option<u32>, callchain: &[T], count: u64) {
         let hash = raw_stack_hash(pid, callchain);
         match self
             .counts
@@ -63,7 +74,7 @@ impl RawStackAccumulator {
     }
 
     #[must_use]
-    pub fn into_collapsed(self) -> Vec<CollapsedRawStack> {
+    pub fn into_collapsed(self) -> Vec<CollapsedRawStack<T>> {
         let mut collapsed = self
             .counts
             .into_iter()
@@ -82,7 +93,7 @@ impl RawStackAccumulator {
     }
 }
 
-fn raw_stack_hash(pid: Option<u32>, callchain: &[u64]) -> u64 {
+fn raw_stack_hash<T: Hash>(pid: Option<u32>, callchain: &[T]) -> u64 {
     let mut hasher = FxHasher::default();
     pid.hash(&mut hasher);
     callchain.hash(&mut hasher);

@@ -258,6 +258,44 @@ fn drops_unwound_user_stack_frames_outside_known_mappings() {
 }
 
 #[test]
+fn keeps_unwound_user_stack_frames_from_mappings_after_sample() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            (1 << 6) | (1 << 7) | (1 << 8),
+        )],
+        [
+            record_bytes(1, &mmap_payload(11, 11, 0x4000, 0x100, 0, "/tmp/app")),
+            record_bytes(
+                9,
+                &sample_payload_with_user_stack(
+                    0x4000,
+                    11,
+                    12,
+                    [],
+                    1,
+                    [0x7fff_0008, 0x7fff_0000, 0x4000],
+                    [
+                        0, 0, 0, 0, 0, 0, 0, 0, //
+                        0x40, 0, 0, 0, 0, 0, 0, 0, //
+                        0, 0x80, 0, 0, 0, 0, 0, 0,
+                    ],
+                ),
+            ),
+            record_bytes(1, &mmap_payload(11, 11, 0x8000, 0x100, 0, "/tmp/lib")),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, "/tmp/lib+0x0;/tmp/app+0x0 1\n");
+}
+
+#[test]
 fn drops_dwarf_user_stack_frames_from_known_non_executable_mappings() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
