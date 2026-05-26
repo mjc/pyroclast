@@ -495,6 +495,28 @@ fn callchain_parser_preserves_user_regs_and_stack_for_dwarf_unwinding() {
 }
 
 #[test]
+fn callchain_parser_accepts_empty_user_stack_without_dynamic_size() {
+    let mut payload = Vec::new();
+    payload.extend(0x1000u64.to_le_bytes());
+    payload.extend(123u32.to_le_bytes());
+    payload.extend(456u32.to_le_bytes());
+    payload.extend(1u64.to_le_bytes());
+    payload.extend(0x2000u64.to_le_bytes());
+    payload.extend(0u64.to_le_bytes());
+
+    let sample = parse_sample_record_callchain(
+        &payload,
+        layout(PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_STACK_USER),
+    )
+    .expect("sample")
+    .expect("callchain");
+
+    let stack = sample.user_stack.as_ref().expect("stack");
+    assert!(stack.bytes.is_empty());
+    assert_eq!(stack.dynamic_size, 0);
+}
+
+#[test]
 fn detects_perf_context_marker_addresses() {
     assert!(is_perf_context_marker(0xffff_ffff_ffff_fe00));
     assert!(!is_perf_context_marker(0x7fff_ffff_f000));

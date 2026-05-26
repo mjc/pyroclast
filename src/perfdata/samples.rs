@@ -462,6 +462,12 @@ impl<'a> SampleCursor<'a> {
     fn read_user_stack(&mut self) -> Result<SampleUserStack<'a>, String> {
         let size = usize::try_from(self.read_u64()?)
             .map_err(|_| "perf sample user stack size does not fit in usize".to_string())?;
+        if size == 0 {
+            return Ok(SampleUserStack {
+                bytes: &[],
+                dynamic_size: 0,
+            });
+        }
         let bytes = self.read_bytes(size)?;
         let padding = size.next_multiple_of(8) - size;
         self.read_bytes(padding)?;
