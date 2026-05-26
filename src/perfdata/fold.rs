@@ -14,7 +14,8 @@ use crate::perfdata::records::{Mmap2Record, ParsedRecord, PerfRecord, iter_recor
 use crate::perfdata::samples::{
     PERF_SAMPLE_ADDR, PERF_SAMPLE_CPU, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP,
     PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME, SampleLayout, is_kernel_space_frame,
-    is_perf_context_marker, is_perf_user_context_marker, parse_sample_record_callchain,
+    is_perf_context_marker, is_perf_user_context_marker, is_perf_user_deferred_context_marker,
+    parse_sample_record_callchain,
 };
 use crate::perfdata::unwind::{FramehopUnwinder, PerfX86_64Regs, unwind_x86_64_stack};
 use crate::symbols::{SymbolFrameCache, SymbolRequest, SymbolResolver};
@@ -50,12 +51,37 @@ struct PerfFoldData {
     raw_stacks: Vec<CollapsedRawStack<FoldFrame>>,
 }
 
-type FoldSample = (Option<u32>, Option<u32>, u64, Vec<FoldFrame>);
+struct FoldAccumulator {
+    process_comms: BTreeMap<u32, String>,
+    exec_process_comms: BTreeMap<u32, String>,
+    thread_comms: BTreeMap<u32, String>,
+    mmap_table: MmapTable,
+    object_unwinder: FramehopUnwinder,
+    loaded_unwind_mappings: BTreeSet<(String, u64, u64, u64)>,
+    raw_stacks: RawStackAccumulator<FoldFrame>,
+    deferred_samples: BTreeMap<u64, Vec<DeferredFoldSample>>,
+    callchain: Vec<FoldFrame>,
+}
 
 struct TimedRecord<'a> {
     index: usize,
     time: Option<u64>,
     record: PerfRecord<'a>,
+}
+
+struct FoldSample {
+    pid: Option<u32>,
+    tid: Option<u32>,
+    count: u64,
+    frames: Vec<FoldFrame>,
+    deferred_cookie: Option<u64>,
+}
+
+struct DeferredFoldSample {
+    pid: Option<u32>,
+    comm: Option<String>,
+    count: u64,
+    frames: Vec<FoldFrame>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -291,83 +317,13 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
     let header = parse_header(bytes)?;
     let sample_layouts = sample_layouts(bytes, header)?;
     let mut records = timed_records(bytes, header, &sample_layouts)?;
-    let mut process_comms = BTreeMap::new();
-    let mut exec_process_comms = BTreeMap::new();
-    let mut thread_comms = BTreeMap::new();
-    let mut mmap_table = MmapTable::default();
-    let mut object_unwinder = FramehopUnwinder::new();
-    let mut loaded_unwind_mappings = BTreeSet::new();
-    let mut raw_stacks = RawStackAccumulator::<FoldFrame>::new();
-    let mut callchain = Vec::new();
+    let mut accumulator = FoldAccumulator::new();
 
     records.sort_by_key(|record| (record.time.unwrap_or(0), record.index));
     for timed_record in records {
         let record = timed_record.record;
         let parsed_record = parse_record_with_context(record)?;
-        let record_result: Result<(), String> = match parsed_record {
-            ParsedRecord::Comm(record) => {
-                update_comm_tables(
-                    &mut process_comms,
-                    &mut exec_process_comms,
-                    &mut thread_comms,
-                    record,
-                );
-                Ok(())
-            }
-            ParsedRecord::Mmap(record) => {
-                load_unwind_mapping(
-                    &mut object_unwinder,
-                    &mut loaded_unwind_mappings,
-                    record.start,
-                    record.len,
-                    record.pgoff,
-                    &record.path,
-                    None,
-                );
-                mmap_table.insert_mmap(record);
-                Ok(())
-            }
-            ParsedRecord::Sample(record) => parse_sample_for_fold(
-                &record.payload,
-                &sample_layouts,
-                options,
-                &mut object_unwinder,
-            )
-            .map(|sample| {
-                add_fold_sample(
-                    sample,
-                    &process_comms,
-                    &exec_process_comms,
-                    &thread_comms,
-                    &mmap_table,
-                    &mut raw_stacks,
-                    &mut callchain,
-                );
-            }),
-            ParsedRecord::Mmap2(record) => {
-                load_mmap2_unwind_mapping(
-                    &mut object_unwinder,
-                    &mut loaded_unwind_mappings,
-                    &record,
-                );
-                mmap_table.insert_mmap2(record);
-                Ok(())
-            }
-            ParsedRecord::Mmap2BuildId(record) => {
-                load_unwind_mapping(
-                    &mut object_unwinder,
-                    &mut loaded_unwind_mappings,
-                    record.start,
-                    record.len,
-                    record.pgoff,
-                    &record.path,
-                    None,
-                );
-                mmap_table.insert_mmap2_build_id(record);
-                Ok(())
-            }
-            _ => Ok(()),
-        };
+        let record_result = accumulator.apply_record(parsed_record, &sample_layouts, options);
         record_result.map_err(|error| {
             format!(
                 "failed to parse record type {} at offset {}: {error}",
@@ -376,10 +332,96 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
         })?;
     }
 
-    Ok(PerfFoldData {
-        mmap_table,
-        raw_stacks: raw_stacks.into_collapsed(),
-    })
+    Ok(accumulator.into_fold_data())
+}
+
+impl FoldAccumulator {
+    fn new() -> Self {
+        Self {
+            process_comms: BTreeMap::new(),
+            exec_process_comms: BTreeMap::new(),
+            thread_comms: BTreeMap::new(),
+            mmap_table: MmapTable::default(),
+            object_unwinder: FramehopUnwinder::new(),
+            loaded_unwind_mappings: BTreeSet::new(),
+            raw_stacks: RawStackAccumulator::<FoldFrame>::new(),
+            deferred_samples: BTreeMap::new(),
+            callchain: Vec::new(),
+        }
+    }
+
+    fn apply_record(
+        &mut self,
+        record: ParsedRecord,
+        sample_layouts: &SampleLayouts,
+        options: FoldOptions,
+    ) -> Result<(), String> {
+        match record {
+            ParsedRecord::Comm(record) => {
+                update_comm_tables(
+                    &mut self.process_comms,
+                    &mut self.exec_process_comms,
+                    &mut self.thread_comms,
+                    record,
+                );
+                Ok(())
+            }
+            ParsedRecord::Mmap(record) => {
+                load_unwind_mapping(
+                    &mut self.object_unwinder,
+                    &mut self.loaded_unwind_mappings,
+                    record.start,
+                    record.len,
+                    record.pgoff,
+                    &record.path,
+                    None,
+                );
+                self.mmap_table.insert_mmap(record);
+                Ok(())
+            }
+            ParsedRecord::Sample(record) => parse_sample_for_fold(
+                &record.payload,
+                sample_layouts,
+                options,
+                &mut self.object_unwinder,
+            )
+            .map(|sample| self.add_fold_sample(sample)),
+            ParsedRecord::CallchainDeferred(record) => {
+                self.add_deferred_callchain(record.cookie, record.ips);
+                Ok(())
+            }
+            ParsedRecord::Mmap2(record) => {
+                load_mmap2_unwind_mapping(
+                    &mut self.object_unwinder,
+                    &mut self.loaded_unwind_mappings,
+                    &record,
+                );
+                self.mmap_table.insert_mmap2(record);
+                Ok(())
+            }
+            ParsedRecord::Mmap2BuildId(record) => {
+                load_unwind_mapping(
+                    &mut self.object_unwinder,
+                    &mut self.loaded_unwind_mappings,
+                    record.start,
+                    record.len,
+                    record.pgoff,
+                    &record.path,
+                    None,
+                );
+                self.mmap_table.insert_mmap2_build_id(record);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn into_fold_data(self) -> PerfFoldData {
+        PerfFoldData {
+            mmap_table: self.mmap_table,
+            raw_stacks: self.raw_stacks.into_collapsed(),
+        }
+    }
 }
 
 fn timed_records<'a>(
@@ -481,37 +523,89 @@ fn update_comm_tables(
     thread_comms.insert(record.tid, record.comm);
 }
 
-fn add_fold_sample(
-    sample: Option<FoldSample>,
-    process_comms: &BTreeMap<u32, String>,
-    exec_process_comms: &BTreeMap<u32, String>,
-    thread_comms: &BTreeMap<u32, String>,
+fn add_fold_stack(
+    pid: Option<u32>,
+    comm: Option<String>,
+    count: u64,
+    frames: Vec<FoldFrame>,
     mmap_table: &MmapTable,
     raw_stacks: &mut RawStackAccumulator<FoldFrame>,
     callchain: &mut Vec<FoldFrame>,
 ) {
-    if let Some((pid, tid, count, frames)) = sample {
-        let comm = pid
-            .and_then(|pid| exec_process_comms.get(&pid))
-            .or_else(|| tid.and_then(|tid| thread_comms.get(&tid)))
-            .or_else(|| pid.and_then(|pid| process_comms.get(&pid)))
-            .cloned();
-        callchain.clear();
-        callchain.reserve(frames.len());
-        callchain.extend(frames.into_iter().rev().filter(|frame| {
-            let address = frame.address();
-            if is_perf_context_marker(address) {
-                return false;
-            }
-            if should_drop_known_non_executable_user_frame(pid, address, mmap_table) {
-                return false;
-            }
-            true
-        }));
-        if callchain.is_empty() {
-            return;
+    callchain.clear();
+    callchain.reserve(frames.len());
+    callchain.extend(frames.into_iter().rev().filter(|frame| {
+        let address = frame.address();
+        if is_perf_context_marker(address) {
+            return false;
         }
+        if should_drop_known_non_executable_user_frame(pid, address, mmap_table) {
+            return false;
+        }
+        true
+    }));
+    if !callchain.is_empty() {
         raw_stacks.add_slice_with_comm(pid, comm, callchain, count);
+    }
+}
+
+impl FoldAccumulator {
+    fn add_fold_sample(&mut self, sample: Option<FoldSample>) {
+        if let Some(sample) = sample {
+            let comm = self.comm_for_sample(&sample);
+            if let Some(cookie) = sample.deferred_cookie {
+                self.deferred_samples
+                    .entry(cookie)
+                    .or_default()
+                    .push(DeferredFoldSample {
+                        pid: sample.pid,
+                        comm,
+                        count: sample.count,
+                        frames: sample.frames,
+                    });
+            } else {
+                add_fold_stack(
+                    sample.pid,
+                    comm,
+                    sample.count,
+                    sample.frames,
+                    &self.mmap_table,
+                    &mut self.raw_stacks,
+                    &mut self.callchain,
+                );
+            }
+        }
+    }
+
+    fn add_deferred_callchain(&mut self, cookie: u64, ips: Vec<u64>) {
+        let Some(samples) = self.deferred_samples.remove(&cookie) else {
+            return;
+        };
+        let deferred_frames = ips
+            .into_iter()
+            .map(FoldFrame::Callchain)
+            .collect::<Vec<_>>();
+        for mut sample in samples {
+            sample.frames.extend(deferred_frames.iter().copied());
+            add_fold_stack(
+                sample.pid,
+                sample.comm,
+                sample.count,
+                sample.frames,
+                &self.mmap_table,
+                &mut self.raw_stacks,
+                &mut self.callchain,
+            );
+        }
+    }
+
+    fn comm_for_sample(&self, sample: &FoldSample) -> Option<String> {
+        sample
+            .pid
+            .and_then(|pid| self.exec_process_comms.get(&pid))
+            .or_else(|| sample.tid.and_then(|tid| self.thread_comms.get(&tid)))
+            .or_else(|| sample.pid.and_then(|pid| self.process_comms.get(&pid)))
+            .cloned()
     }
 }
 
@@ -772,6 +866,7 @@ fn parse_sample_for_fold(
                     1
                 };
                 let mut frames = sample.frames.map(FoldFrame::Callchain).collect::<Vec<_>>();
+                let deferred_cookie = take_deferred_cookie(&mut frames);
                 if let (Some(regs), Some(stack)) = (&sample.user_regs, &sample.user_stack)
                     && !stack.bytes.is_empty()
                     && should_unwind_user_stack(&frames)
@@ -795,11 +890,32 @@ fn parse_sample_for_fold(
                         frames.extend(unwound_frames);
                     }
                 }
-                (sample.pid, sample.tid, count, frames)
+                FoldSample {
+                    pid: sample.pid,
+                    tid: sample.tid,
+                    count,
+                    frames,
+                    deferred_cookie,
+                }
             })
         })
     } else {
         Ok(None)
+    }
+}
+
+fn take_deferred_cookie(frames: &mut Vec<FoldFrame>) -> Option<u64> {
+    match frames.as_slice() {
+        [
+            ..,
+            FoldFrame::Callchain(marker),
+            FoldFrame::Callchain(cookie),
+        ] if is_perf_user_deferred_context_marker(*marker) => {
+            let cookie = *cookie;
+            frames.pop();
+            Some(cookie)
+        }
+        _ => None,
     }
 }
 
