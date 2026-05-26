@@ -4,7 +4,7 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
-use object::{Object, ObjectSection, ObjectSegment};
+use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol, SymbolKind};
 use serde::Serialize;
 
 use crate::perfdata::build_id::kernel_build_id_from_perfdata;
@@ -993,10 +993,16 @@ impl SymbolResolver for RustAddr2lineResolver {
                 .unwrap_or_default();
             for index in indexes {
                 let request = &requests[index];
+                let object_symbol = std::fs::read(&path).ok().as_deref().and_then(|bytes| {
+                    perf_object_symbol_name_from_object_bytes(bytes, request.relative_address)
+                });
                 let mut symbol = loader
                     .find_symbol(request.relative_address)
                     .map(demangle_addr2line_name)
                     .or_else(|| rust_addr2line_frame_name(&loader, request.relative_address));
+                if object_symbol.is_some() {
+                    symbol = object_symbol;
+                }
                 specialize_symbol_from_debug_strings(&mut symbol, &debug_names);
                 resolved_by_request.insert(request.clone(), symbol);
             }
@@ -1032,6 +1038,9 @@ impl SymbolResolver for RustAddr2lineResolver {
                 .and_then(|bytes| PerfDwarfNameResolver::from_object_bytes(bytes).ok());
             for index in indexes {
                 let request = &requests[index];
+                let object_symbol = object_bytes.as_deref().and_then(|bytes| {
+                    perf_object_symbol_name_from_object_bytes(bytes, request.relative_address)
+                });
                 let mut frames = perf_dwarf
                     .as_ref()
                     .and_then(|resolver| resolver.frame_names(request.relative_address))
@@ -1043,6 +1052,11 @@ impl SymbolResolver for RustAddr2lineResolver {
                             .map(|name| vec![demangle_addr2line_name(name)])
                     })
                     .unwrap_or_default();
+                if let Some(object_symbol) = object_symbol
+                    && frames.len() == 1
+                {
+                    frames[0] = object_symbol;
+                }
                 specialize_frames_from_debug_strings(&mut frames, &debug_names);
                 resolved_by_request.insert(request.clone(), frames);
             }
@@ -1062,6 +1076,117 @@ impl SymbolResolver for RustAddr2lineResolver {
 
 fn demangle_addr2line_name(name: &str) -> String {
     perf_dwarf_function_name(&addr2line::demangle_auto(Cow::Borrowed(name), None))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PerfSymbolCandidate {
+    name: String,
+    address: u64,
+    size: u64,
+    binding: PerfSymbolBinding,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PerfSymbolBinding {
+    Global,
+    Weak,
+}
+
+fn perf_object_symbol_name_from_object_bytes(object_bytes: &[u8], address: u64) -> Option<String> {
+    let object = object::File::parse(object_bytes).ok()?;
+    let mut best = None::<PerfSymbolCandidate>;
+    for symbol in object.symbols() {
+        if !perf_symbol_is_candidate(&symbol) {
+            continue;
+        }
+        let candidate = PerfSymbolCandidate {
+            name: perf_symbol_name(&addr2line::demangle_auto(
+                Cow::Borrowed(symbol.name().ok()?),
+                None,
+            )),
+            address: symbol.address(),
+            size: symbol.size(),
+            binding: if symbol.is_weak() {
+                PerfSymbolBinding::Weak
+            } else {
+                PerfSymbolBinding::Global
+            },
+        };
+        if !perf_symbol_candidate_contains_address(&candidate, address) {
+            continue;
+        }
+        best = Some(match best {
+            Some(current) if current.address > candidate.address => current,
+            Some(current) if current.address == candidate.address => {
+                perf_best_duplicate_symbol_owned(current, candidate)
+            }
+            _ => candidate,
+        });
+    }
+    best.map(|candidate| candidate.name)
+}
+
+fn perf_symbol_is_candidate(symbol: &object::Symbol<'_, '_>) -> bool {
+    !symbol.is_undefined()
+        && !symbol.name().unwrap_or_default().is_empty()
+        && matches!(
+            symbol.kind(),
+            SymbolKind::Text | SymbolKind::Data | SymbolKind::Label
+        )
+}
+
+fn perf_symbol_candidate_contains_address(candidate: &PerfSymbolCandidate, address: u64) -> bool {
+    if candidate.size == 0 {
+        candidate.address == address
+    } else {
+        address >= candidate.address && address < candidate.address.saturating_add(candidate.size)
+    }
+}
+
+fn perf_best_duplicate_symbol_owned(
+    current: PerfSymbolCandidate,
+    candidate: PerfSymbolCandidate,
+) -> PerfSymbolCandidate {
+    if perf_best_duplicate_symbol(&current, &candidate) == &current {
+        current
+    } else {
+        candidate
+    }
+}
+
+fn perf_best_duplicate_symbol<'a>(
+    current: &'a PerfSymbolCandidate,
+    candidate: &'a PerfSymbolCandidate,
+) -> &'a PerfSymbolCandidate {
+    if current.size == 0 && candidate.size > 0 {
+        return candidate;
+    }
+    if candidate.size == 0 && current.size > 0 {
+        return current;
+    }
+    if candidate.binding == PerfSymbolBinding::Weak && current.binding != PerfSymbolBinding::Weak {
+        return current;
+    }
+    if current.binding == PerfSymbolBinding::Weak && candidate.binding != PerfSymbolBinding::Weak {
+        return candidate;
+    }
+    let current_underscores = leading_underscore_count(&current.name);
+    let candidate_underscores = leading_underscore_count(&candidate.name);
+    if candidate_underscores > current_underscores {
+        return current;
+    }
+    if current_underscores > candidate_underscores {
+        return candidate;
+    }
+    if current.name.len() >= candidate.name.len() {
+        current
+    } else {
+        candidate
+    }
+}
+
+fn leading_underscore_count(name: &str) -> usize {
+    name.bytes().take_while(|byte| *byte == b'_').count()
 }
 
 fn rust_addr2line_frame_name(loader: &addr2line::Loader, address: u64) -> Option<String> {
@@ -1572,7 +1697,10 @@ fn parse_kallsyms_line(line: &str) -> Option<(u64, String)> {
 mod tests {
     use object::{Object, ObjectSegment};
 
-    use super::clean_object_symbol_request;
+    use super::{
+        PerfSymbolBinding, PerfSymbolCandidate, clean_object_symbol_request,
+        perf_best_duplicate_symbol,
+    };
 
     #[test]
     fn object_requests_use_elf_virtual_addresses_for_pie_file_offsets() {
@@ -1592,5 +1720,26 @@ mod tests {
         let request = clean_object_symbol_request(path, file_offset);
 
         assert_eq!(request.relative_address, virtual_address);
+    }
+
+    #[test]
+    fn perf_alias_tie_breaker_prefers_less_underscored_symbol_like_perf() {
+        let internal_alias = PerfSymbolCandidate {
+            name: "__read".to_string(),
+            address: 0x1000,
+            size: 128,
+            binding: PerfSymbolBinding::Global,
+        };
+        let public_alias = PerfSymbolCandidate {
+            name: "read".to_string(),
+            address: 0x1000,
+            size: 128,
+            binding: PerfSymbolBinding::Global,
+        };
+
+        assert_eq!(
+            perf_best_duplicate_symbol(&internal_alias, &public_alias).name,
+            "read"
+        );
     }
 }
