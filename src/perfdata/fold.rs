@@ -945,8 +945,7 @@ fn parse_sample_for_fold(
                 let mut frames = sample.frames.map(FoldFrame::Callchain).collect::<Vec<_>>();
                 let deferred_cookie = take_deferred_cookie(&mut frames);
                 if let (Some(regs), Some(stack)) = (&sample.user_regs, &sample.user_stack)
-                    && !stack.bytes.is_empty()
-                    && stack.dynamic_size != 0
+                    && has_perf_captured_user_stack(stack)
                     && let Ok(regs) = PerfX86_64Regs::from_perf_masked_values(
                         layout.sample_regs_user,
                         &regs.values,
@@ -994,6 +993,10 @@ fn take_deferred_cookie(frames: &mut Vec<FoldFrame>) -> Option<u64> {
         }
         _ => None,
     }
+}
+
+fn has_perf_captured_user_stack(stack: &crate::perfdata::samples::SampleUserStack<'_>) -> bool {
+    !stack.bytes.is_empty() && stack.dynamic_size != 0
 }
 
 fn load_unwind_mapping(
