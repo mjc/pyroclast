@@ -78,6 +78,12 @@ pub enum SymbolizerKind {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RustAddr2lineResolver;
 
+type PerfDwarfReader = gimli::EndianArcSlice<gimli::RunTimeEndian>;
+
+struct PerfDwarfNameResolver {
+    dwarf: gimli::Dwarf<PerfDwarfReader>,
+}
+
 pub struct PerfSymbolResolver<O> {
     object_resolver: O,
     debug_dir: Option<PathBuf>,
@@ -924,9 +930,14 @@ impl SymbolResolver for RustAddr2lineResolver {
             let debug_names = std::fs::read(&path)
                 .map(|bytes| DebugStringNameIndex::from_object_bytes(&bytes))
                 .unwrap_or_default();
+            let perf_dwarf = PerfDwarfNameResolver::from_object(&path).ok();
             for index in indexes {
                 let request = &requests[index];
-                let mut frames = rust_addr2line_frame_names(&loader, request.relative_address)
+                let mut frames = perf_dwarf
+                    .as_ref()
+                    .and_then(|resolver| resolver.frame_names(request.relative_address))
+                    .map(perf_inline_frame_order)
+                    .or_else(|| rust_addr2line_frame_names(&loader, request.relative_address))
                     .or_else(|| {
                         loader
                             .find_symbol(request.relative_address)
@@ -973,33 +984,52 @@ fn rust_addr2line_frame_names(loader: &addr2line::Loader, address: u64) -> Optio
 
 #[must_use]
 pub fn perf_dwarf_frame_names_from_object(path: &Path, address: u64) -> Option<Vec<String>> {
-    let bytes = std::fs::read(path).ok()?;
-    let object = object::File::parse(bytes.as_slice()).ok()?;
-    let endian = if object.is_little_endian() {
-        gimli::RunTimeEndian::Little
-    } else {
-        gimli::RunTimeEndian::Big
-    };
-    let load_section = |id: gimli::SectionId| {
-        let data = object
-            .section_by_name(id.name())
-            .and_then(|section| section.uncompressed_data().ok())
-            .unwrap_or(Cow::Borrowed(&[][..]));
-        Ok::<_, gimli::Error>(gimli::EndianArcSlice::new(
-            std::sync::Arc::<[u8]>::from(data.as_ref()),
-            endian,
-        ))
-    };
-    let dwarf = gimli::Dwarf::load(load_section).ok()?;
+    PerfDwarfNameResolver::from_object(path)
+        .ok()?
+        .frame_names(address)
+}
+
+impl PerfDwarfNameResolver {
+    fn from_object(path: &Path) -> Result<Self, gimli::Error> {
+        let bytes = std::fs::read(path).map_err(|_| gimli::Error::Io)?;
+        let object = object::File::parse(bytes.as_slice()).map_err(|_| gimli::Error::Io)?;
+        let endian = if object.is_little_endian() {
+            gimli::RunTimeEndian::Little
+        } else {
+            gimli::RunTimeEndian::Big
+        };
+        let load_section = |id: gimli::SectionId| {
+            let data = object
+                .section_by_name(id.name())
+                .and_then(|section| section.uncompressed_data().ok())
+                .unwrap_or(Cow::Borrowed(&[][..]));
+            Ok::<_, gimli::Error>(gimli::EndianArcSlice::new(
+                std::sync::Arc::<[u8]>::from(data.as_ref()),
+                endian,
+            ))
+        };
+        let dwarf = gimli::Dwarf::load(load_section)?;
+        Ok(Self { dwarf })
+    }
+
+    fn frame_names(&self, address: u64) -> Option<Vec<String>> {
+        perf_dwarf_frame_names(&self.dwarf, address)
+    }
+}
+
+fn perf_dwarf_frame_names<R>(dwarf: &gimli::Dwarf<R>, address: u64) -> Option<Vec<String>>
+where
+    R: gimli::Reader,
+{
     let mut units = dwarf.units();
     while let Ok(Some(header)) = units.next() {
         let Ok(unit) = dwarf.unit(header) else {
             continue;
         };
-        if !unit_contains_address(&dwarf, &unit, address) {
+        if !unit_contains_address(dwarf, &unit, address) {
             continue;
         }
-        if let Some(frames) = perf_dwarf_frame_names_from_unit(&dwarf, &unit, address) {
+        if let Some(frames) = perf_dwarf_frame_names_from_unit(dwarf, &unit, address) {
             return Some(frames);
         }
     }

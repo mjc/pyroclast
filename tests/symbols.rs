@@ -416,6 +416,37 @@ fn perf_dwarf_frame_names_prefer_die_names_like_perf_script() {
 }
 
 #[test]
+fn rust_addr2line_resolver_uses_perf_dwarf_names_for_inline_frames() {
+    let profiling_binary = PathBuf::from("target/profiling/pyroclast");
+    if !profiling_binary.exists() {
+        return;
+    }
+
+    let resolver = RustAddr2lineResolver;
+    let frames = resolver
+        .resolve_frame_batch(&[SymbolRequest {
+            path: profiling_binary,
+            relative_address: 0x001e_aa81,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        }])
+        .expect("resolve frames");
+
+    assert_eq!(
+        frames,
+        vec![vec![
+            "parse".to_string(),
+            "insert<u64, alloc::string::String, alloc::alloc::Global>".to_string(),
+            "insert<u64, alloc::string::String, alloc::alloc::Global>".to_string(),
+            "insert_entry<u64, alloc::string::String, alloc::alloc::Global>".to_string(),
+            "insert_recursing<u64, alloc::string::String, alloc::alloc::Global, alloc::collections::btree::map::entry::{impl#8}::insert_entry::{closure_env#0}<u64, alloc::string::String, alloc::alloc::Global>>".to_string(),
+            "insert<u64, alloc::string::String, alloc::alloc::Global>".to_string(),
+        ]]
+    );
+}
+
+#[test]
 fn rejects_ambiguous_generic_dwarf_names_from_debug_strings() {
     let debug_strings =
         b"\0crate::make<crate::A>\0other::make<other::B>\0crate::not_make<crate::A>\0";
