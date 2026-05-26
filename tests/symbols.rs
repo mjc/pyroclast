@@ -15,6 +15,7 @@ fn resolves_each_unique_symbol_address_once() {
         SymbolRequest {
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
+            build_id: None,
             kernel_relocation: None,
         },
         "app::main".to_string(),
@@ -25,6 +26,7 @@ fn resolves_each_unique_symbol_address_once() {
         .resolve(&SymbolRequest {
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
+            build_id: None,
             kernel_relocation: None,
         })
         .expect("first symbol");
@@ -32,6 +34,7 @@ fn resolves_each_unique_symbol_address_once() {
         .resolve(&SymbolRequest {
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
+            build_id: None,
             kernel_relocation: None,
         })
         .expect("second symbol");
@@ -43,6 +46,7 @@ fn resolves_each_unique_symbol_address_once() {
         vec![vec![SymbolRequest {
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
+            build_id: None,
             kernel_relocation: None,
         }]]
     );
@@ -55,6 +59,7 @@ fn batches_only_uncached_symbol_addresses() {
             SymbolRequest {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x10,
+                build_id: None,
                 kernel_relocation: None,
             },
             "app::main".to_string(),
@@ -63,6 +68,7 @@ fn batches_only_uncached_symbol_addresses() {
             SymbolRequest {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x20,
+                build_id: None,
                 kernel_relocation: None,
             },
             "app::work".to_string(),
@@ -73,6 +79,7 @@ fn batches_only_uncached_symbol_addresses() {
         .resolve_many(&[SymbolRequest {
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
+            build_id: None,
             kernel_relocation: None,
         }])
         .expect("prime cache");
@@ -82,16 +89,19 @@ fn batches_only_uncached_symbol_addresses() {
             SymbolRequest {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x10,
+                build_id: None,
                 kernel_relocation: None,
             },
             SymbolRequest {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x20,
+                build_id: None,
                 kernel_relocation: None,
             },
             SymbolRequest {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x20,
+                build_id: None,
                 kernel_relocation: None,
             },
         ])
@@ -111,11 +121,13 @@ fn batches_only_uncached_symbol_addresses() {
             vec![SymbolRequest {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x10,
+                build_id: None,
                 kernel_relocation: None,
             }],
             vec![SymbolRequest {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x20,
+                build_id: None,
                 kernel_relocation: None,
             }],
         ]
@@ -132,11 +144,13 @@ fn addr2line_resolver_batches_requests_by_binary() {
             SymbolRequest {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x10,
+                build_id: None,
                 kernel_relocation: None,
             },
             SymbolRequest {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x20,
+                build_id: None,
                 kernel_relocation: None,
             },
         ])
@@ -163,11 +177,13 @@ fn addr2line_resolver_treats_failed_batches_as_unresolved() {
             SymbolRequest {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x10,
+                build_id: None,
                 kernel_relocation: None,
             },
             SymbolRequest {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x20,
+                build_id: None,
                 kernel_relocation: None,
             },
         ])
@@ -347,11 +363,13 @@ ffffffff88000080 t asm_exc_page_fault
             SymbolRequest {
                 path: PathBuf::from("[kernel.kallsyms]"),
                 relative_address: 0xffff_ffff_8800_008f,
+                build_id: None,
                 kernel_relocation: None,
             },
             SymbolRequest {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x10,
+                build_id: None,
                 kernel_relocation: None,
             },
         ])
@@ -385,6 +403,7 @@ ffffffff82000000 T later_kernel_symbol
         .resolve_batch(&[SymbolRequest {
             path: PathBuf::from("[kernel.kallsyms]_text"),
             relative_address: 0xffff_ffff_8800_1280,
+            build_id: None,
             kernel_relocation: Some(pyroclast::symbols::KernelRelocation {
                 reference_symbol: "_text".to_string(),
                 recorded_reference_address: 0xffff_ffff_8800_0000,
@@ -416,6 +435,7 @@ fn perf_symbol_resolver_loads_perfdata_kernel_build_id_cache() {
         .resolve_batch(&[SymbolRequest {
             path: PathBuf::from("[kernel.kallsyms]"),
             relative_address: 0xffff_ffff_8800_008f,
+            build_id: None,
             kernel_relocation: None,
         }])
         .expect("symbols");
@@ -447,6 +467,7 @@ fn perf_symbol_resolver_loads_perfdata_kernel_build_id_cache_from_file() {
         .resolve_batch(&[SymbolRequest {
             path: PathBuf::from("[kernel.kallsyms]"),
             relative_address: 0xffff_ffff_8800_008f,
+            build_id: None,
             kernel_relocation: None,
         }])
         .expect("symbols");
@@ -554,6 +575,7 @@ fn perf_symbol_resolver_constructor_uses_perfdata_cache_before_system_kallsyms()
         .resolve_batch(&[SymbolRequest {
             path: PathBuf::from("[kernel.kallsyms]"),
             relative_address: 0xffff_ffff_8800_008f,
+            build_id: None,
             kernel_relocation: None,
         }])
         .expect("symbols");
@@ -581,6 +603,7 @@ fn perf_symbol_resolver_uses_kernel_build_id_elf_before_kallsyms() {
         .resolve_batch(&[SymbolRequest {
             path: PathBuf::from("[kernel.kallsyms]"),
             relative_address: 0xffff_ffff_8800_008f,
+            build_id: None,
             kernel_relocation: None,
         }])
         .expect("symbols");
@@ -613,6 +636,7 @@ fn perf_symbol_resolver_uses_system_map_candidates_when_cache_is_missing() {
         .resolve_batch(&[SymbolRequest {
             path: PathBuf::from("[kernel.kallsyms]_text"),
             relative_address: 0xffff_ffff_8100_1280,
+            build_id: None,
             kernel_relocation: None,
         }])
         .expect("symbols");

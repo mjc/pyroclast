@@ -328,6 +328,40 @@ fn folds_mmap2_build_id_records_as_mappings() {
 }
 
 #[test]
+fn symbolized_fold_carries_mmap2_build_ids_to_symbol_requests() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes_with_misc(
+                10,
+                1 << 14,
+                &mmap2_build_id_payload(11, 11, 0x4000, 0x100, 0x20, "[igb]"),
+            ),
+            record_bytes(9, &sample_payload(0x1000, 11, 12, [0x4010])),
+        ],
+    );
+    let resolver = RecordingSymbolResolver::default();
+
+    let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
+        .expect("folded");
+
+    assert_eq!(folded, "[igb]+0x30 1\n");
+    assert_eq!(
+        resolver.calls(),
+        vec![vec![SymbolRequest {
+            path: std::path::PathBuf::from("[igb]"),
+            relative_address: 0x30,
+            build_id: Some("aabbccdd".to_string()),
+            kernel_relocation: None,
+        }]]
+    );
+}
+
+#[test]
 fn folds_mapped_user_frames_with_symbol_names() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
@@ -430,11 +464,13 @@ fn prefetches_unique_symbol_requests_before_folding() {
             SymbolRequest {
                 path: std::path::PathBuf::from("/bin/app"),
                 relative_address: 0x10,
+                build_id: None,
                 kernel_relocation: None,
             },
             SymbolRequest {
                 path: std::path::PathBuf::from("/bin/app"),
                 relative_address: 0x20,
+                build_id: None,
                 kernel_relocation: None,
             }
         ]]

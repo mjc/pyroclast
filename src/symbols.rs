@@ -15,6 +15,7 @@ pub struct KernelRelocation {
 pub struct SymbolRequest {
     pub path: PathBuf,
     pub relative_address: u64,
+    pub build_id: Option<String>,
     pub kernel_relocation: Option<KernelRelocation>,
 }
 
@@ -413,6 +414,7 @@ where
                     kernel_elf_requests.push(SymbolRequest {
                         path: kernel_elf.clone(),
                         relative_address: request.relative_address,
+                        build_id: None,
                         kernel_relocation: None,
                     });
                 } else {

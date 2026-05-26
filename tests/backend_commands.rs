@@ -242,11 +242,13 @@ fn builds_batched_addr2line_command() {
             SymbolRequest {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x10,
+                build_id: None,
                 kernel_relocation: None,
             },
             SymbolRequest {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x20,
+                build_id: None,
                 kernel_relocation: None,
             },
         ],

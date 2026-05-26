@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 use crate::folded::render_folded_stack;
@@ -461,8 +462,17 @@ fn symbol_request(mapping: &ResolvedMapping) -> SymbolRequest {
     SymbolRequest {
         path: PathBuf::from(&mapping.path),
         relative_address: mapping.relative_address,
+        build_id: mapping.build_id.as_deref().map(build_id_hex),
         kernel_relocation: mapping.kernel_relocation.clone(),
     }
+}
+
+fn build_id_hex(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut hex, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    hex
 }
 
 fn mapped_frame_label(mapping: &ResolvedMapping) -> String {
