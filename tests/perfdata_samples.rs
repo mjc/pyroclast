@@ -448,6 +448,7 @@ fn parses_sample_callchain_without_building_sample_record() {
     .expect("callchain");
 
     assert_eq!(sample.pid, Some(123));
+    assert_eq!(sample.tid, Some(456));
     assert_eq!(sample.period, Some(9));
     assert_eq!(sample.frames.collect::<Vec<_>>(), vec![0x2000, 0x3000]);
 }

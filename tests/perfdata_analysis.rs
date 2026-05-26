@@ -35,6 +35,27 @@ fn analyzes_threads_leaf_ips_and_edges() {
     assert_eq!(report.top_edges[0].callee, "0x0000000000001000");
 }
 
+#[test]
+fn ignores_perf_context_markers_when_ranking_leaf_ips() {
+    let perfdata = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [record_bytes(
+            9,
+            &sample_payload(0x1000, 1, 11, 7, [0xffff_ffff_ffff_ff80, 0x1000, 0x2000]),
+        )],
+    );
+
+    let report = analyze_perfdata(&perfdata, 10).expect("analysis");
+
+    assert_eq!(report.top_leaf_ips[0].ip, "0x0000000000001000");
+    assert_eq!(report.top_edges[0].caller, "0x0000000000002000");
+    assert_eq!(report.top_edges[0].callee, "0x0000000000001000");
+}
+
 fn perfdata_with_records_and_attrs<const A: usize, const R: usize>(
     attrs: [[u8; 144]; A],
     records: [Vec<u8>; R],

@@ -82,6 +82,7 @@ pub struct SampleRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SampleCallchain<'a> {
     pub pid: Option<u32>,
+    pub tid: Option<u32>,
     pub period: Option<u64>,
     pub frames: SampleCallchainFrames<'a>,
 }
@@ -213,6 +214,7 @@ pub fn parse_sample_record_callchain(
     layout.reject_unsupported_flags()?;
     let mut cursor = SampleCursor::new(payload);
     let mut pid = None;
+    let mut tid = None;
     let mut period = None;
 
     if layout.has(PERF_SAMPLE_IDENTIFIER) {
@@ -223,7 +225,7 @@ pub fn parse_sample_record_callchain(
     }
     if layout.has(PERF_SAMPLE_TID) {
         pid = Some(cursor.read_u32()?);
-        cursor.skip_u32()?;
+        tid = Some(cursor.read_u32()?);
     }
     if layout.has(PERF_SAMPLE_TIME) {
         cursor.skip_u64()?;
@@ -260,6 +262,7 @@ pub fn parse_sample_record_callchain(
 
     Ok(Some(SampleCallchain {
         pid,
+        tid,
         period,
         frames: SampleCallchainFrames { payload: frames },
     }))

@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use crate::perfdata::fold::summarize_perfdata;
+use crate::perfdata::samples::is_perf_context_marker;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PerfdataAnalysis {
@@ -69,10 +70,16 @@ pub fn analyze_perfdata(bytes: &[u8], limit: usize) -> Result<PerfdataAnalysis, 
         if let Some(tid) = sample.tid.or(sample.pid) {
             add_count(threads.entry(tid).or_default(), weight);
         }
-        if let Some(&leaf) = sample.callchain.first() {
+        let frames = sample
+            .callchain
+            .iter()
+            .copied()
+            .filter(|frame| !is_perf_context_marker(*frame))
+            .collect::<Vec<_>>();
+        if let Some(leaf) = frames.first().copied() {
             add_count(leaf_ips.entry(leaf).or_default(), weight);
         }
-        for window in sample.callchain.windows(2) {
+        for window in frames.windows(2) {
             add_count(
                 edges
                     .entry(Edge {

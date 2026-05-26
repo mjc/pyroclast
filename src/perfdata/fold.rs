@@ -11,7 +11,7 @@ use crate::perfdata::records::{ParsedRecord, PerfRecord, iter_records, parse_rec
 use crate::perfdata::samples::{
     PERF_SAMPLE_ADDR, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_TID,
     PERF_SAMPLE_TIME, SampleCallchainFrames, SampleLayout, is_kernel_space_frame,
-    is_perf_context_marker, parse_sample_record, parse_sample_record_callchain,
+    is_perf_context_marker, parse_sample_record_callchain,
 };
 use crate::symbols::{SymbolCache, SymbolRequest, SymbolResolver};
 
@@ -502,12 +502,12 @@ fn parse_sample_for_summary(
     sample_layouts: &SampleLayouts,
 ) -> Result<Option<PerfSampleStack>, String> {
     if let Some(layout) = sample_layouts.layout_for_payload(payload)? {
-        parse_sample_record(payload, layout).map(|record| {
-            Some(PerfSampleStack {
-                pid: record.pid,
-                tid: record.tid,
-                period: record.period,
-                callchain: record.callchain,
+        parse_sample_record_callchain(payload, layout).map(|sample| {
+            sample.map(|sample| PerfSampleStack {
+                pid: sample.pid,
+                tid: sample.tid,
+                period: sample.period,
+                callchain: sample.frames.collect(),
             })
         })
     } else {
