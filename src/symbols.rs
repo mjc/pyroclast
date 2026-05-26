@@ -463,7 +463,16 @@ impl Kallsyms {
             .filter_map(parse_kallsyms_line)
             .filter(|(address, _)| *address != 0)
         {
-            symbols.insert(address, symbol.clone());
+            match symbols.entry(address) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(symbol.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    if prefer_kernel_alias(&symbol, entry.get()) {
+                        entry.insert(symbol.clone());
+                    }
+                }
+            }
             addresses_by_name.entry(symbol).or_insert(address);
         }
         if symbols.is_empty() {
@@ -1536,6 +1545,10 @@ fn is_kernel_module_symbol_path(path: &Path) -> bool {
 
 fn is_kernel_module_symbol_path_str(path: &str) -> bool {
     path.starts_with('[') && !path.starts_with("[kernel") && !path.starts_with("[guest.kernel]")
+}
+
+fn prefer_kernel_alias(candidate: &str, current: &str) -> bool {
+    candidate.starts_with("__pi_") && !current.starts_with("__pi_")
 }
 
 fn perf_build_id_kallsyms_paths(debug_dir: &Path, build_id: &str) -> [PathBuf; 2] {

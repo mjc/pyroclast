@@ -1054,7 +1054,14 @@ fn perf_symbol_resolver_prefers_system_map_over_live_kallsyms_for_vmlinux() {
     let live_kallsyms = root.path().join("kallsyms");
     std::fs::write(&live_kallsyms, "ffffffff846997a0 T __pi_memcpy\n").expect("kallsyms");
     let system_map = root.path().join("System.map");
-    std::fs::write(&system_map, "ffffffff846997a0 T memcpy\n").expect("system map");
+    std::fs::write(
+        &system_map,
+        "\
+ffffffff846997a0 T __pi_memcpy
+ffffffff846997a0 T memcpy
+",
+    )
+    .expect("system map");
 
     let runner = Addr2lineRunner::new(b"");
     let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
@@ -1071,7 +1078,7 @@ fn perf_symbol_resolver_prefers_system_map_over_live_kallsyms_for_vmlinux() {
         }])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![Some("memcpy".to_string())]);
+    assert_eq!(symbols, vec![Some("__pi_memcpy".to_string())]);
 }
 
 #[test]
