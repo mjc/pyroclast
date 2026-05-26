@@ -1365,7 +1365,7 @@ impl SymbolResolver for StaticSymbolResolver {
                             .then(|| "asm_exc_page_fault".to_string())
                     })
                     .or_else(|| {
-                        (request.path == std::path::Path::new("[kernel.kallsyms]")
+                        (request.path == std::path::Path::new("[zfs]")
                             && request.relative_address == 0xffff_ffff_c000_0123)
                             .then(|| "zfs_read".to_string())
                     })

@@ -594,7 +594,7 @@ fn symbol_request(mapping: &ResolvedMapping) -> SymbolRequest {
 }
 
 fn symbol_request_path(mapping: &ResolvedMapping) -> PathBuf {
-    if is_kernel_mapping(mapping) {
+    if is_kernel_mapping(mapping) && mapping.path.starts_with("[kernel") {
         PathBuf::from("[kernel.kallsyms]")
     } else {
         PathBuf::from(&mapping.path)

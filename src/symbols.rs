@@ -82,6 +82,7 @@ pub struct PerfSymbolResolver<O> {
     debug_dir: Option<PathBuf>,
     kernel_elf: Option<PathBuf>,
     kallsyms: Option<Kallsyms>,
+    live_kallsyms: Option<Kallsyms>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -314,6 +315,7 @@ where
             debug_dir: None,
             kernel_elf: None,
             kallsyms: None,
+            live_kallsyms: None,
         }
     }
 
@@ -337,6 +339,12 @@ where
     #[must_use]
     pub fn with_kallsyms(mut self, kallsyms: Kallsyms) -> Self {
         self.kallsyms = Some(kallsyms);
+        self
+    }
+
+    #[must_use]
+    pub fn with_live_kallsyms(mut self, kallsyms: Kallsyms) -> Self {
+        self.live_kallsyms = Some(kallsyms);
         self
     }
 
@@ -377,14 +385,14 @@ where
 
     #[must_use]
     pub fn with_system_kallsyms(self) -> Self {
-        if self.kernel_elf.is_some() || self.kallsyms.is_some() {
+        if self.kernel_elf.is_some() || self.live_kallsyms.is_some() {
             return self;
         }
         match std::fs::read_to_string("/proc/kallsyms")
             .ok()
             .and_then(|text| Kallsyms::parse(&text).ok())
         {
-            Some(kallsyms) => self.with_kallsyms(kallsyms),
+            Some(kallsyms) => self.with_live_kallsyms(kallsyms),
             None => self,
         }
     }
@@ -627,7 +635,14 @@ where
         let mut user_indexes = Vec::new();
 
         for (index, request) in requests.iter().enumerate() {
-            if is_kernel_symbol_path(&request.path) {
+            if is_kernel_module_symbol_path(&request.path) {
+                if let Some(object_request) = self.cached_object_symbol_request(request) {
+                    user_indexes.push(index);
+                    user_requests.push(object_request);
+                } else {
+                    resolved[index] = self.resolve_kernel_symbol(request);
+                }
+            } else if is_kernel_symbol_path(&request.path) {
                 if let Some(kernel_elf) = &self.kernel_elf {
                     kernel_elf_indexes.push(index);
                     kernel_elf_requests.push(clean_object_symbol_request(
@@ -635,10 +650,7 @@ where
                         request.relative_address,
                     ));
                 } else {
-                    resolved[index] = self
-                        .kallsyms
-                        .as_ref()
-                        .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request));
+                    resolved[index] = self.resolve_kernel_symbol(request);
                 }
             } else if let Some(object_request) = self.object_symbol_request(request) {
                 user_indexes.push(index);
@@ -670,18 +682,21 @@ where
         let mut user_indexes = Vec::new();
 
         for (index, request) in requests.iter().enumerate() {
-            if is_kernel_symbol_path(&request.path) {
+            if is_kernel_module_symbol_path(&request.path) {
+                if let Some(object_request) = self.cached_object_symbol_request(request) {
+                    user_indexes.push(index);
+                    user_requests.push(object_request);
+                } else if let Some(symbol) = self.resolve_kernel_symbol(request) {
+                    resolved[index] = vec![symbol];
+                }
+            } else if is_kernel_symbol_path(&request.path) {
                 if let Some(kernel_elf) = &self.kernel_elf {
                     kernel_elf_indexes.push(index);
                     kernel_elf_requests.push(clean_object_symbol_request(
                         kernel_elf.clone(),
                         request.relative_address,
                     ));
-                } else if let Some(symbol) = self
-                    .kallsyms
-                    .as_ref()
-                    .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
-                {
+                } else if let Some(symbol) = self.resolve_kernel_symbol(request) {
                     resolved[index] = vec![symbol];
                 }
             } else if let Some(object_request) = self.object_symbol_request(request) {
@@ -714,17 +729,16 @@ where
     O: SymbolResolver,
 {
     fn object_symbol_request(&self, request: &SymbolRequest) -> Option<SymbolRequest> {
-        let Some(debug_dir) = &self.debug_dir else {
-            return Self::live_object_symbol_request(request);
-        };
-        let Some(build_id) = &request.build_id else {
-            return Self::live_object_symbol_request(request);
-        };
+        self.cached_object_symbol_request(request)
+            .or_else(|| Self::live_object_symbol_request(request))
+    }
+
+    fn cached_object_symbol_request(&self, request: &SymbolRequest) -> Option<SymbolRequest> {
+        let debug_dir = self.debug_dir.as_ref()?;
+        let build_id = request.build_id.as_ref()?;
         let elf = perf_build_id_elf_path(debug_dir, build_id);
-        if !elf.exists() {
-            return Self::live_object_symbol_request(request);
-        }
-        Some(clean_object_symbol_request(elf, request.relative_address))
+        elf.exists()
+            .then(|| clean_object_symbol_request(elf, request.relative_address))
     }
 
     fn live_object_symbol_request(request: &SymbolRequest) -> Option<SymbolRequest> {
@@ -735,6 +749,28 @@ where
             return None;
         }
         Some(request.clone())
+    }
+
+    fn resolve_kernel_symbol(&self, request: &SymbolRequest) -> Option<String> {
+        if is_kernel_module_symbol_path(&request.path) {
+            self.live_kallsyms
+                .as_ref()
+                .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
+                .or_else(|| {
+                    self.kallsyms
+                        .as_ref()
+                        .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
+                })
+        } else {
+            self.kallsyms
+                .as_ref()
+                .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
+                .or_else(|| {
+                    self.live_kallsyms
+                        .as_ref()
+                        .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
+                })
+        }
     }
 }
 
@@ -985,7 +1021,16 @@ fn is_kernel_symbol_path(path: &Path) -> bool {
         path.starts_with("[kernel.kallsyms]")
             || path.starts_with("[kernel]")
             || path.starts_with("[guest.kernel]")
+            || is_kernel_module_symbol_path_str(path)
     })
+}
+
+fn is_kernel_module_symbol_path(path: &Path) -> bool {
+    path.to_str().is_some_and(is_kernel_module_symbol_path_str)
+}
+
+fn is_kernel_module_symbol_path_str(path: &str) -> bool {
+    path.starts_with('[') && !path.starts_with("[kernel") && !path.starts_with("[guest.kernel]")
 }
 
 fn perf_build_id_kallsyms_paths(debug_dir: &Path, build_id: &str) -> [PathBuf; 2] {

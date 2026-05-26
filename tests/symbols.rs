@@ -584,6 +584,34 @@ ffffffff88000080 t asm_exc_page_fault
 }
 
 #[test]
+fn perf_symbol_resolver_prefers_live_kallsyms_for_kernel_module_paths() {
+    let cached =
+        Kallsyms::parse("ffffffff8501cd2c R xen_elfnote_phys32_entry\n").expect("cached kallsyms");
+    let live = Kallsyms::parse(
+        "ffffffff8501cd2c R xen_elfnote_phys32_entry\n\
+         ffffffffc0e66100 t zpl_iter_read\t[zfs]\n",
+    )
+    .expect("live kallsyms");
+    let runner = Addr2lineRunner::new(b"");
+    let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
+        .with_kallsyms(cached)
+        .with_live_kallsyms(live);
+
+    let symbols = resolver
+        .resolve_batch(&[SymbolRequest {
+            path: PathBuf::from("[zfs]"),
+            relative_address: 0xffff_ffff_c0e6_61e9,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        }])
+        .expect("symbols");
+
+    assert_eq!(symbols, vec![Some("zpl_iter_read".to_string())]);
+    assert!(runner.commands().is_empty());
+}
+
+#[test]
 fn perf_symbol_resolver_applies_kernel_relocation_to_kallsyms() {
     let runner = Addr2lineRunner::new(b"");
     let kallsyms = Kallsyms::parse(
