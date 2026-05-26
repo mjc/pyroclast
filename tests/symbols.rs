@@ -655,6 +655,40 @@ fn perf_symbol_resolver_uses_module_build_id_elf() {
 }
 
 #[test]
+fn perf_symbol_resolver_accepts_pluggable_object_resolver() {
+    let object_resolver = RecordingResolver::with_symbols([(
+        SymbolRequest {
+            path: PathBuf::from("/bin/app"),
+            relative_address: 0x10,
+            build_id: None,
+            kernel_relocation: None,
+        },
+        "app::main".to_string(),
+    )]);
+    let resolver = pyroclast::symbols::PerfSymbolResolver::from_object_resolver(object_resolver);
+
+    let symbols = resolver
+        .resolve_batch(&[SymbolRequest {
+            path: PathBuf::from("/bin/app"),
+            relative_address: 0x10,
+            build_id: None,
+            kernel_relocation: None,
+        }])
+        .expect("symbols");
+
+    assert_eq!(symbols, vec![Some("app::main".to_string())]);
+    assert_eq!(
+        resolver.object_resolver().batch_calls(),
+        vec![vec![SymbolRequest {
+            path: PathBuf::from("/bin/app"),
+            relative_address: 0x10,
+            build_id: None,
+            kernel_relocation: None,
+        }]]
+    );
+}
+
+#[test]
 fn perf_symbol_resolver_uses_system_map_candidates_when_cache_is_missing() {
     let home = tempfile::tempdir().expect("home");
     let perfdata = home.path().join("perf.data");

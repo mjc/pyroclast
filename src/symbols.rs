@@ -37,8 +37,8 @@ pub struct Addr2lineResolver<'a, R> {
     runner: &'a R,
 }
 
-pub struct PerfSymbolResolver<'a, R> {
-    addr2line: Addr2lineResolver<'a, R>,
+pub struct PerfSymbolResolver<O> {
+    object_resolver: O,
     debug_dir: Option<PathBuf>,
     kernel_elf: Option<PathBuf>,
     kallsyms: Option<Kallsyms>,
@@ -116,7 +116,7 @@ pub fn perf_symbol_resolver_for_perfdata_file<'a, R>(
     runner: &'a R,
     perfdata: &Path,
     home: &Path,
-) -> PerfSymbolResolver<'a, R>
+) -> PerfSymbolResolver<Addr2lineResolver<'a, R>>
 where
     R: CommandRunner,
 {
@@ -151,7 +151,7 @@ pub fn current_linux_system_map_candidates() -> Vec<PathBuf> {
 pub fn perf_symbol_resolver_for_current_home<'a, R>(
     runner: &'a R,
     perfdata: &Path,
-) -> PerfSymbolResolver<'a, R>
+) -> PerfSymbolResolver<Addr2lineResolver<'a, R>>
 where
     R: CommandRunner,
 {
@@ -172,18 +172,33 @@ where
     }
 }
 
-impl<'a, R> PerfSymbolResolver<'a, R>
+impl<'a, R> PerfSymbolResolver<Addr2lineResolver<'a, R>>
 where
     R: CommandRunner,
 {
     #[must_use]
     pub fn new(runner: &'a R) -> Self {
+        Self::from_object_resolver(Addr2lineResolver::new(runner))
+    }
+}
+
+impl<O> PerfSymbolResolver<O>
+where
+    O: SymbolResolver,
+{
+    #[must_use]
+    pub fn from_object_resolver(object_resolver: O) -> Self {
         Self {
-            addr2line: Addr2lineResolver::new(runner),
+            object_resolver,
             debug_dir: None,
             kernel_elf: None,
             kallsyms: None,
         }
+    }
+
+    #[must_use]
+    pub fn object_resolver(&self) -> &O {
+        &self.object_resolver
     }
 
     #[must_use]
@@ -405,9 +420,9 @@ where
     }
 }
 
-impl<R> SymbolResolver for PerfSymbolResolver<'_, R>
+impl<O> SymbolResolver for PerfSymbolResolver<O>
 where
-    R: CommandRunner,
+    O: SymbolResolver,
 {
     fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
         let mut resolved = vec![None; requests.len()];
@@ -439,14 +454,14 @@ where
         }
 
         if !kernel_elf_requests.is_empty() {
-            let kernel_symbols = self.addr2line.resolve_batch(&kernel_elf_requests)?;
+            let kernel_symbols = self.object_resolver.resolve_batch(&kernel_elf_requests)?;
             for (index, symbol) in kernel_elf_indexes.into_iter().zip(kernel_symbols) {
                 resolved[index] = symbol;
             }
         }
 
         if !user_requests.is_empty() {
-            let user_symbols = self.addr2line.resolve_batch(&user_requests)?;
+            let user_symbols = self.object_resolver.resolve_batch(&user_requests)?;
             for (index, symbol) in user_indexes.into_iter().zip(user_symbols) {
                 resolved[index] = symbol;
             }
@@ -455,9 +470,9 @@ where
     }
 }
 
-impl<R> PerfSymbolResolver<'_, R>
+impl<O> PerfSymbolResolver<O>
 where
-    R: CommandRunner,
+    O: SymbolResolver,
 {
     fn object_symbol_request(&self, request: &SymbolRequest) -> SymbolRequest {
         let Some(debug_dir) = &self.debug_dir else {
