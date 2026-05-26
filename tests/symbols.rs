@@ -1029,7 +1029,7 @@ ffffffff846997a0 T __pi_memcpy
 }
 
 #[test]
-fn perf_symbol_resolver_prefers_system_kallsyms_over_system_map() {
+fn perf_symbol_resolver_prefers_system_map_over_live_kallsyms_for_vmlinux() {
     let root = tempfile::tempdir().expect("root");
     let live_kallsyms = root.path().join("kallsyms");
     std::fs::write(&live_kallsyms, "ffffffff846997a0 T __pi_memcpy\n").expect("kallsyms");
@@ -1051,7 +1051,7 @@ fn perf_symbol_resolver_prefers_system_kallsyms_over_system_map() {
         }])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![Some("__pi_memcpy".to_string())]);
+    assert_eq!(symbols, vec![Some("memcpy".to_string())]);
 }
 
 #[test]

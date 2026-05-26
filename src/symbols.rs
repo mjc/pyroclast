@@ -80,6 +80,17 @@ pub struct RustAddr2lineResolver;
 
 type PerfDwarfReader = gimli::EndianArcSlice<gimli::RunTimeEndian>;
 
+#[derive(Default)]
+struct ObjectAddressCache {
+    segments_by_path: BTreeMap<PathBuf, Option<Vec<ObjectSegmentRange>>>,
+}
+
+struct ObjectSegmentRange {
+    file_offset: u64,
+    file_end: u64,
+    virtual_address: u64,
+}
+
 struct PerfDwarfNameResolver {
     dwarf: gimli::Dwarf<PerfDwarfReader>,
 }
@@ -169,9 +180,11 @@ pub fn perf_symbol_resolver_for_perfdata_file<'a, R>(
 where
     R: CommandRunner,
 {
-    PerfSymbolResolver::new(runner)
-        .with_perfdata_file_kernel_cache(perfdata, &perf_debug_dir(home))
-        .with_system_kallsyms()
+    perf_symbol_resolver_for_perfdata_file_with_object(
+        Addr2lineResolver::new(runner),
+        perfdata,
+        home,
+    )
 }
 
 #[must_use]
@@ -185,7 +198,6 @@ where
 {
     PerfSymbolResolver::from_object_resolver(object_resolver)
         .with_perfdata_file_kernel_cache(perfdata, &perf_debug_dir(home))
-        .with_system_kallsyms()
 }
 
 #[must_use]
@@ -262,12 +274,19 @@ where
     O: SymbolResolver,
 {
     match std::env::var_os("HOME") {
-        Some(home) => perf_symbol_resolver_for_perfdata_file_with_object(
-            object_resolver,
-            perfdata,
-            Path::new(&home),
-        )
-        .with_system_map_candidates(current_linux_system_map_candidates()),
+        Some(home) => {
+            let resolver = perf_symbol_resolver_for_perfdata_file_with_object(
+                object_resolver,
+                perfdata,
+                Path::new(&home),
+            )
+            .with_system_map_candidates(current_linux_system_map_candidates());
+            if resolver.system_map_kallsyms.is_some() {
+                resolver
+            } else {
+                resolver.with_system_kallsyms()
+            }
+        }
         None => PerfSymbolResolver::from_object_resolver(object_resolver).with_system_kallsyms(),
     }
 }
@@ -655,10 +674,13 @@ where
         let mut kernel_elf_indexes = Vec::new();
         let mut user_requests = Vec::new();
         let mut user_indexes = Vec::new();
+        let mut address_cache = ObjectAddressCache::default();
 
         for (index, request) in requests.iter().enumerate() {
             if is_kernel_module_symbol_path(&request.path) {
-                if let Some(object_request) = self.cached_object_symbol_request(request) {
+                if let Some(object_request) =
+                    self.cached_object_symbol_request(request, &mut address_cache)
+                {
                     user_indexes.push(index);
                     user_requests.push(object_request);
                 } else {
@@ -669,12 +691,15 @@ where
                     resolved[index] = Some(symbol);
                 } else if let Some(kernel_elf) = &self.kernel_elf {
                     kernel_elf_indexes.push(index);
-                    kernel_elf_requests.push(clean_object_symbol_request(
+                    kernel_elf_requests.push(clean_object_symbol_request_with_cache(
                         kernel_elf.clone(),
                         request.relative_address,
+                        &mut address_cache,
                     ));
                 }
-            } else if let Some(object_request) = self.object_symbol_request(request) {
+            } else if let Some(object_request) =
+                self.object_symbol_request(request, &mut address_cache)
+            {
                 user_indexes.push(index);
                 user_requests.push(object_request);
             }
@@ -702,10 +727,13 @@ where
         let mut kernel_elf_indexes = Vec::new();
         let mut user_requests = Vec::new();
         let mut user_indexes = Vec::new();
+        let mut address_cache = ObjectAddressCache::default();
 
         for (index, request) in requests.iter().enumerate() {
             if is_kernel_module_symbol_path(&request.path) {
-                if let Some(object_request) = self.cached_object_symbol_request(request) {
+                if let Some(object_request) =
+                    self.cached_object_symbol_request(request, &mut address_cache)
+                {
                     user_indexes.push(index);
                     user_requests.push(object_request);
                 } else if let Some(symbol) = self.resolve_kernel_symbol(request) {
@@ -716,12 +744,15 @@ where
                     resolved[index] = vec![symbol];
                 } else if let Some(kernel_elf) = &self.kernel_elf {
                     kernel_elf_indexes.push(index);
-                    kernel_elf_requests.push(clean_object_symbol_request(
+                    kernel_elf_requests.push(clean_object_symbol_request_with_cache(
                         kernel_elf.clone(),
                         request.relative_address,
+                        &mut address_cache,
                     ));
                 }
-            } else if let Some(object_request) = self.object_symbol_request(request) {
+            } else if let Some(object_request) =
+                self.object_symbol_request(request, &mut address_cache)
+            {
                 user_indexes.push(index);
                 user_requests.push(object_request);
             }
@@ -750,29 +781,42 @@ impl<O> PerfSymbolResolver<O>
 where
     O: SymbolResolver,
 {
-    fn object_symbol_request(&self, request: &SymbolRequest) -> Option<SymbolRequest> {
-        self.cached_object_symbol_request(request)
-            .or_else(|| Self::live_object_symbol_request(request))
+    fn object_symbol_request(
+        &self,
+        request: &SymbolRequest,
+        address_cache: &mut ObjectAddressCache,
+    ) -> Option<SymbolRequest> {
+        self.cached_object_symbol_request(request, address_cache)
+            .or_else(|| Self::live_object_symbol_request(request, address_cache))
     }
 
-    fn cached_object_symbol_request(&self, request: &SymbolRequest) -> Option<SymbolRequest> {
+    fn cached_object_symbol_request(
+        &self,
+        request: &SymbolRequest,
+        address_cache: &mut ObjectAddressCache,
+    ) -> Option<SymbolRequest> {
         let debug_dir = self.debug_dir.as_ref()?;
         let build_id = request.build_id.as_ref()?;
         let elf = perf_build_id_elf_path(debug_dir, build_id);
-        elf.exists()
-            .then(|| clean_object_symbol_request(elf, request.relative_address))
+        elf.exists().then(|| {
+            clean_object_symbol_request_with_cache(elf, request.relative_address, address_cache)
+        })
     }
 
-    fn live_object_symbol_request(request: &SymbolRequest) -> Option<SymbolRequest> {
+    fn live_object_symbol_request(
+        request: &SymbolRequest,
+        address_cache: &mut ObjectAddressCache,
+    ) -> Option<SymbolRequest> {
         if request
             .file_identity
             .is_some_and(|identity| !file_matches_recorded_identity(&request.path, identity))
         {
             return None;
         }
-        Some(clean_object_symbol_request(
+        Some(clean_object_symbol_request_with_cache(
             request.path.clone(),
             request.relative_address,
+            address_cache,
         ))
     }
 
@@ -791,12 +835,12 @@ where
                 .as_ref()
                 .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
                 .or_else(|| {
-                    self.live_kallsyms
+                    self.system_map_kallsyms
                         .as_ref()
                         .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
                 })
                 .or_else(|| {
-                    self.system_map_kallsyms
+                    self.live_kallsyms
                         .as_ref()
                         .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
                 })
@@ -804,9 +848,20 @@ where
     }
 }
 
+#[cfg(test)]
 fn clean_object_symbol_request(path: PathBuf, relative_address: u64) -> SymbolRequest {
+    let mut address_cache = ObjectAddressCache::default();
+    clean_object_symbol_request_with_cache(path, relative_address, &mut address_cache)
+}
+
+fn clean_object_symbol_request_with_cache(
+    path: PathBuf,
+    relative_address: u64,
+    address_cache: &mut ObjectAddressCache,
+) -> SymbolRequest {
     let relative_address =
-        object_virtual_address_for_file_offset(&path, relative_address).unwrap_or(relative_address);
+        object_virtual_address_for_file_offset_cached(&path, relative_address, address_cache)
+            .unwrap_or(relative_address);
     SymbolRequest {
         path,
         relative_address,
@@ -816,15 +871,36 @@ fn clean_object_symbol_request(path: PathBuf, relative_address: u64) -> SymbolRe
     }
 }
 
-fn object_virtual_address_for_file_offset(path: &Path, file_offset: u64) -> Option<u64> {
+fn object_virtual_address_for_file_offset_cached(
+    path: &Path,
+    file_offset: u64,
+    address_cache: &mut ObjectAddressCache,
+) -> Option<u64> {
+    let segments = address_cache
+        .segments_by_path
+        .entry(path.to_path_buf())
+        .or_insert_with(|| object_load_segment_ranges(path));
+    segments.as_ref()?.iter().find_map(|segment| {
+        (file_offset >= segment.file_offset && file_offset < segment.file_end)
+            .then(|| segment.virtual_address + (file_offset - segment.file_offset))
+    })
+}
+
+fn object_load_segment_ranges(path: &Path) -> Option<Vec<ObjectSegmentRange>> {
     let bytes = std::fs::read(path).ok()?;
     let object = object::File::parse(bytes.as_slice()).ok()?;
-    object.segments().find_map(|segment| {
-        let (segment_offset, segment_size) = segment.file_range();
-        let segment_end = segment_offset.checked_add(segment_size)?;
-        (file_offset >= segment_offset && file_offset < segment_end)
-            .then(|| segment.address() + (file_offset - segment_offset))
-    })
+    let segments = object
+        .segments()
+        .filter_map(|segment| {
+            let (file_offset, file_size) = segment.file_range();
+            Some(ObjectSegmentRange {
+                file_offset,
+                file_end: file_offset.checked_add(file_size)?,
+                virtual_address: segment.address(),
+            })
+        })
+        .collect::<Vec<_>>();
+    (!segments.is_empty()).then_some(segments)
 }
 
 impl<R> SymbolResolver for Addr2lineResolver<'_, R>
