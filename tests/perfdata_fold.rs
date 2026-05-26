@@ -99,7 +99,7 @@ fn summarizes_dwarf_user_stack_payloads() {
                 | PERF_SAMPLE_CALLCHAIN
                 | PERF_SAMPLE_REGS_USER
                 | PERF_SAMPLE_STACK_USER,
-            0b1,
+            1 << 8,
         )],
         [record_bytes(
             9,
@@ -112,6 +112,7 @@ fn summarizes_dwarf_user_stack_payloads() {
     assert_eq!(summary.sample_stacks.len(), 1);
     assert!(summary.sample_stacks[0].has_user_stack);
     assert_eq!(summary.sample_stacks[0].user_register_count, 1);
+    assert_eq!(summary.sample_stacks[0].user_register_ip, Some(0xaaaa));
     assert_eq!(summary.sample_stacks[0].user_stack_size, 3);
 }
 

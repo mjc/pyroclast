@@ -47,6 +47,7 @@ pub struct PerfSampleStack {
     pub callchain: Vec<u64>,
     pub has_user_stack: bool,
     pub user_register_count: usize,
+    pub user_register_ip: Option<u64>,
     pub user_stack_size: usize,
 }
 
@@ -920,6 +921,10 @@ fn parse_sample_for_summary(
                     .user_regs
                     .as_ref()
                     .map_or(0, |regs| regs.values.len()),
+                user_register_ip: sample
+                    .user_regs
+                    .as_ref()
+                    .and_then(|regs| perf_user_reg_value(layout.sample_regs_user, &regs.values, 8)),
                 user_stack_size: sample
                     .user_stack
                     .as_ref()
@@ -929,6 +934,14 @@ fn parse_sample_for_summary(
     } else {
         Ok(None)
     }
+}
+
+fn perf_user_reg_value(mask: u64, values: &[u64], register: u32) -> Option<u64> {
+    if mask & (1_u64 << register) == 0 {
+        return None;
+    }
+    let index = (mask & ((1_u64 << register) - 1)).count_ones() as usize;
+    values.get(index).copied()
 }
 
 fn parse_sample_for_fold(
