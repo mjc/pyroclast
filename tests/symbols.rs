@@ -9,8 +9,9 @@ use pyroclast::perfdata::mappings::FileIdentity;
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
 use pyroclast::symbols::{
     Addr2lineResolver, Kallsyms, RustAddr2lineResolver, SymbolCache, SymbolRequest, SymbolResolver,
-    perf_debug_dir, perf_dwarf_function_name, perf_inline_frame_order, perf_symbol_name,
-    perf_symbol_resolver_for_perfdata_file, perf_symbol_resolver_for_perfdata_file_with_symbolizer,
+    more_specific_dwarf_name_from_debug_strings, perf_debug_dir, perf_dwarf_function_name,
+    perf_inline_frame_order, perf_symbol_name, perf_symbol_resolver_for_perfdata_file,
+    perf_symbol_resolver_for_perfdata_file_with_symbolizer,
 };
 
 #[test]
@@ -355,6 +356,33 @@ fn perf_dwarf_function_name_matches_perf_script_inline_names() {
     assert_eq!(
         perf_dwarf_function_name("foo::bar<std::vector<int>>::baz"),
         "foo::bar<std::vector<int>>::baz"
+    );
+}
+
+#[test]
+fn finds_unique_generic_dwarf_names_from_debug_strings() {
+    let debug_strings = b"\0pyroclast::symbols::perf_symbol_resolver_for_current_home_with_symbolizer<pyroclast::process::RealCommandRunner>\0other_name\0";
+
+    assert_eq!(
+        more_specific_dwarf_name_from_debug_strings(
+            "perf_symbol_resolver_for_current_home_with_symbolizer",
+            debug_strings
+        ),
+        Some(
+            "perf_symbol_resolver_for_current_home_with_symbolizer<pyroclast::process::RealCommandRunner>"
+                .to_string()
+        )
+    );
+}
+
+#[test]
+fn rejects_ambiguous_generic_dwarf_names_from_debug_strings() {
+    let debug_strings =
+        b"\0crate::make<crate::A>\0other::make<other::B>\0crate::not_make<crate::A>\0";
+
+    assert_eq!(
+        more_specific_dwarf_name_from_debug_strings("make", debug_strings),
+        None
     );
 }
 
