@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
-use crate::folded::render_folded_stack;
+use crate::folded::render_inferno_perf_folded_stack;
 use crate::perfdata::attrs::{PerfFileAttr, parse_file_attr_ids, parse_file_attrs};
 use crate::perfdata::build_id::build_id_events_from_perfdata;
 use crate::perfdata::endian::read_u64;
@@ -704,7 +704,7 @@ where
 
     let mut folded = String::new();
     for (callchain, count) in counts {
-        folded.push_str(&render_folded_stack(
+        folded.push_str(&render_inferno_perf_folded_stack(
             callchain.iter().map(String::as_str),
             count,
         ));
