@@ -240,7 +240,7 @@ fn symbolizer_selector_can_use_rust_addr2line_without_process_runner() {
 }
 
 #[test]
-fn perf_symbol_name_shortens_rust_paths_like_perf_script() {
+fn perf_symbol_name_shortens_qualified_paths_like_perf_script() {
     assert_eq!(
         perf_symbol_name("pyroclast::perfdata::attrs::parse_file_attrs"),
         "parse_file_attrs"
@@ -248,6 +248,29 @@ fn perf_symbol_name_shortens_rust_paths_like_perf_script() {
     assert_eq!(
         perf_symbol_name("<pyroclast::cli::RunArgs as clap_builder::derive::Args>::augment_args"),
         "augment_args"
+    );
+    assert_eq!(
+        perf_symbol_name("next<core::slice::iter::Iter<clap_builder::util::id::Id>>"),
+        "next<core::slice::iter::Iter<clap_builder::util::id::Id>>"
+    );
+    assert_eq!(
+        perf_symbol_name(
+            "clone<(clap_builder::builder::arg_predicate::ArgPredicate, clap_builder::util::id::Id), alloc::alloc::Global>"
+        ),
+        "clone<(clap_builder::builder::arg_predicate::ArgPredicate, clap_builder::util::id::Id), alloc::alloc::Global>"
+    );
+    assert_eq!(
+        perf_symbol_name("std::vector<int, std::allocator<int>>::push_back"),
+        "push_back"
+    );
+    assert_eq!(perf_symbol_name("foo::bar<std::vector<int>>::baz"), "baz");
+    assert_eq!(
+        perf_symbol_name("operator new(unsigned long)"),
+        "operator new(unsigned long)"
+    );
+    assert_eq!(
+        perf_symbol_name("__memmove_avx_unaligned_erms"),
+        "__memmove_avx_unaligned_erms"
     );
 }
 
