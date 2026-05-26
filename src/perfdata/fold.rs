@@ -447,6 +447,9 @@ impl<'a> FoldFrameResolver<'a> {
             Vec::new()
         };
         for frame in callchain.iter().copied() {
+            if pid.is_some_and(|pid| self.mmap_table.is_known_non_executable(pid, frame)) {
+                continue;
+            }
             frames.push(self.format_frame(pid, frame, symbol_cache.as_deref_mut())?);
         }
         Ok(frames)
