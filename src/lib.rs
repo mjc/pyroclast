@@ -204,6 +204,7 @@ where
                 stderr: String::new(),
             })
         }
+        CliCommand::AnalyzeFlamegraph(_) => Err("flamegraph analysis is not wired yet".into()),
         CliCommand::Memory(_)
         | CliCommand::Cpu(_)
         | CliCommand::Offpcu(_)

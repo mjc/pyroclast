@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use pyroclast::cli::{Cli, CliCommand, PerfCallGraph, PerfEvent, ProfileKind, SymbolizerKind};
+use pyroclast::cli::{
+    Cli, CliCommand, FlamegraphAnalysisMode, PerfCallGraph, PerfEvent, ProfileKind, SymbolizerKind,
+};
 
 #[test]
 fn parses_profile_defaults() {
@@ -316,5 +318,41 @@ fn parses_analysis_commands() {
     ]);
     assert!(
         matches!(rust_symbolized_flamegraph.command, CliCommand::Flamegraph(command) if command.input == std::path::Path::new("perf.data") && command.symbols && command.symbolizer == SymbolizerKind::RustAddr2line)
+    );
+
+    let flamegraph_analysis = Cli::parse_from([
+        "pyroclast",
+        "analyze-flamegraph",
+        "--json",
+        "--mode",
+        "summary",
+        "--limit",
+        "12",
+        "--min-percent",
+        "0.5",
+        "flamegraph.svg",
+    ]);
+    match flamegraph_analysis.command {
+        CliCommand::AnalyzeFlamegraph(command) => {
+            assert!(command.json);
+            assert_eq!(command.mode, FlamegraphAnalysisMode::Summary);
+            assert_eq!(command.limit, 12);
+            assert!((command.min_percent - 0.5).abs() < f64::EPSILON);
+            assert_eq!(command.input, std::path::Path::new("flamegraph.svg"));
+        }
+        other => panic!("expected analyze-flamegraph command, got {other:?}"),
+    }
+
+    let flamegraph_diff = Cli::parse_from([
+        "pyroclast",
+        "analyze-flamegraph",
+        "--mode",
+        "diff",
+        "--other",
+        "after.svg",
+        "before.svg",
+    ]);
+    assert!(
+        matches!(flamegraph_diff.command, CliCommand::AnalyzeFlamegraph(command) if command.mode == FlamegraphAnalysisMode::Diff && command.other.as_deref() == Some(std::path::Path::new("after.svg")))
     );
 }

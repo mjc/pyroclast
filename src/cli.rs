@@ -37,6 +37,7 @@ pub enum CliCommand {
     Fold(FoldArgs),
     Summarize(SummarizeArgs),
     Flamegraph(FlamegraphArgs),
+    AnalyzeFlamegraph(AnalyzeFlamegraphArgs),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
@@ -170,7 +171,10 @@ impl CliCommand {
                 duration_secs: args.duration_secs,
                 command: args.command.clone(),
             }),
-            Self::Fold(_) | Self::Summarize(_) | Self::Flamegraph(_) => None,
+            Self::Fold(_)
+            | Self::Summarize(_)
+            | Self::Flamegraph(_)
+            | Self::AnalyzeFlamegraph(_) => None,
         }
     }
 }
@@ -278,4 +282,36 @@ pub struct FlamegraphArgs {
 
     #[arg(long, default_value = "CPU profile")]
     pub title: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum FlamegraphAnalysisMode {
+    Top,
+    Search,
+    Syscalls,
+    Summary,
+    Diff,
+}
+
+#[derive(Debug, Args)]
+pub struct AnalyzeFlamegraphArgs {
+    #[arg(long)]
+    pub json: bool,
+
+    #[arg(long, value_enum, default_value_t = FlamegraphAnalysisMode::Top)]
+    pub mode: FlamegraphAnalysisMode,
+
+    #[arg(long, default_value_t = 30)]
+    pub limit: usize,
+
+    #[arg(long, default_value_t = 1.0)]
+    pub min_percent: f64,
+
+    #[arg(long)]
+    pub search: Option<String>,
+
+    #[arg(long)]
+    pub other: Option<PathBuf>,
+
+    pub input: PathBuf,
 }
