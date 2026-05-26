@@ -1,3 +1,4 @@
+pub mod analysis;
 pub mod attrs;
 pub mod build_id;
 pub mod endian;

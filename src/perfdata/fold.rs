@@ -23,6 +23,7 @@ pub struct PerfSummary {
     pub record_counts: BTreeMap<u32, usize>,
     pub comms: Vec<String>,
     pub comms_by_pid: BTreeMap<u32, String>,
+    pub comms_by_tid: BTreeMap<u32, String>,
     pub mmaps: Vec<String>,
     pub lost_records: u64,
     pub mmap_table: MmapTable,
@@ -32,6 +33,7 @@ pub struct PerfSummary {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PerfSampleStack {
     pub pid: Option<u32>,
+    pub tid: Option<u32>,
     pub period: Option<u64>,
     pub callchain: Vec<u64>,
 }
@@ -75,6 +77,7 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
         record_counts: BTreeMap::new(),
         comms: Vec::new(),
         comms_by_pid: BTreeMap::new(),
+        comms_by_tid: BTreeMap::new(),
         mmaps: Vec::new(),
         lost_records: 0,
         mmap_table: MmapTable::default(),
@@ -91,6 +94,7 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
         let record_result: Result<(), String> = match parsed_record {
             ParsedRecord::Comm(record) => {
                 summary.comms_by_pid.insert(record.pid, record.comm.clone());
+                summary.comms_by_tid.insert(record.tid, record.comm.clone());
                 summary.comms.push(record.comm);
                 Ok(())
             }
@@ -501,6 +505,7 @@ fn parse_sample_for_summary(
         parse_sample_record(payload, layout).map(|record| {
             Some(PerfSampleStack {
                 pid: record.pid,
+                tid: record.tid,
                 period: record.period,
                 callchain: record.callchain,
             })
