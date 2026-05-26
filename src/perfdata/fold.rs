@@ -668,6 +668,7 @@ fn parse_sample_for_fold(
                 };
                 let mut frames = sample.frames.map(FoldFrame::Callchain).collect::<Vec<_>>();
                 if let (Some(regs), Some(stack)) = (&sample.user_regs, &sample.user_stack)
+                    && !contains_kernel_callchain_frame(&frames)
                     && let Ok(regs) = PerfX86_64Regs::from_perf_masked_values(
                         layout.sample_regs_user,
                         &regs.values,
@@ -694,6 +695,12 @@ fn parse_sample_for_fold(
     } else {
         Ok(None)
     }
+}
+
+fn contains_kernel_callchain_frame(frames: &[FoldFrame]) -> bool {
+    frames.iter().any(
+        |frame| matches!(frame, FoldFrame::Callchain(address) if is_kernel_space_frame(*address)),
+    )
 }
 
 fn load_unwind_mapping(
