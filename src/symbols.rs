@@ -1554,6 +1554,11 @@ fn generic_function_leaf(name: &str) -> Option<&str> {
 
 #[must_use]
 pub fn perf_symbol_name(name: &str) -> String {
+    if !looks_like_cpp_qualified_name(name)
+        && let Some(name) = rust_receiver_generic_leaf(name)
+    {
+        return name;
+    }
     name.to_owned()
 }
 
@@ -1593,6 +1598,18 @@ fn rust_leaf_with_receiver_generics(name: &str) -> Option<String> {
     } else {
         Some(leaf.to_owned())
     }
+}
+
+fn rust_receiver_generic_leaf(name: &str) -> Option<String> {
+    let separator = last_namespace_separator(name)?;
+    let leaf = name.get(separator + 2..)?;
+    let receiver = name.get(..separator)?;
+    if receiver.starts_with('<') {
+        return None;
+    }
+    let generic_arguments = trailing_generic_arguments(receiver)?;
+    perf_script_receiver_generics_are_specific(generic_arguments)
+        .then(|| format!("{leaf}{generic_arguments}"))
 }
 
 fn perf_script_receiver_generics_are_specific(generic_arguments: &str) -> bool {

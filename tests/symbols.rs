@@ -305,6 +305,12 @@ fn perf_symbol_name_preserves_language_qualified_names_like_perf_script() {
         "clone<(clap_builder::builder::arg_predicate::ArgPredicate, clap_builder::util::id::Id), alloc::alloc::Global>"
     );
     assert_eq!(
+        perf_symbol_name(
+            "alloc::collections::btree::map::IntoIter<u64, alloc::string::String, alloc::alloc::Global>::dying_next"
+        ),
+        "dying_next<u64, alloc::string::String, alloc::alloc::Global>"
+    );
+    assert_eq!(
         perf_symbol_name("std::vector<int, std::allocator<int>>::push_back"),
         "std::vector<int, std::allocator<int>>::push_back"
     );
@@ -357,6 +363,12 @@ fn perf_dwarf_function_name_matches_perf_script_inline_names() {
             "alloc::collections::btree::map::BTreeMap<u64, alloc::string::String, alloc::alloc::Global>::insert"
         ),
         "insert<u64, alloc::string::String, alloc::alloc::Global>"
+    );
+    assert_eq!(
+        perf_dwarf_function_name(
+            "alloc::collections::btree::map::IntoIter<u64, alloc::string::String, alloc::alloc::Global>::dying_next"
+        ),
+        "dying_next<u64, alloc::string::String, alloc::alloc::Global>"
     );
     assert_eq!(
         perf_dwarf_function_name("std::vector<int, std::allocator<int>>::push_back"),
