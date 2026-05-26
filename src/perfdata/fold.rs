@@ -13,7 +13,7 @@ use crate::perfdata::records::{Mmap2Record, ParsedRecord, PerfRecord, iter_recor
 use crate::perfdata::samples::{
     PERF_SAMPLE_ADDR, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_TID,
     PERF_SAMPLE_TIME, SampleLayout, is_kernel_space_frame, is_perf_context_marker,
-    parse_sample_record_callchain,
+    is_perf_user_context_marker, parse_sample_record_callchain,
 };
 use crate::perfdata::unwind::{FramehopUnwinder, PerfX86_64Regs, unwind_x86_64_stack};
 use crate::symbols::{SymbolFrameCache, SymbolRequest, SymbolResolver};
@@ -675,7 +675,7 @@ fn parse_sample_for_fold(
                 };
                 let mut frames = sample.frames.map(FoldFrame::Callchain).collect::<Vec<_>>();
                 if let (Some(regs), Some(stack)) = (&sample.user_regs, &sample.user_stack)
-                    && !contains_kernel_callchain_frame(&frames)
+                    && should_unwind_user_stack(&frames)
                     && let Ok(regs) = PerfX86_64Regs::from_perf_masked_values(
                         layout.sample_regs_user,
                         &regs.values,
@@ -708,6 +708,16 @@ fn contains_kernel_callchain_frame(frames: &[FoldFrame]) -> bool {
     frames.iter().any(
         |frame| matches!(frame, FoldFrame::Callchain(address) if is_kernel_space_frame(*address)),
     )
+}
+
+fn contains_user_context_marker(frames: &[FoldFrame]) -> bool {
+    frames.iter().any(
+        |frame| matches!(frame, FoldFrame::Callchain(address) if is_perf_user_context_marker(*address)),
+    )
+}
+
+fn should_unwind_user_stack(frames: &[FoldFrame]) -> bool {
+    !contains_kernel_callchain_frame(frames) || contains_user_context_marker(frames)
 }
 
 fn load_unwind_mapping(

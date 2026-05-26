@@ -305,6 +305,11 @@ pub fn is_perf_context_marker(frame: u64) -> bool {
 }
 
 #[must_use]
+pub fn is_perf_user_context_marker(frame: u64) -> bool {
+    frame == 0xffff_ffff_ffff_fe00
+}
+
+#[must_use]
 pub fn is_kernel_space_frame(frame: u64) -> bool {
     frame >= 0xffff_8000_0000_0000 && !is_perf_context_marker(frame)
 }

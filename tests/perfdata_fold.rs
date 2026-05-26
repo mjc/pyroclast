@@ -180,7 +180,7 @@ fn folds_dwarf_user_stack_payloads_before_kernel_callchain_frames() {
 }
 
 #[test]
-fn ignores_dwarf_user_stack_payloads_when_callchain_contains_kernel_frames_like_perf_script() {
+fn keeps_dwarf_user_stack_payloads_when_kernel_callchain_has_user_context_marker() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -214,7 +214,7 @@ fn ignores_dwarf_user_stack_payloads_when_callchain_contains_kernel_frames_like_
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "[unknown];[unknown] 1\n");
+    assert_eq!(folded, "0x1234;0x4000;[unknown];[unknown] 1\n");
 }
 
 #[test]
