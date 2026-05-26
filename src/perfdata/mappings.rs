@@ -103,6 +103,20 @@ impl MmapTable {
     }
 
     #[must_use]
+    pub fn has_mappings_for_pid(&self, pid: u32) -> bool {
+        self.mappings
+            .iter()
+            .any(|mapping| mapping.pid == pid || mapping.pid == u32::MAX)
+    }
+
+    #[must_use]
+    pub fn has_executable_mappings_for_pid(&self, pid: u32) -> bool {
+        self.mappings
+            .iter()
+            .any(|mapping| (mapping.pid == pid || mapping.pid == u32::MAX) && mapping.may_execute())
+    }
+
+    #[must_use]
     pub fn is_known_non_executable(&self, pid: u32, ip: u64) -> bool {
         self.mappings
             .iter()
@@ -143,6 +157,10 @@ impl Mapping {
 
     fn is_known_non_executable(&self) -> bool {
         self.prot.is_some_and(|prot| prot & PROT_EXEC == 0) || is_perf_data_path(&self.path)
+    }
+
+    fn may_execute(&self) -> bool {
+        !self.is_known_non_executable()
     }
 }
 

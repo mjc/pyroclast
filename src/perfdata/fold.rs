@@ -48,7 +48,21 @@ struct PerfFoldData {
     raw_stacks: Vec<CollapsedRawStack>,
 }
 
-type FoldSample = (Option<u32>, u64, Vec<u64>);
+type FoldSample = (Option<u32>, u64, Vec<FoldFrame>);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FoldFrame {
+    Callchain(u64),
+    UserUnwind(u64),
+}
+
+impl FoldFrame {
+    fn address(self) -> u64 {
+        match self {
+            Self::Callchain(address) | Self::UserUnwind(address) => address,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 struct SampleLayouts {
@@ -372,17 +386,32 @@ fn add_fold_sample(
     if let Some((pid, count, frames)) = sample {
         callchain.clear();
         callchain.reserve(frames.len());
-        callchain.extend(
-            frames
-                .into_iter()
-                .rev()
-                .filter(|frame| !is_perf_context_marker(*frame))
-                .filter(|frame| {
-                    pid.is_none_or(|pid| !mmap_table.is_known_non_executable(pid, *frame))
-                }),
-        );
+        callchain.extend(frames.into_iter().rev().filter_map(|frame| {
+            let address = frame.address();
+            if is_perf_context_marker(address) {
+                return None;
+            }
+            if pid.is_some_and(|pid| mmap_table.is_known_non_executable(pid, address)) {
+                return None;
+            }
+            if !is_valid_unwound_user_frame(pid, frame, mmap_table) {
+                return None;
+            }
+            Some(address)
+        }));
         raw_stacks.add_slice(pid, callchain, count);
     }
+}
+
+fn is_valid_unwound_user_frame(pid: Option<u32>, frame: FoldFrame, mmap_table: &MmapTable) -> bool {
+    let FoldFrame::UserUnwind(address) = frame else {
+        return true;
+    };
+    pid.is_none_or(|pid| {
+        !mmap_table.has_executable_mappings_for_pid(pid)
+            || mmap_table.resolve(pid, address).is_some()
+            || is_kernel_space_frame(address)
+    })
 }
 
 fn render_fold_data<R>(
@@ -594,7 +623,7 @@ fn parse_sample_for_fold(
                 } else {
                     1
                 };
-                let mut frames = sample.frames.collect::<Vec<_>>();
+                let mut frames = sample.frames.map(FoldFrame::Callchain).collect::<Vec<_>>();
                 if let (Some(regs), Some(stack)) = (&sample.user_regs, &sample.user_stack)
                     && let Ok(regs) = PerfX86_64Regs::from_perf_masked_values(
                         layout.sample_regs_user,
@@ -606,6 +635,10 @@ fn parse_sample_for_fold(
                     } else {
                         object_unwinder.unwind_stack(regs, stack.bytes, 256)
                     };
+                    let unwound_frames = unwound_frames
+                        .into_iter()
+                        .map(FoldFrame::UserUnwind)
+                        .collect::<Vec<_>>();
                     if frames.is_empty() {
                         frames = unwound_frames;
                     } else {
