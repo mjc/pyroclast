@@ -241,6 +241,7 @@ where
                 stderr: String::new(),
             })
         }
+        CliCommand::AnalyzePerfdata(_) => Err("perfdata analysis is not wired yet".into()),
         CliCommand::Memory(_)
         | CliCommand::Cpu(_)
         | CliCommand::Offpcu(_)

@@ -355,4 +355,16 @@ fn parses_analysis_commands() {
     assert!(
         matches!(flamegraph_diff.command, CliCommand::AnalyzeFlamegraph(command) if command.mode == FlamegraphAnalysisMode::Diff && command.other.as_deref() == Some(std::path::Path::new("after.svg")))
     );
+
+    let perfdata_analysis = Cli::parse_from([
+        "pyroclast",
+        "analyze-perfdata",
+        "--json",
+        "--limit",
+        "20",
+        "perf.data",
+    ]);
+    assert!(
+        matches!(perfdata_analysis.command, CliCommand::AnalyzePerfdata(command) if command.json && command.limit == 20 && command.input == std::path::Path::new("perf.data"))
+    );
 }

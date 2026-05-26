@@ -38,6 +38,7 @@ pub enum CliCommand {
     Summarize(SummarizeArgs),
     Flamegraph(FlamegraphArgs),
     AnalyzeFlamegraph(AnalyzeFlamegraphArgs),
+    AnalyzePerfdata(AnalyzePerfdataArgs),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
@@ -174,7 +175,8 @@ impl CliCommand {
             Self::Fold(_)
             | Self::Summarize(_)
             | Self::Flamegraph(_)
-            | Self::AnalyzeFlamegraph(_) => None,
+            | Self::AnalyzeFlamegraph(_)
+            | Self::AnalyzePerfdata(_) => None,
         }
     }
 }
@@ -312,6 +314,17 @@ pub struct AnalyzeFlamegraphArgs {
 
     #[arg(long)]
     pub other: Option<PathBuf>,
+
+    pub input: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct AnalyzePerfdataArgs {
+    #[arg(long)]
+    pub json: bool,
+
+    #[arg(long, default_value_t = 30)]
+    pub limit: usize,
 
     pub input: PathBuf,
 }
