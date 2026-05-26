@@ -297,6 +297,72 @@ fn flamegraph_command_can_symbolize_mapped_frames() {
 }
 
 #[test]
+fn analyze_flamegraph_command_emits_json_summary() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let svg = root.path().join("flamegraph.svg");
+    std::fs::write(
+        &svg,
+        r"
+<svg>
+  <title>all (100 samples, 100%)</title>
+  <title>tokio::runtime::park (40 samples, 40.00%)</title>
+  <title>zfs_read (30 samples, 30.00%)</title>
+</svg>
+",
+    )
+    .expect("svg");
+
+    let output = pyroclast::run_cli([
+        "pyroclast",
+        "analyze-flamegraph",
+        "--json",
+        "--mode",
+        "summary",
+        svg.to_str().expect("svg path"),
+    ])
+    .expect("analyze flamegraph");
+
+    let json: serde_json::Value = serde_json::from_str(&output.stdout).expect("json");
+    assert_eq!(json[0]["name"], "Tokio Runtime");
+    assert_eq!(json[0]["percent"], 40.0);
+    assert_eq!(json[1]["name"], "Disk I/O");
+    assert_eq!(json[1]["percent"], 30.0);
+}
+
+#[test]
+fn analyze_flamegraph_command_emits_text_diff() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let before = root.path().join("before.svg");
+    let after = root.path().join("after.svg");
+    std::fs::write(
+        &before,
+        r"<title>parse (80 samples, 80.00%)</title><title>read (20 samples, 20.00%)</title>",
+    )
+    .expect("before");
+    std::fs::write(
+        &after,
+        r"<title>parse (50 samples, 50.00%)</title><title>write (50 samples, 50.00%)</title>",
+    )
+    .expect("after");
+
+    let output = pyroclast::run_cli([
+        "pyroclast",
+        "analyze-flamegraph",
+        "--mode",
+        "diff",
+        "--other",
+        after.to_str().expect("after path"),
+        before.to_str().expect("before path"),
+    ])
+    .expect("analyze flamegraph");
+
+    assert!(output.stdout.contains("+50.00%"));
+    assert!(output.stdout.contains("write"));
+    assert!(output.stdout.contains("-30.00%"));
+    assert!(output.stdout.contains("parse"));
+}
+
+#[test]
 fn summarize_command_prints_summary_text() {
     let root = tempfile::tempdir().expect("tempdir");
     let run_dir = root.path().join("run");

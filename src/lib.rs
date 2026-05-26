@@ -24,8 +24,12 @@ use backends::macos_xctrace::MacosXctraceBackend;
 use backends::offcpu::OffcpuBackend;
 use backends::strace::StraceBackend;
 use backends::{ProfileRequest, ProfilerBackend};
-use cli::ProfileKind;
+use cli::{AnalyzeFlamegraphArgs, FlamegraphAnalysisMode};
 use cli::{Cli, CliCommand};
+use flamegraph::analysis::{
+    FlamegraphCategory, FlamegraphDelta, FlamegraphEntry, category_summary, diff_flamegraphs,
+    parse_flamegraph_entries, search_entries, syscall_breakdown, top_entries,
+};
 use flamegraph::{FlamegraphRenderer, FlamegraphRequest, InfernoFlamegraphRenderer};
 pub use output::{CliOutput, write_cli_output};
 use perfdata::fold::{
@@ -114,50 +118,76 @@ where
     F: FlamegraphRenderer,
 {
     if let Some(invocation) = cli.command.profile_invocation() {
-        let out_dir = invocation
-            .out
-            .clone()
-            .unwrap_or_else(|| std::path::PathBuf::from("pyroclast-runs/latest"));
-        let request = ProfileRequest {
-            kind: invocation.kind,
-            command: invocation.command,
-            out_dir,
-            name: invocation.name,
-            json: invocation.json,
-            symbols: invocation.symbols,
-            symbolizer: invocation.symbolizer,
-            frequency: invocation.frequency,
-            event: invocation.event,
-            call_graph: invocation.call_graph,
-            pid: invocation.pid,
-            tids: invocation.tids,
-            threads_of_pid: invocation.threads_of_pid,
-            duration_secs: invocation.duration_secs,
-        };
-        match request.kind {
-            ProfileKind::Cpu if platform == "linux" => {
-                LinuxPerfBackend::with_renderer(runner, flamegraph_renderer).profile(&request)?;
-            }
-            ProfileKind::Cpu if platform == "macos" => {
-                MacosXctraceBackend::new(runner).profile(&request)?;
-            }
-            ProfileKind::Latency if platform == "linux" => {
-                StraceBackend::new(runner).profile(&request)?;
-            }
-            ProfileKind::Memory if platform == "linux" => {
-                HeaptrackBackend::new(runner).profile(&request)?;
-            }
-            ProfileKind::Offcpu if platform == "linux" => {
-                OffcpuBackend::new(runner).profile(&request)?;
-            }
-            _ => {
-                FakeBackend.profile(&request)?;
-            }
-        }
+        run_profile_invocation(invocation, runner, flamegraph_renderer, platform)?;
         return Ok(CliOutput::default());
     }
 
-    match cli.command {
+    run_analysis_command(cli.command, runner, &flamegraph_renderer)
+}
+
+fn run_profile_invocation<R, F>(
+    invocation: cli::ProfileInvocation,
+    runner: &R,
+    flamegraph_renderer: F,
+    platform: &str,
+) -> backends::BackendResult<()>
+where
+    R: CommandRunner,
+    F: FlamegraphRenderer,
+{
+    let out_dir = invocation
+        .out
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("pyroclast-runs/latest"));
+    let request = ProfileRequest {
+        kind: invocation.kind,
+        command: invocation.command,
+        out_dir,
+        name: invocation.name,
+        json: invocation.json,
+        symbols: invocation.symbols,
+        symbolizer: invocation.symbolizer,
+        frequency: invocation.frequency,
+        event: invocation.event,
+        call_graph: invocation.call_graph,
+        pid: invocation.pid,
+        tids: invocation.tids,
+        threads_of_pid: invocation.threads_of_pid,
+        duration_secs: invocation.duration_secs,
+    };
+    match request.kind {
+        cli::ProfileKind::Cpu if platform == "linux" => {
+            LinuxPerfBackend::with_renderer(runner, flamegraph_renderer).profile(&request)?;
+        }
+        cli::ProfileKind::Cpu if platform == "macos" => {
+            MacosXctraceBackend::new(runner).profile(&request)?;
+        }
+        cli::ProfileKind::Latency if platform == "linux" => {
+            StraceBackend::new(runner).profile(&request)?;
+        }
+        cli::ProfileKind::Memory if platform == "linux" => {
+            HeaptrackBackend::new(runner).profile(&request)?;
+        }
+        cli::ProfileKind::Offcpu if platform == "linux" => {
+            OffcpuBackend::new(runner).profile(&request)?;
+        }
+        _ => {
+            FakeBackend.profile(&request)?;
+        }
+    }
+    Ok(())
+}
+
+fn run_analysis_command<R, F>(
+    command: CliCommand,
+    runner: &R,
+    flamegraph_renderer: &F,
+) -> backends::BackendResult<CliOutput>
+where
+    R: CommandRunner,
+    F: FlamegraphRenderer,
+{
+    match command {
         CliCommand::Fold(command) => {
             let options = FoldOptions {
                 count_periods: command.count_periods,
@@ -204,13 +234,115 @@ where
                 stderr: String::new(),
             })
         }
-        CliCommand::AnalyzeFlamegraph(_) => Err("flamegraph analysis is not wired yet".into()),
+        CliCommand::AnalyzeFlamegraph(command) => {
+            let stdout = analyze_flamegraph_for_cli(&command)?;
+            Ok(CliOutput {
+                stdout,
+                stderr: String::new(),
+            })
+        }
         CliCommand::Memory(_)
         | CliCommand::Cpu(_)
         | CliCommand::Offpcu(_)
         | CliCommand::Latency(_)
         | CliCommand::Async(_)
         | CliCommand::Profile(_) => unreachable!("profile invocations returned earlier"),
+    }
+}
+
+fn analyze_flamegraph_for_cli(command: &AnalyzeFlamegraphArgs) -> backends::BackendResult<String> {
+    let svg = std::fs::read_to_string(&command.input)?;
+    let entries = parse_flamegraph_entries(&svg);
+
+    match command.mode {
+        FlamegraphAnalysisMode::Top => {
+            let entries = top_entries(&entries, command.limit, command.min_percent);
+            render_flamegraph_entries(&entries, command.json)
+        }
+        FlamegraphAnalysisMode::Search => {
+            let pattern = command.search.as_deref().unwrap_or_default();
+            let entries = search_entries(&entries, pattern);
+            render_flamegraph_entries(&entries, command.json)
+        }
+        FlamegraphAnalysisMode::Syscalls => {
+            let entries = syscall_breakdown(&entries);
+            render_flamegraph_entries(&entries, command.json)
+        }
+        FlamegraphAnalysisMode::Summary => {
+            let categories = category_summary(&entries);
+            render_flamegraph_categories(&categories, command.json)
+        }
+        FlamegraphAnalysisMode::Diff => {
+            let other = command
+                .other
+                .as_ref()
+                .ok_or("--other is required for flamegraph diff mode")?;
+            let other_svg = std::fs::read_to_string(other)?;
+            let other_entries = parse_flamegraph_entries(&other_svg);
+            let deltas = diff_flamegraphs(&entries, &other_entries, command.min_percent);
+            render_flamegraph_deltas(&deltas, command.json)
+        }
+    }
+}
+
+fn render_flamegraph_entries(
+    entries: &[FlamegraphEntry],
+    json: bool,
+) -> backends::BackendResult<String> {
+    if json {
+        Ok(format!("{}\n", serde_json::to_string_pretty(entries)?))
+    } else {
+        let mut output = String::new();
+        for entry in entries {
+            use std::fmt::Write as _;
+            writeln!(
+                output,
+                "{:>6.2}% {:>10}  {}",
+                entry.percent, entry.samples, entry.name
+            )?;
+        }
+        Ok(output)
+    }
+}
+
+fn render_flamegraph_categories(
+    categories: &[FlamegraphCategory],
+    json: bool,
+) -> backends::BackendResult<String> {
+    if json {
+        Ok(format!("{}\n", serde_json::to_string_pretty(categories)?))
+    } else {
+        let mut output = String::new();
+        for category in categories {
+            use std::fmt::Write as _;
+            writeln!(output, "{:>6.2}%  {}", category.percent, category.name)?;
+        }
+        Ok(output)
+    }
+}
+
+fn render_flamegraph_deltas(
+    deltas: &[FlamegraphDelta],
+    json: bool,
+) -> backends::BackendResult<String> {
+    if json {
+        Ok(format!("{}\n", serde_json::to_string_pretty(deltas)?))
+    } else {
+        let mut output = String::new();
+        for delta in deltas {
+            use std::fmt::Write as _;
+            writeln!(
+                output,
+                "{:>7.2}% {:>7.2}% {:+7.2}% {:>10} {:>10}  {}",
+                delta.before_percent,
+                delta.after_percent,
+                delta.delta_percent,
+                delta.before_samples,
+                delta.after_samples,
+                delta.name
+            )?;
+        }
+        Ok(output)
     }
 }
 
