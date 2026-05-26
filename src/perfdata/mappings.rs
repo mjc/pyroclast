@@ -142,6 +142,12 @@ impl Mapping {
     }
 
     fn is_known_non_executable(&self) -> bool {
-        self.prot.is_some_and(|prot| prot & PROT_EXEC == 0)
+        self.prot.is_some_and(|prot| prot & PROT_EXEC == 0) || is_perf_data_path(&self.path)
     }
+}
+
+fn is_perf_data_path(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .is_some_and(|file_name| file_name == "perf.data" || file_name.starts_with("perf.data."))
 }
