@@ -68,6 +68,7 @@ pub struct SampleLayout {
     pub branch_sample_type: u64,
     pub sample_regs_user: u64,
     pub sample_regs_intr: u64,
+    pub sample_id_all: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -83,6 +84,7 @@ pub struct SampleRecord {
 pub struct SampleCallchain<'a> {
     pub pid: Option<u32>,
     pub tid: Option<u32>,
+    pub time: Option<u64>,
     pub period: Option<u64>,
     pub frames: SampleCallchainFrames<'a>,
     pub user_regs: Option<SampleUserRegs>,
@@ -229,6 +231,7 @@ pub fn parse_sample_record_callchain(
     let mut cursor = SampleCursor::new(payload);
     let mut pid = None;
     let mut tid = None;
+    let mut time = None;
     let mut period = None;
 
     if layout.has(PERF_SAMPLE_IDENTIFIER) {
@@ -242,7 +245,7 @@ pub fn parse_sample_record_callchain(
         tid = Some(cursor.read_u32()?);
     }
     if layout.has(PERF_SAMPLE_TIME) {
-        cursor.skip_u64()?;
+        time = Some(cursor.read_u64()?);
     }
     if layout.has(PERF_SAMPLE_ADDR) {
         cursor.skip_u64()?;
@@ -292,6 +295,7 @@ pub fn parse_sample_record_callchain(
     Ok(Some(SampleCallchain {
         pid,
         tid,
+        time,
         period,
         frames: SampleCallchainFrames { payload: frames },
         user_regs,

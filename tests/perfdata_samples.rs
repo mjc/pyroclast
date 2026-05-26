@@ -41,6 +41,7 @@ fn layout(sample_type: u64) -> SampleLayout {
         branch_sample_type: 0,
         sample_regs_user: 0,
         sample_regs_intr: 0,
+        sample_id_all: false,
     }
 }
 

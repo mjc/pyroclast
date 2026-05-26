@@ -24,6 +24,7 @@ fn parses_sample_type_from_file_attr_section() {
             branch_sample_type: 0,
             sample_regs_user: 0,
             sample_regs_intr: 0,
+            sample_id_all: false,
             ids_offset: 512,
             ids_size: 24,
         }]
@@ -100,6 +101,7 @@ fn parses_file_attr_id_lists() {
         branch_sample_type: 0,
         sample_regs_user: 0,
         sample_regs_intr: 0,
+        sample_id_all: false,
         ids_offset: 200,
         ids_size: 16,
     };

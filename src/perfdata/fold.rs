@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::folded::render_folded_stack;
 use crate::perfdata::attrs::{PerfFileAttr, parse_file_attr_ids, parse_file_attrs};
+use crate::perfdata::endian::read_u64;
 use crate::perfdata::header::parse_header;
 use crate::perfdata::mappings::{
     FileIdentity, MmapTable, ResolvedMapping, file_matches_recorded_identity,
@@ -11,9 +12,9 @@ use crate::perfdata::mappings::{
 use crate::perfdata::raw_stack::{CollapsedRawStack, RawStackAccumulator};
 use crate::perfdata::records::{Mmap2Record, ParsedRecord, PerfRecord, iter_records, parse_record};
 use crate::perfdata::samples::{
-    PERF_SAMPLE_ADDR, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_TID,
-    PERF_SAMPLE_TIME, SampleLayout, is_kernel_space_frame, is_perf_context_marker,
-    is_perf_user_context_marker, parse_sample_record_callchain,
+    PERF_SAMPLE_ADDR, PERF_SAMPLE_CPU, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP,
+    PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME, SampleLayout, is_kernel_space_frame,
+    is_perf_context_marker, is_perf_user_context_marker, parse_sample_record_callchain,
 };
 use crate::perfdata::unwind::{FramehopUnwinder, PerfX86_64Regs, unwind_x86_64_stack};
 use crate::symbols::{SymbolFrameCache, SymbolRequest, SymbolResolver};
@@ -50,6 +51,12 @@ struct PerfFoldData {
 }
 
 type FoldSample = (Option<u32>, Option<u32>, u64, Vec<FoldFrame>);
+
+struct TimedRecord<'a> {
+    index: usize,
+    time: Option<u64>,
+    record: PerfRecord<'a>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum FoldFrame {
@@ -283,7 +290,7 @@ fn parse_record_with_context(record: PerfRecord<'_>) -> Result<ParsedRecord, Str
 fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData, String> {
     let header = parse_header(bytes)?;
     let sample_layouts = sample_layouts(bytes, header)?;
-    let records = iter_records(bytes, header)?;
+    let mut records = timed_records(bytes, header, &sample_layouts)?;
     let mut process_comms = BTreeMap::new();
     let mut exec_process_comms = BTreeMap::new();
     let mut thread_comms = BTreeMap::new();
@@ -293,7 +300,9 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
     let mut raw_stacks = RawStackAccumulator::<FoldFrame>::new();
     let mut callchain = Vec::new();
 
-    for record in records {
+    records.sort_by_key(|record| (record.time.unwrap_or(0), record.index));
+    for timed_record in records {
+        let record = timed_record.record;
         let parsed_record = parse_record_with_context(record)?;
         let record_result: Result<(), String> = match parsed_record {
             ParsedRecord::Comm(record) => {
@@ -371,6 +380,92 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
         mmap_table,
         raw_stacks: raw_stacks.into_collapsed(),
     })
+}
+
+fn timed_records<'a>(
+    bytes: &'a [u8],
+    header: crate::perfdata::header::PerfHeader,
+    sample_layouts: &SampleLayouts,
+) -> Result<Vec<TimedRecord<'a>>, String> {
+    iter_records(bytes, header)?
+        .into_iter()
+        .enumerate()
+        .map(|(index, record)| {
+            let time = record_time(record, sample_layouts)?;
+            Ok(TimedRecord {
+                index,
+                time,
+                record,
+            })
+        })
+        .collect()
+}
+
+fn record_time(
+    record: PerfRecord<'_>,
+    sample_layouts: &SampleLayouts,
+) -> Result<Option<u64>, String> {
+    if record.header.record_type == crate::perfdata::records::PERF_RECORD_SAMPLE {
+        return sample_layouts
+            .layout_for_payload(record.payload)?
+            .map_or(Ok(None), |layout| {
+                sample_payload_time(record.payload, layout)
+            });
+    }
+
+    sample_layouts
+        .fallback
+        .filter(|layout| layout.sample_id_all)
+        .map_or(Ok(None), |layout| {
+            sample_id_payload_time(record.payload, layout)
+        })
+}
+
+fn sample_payload_time(payload: &[u8], layout: SampleLayout) -> Result<Option<u64>, String> {
+    if layout.sample_type & PERF_SAMPLE_TIME == 0 {
+        return Ok(None);
+    }
+    let mut offset = 0usize;
+    if layout.sample_type & PERF_SAMPLE_IDENTIFIER != 0 {
+        offset += 8;
+    }
+    if layout.sample_type & PERF_SAMPLE_IP != 0 {
+        offset += 8;
+    }
+    if layout.sample_type & PERF_SAMPLE_TID != 0 {
+        offset += 8;
+    }
+    read_u64(payload, offset).map(Some)
+}
+
+fn sample_id_payload_time(payload: &[u8], layout: SampleLayout) -> Result<Option<u64>, String> {
+    if layout.sample_type & PERF_SAMPLE_TIME == 0 {
+        return Ok(None);
+    }
+    let sample_id_size = sample_id_size(layout);
+    if payload.len() < sample_id_size {
+        return Ok(None);
+    }
+    let mut offset = payload.len() - sample_id_size;
+    if layout.sample_type & PERF_SAMPLE_TID != 0 {
+        offset += 8;
+    }
+    read_u64(payload, offset).map(Some)
+}
+
+fn sample_id_size(layout: SampleLayout) -> usize {
+    [
+        PERF_SAMPLE_TID,
+        PERF_SAMPLE_TIME,
+        PERF_SAMPLE_ID,
+        PERF_SAMPLE_STREAM_ID,
+        PERF_SAMPLE_CPU,
+        PERF_SAMPLE_IDENTIFIER,
+    ]
+    .into_iter()
+    .filter(|flag| layout.sample_type & flag != 0)
+    .count()
+        * 8
 }
 
 fn update_comm_tables(
@@ -800,6 +895,7 @@ fn layout_from_attr(attr: &PerfFileAttr) -> SampleLayout {
         branch_sample_type: attr.branch_sample_type,
         sample_regs_user: attr.sample_regs_user,
         sample_regs_intr: attr.sample_regs_intr,
+        sample_id_all: attr.sample_id_all,
     }
 }
 

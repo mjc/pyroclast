@@ -9,6 +9,7 @@ use pyroclast::perfdata::records::PERF_RECORD_MISC_COMM_EXEC;
 use pyroclast::perfdata::samples::{
     PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP,
     PERF_SAMPLE_PERIOD, PERF_SAMPLE_REGS_USER, PERF_SAMPLE_STACK_USER, PERF_SAMPLE_TID,
+    PERF_SAMPLE_TIME,
 };
 use pyroclast::symbols::{SymbolRequest, SymbolResolver};
 
@@ -666,6 +667,29 @@ fn exec_comm_replaces_stale_thread_comm_like_perf_script() {
 }
 
 #[test]
+fn applies_comm_records_by_perf_timestamp_like_perf_script() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_flags(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CALLCHAIN,
+            1 << 18,
+        )],
+        [
+            record_bytes(3, &comm_payload(11, 12, "perf-exec")),
+            record_bytes(9, &sample_payload_with_time(0x1000, 11, 12, 30, [0x2000])),
+            record_bytes_with_misc(
+                3,
+                PERF_RECORD_MISC_COMM_EXEC,
+                &comm_payload_with_sample_id_time(11, 11, "pyroclast", 20),
+            ),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, "pyroclast;0x2000 1\n");
+}
+
+#[test]
 fn normalizes_comm_spaces_like_inferno() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
@@ -1256,6 +1280,12 @@ fn file_attr_bytes(sample_type: u64, ids_offset: u64, ids_size: u64) -> [u8; 144
     bytes
 }
 
+fn file_attr_bytes_with_flags(sample_type: u64, flags: u64) -> [u8; 144] {
+    let mut bytes = file_attr_bytes(sample_type, 0, 0);
+    put_u64(&mut bytes, 40, flags);
+    bytes
+}
+
 fn file_attr_bytes_with_regs(sample_type: u64, sample_regs_user: u64) -> [u8; 144] {
     let mut bytes = file_attr_bytes(sample_type, 0, 0);
     put_u64(&mut bytes, 80, sample_regs_user);
@@ -1293,6 +1323,25 @@ fn sample_payload<const N: usize>(ip: u64, pid: u32, tid: u32, callchain: [u64; 
     payload.extend(ip.to_le_bytes());
     payload.extend(pid.to_le_bytes());
     payload.extend(tid.to_le_bytes());
+    payload.extend((callchain.len() as u64).to_le_bytes());
+    for frame in callchain {
+        payload.extend(frame.to_le_bytes());
+    }
+    payload
+}
+
+fn sample_payload_with_time<const N: usize>(
+    ip: u64,
+    pid: u32,
+    tid: u32,
+    time: u64,
+    callchain: [u64; N],
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(ip.to_le_bytes());
+    payload.extend(pid.to_le_bytes());
+    payload.extend(tid.to_le_bytes());
+    payload.extend(time.to_le_bytes());
     payload.extend((callchain.len() as u64).to_le_bytes());
     for frame in callchain {
         payload.extend(frame.to_le_bytes());
@@ -1388,6 +1437,14 @@ fn comm_payload(pid: u32, tid: u32, comm: &str) -> Vec<u8> {
     payload.extend(tid.to_le_bytes());
     payload.extend(comm.as_bytes());
     payload.push(0);
+    payload
+}
+
+fn comm_payload_with_sample_id_time(pid: u32, tid: u32, comm: &str, time: u64) -> Vec<u8> {
+    let mut payload = comm_payload(pid, tid, comm);
+    payload.extend(pid.to_le_bytes());
+    payload.extend(tid.to_le_bytes());
+    payload.extend(time.to_le_bytes());
     payload
 }
 
