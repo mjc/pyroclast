@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
@@ -656,7 +657,7 @@ impl SymbolResolver for RustAddr2lineResolver {
                 let request = &requests[index];
                 let symbol = loader
                     .find_symbol(request.relative_address)
-                    .map(ToString::to_string)
+                    .map(demangle_addr2line_name)
                     .or_else(|| rust_addr2line_frame_name(&loader, request.relative_address));
                 resolved_by_request.insert(request.clone(), symbol);
             }
@@ -674,11 +675,15 @@ impl SymbolResolver for RustAddr2lineResolver {
     }
 }
 
+fn demangle_addr2line_name(name: &str) -> String {
+    addr2line::demangle_auto(Cow::Borrowed(name), None).into_owned()
+}
+
 fn rust_addr2line_frame_name(loader: &addr2line::Loader, address: u64) -> Option<String> {
     let mut frames = loader.find_frames(address).ok()?;
     while let Ok(Some(frame)) = frames.next() {
         if let Some(function) = frame.function
-            && let Ok(name) = function.raw_name()
+            && let Ok(name) = function.demangle()
         {
             return Some(name.into_owned());
         }

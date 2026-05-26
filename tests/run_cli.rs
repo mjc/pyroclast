@@ -1,3 +1,4 @@
+use object::{Object, ObjectSymbol};
 use pyroclast::perfdata::samples::{
     PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_TID,
 };
@@ -100,6 +101,74 @@ fn fold_command_can_symbolize_mapped_frames() {
     assert_eq!(output.stdout, "app;app::work 1\n");
     assert_eq!(runner.programs(), vec!["addr2line"]);
     assert_eq!(runner.stdins(), vec![Some(b"0x1000\n".to_vec())]);
+}
+
+#[test]
+fn fold_command_can_use_rust_symbolizer_without_addr2line() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let current_exe = std::env::current_exe().expect("current exe");
+    let object_bytes = std::fs::read(&current_exe).expect("current exe bytes");
+    let object = object::File::parse(object_bytes.as_slice()).expect("current exe object");
+    let symbol = object
+        .symbols()
+        .filter(|symbol| symbol.address() != 0)
+        .find(|symbol| {
+            symbol
+                .name()
+                .is_ok_and(|name| name.contains("fold_command_can_use_rust_symbolizer"))
+        })
+        .expect("test symbol");
+    let perfdata = root.path().join("perf.data");
+    std::fs::write(
+        &perfdata,
+        perfdata_with_records_and_attrs(
+            [file_attr_bytes(
+                PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+                0,
+                0,
+            )],
+            [
+                record_bytes(3, &comm_payload(1, 2, "pyroclast-test")),
+                record_bytes(
+                    1,
+                    &mmap_payload(
+                        1,
+                        2,
+                        0,
+                        symbol.address().saturating_add(1),
+                        0,
+                        &current_exe.display().to_string(),
+                    ),
+                ),
+                record_bytes(
+                    9,
+                    &sample_payload(symbol.address(), 1, 2, [symbol.address()]),
+                ),
+            ],
+        ),
+    )
+    .expect("write perfdata");
+    let runner = RecordingRunner::default();
+    let cli = pyroclast::cli::Cli::parse_from([
+        "pyroclast",
+        "fold",
+        "--symbols",
+        "--symbolizer",
+        "rust-addr2line",
+        perfdata.to_str().unwrap(),
+    ]);
+
+    let output = pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("fold command");
+
+    assert!(
+        output.stdout.starts_with("pyroclast-test;")
+            && output
+                .stdout
+                .contains("fold_command_can_use_rust_symbolizer"),
+        "{}",
+        output.stdout
+    );
+    assert!(runner.programs().is_empty());
 }
 
 #[test]
