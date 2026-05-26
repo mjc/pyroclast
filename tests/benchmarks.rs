@@ -209,7 +209,7 @@ fn exports_perf_script_for_old_pipeline_benchmarks() {
         runner.commands(),
         vec![
             CommandSpec::new("perf")
-                .args(["script", "-i"])
+                .args(["script", "--force", "-i"])
                 .arg(perfdata.to_str().expect("perfdata path should be utf8"))
         ]
     );

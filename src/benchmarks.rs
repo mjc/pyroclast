@@ -252,7 +252,7 @@ where
     R: CommandRunner,
 {
     let command = CommandSpec::new("perf")
-        .args(["script", "-i"])
+        .args(["script", "--force", "-i"])
         .arg(perf_data.display().to_string());
     let command_output = runner
         .run(&command)
