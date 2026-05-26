@@ -912,6 +912,36 @@ fn folds_unmapped_kernel_frames_as_unknown_like_inferno() {
 }
 
 #[test]
+fn keeps_kernel_frames_from_mmap2_records_without_exec_prot() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(
+                10,
+                &mmap2_payload(
+                    u32::MAX,
+                    u32::MAX,
+                    0xffff_ffff_8800_0000,
+                    0x2000,
+                    0,
+                    0,
+                    "[kernel.kallsyms]",
+                ),
+            ),
+            record_bytes(9, &sample_payload(0x1000, 11, 12, [0xffff_ffff_8800_0010])),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, "[unknown] 1\n");
+}
+
+#[test]
 fn folds_unresolved_kernel_mappings_as_unknown_like_inferno() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(

@@ -398,7 +398,7 @@ fn add_fold_sample(
             if is_perf_context_marker(address) {
                 return false;
             }
-            if pid.is_some_and(|pid| mmap_table.is_known_non_executable(pid, address)) {
+            if should_drop_known_non_executable_user_frame(pid, address, mmap_table) {
                 return false;
             }
             true
@@ -524,7 +524,7 @@ impl<'a> FoldFrameResolver<'a> {
                 continue;
             }
             let frame = frame.address();
-            if pid.is_some_and(|pid| self.mmap_table.is_known_non_executable(pid, frame)) {
+            if should_drop_known_non_executable_user_frame(pid, frame, self.mmap_table) {
                 continue;
             }
             frames.extend(self.format_frames(pid, frame, symbol_cache.as_deref_mut())?);
@@ -562,6 +562,15 @@ impl<'a> FoldFrameResolver<'a> {
             Ok(vec![format!("0x{frame:x}")])
         }
     }
+}
+
+fn should_drop_known_non_executable_user_frame(
+    pid: Option<u32>,
+    address: u64,
+    mmap_table: &MmapTable,
+) -> bool {
+    !is_kernel_space_frame(address)
+        && pid.is_some_and(|pid| mmap_table.is_known_non_executable(pid, address))
 }
 
 fn symbol_fallback_frame(mapping: &ResolvedMapping) -> String {
