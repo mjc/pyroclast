@@ -49,7 +49,7 @@ struct PerfFoldData {
     raw_stacks: Vec<CollapsedRawStack<FoldFrame>>,
 }
 
-type FoldSample = (Option<u32>, u64, Vec<FoldFrame>);
+type FoldSample = (Option<u32>, Option<u32>, u64, Vec<FoldFrame>);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum FoldFrame {
@@ -284,7 +284,8 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
     let header = parse_header(bytes)?;
     let sample_layouts = sample_layouts(bytes, header)?;
     let records = iter_records(bytes, header)?;
-    let mut comms_by_pid = BTreeMap::new();
+    let mut process_comms = BTreeMap::new();
+    let mut thread_comms = BTreeMap::new();
     let mut mmap_table = MmapTable::default();
     let mut object_unwinder = FramehopUnwinder::new();
     let mut loaded_unwind_mappings = BTreeSet::new();
@@ -295,7 +296,8 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
         let parsed_record = parse_record_with_context(record)?;
         let record_result: Result<(), String> = match parsed_record {
             ParsedRecord::Comm(record) => {
-                comms_by_pid.insert(record.pid, record.comm);
+                process_comms.insert(record.pid, record.comm.clone());
+                thread_comms.insert(record.tid, record.comm);
                 Ok(())
             }
             ParsedRecord::Mmap(record) => {
@@ -320,7 +322,8 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
             .map(|sample| {
                 add_fold_sample(
                     sample,
-                    &comms_by_pid,
+                    &process_comms,
+                    &thread_comms,
                     &mmap_table,
                     &mut raw_stacks,
                     &mut callchain,
@@ -384,13 +387,17 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
 
 fn add_fold_sample(
     sample: Option<FoldSample>,
-    comms_by_pid: &BTreeMap<u32, String>,
+    process_comms: &BTreeMap<u32, String>,
+    thread_comms: &BTreeMap<u32, String>,
     mmap_table: &MmapTable,
     raw_stacks: &mut RawStackAccumulator<FoldFrame>,
     callchain: &mut Vec<FoldFrame>,
 ) {
-    if let Some((pid, count, frames)) = sample {
-        let comm = pid.and_then(|pid| comms_by_pid.get(&pid)).cloned();
+    if let Some((pid, tid, count, frames)) = sample {
+        let comm = tid
+            .and_then(|tid| thread_comms.get(&tid))
+            .or_else(|| pid.and_then(|pid| process_comms.get(&pid)))
+            .cloned();
         callchain.clear();
         callchain.reserve(frames.len());
         callchain.extend(frames.into_iter().rev().filter(|frame| {
@@ -689,7 +696,7 @@ fn parse_sample_for_fold(
                         frames.extend(unwound_frames);
                     }
                 }
-                (sample.pid, count, frames)
+                (sample.pid, sample.tid, count, frames)
             })
         })
     } else {
