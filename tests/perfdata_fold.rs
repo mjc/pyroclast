@@ -101,8 +101,9 @@ fn summarizes_dwarf_user_stack_payloads() {
                 | PERF_SAMPLE_STACK_USER,
             1 << 8,
         )],
-        [record_bytes(
+        [record_bytes_with_misc(
             9,
+            PERF_RECORD_MISC_CPUMODE_KERNEL,
             &sample_payload_with_user_stack(0x1000, 11, 12, [0x2000], 1, [0xaaaa], [1, 2, 3]),
         )],
     );
@@ -110,10 +111,19 @@ fn summarizes_dwarf_user_stack_payloads() {
     let summary = summarize_perfdata(&bytes).expect("summary");
 
     assert_eq!(summary.sample_stacks.len(), 1);
+    assert_eq!(
+        summary.sample_stacks[0].misc,
+        PERF_RECORD_MISC_CPUMODE_KERNEL
+    );
+    assert_eq!(
+        summary.sample_stacks[0].cpumode,
+        PERF_RECORD_MISC_CPUMODE_KERNEL
+    );
     assert!(summary.sample_stacks[0].has_user_stack);
     assert_eq!(summary.sample_stacks[0].user_register_count, 1);
     assert_eq!(summary.sample_stacks[0].user_register_ip, Some(0xaaaa));
     assert_eq!(summary.sample_stacks[0].user_stack_size, 3);
+    assert_eq!(summary.sample_stacks[0].user_stack_dynamic_size, 3);
 }
 
 #[test]

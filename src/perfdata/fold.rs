@@ -41,6 +41,8 @@ pub struct PerfSummary {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PerfSampleStack {
+    pub misc: u16,
+    pub cpumode: u16,
     pub pid: Option<u32>,
     pub tid: Option<u32>,
     pub period: Option<u64>,
@@ -49,6 +51,7 @@ pub struct PerfSampleStack {
     pub user_register_count: usize,
     pub user_register_ip: Option<u64>,
     pub user_stack_size: usize,
+    pub user_stack_dynamic_size: u64,
 }
 
 struct PerfFoldData {
@@ -182,11 +185,13 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
                 Ok(())
             }
             ParsedRecord::Sample(record) => {
-                parse_sample_for_summary(&record.payload, &sample_layouts).map(|sample| {
-                    if let Some(sample) = sample {
-                        summary.sample_stacks.push(sample);
-                    }
-                })
+                parse_sample_for_summary(record.misc, &record.payload, &sample_layouts).map(
+                    |sample| {
+                        if let Some(sample) = sample {
+                            summary.sample_stacks.push(sample);
+                        }
+                    },
+                )
             }
             ParsedRecord::Mmap2(record) => {
                 summary.mmaps.push(record.path.clone());
@@ -906,12 +911,15 @@ fn is_kernel_mapping(mapping: &ResolvedMapping) -> bool {
 }
 
 fn parse_sample_for_summary(
+    sample_misc: u16,
     payload: &[u8],
     sample_layouts: &SampleLayouts,
 ) -> Result<Option<PerfSampleStack>, String> {
     if let Some(layout) = sample_layouts.layout_for_payload(payload)? {
         parse_sample_record_callchain(payload, layout).map(|sample| {
             sample.map(|sample| PerfSampleStack {
+                misc: sample_misc,
+                cpumode: sample_misc & PERF_RECORD_MISC_CPUMODE_MASK,
                 pid: sample.pid,
                 tid: sample.tid,
                 period: sample.period,
@@ -929,6 +937,10 @@ fn parse_sample_for_summary(
                     .user_stack
                     .as_ref()
                     .map_or(0, |stack| stack.bytes.len()),
+                user_stack_dynamic_size: sample
+                    .user_stack
+                    .as_ref()
+                    .map_or(0, |stack| stack.dynamic_size),
             })
         })
     } else {
