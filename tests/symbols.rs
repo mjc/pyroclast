@@ -350,6 +350,12 @@ fn perf_dwarf_function_name_matches_perf_script_inline_names() {
         "insert_recursing<u64, alloc::string::String, alloc::alloc::Global, alloc::collections::btree::map::entry::{impl#8}::insert_entry::{closure_env#0}<u64, alloc::string::String, alloc::alloc::Global>>"
     );
     assert_eq!(
+        perf_dwarf_function_name(
+            "alloc::collections::btree::map::BTreeMap<u64, alloc::string::String, alloc::alloc::Global>::insert"
+        ),
+        "insert<u64, alloc::string::String, alloc::alloc::Global>"
+    );
+    assert_eq!(
         perf_dwarf_function_name("std::vector<int, std::allocator<int>>::push_back"),
         "std::vector<int, std::allocator<int>>::push_back"
     );

@@ -1060,9 +1060,7 @@ pub fn perf_dwarf_function_name(name: &str) -> String {
     if looks_like_cpp_qualified_name(name) {
         return name.to_owned();
     }
-    leaf_after_last_namespace_separator(name)
-        .unwrap_or(name)
-        .to_owned()
+    rust_leaf_with_receiver_generics(name).unwrap_or_else(|| name.to_owned())
 }
 
 fn looks_like_cpp_qualified_name(name: &str) -> bool {
@@ -1071,7 +1069,31 @@ fn looks_like_cpp_qualified_name(name: &str) -> bool {
         || (name.contains("std::vector") && name.contains("::"))
 }
 
-fn leaf_after_last_namespace_separator(name: &str) -> Option<&str> {
+fn rust_leaf_with_receiver_generics(name: &str) -> Option<String> {
+    let separator = last_namespace_separator(name)?;
+    let leaf = name.get(separator + 2..)?;
+    if leaf.contains('<') {
+        return Some(leaf.to_owned());
+    }
+
+    let receiver = name.get(..separator)?;
+    if receiver.starts_with('<') {
+        return Some(leaf.to_owned());
+    }
+    if let Some(generic_arguments) = trailing_generic_arguments(receiver)
+        && perf_script_receiver_generics_are_specific(generic_arguments)
+    {
+        Some(format!("{leaf}{generic_arguments}"))
+    } else {
+        Some(leaf.to_owned())
+    }
+}
+
+fn perf_script_receiver_generics_are_specific(generic_arguments: &str) -> bool {
+    generic_arguments.contains(',') || generic_arguments.contains("::")
+}
+
+fn last_namespace_separator(name: &str) -> Option<usize> {
     let mut angle_depth = 0_u32;
     let mut last_namespace_separator = None;
     for (index, character) in name.char_indices() {
@@ -1084,7 +1106,26 @@ fn leaf_after_last_namespace_separator(name: &str) -> Option<&str> {
             _ => {}
         }
     }
-    last_namespace_separator.and_then(|index| name.get(index + 2..))
+    last_namespace_separator
+}
+
+fn trailing_generic_arguments(name: &str) -> Option<&str> {
+    let mut angle_depth = 0_u32;
+    let mut generic_start = None;
+    for (index, character) in name.char_indices().rev() {
+        match character {
+            '>' => angle_depth = angle_depth.saturating_add(1),
+            '<' => {
+                angle_depth = angle_depth.checked_sub(1)?;
+                if angle_depth == 0 {
+                    generic_start = Some(index);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    name.get(generic_start?..)
 }
 
 #[must_use]
