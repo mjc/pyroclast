@@ -867,7 +867,7 @@ fn should_drop_perf_data_user_unwind_frame(
 }
 
 fn should_drop_user_unwind_mapping_path(path: &str) -> bool {
-    is_perf_data_mapping_path(path) || matches!(path, "[anon]" | "[stack]" | "[heap]")
+    is_perf_data_mapping_path(path) || matches!(path, "//anon" | "[anon]" | "[stack]" | "[heap]")
 }
 
 fn is_perf_data_mapping_path(path: &str) -> bool {
