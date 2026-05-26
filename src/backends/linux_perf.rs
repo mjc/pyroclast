@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::artifacts::ArtifactLayout;
 use crate::backends::{BackendResult, ProfileRequest, ProfileResult, ProfilerBackend};
-use crate::cli::{PerfEvent, SymbolizerKind};
+use crate::cli::PerfEvent;
 use crate::flamegraph::{FlamegraphRenderer, FlamegraphRequest, InfernoFlamegraphRenderer};
 use crate::manifest::{BackendName, RunManifest};
 use crate::perfdata::fold::{
@@ -12,7 +12,7 @@ use crate::perfdata::fold::{
 use crate::platform::{NativeThreadLister, ThreadLister};
 use crate::process::{CommandRunner, CommandSpec};
 use crate::summary::threads::{render_folded_stack_summary_text, summarize_folded_stacks};
-use crate::symbols::perf_symbol_resolver_for_current_home_with_symbolizer;
+use crate::symbols::{SymbolizerKind, perf_symbol_resolver_for_current_home_with_symbolizer};
 use crate::tools::{ToolSpec, collect_tool_versions};
 
 #[derive(Clone, Debug, Eq, PartialEq)]

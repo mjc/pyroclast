@@ -24,8 +24,8 @@ use backends::macos_xctrace::MacosXctraceBackend;
 use backends::offcpu::OffcpuBackend;
 use backends::strace::StraceBackend;
 use backends::{ProfileRequest, ProfilerBackend};
+use cli::ProfileKind;
 use cli::{Cli, CliCommand};
-use cli::{ProfileKind, SymbolizerKind};
 use flamegraph::{FlamegraphRenderer, FlamegraphRequest, InfernoFlamegraphRenderer};
 pub use output::{CliOutput, write_cli_output};
 use perfdata::fold::{
@@ -34,7 +34,7 @@ use perfdata::fold::{
 };
 use process::{CommandRunner, RealCommandRunner};
 use summary::threads::{render_folded_stack_summary_text, summarize_folded_stacks};
-use symbols::perf_symbol_resolver_for_current_home_with_symbolizer;
+use symbols::{SymbolizerKind, perf_symbol_resolver_for_current_home_with_symbolizer};
 
 /// Parses command-line arguments and runs the requested Pyroclast command.
 ///

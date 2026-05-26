@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
-use crate::cli::SymbolizerKind;
+use clap::ValueEnum;
+use serde::Serialize;
+
 use crate::perfdata::build_id::kernel_build_id_from_perfdata;
 use crate::process::{CommandRunner, CommandSpec};
 
@@ -41,6 +43,13 @@ pub struct Addr2lineResolver<'a, R> {
 pub enum SelectedObjectResolver<'a, R> {
     Addr2line(Addr2lineResolver<'a, R>),
     RustAddr2line(RustAddr2lineResolver),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum SymbolizerKind {
+    Addr2line,
+    RustAddr2line,
 }
 
 #[derive(Clone, Copy, Debug, Default)]

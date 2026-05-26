@@ -8,8 +8,9 @@ pub mod strace;
 use std::path::PathBuf;
 
 use crate::artifacts::ArtifactLayout;
-use crate::cli::{PerfCallGraph, PerfEvent, ProfileKind, SymbolizerKind};
+use crate::cli::{PerfCallGraph, PerfEvent, ProfileKind};
 use crate::manifest::RunManifest;
+use crate::symbols::SymbolizerKind;
 
 pub type BackendResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 

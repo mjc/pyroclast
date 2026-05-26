@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
+pub use crate::symbols::SymbolizerKind;
+
 #[derive(Debug, Parser)]
 #[command(name = "pyroclast")]
 #[command(about = "Rust-only profiling orchestration and analysis")]
@@ -62,13 +64,6 @@ pub enum PerfEvent {
     CpuClock,
     TaskClock,
     Cycles,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-pub enum SymbolizerKind {
-    Addr2line,
-    RustAddr2line,
 }
 
 impl std::fmt::Display for PerfEvent {
