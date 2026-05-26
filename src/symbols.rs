@@ -128,6 +128,20 @@ where
         .with_system_kallsyms()
 }
 
+#[must_use]
+pub fn perf_symbol_resolver_for_perfdata_file_with_object<O>(
+    object_resolver: O,
+    perfdata: &Path,
+    home: &Path,
+) -> PerfSymbolResolver<O>
+where
+    O: SymbolResolver,
+{
+    PerfSymbolResolver::from_object_resolver(object_resolver)
+        .with_perfdata_file_kernel_cache(perfdata, &perf_debug_dir(home))
+        .with_system_kallsyms()
+}
+
 fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut deduped = Vec::new();
     for path in paths {
@@ -158,10 +172,25 @@ pub fn perf_symbol_resolver_for_current_home<'a, R>(
 where
     R: CommandRunner,
 {
+    perf_symbol_resolver_for_current_home_with_object(Addr2lineResolver::new(runner), perfdata)
+}
+
+#[must_use]
+pub fn perf_symbol_resolver_for_current_home_with_object<O>(
+    object_resolver: O,
+    perfdata: &Path,
+) -> PerfSymbolResolver<O>
+where
+    O: SymbolResolver,
+{
     match std::env::var_os("HOME") {
-        Some(home) => perf_symbol_resolver_for_perfdata_file(runner, perfdata, Path::new(&home))
-            .with_system_map_candidates(current_linux_system_map_candidates()),
-        None => PerfSymbolResolver::new(runner).with_system_kallsyms(),
+        Some(home) => perf_symbol_resolver_for_perfdata_file_with_object(
+            object_resolver,
+            perfdata,
+            Path::new(&home),
+        )
+        .with_system_map_candidates(current_linux_system_map_candidates()),
+        None => PerfSymbolResolver::from_object_resolver(object_resolver).with_system_kallsyms(),
     }
 }
 

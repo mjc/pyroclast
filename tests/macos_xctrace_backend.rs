@@ -2,7 +2,7 @@ use std::sync::Mutex;
 
 use pyroclast::backends::macos_xctrace::MacosXctraceBackend;
 use pyroclast::backends::{ProfileRequest, ProfilerBackend};
-use pyroclast::cli::{PerfCallGraph, PerfEvent, ProfileKind};
+use pyroclast::cli::{PerfCallGraph, PerfEvent, ProfileKind, SymbolizerKind};
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
 
 #[test]
@@ -17,6 +17,7 @@ fn macos_xctrace_backend_writes_cpu_summary_artifacts() {
         name: None,
         json: false,
         symbols: false,
+        symbolizer: SymbolizerKind::Addr2line,
         frequency: 997,
         event: PerfEvent::CpuClock,
         call_graph: PerfCallGraph::Fp,

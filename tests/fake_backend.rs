@@ -1,6 +1,6 @@
 use pyroclast::backends::fake::FakeBackend;
 use pyroclast::backends::{ProfileRequest, ProfilerBackend};
-use pyroclast::cli::{PerfCallGraph, PerfEvent, ProfileKind};
+use pyroclast::cli::{PerfCallGraph, PerfEvent, ProfileKind, SymbolizerKind};
 
 #[test]
 fn fake_backend_writes_required_artifacts() {
@@ -12,6 +12,7 @@ fn fake_backend_writes_required_artifacts() {
         name: Some("fake".to_string()),
         json: false,
         symbols: false,
+        symbolizer: SymbolizerKind::Addr2line,
         frequency: 997,
         event: PerfEvent::CpuClock,
         call_graph: PerfCallGraph::Fp,

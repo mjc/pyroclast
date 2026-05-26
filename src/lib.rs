@@ -24,8 +24,8 @@ use backends::macos_xctrace::MacosXctraceBackend;
 use backends::offcpu::OffcpuBackend;
 use backends::strace::StraceBackend;
 use backends::{ProfileRequest, ProfilerBackend};
-use cli::ProfileKind;
 use cli::{Cli, CliCommand};
+use cli::{ProfileKind, SymbolizerKind};
 use flamegraph::{FlamegraphRenderer, FlamegraphRequest, InfernoFlamegraphRenderer};
 pub use output::{CliOutput, write_cli_output};
 use perfdata::fold::{
@@ -34,7 +34,10 @@ use perfdata::fold::{
 };
 use process::{CommandRunner, RealCommandRunner};
 use summary::threads::{render_folded_stack_summary_text, summarize_folded_stacks};
-use symbols::perf_symbol_resolver_for_current_home;
+use symbols::{
+    RustAddr2lineResolver, perf_symbol_resolver_for_current_home,
+    perf_symbol_resolver_for_current_home_with_object,
+};
 
 /// Parses command-line arguments and runs the requested Pyroclast command.
 ///
@@ -125,6 +128,7 @@ where
             name: invocation.name,
             json: invocation.json,
             symbols: invocation.symbols,
+            symbolizer: invocation.symbolizer,
             frequency: invocation.frequency,
             event: invocation.event,
             call_graph: invocation.call_graph,
@@ -161,7 +165,13 @@ where
             let options = FoldOptions {
                 count_periods: command.count_periods,
             };
-            let stdout = fold_perfdata_for_cli(&command.input, options, command.symbols, runner)?;
+            let stdout = fold_perfdata_for_cli(
+                &command.input,
+                options,
+                command.symbols,
+                command.symbolizer,
+                runner,
+            )?;
             Ok(CliOutput {
                 stdout,
                 stderr: String::new(),
@@ -177,6 +187,7 @@ where
                     count_periods: true,
                 },
                 command.symbols,
+                command.symbolizer,
                 runner,
             )?;
             let render = flamegraph_renderer.render(&FlamegraphRequest {
@@ -244,18 +255,34 @@ fn fold_perfdata_for_cli<R>(
     path: &std::path::Path,
     options: FoldOptions,
     symbols: bool,
+    symbolizer: SymbolizerKind,
     runner: &R,
 ) -> backends::BackendResult<String>
 where
     R: CommandRunner,
 {
     if symbols {
-        let symbol_resolver = perf_symbol_resolver_for_current_home(runner, path);
-        Ok(fold_perfdata_file_with_symbols(
-            path,
-            options,
-            &symbol_resolver,
-        )?)
+        match symbolizer {
+            SymbolizerKind::Addr2line => {
+                let symbol_resolver = perf_symbol_resolver_for_current_home(runner, path);
+                Ok(fold_perfdata_file_with_symbols(
+                    path,
+                    options,
+                    &symbol_resolver,
+                )?)
+            }
+            SymbolizerKind::RustAddr2line => {
+                let symbol_resolver = perf_symbol_resolver_for_current_home_with_object(
+                    RustAddr2lineResolver::new(),
+                    path,
+                );
+                Ok(fold_perfdata_file_with_symbols(
+                    path,
+                    options,
+                    &symbol_resolver,
+                )?)
+            }
+        }
     } else if options == FoldOptions::default() {
         Ok(fold_perfdata_file(path)?)
     } else {

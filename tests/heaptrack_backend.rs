@@ -2,7 +2,7 @@ use std::sync::Mutex;
 
 use pyroclast::backends::heaptrack::HeaptrackBackend;
 use pyroclast::backends::{ProfileRequest, ProfilerBackend};
-use pyroclast::cli::{PerfCallGraph, PerfEvent, ProfileKind};
+use pyroclast::cli::{PerfCallGraph, PerfEvent, ProfileKind, SymbolizerKind};
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
 
 #[test]
@@ -17,6 +17,7 @@ fn heaptrack_backend_writes_heap_summary_artifacts() {
         name: None,
         json: false,
         symbols: false,
+        symbolizer: SymbolizerKind::Addr2line,
         frequency: 997,
         event: PerfEvent::CpuClock,
         call_graph: PerfCallGraph::Fp,
@@ -66,6 +67,7 @@ fn heaptrack_backend_uses_suffixed_raw_output_when_heaptrack_creates_one() {
         name: None,
         json: false,
         symbols: false,
+        symbolizer: SymbolizerKind::Addr2line,
         frequency: 997,
         event: PerfEvent::CpuClock,
         call_graph: PerfCallGraph::Fp,

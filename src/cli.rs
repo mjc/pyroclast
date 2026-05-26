@@ -64,6 +64,13 @@ pub enum PerfEvent {
     Cycles,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum SymbolizerKind {
+    Addr2line,
+    RustAddr2line,
+}
+
 impl std::fmt::Display for PerfEvent {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -97,6 +104,9 @@ pub struct RunArgs {
     #[arg(long)]
     pub symbols: bool,
 
+    #[arg(long, value_enum, default_value_t = SymbolizerKind::Addr2line)]
+    pub symbolizer: SymbolizerKind,
+
     #[arg(long, default_value_t = 997)]
     pub frequency: u32,
 
@@ -129,6 +139,7 @@ pub struct ProfileInvocation {
     pub name: Option<String>,
     pub json: bool,
     pub symbols: bool,
+    pub symbolizer: SymbolizerKind,
     pub frequency: u32,
     pub event: PerfEvent,
     pub call_graph: PerfCallGraph,
@@ -154,6 +165,7 @@ impl CliCommand {
                 name: args.name.clone(),
                 json: args.json,
                 symbols: args.symbols,
+                symbolizer: args.symbolizer,
                 frequency: args.frequency,
                 event: args.event,
                 call_graph: args.call_graph,
@@ -176,6 +188,7 @@ impl ProfileInvocation {
             name: args.name.clone(),
             json: args.json,
             symbols: args.symbols,
+            symbolizer: args.symbolizer,
             frequency: args.frequency,
             event: args.event,
             call_graph: args.call_graph,
@@ -204,6 +217,9 @@ pub struct ProfileArgs {
 
     #[arg(long)]
     pub symbols: bool,
+
+    #[arg(long, value_enum, default_value_t = SymbolizerKind::Addr2line)]
+    pub symbolizer: SymbolizerKind,
 
     #[arg(long, default_value_t = 997)]
     pub frequency: u32,
@@ -238,6 +254,9 @@ pub struct FoldArgs {
     #[arg(long)]
     pub symbols: bool,
 
+    #[arg(long, value_enum, default_value_t = SymbolizerKind::Addr2line)]
+    pub symbolizer: SymbolizerKind,
+
     pub input: PathBuf,
 }
 
@@ -258,6 +277,9 @@ pub struct FlamegraphArgs {
 
     #[arg(long)]
     pub symbols: bool,
+
+    #[arg(long, value_enum, default_value_t = SymbolizerKind::Addr2line)]
+    pub symbolizer: SymbolizerKind,
 
     #[arg(long, default_value = "CPU profile")]
     pub title: String,

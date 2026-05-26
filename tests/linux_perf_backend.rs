@@ -2,7 +2,7 @@ use std::sync::Mutex;
 
 use pyroclast::backends::linux_perf::LinuxPerfBackend;
 use pyroclast::backends::{BackendResult, ProfileRequest, ProfilerBackend};
-use pyroclast::cli::{PerfCallGraph, PerfEvent, ProfileKind};
+use pyroclast::cli::{PerfCallGraph, PerfEvent, ProfileKind, SymbolizerKind};
 use pyroclast::flamegraph::{FlamegraphRenderResult, FlamegraphRenderer, FlamegraphRequest};
 use pyroclast::manifest::BackendName;
 use pyroclast::perfdata::samples::{PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_TID};
@@ -21,6 +21,7 @@ fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
         name: None,
         json: false,
         symbols: false,
+        symbolizer: SymbolizerKind::Addr2line,
         frequency: 199,
         event: PerfEvent::CpuClock,
         call_graph: PerfCallGraph::Dwarf,
@@ -91,6 +92,7 @@ fn linux_perf_backend_can_symbolize_folded_stacks() {
         name: None,
         json: false,
         symbols: true,
+        symbolizer: SymbolizerKind::Addr2line,
         frequency: 997,
         event: PerfEvent::CpuClock,
         call_graph: PerfCallGraph::Fp,
@@ -132,6 +134,7 @@ fn linux_perf_backend_accepts_pluggable_flamegraph_renderer() {
         name: None,
         json: false,
         symbols: false,
+        symbolizer: SymbolizerKind::Addr2line,
         frequency: 997,
         event: PerfEvent::CpuClock,
         call_graph: PerfCallGraph::Fp,
@@ -173,6 +176,7 @@ fn linux_perf_backend_writes_tool_errors_when_renderer_fails() {
         name: None,
         json: false,
         symbols: false,
+        symbolizer: SymbolizerKind::Addr2line,
         frequency: 997,
         event: PerfEvent::CpuClock,
         call_graph: PerfCallGraph::Fp,
@@ -207,6 +211,7 @@ fn linux_perf_backend_stops_when_perf_record_fails() {
         name: None,
         json: false,
         symbols: false,
+        symbolizer: SymbolizerKind::Addr2line,
         frequency: 997,
         event: PerfEvent::CpuClock,
         call_graph: PerfCallGraph::Fp,
@@ -242,6 +247,7 @@ fn linux_perf_backend_records_attached_process() {
         name: None,
         json: false,
         symbols: false,
+        symbolizer: SymbolizerKind::Addr2line,
         frequency: 199,
         event: PerfEvent::CpuClock,
         call_graph: PerfCallGraph::Fp,
@@ -295,6 +301,7 @@ fn linux_perf_backend_records_attached_threads() {
         name: None,
         json: false,
         symbols: false,
+        symbolizer: SymbolizerKind::Addr2line,
         frequency: 997,
         event: PerfEvent::CpuClock,
         call_graph: PerfCallGraph::Fp,
@@ -331,6 +338,7 @@ fn linux_perf_backend_records_threads_discovered_from_pid() {
         name: None,
         json: false,
         symbols: false,
+        symbolizer: SymbolizerKind::Addr2line,
         frequency: 997,
         event: PerfEvent::CpuClock,
         call_graph: PerfCallGraph::Fp,
@@ -363,6 +371,7 @@ fn linux_perf_backend_reports_missing_threads_of_pid() {
         name: None,
         json: false,
         symbols: false,
+        symbolizer: SymbolizerKind::Addr2line,
         frequency: 997,
         event: PerfEvent::CpuClock,
         call_graph: PerfCallGraph::Fp,

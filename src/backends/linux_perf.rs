@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::artifacts::ArtifactLayout;
 use crate::backends::{BackendResult, ProfileRequest, ProfileResult, ProfilerBackend};
-use crate::cli::PerfEvent;
+use crate::cli::{PerfEvent, SymbolizerKind};
 use crate::flamegraph::{FlamegraphRenderer, FlamegraphRequest, InfernoFlamegraphRenderer};
 use crate::manifest::{BackendName, RunManifest};
 use crate::perfdata::fold::{
@@ -12,7 +12,10 @@ use crate::perfdata::fold::{
 use crate::platform::{NativeThreadLister, ThreadLister};
 use crate::process::{CommandRunner, CommandSpec};
 use crate::summary::threads::{render_folded_stack_summary_text, summarize_folded_stacks};
-use crate::symbols::perf_symbol_resolver_for_current_home;
+use crate::symbols::{
+    RustAddr2lineResolver, perf_symbol_resolver_for_current_home,
+    perf_symbol_resolver_for_current_home_with_object,
+};
 use crate::tools::{ToolSpec, collect_tool_versions};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -137,7 +140,8 @@ where
             std::fs::write(layout.tool_errors_log(), format!("{error}\n"))?;
             return Err(error.into());
         }
-        let folded_stacks = fold_linux_perfdata(&perf_data, request.symbols, self.runner)?;
+        let folded_stacks =
+            fold_linux_perfdata(&perf_data, request.symbols, request.symbolizer, self.runner)?;
         let folded_summary = summarize_folded_stacks(&folded_stacks);
         std::fs::write(layout.stacks_folded(), &folded_stacks)?;
         let flamegraph_output = match self.flamegraph_renderer.render(&FlamegraphRequest {
@@ -186,7 +190,11 @@ where
             symbols: request.symbols,
             tool_versions: collect_tool_versions(
                 self.runner,
-                &linux_perf_tools(request.symbols, &self.flamegraph_renderer),
+                &linux_perf_tools(
+                    request.symbols,
+                    request.symbolizer,
+                    &self.flamegraph_renderer,
+                ),
             ),
             artifacts: {
                 let mut artifacts = layout.standard_manifest_artifacts();
@@ -278,16 +286,25 @@ impl PerfRecordTarget {
     }
 }
 
-fn linux_perf_tools(symbols: bool, renderer: &impl FlamegraphRenderer) -> Vec<ToolSpec> {
+fn linux_perf_tools(
+    symbols: bool,
+    symbolizer: SymbolizerKind,
+    renderer: &impl FlamegraphRenderer,
+) -> Vec<ToolSpec> {
     let mut tools = vec![ToolSpec::nix_managed("perf")];
     tools.extend(renderer.tool_specs());
-    if symbols {
+    if symbols && symbolizer == SymbolizerKind::Addr2line {
         tools.push(ToolSpec::nix_managed("addr2line"));
     }
     tools
 }
 
-fn fold_linux_perfdata<R>(perf_data: &Path, symbols: bool, runner: &R) -> BackendResult<String>
+fn fold_linux_perfdata<R>(
+    perf_data: &Path,
+    symbols: bool,
+    symbolizer: SymbolizerKind,
+    runner: &R,
+) -> BackendResult<String>
 where
     R: CommandRunner,
 {
@@ -295,12 +312,27 @@ where
         count_periods: true,
     };
     if symbols {
-        let symbol_resolver = perf_symbol_resolver_for_current_home(runner, perf_data);
-        Ok(fold_perfdata_file_with_symbols(
-            perf_data,
-            options,
-            &symbol_resolver,
-        )?)
+        match symbolizer {
+            SymbolizerKind::Addr2line => {
+                let symbol_resolver = perf_symbol_resolver_for_current_home(runner, perf_data);
+                Ok(fold_perfdata_file_with_symbols(
+                    perf_data,
+                    options,
+                    &symbol_resolver,
+                )?)
+            }
+            SymbolizerKind::RustAddr2line => {
+                let symbol_resolver = perf_symbol_resolver_for_current_home_with_object(
+                    RustAddr2lineResolver::new(),
+                    perf_data,
+                );
+                Ok(fold_perfdata_file_with_symbols(
+                    perf_data,
+                    options,
+                    &symbol_resolver,
+                )?)
+            }
+        }
     } else {
         Ok(fold_perfdata_file_with_options(perf_data, options)?)
     }
