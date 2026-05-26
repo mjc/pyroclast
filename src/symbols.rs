@@ -4,7 +4,7 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
-use object::{Object, ObjectSegment};
+use object::{Object, ObjectSection, ObjectSegment};
 use serde::Serialize;
 
 use crate::perfdata::build_id::kernel_build_id_from_perfdata;
@@ -969,6 +969,214 @@ fn rust_addr2line_frame_names(loader: &addr2line::Loader, address: u64) -> Optio
         }
     }
     (!names.is_empty()).then(|| perf_inline_frame_order(names))
+}
+
+#[must_use]
+pub fn perf_dwarf_frame_names_from_object(path: &Path, address: u64) -> Option<Vec<String>> {
+    let bytes = std::fs::read(path).ok()?;
+    let object = object::File::parse(bytes.as_slice()).ok()?;
+    let endian = if object.is_little_endian() {
+        gimli::RunTimeEndian::Little
+    } else {
+        gimli::RunTimeEndian::Big
+    };
+    let load_section = |id: gimli::SectionId| {
+        let data = object
+            .section_by_name(id.name())
+            .and_then(|section| section.uncompressed_data().ok())
+            .unwrap_or(Cow::Borrowed(&[][..]));
+        Ok::<_, gimli::Error>(gimli::EndianArcSlice::new(
+            std::sync::Arc::<[u8]>::from(data.as_ref()),
+            endian,
+        ))
+    };
+    let dwarf = gimli::Dwarf::load(load_section).ok()?;
+    let mut units = dwarf.units();
+    while let Ok(Some(header)) = units.next() {
+        let Ok(unit) = dwarf.unit(header) else {
+            continue;
+        };
+        if !unit_contains_address(&dwarf, &unit, address) {
+            continue;
+        }
+        if let Some(frames) = perf_dwarf_frame_names_from_unit(&dwarf, &unit, address) {
+            return Some(frames);
+        }
+    }
+    None
+}
+
+fn unit_contains_address<R>(dwarf: &gimli::Dwarf<R>, unit: &gimli::Unit<R>, address: u64) -> bool
+where
+    R: gimli::Reader,
+{
+    let Ok(mut ranges) = dwarf.unit_ranges(unit) else {
+        return true;
+    };
+    while let Ok(Some(range)) = ranges.next() {
+        if range.begin <= address && address < range.end {
+            return true;
+        }
+    }
+    false
+}
+
+fn perf_dwarf_frame_names_from_unit<R>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    address: u64,
+) -> Option<Vec<String>>
+where
+    R: gimli::Reader,
+{
+    let mut tree = unit.entries_tree(None).ok()?;
+    let root = tree.root().ok()?;
+    let mut children = root.children();
+    while let Ok(Some(child)) = children.next() {
+        if let Some(mut frames) = perf_dwarf_frames_from_node(dwarf, unit, child, address, false) {
+            frames.reverse();
+            return Some(frames);
+        }
+    }
+    None
+}
+
+fn perf_dwarf_frames_from_node<R>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    node: gimli::EntriesTreeNode<'_, '_, '_, R>,
+    address: u64,
+    looking_for_inline: bool,
+) -> Option<Vec<String>>
+where
+    R: gimli::Reader,
+{
+    let entry = node.entry();
+    let expected_tag = if looking_for_inline {
+        gimli::DW_TAG_inlined_subroutine
+    } else {
+        gimli::DW_TAG_subprogram
+    };
+    if entry.tag() == expected_tag && die_contains_address(dwarf, unit, entry, address) {
+        let mut frames = Vec::new();
+        if let Some(name) = perf_dwarf_die_name(dwarf, unit, entry) {
+            frames.push(perf_dwarf_function_name(&name));
+        }
+        let mut children = node.children();
+        while let Ok(Some(child)) = children.next() {
+            if let Some(mut child_frames) =
+                perf_dwarf_frames_from_node(dwarf, unit, child, address, true)
+            {
+                frames.append(&mut child_frames);
+                break;
+            }
+        }
+        return (!frames.is_empty()).then_some(frames);
+    }
+
+    let mut children = node.children();
+    while let Ok(Some(child)) = children.next() {
+        if let Some(frames) =
+            perf_dwarf_frames_from_node(dwarf, unit, child, address, looking_for_inline)
+        {
+            return Some(frames);
+        }
+    }
+    None
+}
+
+fn die_contains_address<R>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    entry: &gimli::DebuggingInformationEntry<'_, '_, R>,
+    address: u64,
+) -> bool
+where
+    R: gimli::Reader,
+{
+    let Ok(mut ranges) = dwarf.die_ranges(unit, entry) else {
+        return false;
+    };
+    while let Ok(Some(range)) = ranges.next() {
+        if range.begin <= address && address < range.end {
+            return true;
+        }
+    }
+    false
+}
+
+fn perf_dwarf_die_name<R>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    entry: &gimli::DebuggingInformationEntry<'_, '_, R>,
+) -> Option<String>
+where
+    R: gimli::Reader,
+{
+    entry
+        .attr(gimli::DW_AT_name)
+        .ok()
+        .flatten()
+        .and_then(|attr| dwarf.attr_string(unit, attr.value()).ok())
+        .and_then(|name| name.to_string_lossy().ok().map(Cow::into_owned))
+        .or_else(|| {
+            entry
+                .attr(gimli::DW_AT_abstract_origin)
+                .ok()
+                .flatten()
+                .and_then(|attr| perf_dwarf_origin_name(dwarf, unit, &attr.value(), 16))
+        })
+        .or_else(|| {
+            entry
+                .attr(gimli::DW_AT_specification)
+                .ok()
+                .flatten()
+                .and_then(|attr| perf_dwarf_origin_name(dwarf, unit, &attr.value(), 16))
+        })
+}
+
+fn perf_dwarf_origin_name<R>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    value: &gimli::AttributeValue<R>,
+    recursion_limit: usize,
+) -> Option<String>
+where
+    R: gimli::Reader,
+{
+    if recursion_limit == 0 {
+        return None;
+    }
+    let gimli::AttributeValue::UnitRef(offset) = value else {
+        return None;
+    };
+    let mut entries = unit.entries_tree(Some(*offset)).ok()?;
+    let root = entries.root().ok()?;
+    let entry = root.entry();
+    entry
+        .attr(gimli::DW_AT_name)
+        .ok()
+        .flatten()
+        .and_then(|attr| dwarf.attr_string(unit, attr.value()).ok())
+        .and_then(|name| name.to_string_lossy().ok().map(Cow::into_owned))
+        .or_else(|| {
+            entry
+                .attr(gimli::DW_AT_abstract_origin)
+                .ok()
+                .flatten()
+                .and_then(|attr| {
+                    perf_dwarf_origin_name(dwarf, unit, &attr.value(), recursion_limit - 1)
+                })
+        })
+        .or_else(|| {
+            entry
+                .attr(gimli::DW_AT_specification)
+                .ok()
+                .flatten()
+                .and_then(|attr| {
+                    perf_dwarf_origin_name(dwarf, unit, &attr.value(), recursion_limit - 1)
+                })
+        })
 }
 
 fn specialize_symbol_from_debug_strings(

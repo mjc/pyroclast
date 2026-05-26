@@ -9,6 +9,7 @@ addr2line = "0.26.1"
 clap = { version = "4", features = ["derive"] }
 framehop = "0.16.0"
 framehop-object = "0.2.0"
+gimli = "0.32.3"
 hashbrown = "0.17.1"
 memmap2 = "0.9"
 object = "0.39.1"

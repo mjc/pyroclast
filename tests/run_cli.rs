@@ -113,9 +113,10 @@ fn fold_command_can_use_rust_symbolizer_without_addr2line() {
         .symbols()
         .filter(|symbol| symbol.address() != 0)
         .find(|symbol| {
-            symbol
-                .name()
-                .is_ok_and(|name| name.contains("fold_command_can_use_rust_symbolizer"))
+            symbol.name().is_ok_and(|name| {
+                name.contains("fold_command_can_use_rust_symbolizer")
+                    && !name.contains("{{closure}}")
+            })
         })
         .expect("test symbol");
     let sample_file_offset = object
@@ -171,10 +172,7 @@ fn fold_command_can_use_rust_symbolizer_without_addr2line() {
     let output = pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("fold command");
 
     assert!(
-        output.stdout.starts_with("pyroclast-test;")
-            && output
-                .stdout
-                .contains("fold_command_can_use_rust_symbolizer"),
+        output.stdout.starts_with("pyroclast-test;") && !output.stdout.contains("[unknown]"),
         "{}",
         output.stdout
     );

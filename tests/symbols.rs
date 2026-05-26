@@ -9,8 +9,9 @@ use pyroclast::perfdata::mappings::FileIdentity;
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
 use pyroclast::symbols::{
     Addr2lineResolver, Kallsyms, RustAddr2lineResolver, SymbolCache, SymbolRequest, SymbolResolver,
-    more_specific_dwarf_name_from_debug_strings, perf_debug_dir, perf_dwarf_function_name,
-    perf_inline_frame_order, perf_symbol_name, perf_symbol_resolver_for_perfdata_file,
+    more_specific_dwarf_name_from_debug_strings, perf_debug_dir,
+    perf_dwarf_frame_names_from_object, perf_dwarf_function_name, perf_inline_frame_order,
+    perf_symbol_name, perf_symbol_resolver_for_perfdata_file,
     perf_symbol_resolver_for_perfdata_file_with_symbolizer,
 };
 
@@ -388,6 +389,29 @@ fn specializes_generic_placeholder_dwarf_names_from_debug_strings() {
     assert_eq!(
         more_specific_dwarf_name_from_debug_strings("insert<K,V,A>", debug_strings),
         Some("insert<u64, alloc::string::String, alloc::alloc::Global>".to_string())
+    );
+}
+
+#[test]
+fn perf_dwarf_frame_names_prefer_die_names_like_perf_script() {
+    let profiling_binary = PathBuf::from("target/profiling/pyroclast");
+    if !profiling_binary.exists() {
+        return;
+    }
+
+    let frames = perf_dwarf_frame_names_from_object(&profiling_binary, 0x001e_aa81)
+        .expect("perf dwarf frames");
+
+    assert_eq!(
+        frames,
+        vec![
+            "insert<u64, alloc::string::String, alloc::alloc::Global>".to_string(),
+            "insert_recursing<u64, alloc::string::String, alloc::alloc::Global, alloc::collections::btree::map::entry::{impl#8}::insert_entry::{closure_env#0}<u64, alloc::string::String, alloc::alloc::Global>>".to_string(),
+            "insert_entry<u64, alloc::string::String, alloc::alloc::Global>".to_string(),
+            "insert<u64, alloc::string::String, alloc::alloc::Global>".to_string(),
+            "insert<u64, alloc::string::String, alloc::alloc::Global>".to_string(),
+            "parse".to_string(),
+        ]
     );
 }
 
