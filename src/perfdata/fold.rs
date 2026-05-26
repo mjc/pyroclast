@@ -779,6 +779,8 @@ fn should_drop_known_non_executable_user_frame(
 fn symbol_fallback_frame(mapping: &ResolvedMapping) -> String {
     if is_kernel_mapping(mapping) {
         UNKNOWN_FRAME.to_string()
+    } else if mapping.path == UNKNOWN_FRAME {
+        mapping.path.clone()
     } else if mapping.path.starts_with('[') {
         mapped_frame_label(mapping)
     } else {
