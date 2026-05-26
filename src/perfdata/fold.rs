@@ -11,15 +11,11 @@ use crate::perfdata::mappings::{
     FileIdentity, MmapTable, ResolvedMapping, file_matches_recorded_identity,
 };
 use crate::perfdata::raw_stack::{CollapsedRawStack, RawStackAccumulator};
-use crate::perfdata::records::{
-    Mmap2Record, PERF_RECORD_MISC_CPUMODE_KERNEL, PERF_RECORD_MISC_CPUMODE_MASK, ParsedRecord,
-    PerfRecord, iter_records, parse_record,
-};
+use crate::perfdata::records::{Mmap2Record, ParsedRecord, PerfRecord, iter_records, parse_record};
 use crate::perfdata::samples::{
     PERF_SAMPLE_ADDR, PERF_SAMPLE_CPU, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP,
     PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME, SampleLayout, is_kernel_space_frame,
-    is_perf_context_marker, is_perf_user_context_marker, is_perf_user_deferred_context_marker,
-    parse_sample_record_callchain,
+    is_perf_context_marker, is_perf_user_deferred_context_marker, parse_sample_record_callchain,
 };
 use crate::perfdata::unwind::{FramehopUnwinder, PerfX86_64Regs, unwind_x86_64_stack};
 use crate::symbols::{SymbolFrameCache, SymbolRequest, SymbolResolver, perf_build_id_elf_path};
@@ -933,7 +929,7 @@ fn parse_sample_for_summary(
 
 fn parse_sample_for_fold(
     payload: &[u8],
-    sample_misc: u16,
+    _sample_misc: u16,
     sample_layouts: &SampleLayouts,
     options: FoldOptions,
     object_unwinder: &mut FramehopUnwinder,
@@ -950,7 +946,6 @@ fn parse_sample_for_fold(
                 let deferred_cookie = take_deferred_cookie(&mut frames);
                 if let (Some(regs), Some(stack)) = (&sample.user_regs, &sample.user_stack)
                     && has_perf_captured_user_stack(stack)
-                    && should_unwind_sampled_user_stack(sample_misc, &frames)
                     && let Ok(regs) = PerfX86_64Regs::from_perf_masked_values(
                         layout.sample_regs_user,
                         &regs.values,
@@ -1002,13 +997,6 @@ fn take_deferred_cookie(frames: &mut Vec<FoldFrame>) -> Option<u64> {
 
 fn has_perf_captured_user_stack(stack: &crate::perfdata::samples::SampleUserStack<'_>) -> bool {
     !stack.bytes.is_empty() && stack.dynamic_size != 0
-}
-
-fn should_unwind_sampled_user_stack(sample_misc: u16, frames: &[FoldFrame]) -> bool {
-    sample_misc & PERF_RECORD_MISC_CPUMODE_MASK != PERF_RECORD_MISC_CPUMODE_KERNEL
-        || frames.iter().copied().any(|frame| {
-            matches!(frame, FoldFrame::Callchain(address) if is_perf_user_context_marker(address) || is_perf_user_deferred_context_marker(address))
-        })
 }
 
 fn load_unwind_mapping(
