@@ -363,6 +363,45 @@ fn analyze_flamegraph_command_emits_text_diff() {
 }
 
 #[test]
+fn analyze_perfdata_command_emits_json_report() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    std::fs::write(&perfdata, tiny_period_perfdata()).expect("perfdata");
+
+    let output = pyroclast::run_cli([
+        "pyroclast",
+        "analyze-perfdata",
+        "--json",
+        perfdata.to_str().expect("perfdata path"),
+    ])
+    .expect("analyze perfdata");
+
+    let json: serde_json::Value = serde_json::from_str(&output.stdout).expect("json");
+    assert_eq!(json["total_samples"], 1);
+    assert_eq!(json["weighted_samples"], 144);
+    assert_eq!(json["threads"][0]["tid"], 2);
+    assert_eq!(json["top_leaf_ips"][0]["ip"], "0x0000000000002000");
+}
+
+#[test]
+fn analyze_perfdata_command_emits_text_report() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    std::fs::write(&perfdata, tiny_period_perfdata()).expect("perfdata");
+
+    let output = pyroclast::run_cli([
+        "pyroclast",
+        "analyze-perfdata",
+        perfdata.to_str().expect("perfdata path"),
+    ])
+    .expect("analyze perfdata");
+
+    assert!(output.stdout.contains("samples: 1"));
+    assert!(output.stdout.contains("weighted samples: 144"));
+    assert!(output.stdout.contains("0x0000000000002000"));
+}
+
+#[test]
 fn summarize_command_prints_summary_text() {
     let root = tempfile::tempdir().expect("tempdir");
     let run_dir = root.path().join("run");

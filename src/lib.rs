@@ -24,7 +24,7 @@ use backends::macos_xctrace::MacosXctraceBackend;
 use backends::offcpu::OffcpuBackend;
 use backends::strace::StraceBackend;
 use backends::{ProfileRequest, ProfilerBackend};
-use cli::{AnalyzeFlamegraphArgs, FlamegraphAnalysisMode};
+use cli::{AnalyzeFlamegraphArgs, AnalyzePerfdataArgs, FlamegraphAnalysisMode};
 use cli::{Cli, CliCommand};
 use flamegraph::analysis::{
     FlamegraphCategory, FlamegraphDelta, FlamegraphEntry, category_summary, diff_flamegraphs,
@@ -32,6 +32,7 @@ use flamegraph::analysis::{
 };
 use flamegraph::{FlamegraphRenderer, FlamegraphRequest, InfernoFlamegraphRenderer};
 pub use output::{CliOutput, write_cli_output};
+use perfdata::analysis::{PerfdataAnalysis, analyze_perfdata};
 use perfdata::fold::{
     FoldOptions, fold_perfdata_file, fold_perfdata_file_with_options,
     fold_perfdata_file_with_symbols,
@@ -241,7 +242,13 @@ where
                 stderr: String::new(),
             })
         }
-        CliCommand::AnalyzePerfdata(_) => Err("perfdata analysis is not wired yet".into()),
+        CliCommand::AnalyzePerfdata(command) => {
+            let stdout = analyze_perfdata_for_cli(&command)?;
+            Ok(CliOutput {
+                stdout,
+                stderr: String::new(),
+            })
+        }
         CliCommand::Memory(_)
         | CliCommand::Cpu(_)
         | CliCommand::Offpcu(_)
@@ -249,6 +256,57 @@ where
         | CliCommand::Async(_)
         | CliCommand::Profile(_) => unreachable!("profile invocations returned earlier"),
     }
+}
+
+fn analyze_perfdata_for_cli(command: &AnalyzePerfdataArgs) -> backends::BackendResult<String> {
+    let bytes = std::fs::read(&command.input)?;
+    let analysis = analyze_perfdata(&bytes, command.limit)?;
+    render_perfdata_analysis(&analysis, command.json)
+}
+
+fn render_perfdata_analysis(
+    analysis: &PerfdataAnalysis,
+    json: bool,
+) -> backends::BackendResult<String> {
+    use std::fmt::Write as _;
+
+    if json {
+        return Ok(format!("{}\n", serde_json::to_string_pretty(analysis)?));
+    }
+
+    let mut output = String::new();
+    writeln!(output, "records: {}", analysis.total_records)?;
+    writeln!(output, "samples: {}", analysis.total_samples)?;
+    writeln!(output, "weighted samples: {}", analysis.weighted_samples)?;
+    writeln!(output, "lost records: {}", analysis.lost_records)?;
+    writeln!(output)?;
+    writeln!(output, "threads")?;
+    for thread in &analysis.threads {
+        writeln!(
+            output,
+            "{:>10} {:>10} {:>7}  {}",
+            thread.weighted_samples, thread.samples, thread.tid, thread.comm
+        )?;
+    }
+    writeln!(output)?;
+    writeln!(output, "top leaf ips")?;
+    for ip in &analysis.top_leaf_ips {
+        writeln!(
+            output,
+            "{:>10} {:>10}  {}",
+            ip.weighted_samples, ip.samples, ip.ip
+        )?;
+    }
+    writeln!(output)?;
+    writeln!(output, "top edges")?;
+    for edge in &analysis.top_edges {
+        writeln!(
+            output,
+            "{:>10} {:>10}  {} -> {}",
+            edge.weighted_samples, edge.samples, edge.caller, edge.callee
+        )?;
+    }
+    Ok(output)
 }
 
 fn analyze_flamegraph_for_cli(command: &AnalyzeFlamegraphArgs) -> backends::BackendResult<String> {
