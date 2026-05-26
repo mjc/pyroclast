@@ -13,7 +13,16 @@ pub struct ResolvedMapping {
     pub path: String,
     pub relative_address: u64,
     pub build_id: Option<Vec<u8>>,
+    pub file_identity: Option<FileIdentity>,
     pub kernel_relocation: Option<KernelRelocation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileIdentity {
+    pub major: u32,
+    pub minor: u32,
+    pub inode: u64,
+    pub inode_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,6 +33,7 @@ pub struct UserMapping<'a> {
     pub pgoff: u64,
     pub path: &'a str,
     pub build_id: Option<&'a [u8]>,
+    pub file_identity: Option<FileIdentity>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,6 +44,7 @@ struct Mapping {
     pgoff: u64,
     path: String,
     build_id: Option<Vec<u8>>,
+    file_identity: Option<FileIdentity>,
     prot: Option<u32>,
 }
 
@@ -46,6 +57,7 @@ impl MmapTable {
             pgoff: record.pgoff,
             path: record.path,
             build_id: None,
+            file_identity: None,
             prot: None,
         });
     }
@@ -58,6 +70,12 @@ impl MmapTable {
             pgoff: record.pgoff,
             path: record.path,
             build_id: None,
+            file_identity: Some(FileIdentity {
+                major: record.major,
+                minor: record.minor,
+                inode: record.inode,
+                inode_generation: record.inode_generation,
+            }),
             prot: Some(record.prot),
         });
     }
@@ -70,6 +88,7 @@ impl MmapTable {
             pgoff: record.pgoff,
             path: record.path,
             build_id: Some(record.build_id),
+            file_identity: None,
             prot: Some(record.prot),
         });
     }
@@ -84,6 +103,7 @@ impl MmapTable {
                 path: mapping.path.clone(),
                 relative_address: mapping.relative_address(ip),
                 build_id: mapping.build_id.clone(),
+                file_identity: mapping.file_identity,
                 kernel_relocation: mapping.kernel_relocation(),
             })
     }
@@ -99,6 +119,7 @@ impl MmapTable {
                 pgoff: mapping.pgoff,
                 path: &mapping.path,
                 build_id: mapping.build_id.as_deref(),
+                file_identity: mapping.file_identity,
             })
     }
 
