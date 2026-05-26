@@ -1,4 +1,4 @@
-use pyroclast::perfdata::unwind::{PerfStackReader, PerfX86_64Regs};
+use pyroclast::perfdata::unwind::{PerfStackReader, PerfX86_64Regs, unwind_x86_64_stack};
 
 #[test]
 fn maps_perf_x86_64_register_mask_values_by_perf_register_number() {
@@ -24,4 +24,22 @@ fn sampled_stack_reader_reads_little_endian_words_from_sampled_sp() {
     assert_eq!(reader.read_u64(0x7fff_0000), Some(0x10));
     assert_eq!(reader.read_u64(0x7fff_0008), Some(0x20));
     assert_eq!(reader.read_u64(0x7fff_0010), None);
+}
+
+#[test]
+fn unwinds_x86_64_frame_pointer_stack_from_sampled_stack_bytes() {
+    let stack = [
+        0, 0, 0, 0, 0, 0, 0, 0, //
+        0x40, 0, 0, 0, 0, 0, 0, 0, //
+        0x34, 0x12, 0, 0, 0, 0, 0, 0,
+    ];
+    let regs = PerfX86_64Regs {
+        ip: 0x4000,
+        sp: 0x7fff_0000,
+        bp: 0x7fff_0008,
+    };
+
+    let frames = unwind_x86_64_stack(regs, &stack, 4);
+
+    assert_eq!(frames, vec![0x4000, 0x1234]);
 }

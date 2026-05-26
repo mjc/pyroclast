@@ -10,6 +10,28 @@ pub struct PerfStackReader<'a> {
     bytes: &'a [u8],
 }
 
+#[must_use]
+pub fn unwind_x86_64_stack(regs: PerfX86_64Regs, stack: &[u8], max_frames: usize) -> Vec<u64> {
+    use framehop::Unwinder;
+    use framehop::x86_64::{CacheX86_64, UnwindRegsX86_64, UnwinderX86_64};
+
+    let stack_reader = PerfStackReader::new(regs.sp, stack);
+    let mut read_stack = |address| stack_reader.read_u64(address).ok_or(());
+    let mut cache = CacheX86_64::new();
+    let unwinder = UnwinderX86_64::<Vec<u8>>::new();
+    let ip = regs.ip;
+    let regs = UnwindRegsX86_64::new(ip, regs.sp, regs.bp);
+    let mut iter = unwinder.iter_frames(ip, regs, &mut cache, &mut read_stack);
+    let mut frames = Vec::new();
+    while frames.len() < max_frames {
+        let Ok(Some(frame)) = iter.next() else {
+            break;
+        };
+        frames.push(frame.address());
+    }
+    frames
+}
+
 impl PerfX86_64Regs {
     /// Builds the minimal `x86_64` register set needed for stack unwinding from
     /// perf's ascending register-mask encoding.
