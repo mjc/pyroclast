@@ -14,7 +14,7 @@ use crate::perfdata::samples::{
     parse_sample_record_callchain,
 };
 use crate::perfdata::unwind::{FramehopUnwinder, PerfX86_64Regs, unwind_x86_64_stack};
-use crate::symbols::{SymbolCache, SymbolRequest, SymbolResolver};
+use crate::symbols::{SymbolFrameCache, SymbolRequest, SymbolResolver};
 
 const UNKNOWN_FRAME: &str = "[unknown]";
 
@@ -237,7 +237,7 @@ where
     R: SymbolResolver,
 {
     let fold_data = collect_fold_data(bytes, options)?;
-    let mut symbol_cache = SymbolCache::new(symbol_resolver);
+    let mut symbol_cache = SymbolFrameCache::new(symbol_resolver);
     render_fold_data(&fold_data, Some(&mut symbol_cache))
 }
 
@@ -422,7 +422,7 @@ fn is_valid_unwound_user_frame(pid: Option<u32>, frame: FoldFrame, mmap_table: &
 
 fn render_fold_data<R>(
     fold_data: &PerfFoldData,
-    mut symbol_cache: Option<&mut SymbolCache<'_, R>>,
+    mut symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
 ) -> Result<String, String>
 where
     R: SymbolResolver,
@@ -456,7 +456,7 @@ where
 fn prefetch_symbols<R>(
     raw_stacks: &[CollapsedRawStack<FoldFrame>],
     mmap_table: &MmapTable,
-    symbol_cache: &mut SymbolCache<'_, R>,
+    symbol_cache: &mut SymbolFrameCache<'_, R>,
 ) -> Result<(), String>
 where
     R: SymbolResolver,
@@ -508,7 +508,7 @@ impl<'a> FoldFrameResolver<'a> {
         pid: Option<u32>,
         comm: Option<&str>,
         callchain: &[FoldFrame],
-        mut symbol_cache: Option<&mut SymbolCache<'_, R>>,
+        mut symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
     ) -> Result<Vec<String>, String>
     where
         R: SymbolResolver,
@@ -526,46 +526,50 @@ impl<'a> FoldFrameResolver<'a> {
             if pid.is_some_and(|pid| self.mmap_table.is_known_non_executable(pid, frame)) {
                 continue;
             }
-            frames.push(self.format_frame(pid, frame, symbol_cache.as_deref_mut())?);
+            frames.extend(self.format_frames(pid, frame, symbol_cache.as_deref_mut())?);
         }
         Ok(frames)
     }
 
-    fn format_frame<R>(
+    fn format_frames<R>(
         &self,
         pid: Option<u32>,
         frame: u64,
-        symbol_cache: Option<&mut SymbolCache<'_, R>>,
-    ) -> Result<String, String>
+        symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+    ) -> Result<Vec<String>, String>
     where
         R: SymbolResolver,
     {
         if let Some(mapping) = pid.and_then(|pid| self.mmap_table.resolve(pid, frame)) {
             if is_kernel_space_frame(frame) && !is_kernel_mapping(&mapping) {
-                return Ok(format!("0x{frame:x}"));
+                return Ok(vec![format!("0x{frame:x}")]);
             }
             if let Some(cache) = symbol_cache {
-                return Ok(cache
-                    .resolve(&symbol_request(&mapping))?
-                    .unwrap_or_else(|| {
-                        if is_kernel_mapping(&mapping) {
-                            UNKNOWN_FRAME.to_string()
-                        } else if mapping.path.starts_with('[') {
-                            mapped_frame_label(&mapping)
-                        } else {
-                            module_fallback_frame(&mapping.path)
-                        }
-                    }));
+                let frames = cache.resolve(&symbol_request(&mapping))?;
+                if frames.is_empty() {
+                    return Ok(vec![symbol_fallback_frame(&mapping)]);
+                }
+                return Ok(frames);
             }
             if is_kernel_space_frame(frame) {
-                return Ok(UNKNOWN_FRAME.to_string());
+                return Ok(vec![UNKNOWN_FRAME.to_string()]);
             }
-            Ok(mapped_frame_label(&mapping))
+            Ok(vec![mapped_frame_label(&mapping)])
         } else if is_kernel_space_frame(frame) {
-            Ok(UNKNOWN_FRAME.to_string())
+            Ok(vec![UNKNOWN_FRAME.to_string()])
         } else {
-            Ok(format!("0x{frame:x}"))
+            Ok(vec![format!("0x{frame:x}")])
         }
+    }
+}
+
+fn symbol_fallback_frame(mapping: &ResolvedMapping) -> String {
+    if is_kernel_mapping(mapping) {
+        UNKNOWN_FRAME.to_string()
+    } else if mapping.path.starts_with('[') {
+        mapped_frame_label(mapping)
+    } else {
+        module_fallback_frame(&mapping.path)
     }
 }
 

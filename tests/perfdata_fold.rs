@@ -785,6 +785,27 @@ fn folds_mapped_user_frames_with_symbol_names() {
 }
 
 #[test]
+fn symbolized_fold_expands_inline_symbol_frames() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(1, &mmap_payload(11, 11, 0x1000, 0x100, 0, "/bin/app")),
+            record_bytes(9, &sample_payload(0x1000, 11, 12, [0x1010])),
+        ],
+    );
+    let resolver = InlineSymbolResolver;
+
+    let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
+        .expect("folded");
+
+    assert_eq!(folded, "app::outer;app::inner 1\n");
+}
+
+#[test]
 fn symbolized_fold_uses_module_fallback_for_unresolved_user_frames_like_inferno() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
@@ -1239,6 +1260,29 @@ impl SymbolResolver for StaticSymbolResolver {
                             && request.relative_address == 0xffff_ffff_8800_0010)
                             .then(|| "asm_exc_page_fault".to_string())
                     })
+            })
+            .collect())
+    }
+}
+
+struct InlineSymbolResolver;
+
+impl SymbolResolver for InlineSymbolResolver {
+    fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
+        Ok(vec![None; requests.len()])
+    }
+
+    fn resolve_frame_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Vec<String>>, String> {
+        Ok(requests
+            .iter()
+            .map(|request| {
+                if request.path == std::path::Path::new("/bin/app")
+                    && request.relative_address == 0x10
+                {
+                    vec!["app::outer".to_string(), "app::inner".to_string()]
+                } else {
+                    Vec::new()
+                }
             })
             .collect())
     }
