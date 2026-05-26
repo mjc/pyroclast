@@ -321,7 +321,7 @@ where
 
     #[must_use]
     pub fn with_system_map_candidates(self, candidates: impl IntoIterator<Item = PathBuf>) -> Self {
-        if self.kernel_elf.is_some() || self.kallsyms.is_some() {
+        if self.kernel_elf.is_some() {
             return self;
         }
         match Kallsyms::load_first_system_map_candidate(candidates) {
@@ -356,6 +356,9 @@ where
 
     #[must_use]
     pub fn with_system_kallsyms(self) -> Self {
+        if self.kernel_elf.is_some() || self.kallsyms.is_some() {
+            return self;
+        }
         match std::fs::read_to_string("/proc/kallsyms")
             .ok()
             .and_then(|text| Kallsyms::parse(&text).ok())
