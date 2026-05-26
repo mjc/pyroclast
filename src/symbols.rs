@@ -7,7 +7,7 @@ use clap::ValueEnum;
 use serde::Serialize;
 
 use crate::perfdata::build_id::kernel_build_id_from_perfdata;
-use crate::perfdata::mappings::FileIdentity;
+use crate::perfdata::mappings::{FileIdentity, file_matches_recorded_identity};
 use crate::process::{CommandRunner, CommandSpec};
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -643,9 +643,9 @@ where
                         .as_ref()
                         .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request));
                 }
-            } else {
+            } else if let Some(object_request) = self.object_symbol_request(request) {
                 user_indexes.push(index);
-                user_requests.push(self.object_symbol_request(request));
+                user_requests.push(object_request);
             }
         }
 
@@ -690,9 +690,9 @@ where
                 {
                     resolved[index] = vec![symbol];
                 }
-            } else {
+            } else if let Some(object_request) = self.object_symbol_request(request) {
                 user_indexes.push(index);
-                user_requests.push(self.object_symbol_request(request));
+                user_requests.push(object_request);
             }
         }
 
@@ -719,24 +719,34 @@ impl<O> PerfSymbolResolver<O>
 where
     O: SymbolResolver,
 {
-    fn object_symbol_request(&self, request: &SymbolRequest) -> SymbolRequest {
+    fn object_symbol_request(&self, request: &SymbolRequest) -> Option<SymbolRequest> {
         let Some(debug_dir) = &self.debug_dir else {
-            return request.clone();
+            return Self::live_object_symbol_request(request);
         };
         let Some(build_id) = &request.build_id else {
-            return request.clone();
+            return Self::live_object_symbol_request(request);
         };
         let elf = perf_build_id_elf_path(debug_dir, build_id);
         if !elf.exists() {
-            return request.clone();
+            return Self::live_object_symbol_request(request);
         }
-        SymbolRequest {
+        Some(SymbolRequest {
             path: elf,
             relative_address: request.relative_address,
             build_id: None,
             file_identity: None,
             kernel_relocation: None,
+        })
+    }
+
+    fn live_object_symbol_request(request: &SymbolRequest) -> Option<SymbolRequest> {
+        if request
+            .file_identity
+            .is_some_and(|identity| !file_matches_recorded_identity(&request.path, identity))
+        {
+            return None;
         }
+        Some(request.clone())
     }
 }
 

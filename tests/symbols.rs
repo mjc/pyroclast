@@ -5,6 +5,7 @@ use std::sync::Mutex;
 
 use object::{Object, ObjectSymbol};
 use pyroclast::cli::SymbolizerKind;
+use pyroclast::perfdata::mappings::FileIdentity;
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
 use pyroclast::symbols::{
     Addr2lineResolver, Kallsyms, RustAddr2lineResolver, SymbolCache, SymbolRequest, SymbolResolver,
@@ -885,6 +886,43 @@ fn perf_symbol_resolver_preserves_pluggable_object_frame_lists() {
     assert_eq!(
         frames,
         vec![vec!["app::outer".to_string(), "app::inner".to_string()]]
+    );
+}
+
+#[test]
+fn perf_symbol_resolver_skips_stale_user_objects() {
+    let object_path = tempfile::NamedTempFile::new().expect("object file");
+    let object_resolver = RecordingResolver::with_symbols([(
+        SymbolRequest {
+            path: object_path.path().to_path_buf(),
+            relative_address: 0x10,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        },
+        "app::main".to_string(),
+    )]);
+    let resolver = pyroclast::symbols::PerfSymbolResolver::from_object_resolver(object_resolver);
+
+    let symbols = resolver
+        .resolve_batch(&[SymbolRequest {
+            path: object_path.path().to_path_buf(),
+            relative_address: 0x10,
+            build_id: None,
+            file_identity: Some(FileIdentity {
+                major: 0,
+                minor: 0,
+                inode: u64::MAX,
+                inode_generation: 0,
+            }),
+            kernel_relocation: None,
+        }])
+        .expect("symbols");
+
+    assert_eq!(symbols, vec![None]);
+    assert_eq!(
+        resolver.object_resolver().batch_calls(),
+        Vec::<Vec<SymbolRequest>>::new()
     );
 }
 
