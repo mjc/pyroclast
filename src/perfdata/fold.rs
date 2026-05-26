@@ -15,6 +15,8 @@ use crate::perfdata::samples::{
 };
 use crate::symbols::{SymbolCache, SymbolRequest, SymbolResolver};
 
+const UNKNOWN_FRAME: &str = "[unknown]";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PerfSummary {
     pub total_records: usize,
@@ -446,12 +448,20 @@ impl<'a> FoldFrameResolver<'a> {
             if let Some(cache) = symbol_cache {
                 return Ok(cache
                     .resolve(&symbol_request(&mapping))?
-                    .unwrap_or_else(|| mapped_frame_label(&mapping)));
+                    .unwrap_or_else(|| {
+                        if is_kernel_mapping(&mapping) {
+                            UNKNOWN_FRAME.to_string()
+                        } else {
+                            mapped_frame_label(&mapping)
+                        }
+                    }));
             }
             if is_kernel_space_frame(frame) {
-                return Ok(format!("0x{frame:x}"));
+                return Ok(UNKNOWN_FRAME.to_string());
             }
             Ok(mapped_frame_label(&mapping))
+        } else if is_kernel_space_frame(frame) {
+            Ok(UNKNOWN_FRAME.to_string())
         } else {
             Ok(format!("0x{frame:x}"))
         }
