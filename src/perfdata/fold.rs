@@ -546,8 +546,10 @@ impl<'a> FoldFrameResolver<'a> {
                     .unwrap_or_else(|| {
                         if is_kernel_mapping(&mapping) {
                             UNKNOWN_FRAME.to_string()
-                        } else {
+                        } else if mapping.path.starts_with('[') {
                             mapped_frame_label(&mapping)
+                        } else {
+                            module_fallback_frame(&mapping.path)
                         }
                     }));
             }
@@ -582,6 +584,14 @@ fn build_id_hex(bytes: &[u8]) -> String {
 
 fn mapped_frame_label(mapping: &ResolvedMapping) -> String {
     format!("{}+0x{:x}", mapping.path, mapping.relative_address)
+}
+
+fn module_fallback_frame(path: &str) -> String {
+    let name = Path::new(path)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or(path);
+    format!("[{name}]")
 }
 
 fn is_kernel_mapping(mapping: &ResolvedMapping) -> bool {
