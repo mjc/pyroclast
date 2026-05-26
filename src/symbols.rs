@@ -1003,10 +1003,14 @@ impl SymbolResolver for RustAddr2lineResolver {
                 }
                 continue;
             };
-            let debug_names = std::fs::read(&path)
-                .map(|bytes| DebugStringNameIndex::from_object_bytes(&bytes))
+            let object_bytes = std::fs::read(&path).ok();
+            let debug_names = object_bytes
+                .as_deref()
+                .map(DebugStringNameIndex::from_object_bytes)
                 .unwrap_or_default();
-            let perf_dwarf = PerfDwarfNameResolver::from_object(&path).ok();
+            let perf_dwarf = object_bytes
+                .as_deref()
+                .and_then(|bytes| PerfDwarfNameResolver::from_object_bytes(bytes).ok());
             for index in indexes {
                 let request = &requests[index];
                 let mut frames = perf_dwarf
@@ -1065,10 +1069,21 @@ pub fn perf_dwarf_frame_names_from_object(path: &Path, address: u64) -> Option<V
         .frame_names(address)
 }
 
+#[must_use]
+pub fn perf_dwarf_frame_names_from_object_bytes(bytes: &[u8], address: u64) -> Option<Vec<String>> {
+    PerfDwarfNameResolver::from_object_bytes(bytes)
+        .ok()?
+        .frame_names(address)
+}
+
 impl PerfDwarfNameResolver {
     fn from_object(path: &Path) -> Result<Self, gimli::Error> {
         let bytes = std::fs::read(path).map_err(|_| gimli::Error::Io)?;
-        let object = object::File::parse(bytes.as_slice()).map_err(|_| gimli::Error::Io)?;
+        Self::from_object_bytes(&bytes)
+    }
+
+    fn from_object_bytes(bytes: &[u8]) -> Result<Self, gimli::Error> {
+        let object = object::File::parse(bytes).map_err(|_| gimli::Error::Io)?;
         let endian = if object.is_little_endian() {
             gimli::RunTimeEndian::Little
         } else {

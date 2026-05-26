@@ -10,9 +10,9 @@ use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
 use pyroclast::symbols::{
     Addr2lineResolver, Kallsyms, RustAddr2lineResolver, SymbolCache, SymbolRequest, SymbolResolver,
     more_specific_dwarf_name_from_debug_strings, perf_debug_dir,
-    perf_dwarf_frame_names_from_object, perf_dwarf_function_name, perf_inline_frame_order,
-    perf_symbol_name, perf_symbol_resolver_for_perfdata_file,
-    perf_symbol_resolver_for_perfdata_file_with_symbolizer,
+    perf_dwarf_frame_names_from_object, perf_dwarf_frame_names_from_object_bytes,
+    perf_dwarf_function_name, perf_inline_frame_order, perf_symbol_name,
+    perf_symbol_resolver_for_perfdata_file, perf_symbol_resolver_for_perfdata_file_with_symbolizer,
 };
 
 #[test]
@@ -412,6 +412,24 @@ fn perf_dwarf_frame_names_prefer_die_names_like_perf_script() {
             "insert<u64, alloc::string::String, alloc::alloc::Global>".to_string(),
             "parse".to_string(),
         ]
+    );
+}
+
+#[test]
+fn perf_dwarf_frame_names_can_use_existing_object_bytes() {
+    let profiling_binary = PathBuf::from("target/profiling/pyroclast");
+    if !profiling_binary.exists() {
+        return;
+    }
+    let bytes = std::fs::read(&profiling_binary).expect("profiling binary bytes");
+
+    let frames =
+        perf_dwarf_frame_names_from_object_bytes(&bytes, 0x001e_aa81).expect("perf dwarf frames");
+
+    assert_eq!(
+        frames,
+        perf_dwarf_frame_names_from_object(&profiling_binary, 0x001e_aa81)
+            .expect("path-backed perf dwarf frames")
     );
 }
 
