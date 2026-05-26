@@ -10,9 +10,10 @@ use crate::perfdata::raw_stack::{CollapsedRawStack, RawStackAccumulator};
 use crate::perfdata::records::{ParsedRecord, PerfRecord, iter_records, parse_record};
 use crate::perfdata::samples::{
     PERF_SAMPLE_ADDR, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_TID,
-    PERF_SAMPLE_TIME, SampleCallchainFrames, SampleLayout, is_kernel_space_frame,
-    is_perf_context_marker, parse_sample_record_callchain,
+    PERF_SAMPLE_TIME, SampleLayout, is_kernel_space_frame, is_perf_context_marker,
+    parse_sample_record_callchain,
 };
+use crate::perfdata::unwind::{PerfX86_64Regs, unwind_x86_64_stack};
 use crate::symbols::{SymbolCache, SymbolRequest, SymbolResolver};
 
 const UNKNOWN_FRAME: &str = "[unknown]";
@@ -46,6 +47,8 @@ struct PerfFoldData {
     mmap_table: MmapTable,
     raw_stacks: Vec<CollapsedRawStack>,
 }
+
+type FoldSample = (Option<u32>, u64, Vec<u64>);
 
 #[derive(Clone, Debug, Default)]
 struct SampleLayouts {
@@ -287,7 +290,11 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
                     if let Some((pid, count, frames)) = sample {
                         callchain.clear();
                         callchain.reserve(frames.len());
-                        callchain.extend(frames.filter(|frame| !is_perf_context_marker(*frame)));
+                        callchain.extend(
+                            frames
+                                .into_iter()
+                                .filter(|frame| !is_perf_context_marker(*frame)),
+                        );
                         raw_stacks.add_slice(pid, &callchain, count);
                     }
                 })
@@ -527,11 +534,11 @@ fn parse_sample_for_summary(
     }
 }
 
-fn parse_sample_for_fold<'a>(
-    payload: &'a [u8],
+fn parse_sample_for_fold(
+    payload: &[u8],
     sample_layouts: &SampleLayouts,
     options: FoldOptions,
-) -> Result<Option<(Option<u32>, u64, SampleCallchainFrames<'a>)>, String> {
+) -> Result<Option<FoldSample>, String> {
     if let Some(layout) = sample_layouts.layout_for_payload(payload)? {
         parse_sample_record_callchain(payload, layout).map(|sample| {
             sample.map(|sample| {
@@ -540,7 +547,17 @@ fn parse_sample_for_fold<'a>(
                 } else {
                     1
                 };
-                (sample.pid, count, sample.frames)
+                let mut frames = sample.frames.collect::<Vec<_>>();
+                if frames.is_empty()
+                    && let (Some(regs), Some(stack)) = (&sample.user_regs, &sample.user_stack)
+                    && let Ok(regs) = PerfX86_64Regs::from_perf_masked_values(
+                        layout.sample_regs_user,
+                        &regs.values,
+                    )
+                {
+                    frames = unwind_x86_64_stack(regs, stack.bytes, 256);
+                }
+                (sample.pid, count, frames)
             })
         })
     } else {
