@@ -870,7 +870,7 @@ impl SymbolResolver for RustAddr2lineResolver {
 }
 
 fn demangle_addr2line_name(name: &str) -> String {
-    perf_symbol_name(&addr2line::demangle_auto(Cow::Borrowed(name), None))
+    perf_dwarf_function_name(&addr2line::demangle_auto(Cow::Borrowed(name), None))
 }
 
 fn rust_addr2line_frame_name(loader: &addr2line::Loader, address: u64) -> Option<String> {
@@ -884,7 +884,7 @@ fn rust_addr2line_frame_names(loader: &addr2line::Loader, address: u64) -> Optio
         if let Some(function) = frame.function
             && let Ok(name) = function.demangle()
         {
-            names.push(perf_symbol_name(&name));
+            names.push(perf_dwarf_function_name(&name));
         }
     }
     (!names.is_empty()).then(|| perf_inline_frame_order(names))
@@ -893,6 +893,38 @@ fn rust_addr2line_frame_names(loader: &addr2line::Loader, address: u64) -> Optio
 #[must_use]
 pub fn perf_symbol_name(name: &str) -> String {
     name.to_owned()
+}
+
+#[must_use]
+pub fn perf_dwarf_function_name(name: &str) -> String {
+    if looks_like_cpp_qualified_name(name) {
+        return name.to_owned();
+    }
+    leaf_after_last_namespace_separator(name)
+        .unwrap_or(name)
+        .to_owned()
+}
+
+fn looks_like_cpp_qualified_name(name: &str) -> bool {
+    name.starts_with("std::vector")
+        || name.starts_with("std::allocator")
+        || (name.contains("std::vector") && name.contains("::"))
+}
+
+fn leaf_after_last_namespace_separator(name: &str) -> Option<&str> {
+    let mut angle_depth = 0_u32;
+    let mut last_namespace_separator = None;
+    for (index, character) in name.char_indices() {
+        match character {
+            '<' => angle_depth = angle_depth.saturating_add(1),
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            ':' if angle_depth == 0 && name[index..].starts_with("::") => {
+                last_namespace_separator = Some(index);
+            }
+            _ => {}
+        }
+    }
+    last_namespace_separator.and_then(|index| name.get(index + 2..))
 }
 
 #[must_use]

@@ -9,7 +9,7 @@ use pyroclast::perfdata::mappings::FileIdentity;
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
 use pyroclast::symbols::{
     Addr2lineResolver, Kallsyms, RustAddr2lineResolver, SymbolCache, SymbolRequest, SymbolResolver,
-    perf_debug_dir, perf_inline_frame_order, perf_symbol_name,
+    perf_debug_dir, perf_dwarf_function_name, perf_inline_frame_order, perf_symbol_name,
     perf_symbol_resolver_for_perfdata_file, perf_symbol_resolver_for_perfdata_file_with_symbolizer,
 };
 
@@ -315,6 +315,40 @@ fn perf_symbol_name_preserves_language_qualified_names_like_perf_script() {
     assert_eq!(
         perf_symbol_name("__memmove_avx_unaligned_erms"),
         "__memmove_avx_unaligned_erms"
+    );
+}
+
+#[test]
+fn perf_dwarf_function_name_matches_perf_script_inline_names() {
+    assert_eq!(
+        perf_dwarf_function_name("pyroclast::perfdata::attrs::parse_file_attrs"),
+        "parse_file_attrs"
+    );
+    assert_eq!(
+        perf_dwarf_function_name(
+            "pyroclast::symbols::PerfSymbolResolver<O>::with_perfdata_file_kernel_cache"
+        ),
+        "with_perfdata_file_kernel_cache"
+    );
+    assert_eq!(
+        perf_dwarf_function_name(
+            "<pyroclast::cli::RunArgs as clap_builder::derive::Args>::augment_args"
+        ),
+        "augment_args"
+    );
+    assert_eq!(
+        perf_dwarf_function_name(
+            "insert_recursing<u64, alloc::string::String, alloc::alloc::Global, alloc::collections::btree::map::entry::{impl#8}::insert_entry::{closure_env#0}<u64, alloc::string::String, alloc::alloc::Global>>"
+        ),
+        "insert_recursing<u64, alloc::string::String, alloc::alloc::Global, alloc::collections::btree::map::entry::{impl#8}::insert_entry::{closure_env#0}<u64, alloc::string::String, alloc::alloc::Global>>"
+    );
+    assert_eq!(
+        perf_dwarf_function_name("std::vector<int, std::allocator<int>>::push_back"),
+        "std::vector<int, std::allocator<int>>::push_back"
+    );
+    assert_eq!(
+        perf_dwarf_function_name("foo::bar<std::vector<int>>::baz"),
+        "foo::bar<std::vector<int>>::baz"
     );
 }
 
