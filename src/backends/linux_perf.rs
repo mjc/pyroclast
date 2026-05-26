@@ -4,7 +4,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::artifacts::ArtifactLayout;
 use crate::backends::{BackendResult, ProfileRequest, ProfileResult, ProfilerBackend};
 use crate::cli::PerfEvent;
-use crate::flamegraph::{FlamegraphRenderer, FlamegraphRequest, InfernoFlamegraphRenderer};
+use crate::flamegraph::{
+    FlamegraphRenderer, FlamegraphRequest, INFERNO_DEFAULT_TITLE, InfernoFlamegraphRenderer,
+};
 use crate::manifest::{BackendName, RunManifest};
 use crate::perfdata::fold::{
     FoldOptions, fold_perfdata_file_with_options, fold_perfdata_file_with_symbols,
@@ -143,7 +145,7 @@ where
         let folded_summary = summarize_folded_stacks(&folded_stacks);
         std::fs::write(layout.stacks_folded(), &folded_stacks)?;
         let flamegraph_output = match self.flamegraph_renderer.render(&FlamegraphRequest {
-            title: "CPU profile".to_string(),
+            title: INFERNO_DEFAULT_TITLE.to_string(),
             folded_stacks,
             output: layout.flamegraph_svg(),
         }) {

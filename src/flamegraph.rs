@@ -6,6 +6,8 @@ use crate::tools::ToolSpec;
 
 pub mod analysis;
 
+pub const INFERNO_DEFAULT_TITLE: &str = "Flame Graph";
+
 #[must_use]
 pub fn build_inferno_flamegraph_command(title: &str) -> CommandSpec {
     CommandSpec::new("inferno-flamegraph").args([

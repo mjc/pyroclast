@@ -147,6 +147,7 @@ fn linux_perf_backend_accepts_pluggable_flamegraph_renderer() {
     let result = backend.profile(&request).expect("profile");
 
     assert_eq!(renderer.folded_stacks(), "app;/bin/app+0x1000 1\n");
+    assert_eq!(renderer.title(), "Flame Graph");
     assert_eq!(
         std::fs::read_to_string(result.layout.flamegraph_svg()).expect("flamegraph svg"),
         "<svg>plugin</svg>\n"
@@ -420,11 +421,16 @@ impl ThreadLister for FakeThreadLister {
 #[derive(Default)]
 struct RecordingRenderer {
     folded_stacks: Mutex<String>,
+    title: Mutex<String>,
 }
 
 impl RecordingRenderer {
     fn folded_stacks(&self) -> String {
         self.folded_stacks.lock().unwrap().clone()
+    }
+
+    fn title(&self) -> String {
+        self.title.lock().unwrap().clone()
     }
 }
 
@@ -434,6 +440,7 @@ impl FlamegraphRenderer for &RecordingRenderer {
             .lock()
             .unwrap()
             .clone_from(&request.folded_stacks);
+        self.title.lock().unwrap().clone_from(&request.title);
         std::fs::write(&request.output, "<svg>plugin</svg>\n")?;
         Ok(FlamegraphRenderResult { stderr: Vec::new() })
     }
