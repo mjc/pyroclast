@@ -30,6 +30,20 @@ pub trait SymbolResolver {
     ///
     /// Returns an error when the backing symbolizer cannot complete the batch.
     fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String>;
+
+    /// Resolves a batch of object-relative addresses to display frame lists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backing symbolizer cannot complete the batch.
+    fn resolve_frame_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Vec<String>>, String> {
+        self.resolve_batch(requests).map(|symbols| {
+            symbols
+                .into_iter()
+                .map(|symbol| symbol.into_iter().collect())
+                .collect()
+        })
+    }
 }
 
 pub struct SymbolCache<'a, R> {

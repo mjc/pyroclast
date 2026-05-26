@@ -56,6 +56,30 @@ fn resolves_each_unique_symbol_address_once() {
 }
 
 #[test]
+fn symbol_resolver_frame_batch_defaults_to_single_symbol_frames() {
+    let resolver = RecordingResolver::with_symbols([(
+        SymbolRequest {
+            path: PathBuf::from("/bin/app"),
+            relative_address: 0x10,
+            build_id: None,
+            kernel_relocation: None,
+        },
+        "app::main".to_string(),
+    )]);
+
+    let frames = resolver
+        .resolve_frame_batch(&[SymbolRequest {
+            path: PathBuf::from("/bin/app"),
+            relative_address: 0x10,
+            build_id: None,
+            kernel_relocation: None,
+        }])
+        .expect("frames");
+
+    assert_eq!(frames, vec![vec!["app::main".to_string()]]);
+}
+
+#[test]
 fn batches_only_uncached_symbol_addresses() {
     let resolver = RecordingResolver::with_symbols([
         (
