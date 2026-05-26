@@ -218,6 +218,44 @@ fn keeps_dwarf_user_stack_payloads_when_kernel_callchain_has_user_context_marker
 }
 
 #[test]
+fn ignores_dwarf_user_stack_payloads_when_kernel_callchain_has_no_user_context_marker() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            (1 << 6) | (1 << 7) | (1 << 8),
+        )],
+        [record_bytes(
+            9,
+            &sample_payload_with_user_stack(
+                0x4000,
+                11,
+                12,
+                [
+                    0xffff_ffff_ffff_ff80,
+                    0xffff_ffff_8100_0000,
+                    0xffff_ffff_8200_0000,
+                ],
+                1,
+                [0x7fff_0008, 0x7fff_0000, 0x4000],
+                [
+                    0, 0, 0, 0, 0, 0, 0, 0, //
+                    0x40, 0, 0, 0, 0, 0, 0, 0, //
+                    0x34, 0x12, 0, 0, 0, 0, 0, 0,
+                ],
+            ),
+        )],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, "[unknown];[unknown] 1\n");
+}
+
+#[test]
 fn uses_mapped_object_unwinder_for_dwarf_user_stack_frames() {
     let current_exe = std::env::current_exe().expect("current exe");
     let current_exe = current_exe.to_string_lossy();
