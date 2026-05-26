@@ -1084,6 +1084,27 @@ fn symbolized_fold_keeps_unknown_caller_before_inline_frames_like_perf_script() 
 }
 
 #[test]
+fn symbolized_fold_renders_unmapped_user_caller_as_unknown_like_perf_script() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(1, &mmap_payload(11, 11, 0x1000, 0x100, 0, "/bin/app")),
+            record_bytes(9, &sample_payload(0x1000, 11, 12, [0x1010, 0x2010])),
+        ],
+    );
+    let resolver = InlineSymbolResolver;
+
+    let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
+        .expect("folded");
+
+    assert_eq!(folded, "[unknown];app::outer;app::inner 1\n");
+}
+
+#[test]
 fn symbolized_fold_uses_module_fallback_for_unresolved_user_frames_like_inferno() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(

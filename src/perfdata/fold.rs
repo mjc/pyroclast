@@ -744,6 +744,7 @@ impl<'a> FoldFrameResolver<'a> {
     where
         R: SymbolResolver,
     {
+        let symbolizing = symbol_cache.is_some();
         if let Some(mapping) = pid.and_then(|pid| self.mmap_table.resolve(pid, frame)) {
             if is_kernel_space_frame(frame) && !is_kernel_mapping(&mapping) {
                 return Ok(vec![format!("0x{frame:x}")]);
@@ -759,7 +760,7 @@ impl<'a> FoldFrameResolver<'a> {
                 return Ok(vec![UNKNOWN_FRAME.to_string()]);
             }
             Ok(vec![mapped_frame_label(&mapping)])
-        } else if is_kernel_space_frame(frame) {
+        } else if is_kernel_space_frame(frame) || symbolizing {
             Ok(vec![UNKNOWN_FRAME.to_string()])
         } else {
             Ok(vec![format!("0x{frame:x}")])
