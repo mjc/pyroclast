@@ -332,6 +332,12 @@ fn perf_dwarf_function_name_matches_perf_script_inline_names() {
     );
     assert_eq!(
         perf_dwarf_function_name(
+            "pyroclast::symbols::perf_symbol_resolver_for_current_home_with_symbolizer<pyroclast::process::RealCommandRunner>"
+        ),
+        "perf_symbol_resolver_for_current_home_with_symbolizer<pyroclast::process::RealCommandRunner>"
+    );
+    assert_eq!(
+        perf_dwarf_function_name(
             "<pyroclast::cli::RunArgs as clap_builder::derive::Args>::augment_args"
         ),
         "augment_args"
