@@ -294,7 +294,12 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
                             frames
                                 .into_iter()
                                 .rev()
-                                .filter(|frame| !is_perf_context_marker(*frame)),
+                                .filter(|frame| !is_perf_context_marker(*frame))
+                                .filter(|frame| {
+                                    pid.is_none_or(|pid| {
+                                        !mmap_table.is_known_non_executable(pid, *frame)
+                                    })
+                                }),
                         );
                         raw_stacks.add_slice(pid, &callchain, count);
                     }

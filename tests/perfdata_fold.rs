@@ -22,7 +22,7 @@ fn summarizes_record_counts_and_comm_names() {
             ),
             record_bytes(
                 10,
-                &mmap2_payload(1, 2, 0x3000, 0x4000, 0, "/usr/lib/libc.so"),
+                &mmap2_payload(1, 2, 0x3000, 0x4000, 0, 5, "/usr/lib/libc.so"),
             ),
             record_bytes(9, b"sample"),
         ],
@@ -176,6 +176,46 @@ fn folds_dwarf_user_stack_payloads_before_kernel_callchain_frames() {
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
     assert_eq!(folded, "0x1234;0x4000;0xa000;0x9000 1\n");
+}
+
+#[test]
+fn drops_dwarf_user_stack_frames_from_known_non_executable_mappings() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            (1 << 6) | (1 << 7) | (1 << 8),
+        )],
+        [
+            record_bytes(
+                10,
+                &mmap2_payload(11, 11, 0x1200, 0x100, 0, 1, "/tmp/perf.data"),
+            ),
+            record_bytes(
+                9,
+                &sample_payload_with_user_stack(
+                    0x4000,
+                    11,
+                    12,
+                    [0x9000],
+                    1,
+                    [0x7fff_0008, 0x7fff_0000, 0x4000],
+                    [
+                        0, 0, 0, 0, 0, 0, 0, 0, //
+                        0x40, 0, 0, 0, 0, 0, 0, 0, //
+                        0x34, 0x12, 0, 0, 0, 0, 0, 0,
+                    ],
+                ),
+            ),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, "0x4000;0x9000 1\n");
 }
 
 #[test]
@@ -841,13 +881,21 @@ fn mmap_payload(pid: u32, tid: u32, start: u64, len: u64, pgoff: u64, path: &str
     payload
 }
 
-fn mmap2_payload(pid: u32, tid: u32, start: u64, len: u64, pgoff: u64, path: &str) -> Vec<u8> {
+fn mmap2_payload(
+    pid: u32,
+    tid: u32,
+    start: u64,
+    len: u64,
+    pgoff: u64,
+    prot: u32,
+    path: &str,
+) -> Vec<u8> {
     let mut payload = mmap_range_payload(pid, tid, start, len, pgoff);
     payload.extend(8u32.to_le_bytes());
     payload.extend(1u32.to_le_bytes());
     payload.extend(99u64.to_le_bytes());
     payload.extend(7u64.to_le_bytes());
-    payload.extend(5u32.to_le_bytes());
+    payload.extend(prot.to_le_bytes());
     payload.extend(2u32.to_le_bytes());
     payload.extend(path.as_bytes());
     payload.push(0);

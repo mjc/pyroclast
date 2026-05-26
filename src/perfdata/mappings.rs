@@ -1,6 +1,8 @@
 use crate::perfdata::records::{Mmap2BuildIdRecord, Mmap2Record, MmapRecord};
 use crate::symbols::KernelRelocation;
 
+const PROT_EXEC: u32 = 4;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MmapTable {
     mappings: Vec<Mapping>,
@@ -32,6 +34,7 @@ struct Mapping {
     pgoff: u64,
     path: String,
     build_id: Option<Vec<u8>>,
+    prot: Option<u32>,
 }
 
 impl MmapTable {
@@ -43,6 +46,7 @@ impl MmapTable {
             pgoff: record.pgoff,
             path: record.path,
             build_id: None,
+            prot: None,
         });
     }
 
@@ -54,6 +58,7 @@ impl MmapTable {
             pgoff: record.pgoff,
             path: record.path,
             build_id: None,
+            prot: Some(record.prot),
         });
     }
 
@@ -65,6 +70,7 @@ impl MmapTable {
             pgoff: record.pgoff,
             path: record.path,
             build_id: Some(record.build_id),
+            prot: Some(record.prot),
         });
     }
 
@@ -95,6 +101,15 @@ impl MmapTable {
                 build_id: mapping.build_id.as_deref(),
             })
     }
+
+    #[must_use]
+    pub fn is_known_non_executable(&self, pid: u32, ip: u64) -> bool {
+        self.mappings
+            .iter()
+            .filter(|mapping| mapping.contains(pid, ip))
+            .max_by_key(|mapping| mapping.start)
+            .is_some_and(Mapping::is_known_non_executable)
+    }
 }
 
 impl Mapping {
@@ -124,5 +139,9 @@ impl Mapping {
 
     fn is_user_file_mapping(&self) -> bool {
         !self.path.starts_with('[') && self.pid != u32::MAX
+    }
+
+    fn is_known_non_executable(&self) -> bool {
+        self.prot.is_some_and(|prot| prot & PROT_EXEC == 0)
     }
 }
