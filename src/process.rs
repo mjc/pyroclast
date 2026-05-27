@@ -111,7 +111,10 @@ impl RealCommandRunner {
         };
         let resolved = self.resolve_tool(&tool)?;
         let mut command = command.clone();
-        command.program = resolved.path;
+        let existing_args = std::mem::take(&mut command.args);
+        command.program = resolved.launch_program;
+        command.args = resolved.launch_args;
+        command.args.extend(existing_args);
         Ok(command)
     }
 }

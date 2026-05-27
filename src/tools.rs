@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 use crate::process::{CommandRunner, CommandSpec};
@@ -59,19 +60,31 @@ impl ToolSpec {
         }
     }
 
-    fn version_command(program: &str) -> CommandSpec {
-        CommandSpec::new(program).arg("--version")
+    fn probe_command(self, program: &str) -> CommandSpec {
+        match self.name {
+            "inferno-flamegraph" | "inferno-collapse-perf" => {
+                CommandSpec::new(program).arg("--help")
+            }
+            _ => CommandSpec::new(program).arg("--version"),
+        }
     }
 
-    fn accepts_version_output(self, version: Option<&str>) -> bool {
+    fn accepts_probe_output(self, probe_output: Option<&str>) -> bool {
         match self.name {
-            "xctrace" => version.is_none_or(|line| {
+            "xctrace" => probe_output.is_none_or(|line| {
                 let lowered = line.to_ascii_lowercase();
                 !lowered.contains("xcode")
                     && !lowered.contains("developer directory")
                     && !lowered.contains("unable to find utility")
             }),
             _ => true,
+        }
+    }
+
+    fn reported_version(self, stdout: &[u8], stderr: &[u8]) -> Option<String> {
+        match self.name {
+            "inferno-flamegraph" | "inferno-collapse-perf" => None,
+            _ => first_output_line(stdout, stderr),
         }
     }
 
@@ -104,6 +117,8 @@ pub struct ResolvedTool {
     pub path: String,
     pub source: ToolSource,
     pub version: Option<String>,
+    pub launch_program: String,
+    pub launch_args: Vec<String>,
 }
 
 impl ResolvedTool {
@@ -114,6 +129,8 @@ impl ResolvedTool {
             path: tool.name.to_string(),
             source: ToolSource::Path,
             version: None,
+            launch_program: tool.name.to_string(),
+            launch_args: Vec::new(),
         }
     }
 }
@@ -185,27 +202,16 @@ where
             return Ok(resolved.clone());
         }
 
-        let mut resolved = if self.context.in_nix_shell {
-            self.resolve_from_path(tool, true)?
+        let mut attempts = Vec::new();
+        let resolved = if self.context.in_nix_shell {
+            self.resolve_from_path(tool, true, &mut attempts)
         } else {
-            None
-        };
-        if resolved.is_none() && !self.context.in_nix_shell {
-            resolved = self.resolve_from_path(tool, false)?;
+            self.resolve_from_path(tool, false, &mut attempts)
         }
-        if resolved.is_none() {
-            resolved = match self.resolve_from_project_flake(tool) {
-                Some(Ok(found)) => Some(found),
-                Some(Err(_)) | None => None,
-            };
-        }
-        if resolved.is_none() {
-            resolved = match self.resolve_from_ephemeral_nix(tool) {
-                Some(Ok(found)) => Some(found),
-                Some(Err(_)) | None => None,
-            };
-        }
-        let resolved = resolved.ok_or_else(|| std::io::Error::other(tool.missing_tool_error()))?;
+        .or_else(|| self.resolve_from_project_flake(tool, &mut attempts))
+        .or_else(|| self.resolve_from_ephemeral_nix(tool, &mut attempts));
+        let resolved =
+            resolved.ok_or_else(|| resolution_error(tool, &attempts, &self.context.cwd))?;
         self.cache.insert(tool.name, resolved.clone());
         Ok(resolved)
     }
@@ -214,41 +220,133 @@ where
         &self,
         tool: &ToolSpec,
         in_nix_shell: bool,
-    ) -> std::io::Result<Option<ResolvedTool>> {
+        attempts: &mut Vec<String>,
+    ) -> Option<ResolvedTool> {
         let Some(path) = find_executable_on_path(tool.name, self.context.path.as_deref()) else {
-            return Ok(None);
+            attempts.push(format!(
+                "{}: not found",
+                if in_nix_shell {
+                    "PATH (inside current nix shell)"
+                } else {
+                    "PATH"
+                }
+            ));
+            return None;
         };
         match self.probe_tool_version(tool, &path.to_string_lossy()) {
-            Ok(version) => Ok(Some(ResolvedTool {
-                name: tool.name.to_string(),
-                path: path.to_string_lossy().into_owned(),
-                source: if in_nix_shell {
-                    ToolSource::InNixShell
-                } else {
-                    ToolSource::Path
-                },
-                version,
-            })),
-            Err(error) if tool.kind == ToolKind::AppleProvided => Err(error),
-            Err(_) => Ok(None),
+            Ok(version) => {
+                let path = path.to_string_lossy().into_owned();
+                attempts.push(format!(
+                    "{}: found {}",
+                    if in_nix_shell {
+                        "PATH (inside current nix shell)"
+                    } else {
+                        "PATH"
+                    },
+                    path
+                ));
+                Some(ResolvedTool {
+                    name: tool.name.to_string(),
+                    path: path.clone(),
+                    source: if in_nix_shell {
+                        ToolSource::InNixShell
+                    } else {
+                        ToolSource::Path
+                    },
+                    version,
+                    launch_program: path,
+                    launch_args: Vec::new(),
+                })
+            }
+            Err(error) => {
+                attempts.push(format!(
+                    "{}: found {} but probe failed: {}",
+                    if in_nix_shell {
+                        "PATH (inside current nix shell)"
+                    } else {
+                        "PATH"
+                    },
+                    path.display(),
+                    error
+                ));
+                None
+            }
         }
     }
 
-    fn resolve_from_project_flake(&self, tool: &ToolSpec) -> Option<std::io::Result<ResolvedTool>> {
+    fn resolve_from_project_flake(
+        &self,
+        tool: &ToolSpec,
+        attempts: &mut Vec<String>,
+    ) -> Option<ResolvedTool> {
         if tool.kind == ToolKind::AppleProvided {
             return None;
         }
-        let nix = find_executable_on_path("nix", self.context.path.as_deref())?;
-        let flake_dir = find_nearest_flake_dir(&self.context.cwd)?;
-        Some(self.probe_nix_shell_tool(&nix, tool, &flake_dir, false))
+        let Some(nix) = find_executable_on_path("nix", self.context.path.as_deref()) else {
+            attempts.push("project flake: skipped because `nix` was not found on PATH".to_string());
+            return None;
+        };
+        let Some(flake_dir) = find_nearest_flake_dir(&self.context.cwd) else {
+            attempts.push(format!(
+                "project flake: skipped because no flake.nix was found from {} upward",
+                self.context.cwd.display()
+            ));
+            return None;
+        };
+        match self.probe_nix_shell_tool(&nix, tool, &flake_dir) {
+            Ok(resolved) => {
+                attempts.push(format!(
+                    "project flake via `nix develop {}`: found {}",
+                    flake_dir.display(),
+                    resolved.path
+                ));
+                Some(resolved)
+            }
+            Err(error) => {
+                attempts.push(format!(
+                    "project flake via `nix develop {}`: failed: {}",
+                    flake_dir.display(),
+                    error
+                ));
+                None
+            }
+        }
     }
 
-    fn resolve_from_ephemeral_nix(&self, tool: &ToolSpec) -> Option<std::io::Result<ResolvedTool>> {
+    fn resolve_from_ephemeral_nix(
+        &self,
+        tool: &ToolSpec,
+        attempts: &mut Vec<String>,
+    ) -> Option<ResolvedTool> {
         if !tool.allow_ephemeral_nix {
+            attempts.push("ephemeral nix shell: skipped because this tool is not allowed to come from nixpkgs on demand".to_string());
             return None;
         }
-        let nix = find_executable_on_path("nix", self.context.path.as_deref())?;
-        Some(self.probe_nix_shell_tool(&nix, tool, &self.context.cwd, true))
+        let Some(nix) = find_executable_on_path("nix", self.context.path.as_deref()) else {
+            attempts.push(
+                "ephemeral nix shell: skipped because `nix` was not found on PATH".to_string(),
+            );
+            return None;
+        };
+        let package = tool
+            .nix_package
+            .expect("ephemeral nix tools must declare a nix package");
+        match self.probe_ephemeral_nix_tool(&nix, tool) {
+            Ok(resolved) => {
+                attempts.push(format!(
+                    "ephemeral nix shell via `nix shell nixpkgs#{} --command {}`: found {}",
+                    package, tool.name, resolved.path
+                ));
+                Some(resolved)
+            }
+            Err(error) => {
+                attempts.push(format!(
+                    "ephemeral nix shell via `nix shell nixpkgs#{} --command {}`: failed: {}",
+                    package, tool.name, error
+                ));
+                None
+            }
+        }
     }
 
     fn probe_nix_shell_tool(
@@ -256,50 +354,78 @@ where
         nix: &Path,
         tool: &ToolSpec,
         working_dir: &Path,
-        ephemeral: bool,
     ) -> std::io::Result<ResolvedTool> {
-        let probe = if ephemeral {
-            let Some(package) = tool.nix_package else {
-                return Err(std::io::Error::other(tool.missing_tool_error()));
-            };
-            CommandSpec::new(nix.to_string_lossy().into_owned()).args([
-                "--extra-experimental-features".to_string(),
-                "nix-command flakes".to_string(),
-                "shell".to_string(),
-                format!("nixpkgs#{package}"),
-                "-c".to_string(),
-                "sh".to_string(),
-                "-lc".to_string(),
-                format!("command -v {}", tool.name),
-            ])
-        } else {
-            CommandSpec::new(nix.to_string_lossy().into_owned()).args([
-                "--extra-experimental-features".to_string(),
-                "nix-command flakes".to_string(),
-                "develop".to_string(),
-                working_dir.display().to_string(),
-                "-c".to_string(),
-                "sh".to_string(),
-                "-lc".to_string(),
-                format!("command -v {}", tool.name),
-            ])
-        };
+        let probe = CommandSpec::new(nix.to_string_lossy().into_owned()).args([
+            "--extra-experimental-features".to_string(),
+            "nix-command flakes".to_string(),
+            "develop".to_string(),
+            working_dir.display().to_string(),
+            "-c".to_string(),
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("command -v {}", tool.name),
+        ]);
         let output = self.runner.run(&probe)?;
         if output.status_code != Some(0) {
-            return Err(std::io::Error::other(tool.missing_tool_error()));
+            return Err(command_probe_error("nix develop probe failed", &output));
         }
-        let path = first_output_line(&output.stdout, &output.stderr)
-            .ok_or_else(|| std::io::Error::other(tool.missing_tool_error()))?;
+        let path = last_output_line(&output.stdout).ok_or_else(|| {
+            probe_output_error("nix develop probe did not report a tool path on stdout")
+        })?;
+        let version = self.probe_tool_version(tool, &path)?;
+        Ok(ResolvedTool {
+            name: tool.name.to_string(),
+            path: path.clone(),
+            source: ToolSource::ProjectFlake,
+            version,
+            launch_program: path.clone(),
+            launch_args: Vec::new(),
+        })
+    }
+
+    fn probe_ephemeral_nix_tool(
+        &self,
+        nix: &Path,
+        tool: &ToolSpec,
+    ) -> std::io::Result<ResolvedTool> {
+        let Some(package) = tool.nix_package else {
+            return Err(std::io::Error::other(tool.missing_tool_error()));
+        };
+        let launch_program = nix.to_string_lossy().into_owned();
+        let package_ref = format!("nixpkgs#{package}");
+        let launch_args = vec![
+            "--extra-experimental-features".to_string(),
+            "nix-command flakes".to_string(),
+            "shell".to_string(),
+            package_ref.clone(),
+            "--command".to_string(),
+            tool.name.to_string(),
+        ];
+        let probe = CommandSpec::new(launch_program.clone()).args([
+            "--extra-experimental-features".to_string(),
+            "nix-command flakes".to_string(),
+            "shell".to_string(),
+            package_ref,
+            "--command".to_string(),
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("command -v {}", tool.name),
+        ]);
+        let output = self.runner.run(&probe)?;
+        if output.status_code != Some(0) {
+            return Err(command_probe_error("nix shell probe failed", &output));
+        }
+        let path = last_output_line(&output.stdout).ok_or_else(|| {
+            probe_output_error("nix shell probe did not report a tool path on stdout")
+        })?;
         let version = self.probe_tool_version(tool, &path)?;
         Ok(ResolvedTool {
             name: tool.name.to_string(),
             path,
-            source: if ephemeral {
-                ToolSource::EphemeralNix
-            } else {
-                ToolSource::ProjectFlake
-            },
+            source: ToolSource::EphemeralNix,
             version,
+            launch_program,
+            launch_args,
         })
     }
 
@@ -308,15 +434,20 @@ where
         tool: &ToolSpec,
         program: &str,
     ) -> std::io::Result<Option<String>> {
-        let output = self.runner.run(&ToolSpec::version_command(program))?;
+        let output = self.runner.run(&tool.probe_command(program))?;
         if output.status_code != Some(0) {
-            return Err(std::io::Error::other(tool.missing_tool_error()));
+            return Err(command_probe_error(
+                &format!("{program} probe failed"),
+                &output,
+            ));
         }
-        let version = first_output_line(&output.stdout, &output.stderr);
-        if !tool.accepts_version_output(version.as_deref()) {
-            return Err(std::io::Error::other(tool.missing_tool_error()));
+        let probe_output = first_output_line(&output.stdout, &output.stderr);
+        if !tool.accepts_probe_output(probe_output.as_deref()) {
+            return Err(probe_output_error(&format!(
+                "{program} probe returned unusable output"
+            )));
         }
-        Ok(version)
+        Ok(tool.reported_version(&output.stdout, &output.stderr))
     }
 }
 
@@ -391,13 +522,13 @@ where
             error: None,
         };
     }
-    let output = runner.run(&ToolSpec::version_command(&resolved.path));
+    let output = runner.run(&tool.probe_command(&resolved.path));
     match output {
         Ok(output) if output.status_code == Some(0) => ToolVersion {
             name: tool.name.to_string(),
             path: Some(resolved.path),
             source: Some(resolved.source),
-            version: first_output_line(&output.stdout, &output.stderr),
+            version: tool.reported_version(&output.stdout, &output.stderr),
             error: None,
         },
         Ok(output) => ToolVersion {
@@ -424,6 +555,56 @@ fn first_output_line(stdout: &[u8], stderr: &[u8]) -> Option<String> {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn last_output_line(output: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn probe_detail(stdout: &[u8], stderr: &[u8]) -> Option<String> {
+    let stderr_lines = String::from_utf8_lossy(stderr);
+    stderr_lines
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("error:"))
+        .map(ToOwned::to_owned)
+        .or_else(|| last_output_line(stderr))
+        .or_else(|| last_output_line(stdout))
+}
+
+fn command_probe_error(context: &str, output: &crate::process::CommandOutput) -> std::io::Error {
+    let detail = probe_detail(&output.stdout, &output.stderr)
+        .unwrap_or_else(|| format!("exit status {:?}", output.status_code));
+    std::io::Error::other(format!("{context}: {detail}"))
+}
+
+fn probe_output_error(context: &str) -> std::io::Error {
+    std::io::Error::other(context.to_string())
+}
+
+fn resolution_error(tool: &ToolSpec, attempts: &[String], cwd: &Path) -> std::io::Error {
+    let mut message = tool.missing_tool_error();
+    message.push_str("\nResolution attempts:");
+    for attempt in attempts {
+        message.push_str("\n- ");
+        message.push_str(attempt);
+    }
+    if attempts.is_empty() {
+        message.push_str("\n- no supported resolution sources were available");
+    }
+    if tool.kind == ToolKind::NixManaged {
+        let _ = write!(
+            message,
+            "\nNext step: install `{}` directly, add it to the project flake, or run from a dev shell for {}.",
+            tool.name,
+            cwd.display()
+        );
+    }
+    std::io::Error::other(message)
 }
 
 const fn nix_tool(name: &'static str) -> ToolSpec {

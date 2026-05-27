@@ -278,6 +278,8 @@ impl CommandRunner for MissingHeaptrackPrintRunner {
             path: tool.name.to_string(),
             source: ToolSource::Path,
             version: Some(format!("{} fake version", tool.name)),
+            launch_program: tool.name.to_string(),
+            launch_args: Vec::new(),
         })
     }
 }

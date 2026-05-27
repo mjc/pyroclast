@@ -698,7 +698,8 @@ where
     let collapse_tool = runner
         .resolve_tool(&INFERNO_COLLAPSE_PERF)
         .map_err(|error| format!("failed to resolve inferno-collapse-perf: {error}"))?;
-    let mut collapse_command = Command::new(&collapse_tool.path);
+    let mut collapse_command = Command::new(&collapse_tool.launch_program);
+    collapse_command.args(&collapse_tool.launch_args);
     if let Some(path) = &perf_script {
         collapse_command.arg(path);
     }
@@ -810,9 +811,9 @@ where
     let resolved = runner
         .resolve_tool(&INFERNO_FLAMEGRAPH)
         .map_err(|error| format!("failed to resolve inferno-flamegraph: {error}"))?;
-    let mut spec = build_inferno_flamegraph_command(title);
-    spec.program = resolved.path;
-    let mut command = Command::new(&spec.program);
+    let spec = build_inferno_flamegraph_command(title);
+    let mut command = Command::new(&resolved.launch_program);
+    command.args(&resolved.launch_args);
     command.args(&spec.args);
     for (key, value) in &spec.env {
         command.env(key, value);
