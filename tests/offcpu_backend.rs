@@ -69,7 +69,7 @@ fn offcpu_backend_defaults_to_perf_sched_summary_artifacts() {
         result.manifest.diagnostics,
         vec!["offcpu method: perf_sched".to_string()]
     );
-    assert_eq!(runner.programs(), vec!["perf", "perf", "perf"]);
+    assert_eq!(runner.programs(), vec!["perf", "perf"]);
 }
 
 #[test]
@@ -129,7 +129,7 @@ fn offcpu_backend_bpftrace_method_writes_folded_stack_artifacts() {
         result.manifest.diagnostics,
         vec!["offcpu method: bpftrace".to_string()]
     );
-    assert_eq!(runner.programs(), vec!["bpftrace", "bpftrace"]);
+    assert_eq!(runner.programs(), vec!["bpftrace"]);
 }
 
 #[test]
@@ -180,7 +180,7 @@ fn offcpu_backend_perf_cpu_clock_method_writes_folded_stack_artifacts() {
             .collect::<Vec<_>>(),
         vec!["perf"]
     );
-    assert_eq!(runner.programs(), vec!["perf", "perf"]);
+    assert_eq!(runner.programs(), vec!["perf"]);
 }
 
 #[test]

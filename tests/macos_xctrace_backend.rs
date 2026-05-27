@@ -43,7 +43,7 @@ fn macos_xctrace_backend_writes_cpu_summary_artifacts() {
             .expect("summary json");
     assert_eq!(summary_json["rows"].as_array().expect("rows").len(), 2);
     assert_eq!(summary_json["total_weight"], 15.5);
-    assert_eq!(runner.programs(), vec!["xctrace", "xctrace", "xctrace"]);
+    assert_eq!(runner.programs(), vec!["xctrace", "xctrace"]);
     assert_eq!(
         result.manifest.actual_backend,
         pyroclast::manifest::BackendName::MacosXctrace

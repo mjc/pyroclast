@@ -194,10 +194,16 @@ where
             resolved = self.resolve_from_path(tool, false)?;
         }
         if resolved.is_none() {
-            resolved = self.resolve_from_project_flake(tool).transpose()?;
+            resolved = match self.resolve_from_project_flake(tool) {
+                Some(Ok(found)) => Some(found),
+                Some(Err(_)) | None => None,
+            };
         }
         if resolved.is_none() {
-            resolved = self.resolve_from_ephemeral_nix(tool).transpose()?;
+            resolved = match self.resolve_from_ephemeral_nix(tool) {
+                Some(Ok(found)) => Some(found),
+                Some(Err(_)) | None => None,
+            };
         }
         let resolved = resolved.ok_or_else(|| std::io::Error::other(tool.missing_tool_error()))?;
         self.cache.insert(tool.name, resolved.clone());
@@ -333,6 +339,33 @@ where
         .collect()
 }
 
+/// Resolves all required tools up front and returns version metadata.
+///
+/// # Errors
+///
+/// Returns an I/O error as soon as any required tool cannot be resolved.
+pub fn resolve_required_tools<R>(
+    runner: &R,
+    tools: &[ToolSpec],
+) -> std::io::Result<Vec<ToolVersion>>
+where
+    R: CommandRunner,
+{
+    tools
+        .iter()
+        .map(|tool| {
+            let resolved = runner.resolve_tool(tool)?;
+            Ok(ToolVersion {
+                name: resolved.name,
+                path: Some(resolved.path),
+                source: Some(resolved.source),
+                version: resolved.version,
+                error: None,
+            })
+        })
+        .collect()
+}
+
 fn collect_tool_version<R>(runner: &R, tool: &ToolSpec) -> ToolVersion
 where
     R: CommandRunner,
@@ -406,8 +439,8 @@ pub const INFERNO_COLLAPSE_PERF: ToolSpec = nix_utility("inferno-collapse-perf",
 pub const TOKIO_CONSOLE: ToolSpec = nix_utility("tokio-console", "tokio-console");
 pub const ADDR2LINE: ToolSpec = nix_utility("addr2line", "binutils");
 pub const PERF: ToolSpec = nix_tool("perf");
-pub const HEAPTRACK: ToolSpec = nix_tool("heaptrack");
-pub const HEAPTRACK_PRINT: ToolSpec = nix_tool("heaptrack_print");
+pub const HEAPTRACK: ToolSpec = nix_utility("heaptrack", "heaptrack");
+pub const HEAPTRACK_PRINT: ToolSpec = nix_utility("heaptrack_print", "heaptrack");
 pub const STRACE: ToolSpec = nix_tool("strace");
 pub const BPFTRACE: ToolSpec = nix_tool("bpftrace");
 pub const VALGRIND: ToolSpec = nix_tool("valgrind");

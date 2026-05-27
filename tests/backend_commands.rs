@@ -125,6 +125,7 @@ fn builds_heaptrack_command() {
     assert_eq!(
         command.args,
         vec![
+            "--record-only",
             "-o",
             "run/profile.raw.heaptrack",
             "target/release/app",

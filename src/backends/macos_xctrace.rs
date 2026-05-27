@@ -7,7 +7,7 @@ use crate::manifest::{BackendName, RunManifest};
 use crate::parsers::xctrace::{parse_cpu_profile, render_cpu_profile_summary_text};
 use crate::process::CommandRunner;
 use crate::process::CommandSpec;
-use crate::tools::{ToolSpec, collect_tool_versions};
+use crate::tools::{XCTRACE, resolve_required_tools};
 
 pub const XCTRACE_PID_ENV: &str = "PYROCLAST_XCTRACE_TARGET_PID";
 
@@ -66,6 +66,7 @@ where
     R: CommandRunner,
 {
     fn profile(&self, request: &ProfileRequest) -> BackendResult<ProfileResult> {
+        let tool_versions = resolve_required_tools(self.runner, &[XCTRACE])?;
         let layout = ArtifactLayout::new(request.out_dir.clone());
         std::fs::create_dir_all(layout.root())?;
 
@@ -133,10 +134,7 @@ where
             record_target: "command".to_string(),
             duration_secs: None,
             symbols: request.symbols,
-            tool_versions: collect_tool_versions(
-                self.runner,
-                &[ToolSpec::apple_provided("xctrace")],
-            ),
+            tool_versions,
             artifacts: {
                 let mut artifacts = layout.standard_manifest_artifacts();
                 artifacts.push(trace_path);

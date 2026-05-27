@@ -164,6 +164,53 @@ fn resolver_does_not_use_ephemeral_nix_for_perf() {
 }
 
 #[test]
+fn resolver_uses_ephemeral_nix_for_heaptrack() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let bin = root.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("bin dir");
+    std::fs::write(bin.join("nix"), b"").expect("nix stub");
+    let path = std::env::join_paths([bin.as_path()]).expect("join path");
+    let runner = NixFallbackRunner::default();
+    let mut resolver = SystemToolResolver::new(
+        &runner,
+        ResolverContext::for_tests("linux", root.path(), Some(path), false),
+    );
+
+    let tool_path = resolver
+        .resolve(&tool_spec_named("heaptrack").expect("heaptrack"))
+        .expect("resolve heaptrack");
+
+    assert_eq!(tool_path.source, ToolSource::EphemeralNix);
+    assert_eq!(tool_path.path, "/nix/store/fake/bin/heaptrack".to_string());
+    assert!(runner.saw_shell());
+}
+
+#[test]
+fn resolver_uses_ephemeral_nix_for_heaptrack_print() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let bin = root.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("bin dir");
+    std::fs::write(bin.join("nix"), b"").expect("nix stub");
+    let path = std::env::join_paths([bin.as_path()]).expect("join path");
+    let runner = NixFallbackRunner::default();
+    let mut resolver = SystemToolResolver::new(
+        &runner,
+        ResolverContext::for_tests("linux", root.path(), Some(path), false),
+    );
+
+    let tool_path = resolver
+        .resolve(&tool_spec_named("heaptrack_print").expect("heaptrack_print"))
+        .expect("resolve heaptrack_print");
+
+    assert_eq!(tool_path.source, ToolSource::EphemeralNix);
+    assert_eq!(
+        tool_path.path,
+        "/nix/store/fake/bin/heaptrack_print".to_string()
+    );
+    assert!(runner.saw_shell());
+}
+
+#[test]
 fn resolver_caches_project_flake_probes() {
     let root = tempfile::tempdir().expect("tempdir");
     let project = root.path().join("project/subdir");
@@ -189,6 +236,64 @@ fn resolver_caches_project_flake_probes() {
         runner.matching_program("/nix/store/fake/bin/inferno-flamegraph"),
         1
     );
+}
+
+#[test]
+fn resolver_falls_back_to_ephemeral_nix_when_project_flake_lacks_tool() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let project = root.path().join("project/subdir");
+    let bin = root.path().join("bin");
+    std::fs::create_dir_all(&project).expect("project dir");
+    std::fs::create_dir_all(&bin).expect("bin dir");
+    std::fs::write(root.path().join("project/flake.nix"), b"{}").expect("flake");
+    std::fs::write(bin.join("nix"), b"").expect("nix stub");
+    let path = std::env::join_paths([bin.as_path()]).expect("join path");
+    let runner = ProjectFlakeMissRunner::default();
+    let mut resolver = SystemToolResolver::new(
+        &runner,
+        ResolverContext::for_tests("linux", &project, Some(path), false),
+    );
+
+    let tool_path = resolver
+        .resolve(&tool_spec_named("inferno-flamegraph").expect("inferno-flamegraph"))
+        .expect("resolve inferno-flamegraph");
+
+    assert_eq!(tool_path.source, ToolSource::EphemeralNix);
+    assert_eq!(
+        tool_path.path,
+        "/nix/store/fake/bin/inferno-flamegraph".to_string()
+    );
+    assert_eq!(runner.matching_commands("develop"), 1);
+    assert_eq!(runner.matching_commands("shell"), 1);
+}
+
+#[test]
+fn resolver_falls_back_to_ephemeral_nix_when_project_flake_probe_errors() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let project = root.path().join("project/subdir");
+    let bin = root.path().join("bin");
+    std::fs::create_dir_all(&project).expect("project dir");
+    std::fs::create_dir_all(&bin).expect("bin dir");
+    std::fs::write(root.path().join("project/flake.nix"), b"{}").expect("flake");
+    std::fs::write(bin.join("nix"), b"").expect("nix stub");
+    let path = std::env::join_paths([bin.as_path()]).expect("join path");
+    let runner = ProjectFlakeErrorRunner::default();
+    let mut resolver = SystemToolResolver::new(
+        &runner,
+        ResolverContext::for_tests("linux", &project, Some(path), false),
+    );
+
+    let tool_path = resolver
+        .resolve(&tool_spec_named("inferno-flamegraph").expect("inferno-flamegraph"))
+        .expect("resolve inferno-flamegraph");
+
+    assert_eq!(tool_path.source, ToolSource::EphemeralNix);
+    assert_eq!(
+        tool_path.path,
+        "/nix/store/fake/bin/inferno-flamegraph".to_string()
+    );
+    assert_eq!(runner.matching_commands("develop"), 1);
+    assert_eq!(runner.matching_commands("shell"), 1);
 }
 
 struct VersionRunner;
@@ -266,9 +371,15 @@ impl CommandRunner for &NixFallbackRunner {
             ));
         }
         if command.program.ends_with("/nix") && command.args.iter().any(|arg| arg == "shell") {
-            return Ok(nix_resolution_output(
-                "/nix/store/fake/bin/inferno-collapse-perf",
-            ));
+            let requested_tool = command.args.last().map(String::as_str).unwrap_or_default();
+            let resolved_path = if requested_tool.contains("heaptrack_print") {
+                "/nix/store/fake/bin/heaptrack_print"
+            } else if requested_tool.contains("heaptrack") {
+                "/nix/store/fake/bin/heaptrack"
+            } else {
+                "/nix/store/fake/bin/inferno-collapse-perf"
+            };
+            return Ok(nix_resolution_output(resolved_path));
         }
         if command.program == "/nix/store/fake/bin/inferno-flamegraph"
             && command.args == ["--version"]
@@ -285,6 +396,109 @@ impl CommandRunner for &NixFallbackRunner {
             return Ok(CommandOutput {
                 status_code: Some(0),
                 stdout: b"inferno-collapse-perf 0.12.6\n".to_vec(),
+                stderr: Vec::new(),
+            });
+        }
+        if command.program == "/nix/store/fake/bin/heaptrack" && command.args == ["--version"] {
+            return Ok(CommandOutput {
+                status_code: Some(0),
+                stdout: b"heaptrack 1.5.0\n".to_vec(),
+                stderr: Vec::new(),
+            });
+        }
+        if command.program == "/nix/store/fake/bin/heaptrack_print" && command.args == ["--version"]
+        {
+            return Ok(CommandOutput {
+                status_code: Some(0),
+                stdout: b"heaptrack_print 1.5.0\n".to_vec(),
+                stderr: Vec::new(),
+            });
+        }
+        panic!("unexpected command: {command:?}");
+    }
+}
+
+#[derive(Default)]
+struct ProjectFlakeMissRunner {
+    commands: std::sync::Mutex<Vec<CommandSpec>>,
+}
+
+impl ProjectFlakeMissRunner {
+    fn matching_commands(&self, needle: &str) -> usize {
+        self.commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|command| {
+                command.program.ends_with("/nix") && command.args.iter().any(|arg| arg == needle)
+            })
+            .count()
+    }
+}
+
+impl CommandRunner for &ProjectFlakeMissRunner {
+    fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
+        self.commands.lock().unwrap().push(command.clone());
+        if command.program.ends_with("/nix") && command.args.iter().any(|arg| arg == "develop") {
+            return Ok(CommandOutput {
+                status_code: Some(1),
+                stdout: Vec::new(),
+                stderr: b"command not found: inferno-flamegraph".to_vec(),
+            });
+        }
+        if command.program.ends_with("/nix") && command.args.iter().any(|arg| arg == "shell") {
+            return Ok(nix_resolution_output(
+                "/nix/store/fake/bin/inferno-flamegraph",
+            ));
+        }
+        if command.program == "/nix/store/fake/bin/inferno-flamegraph"
+            && command.args == ["--version"]
+        {
+            return Ok(CommandOutput {
+                status_code: Some(0),
+                stdout: b"inferno-flamegraph 0.12.6\n".to_vec(),
+                stderr: Vec::new(),
+            });
+        }
+        panic!("unexpected command: {command:?}");
+    }
+}
+
+#[derive(Default)]
+struct ProjectFlakeErrorRunner {
+    commands: std::sync::Mutex<Vec<CommandSpec>>,
+}
+
+impl ProjectFlakeErrorRunner {
+    fn matching_commands(&self, needle: &str) -> usize {
+        self.commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|command| {
+                command.program.ends_with("/nix") && command.args.iter().any(|arg| arg == needle)
+            })
+            .count()
+    }
+}
+
+impl CommandRunner for &ProjectFlakeErrorRunner {
+    fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
+        self.commands.lock().unwrap().push(command.clone());
+        if command.program.ends_with("/nix") && command.args.iter().any(|arg| arg == "develop") {
+            return Err(std::io::Error::other("nix develop exploded"));
+        }
+        if command.program.ends_with("/nix") && command.args.iter().any(|arg| arg == "shell") {
+            return Ok(nix_resolution_output(
+                "/nix/store/fake/bin/inferno-flamegraph",
+            ));
+        }
+        if command.program == "/nix/store/fake/bin/inferno-flamegraph"
+            && command.args == ["--version"]
+        {
+            return Ok(CommandOutput {
+                status_code: Some(0),
+                stdout: b"inferno-flamegraph 0.12.6\n".to_vec(),
                 stderr: Vec::new(),
             });
         }

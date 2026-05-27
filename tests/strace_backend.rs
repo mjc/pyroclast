@@ -46,7 +46,7 @@ fn strace_backend_writes_syscall_summary_artifacts() {
             .expect("summary json");
     assert_eq!(summary_json["total_calls"], 2);
     assert_eq!(summary_json["by_syscall"]["read"]["calls"], 1);
-    assert_eq!(runner.programs(), vec!["strace", "strace"]);
+    assert_eq!(runner.programs(), vec!["strace"]);
     assert_eq!(
         result.manifest.actual_backend,
         pyroclast::manifest::BackendName::Strace

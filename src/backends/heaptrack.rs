@@ -7,13 +7,14 @@ use crate::manifest::{BackendName, RunManifest};
 use crate::parsers::heaptrack::{parse_heaptrack_summary, render_heaptrack_summary_text};
 use crate::process::CommandRunner;
 use crate::process::CommandSpec;
-use crate::tools::{ToolSpec, collect_tool_versions};
+use crate::tools::{HEAPTRACK, HEAPTRACK_PRINT, resolve_required_tools};
 
 pub fn build_heaptrack_command(
     output_prefix: &Path,
     profiled_command: impl IntoIterator<Item = String>,
 ) -> CommandSpec {
     CommandSpec::new("heaptrack")
+        .arg("--record-only")
         .arg("-o")
         .arg(output_prefix.display().to_string())
         .args(profiled_command)
@@ -41,6 +42,7 @@ where
     R: CommandRunner,
 {
     fn profile(&self, request: &ProfileRequest) -> BackendResult<ProfileResult> {
+        let tool_versions = resolve_required_tools(self.runner, &[HEAPTRACK, HEAPTRACK_PRINT])?;
         let layout = ArtifactLayout::new(request.out_dir.clone());
         std::fs::create_dir_all(layout.root())?;
 
@@ -107,10 +109,7 @@ where
             record_target: "command".to_string(),
             duration_secs: None,
             symbols: request.symbols,
-            tool_versions: collect_tool_versions(
-                self.runner,
-                &[ToolSpec::nix_managed("heaptrack")],
-            ),
+            tool_versions,
             artifacts: {
                 let mut artifacts = layout.standard_manifest_artifacts();
                 artifacts.push(raw_output);

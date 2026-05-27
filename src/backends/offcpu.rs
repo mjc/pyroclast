@@ -15,7 +15,7 @@ use crate::process::{CommandRunner, CommandSpec};
 use crate::summary::threads::{
     FoldedStackSummary, render_folded_stack_summary_text, summarize_folded_stacks,
 };
-use crate::tools::{ToolSpec, collect_tool_versions};
+use crate::tools::{BPFTRACE, PERF, ToolSpec, resolve_required_tools};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -139,6 +139,14 @@ where
 {
     fn profile(&self, request: &ProfileRequest) -> BackendResult<ProfileResult> {
         ensure_command_workflow(request)?;
+        let tool_versions = resolve_required_tools(
+            self.runner,
+            &offcpu_tool_specs(
+                request.offcpu_method.unwrap_or(OffcpuMethod::PerfSched),
+                request.symbols,
+                request.symbolizer,
+            ),
+        )?;
 
         let layout = ArtifactLayout::new(request.out_dir.clone());
         std::fs::create_dir_all(layout.root())?;
@@ -183,7 +191,7 @@ where
             record_target: "command".to_string(),
             duration_secs: run.duration_secs,
             symbols: request.symbols,
-            tool_versions: collect_tool_versions(self.runner, &run.tool_specs),
+            tool_versions,
             artifacts: {
                 let mut artifacts = layout.standard_manifest_artifacts();
                 artifacts.push(run.raw_profile);
@@ -236,7 +244,6 @@ where
                 method: OffcpuMethod::PerfSched,
                 timehist_raw,
             })?,
-            tool_specs: vec![ToolSpec::nix_managed("perf")],
         })
     }
 
@@ -266,7 +273,6 @@ where
             folded_stacks,
             PerfEvent::CpuClock,
             None,
-            linux_perf_fold_tools(request.symbols, request.symbolizer),
         )
     }
 
@@ -297,8 +303,19 @@ where
             folded_stacks,
             request.event,
             Some(request.duration_secs),
-            vec![ToolSpec::nix_managed("bpftrace")],
         )
+    }
+}
+
+fn offcpu_tool_specs(
+    method: OffcpuMethod,
+    symbols: bool,
+    symbolizer: crate::cli::SymbolizerKind,
+) -> Vec<ToolSpec> {
+    match method {
+        OffcpuMethod::PerfSched => vec![PERF],
+        OffcpuMethod::PerfCpuClock => linux_perf_fold_tools(symbols, symbolizer),
+        OffcpuMethod::Bpftrace => vec![BPFTRACE],
     }
 }
 
@@ -312,7 +329,6 @@ struct OffcpuRun {
     folded_stacks: Option<String>,
     summary_text: String,
     summary_json: serde_json::Value,
-    tool_specs: Vec<ToolSpec>,
 }
 
 fn folded_offcpu_run(
@@ -322,7 +338,6 @@ fn folded_offcpu_run(
     folded_stacks: String,
     sample_event: PerfEvent,
     duration_secs: Option<u32>,
-    tool_specs: Vec<ToolSpec>,
 ) -> BackendResult<OffcpuRun> {
     let folded_summary = summarize_folded_stacks(&folded_stacks);
     Ok(OffcpuRun {
@@ -338,7 +353,6 @@ fn folded_offcpu_run(
             folded: folded_summary,
         })?,
         folded_stacks: Some(folded_stacks),
-        tool_specs,
     })
 }
 

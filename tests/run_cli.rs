@@ -27,10 +27,11 @@ fn top_level_memory_command_uses_injected_heaptrack_runner() {
         std::fs::read_to_string(out.join("command.txt")).unwrap(),
         "cargo check\n"
     );
-    assert_eq!(
-        runner.programs(),
-        vec!["heaptrack", "heaptrack_print", "heaptrack"]
-    );
+    assert_eq!(runner.programs(), vec!["heaptrack", "heaptrack_print"]);
+    assert!(runner.commands().iter().any(|command| {
+        command.program == "heaptrack"
+            && command.args.first().map(String::as_str) == Some("--record-only")
+    }));
     let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
     assert!(run_json.contains("\"actual_backend\": \"heaptrack\""));
     assert!(out.join("profile.raw.heaptrack").is_file());
@@ -551,10 +552,7 @@ fn top_level_cpu_command_uses_injected_perf_runner() {
 
     pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("run cli");
 
-    assert_eq!(
-        runner.programs(),
-        vec!["perf", "inferno-flamegraph", "perf", "inferno-flamegraph"]
-    );
+    assert_eq!(runner.programs(), vec!["perf", "inferno-flamegraph"]);
     let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
     assert!(run_json.contains("\"actual_backend\": \"linux_perf\""));
     assert!(run_json.contains("\"sample_frequency\": 997"));
@@ -593,7 +591,7 @@ fn top_level_cpu_command_uses_xctrace_on_macos() {
     )
     .expect("run cli");
 
-    assert_eq!(runner.programs(), vec!["xctrace", "xctrace", "xctrace"]);
+    assert_eq!(runner.programs(), vec!["xctrace", "xctrace"]);
     let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
     assert!(run_json.contains("\"actual_backend\": \"macos_xctrace\""));
     assert!(out.join("profile.raw.xctrace.trace").is_dir());
@@ -616,7 +614,7 @@ fn top_level_latency_command_uses_injected_strace_runner() {
 
     pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("run cli");
 
-    assert_eq!(runner.programs(), vec!["strace", "strace"]);
+    assert_eq!(runner.programs(), vec!["strace"]);
     let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
     assert!(run_json.contains("\"actual_backend\": \"strace\""));
     assert!(out.join("profile.raw.strace").is_file());
@@ -642,7 +640,7 @@ fn top_level_offcpu_command_uses_injected_perf_sched_runner() {
 
     pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("run cli");
 
-    assert_eq!(runner.programs(), vec!["perf", "perf", "perf"]);
+    assert_eq!(runner.programs(), vec!["perf", "perf"]);
     let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
     assert!(run_json.contains("\"actual_backend\": \"offcpu\""));
     assert!(out.join("profile.raw.perf.data").is_file());
@@ -681,30 +679,26 @@ struct RecordingRunner {
 }
 
 impl RecordingRunner {
+    fn commands(&self) -> Vec<pyroclast::process::CommandSpec> {
+        self.commands.lock().unwrap().clone()
+    }
+
     fn programs(&self) -> Vec<String> {
-        self.commands
-            .lock()
-            .unwrap()
+        self.commands()
             .iter()
             .map(|command| command.program.clone())
             .collect()
     }
 
     fn stdins(&self) -> Vec<Option<Vec<u8>>> {
-        self.commands
-            .lock()
-            .unwrap()
+        self.commands()
             .iter()
             .map(|command| command.stdin.clone())
             .collect()
     }
 
     fn first_args(&self) -> Option<Vec<String>> {
-        self.commands
-            .lock()
-            .unwrap()
-            .first()
-            .map(|command| command.args.clone())
+        self.commands().first().map(|command| command.args.clone())
     }
 }
 

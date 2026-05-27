@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crate::backends::BackendResult;
 use crate::process::{CommandRunner, CommandSpec};
-use crate::tools::ToolSpec;
+use crate::tools::{INFERNO_FLAMEGRAPH, ToolSpec};
 
 pub mod analysis;
 
@@ -58,7 +58,7 @@ where
     R: CommandRunner,
 {
     fn tool_specs(&self) -> Vec<ToolSpec> {
-        vec![ToolSpec::nix_managed("inferno-flamegraph")]
+        vec![INFERNO_FLAMEGRAPH]
     }
 
     fn render(&self, request: &FlamegraphRequest) -> BackendResult<FlamegraphRenderResult> {

@@ -15,7 +15,7 @@ use crate::platform::{NativeThreadLister, ThreadLister};
 use crate::process::{CommandRunner, CommandSpec};
 use crate::summary::threads::{render_folded_stack_summary_text, summarize_folded_stacks};
 use crate::symbols::{SymbolizerKind, perf_symbol_resolver_for_current_home_with_symbolizer};
-use crate::tools::{ToolSpec, collect_tool_versions};
+use crate::tools::{ADDR2LINE, PERF, ToolSpec, resolve_required_tools};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PerfRecordTarget {
@@ -114,6 +114,14 @@ where
     F: FlamegraphRenderer,
 {
     fn profile(&self, request: &ProfileRequest) -> BackendResult<ProfileResult> {
+        let tool_versions = resolve_required_tools(
+            self.runner,
+            &linux_perf_tools(
+                request.symbols,
+                request.symbolizer,
+                &self.flamegraph_renderer,
+            ),
+        )?;
         let layout = ArtifactLayout::new(request.out_dir.clone());
         std::fs::create_dir_all(layout.root())?;
 
@@ -188,14 +196,7 @@ where
             record_target: record_target_label(request).to_string(),
             duration_secs: attach_duration(request),
             symbols: request.symbols,
-            tool_versions: collect_tool_versions(
-                self.runner,
-                &linux_perf_tools(
-                    request.symbols,
-                    request.symbolizer,
-                    &self.flamegraph_renderer,
-                ),
-            ),
+            tool_versions,
             artifacts: {
                 let mut artifacts = layout.standard_manifest_artifacts();
                 artifacts.push(perf_data);
@@ -297,9 +298,9 @@ fn linux_perf_tools(
 }
 
 pub(crate) fn linux_perf_fold_tools(symbols: bool, symbolizer: SymbolizerKind) -> Vec<ToolSpec> {
-    let mut tools = vec![ToolSpec::nix_managed("perf")];
+    let mut tools = vec![PERF];
     if symbols && symbolizer == SymbolizerKind::Addr2line {
-        tools.push(ToolSpec::nix_managed("addr2line"));
+        tools.push(ADDR2LINE);
     }
     tools
 }

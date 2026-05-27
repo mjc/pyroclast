@@ -8,6 +8,7 @@ use pyroclast::manifest::BackendName;
 use pyroclast::perfdata::samples::{PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_TID};
 use pyroclast::platform::ThreadLister;
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
+use pyroclast::tools::{ResolvedTool, ToolSource, ToolSpec};
 
 #[test]
 fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
@@ -47,10 +48,7 @@ fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
             .collect::<Vec<_>>(),
         vec!["perf", "inferno-flamegraph"]
     );
-    assert_eq!(
-        runner.programs(),
-        vec!["perf", "inferno-flamegraph", "perf", "inferno-flamegraph"]
-    );
+    assert_eq!(runner.programs(), vec!["perf", "inferno-flamegraph"]);
     assert_eq!(runner.perf_frequency(), Some("199".to_string()));
     assert_eq!(runner.perf_call_graph(), Some("dwarf,64000".to_string()));
     assert!(result.layout.raw_profile("perf.data").is_file());
@@ -108,14 +106,7 @@ fn linux_perf_backend_can_symbolize_folded_stacks() {
 
     assert_eq!(
         runner.programs(),
-        vec![
-            "perf",
-            "addr2line",
-            "inferno-flamegraph",
-            "perf",
-            "addr2line",
-            "inferno-flamegraph"
-        ]
+        vec!["perf", "addr2line", "inferno-flamegraph"]
     );
     assert_eq!(
         std::fs::read_to_string(result.layout.stacks_folded()).expect("stacks folded"),
@@ -155,7 +146,7 @@ fn linux_perf_backend_accepts_pluggable_flamegraph_renderer() {
         std::fs::read_to_string(result.layout.flamegraph_svg()).expect("flamegraph svg"),
         "<svg>plugin</svg>\n"
     );
-    assert_eq!(runner.programs(), vec!["perf", "perf"]);
+    assert_eq!(runner.programs(), vec!["perf"]);
     assert_eq!(
         result
             .manifest
@@ -239,6 +230,38 @@ fn linux_perf_backend_stops_when_perf_record_fails() {
         "perf record exited with Some(13): permission denied\n"
     );
     assert!(!root.path().join("cpu/stacks.folded").exists());
+}
+
+#[test]
+fn linux_perf_backend_preflights_flamegraph_tool_before_perf_record() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let runner = MissingInfernoRunner::default();
+    let backend = LinuxPerfBackend::new(&runner);
+    let request = ProfileRequest {
+        kind: ProfileKind::Cpu,
+        command: vec!["true".to_string()],
+        out_dir: root.path().join("cpu"),
+        name: None,
+        json: false,
+        symbols: false,
+        symbolizer: SymbolizerKind::Addr2line,
+        frequency: 997,
+        event: PerfEvent::CpuClock,
+        call_graph: PerfCallGraph::Fp,
+        pid: None,
+        tids: Vec::new(),
+        threads_of_pid: None,
+        duration_secs: 3600,
+        offcpu_method: None,
+    };
+
+    let error = backend
+        .profile(&request)
+        .expect_err("missing inferno-flamegraph");
+
+    assert!(error.to_string().contains("inferno-flamegraph"));
+    assert!(runner.programs().is_empty());
+    assert!(!root.path().join("cpu/profile.raw.perf.data").exists());
 }
 
 #[test]
@@ -560,6 +583,44 @@ impl CommandRunner for RecordingRunner {
             status_code: Some(0),
             stdout,
             stderr: b"perf stderr".to_vec(),
+        })
+    }
+}
+
+#[derive(Default)]
+struct MissingInfernoRunner {
+    commands: Mutex<Vec<CommandSpec>>,
+}
+
+impl MissingInfernoRunner {
+    fn programs(&self) -> Vec<String> {
+        self.commands
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|command| command.program.clone())
+            .collect()
+    }
+}
+
+impl CommandRunner for MissingInfernoRunner {
+    fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
+        self.commands.lock().unwrap().push(command.clone());
+        panic!("preflight should fail before running commands: {command:?}");
+    }
+
+    fn resolve_tool(&self, tool: &ToolSpec) -> std::io::Result<ResolvedTool> {
+        if tool.name == "inferno-flamegraph" {
+            return Err(std::io::Error::other(
+                "inferno-flamegraph is required but was not found on PATH or in the project flake; install it or enter the project dev shell",
+            ));
+        }
+
+        Ok(ResolvedTool {
+            name: tool.name.to_string(),
+            path: tool.name.to_string(),
+            source: ToolSource::Path,
+            version: Some(format!("{} fake version", tool.name)),
         })
     }
 }

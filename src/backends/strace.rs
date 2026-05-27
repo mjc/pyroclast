@@ -7,7 +7,7 @@ use crate::manifest::{BackendName, RunManifest};
 use crate::parsers::strace::{parse_strace_summary, render_strace_summary_text};
 use crate::process::CommandRunner;
 use crate::process::CommandSpec;
-use crate::tools::{ToolSpec, collect_tool_versions};
+use crate::tools::{STRACE, resolve_required_tools};
 
 pub fn build_strace_command(
     output: &Path,
@@ -36,6 +36,7 @@ where
     R: CommandRunner,
 {
     fn profile(&self, request: &ProfileRequest) -> BackendResult<ProfileResult> {
+        let tool_versions = resolve_required_tools(self.runner, &[STRACE])?;
         let layout = ArtifactLayout::new(request.out_dir.clone());
         std::fs::create_dir_all(layout.root())?;
 
@@ -85,7 +86,7 @@ where
             record_target: "command".to_string(),
             duration_secs: None,
             symbols: request.symbols,
-            tool_versions: collect_tool_versions(self.runner, &[ToolSpec::nix_managed("strace")]),
+            tool_versions,
             artifacts: {
                 let mut artifacts = layout.standard_manifest_artifacts();
                 artifacts.push(raw_strace);

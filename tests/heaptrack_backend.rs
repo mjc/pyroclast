@@ -4,6 +4,7 @@ use pyroclast::backends::heaptrack::HeaptrackBackend;
 use pyroclast::backends::{ProfileRequest, ProfilerBackend};
 use pyroclast::cli::{PerfCallGraph, PerfEvent, ProfileKind, SymbolizerKind};
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
+use pyroclast::tools::{ResolvedTool, ToolSource, ToolSpec};
 
 #[test]
 fn heaptrack_backend_writes_heap_summary_artifacts() {
@@ -46,9 +47,22 @@ fn heaptrack_backend_writes_heap_summary_artifacts() {
             .expect("summary json");
     assert_eq!(summary_json["total_allocations"], 42);
     assert_eq!(summary_json["peak_heap_bytes"], 1024);
+    assert_eq!(runner.programs(), vec!["heaptrack", "heaptrack_print"]);
     assert_eq!(
-        runner.programs(),
-        vec!["heaptrack", "heaptrack_print", "heaptrack"]
+        runner
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|command| command.program == "heaptrack" && command.args != ["--version"])
+            .map(|command| command.args.clone()),
+        Some(vec![
+            "--record-only".to_string(),
+            "-o".to_string(),
+            result.layout.raw_profile("heaptrack").display().to_string(),
+            "target/release/app".to_string(),
+            "--serve".to_string(),
+        ])
     );
     assert_eq!(
         result.manifest.actual_backend,
@@ -92,6 +106,38 @@ fn heaptrack_backend_uses_suffixed_raw_output_when_heaptrack_creates_one() {
             .artifacts
             .contains(&result.layout.raw_profile("heaptrack.1234.zst"))
     );
+}
+
+#[test]
+fn heaptrack_backend_preflights_heaptrack_print_before_launch() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let out = root.path().join("heap");
+    let runner = MissingHeaptrackPrintRunner::default();
+    let request = ProfileRequest {
+        kind: ProfileKind::Memory,
+        command: vec!["target/release/app".to_string(), "--serve".to_string()],
+        out_dir: out,
+        name: None,
+        json: false,
+        symbols: false,
+        symbolizer: SymbolizerKind::Addr2line,
+        frequency: 997,
+        event: PerfEvent::CpuClock,
+        call_graph: PerfCallGraph::Fp,
+        pid: None,
+        tids: Vec::new(),
+        threads_of_pid: None,
+        duration_secs: 3600,
+        offcpu_method: None,
+    };
+
+    let error = HeaptrackBackend::new(&runner)
+        .profile(&request)
+        .expect_err("missing heaptrack_print");
+
+    assert!(error.to_string().contains("heaptrack_print"));
+    assert!(runner.programs().is_empty());
+    assert!(!root.path().join("heap/profile.raw.heaptrack").exists());
 }
 
 #[derive(Default)]
@@ -195,5 +241,43 @@ impl CommandRunner for SuffixedHeaptrackRunner {
             }),
             program => panic!("unexpected command: {program}"),
         }
+    }
+}
+
+#[derive(Default)]
+struct MissingHeaptrackPrintRunner {
+    commands: Mutex<Vec<CommandSpec>>,
+}
+
+impl MissingHeaptrackPrintRunner {
+    fn programs(&self) -> Vec<String> {
+        self.commands
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|command| command.program.clone())
+            .collect()
+    }
+}
+
+impl CommandRunner for MissingHeaptrackPrintRunner {
+    fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
+        self.commands.lock().unwrap().push(command.clone());
+        panic!("preflight should fail before running commands: {command:?}");
+    }
+
+    fn resolve_tool(&self, tool: &ToolSpec) -> std::io::Result<ResolvedTool> {
+        if tool.name == "heaptrack_print" {
+            return Err(std::io::Error::other(
+                "heaptrack_print is required but was not found on PATH or in the project flake; install it or enter the project dev shell",
+            ));
+        }
+
+        Ok(ResolvedTool {
+            name: tool.name.to_string(),
+            path: tool.name.to_string(),
+            source: ToolSource::Path,
+            version: Some(format!("{} fake version", tool.name)),
+        })
     }
 }
