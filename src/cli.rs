@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use std::path::PathBuf;
@@ -137,8 +137,8 @@ pub struct RunArgs {
     #[arg(long)]
     pub json: bool,
 
-    #[arg(long)]
-    pub symbols: bool,
+    #[arg(long = "no-symbols")]
+    pub no_symbols: bool,
 
     #[arg(long, value_enum, default_value_t = SymbolizerKind::RustAddr2line)]
     pub symbolizer: SymbolizerKind,
@@ -200,7 +200,7 @@ impl CliCommand {
                 out: args.out.clone(),
                 name: args.name.clone(),
                 json: args.json,
-                symbols: default_symbols_enabled(args.kind, args.symbols),
+                symbols: profile_symbols_enabled(args.kind, args.no_symbols),
                 symbolizer: args.symbolizer,
                 frequency: args.frequency,
                 event: args.event,
@@ -223,7 +223,7 @@ impl ProfileInvocation {
             out: args.out.clone(),
             name: args.name.clone(),
             json: args.json,
-            symbols: default_symbols_enabled(kind, args.symbols),
+            symbols: profile_symbols_enabled(kind, args.no_symbols),
             symbolizer: args.symbolizer,
             frequency: args.frequency,
             event: args.event,
@@ -237,8 +237,8 @@ impl ProfileInvocation {
     }
 }
 
-fn default_symbols_enabled(kind: ProfileKind, requested_symbols: bool) -> bool {
-    requested_symbols || matches!(kind, ProfileKind::Cpu | ProfileKind::Offcpu)
+fn profile_symbols_enabled(kind: ProfileKind, no_symbols: bool) -> bool {
+    !no_symbols && matches!(kind, ProfileKind::Cpu | ProfileKind::Offcpu)
 }
 
 #[derive(Debug, Args)]
@@ -255,8 +255,8 @@ pub struct ProfileArgs {
     #[arg(long)]
     pub json: bool,
 
-    #[arg(long)]
-    pub symbols: bool,
+    #[arg(long = "no-symbols")]
+    pub no_symbols: bool,
 
     #[arg(long, value_enum, default_value_t = SymbolizerKind::RustAddr2line)]
     pub symbolizer: SymbolizerKind,
@@ -291,7 +291,7 @@ pub struct FoldArgs {
     #[arg(long)]
     pub count_periods: bool,
 
-    #[arg(long)]
+    #[arg(long = "no-symbols", action = ArgAction::SetFalse, default_value_t = true)]
     pub symbols: bool,
 
     #[arg(long, value_enum, default_value_t = SymbolizerKind::RustAddr2line)]
@@ -315,7 +315,7 @@ pub struct FlamegraphArgs {
     #[arg(short = 'o', long)]
     pub output: Option<PathBuf>,
 
-    #[arg(long)]
+    #[arg(long = "no-symbols", action = ArgAction::SetFalse, default_value_t = true)]
     pub symbols: bool,
 
     #[arg(long, value_enum, default_value_t = SymbolizerKind::RustAddr2line)]

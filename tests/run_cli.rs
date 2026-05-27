@@ -63,8 +63,14 @@ fn fold_command_reads_perfdata_directly() {
     )
     .expect("write perfdata");
 
-    let output = pyroclast::run_cli(["pyroclast", "plumbing", "fold", perfdata.to_str().unwrap()])
-        .expect("fold command");
+    let output = pyroclast::run_cli([
+        "pyroclast",
+        "plumbing",
+        "fold",
+        "--no-symbols",
+        perfdata.to_str().unwrap(),
+    ])
+    .expect("fold command");
 
     assert_eq!(output.stdout, "app;/bin/app+0x1000 1\n");
 }
@@ -94,7 +100,6 @@ fn fold_command_can_symbolize_mapped_frames() {
         "pyroclast",
         "plumbing",
         "fold",
-        "--symbols",
         "--symbolizer",
         "addr2line",
         perfdata.to_str().unwrap(),
@@ -168,7 +173,6 @@ fn fold_command_can_use_rust_symbolizer_without_addr2line() {
         "pyroclast",
         "plumbing",
         "fold",
-        "--symbols",
         "--symbolizer",
         "rust-addr2line",
         perfdata.to_str().unwrap(),
@@ -195,6 +199,7 @@ fn flamegraph_command_folds_perfdata_without_perf_script() {
         "pyroclast",
         "plumbing",
         "flamegraph",
+        "--no-symbols",
         perfdata.to_str().expect("perfdata path"),
         "-o",
         output_svg.to_str().expect("svg path"),
@@ -234,6 +239,7 @@ fn flamegraph_command_weights_perf_sample_periods() {
         "pyroclast",
         "plumbing",
         "flamegraph",
+        "--no-symbols",
         perfdata.to_str().expect("perfdata path"),
         "-o",
         output_svg.to_str().expect("svg path"),
@@ -259,6 +265,7 @@ fn flamegraph_command_accepts_injected_renderer() {
         "pyroclast",
         "plumbing",
         "flamegraph",
+        "--no-symbols",
         perfdata.to_str().expect("perfdata path"),
         "-o",
         output_svg.to_str().expect("svg path"),
@@ -301,7 +308,6 @@ fn flamegraph_command_can_symbolize_mapped_frames() {
         "pyroclast",
         "plumbing",
         "flamegraph",
-        "--symbols",
         "--symbolizer",
         "addr2line",
         perfdata.to_str().expect("perfdata path"),

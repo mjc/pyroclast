@@ -767,6 +767,24 @@ ffffffff812f5920 t do_user_addr_fault
 }
 
 #[test]
+fn kallsyms_parse_modules_only_keeps_module_symbols() {
+    let symbols = Kallsyms::parse_modules(
+        "\
+ffffffff81001280 T asm_exc_page_fault
+ffffffffc0e17dae t zfs_read [zfs]
+ffffffffc0e17e10 t zfs_write [zfs]
+",
+    )
+    .expect("module kallsyms");
+
+    assert_eq!(
+        symbols.resolve(0xffff_ffff_c0e1_7dae).as_deref(),
+        Some("zfs_read")
+    );
+    assert_eq!(symbols.resolve(0xffff_ffff_8100_1280), None);
+}
+
+#[test]
 fn kallsyms_resolves_relocated_kernel_addresses() {
     let symbols = Kallsyms::parse(
         "\
@@ -1282,6 +1300,70 @@ ffffffff846997a0 T memcpy
         .expect("symbols");
 
     assert_eq!(symbols, vec![Some("__pi_memcpy".to_string())]);
+}
+
+#[test]
+fn perf_symbol_resolver_loads_live_kallsyms_lazily_for_modules() {
+    let root = tempfile::tempdir().expect("root");
+    let live_kallsyms = root.path().join("kallsyms");
+
+    let runner = Addr2lineRunner::new(b"");
+    let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
+        .with_system_kallsyms_from_path(&live_kallsyms);
+
+    std::fs::write(
+        &live_kallsyms,
+        "\
+ffffffff846997a0 T __pi_memcpy
+ffffffffc0e17dae t zfs_read [zfs]
+",
+    )
+    .expect("kallsyms");
+
+    let symbols = resolver
+        .resolve_batch(&[SymbolRequest {
+            path: PathBuf::from("[zfs]"),
+            relative_address: 0xffff_ffff_c0e1_7dae,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        }])
+        .expect("symbols");
+
+    assert_eq!(symbols, vec![Some("zfs_read".to_string())]);
+    assert!(runner.commands().is_empty());
+}
+
+#[test]
+fn perf_symbol_resolver_loads_system_map_lazily() {
+    let root = tempfile::tempdir().expect("root");
+    let system_map = root.path().join("System.map");
+
+    let runner = Addr2lineRunner::new(b"");
+    let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
+        .with_system_map_candidates([system_map.clone()]);
+
+    std::fs::write(
+        &system_map,
+        "\
+ffffffff846997a0 T __pi_memcpy
+ffffffff846997a0 T memcpy
+",
+    )
+    .expect("system map");
+
+    let symbols = resolver
+        .resolve_batch(&[SymbolRequest {
+            path: PathBuf::from("[kernel.kallsyms]"),
+            relative_address: 0xffff_ffff_8469_97ac,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        }])
+        .expect("symbols");
+
+    assert_eq!(symbols, vec![Some("__pi_memcpy".to_string())]);
+    assert!(runner.commands().is_empty());
 }
 
 #[test]

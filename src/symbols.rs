@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use clap::ValueEnum;
 use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol, SymbolKind};
@@ -78,8 +79,6 @@ pub enum SymbolizerKind {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RustAddr2lineResolver;
 
-type PerfDwarfReader = gimli::EndianArcSlice<gimli::RunTimeEndian>;
-
 #[derive(Default)]
 struct ObjectAddressCache {
     segments_by_path: BTreeMap<PathBuf, Option<Vec<ObjectSegmentRange>>>,
@@ -92,7 +91,44 @@ struct ObjectSegmentRange {
 }
 
 struct PerfDwarfNameResolver {
-    dwarf: gimli::Dwarf<PerfDwarfReader>,
+    units: Vec<PerfDwarfUnitIndex>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PerfAddressRange {
+    begin: u64,
+    end: u64,
+}
+
+#[derive(Debug)]
+struct PerfDwarfUnitIndex {
+    ranges: Option<Vec<PerfAddressRange>>,
+    roots: Vec<PerfDwarfDieNode>,
+}
+
+#[derive(Debug)]
+struct PerfDwarfDieNode {
+    kind: PerfDwarfDieKind,
+    ranges: Vec<PerfAddressRange>,
+    name: Option<String>,
+    children: Vec<PerfDwarfDieNode>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PerfDwarfDieKind {
+    Subprogram,
+    Inline,
+}
+
+#[derive(Default)]
+struct PreparedObjectMetadata {
+    object_symbols: PerfObjectSymbolIndex,
+    debug_names: DebugStringNameIndex,
+}
+
+#[derive(Default)]
+struct PerfObjectSymbolIndex {
+    symbols: Vec<PerfSymbolCandidate>,
 }
 
 pub struct PerfSymbolResolver<O> {
@@ -101,7 +137,12 @@ pub struct PerfSymbolResolver<O> {
     kernel_elf: Option<PathBuf>,
     kallsyms: Option<Kallsyms>,
     live_kallsyms: Option<Kallsyms>,
+    live_kallsyms_path: Option<PathBuf>,
+    live_kallsyms_cache: OnceLock<Option<Kallsyms>>,
+    live_module_kallsyms_cache: OnceLock<Option<Kallsyms>>,
     system_map_kallsyms: Option<Kallsyms>,
+    system_map_candidates: Vec<PathBuf>,
+    system_map_kallsyms_cache: OnceLock<Option<Kallsyms>>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -353,7 +394,12 @@ where
             kernel_elf: None,
             kallsyms: None,
             live_kallsyms: None,
+            live_kallsyms_path: None,
+            live_kallsyms_cache: OnceLock::new(),
+            live_module_kallsyms_cache: OnceLock::new(),
             system_map_kallsyms: None,
+            system_map_candidates: Vec::new(),
+            system_map_kallsyms_cache: OnceLock::new(),
         }
     }
 
@@ -383,12 +429,14 @@ where
     #[must_use]
     pub fn with_live_kallsyms(mut self, kallsyms: Kallsyms) -> Self {
         self.live_kallsyms = Some(kallsyms);
+        self.live_kallsyms_path = None;
         self
     }
 
     #[must_use]
     pub fn with_system_map_kallsyms(mut self, kallsyms: Kallsyms) -> Self {
         self.system_map_kallsyms = Some(kallsyms);
+        self.system_map_candidates.clear();
         self
     }
 
@@ -397,10 +445,11 @@ where
         if self.kernel_elf.is_some() {
             return self;
         }
-        match Kallsyms::load_first_system_map_candidate(candidates) {
-            Some(kallsyms) => self.with_system_map_kallsyms(kallsyms),
-            None => self,
+        let mut this = self;
+        if this.system_map_kallsyms.is_none() {
+            this.system_map_candidates = dedup_paths(candidates.into_iter().collect());
         }
+        this
     }
 
     #[must_use]
@@ -436,16 +485,11 @@ where
 
     #[must_use]
     pub fn with_system_kallsyms_from_path(self, path: &Path) -> Self {
-        if self.live_kallsyms.is_some() {
-            return self;
+        let mut this = self;
+        if this.live_kallsyms.is_none() {
+            this.live_kallsyms_path = Some(path.to_path_buf());
         }
-        match std::fs::read_to_string(path)
-            .ok()
-            .and_then(|text| Kallsyms::parse(&text).ok())
-        {
-            Some(kallsyms) => self.with_live_kallsyms(kallsyms),
-            None => self,
-        }
+        this
     }
 }
 
@@ -477,6 +521,40 @@ impl Kallsyms {
         }
         if symbols.is_empty() {
             return Err("kallsyms did not contain any parseable symbols".to_string());
+        }
+        Ok(Self {
+            symbols,
+            addresses_by_name,
+        })
+    }
+
+    /// Parses only module-backed `/proc/kallsyms` lines.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no valid module symbols are present.
+    pub fn parse_modules(text: &str) -> Result<Self, String> {
+        let mut symbols = BTreeMap::new();
+        let mut addresses_by_name = BTreeMap::new();
+        for (address, symbol) in text
+            .lines()
+            .filter_map(parse_module_kallsyms_line)
+            .filter(|(address, _)| *address != 0)
+        {
+            match symbols.entry(address) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(symbol.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    if prefer_kernel_alias(&symbol, entry.get()) {
+                        entry.insert(symbol.clone());
+                    }
+                }
+            }
+            addresses_by_name.entry(symbol).or_insert(address);
+        }
+        if symbols.is_empty() {
+            return Err("kallsyms did not contain any parseable module symbols".to_string());
         }
         Ok(Self {
             symbols,
@@ -839,10 +917,49 @@ where
         ))
     }
 
+    fn live_kallsyms_ref(&self) -> Option<&Kallsyms> {
+        self.live_kallsyms.as_ref().or_else(|| {
+            self.live_kallsyms_cache
+                .get_or_init(|| {
+                    self.live_kallsyms_path.as_ref().and_then(|path| {
+                        std::fs::read_to_string(path)
+                            .ok()
+                            .and_then(|text| Kallsyms::parse(&text).ok())
+                    })
+                })
+                .as_ref()
+        })
+    }
+
+    fn live_module_kallsyms_ref(&self) -> Option<&Kallsyms> {
+        self.live_kallsyms.as_ref().or_else(|| {
+            self.live_module_kallsyms_cache
+                .get_or_init(|| {
+                    self.live_kallsyms_path.as_ref().and_then(|path| {
+                        std::fs::read_to_string(path)
+                            .ok()
+                            .and_then(|text| Kallsyms::parse_modules(&text).ok())
+                    })
+                })
+                .as_ref()
+        })
+    }
+
+    fn system_map_kallsyms_ref(&self) -> Option<&Kallsyms> {
+        self.system_map_kallsyms.as_ref().or_else(|| {
+            self.system_map_kallsyms_cache
+                .get_or_init(|| {
+                    Kallsyms::load_first_system_map_candidate(
+                        self.system_map_candidates.iter().cloned(),
+                    )
+                })
+                .as_ref()
+        })
+    }
+
     fn resolve_kernel_symbol(&self, request: &SymbolRequest) -> Option<String> {
         if is_kernel_module_symbol_path(&request.path) {
-            self.live_kallsyms
-                .as_ref()
+            self.live_module_kallsyms_ref()
                 .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
                 .or_else(|| {
                     self.kallsyms
@@ -854,13 +971,11 @@ where
                 .as_ref()
                 .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
                 .or_else(|| {
-                    self.system_map_kallsyms
-                        .as_ref()
+                    self.system_map_kallsyms_ref()
                         .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
                 })
                 .or_else(|| {
-                    self.live_kallsyms
-                        .as_ref()
+                    self.live_kallsyms_ref()
                         .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
                 })
         }
@@ -989,21 +1104,19 @@ impl SymbolResolver for RustAddr2lineResolver {
                 continue;
             };
             let object_bytes = std::fs::read(&path).ok();
-            let debug_names = object_bytes
+            let object_metadata = object_bytes
                 .as_deref()
-                .map(DebugStringNameIndex::from_object_bytes)
+                .map(PreparedObjectMetadata::from_object_bytes)
                 .unwrap_or_default();
             for index in indexes {
                 let request = &requests[index];
-                let object_symbol = object_bytes.as_deref().and_then(|bytes| {
-                    perf_object_symbol_name_from_object_bytes(bytes, request.relative_address)
-                });
+                let object_symbol = object_metadata.object_symbol(request.relative_address);
                 let symbol = loader
                     .find_symbol(request.relative_address)
                     .map(demangle_addr2line_name)
                     .or_else(|| rust_addr2line_frame_name(&loader, request.relative_address));
                 let mut symbol = perf_name_with_object_alias(symbol, object_symbol);
-                specialize_symbol_from_debug_strings(&mut symbol, &debug_names);
+                specialize_symbol_from_debug_strings(&mut symbol, &object_metadata.debug_names);
                 resolved_by_request.insert(request.clone(), symbol);
             }
         }
@@ -1029,18 +1142,16 @@ impl SymbolResolver for RustAddr2lineResolver {
                 continue;
             };
             let object_bytes = std::fs::read(&path).ok();
-            let debug_names = object_bytes
+            let object_metadata = object_bytes
                 .as_deref()
-                .map(DebugStringNameIndex::from_object_bytes)
+                .map(PreparedObjectMetadata::from_object_bytes)
                 .unwrap_or_default();
             let perf_dwarf = object_bytes
                 .as_deref()
                 .and_then(|bytes| PerfDwarfNameResolver::from_object_bytes(bytes).ok());
             for index in indexes {
                 let request = &requests[index];
-                let object_symbol = object_bytes.as_deref().and_then(|bytes| {
-                    perf_object_symbol_name_from_object_bytes(bytes, request.relative_address)
-                });
+                let object_symbol = object_metadata.object_symbol(request.relative_address);
                 let mut frames = perf_dwarf
                     .as_ref()
                     .and_then(|resolver| {
@@ -1059,7 +1170,7 @@ impl SymbolResolver for RustAddr2lineResolver {
                     .or_else(|| rust_addr2line_frame_names(&loader, request.relative_address))
                     .unwrap_or_default();
                 frames = perf_frames_with_object_alias(frames, object_symbol);
-                specialize_frames_from_debug_strings(&mut frames, &debug_names);
+                specialize_frames_from_debug_strings(&mut frames, &object_metadata.debug_names);
                 resolved_by_request.insert(request.clone(), frames);
             }
         }
@@ -1126,40 +1237,6 @@ enum PerfSymbolBinding {
     Weak,
 }
 
-fn perf_object_symbol_name_from_object_bytes(object_bytes: &[u8], address: u64) -> Option<String> {
-    let object = object::File::parse(object_bytes).ok()?;
-    let mut best = None::<PerfSymbolCandidate>;
-    for symbol in object.symbols() {
-        if !perf_symbol_is_candidate(&symbol) {
-            continue;
-        }
-        let candidate = PerfSymbolCandidate {
-            name: perf_symbol_name(&addr2line::demangle_auto(
-                Cow::Borrowed(symbol.name().ok()?),
-                None,
-            )),
-            address: symbol.address(),
-            size: symbol.size(),
-            binding: if symbol.is_weak() {
-                PerfSymbolBinding::Weak
-            } else {
-                PerfSymbolBinding::Global
-            },
-        };
-        if !perf_symbol_candidate_contains_address(&candidate, address) {
-            continue;
-        }
-        best = Some(match best {
-            Some(current) if current.address > candidate.address => current,
-            Some(current) if current.address == candidate.address => {
-                perf_best_duplicate_symbol_owned(current, candidate)
-            }
-            _ => candidate,
-        });
-    }
-    best.map(|candidate| candidate.name)
-}
-
 fn perf_symbol_is_candidate(symbol: &object::Symbol<'_, '_>) -> bool {
     !symbol.is_undefined()
         && !symbol.name().unwrap_or_default().is_empty()
@@ -1174,17 +1251,6 @@ fn perf_symbol_candidate_contains_address(candidate: &PerfSymbolCandidate, addre
         candidate.address == address
     } else {
         address >= candidate.address && address < candidate.address.saturating_add(candidate.size)
-    }
-}
-
-fn perf_best_duplicate_symbol_owned(
-    current: PerfSymbolCandidate,
-    candidate: PerfSymbolCandidate,
-) -> PerfSymbolCandidate {
-    if perf_best_duplicate_symbol(&current, &candidate) == &current {
-        current
-    } else {
-        candidate
     }
 }
 
@@ -1221,6 +1287,63 @@ fn perf_best_duplicate_symbol<'a>(
 
 fn leading_underscore_count(name: &str) -> usize {
     name.bytes().take_while(|byte| *byte == b'_').count()
+}
+
+impl PreparedObjectMetadata {
+    fn from_object_bytes(object_bytes: &[u8]) -> Self {
+        Self {
+            object_symbols: PerfObjectSymbolIndex::from_object_bytes(object_bytes),
+            debug_names: DebugStringNameIndex::from_object_bytes(object_bytes),
+        }
+    }
+
+    fn object_symbol(&self, address: u64) -> Option<String> {
+        self.object_symbols.symbol_name(address)
+    }
+}
+
+impl PerfObjectSymbolIndex {
+    fn from_object_bytes(object_bytes: &[u8]) -> Self {
+        let Ok(object) = object::File::parse(object_bytes) else {
+            return Self::default();
+        };
+        let mut symbols = object
+            .symbols()
+            .filter(perf_symbol_is_candidate)
+            .map(|symbol| PerfSymbolCandidate {
+                name: perf_symbol_name(&addr2line::demangle_auto(
+                    Cow::Borrowed(symbol.name().unwrap_or_default()),
+                    None,
+                )),
+                address: symbol.address(),
+                size: symbol.size(),
+                binding: if symbol.is_weak() {
+                    PerfSymbolBinding::Weak
+                } else {
+                    PerfSymbolBinding::Global
+                },
+            })
+            .collect::<Vec<_>>();
+        symbols.sort_by_key(|symbol| symbol.address);
+        Self { symbols }
+    }
+
+    fn symbol_name(&self, address: u64) -> Option<String> {
+        let mut best = None::<&PerfSymbolCandidate>;
+        for candidate in &self.symbols {
+            if !perf_symbol_candidate_contains_address(candidate, address) {
+                continue;
+            }
+            best = Some(match best {
+                Some(current) if current.address > candidate.address => current,
+                Some(current) if current.address == candidate.address => {
+                    perf_best_duplicate_symbol(current, candidate)
+                }
+                _ => candidate,
+            });
+        }
+        best.map(|candidate| candidate.name.clone())
+    }
 }
 
 fn rust_addr2line_frame_name(loader: &addr2line::Loader, address: u64) -> Option<String> {
@@ -1267,22 +1390,32 @@ impl PerfDwarfNameResolver {
         } else {
             gimli::RunTimeEndian::Big
         };
-        let load_section = |id: gimli::SectionId| {
-            let data = object
-                .section_by_name(id.name())
-                .and_then(|section| section.uncompressed_data().ok())
-                .unwrap_or(Cow::Borrowed(&[][..]));
-            Ok::<_, gimli::Error>(gimli::EndianArcSlice::new(
-                std::sync::Arc::<[u8]>::from(data.as_ref()),
-                endian,
-            ))
-        };
-        let dwarf = gimli::Dwarf::load(load_section)?;
-        Ok(Self { dwarf })
+        let dwarf_sections = gimli::DwarfSections::load(|id| {
+            Ok::<_, gimli::Error>(
+                object
+                    .section_by_name(id.name())
+                    .and_then(|section| section.uncompressed_data().ok())
+                    .unwrap_or(Cow::Borrowed(&[][..])),
+            )
+        })?;
+        let dwarf =
+            dwarf_sections.borrow(|section| gimli::EndianSlice::new(section.as_ref(), endian));
+        let mut units = Vec::new();
+        let mut headers = dwarf.units();
+        while let Ok(Some(header)) = headers.next() {
+            let Ok(unit) = dwarf.unit(header) else {
+                continue;
+            };
+            units.push(PerfDwarfUnitIndex {
+                ranges: perf_dwarf_ranges(dwarf.unit_ranges(&unit).ok()),
+                roots: perf_dwarf_unit_roots(&dwarf, &unit),
+            });
+        }
+        Ok(Self { units })
     }
 
     fn frame_names(&self, address: u64) -> Option<Vec<String>> {
-        perf_dwarf_frame_names(&self.dwarf, address, None)
+        self.frame_names_for_base_symbol(address, None)
     }
 
     fn frame_names_for_base_symbol(
@@ -1290,127 +1423,140 @@ impl PerfDwarfNameResolver {
         address: u64,
         base_symbol: Option<&str>,
     ) -> Option<Vec<String>> {
-        perf_dwarf_frame_names(&self.dwarf, address, base_symbol)
+        for unit in &self.units {
+            if !perf_dwarf_unit_contains_address(unit, address) {
+                continue;
+            }
+            if let Some(mut frames) =
+                perf_dwarf_frame_names_from_index(&unit.roots, address, false, base_symbol)
+            {
+                frames.reverse();
+                return Some(frames);
+            }
+        }
+        None
     }
 }
 
-fn perf_dwarf_frame_names<R>(
-    dwarf: &gimli::Dwarf<R>,
-    address: u64,
-    base_symbol: Option<&str>,
-) -> Option<Vec<String>>
+fn perf_dwarf_unit_roots<R>(dwarf: &gimli::Dwarf<R>, unit: &gimli::Unit<R>) -> Vec<PerfDwarfDieNode>
 where
     R: gimli::Reader,
 {
-    let mut units = dwarf.units();
-    while let Ok(Some(header)) = units.next() {
-        let Ok(unit) = dwarf.unit(header) else {
-            continue;
-        };
-        if !unit_contains_address(dwarf, &unit, address) {
-            continue;
-        }
-        if let Some(frames) = perf_dwarf_frame_names_from_unit(dwarf, &unit, address, base_symbol) {
-            return Some(frames);
-        }
-    }
-    None
-}
-
-fn unit_contains_address<R>(dwarf: &gimli::Dwarf<R>, unit: &gimli::Unit<R>, address: u64) -> bool
-where
-    R: gimli::Reader,
-{
-    let Ok(mut ranges) = dwarf.unit_ranges(unit) else {
-        return true;
+    let Ok(mut tree) = unit.entries_tree(None) else {
+        return Vec::new();
     };
-    while let Ok(Some(range)) = ranges.next() {
-        if range.begin <= address && address < range.end {
-            return true;
-        }
-    }
-    false
-}
-
-fn perf_dwarf_frame_names_from_unit<R>(
-    dwarf: &gimli::Dwarf<R>,
-    unit: &gimli::Unit<R>,
-    address: u64,
-    base_symbol: Option<&str>,
-) -> Option<Vec<String>>
-where
-    R: gimli::Reader,
-{
-    let mut tree = unit.entries_tree(None).ok()?;
-    let root = tree.root().ok()?;
+    let Ok(root) = tree.root() else {
+        return Vec::new();
+    };
+    let mut roots = Vec::new();
     let mut children = root.children();
     while let Ok(Some(child)) = children.next() {
-        if let Some(mut frames) =
-            perf_dwarf_frames_from_node(dwarf, unit, child, address, false, base_symbol)
-        {
-            frames.reverse();
-            return Some(frames);
-        }
+        perf_dwarf_collect_relevant_nodes(dwarf, unit, child, &mut roots);
     }
-    None
+    roots
 }
 
-fn perf_dwarf_frames_from_node<R>(
+fn perf_dwarf_collect_relevant_nodes<R>(
     dwarf: &gimli::Dwarf<R>,
     unit: &gimli::Unit<R>,
     node: gimli::EntriesTreeNode<'_, '_, R>,
-    address: u64,
-    looking_for_inline: bool,
-    base_symbol: Option<&str>,
-) -> Option<Vec<String>>
+    out: &mut Vec<PerfDwarfDieNode>,
+) where
+    R: gimli::Reader,
+{
+    let tag = node.entry().tag();
+    let kind = match tag {
+        gimli::DW_TAG_subprogram => Some(PerfDwarfDieKind::Subprogram),
+        gimli::DW_TAG_inlined_subroutine => Some(PerfDwarfDieKind::Inline),
+        _ => None,
+    };
+    let ranges = kind
+        .map(|_| perf_dwarf_ranges(dwarf.die_ranges(unit, node.entry()).ok()).unwrap_or_default());
+    let name = kind.and_then(|_| {
+        perf_dwarf_die_name(dwarf, unit, node.entry()).map(|name| perf_dwarf_function_name(&name))
+    });
+    if let Some(kind) = kind {
+        let mut children = Vec::new();
+        let mut child_iter = node.children();
+        while let Ok(Some(child)) = child_iter.next() {
+            perf_dwarf_collect_relevant_nodes(dwarf, unit, child, &mut children);
+        }
+        out.push(PerfDwarfDieNode {
+            kind,
+            ranges: ranges.unwrap_or_default(),
+            name,
+            children,
+        });
+        return;
+    }
+    let mut child_iter = node.children();
+    while let Ok(Some(child)) = child_iter.next() {
+        perf_dwarf_collect_relevant_nodes(dwarf, unit, child, out);
+    }
+}
+
+fn perf_dwarf_ranges<R>(ranges: Option<gimli::RangeIter<R>>) -> Option<Vec<PerfAddressRange>>
 where
     R: gimli::Reader,
 {
-    let entry = node.entry();
-    let expected_tag = if looking_for_inline {
-        gimli::DW_TAG_inlined_subroutine
-    } else {
-        gimli::DW_TAG_subprogram
-    };
-    if entry.tag() == expected_tag && die_contains_address(dwarf, unit, entry, address) {
-        let mut frames = Vec::new();
-        if let Some(name) = perf_dwarf_die_name(dwarf, unit, entry) {
-            frames.push(perf_dwarf_function_name(&name));
-        }
-        let mut found_inline_child = false;
-        let mut children = node.children();
-        while let Ok(Some(child)) = children.next() {
-            if let Some(mut child_frames) =
-                perf_dwarf_frames_from_node(dwarf, unit, child, address, true, base_symbol)
-            {
-                found_inline_child = true;
-                frames.append(&mut child_frames);
-                break;
-            }
-        }
-        // perf's inline replacement starts at the real subprogram DIE:
-        // tools/perf/util/dwarf-aux.c:cu_walk_functions_at calls
-        // die_find_realfunc(), then walks inline children.  The DIE is only
-        // rendered as an inline frame when srcline.c:new_inline_sym creates a
-        // synthetic symbol, which happens when dwarf_diename(die) differs from
-        // the base symbol name.
-        if !looking_for_inline
-            && !found_inline_child
-            && !frames
-                .first()
-                .is_some_and(|name| perf_realfunc_name_replaces_base_symbol(name, base_symbol))
-        {
-            return None;
-        }
-        return (!frames.is_empty()).then_some(frames);
+    let mut ranges = ranges?;
+    let mut collected = Vec::new();
+    while let Ok(Some(range)) = ranges.next() {
+        collected.push(PerfAddressRange {
+            begin: range.begin,
+            end: range.end,
+        });
     }
+    Some(collected)
+}
 
-    let mut children = node.children();
-    while let Ok(Some(child)) = children.next() {
-        if let Some(frames) = perf_dwarf_frames_from_node(
-            dwarf,
-            unit,
-            child,
+fn perf_dwarf_unit_contains_address(unit: &PerfDwarfUnitIndex, address: u64) -> bool {
+    unit.ranges
+        .as_ref()
+        .is_none_or(|ranges| perf_dwarf_ranges_contain(ranges, address))
+}
+
+fn perf_dwarf_ranges_contain(ranges: &[PerfAddressRange], address: u64) -> bool {
+    ranges
+        .iter()
+        .any(|range| range.begin <= address && address < range.end)
+}
+
+fn perf_dwarf_frame_names_from_index(
+    nodes: &[PerfDwarfDieNode],
+    address: u64,
+    looking_for_inline: bool,
+    base_symbol: Option<&str>,
+) -> Option<Vec<String>> {
+    let expected_kind = if looking_for_inline {
+        PerfDwarfDieKind::Inline
+    } else {
+        PerfDwarfDieKind::Subprogram
+    };
+    for node in nodes {
+        if node.kind == expected_kind && perf_dwarf_ranges_contain(&node.ranges, address) {
+            let mut frames = Vec::new();
+            if let Some(name) = &node.name {
+                frames.push(name.clone());
+            }
+            let child_frames =
+                perf_dwarf_frame_names_from_index(&node.children, address, true, base_symbol);
+            let found_inline_child = child_frames.is_some();
+            if let Some(mut child_frames) = child_frames {
+                frames.append(&mut child_frames);
+            }
+            if !looking_for_inline
+                && !found_inline_child
+                && !frames
+                    .first()
+                    .is_some_and(|name| perf_realfunc_name_replaces_base_symbol(name, base_symbol))
+            {
+                return None;
+            }
+            return (!frames.is_empty()).then_some(frames);
+        }
+        if let Some(frames) = perf_dwarf_frame_names_from_index(
+            &node.children,
             address,
             looking_for_inline,
             base_symbol,
@@ -1423,26 +1569,6 @@ where
 
 fn perf_realfunc_name_replaces_base_symbol(name: &str, base_symbol: Option<&str>) -> bool {
     base_symbol.is_some_and(|base_symbol| name != base_symbol)
-}
-
-fn die_contains_address<R>(
-    dwarf: &gimli::Dwarf<R>,
-    unit: &gimli::Unit<R>,
-    entry: &gimli::DebuggingInformationEntry<R>,
-    address: u64,
-) -> bool
-where
-    R: gimli::Reader,
-{
-    let Ok(mut ranges) = dwarf.die_ranges(unit, entry) else {
-        return false;
-    };
-    while let Ok(Some(range)) = ranges.next() {
-        if range.begin <= address && address < range.end {
-            return true;
-        }
-    }
-    false
 }
 
 fn perf_dwarf_die_name<R>(
@@ -1768,6 +1894,15 @@ fn parse_kallsyms_line(line: &str) -> Option<(u64, String)> {
     let _symbol_type = fields.next()?;
     let symbol = fields.next()?;
     Some((address, symbol.to_string()))
+}
+
+fn parse_module_kallsyms_line(line: &str) -> Option<(u64, String)> {
+    let mut fields = line.split_whitespace();
+    let address = u64::from_str_radix(fields.next()?, 16).ok()?;
+    let _symbol_type = fields.next()?;
+    let symbol = fields.next()?;
+    let module = fields.next()?;
+    (module.starts_with('[') && module.ends_with(']')).then(|| (address, symbol.to_string()))
 }
 
 #[cfg(test)]
