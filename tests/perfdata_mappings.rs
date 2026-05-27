@@ -277,3 +277,77 @@ fn exposes_user_mappings_for_unwind_module_loading() {
     assert_eq!(mappings[0].pgoff, 0);
     assert_eq!(mappings[0].path, "/bin/app");
 }
+
+#[test]
+fn tracks_executable_mappings_without_rescanning_every_lookup() {
+    let mut table = MmapTable::default();
+    table.insert_mmap2(Mmap2Record {
+        pid: 42,
+        tid: 42,
+        start: 0x1000,
+        len: 0x200,
+        pgoff: 0,
+        major: 8,
+        minor: 1,
+        inode: 99,
+        inode_generation: 7,
+        prot: 0,
+        flags: 2,
+        path: "/tmp/not-exec".to_string(),
+    });
+    table.insert_mmap2(Mmap2Record {
+        pid: u32::MAX,
+        tid: u32::MAX,
+        start: 0xffff_ffff_8800_0000,
+        len: 0x2000,
+        pgoff: 0,
+        major: 0,
+        minor: 0,
+        inode: 0,
+        inode_generation: 0,
+        prot: 5,
+        flags: 2,
+        path: "[kernel.kallsyms]".to_string(),
+    });
+
+    assert!(table.has_mappings_for_pid(42));
+    assert!(table.has_mappings_for_pid(7));
+    assert!(table.has_executable_mappings_for_pid(42));
+    assert!(table.has_executable_mappings_for_pid(7));
+}
+
+#[test]
+fn uses_most_specific_mapping_for_non_executable_checks() {
+    let mut table = MmapTable::default();
+    table.insert_mmap2(Mmap2Record {
+        pid: 42,
+        tid: 42,
+        start: 0x1000,
+        len: 0x1000,
+        pgoff: 0,
+        major: 8,
+        minor: 1,
+        inode: 99,
+        inode_generation: 7,
+        prot: 5,
+        flags: 2,
+        path: "/bin/app".to_string(),
+    });
+    table.insert_mmap2(Mmap2Record {
+        pid: 42,
+        tid: 42,
+        start: 0x1800,
+        len: 0x100,
+        pgoff: 0,
+        major: 8,
+        minor: 1,
+        inode: 100,
+        inode_generation: 8,
+        prot: 0,
+        flags: 2,
+        path: "/tmp/not-exec".to_string(),
+    });
+
+    assert!(!table.is_known_non_executable(42, 0x1400));
+    assert!(table.is_known_non_executable(42, 0x1810));
+}

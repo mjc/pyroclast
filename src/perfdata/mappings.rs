@@ -1,5 +1,7 @@
 use crate::perfdata::records::{Mmap2BuildIdRecord, Mmap2Record, MmapRecord};
 use crate::symbols::KernelRelocation;
+use hashbrown::{HashMap, HashSet};
+use rustc_hash::FxBuildHasher;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -10,6 +12,11 @@ const PROT_EXEC: u32 = 4;
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MmapTable {
     mappings: Vec<Mapping>,
+    mappings_by_pid: HashMap<u32, Vec<IndexedMapping>, FxBuildHasher>,
+    pids_with_mappings: HashSet<u32, FxBuildHasher>,
+    executable_pids: HashSet<u32, FxBuildHasher>,
+    has_global_mappings: bool,
+    has_global_executable_mappings: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,9 +70,15 @@ struct Mapping {
     prot: Option<u32>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IndexedMapping {
+    start: u64,
+    index: usize,
+}
+
 impl MmapTable {
     pub fn insert_mmap(&mut self, record: MmapRecord) {
-        self.mappings.push(Mapping {
+        self.insert_mapping(Mapping {
             pid: record.pid,
             start: record.start,
             len: record.len,
@@ -82,7 +95,7 @@ impl MmapTable {
     }
 
     pub fn insert_mmap2_with_build_id(&mut self, record: Mmap2Record, build_id: Option<Vec<u8>>) {
-        self.mappings.push(Mapping {
+        self.insert_mapping(Mapping {
             pid: record.pid,
             start: record.start,
             len: record.len,
@@ -100,7 +113,7 @@ impl MmapTable {
     }
 
     pub fn insert_mmap2_build_id(&mut self, record: Mmap2BuildIdRecord) {
-        self.mappings.push(Mapping {
+        self.insert_mapping(Mapping {
             pid: record.pid,
             start: record.start,
             len: record.len,
@@ -112,12 +125,29 @@ impl MmapTable {
         });
     }
 
+    fn insert_mapping(&mut self, mapping: Mapping) {
+        let pid = mapping.pid;
+        let start = mapping.start;
+        let may_execute = mapping.may_execute();
+        let index = self.mappings.len();
+        self.mappings.push(mapping);
+        let bucket = self.mappings_by_pid.entry(pid).or_default();
+        let position = bucket.partition_point(|indexed| indexed.start <= start);
+        bucket.insert(position, IndexedMapping { start, index });
+        if pid == u32::MAX {
+            self.has_global_mappings = true;
+            self.has_global_executable_mappings |= may_execute;
+        } else {
+            self.pids_with_mappings.insert(pid);
+            if may_execute {
+                self.executable_pids.insert(pid);
+            }
+        }
+    }
+
     #[must_use]
     pub fn resolve(&self, pid: u32, ip: u64) -> Option<ResolvedMapping> {
-        self.mappings
-            .iter()
-            .filter(|mapping| mapping.contains(pid, ip))
-            .max_by_key(|mapping| mapping.start)
+        self.resolve_mapping(pid, ip)
             .map(|mapping| ResolvedMapping {
                 path: mapping.path.clone(),
                 relative_address: mapping.relative_address(ip),
@@ -144,33 +174,55 @@ impl MmapTable {
 
     #[must_use]
     pub fn has_mappings_for_pid(&self, pid: u32) -> bool {
-        self.mappings
-            .iter()
-            .any(|mapping| mapping.pid == pid || mapping.pid == u32::MAX)
+        self.has_global_mappings || self.pids_with_mappings.contains(&pid)
     }
 
     #[must_use]
     pub fn has_executable_mappings_for_pid(&self, pid: u32) -> bool {
-        self.mappings
-            .iter()
-            .any(|mapping| (mapping.pid == pid || mapping.pid == u32::MAX) && mapping.may_execute())
+        self.has_global_executable_mappings || self.executable_pids.contains(&pid)
     }
 
     #[must_use]
     pub fn is_known_non_executable(&self, pid: u32, ip: u64) -> bool {
-        self.mappings
-            .iter()
-            .filter(|mapping| mapping.contains(pid, ip))
-            .max_by_key(|mapping| mapping.start)
+        self.resolve_mapping(pid, ip)
             .is_some_and(Mapping::is_known_non_executable)
+    }
+
+    fn resolve_mapping(&self, pid: u32, ip: u64) -> Option<&Mapping> {
+        if pid == u32::MAX {
+            return self.resolve_mapping_for_pid(pid, ip);
+        }
+        match (
+            self.resolve_mapping_for_pid(pid, ip),
+            self.resolve_mapping_for_pid(u32::MAX, ip),
+        ) {
+            (Some(left), Some(right)) => Some(if left.start >= right.start {
+                left
+            } else {
+                right
+            }),
+            (Some(mapping), None) | (None, Some(mapping)) => Some(mapping),
+            (None, None) => None,
+        }
+    }
+
+    fn resolve_mapping_for_pid(&self, pid: u32, ip: u64) -> Option<&Mapping> {
+        let bucket = self.mappings_by_pid.get(&pid)?;
+        let mut upper_bound = bucket.partition_point(|indexed| indexed.start <= ip);
+        while upper_bound > 0 {
+            upper_bound -= 1;
+            let mapping = &self.mappings[bucket[upper_bound].index];
+            if mapping.contains_ip(ip) {
+                return Some(mapping);
+            }
+        }
+        None
     }
 }
 
 impl Mapping {
-    fn contains(&self, pid: u32, ip: u64) -> bool {
-        (self.pid == pid || self.pid == u32::MAX)
-            && ip >= self.start
-            && ip < self.start.saturating_add(self.len)
+    fn contains_ip(&self, ip: u64) -> bool {
+        ip >= self.start && ip < self.start.saturating_add(self.len)
     }
 
     fn relative_address(&self, ip: u64) -> u64 {
