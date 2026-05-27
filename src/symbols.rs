@@ -103,7 +103,7 @@ struct PerfAddressRange {
 #[derive(Debug)]
 struct PerfDwarfUnitIndex {
     ranges: Option<Vec<PerfAddressRange>>,
-    roots: Vec<PerfDwarfDieNode>,
+    segments: Vec<PerfDwarfFrameRange>,
 }
 
 #[derive(Debug)]
@@ -112,6 +112,13 @@ struct PerfDwarfDieNode {
     ranges: Vec<PerfAddressRange>,
     name: Option<String>,
     children: Vec<PerfDwarfDieNode>,
+}
+
+#[derive(Debug)]
+struct PerfDwarfFrameRange {
+    range: PerfAddressRange,
+    frames: Box<[String]>,
+    base_symbol_sensitive: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -944,7 +951,6 @@ where
                 .as_ref()
         })
     }
-
     fn system_map_kallsyms_ref(&self) -> Option<&Kallsyms> {
         self.system_map_kallsyms.as_ref().or_else(|| {
             self.system_map_kallsyms_cache
@@ -1406,9 +1412,10 @@ impl PerfDwarfNameResolver {
             let Ok(unit) = dwarf.unit(header) else {
                 continue;
             };
+            let roots = perf_dwarf_unit_roots(&dwarf, &unit);
             units.push(PerfDwarfUnitIndex {
                 ranges: perf_dwarf_ranges(dwarf.unit_ranges(&unit).ok()),
-                roots: perf_dwarf_unit_roots(&dwarf, &unit),
+                segments: perf_dwarf_frame_ranges_from_roots(&roots),
             });
         }
         Ok(Self { units })
@@ -1427,10 +1434,9 @@ impl PerfDwarfNameResolver {
             if !perf_dwarf_unit_contains_address(unit, address) {
                 continue;
             }
-            if let Some(mut frames) =
-                perf_dwarf_frame_names_from_index(&unit.roots, address, false, base_symbol)
+            if let Some(frames) =
+                perf_dwarf_frame_names_from_index(&unit.segments, address, base_symbol)
             {
-                frames.reverse();
                 return Some(frames);
             }
         }
@@ -1522,49 +1528,130 @@ fn perf_dwarf_ranges_contain(ranges: &[PerfAddressRange], address: u64) -> bool 
         .any(|range| range.begin <= address && address < range.end)
 }
 
-fn perf_dwarf_frame_names_from_index(
-    nodes: &[PerfDwarfDieNode],
-    address: u64,
-    looking_for_inline: bool,
-    base_symbol: Option<&str>,
-) -> Option<Vec<String>> {
-    let expected_kind = if looking_for_inline {
-        PerfDwarfDieKind::Inline
-    } else {
-        PerfDwarfDieKind::Subprogram
-    };
-    for node in nodes {
-        if node.kind == expected_kind && perf_dwarf_ranges_contain(&node.ranges, address) {
-            let mut frames = Vec::new();
-            if let Some(name) = &node.name {
-                frames.push(name.clone());
-            }
-            let child_frames =
-                perf_dwarf_frame_names_from_index(&node.children, address, true, base_symbol);
-            let found_inline_child = child_frames.is_some();
-            if let Some(mut child_frames) = child_frames {
-                frames.append(&mut child_frames);
-            }
-            if !looking_for_inline
-                && !found_inline_child
-                && !frames
-                    .first()
-                    .is_some_and(|name| perf_realfunc_name_replaces_base_symbol(name, base_symbol))
-            {
-                return None;
-            }
-            return (!frames.is_empty()).then_some(frames);
-        }
-        if let Some(frames) = perf_dwarf_frame_names_from_index(
-            &node.children,
-            address,
-            looking_for_inline,
-            base_symbol,
-        ) {
-            return Some(frames);
+fn perf_dwarf_frame_ranges_from_roots(roots: &[PerfDwarfDieNode]) -> Vec<PerfDwarfFrameRange> {
+    let mut segments = Vec::new();
+    let mut prefix = Vec::new();
+    for root in roots {
+        perf_dwarf_collect_frame_ranges(root, &mut prefix, &mut segments);
+    }
+    segments.sort_by_key(|segment| segment.range.begin);
+    segments
+}
+
+fn perf_dwarf_collect_frame_ranges(
+    node: &PerfDwarfDieNode,
+    prefix: &mut Vec<String>,
+    out: &mut Vec<PerfDwarfFrameRange>,
+) -> Vec<PerfAddressRange> {
+    let prefix_len = prefix.len();
+    if let Some(name) = &node.name {
+        prefix.push(name.clone());
+    }
+
+    let mut child_coverage = Vec::new();
+    for child in &node.children {
+        child_coverage.extend(perf_dwarf_collect_frame_ranges(child, prefix, out));
+    }
+
+    if !prefix.is_empty() {
+        let base_symbol_sensitive = node.kind == PerfDwarfDieKind::Subprogram && prefix.len() == 1;
+        for range in perf_dwarf_subtract_ranges(&node.ranges, &child_coverage) {
+            out.push(PerfDwarfFrameRange {
+                range,
+                frames: prefix.clone().into_boxed_slice(),
+                base_symbol_sensitive,
+            });
         }
     }
-    None
+
+    prefix.truncate(prefix_len);
+    perf_dwarf_merge_ranges(node.ranges.clone())
+}
+
+fn perf_dwarf_merge_ranges(mut ranges: Vec<PerfAddressRange>) -> Vec<PerfAddressRange> {
+    if ranges.len() <= 1 {
+        return ranges;
+    }
+    ranges.sort_by_key(|range| range.begin);
+    let mut merged = Vec::<PerfAddressRange>::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(current) = merged.last_mut()
+            && range.begin <= current.end
+        {
+            current.end = current.end.max(range.end);
+            continue;
+        }
+        merged.push(range);
+    }
+    merged
+}
+
+fn perf_dwarf_subtract_ranges(
+    ranges: &[PerfAddressRange],
+    covered: &[PerfAddressRange],
+) -> Vec<PerfAddressRange> {
+    let merged_ranges = perf_dwarf_merge_ranges(ranges.to_vec());
+    let merged_covered = perf_dwarf_merge_ranges(covered.to_vec());
+    let mut uncovered = Vec::new();
+    let mut covered_index = 0;
+
+    for range in merged_ranges {
+        let mut cursor = range.begin;
+        while covered_index < merged_covered.len() && merged_covered[covered_index].end <= cursor {
+            covered_index += 1;
+        }
+
+        let mut index = covered_index;
+        while index < merged_covered.len() && merged_covered[index].begin < range.end {
+            let overlap = merged_covered[index];
+            if cursor < overlap.begin {
+                uncovered.push(PerfAddressRange {
+                    begin: cursor,
+                    end: overlap.begin.min(range.end),
+                });
+            }
+            cursor = cursor.max(overlap.end);
+            if cursor >= range.end {
+                break;
+            }
+            index += 1;
+        }
+
+        if cursor < range.end {
+            uncovered.push(PerfAddressRange {
+                begin: cursor,
+                end: range.end,
+            });
+        }
+    }
+
+    uncovered
+}
+
+fn perf_dwarf_frame_names_from_index(
+    segments: &[PerfDwarfFrameRange],
+    address: u64,
+    base_symbol: Option<&str>,
+) -> Option<Vec<String>> {
+    let upper_bound = segments.partition_point(|segment| segment.range.begin <= address);
+    if upper_bound == 0 {
+        return None;
+    }
+    let segment = &segments[upper_bound - 1];
+    if !(segment.range.begin <= address && address < segment.range.end) {
+        return None;
+    }
+    if segment.base_symbol_sensitive
+        && !segment
+            .frames
+            .first()
+            .is_some_and(|name| perf_realfunc_name_replaces_base_symbol(name, base_symbol))
+    {
+        return None;
+    }
+    let mut frames = segment.frames.to_vec();
+    frames.reverse();
+    Some(frames)
 }
 
 fn perf_realfunc_name_replaces_base_symbol(name: &str, base_symbol: Option<&str>) -> bool {
