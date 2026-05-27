@@ -7,7 +7,9 @@ pub use crate::symbols::SymbolizerKind;
 
 #[derive(Debug, Parser)]
 #[command(name = "pyroclast")]
-#[command(about = "Rust-only profiling orchestration and analysis")]
+#[command(
+    about = "Rust-first profiling orchestration with separate porcelain and plumbing surfaces"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: CliCommand,
@@ -28,17 +30,52 @@ pub enum CliCommand {
     #[command(alias = "heap")]
     Memory(RunArgs),
     Cpu(RunArgs),
-    #[command(alias = "offcpu")]
-    Offpcu(RunArgs),
+    Offcpu(RunArgs),
     #[command(alias = "syscalls")]
     Latency(RunArgs),
     Async(RunArgs),
     Profile(ProfileArgs),
+    Plumbing {
+        #[command(subcommand)]
+        command: PlumbingCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PlumbingCommand {
     Fold(FoldArgs),
-    Summarize(SummarizeArgs),
     Flamegraph(FlamegraphArgs),
-    AnalyzeFlamegraph(AnalyzeFlamegraphArgs),
-    AnalyzePerfdata(AnalyzePerfdataArgs),
+    Summarize(SummarizeArgs),
+    Parse {
+        #[command(subcommand)]
+        command: ParseCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ParseCommand {
+    Perf {
+        #[command(subcommand)]
+        command: ParsePerfCommand,
+    },
+    Flamegraph {
+        #[command(subcommand)]
+        command: ParseFlamegraphCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ParsePerfCommand {
+    Summary(ParsePerfSummaryArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ParseFlamegraphCommand {
+    Top(ParseFlamegraphTopArgs),
+    Search(ParseFlamegraphSearchArgs),
+    Syscalls(ParseFlamegraphSyscallsArgs),
+    Summary(ParseFlamegraphSummaryArgs),
+    Diff(ParseFlamegraphDiffArgs),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
@@ -155,7 +192,7 @@ impl CliCommand {
         match self {
             Self::Memory(args) => Some(ProfileInvocation::from_run(ProfileKind::Memory, args)),
             Self::Cpu(args) => Some(ProfileInvocation::from_run(ProfileKind::Cpu, args)),
-            Self::Offpcu(args) => Some(ProfileInvocation::from_run(ProfileKind::Offcpu, args)),
+            Self::Offcpu(args) => Some(ProfileInvocation::from_run(ProfileKind::Offcpu, args)),
             Self::Latency(args) => Some(ProfileInvocation::from_run(ProfileKind::Latency, args)),
             Self::Async(args) => Some(ProfileInvocation::from_run(ProfileKind::Async, args)),
             Self::Profile(args) => Some(ProfileInvocation {
@@ -174,11 +211,7 @@ impl CliCommand {
                 duration_secs: args.duration_secs,
                 command: args.command.clone(),
             }),
-            Self::Fold(_)
-            | Self::Summarize(_)
-            | Self::Flamegraph(_)
-            | Self::AnalyzeFlamegraph(_)
-            | Self::AnalyzePerfdata(_) => None,
+            Self::Plumbing { .. } => None,
         }
     }
 }
@@ -288,7 +321,7 @@ pub struct FlamegraphArgs {
     pub title: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FlamegraphAnalysisMode {
     Top,
     Search,
@@ -297,13 +330,50 @@ pub enum FlamegraphAnalysisMode {
     Diff,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug)]
 pub struct AnalyzeFlamegraphArgs {
+    pub json: bool,
+    pub mode: FlamegraphAnalysisMode,
+    pub limit: usize,
+    pub min_percent: f64,
+    pub search: Option<String>,
+    pub other: Option<PathBuf>,
+    pub input: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct AnalyzePerfdataArgs {
+    pub json: bool,
+    pub limit: usize,
+    pub input: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct ParsePerfSummaryArgs {
     #[arg(long)]
     pub json: bool,
 
-    #[arg(long, value_enum, default_value_t = FlamegraphAnalysisMode::Top)]
-    pub mode: FlamegraphAnalysisMode,
+    #[arg(long, default_value_t = 30)]
+    pub limit: usize,
+
+    pub input: PathBuf,
+}
+
+impl ParsePerfSummaryArgs {
+    #[must_use]
+    pub fn analyze_args(&self) -> AnalyzePerfdataArgs {
+        AnalyzePerfdataArgs {
+            json: self.json,
+            limit: self.limit,
+            input: self.input.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct ParseFlamegraphTopArgs {
+    #[arg(long)]
+    pub json: bool,
 
     #[arg(long, default_value_t = 30)]
     pub limit: usize,
@@ -311,22 +381,117 @@ pub struct AnalyzeFlamegraphArgs {
     #[arg(long, default_value_t = 1.0)]
     pub min_percent: f64,
 
-    #[arg(long)]
-    pub search: Option<String>,
+    pub input: PathBuf,
+}
 
+impl ParseFlamegraphTopArgs {
+    #[must_use]
+    pub fn analyze_args(&self) -> AnalyzeFlamegraphArgs {
+        AnalyzeFlamegraphArgs {
+            json: self.json,
+            mode: FlamegraphAnalysisMode::Top,
+            limit: self.limit,
+            min_percent: self.min_percent,
+            search: None,
+            other: None,
+            input: self.input.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct ParseFlamegraphSearchArgs {
     #[arg(long)]
-    pub other: Option<PathBuf>,
+    pub json: bool,
+
+    pub input: PathBuf,
+    pub pattern: String,
+}
+
+impl ParseFlamegraphSearchArgs {
+    #[must_use]
+    pub fn analyze_args(&self) -> AnalyzeFlamegraphArgs {
+        AnalyzeFlamegraphArgs {
+            json: self.json,
+            mode: FlamegraphAnalysisMode::Search,
+            limit: 30,
+            min_percent: 1.0,
+            search: Some(self.pattern.clone()),
+            other: None,
+            input: self.input.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct ParseFlamegraphSyscallsArgs {
+    #[arg(long)]
+    pub json: bool,
 
     pub input: PathBuf,
 }
 
+impl ParseFlamegraphSyscallsArgs {
+    #[must_use]
+    pub fn analyze_args(&self) -> AnalyzeFlamegraphArgs {
+        AnalyzeFlamegraphArgs {
+            json: self.json,
+            mode: FlamegraphAnalysisMode::Syscalls,
+            limit: 30,
+            min_percent: 1.0,
+            search: None,
+            other: None,
+            input: self.input.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Args)]
-pub struct AnalyzePerfdataArgs {
+pub struct ParseFlamegraphSummaryArgs {
     #[arg(long)]
     pub json: bool,
 
-    #[arg(long, default_value_t = 30)]
-    pub limit: usize,
-
     pub input: PathBuf,
+}
+
+impl ParseFlamegraphSummaryArgs {
+    #[must_use]
+    pub fn analyze_args(&self) -> AnalyzeFlamegraphArgs {
+        AnalyzeFlamegraphArgs {
+            json: self.json,
+            mode: FlamegraphAnalysisMode::Summary,
+            limit: 30,
+            min_percent: 1.0,
+            search: None,
+            other: None,
+            input: self.input.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct ParseFlamegraphDiffArgs {
+    #[arg(long)]
+    pub json: bool,
+
+    #[arg(long, default_value_t = 1.0)]
+    pub min_percent: f64,
+
+    pub before: PathBuf,
+    pub after: PathBuf,
+}
+
+impl ParseFlamegraphDiffArgs {
+    #[must_use]
+    pub fn analyze_args(&self) -> AnalyzeFlamegraphArgs {
+        AnalyzeFlamegraphArgs {
+            json: self.json,
+            mode: FlamegraphAnalysisMode::Diff,
+            limit: 30,
+            min_percent: self.min_percent,
+            search: None,
+            other: Some(self.after.clone()),
+            input: self.before.clone(),
+        }
+    }
 }

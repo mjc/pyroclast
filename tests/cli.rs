@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use pyroclast::cli::{
-    Cli, CliCommand, FlamegraphAnalysisMode, PerfCallGraph, PerfEvent, ProfileKind, SymbolizerKind,
+    Cli, CliCommand, FlamegraphAnalysisMode, ParseCommand, ParseFlamegraphCommand,
+    ParsePerfCommand, PerfCallGraph, PerfEvent, PlumbingCommand, ProfileKind, SymbolizerKind,
 };
 
 #[test]
@@ -218,7 +219,6 @@ fn parses_top_level_profiler_commands() {
         ("memory", ProfileKind::Memory),
         ("heap", ProfileKind::Memory),
         ("cpu", ProfileKind::Cpu),
-        ("offpcu", ProfileKind::Offcpu),
         ("offcpu", ProfileKind::Offcpu),
         ("latency", ProfileKind::Latency),
         ("syscalls", ProfileKind::Latency),
@@ -273,24 +273,32 @@ fn parses_top_level_profiler_commands() {
 }
 
 #[test]
-fn parses_analysis_commands() {
-    let fold = Cli::parse_from(["pyroclast", "fold", "perf.data"]);
+fn parses_plumbing_fold_and_summarize_commands() {
+    let fold = Cli::parse_from(["pyroclast", "plumbing", "fold", "perf.data"]);
     assert!(
-        matches!(fold.command, CliCommand::Fold(command) if command.input == std::path::Path::new("perf.data") && !command.count_periods)
+        matches!(fold.command, CliCommand::Plumbing { command: PlumbingCommand::Fold(command) } if command.input == std::path::Path::new("perf.data") && !command.count_periods)
     );
 
-    let weighted_fold = Cli::parse_from(["pyroclast", "fold", "--count-periods", "perf.data"]);
+    let weighted_fold = Cli::parse_from([
+        "pyroclast",
+        "plumbing",
+        "fold",
+        "--count-periods",
+        "perf.data",
+    ]);
     assert!(
-        matches!(weighted_fold.command, CliCommand::Fold(command) if command.input == std::path::Path::new("perf.data") && command.count_periods && !command.symbols)
+        matches!(weighted_fold.command, CliCommand::Plumbing { command: PlumbingCommand::Fold(command) } if command.input == std::path::Path::new("perf.data") && command.count_periods && !command.symbols)
     );
 
-    let symbolized_fold = Cli::parse_from(["pyroclast", "fold", "--symbols", "perf.data"]);
+    let symbolized_fold =
+        Cli::parse_from(["pyroclast", "plumbing", "fold", "--symbols", "perf.data"]);
     assert!(
-        matches!(symbolized_fold.command, CliCommand::Fold(command) if command.input == std::path::Path::new("perf.data") && command.symbols && command.symbolizer == SymbolizerKind::RustAddr2line)
+        matches!(symbolized_fold.command, CliCommand::Plumbing { command: PlumbingCommand::Fold(command) } if command.input == std::path::Path::new("perf.data") && command.symbols && command.symbolizer == SymbolizerKind::RustAddr2line)
     );
 
     let rust_symbolized_fold = Cli::parse_from([
         "pyroclast",
+        "plumbing",
         "fold",
         "--symbols",
         "--symbolizer",
@@ -298,27 +306,43 @@ fn parses_analysis_commands() {
         "perf.data",
     ]);
     assert!(
-        matches!(rust_symbolized_fold.command, CliCommand::Fold(command) if command.input == std::path::Path::new("perf.data") && command.symbols && command.symbolizer == SymbolizerKind::RustAddr2line)
+        matches!(rust_symbolized_fold.command, CliCommand::Plumbing { command: PlumbingCommand::Fold(command) } if command.input == std::path::Path::new("perf.data") && command.symbols && command.symbolizer == SymbolizerKind::RustAddr2line)
     );
 
-    let summarize = Cli::parse_from(["pyroclast", "summarize", "--json", "run-dir"]);
+    let summarize = Cli::parse_from(["pyroclast", "plumbing", "summarize", "--json", "run-dir"]);
     assert!(
-        matches!(summarize.command, CliCommand::Summarize(command) if command.json && command.artifact_dir == std::path::Path::new("run-dir"))
+        matches!(summarize.command, CliCommand::Plumbing { command: PlumbingCommand::Summarize(command) } if command.json && command.artifact_dir == std::path::Path::new("run-dir"))
+    );
+}
+
+#[test]
+fn parses_plumbing_flamegraph_commands() {
+    let flamegraph = Cli::parse_from([
+        "pyroclast",
+        "plumbing",
+        "flamegraph",
+        "perf.data",
+        "-o",
+        "out.svg",
+    ]);
+    assert!(
+        matches!(flamegraph.command, CliCommand::Plumbing { command: PlumbingCommand::Flamegraph(command) } if command.input == std::path::Path::new("perf.data") && command.output.as_deref() == Some(std::path::Path::new("out.svg")) && !command.symbols)
     );
 
-    let flamegraph = Cli::parse_from(["pyroclast", "flamegraph", "perf.data", "-o", "out.svg"]);
+    let symbolized_flamegraph = Cli::parse_from([
+        "pyroclast",
+        "plumbing",
+        "flamegraph",
+        "--symbols",
+        "perf.data",
+    ]);
     assert!(
-        matches!(flamegraph.command, CliCommand::Flamegraph(command) if command.input == std::path::Path::new("perf.data") && command.output.as_deref() == Some(std::path::Path::new("out.svg")) && !command.symbols)
-    );
-
-    let symbolized_flamegraph =
-        Cli::parse_from(["pyroclast", "flamegraph", "--symbols", "perf.data"]);
-    assert!(
-        matches!(symbolized_flamegraph.command, CliCommand::Flamegraph(command) if command.input == std::path::Path::new("perf.data") && command.symbols && command.symbolizer == SymbolizerKind::RustAddr2line)
+        matches!(symbolized_flamegraph.command, CliCommand::Plumbing { command: PlumbingCommand::Flamegraph(command) } if command.input == std::path::Path::new("perf.data") && command.symbols && command.symbolizer == SymbolizerKind::RustAddr2line)
     );
 
     let rust_symbolized_flamegraph = Cli::parse_from([
         "pyroclast",
+        "plumbing",
         "flamegraph",
         "--symbols",
         "--symbolizer",
@@ -326,15 +350,19 @@ fn parses_analysis_commands() {
         "perf.data",
     ]);
     assert!(
-        matches!(rust_symbolized_flamegraph.command, CliCommand::Flamegraph(command) if command.input == std::path::Path::new("perf.data") && command.symbols && command.symbolizer == SymbolizerKind::RustAddr2line)
+        matches!(rust_symbolized_flamegraph.command, CliCommand::Plumbing { command: PlumbingCommand::Flamegraph(command) } if command.input == std::path::Path::new("perf.data") && command.symbols && command.symbolizer == SymbolizerKind::RustAddr2line)
     );
+}
 
+#[test]
+fn parses_plumbing_parse_commands() {
     let flamegraph_analysis = Cli::parse_from([
         "pyroclast",
-        "analyze-flamegraph",
+        "plumbing",
+        "parse",
+        "flamegraph",
+        "top",
         "--json",
-        "--mode",
-        "summary",
         "--limit",
         "12",
         "--min-percent",
@@ -342,38 +370,59 @@ fn parses_analysis_commands() {
         "flamegraph.svg",
     ]);
     match flamegraph_analysis.command {
-        CliCommand::AnalyzeFlamegraph(command) => {
-            assert!(command.json);
-            assert_eq!(command.mode, FlamegraphAnalysisMode::Summary);
-            assert_eq!(command.limit, 12);
-            assert!((command.min_percent - 0.5).abs() < f64::EPSILON);
-            assert_eq!(command.input, std::path::Path::new("flamegraph.svg"));
+        CliCommand::Plumbing {
+            command:
+                PlumbingCommand::Parse {
+                    command:
+                        ParseCommand::Flamegraph {
+                            command: ParseFlamegraphCommand::Top(command),
+                        },
+                },
+        } => {
+            let analyze = command.analyze_args();
+            assert!(analyze.json);
+            assert_eq!(analyze.mode, FlamegraphAnalysisMode::Top);
+            assert_eq!(analyze.limit, 12);
+            assert!((analyze.min_percent - 0.5).abs() < f64::EPSILON);
+            assert_eq!(analyze.input, std::path::Path::new("flamegraph.svg"));
         }
-        other => panic!("expected analyze-flamegraph command, got {other:?}"),
+        other => panic!("expected plumbing parse flamegraph top command, got {other:?}"),
     }
 
     let flamegraph_diff = Cli::parse_from([
         "pyroclast",
-        "analyze-flamegraph",
-        "--mode",
+        "plumbing",
+        "parse",
+        "flamegraph",
         "diff",
-        "--other",
-        "after.svg",
         "before.svg",
+        "after.svg",
     ]);
     assert!(
-        matches!(flamegraph_diff.command, CliCommand::AnalyzeFlamegraph(command) if command.mode == FlamegraphAnalysisMode::Diff && command.other.as_deref() == Some(std::path::Path::new("after.svg")))
+        matches!(flamegraph_diff.command, CliCommand::Plumbing { command: PlumbingCommand::Parse { command: ParseCommand::Flamegraph { command: ParseFlamegraphCommand::Diff(command) } } } if command.before == std::path::Path::new("before.svg") && command.after == std::path::Path::new("after.svg"))
     );
 
     let perfdata_analysis = Cli::parse_from([
         "pyroclast",
-        "analyze-perfdata",
+        "plumbing",
+        "parse",
+        "perf",
+        "summary",
         "--json",
         "--limit",
         "20",
         "perf.data",
     ]);
     assert!(
-        matches!(perfdata_analysis.command, CliCommand::AnalyzePerfdata(command) if command.json && command.limit == 20 && command.input == std::path::Path::new("perf.data"))
+        matches!(perfdata_analysis.command, CliCommand::Plumbing { command: PlumbingCommand::Parse { command: ParseCommand::Perf { command: ParsePerfCommand::Summary(command) } } } if command.json && command.limit == 20 && command.input == std::path::Path::new("perf.data"))
     );
+}
+
+#[test]
+fn rejects_removed_top_level_plumbing_commands() {
+    assert!(Cli::try_parse_from(["pyroclast", "fold", "perf.data"]).is_err());
+    assert!(Cli::try_parse_from(["pyroclast", "flamegraph", "perf.data"]).is_err());
+    assert!(Cli::try_parse_from(["pyroclast", "summarize", "run-dir"]).is_err());
+    assert!(Cli::try_parse_from(["pyroclast", "analyze-flamegraph", "graph.svg"]).is_err());
+    assert!(Cli::try_parse_from(["pyroclast", "analyze-perfdata", "perf.data"]).is_err());
 }

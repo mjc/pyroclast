@@ -12,9 +12,11 @@ fn readme_documents_primary_commands() {
         "pyroclast profile --kind latency -- <command...>",
         "pyroclast heap -- <command...>",
         "pyroclast syscalls -- <command...>",
-        "pyroclast fold <perf.data>",
-        "pyroclast flamegraph <perf.data>",
-        "pyroclast summarize <artifact-dir>",
+        "pyroclast plumbing fold <perf.data>",
+        "pyroclast plumbing flamegraph <perf.data>",
+        "pyroclast plumbing summarize <artifact-dir>",
+        "pyroclast plumbing parse perf summary <perf.data>",
+        "pyroclast plumbing parse flamegraph summary <flamegraph.svg>",
     ] {
         assert!(readme.contains(command), "README missing {command}");
     }

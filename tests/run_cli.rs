@@ -62,7 +62,7 @@ fn fold_command_reads_perfdata_directly() {
     )
     .expect("write perfdata");
 
-    let output = pyroclast::run_cli(["pyroclast", "fold", perfdata.to_str().unwrap()])
+    let output = pyroclast::run_cli(["pyroclast", "plumbing", "fold", perfdata.to_str().unwrap()])
         .expect("fold command");
 
     assert_eq!(output.stdout, "app;/bin/app+0x1000 1\n");
@@ -91,6 +91,7 @@ fn fold_command_can_symbolize_mapped_frames() {
     let runner = RecordingRunner::default();
     let cli = pyroclast::cli::Cli::parse_from([
         "pyroclast",
+        "plumbing",
         "fold",
         "--symbols",
         "--symbolizer",
@@ -164,6 +165,7 @@ fn fold_command_can_use_rust_symbolizer_without_addr2line() {
     let runner = RecordingRunner::default();
     let cli = pyroclast::cli::Cli::parse_from([
         "pyroclast",
+        "plumbing",
         "fold",
         "--symbols",
         "--symbolizer",
@@ -190,6 +192,7 @@ fn flamegraph_command_folds_perfdata_without_perf_script() {
     let runner = RecordingRunner::default();
     let cli = pyroclast::cli::Cli::parse_from([
         "pyroclast",
+        "plumbing",
         "flamegraph",
         perfdata.to_str().expect("perfdata path"),
         "-o",
@@ -228,6 +231,7 @@ fn flamegraph_command_weights_perf_sample_periods() {
     let runner = RecordingRunner::default();
     let cli = pyroclast::cli::Cli::parse_from([
         "pyroclast",
+        "plumbing",
         "flamegraph",
         perfdata.to_str().expect("perfdata path"),
         "-o",
@@ -252,6 +256,7 @@ fn flamegraph_command_accepts_injected_renderer() {
     let renderer = RecordingRenderer::default();
     let cli = pyroclast::cli::Cli::parse_from([
         "pyroclast",
+        "plumbing",
         "flamegraph",
         perfdata.to_str().expect("perfdata path"),
         "-o",
@@ -293,6 +298,7 @@ fn flamegraph_command_can_symbolize_mapped_frames() {
     let runner = RecordingRunner::default();
     let cli = pyroclast::cli::Cli::parse_from([
         "pyroclast",
+        "plumbing",
         "flamegraph",
         "--symbols",
         "--symbolizer",
@@ -332,10 +338,11 @@ fn analyze_flamegraph_command_emits_json_summary() {
 
     let output = pyroclast::run_cli([
         "pyroclast",
-        "analyze-flamegraph",
-        "--json",
-        "--mode",
+        "plumbing",
+        "parse",
+        "flamegraph",
         "summary",
+        "--json",
         svg.to_str().expect("svg path"),
     ])
     .expect("analyze flamegraph");
@@ -365,12 +372,12 @@ fn analyze_flamegraph_command_emits_text_diff() {
 
     let output = pyroclast::run_cli([
         "pyroclast",
-        "analyze-flamegraph",
-        "--mode",
+        "plumbing",
+        "parse",
+        "flamegraph",
         "diff",
-        "--other",
-        after.to_str().expect("after path"),
         before.to_str().expect("before path"),
+        after.to_str().expect("after path"),
     ])
     .expect("analyze flamegraph");
 
@@ -388,7 +395,10 @@ fn analyze_perfdata_command_emits_json_report() {
 
     let output = pyroclast::run_cli([
         "pyroclast",
-        "analyze-perfdata",
+        "plumbing",
+        "parse",
+        "perf",
+        "summary",
         "--json",
         perfdata.to_str().expect("perfdata path"),
     ])
@@ -409,7 +419,10 @@ fn analyze_perfdata_command_emits_text_report() {
 
     let output = pyroclast::run_cli([
         "pyroclast",
-        "analyze-perfdata",
+        "plumbing",
+        "parse",
+        "perf",
+        "summary",
         perfdata.to_str().expect("perfdata path"),
     ])
     .expect("analyze perfdata");
@@ -427,8 +440,13 @@ fn summarize_command_prints_summary_text() {
     std::fs::write(run_dir.join("summary.txt"), "folded lines: 3\n").expect("summary txt");
     std::fs::write(run_dir.join("summary.json"), "{\"folded_lines\":3}\n").expect("summary json");
 
-    let output = pyroclast::run_cli(["pyroclast", "summarize", run_dir.to_str().unwrap()])
-        .expect("summarize command");
+    let output = pyroclast::run_cli([
+        "pyroclast",
+        "plumbing",
+        "summarize",
+        run_dir.to_str().unwrap(),
+    ])
+    .expect("summarize command");
 
     assert_eq!(output.stdout, "folded lines: 3\n");
 }
@@ -443,6 +461,7 @@ fn summarize_command_prints_summary_json() {
 
     let output = pyroclast::run_cli([
         "pyroclast",
+        "plumbing",
         "summarize",
         "--json",
         run_dir.to_str().unwrap(),
@@ -459,8 +478,13 @@ fn summarize_command_computes_text_from_folded_stacks_when_summary_is_missing() 
     std::fs::create_dir(&run_dir).expect("run dir");
     std::fs::write(run_dir.join("stacks.folded"), "a;b 2\nc 3\n").expect("folded stacks");
 
-    let output = pyroclast::run_cli(["pyroclast", "summarize", run_dir.to_str().unwrap()])
-        .expect("summarize command");
+    let output = pyroclast::run_cli([
+        "pyroclast",
+        "plumbing",
+        "summarize",
+        run_dir.to_str().unwrap(),
+    ])
+    .expect("summarize command");
 
     assert_eq!(
         output.stdout,
@@ -475,8 +499,13 @@ fn summarize_command_computes_text_from_raw_perfdata_when_summaries_are_missing(
     std::fs::create_dir(&run_dir).expect("run dir");
     std::fs::write(run_dir.join("profile.raw.perf.data"), tiny_perfdata()).expect("perfdata");
 
-    let output = pyroclast::run_cli(["pyroclast", "summarize", run_dir.to_str().unwrap()])
-        .expect("summarize command");
+    let output = pyroclast::run_cli([
+        "pyroclast",
+        "plumbing",
+        "summarize",
+        run_dir.to_str().unwrap(),
+    ])
+    .expect("summarize command");
 
     assert_eq!(
         output.stdout,
@@ -493,6 +522,7 @@ fn summarize_command_computes_json_from_raw_perfdata_when_summaries_are_missing(
 
     let output = pyroclast::run_cli([
         "pyroclast",
+        "plumbing",
         "summarize",
         "--json",
         run_dir.to_str().unwrap(),

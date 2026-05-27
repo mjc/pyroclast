@@ -24,8 +24,10 @@ use backends::macos_xctrace::MacosXctraceBackend;
 use backends::offcpu::OffcpuBackend;
 use backends::strace::StraceBackend;
 use backends::{ProfileRequest, ProfilerBackend};
-use cli::{AnalyzeFlamegraphArgs, AnalyzePerfdataArgs, FlamegraphAnalysisMode};
-use cli::{Cli, CliCommand};
+use cli::{
+    AnalyzeFlamegraphArgs, AnalyzePerfdataArgs, Cli, CliCommand, FlamegraphAnalysisMode,
+    ParseCommand, ParseFlamegraphCommand, ParsePerfCommand, PlumbingCommand,
+};
 use flamegraph::analysis::{
     FlamegraphCategory, FlamegraphDelta, FlamegraphEntry, category_summary, diff_flamegraphs,
     parse_flamegraph_entries, search_entries, syscall_breakdown, top_entries,
@@ -123,7 +125,7 @@ where
         return Ok(CliOutput::default());
     }
 
-    run_analysis_command(cli.command, runner, &flamegraph_renderer)
+    run_non_profile_command(cli.command, runner, &flamegraph_renderer)
 }
 
 fn run_profile_invocation<R, F>(
@@ -180,7 +182,7 @@ where
     Ok(())
 }
 
-fn run_analysis_command<R, F>(
+fn run_non_profile_command<R, F>(
     command: CliCommand,
     runner: &R,
     flamegraph_renderer: &F,
@@ -190,7 +192,29 @@ where
     F: FlamegraphRenderer,
 {
     match command {
-        CliCommand::Fold(command) => {
+        CliCommand::Plumbing { command } => {
+            run_plumbing_command(command, runner, flamegraph_renderer)
+        }
+        CliCommand::Memory(_)
+        | CliCommand::Cpu(_)
+        | CliCommand::Offcpu(_)
+        | CliCommand::Latency(_)
+        | CliCommand::Async(_)
+        | CliCommand::Profile(_) => unreachable!("profile invocations returned earlier"),
+    }
+}
+
+fn run_plumbing_command<R, F>(
+    command: PlumbingCommand,
+    runner: &R,
+    flamegraph_renderer: &F,
+) -> backends::BackendResult<CliOutput>
+where
+    R: CommandRunner,
+    F: FlamegraphRenderer,
+{
+    match command {
+        PlumbingCommand::Fold(command) => {
             let options = FoldOptions {
                 count_periods: command.count_periods,
             };
@@ -206,7 +230,7 @@ where
                 stderr: String::new(),
             })
         }
-        CliCommand::Flamegraph(command) => {
+        PlumbingCommand::Flamegraph(command) => {
             let output = command
                 .output
                 .unwrap_or_else(|| std::path::PathBuf::from("flamegraph.svg"));
@@ -229,34 +253,60 @@ where
                 stderr: String::from_utf8_lossy(&render.stderr).into_owned(),
             })
         }
-        CliCommand::Summarize(command) => {
+        PlumbingCommand::Summarize(command) => {
             let stdout = summarize_artifact_dir(&command.artifact_dir, command.json)?;
             Ok(CliOutput {
                 stdout,
                 stderr: String::new(),
             })
         }
-        CliCommand::AnalyzeFlamegraph(command) => {
-            let stdout = analyze_flamegraph_for_cli(&command)?;
-            Ok(CliOutput {
-                stdout,
-                stderr: String::new(),
-            })
-        }
-        CliCommand::AnalyzePerfdata(command) => {
-            let stdout = analyze_perfdata_for_cli(&command)?;
-            Ok(CliOutput {
-                stdout,
-                stderr: String::new(),
-            })
-        }
-        CliCommand::Memory(_)
-        | CliCommand::Cpu(_)
-        | CliCommand::Offpcu(_)
-        | CliCommand::Latency(_)
-        | CliCommand::Async(_)
-        | CliCommand::Profile(_) => unreachable!("profile invocations returned earlier"),
+        PlumbingCommand::Parse { command } => run_parse_command(command),
     }
+}
+
+fn run_parse_command(command: ParseCommand) -> backends::BackendResult<CliOutput> {
+    match command {
+        ParseCommand::Perf { command } => run_parse_perf_command(command),
+        ParseCommand::Flamegraph { command } => run_parse_flamegraph_command(command),
+    }
+}
+
+fn run_parse_perf_command(command: ParsePerfCommand) -> backends::BackendResult<CliOutput> {
+    match command {
+        ParsePerfCommand::Summary(command) => {
+            let stdout = analyze_perfdata_for_cli(&command.analyze_args())?;
+            Ok(CliOutput {
+                stdout,
+                stderr: String::new(),
+            })
+        }
+    }
+}
+
+fn run_parse_flamegraph_command(
+    command: ParseFlamegraphCommand,
+) -> backends::BackendResult<CliOutput> {
+    let stdout = match command {
+        ParseFlamegraphCommand::Top(command) => {
+            analyze_flamegraph_for_cli(&command.analyze_args())?
+        }
+        ParseFlamegraphCommand::Search(command) => {
+            analyze_flamegraph_for_cli(&command.analyze_args())?
+        }
+        ParseFlamegraphCommand::Syscalls(command) => {
+            analyze_flamegraph_for_cli(&command.analyze_args())?
+        }
+        ParseFlamegraphCommand::Summary(command) => {
+            analyze_flamegraph_for_cli(&command.analyze_args())?
+        }
+        ParseFlamegraphCommand::Diff(command) => {
+            analyze_flamegraph_for_cli(&command.analyze_args())?
+        }
+    };
+    Ok(CliOutput {
+        stdout,
+        stderr: String::new(),
+    })
 }
 
 fn analyze_perfdata_for_cli(command: &AnalyzePerfdataArgs) -> backends::BackendResult<String> {
