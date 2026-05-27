@@ -157,7 +157,7 @@ fn folds_dwarf_user_stack_payloads_when_callchain_is_empty() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "0x1233;0x4000 1\n");
+    assert_eq!(folded, "[unknown];0x1233;0x4000 1\n");
 }
 
 #[test]
@@ -191,7 +191,7 @@ fn folds_dwarf_user_stack_payloads_before_kernel_callchain_frames() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "0x1233;0x4000;0xa000;0x9000 1\n");
+    assert_eq!(folded, "[unknown];0x1233;0x4000;0xa000;0x9000 1\n");
 }
 
 #[test]
@@ -229,7 +229,7 @@ fn keeps_dwarf_user_stack_payloads_when_kernel_callchain_has_user_context_marker
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "0x1233;0x4000;[unknown];[unknown] 1\n");
+    assert_eq!(folded, "[unknown];0x1233;0x4000;[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -268,7 +268,7 @@ fn keeps_dwarf_user_stack_payloads_when_kernel_callchain_has_no_user_context_mar
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "0x1233;0x4000;[unknown];[unknown] 1\n");
+    assert_eq!(folded, "[unknown];0x1233;0x4000;[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -308,7 +308,7 @@ fn keeps_dwarf_user_stack_payloads_for_kernel_samples_without_user_context_marke
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "0x1233;0x4000;[unknown];[unknown] 1\n");
+    assert_eq!(folded, "[unknown];0x1233;0x4000;[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -347,7 +347,7 @@ fn skips_dwarf_unwind_when_perf_user_stack_dynamic_size_is_zero_like_perf_script
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "[unknown];[unknown] 1\n");
+    assert_eq!(folded, "[unknown];[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -389,7 +389,7 @@ fn uses_mapped_object_unwinder_for_dwarf_user_stack_frames() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, format!("{current_exe}+0x4000 1\n"));
+    assert_eq!(folded, format!("[unknown];{current_exe}+0x4000 1\n"));
 }
 
 #[test]
@@ -426,7 +426,7 @@ fn drops_unwound_user_stack_frames_outside_known_mappings() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "/tmp/app+0x0 1\n");
+    assert_eq!(folded, "[unknown];/tmp/app+0x0 1\n");
 }
 
 #[test]
@@ -464,7 +464,7 @@ fn drops_dwarf_user_stack_frames_from_anon_mappings_like_perf_script() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "/tmp/app+0x0 1\n");
+    assert_eq!(folded, "[unknown];/tmp/app+0x0 1\n");
 }
 
 #[test]
@@ -502,7 +502,7 @@ fn drops_dwarf_user_stack_frames_from_slash_anon_mappings_like_perf_script() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "/tmp/app+0x0 1\n");
+    assert_eq!(folded, "[unknown];/tmp/app+0x0 1\n");
 }
 
 #[test]
@@ -541,7 +541,7 @@ fn symbolized_fold_renders_unmapped_user_unwind_frames_as_unknown_like_perf_scri
     let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
         .expect("folded");
 
-    assert_eq!(folded, "[unknown];[app] 1\n");
+    assert_eq!(folded, "[unknown];[unknown];[app] 1\n");
 }
 
 #[test]
@@ -579,7 +579,7 @@ fn keeps_unwound_user_stack_frames_from_mappings_after_sample() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "/tmp/lib+0x0;/tmp/app+0x0 1\n");
+    assert_eq!(folded, "[unknown];/tmp/lib+0x0;/tmp/app+0x0 1\n");
 }
 
 #[test]
@@ -619,7 +619,7 @@ fn drops_dwarf_user_stack_frames_from_known_non_executable_mappings() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "0x4000;0x9000 1\n");
+    assert_eq!(folded, "[unknown];0x4000;0x9000 1\n");
 }
 
 #[test]
@@ -659,7 +659,7 @@ fn keeps_dwarf_user_stack_frames_from_mapped_non_executable_libraries_like_perf_
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "/lib/libc.so.6+0x33;0x4000;0x9000 1\n");
+    assert_eq!(folded, "[unknown];/lib/libc.so.6+0x33;0x4000;0x9000 1\n");
 }
 
 #[test]
@@ -696,7 +696,7 @@ fn drops_dwarf_user_stack_frames_from_stack_mappings_like_perf_script() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "0x4000;0x9000 1\n");
+    assert_eq!(folded, "[unknown];0x4000;0x9000 1\n");
 }
 
 #[test]
@@ -733,7 +733,7 @@ fn drops_dwarf_user_stack_frames_from_perf_data_file_mappings_without_prot() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "0x4000;0x9000 1\n");
+    assert_eq!(folded, "[unknown];0x4000;0x9000 1\n");
 }
 
 #[test]
@@ -770,7 +770,7 @@ fn drops_perf_data_file_frames_when_mapping_arrives_after_sample() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "0x4000;0x9000 1\n");
+    assert_eq!(folded, "[unknown];0x4000;0x9000 1\n");
 }
 
 #[test]
@@ -789,7 +789,7 @@ fn folds_callchains_in_flamegraph_root_to_leaf_order() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "0x4000;0x3000;0x2000 1\n");
+    assert_eq!(folded, "[unknown];0x4000;0x3000;0x2000 1\n");
 }
 
 #[test]
@@ -826,7 +826,7 @@ fn folds_identical_sample_callchains_as_hex_frames() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "0x3000;0x2000 2\n0x4000 1\n");
+    assert_eq!(folded, "[unknown];0x3000;0x2000 2\n[unknown];0x4000 1\n");
 }
 
 #[test]
@@ -845,7 +845,7 @@ fn drops_perf_context_marker_frames_when_folding() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "0x2000 1\n");
+    assert_eq!(folded, "[unknown];0x2000 1\n");
 }
 
 #[test]
@@ -1043,7 +1043,7 @@ fn can_fold_samples_weighted_by_period() {
     )
     .expect("folded");
 
-    assert_eq!(folded, "0x2000 10\n");
+    assert_eq!(folded, "[unknown];0x2000 10\n");
 }
 
 #[test]
@@ -1079,7 +1079,7 @@ fn selects_sample_layout_by_identifier() {
     )
     .expect("folded");
 
-    assert_eq!(folded, "0x2000 7\n");
+    assert_eq!(folded, "[unknown];0x2000 7\n");
 }
 
 #[test]
@@ -1115,7 +1115,7 @@ fn selects_sample_layout_by_id_field() {
     )
     .expect("folded");
 
-    assert_eq!(folded, "0x2000 7\n");
+    assert_eq!(folded, "[unknown];0x2000 7\n");
 }
 
 #[test]
@@ -1161,7 +1161,7 @@ fn folds_only_first_encountered_event_type_like_inferno_collapse_perf() {
     )
     .expect("folded");
 
-    assert_eq!(folded, "0x2222 2\n");
+    assert_eq!(folded, "[unknown];0x2222 2\n");
 }
 
 #[test]
@@ -1189,7 +1189,7 @@ fn folds_perfdata_from_file_path() {
     )
     .expect("folded");
 
-    assert_eq!(folded, "0x2000 10\n");
+    assert_eq!(folded, "[unknown];0x2000 10\n");
 }
 
 #[test]
@@ -1208,7 +1208,7 @@ fn folds_mapped_user_frames_as_file_relative_addresses() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "/bin/app+0x10 1\n");
+    assert_eq!(folded, "[unknown];/bin/app+0x10 1\n");
 }
 
 #[test]
@@ -1231,7 +1231,7 @@ fn folds_mmap2_build_id_records_as_mappings() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "/bin/build-id-app+0x30 1\n");
+    assert_eq!(folded, "[unknown];/bin/build-id-app+0x30 1\n");
 }
 
 #[test]
@@ -1256,7 +1256,7 @@ fn symbolized_fold_carries_mmap2_build_ids_to_symbol_requests() {
     let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
         .expect("folded");
 
-    assert_eq!(folded, "[igb]+0x30 1\n");
+    assert_eq!(folded, "[unknown];[igb]+0x30 1\n");
     assert_eq!(
         resolver.calls(),
         vec![vec![SymbolRequest {
@@ -1290,7 +1290,7 @@ fn symbolized_fold_carries_mmap2_file_identity_to_symbol_requests() {
     let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
         .expect("folded");
 
-    assert_eq!(folded, "[app] 1\n");
+    assert_eq!(folded, "[unknown];[app] 1\n");
     assert_eq!(
         resolver.calls(),
         vec![vec![SymbolRequest {
@@ -1334,7 +1334,7 @@ fn symbolized_fold_carries_header_build_ids_to_mmap2_symbol_requests() {
     let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
         .expect("folded");
 
-    assert_eq!(folded, "[stale-app] 1\n");
+    assert_eq!(folded, "[unknown];[stale-app] 1\n");
     assert_eq!(
         resolver.calls(),
         vec![vec![SymbolRequest {
@@ -1370,7 +1370,7 @@ fn folds_mapped_user_frames_with_symbol_names() {
     let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
         .expect("folded");
 
-    assert_eq!(folded, "app::main;app::main 1\n");
+    assert_eq!(folded, "[unknown];app::main;app::main 1\n");
 }
 
 #[test]
@@ -1391,7 +1391,7 @@ fn symbolized_fold_expands_inline_symbol_frames() {
     let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
         .expect("folded");
 
-    assert_eq!(folded, "app::outer;app::inner 1\n");
+    assert_eq!(folded, "[unknown];app::outer;app::inner 1\n");
 }
 
 #[test]
@@ -1412,7 +1412,10 @@ fn symbolized_fold_renders_inline_arrows_like_inferno_collapse_perf() {
     let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
         .expect("folded");
 
-    assert_eq!(folded, "app::outer;app::middle;app::inner_[i] 1\n");
+    assert_eq!(
+        folded,
+        "[unknown];app::outer;app::middle;app::inner_[i] 1\n"
+    );
 }
 
 #[test]
@@ -1434,7 +1437,7 @@ fn symbolized_fold_keeps_unknown_caller_before_inline_frames_like_perf_script() 
     let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
         .expect("folded");
 
-    assert_eq!(folded, "[unknown];app::outer;app::inner 1\n");
+    assert_eq!(folded, "[unknown];[unknown];app::outer;app::inner 1\n");
 }
 
 #[test]
@@ -1459,7 +1462,7 @@ fn symbolized_fold_keeps_module_fallback_caller_before_inline_frames_like_perf_s
     let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
         .expect("folded");
 
-    assert_eq!(folded, "[libc.so.6];app::outer;app::inner 1\n");
+    assert_eq!(folded, "[unknown];[libc.so.6];app::outer;app::inner 1\n");
 }
 
 #[test]
@@ -1480,7 +1483,7 @@ fn symbolized_fold_renders_unmapped_user_caller_as_unknown_like_perf_script() {
     let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
         .expect("folded");
 
-    assert_eq!(folded, "[unknown];app::outer;app::inner 1\n");
+    assert_eq!(folded, "[unknown];[unknown];app::outer;app::inner 1\n");
 }
 
 #[test]
@@ -1501,7 +1504,7 @@ fn symbolized_fold_uses_module_fallback_for_unresolved_user_frames_like_inferno(
     let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
         .expect("folded");
 
-    assert_eq!(folded, "[app] 1\n");
+    assert_eq!(folded, "[unknown];[app] 1\n");
 }
 
 #[test]
@@ -1525,7 +1528,7 @@ fn leaves_kernel_space_frames_as_hex_without_symbol_lookup() {
     let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
         .expect("folded");
 
-    assert_eq!(folded, "0xffffffff88000010 1\n");
+    assert_eq!(folded, "[unknown];0xffffffff88000010 1\n");
     assert_eq!(resolver.calls(), Vec::<Vec<SymbolRequest>>::new());
 }
 
@@ -1545,7 +1548,7 @@ fn folds_unmapped_kernel_frames_as_unknown_like_inferno() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "[unknown] 1\n");
+    assert_eq!(folded, "[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -1575,7 +1578,7 @@ fn keeps_kernel_frames_from_mmap2_records_without_exec_prot() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "[unknown] 1\n");
+    assert_eq!(folded, "[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -1606,7 +1609,7 @@ fn folds_unresolved_kernel_mappings_as_unknown_like_inferno() {
     let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
         .expect("folded");
 
-    assert_eq!(folded, "[unknown] 1\n");
+    assert_eq!(folded, "[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -1637,7 +1640,7 @@ fn symbolized_fold_resolves_mapped_kernel_frames() {
     let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
         .expect("folded");
 
-    assert_eq!(folded, "asm_exc_page_fault 1\n");
+    assert_eq!(folded, "[unknown];asm_exc_page_fault 1\n");
 }
 
 #[test]
@@ -1668,7 +1671,7 @@ fn symbolized_fold_resolves_kernel_module_frames() {
     let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
         .expect("folded");
 
-    assert_eq!(folded, "zfs_read 1\n");
+    assert_eq!(folded, "[unknown];zfs_read 1\n");
 }
 
 #[test]
@@ -1690,7 +1693,7 @@ fn prefetches_unique_symbol_requests_before_folding() {
     let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
         .expect("folded");
 
-    assert_eq!(folded, "app::work;app::main 2\n");
+    assert_eq!(folded, "[unknown];app::work;app::main 2\n");
     assert_eq!(
         resolver.calls(),
         vec![vec![

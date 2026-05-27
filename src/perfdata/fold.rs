@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
+use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 
-use crate::folded::render_inferno_perf_folded_stack;
+use crate::folded::render_inferno_perf_stack;
 use crate::perfdata::attrs::{PerfFileAttr, parse_file_attr_ids, parse_file_attrs};
 use crate::perfdata::build_id::build_id_events_from_perfdata;
 use crate::perfdata::endian::read_u64;
@@ -322,6 +323,120 @@ where
         std::fs::File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
     let mapping = map_perfdata_file(&file)?;
     fold_perfdata_callchains_with_symbols(&mapping, options, symbol_resolver)
+}
+
+pub(crate) fn write_folded_perfdata_file_with_options<W>(
+    path: &Path,
+    options: FoldOptions,
+    writer: &mut W,
+) -> Result<(), String>
+where
+    W: IoWrite + ?Sized,
+{
+    let file =
+        std::fs::File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
+    let mapping = map_perfdata_file(&file)?;
+    write_folded_perfdata_callchains_with_options(&mapping, options, writer)
+}
+
+pub(crate) fn write_folded_perfdata_callchains_with_options<W>(
+    bytes: &[u8],
+    options: FoldOptions,
+    writer: &mut W,
+) -> Result<(), String>
+where
+    W: IoWrite + ?Sized,
+{
+    let fold_data = collect_fold_data(bytes, options)?;
+    write_fold_data::<NoopSymbolResolver, _>(&fold_data, None, writer)
+}
+
+pub(crate) fn write_folded_perfdata_file_with_symbols<R, W>(
+    path: &Path,
+    options: FoldOptions,
+    symbol_resolver: &R,
+    writer: &mut W,
+) -> Result<(), String>
+where
+    R: SymbolResolver,
+    W: IoWrite + ?Sized,
+{
+    let file =
+        std::fs::File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
+    let mapping = map_perfdata_file(&file)?;
+    write_folded_perfdata_callchains_with_symbols(&mapping, options, symbol_resolver, writer)
+}
+
+pub(crate) fn write_folded_perfdata_callchains_with_symbols<R, W>(
+    bytes: &[u8],
+    options: FoldOptions,
+    symbol_resolver: &R,
+    writer: &mut W,
+) -> Result<(), String>
+where
+    R: SymbolResolver,
+    W: IoWrite + ?Sized,
+{
+    let fold_data = collect_fold_data(bytes, options)?;
+    let mut symbol_cache = SymbolFrameCache::new(symbol_resolver);
+    write_fold_data(&fold_data, Some(&mut symbol_cache), writer)
+}
+
+pub(crate) fn write_inferno_perf_script_file_with_options<W>(
+    path: &Path,
+    options: FoldOptions,
+    writer: &mut W,
+) -> Result<(), String>
+where
+    W: IoWrite + ?Sized,
+{
+    let file =
+        std::fs::File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
+    let mapping = map_perfdata_file(&file)?;
+    write_inferno_perf_script_callchains_with_options(&mapping, options, writer)
+}
+
+pub(crate) fn write_inferno_perf_script_callchains_with_options<W>(
+    bytes: &[u8],
+    options: FoldOptions,
+    writer: &mut W,
+) -> Result<(), String>
+where
+    W: IoWrite + ?Sized,
+{
+    let fold_data = collect_fold_data(bytes, options)?;
+    write_inferno_perf_script::<NoopSymbolResolver, _>(&fold_data, None, writer)
+}
+
+pub(crate) fn write_inferno_perf_script_file_with_symbols<R, W>(
+    path: &Path,
+    options: FoldOptions,
+    symbol_resolver: &R,
+    writer: &mut W,
+) -> Result<(), String>
+where
+    R: SymbolResolver,
+    W: IoWrite + ?Sized,
+{
+    let file =
+        std::fs::File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
+    let mapping = map_perfdata_file(&file)?;
+    write_inferno_perf_script_callchains_with_symbols(&mapping, options, symbol_resolver, writer)
+}
+
+pub(crate) fn write_inferno_perf_script_callchains_with_symbols<R, W>(
+    bytes: &[u8],
+    options: FoldOptions,
+    symbol_resolver: &R,
+    writer: &mut W,
+) -> Result<(), String>
+where
+    R: SymbolResolver,
+    W: IoWrite + ?Sized,
+{
+    let fold_data = collect_fold_data(bytes, options)?;
+    let mut symbol_cache = SymbolFrameCache::new(symbol_resolver);
+    write_inferno_perf_script(&fold_data, Some(&mut symbol_cache), writer)
 }
 
 fn map_perfdata_file(file: &std::fs::File) -> Result<memmap2::Mmap, String> {
@@ -706,15 +821,36 @@ fn is_valid_unwound_user_frame(pid: Option<u32>, frame: FoldFrame, mmap_table: &
 
 fn render_fold_data<R>(
     fold_data: &PerfFoldData,
-    mut symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+    symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
 ) -> Result<String, String>
 where
     R: SymbolResolver,
 {
+    let mut folded = Vec::new();
+    write_fold_data(fold_data, symbol_cache, &mut folded)?;
+    String::from_utf8(folded).map_err(|error| format!("folded output is not utf-8: {error}"))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PerfScriptFrame {
+    pc: String,
+    rawfunc: String,
+    module: String,
+}
+
+fn write_fold_data<R, W>(
+    fold_data: &PerfFoldData,
+    mut symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+    writer: &mut W,
+) -> Result<(), String>
+where
+    R: SymbolResolver,
+    W: IoWrite + ?Sized,
+{
     if let Some(cache) = symbol_cache.as_deref_mut() {
         prefetch_symbols(&fold_data.raw_stacks, &fold_data.mmap_table, cache)?;
     }
-    let mut counts = BTreeMap::<Vec<String>, u64>::new();
+    let mut counts = BTreeMap::<String, u64>::new();
     let frame_resolver = FoldFrameResolver::new(&fold_data.mmap_table);
     for stack in &fold_data.raw_stacks {
         let frames = frame_resolver.frames_for_stack(
@@ -723,18 +859,62 @@ where
             &stack.callchain,
             symbol_cache.as_deref_mut(),
         )?;
-        *counts.entry(frames).or_insert(0) += stack.count;
+        let rendered = render_inferno_perf_stack(frames.iter().map(String::as_str));
+        *counts.entry(rendered).or_insert(0) += stack.count;
     }
-
-    let mut folded = String::new();
     for (callchain, count) in counts {
-        folded.push_str(&render_inferno_perf_folded_stack(
-            callchain.iter().map(String::as_str),
-            count,
-        ));
-        folded.push('\n');
+        writer
+            .write_all(callchain.as_bytes())
+            .map_err(|error| format!("failed to write folded output: {error}"))?;
+        writer
+            .write_all(b" ")
+            .map_err(|error| format!("failed to write folded output: {error}"))?;
+        writer
+            .write_all(count.to_string().as_bytes())
+            .map_err(|error| format!("failed to write folded output: {error}"))?;
+        writer
+            .write_all(b"\n")
+            .map_err(|error| format!("failed to write folded output: {error}"))?;
     }
-    Ok(folded)
+    Ok(())
+}
+
+fn write_inferno_perf_script<R, W>(
+    fold_data: &PerfFoldData,
+    mut symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+    writer: &mut W,
+) -> Result<(), String>
+where
+    R: SymbolResolver,
+    W: IoWrite + ?Sized,
+{
+    if let Some(cache) = symbol_cache.as_deref_mut() {
+        prefetch_symbols(&fold_data.raw_stacks, &fold_data.mmap_table, cache)?;
+    }
+    let frame_resolver = FoldFrameResolver::new(&fold_data.mmap_table);
+    for stack in &fold_data.raw_stacks {
+        let comm = stack.comm.as_deref().unwrap_or("[unknown]");
+        let pid = stack.pid.unwrap_or(0);
+        writeln!(writer, "{comm} {pid}/{pid} 0: {} cycles:", stack.count)
+            .map_err(|error| format!("failed to write perf script output: {error}"))?;
+        let frames = frame_resolver.script_frames_for_stack(
+            stack.pid,
+            &stack.callchain,
+            symbol_cache.as_deref_mut(),
+        )?;
+        for frame in frames.iter().rev() {
+            writeln!(
+                writer,
+                "\t{} {} ({})",
+                frame.pc, frame.rawfunc, frame.module
+            )
+            .map_err(|error| format!("failed to write perf script output: {error}"))?;
+        }
+        writer
+            .write_all(b"\n")
+            .map_err(|error| format!("failed to write perf script output: {error}"))?;
+    }
+    Ok(())
 }
 
 fn prefetch_symbols<R>(
@@ -797,11 +977,7 @@ impl<'a> FoldFrameResolver<'a> {
     where
         R: SymbolResolver,
     {
-        let mut frames = if let Some(comm) = comm {
-            vec![comm.replace(' ', "_")]
-        } else {
-            Vec::new()
-        };
+        let mut frames = vec![folded_comm_label(comm)];
         for frame in callchain.iter().copied() {
             if symbol_cache.is_none() && !is_valid_unwound_user_frame(pid, frame, self.mmap_table) {
                 continue;
@@ -811,6 +987,34 @@ impl<'a> FoldFrameResolver<'a> {
             }
             let frame = frame.address();
             frames.extend(self.format_frames(pid, frame, symbol_cache.as_deref_mut())?);
+        }
+        Ok(frames)
+    }
+
+    fn script_frames_for_stack<R>(
+        &self,
+        pid: Option<u32>,
+        callchain: &[FoldFrame],
+        mut symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+    ) -> Result<Vec<PerfScriptFrame>, String>
+    where
+        R: SymbolResolver,
+    {
+        let mut frames = Vec::new();
+        for frame in callchain.iter().copied() {
+            if symbol_cache.is_none() && !is_valid_unwound_user_frame(pid, frame, self.mmap_table) {
+                continue;
+            }
+            if should_drop_perf_data_user_unwind_frame(pid, frame, self.mmap_table) {
+                continue;
+            }
+            let address = frame.address();
+            let labels = self.format_frames(pid, address, symbol_cache.as_deref_mut())?;
+            frames.extend(
+                labels
+                    .into_iter()
+                    .map(|label| script_frame_for_label(address, &label)),
+            );
         }
         Ok(frames)
     }
@@ -846,6 +1050,58 @@ impl<'a> FoldFrameResolver<'a> {
             Ok(vec![format!("0x{frame:x}")])
         }
     }
+}
+
+fn folded_comm_label(comm: Option<&str>) -> String {
+    comm.map_or_else(|| UNKNOWN_FRAME.to_string(), |comm| comm.replace(' ', "_"))
+}
+
+fn script_frame_for_label(address: u64, label: &str) -> PerfScriptFrame {
+    let pc = format!("{address:x}");
+    if label == UNKNOWN_FRAME {
+        return PerfScriptFrame {
+            pc,
+            rawfunc: UNKNOWN_FRAME.to_string(),
+            module: UNKNOWN_FRAME.to_string(),
+        };
+    }
+    if label.starts_with("0x") {
+        return PerfScriptFrame {
+            pc,
+            rawfunc: label.to_string(),
+            module: UNKNOWN_FRAME.to_string(),
+        };
+    }
+    if let Some(module) = module_fallback_label_module(label) {
+        return PerfScriptFrame {
+            pc,
+            rawfunc: UNKNOWN_FRAME.to_string(),
+            module: module.to_string(),
+        };
+    }
+    if looks_like_mapped_frame_label(label) {
+        return PerfScriptFrame {
+            pc,
+            rawfunc: format!("{label}+0x0"),
+            module: UNKNOWN_FRAME.to_string(),
+        };
+    }
+    PerfScriptFrame {
+        pc,
+        rawfunc: label.to_string(),
+        module: UNKNOWN_FRAME.to_string(),
+    }
+}
+
+fn module_fallback_label_module(label: &str) -> Option<&str> {
+    let inner = label.strip_prefix('[')?.strip_suffix(']')?;
+    (inner != "unknown" && !inner.is_empty()).then_some(inner)
+}
+
+fn looks_like_mapped_frame_label(label: &str) -> bool {
+    label.rsplit_once("+0x").is_some_and(|(_, suffix)| {
+        !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_hexdigit())
+    })
 }
 
 fn should_drop_perf_data_user_unwind_frame(

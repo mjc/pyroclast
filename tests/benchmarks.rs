@@ -33,7 +33,7 @@ fn fold_benchmark_reports_folded_output_size() {
     let report = run_fold_benchmark(&perfdata).expect("benchmark");
 
     assert_eq!(report.input, perfdata);
-    assert_eq!(report.folded_bytes, 9);
+    assert_eq!(report.folded_bytes, "[unknown];0x2000 2\n".len());
     assert_eq!(report.folded_lines, 1);
     assert!(report.elapsed.as_nanos() > 0);
 }
@@ -60,7 +60,7 @@ fn fold_benchmark_weights_perf_sample_periods() {
 
     let report = run_fold_benchmark(&perfdata).expect("benchmark");
 
-    assert_eq!(report.folded_bytes, "0x2000 144\n".len());
+    assert_eq!(report.folded_bytes, "[unknown];0x2000 144\n".len());
 }
 
 #[test]
@@ -112,7 +112,7 @@ fn symbolized_fold_benchmark_uses_runner_addr2line() {
 
     let report = run_fold_benchmark_with_runner(&perfdata, &runner, true).expect("benchmark");
 
-    assert_eq!(report.folded_bytes, "app::main 1\n".len());
+    assert_eq!(report.folded_bytes, "[unknown];app::main 1\n".len());
     assert_eq!(runner.programs(), vec!["addr2line"]);
 }
 
@@ -196,23 +196,27 @@ fn exports_perf_script_for_old_pipeline_benchmarks() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
     let perf_script = root.path().join("perf-script.txt");
-    std::fs::write(&perfdata, b"PERFILE2 placeholder").expect("write perfdata");
+    std::fs::write(
+        &perfdata,
+        perfdata_with_records_and_attrs(
+            [file_attr_bytes(
+                PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+                0,
+                0,
+            )],
+            [record_bytes(9, &sample_payload(0x1000, 1, 2, [0x2000]))],
+        ),
+    )
+    .expect("write perfdata");
     let runner = PerfScriptRunner::default();
 
-    export_perf_script(&perfdata, &perf_script, &runner).expect("export perf script");
+    export_perf_script(&perfdata, &perf_script, &runner, false).expect("export perf script");
 
     assert_eq!(
         std::fs::read_to_string(&perf_script).unwrap(),
-        "perf script\n"
+        "[unknown] 1/1 0: 1 cycles:\n\t2000 0x2000 ([unknown])\n\n"
     );
-    assert_eq!(
-        runner.commands(),
-        vec![
-            CommandSpec::new("perf")
-                .args(["script", "--force", "-i"])
-                .arg(perfdata.to_str().expect("perfdata path should be utf8"))
-        ]
-    );
+    assert!(runner.commands().is_empty());
 }
 
 #[test]
@@ -321,7 +325,7 @@ impl CommandRunner for MatchingCollapseRunner {
         }
         Ok(CommandOutput {
             status_code: Some(0),
-            stdout: b"0x2000 2\n".to_vec(),
+            stdout: b"[unknown];0x2000 2\n".to_vec(),
             stderr: Vec::new(),
         })
     }
@@ -375,7 +379,7 @@ impl CommandRunner for SymbolizedCompareRunner {
         self.commands.lock().unwrap().push(command.clone());
         let stdout = match command.program.as_str() {
             "addr2line" => b"app::main\n/bin/app.rs:10\n".to_vec(),
-            "inferno-collapse-perf" => b"app::main 1\n".to_vec(),
+            "inferno-collapse-perf" => b"[unknown];app::main 1\n".to_vec(),
             "inferno-flamegraph" => {
                 let mut svg = b"<svg>".to_vec();
                 svg.extend(command.stdin.as_deref().unwrap_or_default());

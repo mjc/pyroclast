@@ -209,7 +209,10 @@ fn flamegraph_command_folds_perfdata_without_perf_script() {
             "-".to_string()
         ])
     );
-    assert_eq!(runner.stdins(), vec![Some(b"0x2000 1\n".to_vec())]);
+    assert_eq!(
+        runner.stdins(),
+        vec![Some(b"[unknown];0x2000 1\n".to_vec())]
+    );
     assert_eq!(
         std::fs::read_to_string(output_svg).expect("svg"),
         "<svg></svg>\n"
@@ -233,7 +236,10 @@ fn flamegraph_command_weights_perf_sample_periods() {
 
     pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("flamegraph command");
 
-    assert_eq!(runner.stdins(), vec![Some(b"0x2000 144\n".to_vec())]);
+    assert_eq!(
+        runner.stdins(),
+        vec![Some(b"[unknown];0x2000 144\n".to_vec())]
+    );
 }
 
 #[test]
@@ -256,7 +262,7 @@ fn flamegraph_command_accepts_injected_renderer() {
         .expect("flamegraph command");
 
     assert_eq!(runner.programs(), Vec::<String>::new());
-    assert_eq!(renderer.folded_stacks(), "0x2000 1\n");
+    assert_eq!(renderer.folded_stacks(), "[unknown];0x2000 1\n");
     assert_eq!(
         std::fs::read_to_string(output_svg).expect("svg"),
         "<svg>cli plugin</svg>\n"
@@ -474,7 +480,7 @@ fn summarize_command_computes_text_from_raw_perfdata_when_summaries_are_missing(
 
     assert_eq!(
         output.stdout,
-        "folded lines: 1\nfolded bytes: 9\ntotal count: 1\n"
+        "folded lines: 1\nfolded bytes: 19\ntotal count: 1\n"
     );
 }
 
@@ -495,7 +501,7 @@ fn summarize_command_computes_json_from_raw_perfdata_when_summaries_are_missing(
     let summary: serde_json::Value = serde_json::from_str(&output.stdout).expect("summary json");
 
     assert_eq!(summary["folded_lines"], 1);
-    assert_eq!(summary["folded_bytes"], 9);
+    assert_eq!(summary["folded_bytes"], 19);
     assert_eq!(summary["total_count"], 1);
 }
 

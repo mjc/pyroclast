@@ -20,65 +20,48 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    match pyroclast::benchmarks::run_fold_benchmark_with_runner(
+    let perf_script = match args.export_perf_script {
+        Some(path) => {
+            if let Err(error) = pyroclast::benchmarks::export_perf_script(
+                &input,
+                &path,
+                &RealCommandRunner,
+                args.symbols,
+            ) {
+                eprintln!("perf script export failed: {error}");
+                return ExitCode::FAILURE;
+            }
+            Some(path)
+        }
+        None => args.perf_script,
+    };
+
+    if let Some(perf_script) = &perf_script
+        && !perf_script.is_file()
+    {
+        eprintln!("perf script input not found: {}", perf_script.display());
+        return ExitCode::FAILURE;
+    }
+    match pyroclast::benchmarks::run_streaming_comparison_with_symbols(
         &input,
+        perf_script.as_deref(),
         &RealCommandRunner,
         args.symbols,
     ) {
         Ok(report) => {
-            print_report("pyroclast_fold", &report);
-            let perf_script = match args.export_perf_script {
-                Some(path) => {
-                    if let Err(error) =
-                        pyroclast::benchmarks::export_perf_script(&input, &path, &RealCommandRunner)
-                    {
-                        eprintln!("perf script export failed: {error}");
-                        return ExitCode::FAILURE;
-                    }
-                    Some(path)
-                }
-                None => args.perf_script,
-            };
-            if let Some(perf_script) = perf_script {
-                if !perf_script.is_file() {
-                    eprintln!("perf script input not found: {}", perf_script.display());
-                    return ExitCode::FAILURE;
-                }
-                match pyroclast::benchmarks::run_inferno_collapse_benchmark(
-                    &perf_script,
-                    &RealCommandRunner,
-                ) {
-                    Ok(report) => {
-                        print_report("inferno_collapse_perf", &report);
-                        match pyroclast::benchmarks::compare_with_inferno_collapse_with_symbols(
-                            &input,
-                            &perf_script,
-                            &RealCommandRunner,
-                            args.symbols,
-                        ) {
-                            Ok(report) => print!(
-                                "{}",
-                                pyroclast::benchmarks::format_comparison_report(
-                                    "inferno_compare",
-                                    &report
-                                )
-                            ),
-                            Err(error) => {
-                                eprintln!("inferno comparison failed: {error}");
-                                return ExitCode::FAILURE;
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!("inferno benchmark failed: {error}");
-                        return ExitCode::FAILURE;
-                    }
-                }
-            }
+            print_report("pyroclast_fold", &report.pyroclast_fold);
+            print_report("inferno_collapse_perf", &report.inferno_fold);
+            print!(
+                "{}",
+                pyroclast::benchmarks::format_comparison_report(
+                    "inferno_compare",
+                    &report.comparison
+                )
+            );
             ExitCode::SUCCESS
         }
         Err(error) => {
-            eprintln!("benchmark failed: {error}");
+            eprintln!("inferno comparison failed: {error}");
             ExitCode::FAILURE
         }
     }

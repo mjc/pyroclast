@@ -22,6 +22,14 @@ pub fn render_inferno_perf_folded_stack<'a>(
     frames: impl IntoIterator<Item = &'a str>,
     count: u64,
 ) -> String {
+    let mut rendered = render_inferno_perf_stack(frames);
+    rendered.push(' ');
+    rendered.push_str(&count.to_string());
+    rendered
+}
+
+#[must_use]
+pub(crate) fn render_inferno_perf_stack<'a>(frames: impl IntoIterator<Item = &'a str>) -> String {
     let mut rendered = String::new();
     for frame in frames {
         for (index, part) in frame.split("->").enumerate() {
@@ -35,8 +43,6 @@ pub fn render_inferno_perf_folded_stack<'a>(
             rendered.push_str(&escape_frame(&part));
         }
     }
-    rendered.push(' ');
-    rendered.push_str(&count.to_string());
     rendered
 }
 
