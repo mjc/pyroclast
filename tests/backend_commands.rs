@@ -3,7 +3,10 @@ use pyroclast::backends::linux_perf::{PerfRecordTarget, build_perf_record_comman
 use pyroclast::backends::macos_xctrace::{
     build_xctrace_export_cpu_command, build_xctrace_record_command,
 };
-use pyroclast::backends::offcpu::build_bpftrace_offcpu_command;
+use pyroclast::backends::offcpu::{
+    build_bpftrace_offcpu_command, build_perf_cpu_clock_command, build_perf_sched_record_command,
+    build_perf_sched_timehist_command,
+};
 use pyroclast::backends::strace::build_strace_command;
 use pyroclast::cli::PerfEvent;
 use pyroclast::flamegraph::build_inferno_flamegraph_command;
@@ -160,6 +163,64 @@ fn builds_bpftrace_offcpu_command() {
     assert_eq!(
         &command.args[2..],
         ["-c", "target/release/app --serve", "--unsafe"]
+    );
+}
+
+#[test]
+fn builds_perf_sched_offcpu_commands() {
+    let record = build_perf_sched_record_command(
+        &PathBuf::from("run/profile.raw.perf.data"),
+        vec!["target/release/app".to_string(), "--serve".to_string()],
+    );
+    let timehist = build_perf_sched_timehist_command(&PathBuf::from("run/profile.raw.perf.data"));
+
+    assert_eq!(record.program, "perf");
+    assert_eq!(
+        record.args,
+        vec![
+            "sched",
+            "record",
+            "-o",
+            "run/profile.raw.perf.data",
+            "--",
+            "target/release/app",
+            "--serve",
+        ]
+    );
+    assert_eq!(timehist.program, "perf");
+    assert_eq!(
+        timehist.args,
+        vec!["sched", "timehist", "-i", "run/profile.raw.perf.data"]
+    );
+}
+
+#[test]
+fn builds_perf_cpu_clock_offcpu_command() {
+    let command = build_perf_cpu_clock_command(
+        997,
+        "fp",
+        &PathBuf::from("run/profile.raw.perf.data"),
+        vec!["target/release/app".to_string(), "--serve".to_string()],
+    );
+
+    assert_eq!(command.program, "perf");
+    assert_eq!(
+        command.args,
+        vec![
+            "record",
+            "-e",
+            "cpu-clock",
+            "-F",
+            "997",
+            "-g",
+            "--call-graph",
+            "fp",
+            "-o",
+            "run/profile.raw.perf.data",
+            "--",
+            "target/release/app",
+            "--serve",
+        ]
     );
 }
 

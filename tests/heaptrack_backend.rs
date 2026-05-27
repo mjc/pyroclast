@@ -25,6 +25,7 @@ fn heaptrack_backend_writes_heap_summary_artifacts() {
         tids: Vec::new(),
         threads_of_pid: None,
         duration_secs: 3600,
+        offcpu_method: None,
     };
 
     let result = HeaptrackBackend::new(&runner)
@@ -75,6 +76,7 @@ fn heaptrack_backend_uses_suffixed_raw_output_when_heaptrack_creates_one() {
         tids: Vec::new(),
         threads_of_pid: None,
         duration_secs: 3600,
+        offcpu_method: None,
     };
 
     let result = HeaptrackBackend::new(&runner)

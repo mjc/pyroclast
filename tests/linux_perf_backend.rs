@@ -29,6 +29,7 @@ fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
         tids: Vec::new(),
         threads_of_pid: None,
         duration_secs: 3600,
+        offcpu_method: None,
     };
 
     let result = backend.profile(&request).expect("profile");
@@ -100,6 +101,7 @@ fn linux_perf_backend_can_symbolize_folded_stacks() {
         tids: Vec::new(),
         threads_of_pid: None,
         duration_secs: 3600,
+        offcpu_method: None,
     };
 
     let result = backend.profile(&request).expect("profile");
@@ -111,8 +113,8 @@ fn linux_perf_backend_can_symbolize_folded_stacks() {
             "addr2line",
             "inferno-flamegraph",
             "perf",
-            "inferno-flamegraph",
-            "addr2line"
+            "addr2line",
+            "inferno-flamegraph"
         ]
     );
     assert_eq!(
@@ -142,6 +144,7 @@ fn linux_perf_backend_accepts_pluggable_flamegraph_renderer() {
         tids: Vec::new(),
         threads_of_pid: None,
         duration_secs: 3600,
+        offcpu_method: None,
     };
 
     let result = backend.profile(&request).expect("profile");
@@ -185,6 +188,7 @@ fn linux_perf_backend_writes_tool_errors_when_renderer_fails() {
         tids: Vec::new(),
         threads_of_pid: None,
         duration_secs: 3600,
+        offcpu_method: None,
     };
 
     let error = backend.profile(&request).expect_err("renderer failure");
@@ -220,6 +224,7 @@ fn linux_perf_backend_stops_when_perf_record_fails() {
         tids: Vec::new(),
         threads_of_pid: None,
         duration_secs: 3600,
+        offcpu_method: None,
     };
 
     let error = backend.profile(&request).expect_err("perf failure");
@@ -256,6 +261,7 @@ fn linux_perf_backend_records_attached_process() {
         tids: Vec::new(),
         threads_of_pid: None,
         duration_secs: 5,
+        offcpu_method: None,
     };
 
     backend.profile(&request).expect("profile");
@@ -310,6 +316,7 @@ fn linux_perf_backend_records_attached_threads() {
         tids: vec![101, 102],
         threads_of_pid: None,
         duration_secs: 7,
+        offcpu_method: None,
     };
 
     backend.profile(&request).expect("profile");
@@ -347,6 +354,7 @@ fn linux_perf_backend_records_threads_discovered_from_pid() {
         tids: Vec::new(),
         threads_of_pid: Some(99),
         duration_secs: 7,
+        offcpu_method: None,
     };
 
     let result = backend.profile(&request).expect("profile");
@@ -380,6 +388,7 @@ fn linux_perf_backend_reports_missing_threads_of_pid() {
         tids: Vec::new(),
         threads_of_pid: Some(99),
         duration_secs: 7,
+        offcpu_method: None,
     };
 
     let error = backend.profile(&request).expect_err("missing threads");

@@ -25,6 +25,7 @@ fn strace_backend_writes_syscall_summary_artifacts() {
         tids: Vec::new(),
         threads_of_pid: None,
         duration_secs: 3600,
+        offcpu_method: None,
     };
 
     let result = StraceBackend::new(&runner)

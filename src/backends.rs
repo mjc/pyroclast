@@ -8,6 +8,7 @@ pub mod strace;
 use std::path::PathBuf;
 
 use crate::artifacts::ArtifactLayout;
+use crate::backends::offcpu::OffcpuMethod;
 use crate::cli::{PerfCallGraph, PerfEvent, ProfileKind};
 use crate::manifest::RunManifest;
 use crate::symbols::SymbolizerKind;
@@ -30,6 +31,7 @@ pub struct ProfileRequest {
     pub tids: Vec<u32>,
     pub threads_of_pid: Option<u32>,
     pub duration_secs: u32,
+    pub offcpu_method: Option<OffcpuMethod>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

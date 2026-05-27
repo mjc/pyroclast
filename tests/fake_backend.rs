@@ -20,6 +20,7 @@ fn fake_backend_writes_required_artifacts() {
         tids: Vec::new(),
         threads_of_pid: None,
         duration_secs: 3600,
+        offcpu_method: None,
     };
 
     let result = FakeBackend.profile(&request).expect("fake profile");

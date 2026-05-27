@@ -25,6 +25,7 @@ fn macos_xctrace_backend_writes_cpu_summary_artifacts() {
         tids: Vec::new(),
         threads_of_pid: None,
         duration_secs: 3600,
+        offcpu_method: None,
     };
 
     let result = MacosXctraceBackend::new(&runner)

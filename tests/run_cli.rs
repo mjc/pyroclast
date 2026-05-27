@@ -597,7 +597,7 @@ fn top_level_latency_command_uses_injected_strace_runner() {
 }
 
 #[test]
-fn top_level_offcpu_command_uses_injected_bpftrace_runner() {
+fn top_level_offcpu_command_uses_injected_perf_sched_runner() {
     let root = tempfile::tempdir().expect("tempdir");
     let out = root.path().join("offcpu-run");
     let runner = RecordingRunner::default();
@@ -612,14 +612,37 @@ fn top_level_offcpu_command_uses_injected_bpftrace_runner() {
 
     pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("run cli");
 
-    assert_eq!(runner.programs(), vec!["bpftrace", "bpftrace"]);
+    assert_eq!(runner.programs(), vec!["perf", "perf", "perf"]);
     let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
     assert!(run_json.contains("\"actual_backend\": \"offcpu\""));
-    assert!(out.join("profile.raw.bpftrace").is_file());
+    assert!(out.join("profile.raw.perf.data").is_file());
+    assert!(!out.join("stacks.folded").exists());
+    let summary_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("summary.json")).unwrap())
+            .expect("summary json");
+    assert_eq!(summary_json["method"], "perf_sched");
+}
+
+#[test]
+fn top_level_offcpu_command_rejects_attach_workflows() {
+    let runner = RecordingRunner::default();
+    let cli = pyroclast::cli::Cli::parse_from([
+        "pyroclast",
+        "offcpu",
+        "--pid",
+        "99",
+        "--duration-secs",
+        "5",
+    ]);
+
+    let error =
+        pyroclast::run_parsed_cli_with_runner(cli, &runner).expect_err("attach should fail");
+
     assert_eq!(
-        std::fs::read_to_string(out.join("stacks.folded")).expect("folded"),
-        "app::serve;tokio::runtime::park 1500\n"
+        error.to_string(),
+        "offcpu currently supports command-driven workflows only"
     );
+    assert!(runner.programs().is_empty());
 }
 
 #[derive(Default)]
@@ -691,6 +714,12 @@ impl pyroclast::process::CommandRunner for RecordingRunner {
         }
         let stdout = match command.program.as_str() {
             "addr2line" => b"app::work\n/bin/app.rs:10\n".to_vec(),
+            "perf"
+                if command.args.first().map(String::as_str) == Some("sched")
+                    && command.args.get(1).map(String::as_str) == Some("timehist") =>
+            {
+                b"timehist report\n".to_vec()
+            }
             "bpftrace" => {
                 b"@offcpu[\n    55 tokio::runtime::park+12 (/bin/app)\n    44 app::serve+7 (/bin/app)\n]: 1500\n".to_vec()
             }

@@ -291,15 +291,20 @@ fn linux_perf_tools(
     symbolizer: SymbolizerKind,
     renderer: &impl FlamegraphRenderer,
 ) -> Vec<ToolSpec> {
-    let mut tools = vec![ToolSpec::nix_managed("perf")];
+    let mut tools = linux_perf_fold_tools(symbols, symbolizer);
     tools.extend(renderer.tool_specs());
+    tools
+}
+
+pub(crate) fn linux_perf_fold_tools(symbols: bool, symbolizer: SymbolizerKind) -> Vec<ToolSpec> {
+    let mut tools = vec![ToolSpec::nix_managed("perf")];
     if symbols && symbolizer == SymbolizerKind::Addr2line {
         tools.push(ToolSpec::nix_managed("addr2line"));
     }
     tools
 }
 
-fn fold_linux_perfdata<R>(
+pub(crate) fn fold_linux_perfdata<R>(
     perf_data: &Path,
     symbols: bool,
     symbolizer: SymbolizerKind,

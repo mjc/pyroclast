@@ -155,6 +155,7 @@ where
         tids: invocation.tids,
         threads_of_pid: invocation.threads_of_pid,
         duration_secs: invocation.duration_secs,
+        offcpu_method: None,
     };
     match request.kind {
         cli::ProfileKind::Cpu if platform == "linux" => {
