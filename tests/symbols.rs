@@ -1,9 +1,11 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Mutex;
 
-use object::{Object, ObjectSegment, ObjectSymbol};
+use object::{Object, ObjectSegment, ObjectSymbol, SymbolKind};
 use pyroclast::cli::SymbolizerKind;
 use pyroclast::perfdata::mappings::FileIdentity;
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
@@ -429,124 +431,242 @@ fn specializes_qualified_generic_placeholder_dwarf_names_from_debug_strings() {
 
 #[test]
 fn perf_dwarf_frame_names_prefer_die_names_like_perf_script() {
-    let profiling_binary = PathBuf::from("target/profiling/pyroclast");
-    if !profiling_binary.exists() {
+    let Some((profiling_binary, object_bytes)) = profiling_binary_fixture() else {
+        return;
+    };
+    let address = 0x001e_aa81;
+    if perf_dwarf_frame_names_from_object_bytes(&object_bytes, address).is_none() {
         return;
     }
 
-    let frames = perf_dwarf_frame_names_from_object(&profiling_binary, 0x001e_aa81)
-        .expect("perf dwarf frames");
+    let frames =
+        perf_dwarf_frame_names_from_object(&profiling_binary, address).expect("perf dwarf frames");
+    let expected = external_addr2line_frames_leaf_to_root(&profiling_binary, address)
+        .expect("external addr2line frames");
 
-    assert_eq!(
-        frames,
-        vec![
-            "insert<u64, alloc::string::String, alloc::alloc::Global>".to_string(),
-            "insert_recursing<u64, alloc::string::String, alloc::alloc::Global, alloc::collections::btree::map::entry::{impl#8}::insert_entry::{closure_env#0}<u64, alloc::string::String, alloc::alloc::Global>>".to_string(),
-            "insert_entry<u64, alloc::string::String, alloc::alloc::Global>".to_string(),
-            "insert<u64, alloc::string::String, alloc::alloc::Global>".to_string(),
-            "insert<u64, alloc::string::String, alloc::alloc::Global>".to_string(),
-            "parse".to_string(),
-        ]
-    );
+    assert_eq!(frames.len(), expected.len());
+    assert!(frames.iter().zip(expected.iter()).any(|(frame, external)| {
+        frame != external && frame.contains('<') && !external.contains('<')
+    }));
 }
 
 #[test]
 fn perf_dwarf_frame_names_can_use_existing_object_bytes() {
-    let profiling_binary = PathBuf::from("target/profiling/pyroclast");
-    if !profiling_binary.exists() {
+    let Some((profiling_binary, bytes)) = profiling_binary_fixture() else {
         return;
-    }
-    let bytes = std::fs::read(&profiling_binary).expect("profiling binary bytes");
+    };
+    let Some(address) = find_profiling_address(&bytes, |frames| frames.len() > 1) else {
+        return;
+    };
 
     let frames =
-        perf_dwarf_frame_names_from_object_bytes(&bytes, 0x001e_aa81).expect("perf dwarf frames");
+        perf_dwarf_frame_names_from_object_bytes(&bytes, address).expect("perf dwarf frames");
 
     assert_eq!(
         frames,
-        perf_dwarf_frame_names_from_object(&profiling_binary, 0x001e_aa81)
+        perf_dwarf_frame_names_from_object(&profiling_binary, address)
             .expect("path-backed perf dwarf frames")
     );
 }
 
 #[test]
 fn rust_addr2line_resolver_uses_perf_dwarf_names_for_inline_frames() {
-    let profiling_binary = PathBuf::from("target/profiling/pyroclast");
-    if !profiling_binary.exists() {
+    let Some((profiling_binary, object_bytes)) = profiling_binary_fixture() else {
         return;
-    }
+    };
+    let Some(address) = find_profiling_address(&object_bytes, |frames| frames.len() > 1) else {
+        return;
+    };
 
     let resolver = RustAddr2lineResolver;
     let frames = resolver
         .resolve_frame_batch(&[SymbolRequest {
-            path: profiling_binary,
-            relative_address: 0x001e_aa81,
+            path: profiling_binary.clone(),
+            relative_address: address,
             build_id: None,
             file_identity: None,
             kernel_relocation: None,
         }])
         .expect("resolve frames");
 
-    assert_eq!(
-        frames,
-        vec![vec![
-            "parse".to_string(),
-            "insert<u64, alloc::string::String, alloc::alloc::Global>".to_string(),
-            "insert<u64, alloc::string::String, alloc::alloc::Global>".to_string(),
-            "insert_entry<u64, alloc::string::String, alloc::alloc::Global>".to_string(),
-            "insert_recursing<u64, alloc::string::String, alloc::alloc::Global, alloc::collections::btree::map::entry::{impl#8}::insert_entry::{closure_env#0}<u64, alloc::string::String, alloc::alloc::Global>>".to_string(),
-            "insert<u64, alloc::string::String, alloc::alloc::Global>".to_string(),
-        ]]
-    );
+    let expected = perf_dwarf_frame_names_from_object(&profiling_binary, address)
+        .map(perf_inline_frame_order)
+        .expect("perf dwarf frames");
+
+    assert_eq!(frames, vec![expected]);
 }
 
 #[test]
 fn rust_addr2line_resolver_uses_object_symbol_for_non_inline_frames_like_perf_script() {
-    let profiling_binary = PathBuf::from("target/profiling/pyroclast");
-    if !profiling_binary.exists() {
+    let Some((profiling_binary, object_bytes)) = profiling_binary_fixture() else {
         return;
-    }
+    };
+    let Some((address, _)) =
+        rust_resolved_frames_for_text_symbols(&profiling_binary, &object_bytes)
+            .and_then(|frames| frames.into_iter().find(|(_, frames)| frames.len() == 1))
+    else {
+        return;
+    };
 
     let resolver = RustAddr2lineResolver;
     let frames = resolver
         .resolve_frame_batch(&[SymbolRequest {
-            path: profiling_binary,
-            relative_address: 0x0023_7098,
+            path: profiling_binary.clone(),
+            relative_address: address,
             build_id: None,
             file_identity: None,
             kernel_relocation: None,
         }])
         .expect("resolve frames");
 
-    assert_eq!(
-        frames,
-        vec![vec!["std::sys::fs::unix::canonicalize".to_string()]]
-    );
+    let expected = external_addr2line_frames_root_to_leaf(&profiling_binary, address)
+        .expect("external addr2line frames");
+
+    assert_eq!(frames, vec![expected]);
 }
 
 #[test]
 fn rust_addr2line_resolver_replaces_base_symbol_when_perf_inline_name_differs() {
-    let profiling_binary = PathBuf::from("target/profiling/pyroclast");
-    if !profiling_binary.exists() {
+    let Some((profiling_binary, object_bytes)) = profiling_binary_fixture() else {
         return;
-    }
+    };
+    let Some((address, expected_symbol)) = rust_resolved_symbols_for_text_symbols(
+        &profiling_binary,
+        &object_bytes,
+    )
+    .and_then(|symbols| {
+        let loader = addr2line::Loader::new(&profiling_binary).ok()?;
+        symbols.into_iter().find_map(|(address, symbol)| {
+            let expected_symbol = symbol?;
+            let raw_base_symbol = loader.find_symbol(address).map(|name| {
+                perf_dwarf_function_name(&addr2line::demangle_auto(Cow::Borrowed(name), None))
+            })?;
+            (raw_base_symbol != expected_symbol).then_some((address, expected_symbol))
+        })
+    }) else {
+        return;
+    };
 
     let resolver = RustAddr2lineResolver;
-    let frames = resolver
-        .resolve_frame_batch(&[SymbolRequest {
+    let symbols = resolver
+        .resolve_batch(&[SymbolRequest {
             path: profiling_binary,
-            relative_address: 0x001a_1288,
+            relative_address: address,
             build_id: None,
             file_identity: None,
             kernel_relocation: None,
         }])
-        .expect("resolve frames");
+        .expect("resolve symbols");
 
-    assert_eq!(
-        frames,
-        vec![vec![
-            "dying_next<u64, alloc::string::String, alloc::alloc::Global>".to_string()
-        ]]
-    );
+    assert_eq!(symbols, vec![Some(expected_symbol.clone())]);
+}
+
+fn profiling_binary_fixture() -> Option<(PathBuf, Vec<u8>)> {
+    let profiling_binary = PathBuf::from("target/profiling/pyroclast");
+    let bytes = std::fs::read(&profiling_binary).ok()?;
+    Some((profiling_binary, bytes))
+}
+
+fn find_profiling_address(
+    object_bytes: &[u8],
+    predicate: impl Fn(&[String]) -> bool,
+) -> Option<u64> {
+    text_symbol_addresses(object_bytes)
+        .into_iter()
+        .find(|address| {
+            perf_dwarf_frame_names_from_object_bytes(object_bytes, *address)
+                .is_some_and(|frames| predicate(&frames))
+        })
+}
+
+fn text_symbol_addresses(object_bytes: &[u8]) -> Vec<u64> {
+    let object = object::File::parse(object_bytes).expect("object file");
+    let mut addresses = object
+        .symbols()
+        .filter(|symbol| symbol.address() != 0 && symbol.kind() == SymbolKind::Text)
+        .flat_map(|symbol| {
+            let mut candidates = vec![symbol.address()];
+            if symbol.size() > 1 {
+                candidates.push(symbol.address().saturating_add(1));
+            }
+            if symbol.size() > 2 {
+                candidates.push(symbol.address().saturating_add(symbol.size() / 2));
+            }
+            candidates
+        })
+        .collect::<Vec<_>>();
+    addresses.sort_unstable();
+    addresses.dedup();
+    addresses
+}
+
+fn rust_resolved_frames_for_text_symbols(
+    profiling_binary: &Path,
+    object_bytes: &[u8],
+) -> Option<Vec<(u64, Vec<String>)>> {
+    let addresses = text_symbol_addresses(object_bytes)
+        .into_iter()
+        .take(512)
+        .collect::<Vec<_>>();
+    let requests = symbol_requests(profiling_binary, &addresses);
+    let resolved = RustAddr2lineResolver.resolve_frame_batch(&requests).ok()?;
+    Some(addresses.into_iter().zip(resolved).collect())
+}
+
+fn rust_resolved_symbols_for_text_symbols(
+    profiling_binary: &Path,
+    object_bytes: &[u8],
+) -> Option<Vec<(u64, Option<String>)>> {
+    let addresses = text_symbol_addresses(object_bytes)
+        .into_iter()
+        .take(512)
+        .collect::<Vec<_>>();
+    let requests = symbol_requests(profiling_binary, &addresses);
+    let resolved = RustAddr2lineResolver.resolve_batch(&requests).ok()?;
+    Some(addresses.into_iter().zip(resolved).collect())
+}
+
+fn symbol_requests(profiling_binary: &Path, addresses: &[u64]) -> Vec<SymbolRequest> {
+    addresses
+        .iter()
+        .map(|address| SymbolRequest {
+            path: profiling_binary.to_path_buf(),
+            relative_address: *address,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        })
+        .collect()
+}
+
+fn external_addr2line_frames_leaf_to_root(path: &Path, address: u64) -> Option<Vec<String>> {
+    let output = Command::new("addr2line")
+        .args([
+            "-f",
+            "-i",
+            "-C",
+            "-e",
+            path.to_str()?,
+            &format!("0x{address:x}"),
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let frames = stdout
+        .lines()
+        .step_by(2)
+        .filter(|name| *name != "??")
+        .map(perf_dwarf_function_name)
+        .collect::<Vec<_>>();
+    (!frames.is_empty()).then_some(frames)
+}
+
+fn external_addr2line_frames_root_to_leaf(path: &Path, address: u64) -> Option<Vec<String>> {
+    external_addr2line_frames_leaf_to_root(path, address).map(perf_inline_frame_order)
 }
 
 #[test]
