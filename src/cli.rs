@@ -200,7 +200,7 @@ impl CliCommand {
                 out: args.out.clone(),
                 name: args.name.clone(),
                 json: args.json,
-                symbols: args.symbols,
+                symbols: default_symbols_enabled(args.kind, args.symbols),
                 symbolizer: args.symbolizer,
                 frequency: args.frequency,
                 event: args.event,
@@ -223,7 +223,7 @@ impl ProfileInvocation {
             out: args.out.clone(),
             name: args.name.clone(),
             json: args.json,
-            symbols: args.symbols,
+            symbols: default_symbols_enabled(kind, args.symbols),
             symbolizer: args.symbolizer,
             frequency: args.frequency,
             event: args.event,
@@ -235,6 +235,10 @@ impl ProfileInvocation {
             command: args.command.clone(),
         }
     }
+}
+
+fn default_symbols_enabled(kind: ProfileKind, requested_symbols: bool) -> bool {
+    requested_symbols || matches!(kind, ProfileKind::Cpu | ProfileKind::Offcpu)
 }
 
 #[derive(Debug, Args)]

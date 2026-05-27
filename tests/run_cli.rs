@@ -560,13 +560,37 @@ fn top_level_cpu_command_uses_injected_perf_runner() {
     assert!(run_json.contains("\"call_graph\": \"dwarf\""));
     assert!(run_json.contains("\"record_target\": \"command\""));
     assert!(run_json.contains("\"duration_secs\": null"));
-    assert!(run_json.contains("\"symbols\": false"));
+    assert!(run_json.contains("\"symbols\": true"));
     assert!(run_json.contains("\"tool_versions\""));
     let summary_json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(out.join("summary.json")).unwrap())
             .expect("summary json");
     assert_eq!(summary_json["folded_lines"], 1);
     assert_eq!(summary_json["total_count"], 1);
+}
+
+#[test]
+fn profile_cpu_command_uses_injected_perf_runner() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let out = root.path().join("profile-cpu-run");
+    let runner = RecordingRunner::default();
+    let cli = pyroclast::cli::Cli::parse_from([
+        "pyroclast",
+        "profile",
+        "--kind",
+        "cpu",
+        "--out",
+        out.to_str().expect("utf8 path"),
+        "--",
+        "true",
+    ]);
+
+    pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("run cli");
+
+    assert_eq!(runner.programs(), vec!["perf", "inferno-flamegraph"]);
+    let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
+    assert!(run_json.contains("\"actual_backend\": \"linux_perf\""));
+    assert!(run_json.contains("\"symbols\": true"));
 }
 
 #[test]
@@ -596,6 +620,30 @@ fn top_level_cpu_command_uses_xctrace_on_macos() {
     assert!(run_json.contains("\"actual_backend\": \"macos_xctrace\""));
     assert!(out.join("profile.raw.xctrace.trace").is_dir());
     assert!(out.join("profile.raw.xctrace.xml").is_file());
+}
+
+#[test]
+fn profile_memory_command_keeps_symbols_off_by_default() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let out = root.path().join("profile-memory-run");
+    let runner = RecordingRunner::default();
+    let cli = pyroclast::cli::Cli::parse_from([
+        "pyroclast",
+        "profile",
+        "--kind",
+        "memory",
+        "--out",
+        out.to_str().expect("utf8 path"),
+        "--",
+        "true",
+    ]);
+
+    pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("run cli");
+
+    assert_eq!(runner.programs(), vec!["heaptrack", "heaptrack_print"]);
+    let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
+    assert!(run_json.contains("\"actual_backend\": \"heaptrack\""));
+    assert!(run_json.contains("\"symbols\": false"));
 }
 
 #[test]
@@ -643,6 +691,7 @@ fn top_level_offcpu_command_uses_injected_perf_sched_runner() {
     assert_eq!(runner.programs(), vec!["perf", "perf"]);
     let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
     assert!(run_json.contains("\"actual_backend\": \"offcpu\""));
+    assert!(run_json.contains("\"symbols\": true"));
     assert!(out.join("profile.raw.perf.data").is_file());
     assert!(!out.join("stacks.folded").exists());
     let summary_json: serde_json::Value =

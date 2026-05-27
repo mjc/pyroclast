@@ -28,6 +28,48 @@ fn parses_profile_defaults() {
 }
 
 #[test]
+fn profile_invocation_defaults_cpu_symbols_on() {
+    let cli = Cli::parse_from(["pyroclast", "profile", "--", "true"]);
+
+    let profile = cli
+        .command
+        .profile_invocation()
+        .expect("profile invocation");
+
+    assert_eq!(profile.kind, ProfileKind::Cpu);
+    assert!(profile.symbols);
+    assert_eq!(profile.symbolizer, SymbolizerKind::RustAddr2line);
+}
+
+#[test]
+fn profile_invocation_defaults_offcpu_symbols_on() {
+    let cli = Cli::parse_from(["pyroclast", "profile", "--kind", "offcpu", "--", "true"]);
+
+    let profile = cli
+        .command
+        .profile_invocation()
+        .expect("profile invocation");
+
+    assert_eq!(profile.kind, ProfileKind::Offcpu);
+    assert!(profile.symbols);
+    assert_eq!(profile.symbolizer, SymbolizerKind::RustAddr2line);
+}
+
+#[test]
+fn profile_invocation_keeps_memory_symbols_off_by_default() {
+    let cli = Cli::parse_from(["pyroclast", "profile", "--kind", "memory", "--", "true"]);
+
+    let profile = cli
+        .command
+        .profile_invocation()
+        .expect("profile invocation");
+
+    assert_eq!(profile.kind, ProfileKind::Memory);
+    assert!(!profile.symbols);
+    assert_eq!(profile.symbolizer, SymbolizerKind::RustAddr2line);
+}
+
+#[test]
 fn dwarf_call_graph_matches_cargo_flamegraph_record_argument() {
     assert_eq!(PerfCallGraph::Dwarf.to_string(), "dwarf,64000");
 }
@@ -233,7 +275,11 @@ fn parses_top_level_profiler_commands() {
             .profile_invocation()
             .unwrap_or_else(|| panic!("expected profile invocation for {verb}"));
         assert_eq!(profile.kind, kind, "verb {verb}");
-        assert!(!profile.symbols, "verb {verb}");
+        assert_eq!(
+            profile.symbols,
+            matches!(kind, ProfileKind::Cpu | ProfileKind::Offcpu),
+            "verb {verb}"
+        );
         assert_eq!(
             profile.symbolizer,
             SymbolizerKind::RustAddr2line,
