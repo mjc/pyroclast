@@ -1358,7 +1358,7 @@ where
 fn perf_dwarf_frames_from_node<R>(
     dwarf: &gimli::Dwarf<R>,
     unit: &gimli::Unit<R>,
-    node: gimli::EntriesTreeNode<'_, '_, '_, R>,
+    node: gimli::EntriesTreeNode<'_, '_, R>,
     address: u64,
     looking_for_inline: bool,
     base_symbol: Option<&str>,
@@ -1428,7 +1428,7 @@ fn perf_realfunc_name_replaces_base_symbol(name: &str, base_symbol: Option<&str>
 fn die_contains_address<R>(
     dwarf: &gimli::Dwarf<R>,
     unit: &gimli::Unit<R>,
-    entry: &gimli::DebuggingInformationEntry<'_, '_, R>,
+    entry: &gimli::DebuggingInformationEntry<R>,
     address: u64,
 ) -> bool
 where
@@ -1448,29 +1448,23 @@ where
 fn perf_dwarf_die_name<R>(
     dwarf: &gimli::Dwarf<R>,
     unit: &gimli::Unit<R>,
-    entry: &gimli::DebuggingInformationEntry<'_, '_, R>,
+    entry: &gimli::DebuggingInformationEntry<R>,
 ) -> Option<String>
 where
     R: gimli::Reader,
 {
     entry
         .attr(gimli::DW_AT_name)
-        .ok()
-        .flatten()
         .and_then(|attr| dwarf.attr_string(unit, attr.value()).ok())
         .and_then(|name| name.to_string_lossy().ok().map(Cow::into_owned))
         .or_else(|| {
             entry
                 .attr(gimli::DW_AT_abstract_origin)
-                .ok()
-                .flatten()
                 .and_then(|attr| perf_dwarf_origin_name(dwarf, unit, &attr.value(), 16))
         })
         .or_else(|| {
             entry
                 .attr(gimli::DW_AT_specification)
-                .ok()
-                .flatten()
                 .and_then(|attr| perf_dwarf_origin_name(dwarf, unit, &attr.value(), 16))
         })
 }
@@ -1495,27 +1489,17 @@ where
     let entry = root.entry();
     entry
         .attr(gimli::DW_AT_name)
-        .ok()
-        .flatten()
         .and_then(|attr| dwarf.attr_string(unit, attr.value()).ok())
         .and_then(|name| name.to_string_lossy().ok().map(Cow::into_owned))
         .or_else(|| {
-            entry
-                .attr(gimli::DW_AT_abstract_origin)
-                .ok()
-                .flatten()
-                .and_then(|attr| {
-                    perf_dwarf_origin_name(dwarf, unit, &attr.value(), recursion_limit - 1)
-                })
+            entry.attr(gimli::DW_AT_abstract_origin).and_then(|attr| {
+                perf_dwarf_origin_name(dwarf, unit, &attr.value(), recursion_limit - 1)
+            })
         })
         .or_else(|| {
-            entry
-                .attr(gimli::DW_AT_specification)
-                .ok()
-                .flatten()
-                .and_then(|attr| {
-                    perf_dwarf_origin_name(dwarf, unit, &attr.value(), recursion_limit - 1)
-                })
+            entry.attr(gimli::DW_AT_specification).and_then(|attr| {
+                perf_dwarf_origin_name(dwarf, unit, &attr.value(), recursion_limit - 1)
+            })
         })
 }
 
