@@ -18,6 +18,7 @@ pub fn build_strace_command(
         .arg(output.display().to_string())
         .arg("--")
         .args(profiled_command)
+        .interactive()
 }
 
 pub struct StraceBackend<'a, R> {

@@ -17,6 +17,7 @@ pub fn build_heaptrack_command(
         .arg("-o")
         .arg(output_prefix.display().to_string())
         .args(profiled_command)
+        .interactive()
 }
 
 #[must_use]

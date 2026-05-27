@@ -63,7 +63,7 @@ pub fn build_perf_record_command(
     ]);
 
     match target {
-        PerfRecordTarget::Command(profiled_command) => command.args(profiled_command),
+        PerfRecordTarget::Command(profiled_command) => command.args(profiled_command).interactive(),
         PerfRecordTarget::Process(_) | PerfRecordTarget::Threads(_) => {
             command.args(["sleep".to_string(), duration_secs.to_string()])
         }

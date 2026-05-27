@@ -65,7 +65,8 @@ where
 /// Returns an error when command execution, artifact I/O, or input parsing
 /// fails.
 pub fn run_parsed_cli(cli: Cli) -> backends::BackendResult<CliOutput> {
-    run_parsed_cli_with_runner(cli, &RealCommandRunner)
+    let runner = RealCommandRunner::default();
+    run_parsed_cli_with_runner(cli, &runner)
 }
 
 /// Runs a parsed CLI command with an injected process runner.

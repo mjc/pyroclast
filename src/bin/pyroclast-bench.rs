@@ -8,6 +8,7 @@ const DEFAULT_INPUT: &str = "target/benchmarks/biggest.perf.data";
 
 fn main() -> ExitCode {
     let args = BenchArgs::parse(std::env::args_os().skip(1).map(PathBuf::from).collect());
+    let runner = RealCommandRunner::default();
     let input = args
         .perf_data
         .unwrap_or_else(|| PathBuf::from(DEFAULT_INPUT));
@@ -22,12 +23,9 @@ fn main() -> ExitCode {
 
     let perf_script = match args.export_perf_script {
         Some(path) => {
-            if let Err(error) = pyroclast::benchmarks::export_perf_script(
-                &input,
-                &path,
-                &RealCommandRunner,
-                args.symbols,
-            ) {
+            if let Err(error) =
+                pyroclast::benchmarks::export_perf_script(&input, &path, &runner, args.symbols)
+            {
                 eprintln!("perf script export failed: {error}");
                 return ExitCode::FAILURE;
             }
@@ -45,7 +43,7 @@ fn main() -> ExitCode {
     match pyroclast::benchmarks::run_streaming_comparison_with_symbols(
         &input,
         perf_script.as_deref(),
-        &RealCommandRunner,
+        &runner,
         args.symbols,
     ) {
         Ok(report) => {

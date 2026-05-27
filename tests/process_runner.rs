@@ -2,7 +2,7 @@ use pyroclast::process::{CommandRunner, CommandSpec, RealCommandRunner};
 
 #[test]
 fn real_runner_captures_status_stdout_and_stderr() {
-    let output = RealCommandRunner
+    let output = RealCommandRunner::default()
         .run(&CommandSpec::new("sh").args(["-c", "printf out; printf err >&2"]))
         .expect("run command");
 
@@ -13,7 +13,7 @@ fn real_runner_captures_status_stdout_and_stderr() {
 
 #[test]
 fn real_runner_writes_configured_stdin() {
-    let output = RealCommandRunner
+    let output = RealCommandRunner::default()
         .run(&CommandSpec::new("cat").stdin(b"folded stacks".to_vec()))
         .expect("run command");
 
@@ -23,7 +23,7 @@ fn real_runner_writes_configured_stdin() {
 
 #[test]
 fn real_runner_reports_child_status_when_stdin_pipe_breaks() {
-    let output = RealCommandRunner
+    let output = RealCommandRunner::default()
         .run(
             &CommandSpec::new("sh")
                 .args(["-c", "exit 7"])
@@ -32,4 +32,19 @@ fn real_runner_reports_child_status_when_stdin_pipe_breaks() {
         .expect("broken pipe should not hide child status");
 
     assert_eq!(output.status_code, Some(7));
+}
+
+#[test]
+fn real_runner_can_run_interactive_commands_without_capturing_output() {
+    let output = RealCommandRunner::default()
+        .run(
+            &CommandSpec::new("sh")
+                .args(["-c", "printf terminal-output; printf terminal-error >&2"])
+                .interactive(),
+        )
+        .expect("interactive command");
+
+    assert_eq!(output.status_code, Some(0));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
 }

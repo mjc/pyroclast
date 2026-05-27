@@ -56,6 +56,7 @@ pub fn build_bpftrace_offcpu_command(profiled_command: String, duration_secs: u3
         .arg("-c")
         .arg(profiled_command)
         .arg("--unsafe")
+        .interactive()
 }
 
 #[must_use]
@@ -70,6 +71,7 @@ pub fn build_perf_sched_record_command(
         .arg(output.display().to_string())
         .arg("--")
         .args(profiled_command)
+        .interactive()
 }
 
 #[must_use]

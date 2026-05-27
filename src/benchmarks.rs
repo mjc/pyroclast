@@ -15,6 +15,7 @@ use crate::perfdata::fold::{
 };
 use crate::process::{CommandRunner, CommandSpec};
 use crate::symbols::perf_symbol_resolver_for_current_home;
+use crate::tools::{INFERNO_COLLAPSE_PERF, INFERNO_FLAMEGRAPH};
 use blake3::Hash;
 
 const PIPE_BUFFER_CAPACITY: usize = 1024 * 1024;
@@ -561,7 +562,7 @@ where
     let perf_data = perf_data.to_path_buf();
     let started = Instant::now();
     let (mut flamegraph, flamegraph_stdin, svg_thread, stderr_thread) =
-        spawn_inferno_flamegraph_process("Pyroclast comparison")?;
+        spawn_inferno_flamegraph_process(runner, "Pyroclast comparison")?;
     let line_writer = LineChannelWriter::new(line_sender);
     let tee = TeeWriter::new(
         line_writer,
@@ -616,7 +617,10 @@ where
     let perf_data = perf_data.to_path_buf();
     let perf_script = perf_script.map(Path::to_path_buf);
     let started = Instant::now();
-    let mut collapse_command = Command::new("inferno-collapse-perf");
+    let collapse_tool = runner
+        .resolve_tool(&INFERNO_COLLAPSE_PERF)
+        .map_err(|error| format!("failed to resolve inferno-collapse-perf: {error}"))?;
+    let mut collapse_command = Command::new(&collapse_tool.path);
     if let Some(path) = &perf_script {
         collapse_command.arg(path);
     }
@@ -642,7 +646,7 @@ where
     let mut collapse_stdin = collapse.stdin.take();
 
     let (mut flamegraph, flamegraph_stdin, svg_thread, stderr_thread) =
-        spawn_inferno_flamegraph_process("Pyroclast comparison")?;
+        spawn_inferno_flamegraph_process(runner, "Pyroclast comparison")?;
     let line_writer = LineChannelWriter::new(line_sender);
     let tee = TeeWriter::new(
         line_writer,
@@ -721,8 +725,15 @@ where
     })
 }
 
-fn spawn_inferno_flamegraph_process(title: &str) -> Result<SpawnedFlamegraph, String> {
-    let spec = build_inferno_flamegraph_command(title);
+fn spawn_inferno_flamegraph_process<R>(runner: &R, title: &str) -> Result<SpawnedFlamegraph, String>
+where
+    R: CommandRunner,
+{
+    let resolved = runner
+        .resolve_tool(&INFERNO_FLAMEGRAPH)
+        .map_err(|error| format!("failed to resolve inferno-flamegraph: {error}"))?;
+    let mut spec = build_inferno_flamegraph_command(title);
+    spec.program = resolved.path;
     let mut command = Command::new(&spec.program);
     command.args(&spec.args);
     for (key, value) in &spec.env {

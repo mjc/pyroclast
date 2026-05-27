@@ -34,6 +34,7 @@ pub fn build_xctrace_record_command(
         ])
         .env(XCTRACE_PID_ENV, target_pid_path.display().to_string())
         .args(profiled_command)
+        .interactive()
 }
 
 #[must_use]

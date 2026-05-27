@@ -41,6 +41,7 @@ fn builds_linux_perf_record_command() {
             "check",
         ]
     );
+    assert!(command.interactive);
 }
 
 #[test]
@@ -75,6 +76,7 @@ fn builds_linux_perf_thread_record_command() {
             "15",
         ]
     );
+    assert!(!command.interactive);
 }
 
 #[test]
@@ -109,6 +111,7 @@ fn builds_linux_perf_process_record_command() {
             "30",
         ]
     );
+    assert!(!command.interactive);
 }
 
 #[test]
@@ -128,6 +131,7 @@ fn builds_heaptrack_command() {
             "--serve"
         ]
     );
+    assert!(command.interactive);
 }
 
 #[test]
@@ -151,6 +155,7 @@ fn builds_strace_command() {
             "--serve",
         ]
     );
+    assert!(command.interactive);
 }
 
 #[test]
@@ -164,6 +169,7 @@ fn builds_bpftrace_offcpu_command() {
         &command.args[2..],
         ["-c", "target/release/app --serve", "--unsafe"]
     );
+    assert!(command.interactive);
 }
 
 #[test]
@@ -187,11 +193,13 @@ fn builds_perf_sched_offcpu_commands() {
             "--serve",
         ]
     );
+    assert!(record.interactive);
     assert_eq!(timehist.program, "perf");
     assert_eq!(
         timehist.args,
         vec!["sched", "timehist", "-i", "run/profile.raw.perf.data"]
     );
+    assert!(!timehist.interactive);
 }
 
 #[test]
@@ -222,6 +230,7 @@ fn builds_perf_cpu_clock_offcpu_command() {
             "--serve",
         ]
     );
+    assert!(command.interactive);
 }
 
 #[test]
@@ -230,6 +239,7 @@ fn builds_inferno_flamegraph_command() {
 
     assert_eq!(command.program, "inferno-flamegraph");
     assert_eq!(command.args, vec!["--title", "CPU profile", "-"]);
+    assert!(!command.interactive);
 }
 
 #[test]
@@ -269,6 +279,7 @@ fn builds_macos_xctrace_record_command() {
             "run/xctrace-target.pid".to_string()
         )]
     );
+    assert!(command.interactive);
 }
 
 #[test]
@@ -291,6 +302,7 @@ fn builds_macos_xctrace_export_command() {
             "//table",
         ]
     );
+    assert!(!command.interactive);
 }
 
 #[test]
@@ -318,4 +330,5 @@ fn builds_batched_addr2line_command() {
     assert_eq!(command.program, "addr2line");
     assert_eq!(command.args, vec!["-f", "-C", "-e", "/bin/app"]);
     assert_eq!(command.stdin, Some(b"0x10\n0x20\n".to_vec()));
+    assert!(!command.interactive);
 }

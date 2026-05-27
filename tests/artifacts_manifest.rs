@@ -1,7 +1,7 @@
 use pyroclast::artifacts::ArtifactLayout;
 use pyroclast::cli::{PerfCallGraph, PerfEvent, ProfileKind};
 use pyroclast::manifest::{BackendName, RunManifest};
-use pyroclast::tools::ToolVersion;
+use pyroclast::tools::{ToolSource, ToolVersion};
 
 #[test]
 fn artifact_layout_uses_required_file_names() {
@@ -56,6 +56,8 @@ fn manifest_serializes_core_run_fields() {
         symbols: true,
         tool_versions: vec![ToolVersion {
             name: "perf".to_string(),
+            path: Some("/usr/bin/perf".to_string()),
+            source: Some(ToolSource::Path),
             version: Some("perf version 6.9".to_string()),
             error: None,
         }],
@@ -78,5 +80,7 @@ fn manifest_serializes_core_run_fields() {
     assert_eq!(json["duration_secs"], serde_json::Value::Null);
     assert_eq!(json["symbols"], true);
     assert_eq!(json["tool_versions"][0]["name"], "perf");
+    assert_eq!(json["tool_versions"][0]["path"], "/usr/bin/perf");
+    assert_eq!(json["tool_versions"][0]["source"], "path");
     assert_eq!(json["tool_versions"][0]["version"], "perf version 6.9");
 }
