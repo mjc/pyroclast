@@ -617,18 +617,17 @@ fn timed_records<'a>(
     header: crate::perfdata::header::PerfHeader,
     sample_layouts: &SampleLayouts,
 ) -> Result<Vec<TimedRecord<'a>>, String> {
-    iter_records(bytes, header)?
-        .into_iter()
-        .enumerate()
-        .map(|(index, record)| {
-            let time = record_time(record, sample_layouts)?;
-            Ok(TimedRecord {
-                index,
-                time,
-                record,
-            })
-        })
-        .collect()
+    let records = iter_records(bytes, header)?;
+    let mut timed = Vec::with_capacity(records.len());
+    for (index, record) in records.into_iter().enumerate() {
+        let time = record_time(record, sample_layouts)?;
+        timed.push(TimedRecord {
+            index,
+            time,
+            record,
+        });
+    }
+    Ok(timed)
 }
 
 fn record_time(
@@ -814,7 +813,7 @@ fn is_valid_unwound_user_frame(pid: Option<u32>, frame: FoldFrame, mmap_table: &
     };
     pid.is_none_or(|pid| {
         !mmap_table.has_executable_mappings_for_pid(pid)
-            || mmap_table.resolve(pid, address).is_some()
+            || mmap_table.has_mapping_for_pid(pid, address)
             || is_kernel_space_frame(address)
     })
 }
@@ -829,13 +828,6 @@ where
     let mut folded = Vec::new();
     write_fold_data(fold_data, symbol_cache, &mut folded)?;
     String::from_utf8(folded).map_err(|error| format!("folded output is not utf-8: {error}"))
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PerfScriptFrame {
-    pc: String,
-    rawfunc: String,
-    module: String,
 }
 
 fn write_fold_data<R, W>(
@@ -897,19 +889,12 @@ where
         let pid = stack.pid.unwrap_or(0);
         writeln!(writer, "{comm} {pid}/{pid} 0: {} cycles:", stack.count)
             .map_err(|error| format!("failed to write perf script output: {error}"))?;
-        let frames = frame_resolver.script_frames_for_stack(
+        frame_resolver.write_script_frames_for_stack(
             stack.pid,
             &stack.callchain,
             symbol_cache.as_deref_mut(),
+            writer,
         )?;
-        for frame in frames.iter().rev() {
-            writeln!(
-                writer,
-                "\t{} {} ({})",
-                frame.pc, frame.rawfunc, frame.module
-            )
-            .map_err(|error| format!("failed to write perf script output: {error}"))?;
-        }
         writer
             .write_all(b"\n")
             .map_err(|error| format!("failed to write perf script output: {error}"))?;
@@ -991,17 +976,18 @@ impl<'a> FoldFrameResolver<'a> {
         Ok(frames)
     }
 
-    fn script_frames_for_stack<R>(
+    fn write_script_frames_for_stack<R, W>(
         &self,
         pid: Option<u32>,
         callchain: &[FoldFrame],
         mut symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
-    ) -> Result<Vec<PerfScriptFrame>, String>
+        writer: &mut W,
+    ) -> Result<(), String>
     where
         R: SymbolResolver,
+        W: IoWrite + ?Sized,
     {
-        let mut frames = Vec::new();
-        for frame in callchain.iter().copied() {
+        for frame in callchain.iter().rev().copied() {
             if symbol_cache.is_none() && !is_valid_unwound_user_frame(pid, frame, self.mmap_table) {
                 continue;
             }
@@ -1009,14 +995,44 @@ impl<'a> FoldFrameResolver<'a> {
                 continue;
             }
             let address = frame.address();
-            let labels = self.format_frames(pid, address, symbol_cache.as_deref_mut())?;
-            frames.extend(
-                labels
-                    .into_iter()
-                    .map(|label| script_frame_for_label(address, &label)),
-            );
+            let symbolizing = symbol_cache.is_some();
+            if let Some(mapping) = pid.and_then(|pid| self.mmap_table.resolve(pid, address)) {
+                if is_kernel_space_frame(address) && !is_kernel_mapping(&mapping) {
+                    write_perf_script_address_frame(writer, address)?;
+                    continue;
+                }
+                if let Some(cache) = symbol_cache.as_deref_mut() {
+                    let frames = cache.resolve(&symbol_request(&mapping))?;
+                    if frames.is_empty() {
+                        write_perf_script_frame_for_label(
+                            writer,
+                            address,
+                            &symbol_fallback_frame(&mapping),
+                        )?;
+                    } else {
+                        for label in frames.iter().rev() {
+                            write_perf_script_frame_for_label(writer, address, label)?;
+                        }
+                    }
+                    continue;
+                }
+                if is_kernel_space_frame(address) {
+                    write_perf_script_unknown_frame(writer, address)?;
+                } else {
+                    write_perf_script_mapped_frame(
+                        writer,
+                        address,
+                        mapping.path.as_str(),
+                        mapping.relative_address,
+                    )?;
+                }
+            } else if is_kernel_space_frame(address) || symbolizing {
+                write_perf_script_unknown_frame(writer, address)?;
+            } else {
+                write_perf_script_address_frame(writer, address)?;
+            }
         }
-        Ok(frames)
+        Ok(())
     }
 
     fn format_frames<R>(
@@ -1056,41 +1072,69 @@ fn folded_comm_label(comm: Option<&str>) -> String {
     comm.map_or_else(|| UNKNOWN_FRAME.to_string(), |comm| comm.replace(' ', "_"))
 }
 
-fn script_frame_for_label(address: u64, label: &str) -> PerfScriptFrame {
-    let pc = format!("{address:x}");
+fn write_perf_script_frame_for_label<W>(
+    writer: &mut W,
+    address: u64,
+    label: &str,
+) -> Result<(), String>
+where
+    W: IoWrite + ?Sized,
+{
     if label == UNKNOWN_FRAME {
-        return PerfScriptFrame {
-            pc,
-            rawfunc: UNKNOWN_FRAME.to_string(),
-            module: UNKNOWN_FRAME.to_string(),
-        };
+        return write_perf_script_unknown_frame(writer, address);
     }
     if label.starts_with("0x") {
-        return PerfScriptFrame {
-            pc,
-            rawfunc: label.to_string(),
-            module: UNKNOWN_FRAME.to_string(),
-        };
+        return write_perf_script_label_frame(writer, address, label);
     }
     if let Some(module) = module_fallback_label_module(label) {
-        return PerfScriptFrame {
-            pc,
-            rawfunc: UNKNOWN_FRAME.to_string(),
-            module: module.to_string(),
-        };
+        return writeln!(writer, "\t{address:x} {UNKNOWN_FRAME} ({module})")
+            .map_err(|error| format!("failed to write perf script output: {error}"));
     }
     if looks_like_mapped_frame_label(label) {
-        return PerfScriptFrame {
-            pc,
-            rawfunc: format!("{label}+0x0"),
-            module: UNKNOWN_FRAME.to_string(),
-        };
+        return writeln!(writer, "\t{address:x} {label}+0x0 ({UNKNOWN_FRAME})")
+            .map_err(|error| format!("failed to write perf script output: {error}"));
     }
-    PerfScriptFrame {
-        pc,
-        rawfunc: label.to_string(),
-        module: UNKNOWN_FRAME.to_string(),
-    }
+    write_perf_script_label_frame(writer, address, label)
+}
+
+fn write_perf_script_unknown_frame<W>(writer: &mut W, address: u64) -> Result<(), String>
+where
+    W: IoWrite + ?Sized,
+{
+    writeln!(writer, "\t{address:x} {UNKNOWN_FRAME} ({UNKNOWN_FRAME})")
+        .map_err(|error| format!("failed to write perf script output: {error}"))
+}
+
+fn write_perf_script_address_frame<W>(writer: &mut W, address: u64) -> Result<(), String>
+where
+    W: IoWrite + ?Sized,
+{
+    writeln!(writer, "\t{address:x} 0x{address:x} ({UNKNOWN_FRAME})")
+        .map_err(|error| format!("failed to write perf script output: {error}"))
+}
+
+fn write_perf_script_label_frame<W>(writer: &mut W, address: u64, label: &str) -> Result<(), String>
+where
+    W: IoWrite + ?Sized,
+{
+    writeln!(writer, "\t{address:x} {label} ({UNKNOWN_FRAME})")
+        .map_err(|error| format!("failed to write perf script output: {error}"))
+}
+
+fn write_perf_script_mapped_frame<W>(
+    writer: &mut W,
+    address: u64,
+    path: &str,
+    relative_address: u64,
+) -> Result<(), String>
+where
+    W: IoWrite + ?Sized,
+{
+    writeln!(
+        writer,
+        "\t{address:x} {path}+0x{relative_address:x}+0x0 ({UNKNOWN_FRAME})"
+    )
+    .map_err(|error| format!("failed to write perf script output: {error}"))
 }
 
 fn module_fallback_label_module(label: &str) -> Option<&str> {
@@ -1115,8 +1159,8 @@ fn should_drop_perf_data_user_unwind_frame(
     !is_kernel_space_frame(address)
         && pid.is_some_and(|pid| {
             mmap_table
-                .resolve(pid, address)
-                .is_some_and(|mapping| should_drop_user_unwind_mapping_path(&mapping.path))
+                .mapping_path(pid, address)
+                .is_some_and(should_drop_user_unwind_mapping_path)
         })
 }
 

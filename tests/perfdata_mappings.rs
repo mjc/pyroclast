@@ -28,6 +28,8 @@ fn resolves_user_ip_to_mapping_relative_address() {
             kernel_relocation: None,
         })
     );
+    assert!(table.has_mapping_for_pid(42, 0x1010));
+    assert_eq!(table.mapping_path(42, 0x1010), Some("/bin/app"));
 }
 
 #[test]
@@ -246,6 +248,10 @@ fn does_not_resolve_other_pids_or_out_of_range_ips() {
 
     assert_eq!(table.resolve(41, 0x1010), None);
     assert_eq!(table.resolve(42, 0x1200), None);
+    assert!(!table.has_mapping_for_pid(41, 0x1010));
+    assert!(!table.has_mapping_for_pid(42, 0x1200));
+    assert_eq!(table.mapping_path(41, 0x1010), None);
+    assert_eq!(table.mapping_path(42, 0x1200), None);
 }
 
 #[test]

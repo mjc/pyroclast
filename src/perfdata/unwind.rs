@@ -1,7 +1,12 @@
+use std::fs::File;
+use std::ops::{Deref, Range};
 use std::path::Path;
+use std::sync::Arc;
 
-use framehop::Unwinder;
 use framehop::x86_64::{CacheX86_64, UnwindRegsX86_64, UnwinderX86_64};
+use framehop::{ExplicitModuleSectionInfo, Unwinder};
+use memmap2::Mmap;
+use object::read::{Object, ObjectSection, ObjectSegment};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PerfX86_64Regs {
@@ -16,9 +21,21 @@ pub struct PerfStackReader<'a> {
 }
 
 pub struct FramehopUnwinder {
-    unwinder: UnwinderX86_64<Vec<u8>>,
+    unwinder: UnwinderX86_64<ModuleBytes>,
     cache: CacheX86_64,
     module_count: usize,
+}
+
+#[derive(Clone, Debug)]
+enum ModuleBytes {
+    Mapped(MappedBytes),
+    Owned(Vec<u8>),
+}
+
+#[derive(Clone, Debug)]
+struct MappedBytes {
+    mmap: Arc<Mmap>,
+    range: Range<usize>,
 }
 
 #[must_use]
@@ -71,17 +88,21 @@ impl FramehopUnwinder {
         if len == 0 {
             return Ok(false);
         }
-        let bytes = std::fs::read(path)
-            .map_err(|error| format!("failed to read unwind object {}: {error}", path.display()))?;
-        let object = object::File::parse(bytes.as_slice()).map_err(|error| {
+        let file = File::open(path)
+            .map_err(|error| format!("failed to open unwind object {}: {error}", path.display()))?;
+        let mapped =
+            Arc::new(unsafe { Mmap::map(&file) }.map_err(|error| {
+                format!("failed to map unwind object {}: {error}", path.display())
+            })?);
+        let object = object::File::parse(&mapped[..]).map_err(|error| {
             format!("failed to parse unwind object {}: {error}", path.display())
         })?;
-        let section_info = framehop_object::ObjectSectionInfo::new(object);
-        let module = framehop::Module::<Vec<u8>>::new(
+        let section_info = explicit_module_section_info(&mapped, &object);
+        let module = framehop::Module::<ModuleBytes>::new(
             path.to_string_lossy().into_owned(),
             start..start.saturating_add(len),
             start.saturating_sub(pgoff),
-            &section_info,
+            section_info,
         );
         self.unwinder.add_module(module);
         self.module_count += 1;
@@ -116,6 +137,129 @@ impl FramehopUnwinder {
         }
         frames
     }
+}
+
+impl Deref for ModuleBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Mapped(bytes) => bytes,
+            Self::Owned(bytes) => bytes,
+        }
+    }
+}
+
+impl Deref for MappedBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.mmap[self.range.clone()]
+    }
+}
+
+fn explicit_module_section_info<'a>(
+    mapped: &Arc<Mmap>,
+    object: &object::File<'a, &'a [u8]>,
+) -> ExplicitModuleSectionInfo<ModuleBytes> {
+    ExplicitModuleSectionInfo {
+        base_svma: object_base_svma(object),
+        text_svma: first_section_svma_range(object, &[b"__text", b".text"]),
+        text: first_section_data(mapped, object, &[b"__text", b".text"]),
+        stubs_svma: first_section_svma_range(object, &[b"__stubs"]),
+        stub_helper_svma: first_section_svma_range(object, &[b"__stub_helper"]),
+        got_svma: first_section_svma_range(object, &[b"__got", b".got"]),
+        unwind_info: first_section_data(mapped, object, &[b"__unwind_info"]),
+        eh_frame_svma: first_section_svma_range(object, &[b"__eh_frame", b".eh_frame"]),
+        eh_frame: first_section_data(mapped, object, &[b"__eh_frame", b".eh_frame"]),
+        eh_frame_hdr_svma: first_section_svma_range(object, &[b"__eh_frame_hdr", b".eh_frame_hdr"]),
+        eh_frame_hdr: first_section_data(mapped, object, &[b"__eh_frame_hdr", b".eh_frame_hdr"]),
+        debug_frame: first_section_data(mapped, object, &[b".debug_frame"]),
+        text_segment_svma: segment_svma_range(object, b"__TEXT"),
+        text_segment: segment_data(mapped, object, b"__TEXT"),
+    }
+}
+
+fn object_base_svma<'a>(object: &object::File<'a, &'a [u8]>) -> u64 {
+    object
+        .segments()
+        .find(|segment| segment.name() == Ok(Some("__TEXT")))
+        .map_or_else(
+            || object.relative_address_base(),
+            |segment| segment.address(),
+        )
+}
+
+fn first_section_svma_range<'a>(
+    object: &object::File<'a, &'a [u8]>,
+    names: &[&[u8]],
+) -> Option<Range<u64>> {
+    names.iter().find_map(|name| {
+        let section = object.section_by_name_bytes(name)?;
+        Some(section.address()..section.address().saturating_add(section.size()))
+    })
+}
+
+fn first_section_data<'a>(
+    mapped: &Arc<Mmap>,
+    object: &object::File<'a, &'a [u8]>,
+    names: &[&[u8]],
+) -> Option<ModuleBytes> {
+    names.iter().find_map(|name| {
+        let section = object.section_by_name_bytes(name)?;
+        section_data(mapped, &section)
+    })
+}
+
+fn segment_svma_range<'a>(object: &object::File<'a, &'a [u8]>, name: &[u8]) -> Option<Range<u64>> {
+    let segment = object
+        .segments()
+        .find(|segment| segment.name_bytes() == Ok(Some(name)))?;
+    Some(segment.address()..segment.address().saturating_add(segment.size()))
+}
+
+fn segment_data<'a>(
+    mapped: &Arc<Mmap>,
+    object: &object::File<'a, &'a [u8]>,
+    name: &[u8],
+) -> Option<ModuleBytes> {
+    let segment = object
+        .segments()
+        .find(|segment| segment.name_bytes() == Ok(Some(name)))?;
+    map_file_range(mapped, segment.file_range()).or_else(|| {
+        segment
+            .data()
+            .ok()
+            .map(|data| ModuleBytes::Owned(data.to_vec()))
+    })
+}
+
+fn section_data<'a, S>(mapped: &Arc<Mmap>, section: &S) -> Option<ModuleBytes>
+where
+    S: ObjectSection<'a>,
+{
+    map_optional_file_range(mapped, section.file_range()).or_else(|| {
+        section
+            .data()
+            .ok()
+            .map(|data| ModuleBytes::Owned(data.to_vec()))
+    })
+}
+
+fn map_optional_file_range(mapped: &Arc<Mmap>, range: Option<(u64, u64)>) -> Option<ModuleBytes> {
+    map_file_range(mapped, range?)
+}
+
+fn map_file_range(mapped: &Arc<Mmap>, (offset, size): (u64, u64)) -> Option<ModuleBytes> {
+    let start = usize::try_from(offset).ok()?;
+    let len = usize::try_from(size).ok()?;
+    let end = start.checked_add(len)?;
+    (end <= mapped.len()).then(|| {
+        ModuleBytes::Mapped(MappedBytes {
+            mmap: Arc::clone(mapped),
+            range: start..end,
+        })
+    })
 }
 
 fn push_perf_unwind_address(frames: &mut Vec<u64>, address: u64) {

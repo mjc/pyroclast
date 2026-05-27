@@ -157,6 +157,17 @@ impl MmapTable {
             })
     }
 
+    #[must_use]
+    pub fn has_mapping_for_pid(&self, pid: u32, ip: u64) -> bool {
+        self.resolve_mapping(pid, ip).is_some()
+    }
+
+    #[must_use]
+    pub fn mapping_path(&self, pid: u32, ip: u64) -> Option<&str> {
+        self.resolve_mapping(pid, ip)
+            .map(|mapping| mapping.path.as_str())
+    }
+
     pub fn user_mappings(&self) -> impl Iterator<Item = UserMapping<'_>> {
         self.mappings
             .iter()
