@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use clap::ValueEnum;
 use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol, SymbolKind};
@@ -146,7 +146,7 @@ pub struct PerfSymbolResolver<O> {
     live_kallsyms: Option<Kallsyms>,
     live_kallsyms_path: Option<PathBuf>,
     live_kallsyms_cache: OnceLock<Option<Kallsyms>>,
-    live_module_kallsyms_cache: OnceLock<Option<Kallsyms>>,
+    live_module_kallsyms_cache: Mutex<BTreeMap<String, Option<Arc<Kallsyms>>>>,
     system_map_kallsyms: Option<Kallsyms>,
     system_map_candidates: Vec<PathBuf>,
     system_map_kallsyms_cache: OnceLock<Option<Kallsyms>>,
@@ -403,7 +403,7 @@ where
             live_kallsyms: None,
             live_kallsyms_path: None,
             live_kallsyms_cache: OnceLock::new(),
-            live_module_kallsyms_cache: OnceLock::new(),
+            live_module_kallsyms_cache: Mutex::new(BTreeMap::new()),
             system_map_kallsyms: None,
             system_map_candidates: Vec::new(),
             system_map_kallsyms_cache: OnceLock::new(),
@@ -545,7 +545,9 @@ impl Kallsyms {
         let mut addresses_by_name = BTreeMap::new();
         for (address, symbol) in text
             .lines()
-            .filter_map(parse_module_kallsyms_line)
+            .filter_map(|line| {
+                parse_module_kallsyms_line(line).map(|(address, symbol, _)| (address, symbol))
+            })
             .filter(|(address, _)| *address != 0)
         {
             match symbols.entry(address) {
@@ -562,6 +564,44 @@ impl Kallsyms {
         }
         if symbols.is_empty() {
             return Err("kallsyms did not contain any parseable module symbols".to_string());
+        }
+        Ok(Self {
+            symbols,
+            addresses_by_name,
+        })
+    }
+
+    /// Parses only `/proc/kallsyms` lines for a specific module path like `[zfs]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no valid module symbols are present for that module.
+    pub fn parse_modules_for_path(text: &str, module_path: &str) -> Result<Self, String> {
+        let mut symbols = BTreeMap::new();
+        let mut addresses_by_name = BTreeMap::new();
+        for (address, symbol) in text
+            .lines()
+            .filter_map(parse_module_kallsyms_line)
+            .filter(|(_, _, module)| *module == module_path)
+            .map(|(address, symbol, _)| (address, symbol))
+            .filter(|(address, _)| *address != 0)
+        {
+            match symbols.entry(address) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(symbol.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    if prefer_kernel_alias(&symbol, entry.get()) {
+                        entry.insert(symbol.clone());
+                    }
+                }
+            }
+            addresses_by_name.entry(symbol).or_insert(address);
+        }
+        if symbols.is_empty() {
+            return Err(format!(
+                "kallsyms did not contain any parseable module symbols for {module_path}"
+            ));
         }
         Ok(Self {
             symbols,
@@ -938,19 +978,30 @@ where
         })
     }
 
-    fn live_module_kallsyms_ref(&self) -> Option<&Kallsyms> {
-        self.live_kallsyms.as_ref().or_else(|| {
-            self.live_module_kallsyms_cache
-                .get_or_init(|| {
-                    self.live_kallsyms_path.as_ref().and_then(|path| {
-                        std::fs::read_to_string(path)
-                            .ok()
-                            .and_then(|text| Kallsyms::parse_modules(&text).ok())
-                    })
-                })
-                .as_ref()
-        })
+    fn live_module_kallsyms_for_path(&self, module_path: &str) -> Option<Arc<Kallsyms>> {
+        if let Some(kallsyms) = &self.live_kallsyms {
+            return Some(Arc::new(kallsyms.clone()));
+        }
+        if !is_kernel_module_symbol_path_str(module_path) {
+            return None;
+        }
+        if let Ok(cache) = self.live_module_kallsyms_cache.lock()
+            && let Some(kallsyms) = cache.get(module_path)
+        {
+            return kallsyms.clone();
+        }
+        let parsed = self.live_kallsyms_path.as_ref().and_then(|path| {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|text| Kallsyms::parse_modules_for_path(&text, module_path).ok())
+                .map(Arc::new)
+        });
+        if let Ok(mut cache) = self.live_module_kallsyms_cache.lock() {
+            cache.insert(module_path.to_string(), parsed.clone());
+        }
+        parsed
     }
+
     fn system_map_kallsyms_ref(&self) -> Option<&Kallsyms> {
         self.system_map_kallsyms.as_ref().or_else(|| {
             self.system_map_kallsyms_cache
@@ -965,8 +1016,11 @@ where
 
     fn resolve_kernel_symbol(&self, request: &SymbolRequest) -> Option<String> {
         if is_kernel_module_symbol_path(&request.path) {
-            self.live_module_kallsyms_ref()
-                .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
+            request
+                .path
+                .to_str()
+                .and_then(|module_path| self.live_module_kallsyms_for_path(module_path))
+                .and_then(|kallsyms| resolve_kernel_kallsyms(&kallsyms, request))
                 .or_else(|| {
                     self.kallsyms
                         .as_ref()
@@ -1983,13 +2037,14 @@ fn parse_kallsyms_line(line: &str) -> Option<(u64, String)> {
     Some((address, symbol.to_string()))
 }
 
-fn parse_module_kallsyms_line(line: &str) -> Option<(u64, String)> {
+fn parse_module_kallsyms_line(line: &str) -> Option<(u64, String, String)> {
     let mut fields = line.split_whitespace();
     let address = u64::from_str_radix(fields.next()?, 16).ok()?;
     let _symbol_type = fields.next()?;
     let symbol = fields.next()?;
     let module = fields.next()?;
-    (module.starts_with('[') && module.ends_with(']')).then(|| (address, symbol.to_string()))
+    (module.starts_with('[') && module.ends_with(']'))
+        .then(|| (address, symbol.to_string(), module.to_string()))
 }
 
 #[cfg(test)]

@@ -785,6 +785,30 @@ ffffffffc0e17e10 t zfs_write [zfs]
 }
 
 #[test]
+fn kallsyms_parse_modules_for_path_only_keeps_requested_module() {
+    let symbols = Kallsyms::parse_modules_for_path(
+        "\
+ffffffff81001280 T asm_exc_page_fault
+ffffffffc0e17dae t zfs_read [zfs]
+ffffffffc0e17e10 t zfs_write [zfs]
+ffffffffc1e17dae t igb_clean_rx_irq [igb]
+",
+        "[zfs]",
+    )
+    .expect("module kallsyms");
+
+    assert_eq!(
+        symbols.resolve(0xffff_ffff_c0e1_7dae).as_deref(),
+        Some("zfs_read")
+    );
+    assert_ne!(
+        symbols.resolve(0xffff_ffff_c1e1_7dae).as_deref(),
+        Some("igb_clean_rx_irq")
+    );
+    assert_eq!(symbols.resolve(0xffff_ffff_8100_1280), None);
+}
+
+#[test]
 fn kallsyms_resolves_relocated_kernel_addresses() {
     let symbols = Kallsyms::parse(
         "\
@@ -1331,6 +1355,64 @@ ffffffffc0e17dae t zfs_read [zfs]
         .expect("symbols");
 
     assert_eq!(symbols, vec![Some("zfs_read".to_string())]);
+    assert!(runner.commands().is_empty());
+}
+
+#[test]
+fn perf_symbol_resolver_caches_live_kallsyms_per_module_path() {
+    let root = tempfile::tempdir().expect("root");
+    let live_kallsyms = root.path().join("kallsyms");
+
+    let runner = Addr2lineRunner::new(b"");
+    let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
+        .with_system_kallsyms_from_path(&live_kallsyms);
+
+    std::fs::write(
+        &live_kallsyms,
+        "\
+ffffffff846997a0 T __pi_memcpy
+ffffffffc0e17dae t zfs_read [zfs]
+",
+    )
+    .expect("kallsyms");
+
+    let zfs = SymbolRequest {
+        path: PathBuf::from("[zfs]"),
+        relative_address: 0xffff_ffff_c0e1_7dae,
+        build_id: None,
+        file_identity: None,
+        kernel_relocation: None,
+    };
+    let symbols = resolver
+        .resolve_batch(std::slice::from_ref(&zfs))
+        .expect("symbols");
+    assert_eq!(symbols, vec![Some("zfs_read".to_string())]);
+
+    std::fs::write(
+        &live_kallsyms,
+        "\
+ffffffff846997a0 T __pi_memcpy
+ffffffffc1e17dae t igb_clean_rx_irq [igb]
+",
+    )
+    .expect("kallsyms");
+
+    let igb = SymbolRequest {
+        path: PathBuf::from("[igb]"),
+        relative_address: 0xffff_ffff_c1e1_7dae,
+        build_id: None,
+        file_identity: None,
+        kernel_relocation: None,
+    };
+    let symbols = resolver.resolve_batch(&[zfs, igb]).expect("symbols");
+
+    assert_eq!(
+        symbols,
+        vec![
+            Some("zfs_read".to_string()),
+            Some("igb_clean_rx_irq".to_string())
+        ]
+    );
     assert!(runner.commands().is_empty());
 }
 
