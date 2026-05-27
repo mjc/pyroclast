@@ -1,8 +1,9 @@
 use std::sync::Mutex;
 
 use pyroclast::benchmarks::{
-    BenchArgs, compare_with_inferno_collapse, compare_with_inferno_collapse_with_symbols,
-    export_perf_script, format_comparison_report, run_fold_benchmark,
+    BenchArgs, DEFAULT_BENCHMARK_INPUT, compare_with_inferno_collapse,
+    compare_with_inferno_collapse_with_symbols, export_perf_script, format_bench_output,
+    format_comparison_report, run_bench_command, run_fold_benchmark,
     run_fold_benchmark_with_runner, run_inferno_collapse_benchmark,
 };
 use pyroclast::perfdata::samples::{
@@ -264,6 +265,108 @@ fn parses_benchmark_inputs() {
     assert_eq!(args.perf_script, Some("perf-script.txt".into()));
 }
 
+#[test]
+fn benchmark_args_default_to_standard_input_path() {
+    let args = BenchArgs::default();
+
+    assert_eq!(
+        args.input_path(),
+        std::path::PathBuf::from(DEFAULT_BENCHMARK_INPUT)
+    );
+}
+
+#[test]
+fn bench_command_reports_missing_input() {
+    let runner = CollapseRunner::default();
+    let args = BenchArgs {
+        perf_data: Some("missing.perf.data".into()),
+        perf_script: None,
+        export_perf_script: None,
+        symbols: false,
+    };
+
+    let error = run_bench_command(&args, &runner).expect_err("missing input should fail");
+
+    assert!(error.contains("benchmark input not found"));
+}
+
+#[test]
+fn bench_command_reports_missing_perf_script_input() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    std::fs::write(&perfdata, tiny_perfdata()).expect("write perfdata");
+    let runner = CollapseRunner::default();
+    let args = BenchArgs {
+        perf_data: Some(perfdata),
+        perf_script: Some(root.path().join("missing.perf-script")),
+        export_perf_script: None,
+        symbols: false,
+    };
+
+    let error = run_bench_command(&args, &runner).expect_err("missing perf script should fail");
+
+    assert!(error.contains("perf script input not found"));
+}
+
+#[test]
+fn bench_command_exports_perf_script_and_compares_without_perf_runner() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    let exported_perf_script = root.path().join("exported.perf-script");
+    std::fs::write(&perfdata, tiny_perfdata()).expect("write perfdata");
+    let runner = BenchCommandRunner::default();
+    let args = BenchArgs {
+        perf_data: Some(perfdata),
+        perf_script: None,
+        export_perf_script: Some(exported_perf_script.clone()),
+        symbols: false,
+    };
+
+    let output = run_bench_command(&args, &runner).expect("bench command");
+
+    assert_eq!(
+        std::fs::read_to_string(&exported_perf_script).expect("exported perf script"),
+        "[unknown] 1/1 0: 1 cycles:\n\t2000 0x2000 ([unknown])\n\n"
+    );
+    assert!(output.contains("inferno_compare.matches=true"));
+    assert!(output.contains("pyroclast_fold.input="));
+    assert!(output.contains("inferno_collapse_perf.input="));
+}
+
+#[test]
+fn formats_streaming_benchmark_output() {
+    let report = pyroclast::benchmarks::StreamingComparisonReport {
+        pyroclast_fold: pyroclast::benchmarks::FoldBenchmarkReport {
+            input: "profile.perf.data".into(),
+            elapsed: std::time::Duration::from_millis(10),
+            folded_bytes: 100,
+            folded_lines: 4,
+        },
+        inferno_fold: pyroclast::benchmarks::FoldBenchmarkReport {
+            input: "profile.perf.script".into(),
+            elapsed: std::time::Duration::from_millis(20),
+            folded_bytes: 120,
+            folded_lines: 5,
+        },
+        comparison: pyroclast::benchmarks::FoldComparisonReport {
+            pyroclast_folded_lines: 4,
+            inferno_folded_lines: 5,
+            matches: false,
+            svg_matches: false,
+            pyroclast_svg_bytes: 40,
+            inferno_svg_bytes: 41,
+            only_pyroclast: vec!["a".to_string()],
+            only_inferno: vec!["b".to_string()],
+        },
+    };
+
+    let output = format_bench_output(&report);
+
+    assert!(output.contains("pyroclast_fold.input=profile.perf.data"));
+    assert!(output.contains("inferno_collapse_perf.input=profile.perf.script"));
+    assert!(output.contains("inferno_compare.matches=false"));
+}
+
 #[derive(Default)]
 struct PerfScriptRunner {
     commands: Mutex<Vec<CommandSpec>>,
@@ -303,6 +406,32 @@ impl CommandRunner for CollapseRunner {
         Ok(CommandOutput {
             status_code: Some(0),
             stdout: b"app;work 2\napp;io 1\n".to_vec(),
+            stderr: Vec::new(),
+        })
+    }
+}
+
+#[derive(Default)]
+struct BenchCommandRunner {
+    commands: Mutex<Vec<CommandSpec>>,
+}
+
+impl CommandRunner for BenchCommandRunner {
+    fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
+        self.commands.lock().unwrap().push(command.clone());
+        let stdout = match command.program.as_str() {
+            "inferno-collapse-perf" => b"[unknown];0x2000 1\n".to_vec(),
+            "inferno-flamegraph" => {
+                let mut svg = b"<svg>".to_vec();
+                svg.extend(command.stdin.as_deref().unwrap_or_default());
+                svg.extend(b"</svg>\n");
+                svg
+            }
+            program => panic!("unexpected command: {program}"),
+        };
+        Ok(CommandOutput {
+            status_code: Some(0),
+            stdout,
             stderr: Vec::new(),
         })
     }
@@ -417,6 +546,17 @@ fn perfdata_with_records_and_attrs<const A: usize, const R: usize>(
         bytes.extend(record);
     }
     bytes
+}
+
+fn tiny_perfdata() -> Vec<u8> {
+    perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [record_bytes(9, &sample_payload(0x1000, 1, 2, [0x2000]))],
+    )
 }
 
 fn file_attr_bytes(sample_type: u64, ids_offset: u64, ids_size: u64) -> [u8; 144] {

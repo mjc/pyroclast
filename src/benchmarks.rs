@@ -19,12 +19,16 @@ use crate::tools::{INFERNO_COLLAPSE_PERF, INFERNO_FLAMEGRAPH};
 use blake3::Hash;
 
 const PIPE_BUFFER_CAPACITY: usize = 1024 * 1024;
+pub const DEFAULT_BENCHMARK_INPUT: &str = "target/benchmarks/biggest.perf.data";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BenchArgs {
     pub perf_data: Option<PathBuf>,
+
     pub perf_script: Option<PathBuf>,
+
     pub export_perf_script: Option<PathBuf>,
+
     pub symbols: bool,
 }
 
@@ -45,6 +49,13 @@ impl BenchArgs {
             }
         }
         parsed
+    }
+
+    #[must_use]
+    pub fn input_path(&self) -> PathBuf {
+        self.perf_data
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_BENCHMARK_INPUT))
     }
 }
 
@@ -73,6 +84,73 @@ pub struct StreamingComparisonReport {
     pub pyroclast_fold: FoldBenchmarkReport,
     pub inferno_fold: FoldBenchmarkReport,
     pub comparison: FoldComparisonReport,
+}
+
+/// Runs the benchmark comparison helper used by the repository dev script.
+///
+/// # Errors
+///
+/// Returns an error when the benchmark input is missing, perf-script export
+/// fails, or the comparison run fails.
+pub fn run_bench_command<R>(args: &BenchArgs, runner: &R) -> Result<String, String>
+where
+    R: CommandRunner + Sync,
+{
+    let input = args.input_path();
+    if !input.is_file() {
+        return Err(format!(
+            "benchmark input not found: {}\nlink or copy a perf.data file there, or pass a path",
+            input.display()
+        ));
+    }
+
+    let perf_script = match &args.export_perf_script {
+        Some(path) => {
+            export_perf_script(&input, path, runner, args.symbols)
+                .map_err(|error| format!("perf script export failed: {error}"))?;
+            Some(path.clone())
+        }
+        None => args.perf_script.clone(),
+    };
+
+    if let Some(perf_script) = &perf_script
+        && !perf_script.is_file()
+    {
+        return Err(format!(
+            "perf script input not found: {}",
+            perf_script.display()
+        ));
+    }
+
+    let report =
+        run_streaming_comparison_with_symbols(&input, perf_script.as_deref(), runner, args.symbols)
+            .map_err(|error| format!("inferno comparison failed: {error}"))?;
+    Ok(format_bench_output(&report))
+}
+
+#[must_use]
+pub fn format_bench_output(report: &StreamingComparisonReport) -> String {
+    let mut output = String::new();
+    append_bench_report("pyroclast_fold", &report.pyroclast_fold, &mut output);
+    append_bench_report("inferno_collapse_perf", &report.inferno_fold, &mut output);
+    output.push_str(&format_comparison_report(
+        "inferno_compare",
+        &report.comparison,
+    ));
+    output
+}
+
+fn append_bench_report(name: &str, report: &FoldBenchmarkReport, output: &mut String) {
+    use std::fmt::Write as _;
+
+    writeln!(output, "{name}.input={}", report.input.display())
+        .expect("writing benchmark report to a string cannot fail");
+    writeln!(output, "{name}.elapsed_ms={}", report.elapsed.as_millis())
+        .expect("writing benchmark report to a string cannot fail");
+    writeln!(output, "{name}.folded_bytes={}", report.folded_bytes)
+        .expect("writing benchmark report to a string cannot fail");
+    writeln!(output, "{name}.folded_lines={}", report.folded_lines)
+        .expect("writing benchmark report to a string cannot fail");
 }
 
 /// Folds a `perf.data` file and returns timing and output-size metadata.

@@ -4,4 +4,13 @@ set -eu
 repo="$(git rev-parse --show-toplevel)"
 cd "$repo"
 
-exec nix develop "$repo" --command cargo run --quiet --bin pyroclast-precommit --
+exec nix develop "$repo" --command sh -eu -c '
+  echo "pre-commit: rustfmt" >&2
+  cargo fmt --check
+  echo "pre-commit: clippy pedantic" >&2
+  cargo clippy --all-targets -- -D warnings -W clippy::pedantic
+  echo "pre-commit: nextest" >&2
+  cargo nextest run
+  echo "pre-commit: flake check" >&2
+  nix flake check --no-build
+'

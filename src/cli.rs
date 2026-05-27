@@ -1,7 +1,7 @@
-use std::path::PathBuf;
-
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
+
+use std::path::PathBuf;
 
 pub use crate::symbols::SymbolizerKind;
 

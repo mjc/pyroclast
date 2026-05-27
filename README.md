@@ -69,6 +69,7 @@ Use the Nix shell:
 ```sh
 nix develop
 cargo nextest run
+scripts/pyroclast-bench [<perf.data>] [--perf-script <perf.script>] [--export-perf-script <out>] [--symbols]
 ```
 
 The pre-commit hook runs rustfmt, Clippy pedantic, `cargo nextest run`, and `nix flake check`.

@@ -316,6 +316,15 @@ fn parses_plumbing_fold_and_summarize_commands() {
 }
 
 #[test]
+fn rejects_removed_dev_helper_plumbing_commands() {
+    let bench = Cli::try_parse_from(["pyroclast", "plumbing", "bench"]);
+    let precommit = Cli::try_parse_from(["pyroclast", "plumbing", "precommit"]);
+
+    assert!(bench.is_err());
+    assert!(precommit.is_err());
+}
+
+#[test]
 fn parses_plumbing_flamegraph_commands() {
     let flamegraph = Cli::parse_from([
         "pyroclast",

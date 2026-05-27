@@ -15,6 +15,7 @@ fn readme_documents_primary_commands() {
         "pyroclast plumbing fold <perf.data>",
         "pyroclast plumbing flamegraph <perf.data>",
         "pyroclast plumbing summarize <artifact-dir>",
+        "scripts/pyroclast-bench",
         "pyroclast plumbing parse perf summary <perf.data>",
         "pyroclast plumbing parse flamegraph summary <flamegraph.svg>",
     ] {
