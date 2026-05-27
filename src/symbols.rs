@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use clap::ValueEnum;
 use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol, SymbolKind};
@@ -117,7 +117,7 @@ struct PerfDwarfDieNode {
 #[derive(Debug)]
 struct PerfDwarfFrameRange {
     range: PerfAddressRange,
-    frames: Box<[String]>,
+    frames: Arc<[String]>,
     base_symbol_sensitive: bool,
 }
 
@@ -146,7 +146,7 @@ pub struct PerfSymbolResolver<O> {
     live_kallsyms: Option<Kallsyms>,
     live_kallsyms_path: Option<PathBuf>,
     live_kallsyms_cache: OnceLock<Option<Kallsyms>>,
-    live_module_kallsyms_cache: Mutex<BTreeMap<String, Option<Arc<Kallsyms>>>>,
+    live_module_kallsyms_cache: OnceLock<BTreeMap<String, Arc<Kallsyms>>>,
     system_map_kallsyms: Option<Kallsyms>,
     system_map_candidates: Vec<PathBuf>,
     system_map_kallsyms_cache: OnceLock<Option<Kallsyms>>,
@@ -403,7 +403,7 @@ where
             live_kallsyms: None,
             live_kallsyms_path: None,
             live_kallsyms_cache: OnceLock::new(),
-            live_module_kallsyms_cache: Mutex::new(BTreeMap::new()),
+            live_module_kallsyms_cache: OnceLock::new(),
             system_map_kallsyms: None,
             system_map_candidates: Vec::new(),
             system_map_kallsyms_cache: OnceLock::new(),
@@ -514,17 +514,7 @@ impl Kallsyms {
             .filter_map(parse_kallsyms_line)
             .filter(|(address, _)| *address != 0)
         {
-            match symbols.entry(address) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(symbol.clone());
-                }
-                std::collections::btree_map::Entry::Occupied(mut entry) => {
-                    if prefer_kernel_alias(&symbol, entry.get()) {
-                        entry.insert(symbol.clone());
-                    }
-                }
-            }
-            addresses_by_name.entry(symbol).or_insert(address);
+            insert_kallsyms_symbol(&mut symbols, &mut addresses_by_name, address, symbol);
         }
         if symbols.is_empty() {
             return Err("kallsyms did not contain any parseable symbols".to_string());
@@ -550,17 +540,7 @@ impl Kallsyms {
             })
             .filter(|(address, _)| *address != 0)
         {
-            match symbols.entry(address) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(symbol.clone());
-                }
-                std::collections::btree_map::Entry::Occupied(mut entry) => {
-                    if prefer_kernel_alias(&symbol, entry.get()) {
-                        entry.insert(symbol.clone());
-                    }
-                }
-            }
-            addresses_by_name.entry(symbol).or_insert(address);
+            insert_kallsyms_symbol(&mut symbols, &mut addresses_by_name, address, symbol);
         }
         if symbols.is_empty() {
             return Err("kallsyms did not contain any parseable module symbols".to_string());
@@ -586,17 +566,7 @@ impl Kallsyms {
             .map(|(address, symbol, _)| (address, symbol))
             .filter(|(address, _)| *address != 0)
         {
-            match symbols.entry(address) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(symbol.clone());
-                }
-                std::collections::btree_map::Entry::Occupied(mut entry) => {
-                    if prefer_kernel_alias(&symbol, entry.get()) {
-                        entry.insert(symbol.clone());
-                    }
-                }
-            }
-            addresses_by_name.entry(symbol).or_insert(address);
+            insert_kallsyms_symbol(&mut symbols, &mut addresses_by_name, address, symbol);
         }
         if symbols.is_empty() {
             return Err(format!(
@@ -978,28 +948,22 @@ where
         })
     }
 
-    fn live_module_kallsyms_for_path(&self, module_path: &str) -> Option<Arc<Kallsyms>> {
+    fn live_module_kallsyms_for_path(&self, module_path: &str) -> Option<&Kallsyms> {
         if let Some(kallsyms) = &self.live_kallsyms {
-            return Some(Arc::new(kallsyms.clone()));
+            return Some(kallsyms);
         }
         if !is_kernel_module_symbol_path_str(module_path) {
             return None;
         }
-        if let Ok(cache) = self.live_module_kallsyms_cache.lock()
-            && let Some(kallsyms) = cache.get(module_path)
-        {
-            return kallsyms.clone();
-        }
-        let parsed = self.live_kallsyms_path.as_ref().and_then(|path| {
-            std::fs::read_to_string(path)
-                .ok()
-                .and_then(|text| Kallsyms::parse_modules_for_path(&text, module_path).ok())
-                .map(Arc::new)
-        });
-        if let Ok(mut cache) = self.live_module_kallsyms_cache.lock() {
-            cache.insert(module_path.to_string(), parsed.clone());
-        }
-        parsed
+        self.live_module_kallsyms_cache
+            .get_or_init(|| {
+                self.live_kallsyms_path
+                    .as_ref()
+                    .and_then(|path| std::fs::read_to_string(path).ok())
+                    .map_or_else(BTreeMap::new, |text| parse_module_kallsyms_by_path(&text))
+            })
+            .get(module_path)
+            .map(Arc::as_ref)
     }
 
     fn system_map_kallsyms_ref(&self) -> Option<&Kallsyms> {
@@ -1020,7 +984,7 @@ where
                 .path
                 .to_str()
                 .and_then(|module_path| self.live_module_kallsyms_for_path(module_path))
-                .and_then(|kallsyms| resolve_kernel_kallsyms(&kallsyms, request))
+                .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
                 .or_else(|| {
                     self.kallsyms
                         .as_ref()
@@ -1584,9 +1548,9 @@ fn perf_dwarf_ranges_contain(ranges: &[PerfAddressRange], address: u64) -> bool 
 
 fn perf_dwarf_frame_ranges_from_roots(roots: &[PerfDwarfDieNode]) -> Vec<PerfDwarfFrameRange> {
     let mut segments = Vec::new();
-    let mut prefix = Vec::new();
+    let root_frames: Arc<[String]> = Arc::from([]);
     for root in roots {
-        perf_dwarf_collect_frame_ranges(root, &mut prefix, &mut segments);
+        perf_dwarf_collect_frame_ranges(root, &root_frames, &mut segments);
     }
     segments.sort_by_key(|segment| segment.range.begin);
     segments
@@ -1594,32 +1558,37 @@ fn perf_dwarf_frame_ranges_from_roots(roots: &[PerfDwarfDieNode]) -> Vec<PerfDwa
 
 fn perf_dwarf_collect_frame_ranges(
     node: &PerfDwarfDieNode,
-    prefix: &mut Vec<String>,
+    parent_frames: &Arc<[String]>,
     out: &mut Vec<PerfDwarfFrameRange>,
 ) -> Vec<PerfAddressRange> {
-    let prefix_len = prefix.len();
-    if let Some(name) = &node.name {
-        prefix.push(name.clone());
-    }
+    let frames = perf_dwarf_node_frames(parent_frames, node.name.as_ref());
 
     let mut child_coverage = Vec::new();
     for child in &node.children {
-        child_coverage.extend(perf_dwarf_collect_frame_ranges(child, prefix, out));
+        child_coverage.extend(perf_dwarf_collect_frame_ranges(child, &frames, out));
     }
 
-    if !prefix.is_empty() {
-        let base_symbol_sensitive = node.kind == PerfDwarfDieKind::Subprogram && prefix.len() == 1;
+    if !frames.is_empty() {
+        let base_symbol_sensitive = node.kind == PerfDwarfDieKind::Subprogram && frames.len() == 1;
         for range in perf_dwarf_subtract_ranges(&node.ranges, &child_coverage) {
             out.push(PerfDwarfFrameRange {
                 range,
-                frames: prefix.clone().into_boxed_slice(),
+                frames: frames.clone(),
                 base_symbol_sensitive,
             });
         }
     }
 
-    prefix.truncate(prefix_len);
     perf_dwarf_merge_ranges(node.ranges.clone())
+}
+
+fn perf_dwarf_node_frames(parent_frames: &Arc<[String]>, name: Option<&String>) -> Arc<[String]> {
+    name.map_or(parent_frames.clone(), |name| {
+        let mut frames = Vec::with_capacity(parent_frames.len() + 1);
+        frames.extend(parent_frames.iter().cloned());
+        frames.push(name.clone());
+        Arc::from(frames)
+    })
 }
 
 fn perf_dwarf_merge_ranges(mut ranges: Vec<PerfAddressRange>) -> Vec<PerfAddressRange> {
@@ -1703,7 +1672,7 @@ fn perf_dwarf_frame_names_from_index(
     {
         return None;
     }
-    let mut frames = segment.frames.to_vec();
+    let mut frames = segment.frames.as_ref().to_vec();
     frames.reverse();
     Some(frames)
 }
@@ -2024,6 +1993,51 @@ fn prefer_kernel_alias(candidate: &str, current: &str) -> bool {
     candidate.starts_with("__pi_") && !current.starts_with("__pi_")
 }
 
+fn insert_kallsyms_symbol(
+    symbols: &mut BTreeMap<u64, String>,
+    addresses_by_name: &mut BTreeMap<String, u64>,
+    address: u64,
+    symbol: String,
+) {
+    match symbols.entry(address) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(symbol.clone());
+        }
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            if prefer_kernel_alias(&symbol, entry.get()) {
+                entry.insert(symbol.clone());
+            }
+        }
+    }
+    addresses_by_name.entry(symbol).or_insert(address);
+}
+
+fn parse_module_kallsyms_by_path(text: &str) -> BTreeMap<String, Arc<Kallsyms>> {
+    let mut grouped = BTreeMap::<String, (BTreeMap<u64, String>, BTreeMap<String, u64>)>::new();
+    for (address, symbol, module) in text.lines().filter_map(parse_module_kallsyms_line) {
+        if address == 0 {
+            continue;
+        }
+        let (symbols, addresses_by_name) = grouped
+            .entry(module)
+            .or_insert_with(|| (BTreeMap::new(), BTreeMap::new()));
+        insert_kallsyms_symbol(symbols, addresses_by_name, address, symbol);
+    }
+
+    grouped
+        .into_iter()
+        .filter_map(|(module, (symbols, addresses_by_name))| {
+            (!symbols.is_empty()).then_some((
+                module,
+                Arc::new(Kallsyms {
+                    symbols,
+                    addresses_by_name,
+                }),
+            ))
+        })
+        .collect()
+}
+
 fn perf_build_id_kallsyms_paths(debug_dir: &Path, build_id: &str) -> [PathBuf; 2] {
     let base = debug_dir.join("[kernel.kallsyms]").join(build_id);
     [base.join("kallsyms"), base]
@@ -2049,11 +2063,15 @@ fn parse_module_kallsyms_line(line: &str) -> Option<(u64, String, String)> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use object::{Object, ObjectSegment};
 
     use super::{
-        PerfSymbolBinding, PerfSymbolCandidate, clean_object_symbol_request,
-        perf_best_duplicate_symbol, perf_frames_with_object_alias,
+        PerfAddressRange, PerfDwarfDieKind, PerfDwarfDieNode, PerfSymbolBinding,
+        PerfSymbolCandidate, clean_object_symbol_request, perf_best_duplicate_symbol,
+        perf_dwarf_frame_names_from_index, perf_dwarf_frame_ranges_from_roots,
+        perf_frames_with_object_alias,
     };
 
     #[test]
@@ -2110,5 +2128,91 @@ mod tests {
             ),
             vec!["alloc::collections::btree::map::IntoIter<K,V,A>::dying_next".to_string()]
         );
+    }
+
+    #[test]
+    fn flattened_dwarf_ranges_share_frame_slices_for_the_same_node() {
+        let segments = perf_dwarf_frame_ranges_from_roots(&[PerfDwarfDieNode {
+            kind: PerfDwarfDieKind::Subprogram,
+            ranges: vec![test_range(0, 100)],
+            name: Some("outer".to_string()),
+            children: vec![PerfDwarfDieNode {
+                kind: PerfDwarfDieKind::Inline,
+                ranges: vec![test_range(10, 20)],
+                name: Some("inner".to_string()),
+                children: Vec::new(),
+            }],
+        }]);
+
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0].frames.as_ref(), &["outer".to_string()]);
+        assert_eq!(
+            segments[1].frames.as_ref(),
+            &["outer".to_string(), "inner".to_string()]
+        );
+        assert_eq!(segments[2].frames.as_ref(), &["outer".to_string()]);
+        assert!(Arc::ptr_eq(&segments[0].frames, &segments[2].frames));
+        assert!(!Arc::ptr_eq(&segments[0].frames, &segments[1].frames));
+    }
+
+    #[test]
+    fn flattened_dwarf_lookup_keeps_inline_and_base_symbol_rules() {
+        let segments = perf_dwarf_frame_ranges_from_roots(&[PerfDwarfDieNode {
+            kind: PerfDwarfDieKind::Subprogram,
+            ranges: vec![test_range(0, 100)],
+            name: Some("outer".to_string()),
+            children: vec![PerfDwarfDieNode {
+                kind: PerfDwarfDieKind::Inline,
+                ranges: vec![test_range(10, 20)],
+                name: Some("inner".to_string()),
+                children: Vec::new(),
+            }],
+        }]);
+
+        assert_eq!(
+            perf_dwarf_frame_names_from_index(&segments, 15, Some("outer")),
+            Some(vec!["inner".to_string(), "outer".to_string()])
+        );
+        assert_eq!(
+            perf_dwarf_frame_names_from_index(&segments, 5, Some("outer")),
+            None
+        );
+        assert_eq!(
+            perf_dwarf_frame_names_from_index(&segments, 5, Some("different_base")),
+            Some(vec!["outer".to_string()])
+        );
+        assert_eq!(
+            perf_dwarf_frame_names_from_index(&segments, 150, None),
+            None
+        );
+    }
+
+    #[test]
+    fn flattened_dwarf_lookup_ignores_unnamed_intermediate_nodes() {
+        let segments = perf_dwarf_frame_ranges_from_roots(&[PerfDwarfDieNode {
+            kind: PerfDwarfDieKind::Subprogram,
+            ranges: vec![test_range(0, 100)],
+            name: Some("outer".to_string()),
+            children: vec![PerfDwarfDieNode {
+                kind: PerfDwarfDieKind::Inline,
+                ranges: vec![test_range(20, 80)],
+                name: None,
+                children: vec![PerfDwarfDieNode {
+                    kind: PerfDwarfDieKind::Inline,
+                    ranges: vec![test_range(30, 40)],
+                    name: Some("inner".to_string()),
+                    children: Vec::new(),
+                }],
+            }],
+        }]);
+
+        assert_eq!(
+            perf_dwarf_frame_names_from_index(&segments, 35, Some("outer")),
+            Some(vec!["inner".to_string(), "outer".to_string()])
+        );
+    }
+
+    fn test_range(begin: u64, end: u64) -> PerfAddressRange {
+        PerfAddressRange { begin, end }
     }
 }

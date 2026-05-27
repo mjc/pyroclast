@@ -1359,7 +1359,7 @@ ffffffffc0e17dae t zfs_read [zfs]
 }
 
 #[test]
-fn perf_symbol_resolver_caches_live_kallsyms_per_module_path() {
+fn perf_symbol_resolver_uses_a_single_live_kallsyms_snapshot_for_module_paths() {
     let root = tempfile::tempdir().expect("root");
     let live_kallsyms = root.path().join("kallsyms");
 
@@ -1372,6 +1372,7 @@ fn perf_symbol_resolver_caches_live_kallsyms_per_module_path() {
         "\
 ffffffff846997a0 T __pi_memcpy
 ffffffffc0e17dae t zfs_read [zfs]
+ffffffffc1e17dae t igb_clean_rx_irq [igb]
 ",
     )
     .expect("kallsyms");
@@ -1392,7 +1393,7 @@ ffffffffc0e17dae t zfs_read [zfs]
         &live_kallsyms,
         "\
 ffffffff846997a0 T __pi_memcpy
-ffffffffc1e17dae t igb_clean_rx_irq [igb]
+ffffffffc2e17dae t unrelated_module_symbol [mlx5]
 ",
     )
     .expect("kallsyms");
