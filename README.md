@@ -57,6 +57,13 @@ profiling uses Apple-provided `xctrace`.
 
 ## Development
 
+Build or run the CLI from the flake:
+
+```sh
+nix build .#
+nix run .# -- --help
+```
+
 Use the Nix shell:
 
 ```sh

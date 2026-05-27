@@ -5,6 +5,10 @@ fn flake_and_precommit_use_nextest() {
         std::fs::read_to_string("src/bin/pyroclast-precommit.rs").expect("precommit source");
 
     assert!(flake.contains("cargo-nextest"));
+    assert!(flake.contains("packages = forAllSystems"));
+    assert!(flake.contains("apps = forAllSystems"));
+    assert!(flake.contains("crane.mkLib"));
+    assert!(flake.contains("buildPackage"));
     assert!(precommit.contains("\"nextest\""));
     assert!(precommit.contains("\"run\""));
     assert!(!precommit.contains("args: &[\"test\"]"));

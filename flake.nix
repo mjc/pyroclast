@@ -1,12 +1,18 @@
 {
-  description = "pyroclast development shell";
+  description = "pyroclast CLI and development shell";
 
   inputs = {
+    crane.url = "github:ipetkov/crane";
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   };
 
   outputs =
-    { nixpkgs, ... }:
+    {
+      self,
+      crane,
+      nixpkgs,
+      ...
+    }:
     let
       systems = [
         "aarch64-darwin"
@@ -26,6 +32,53 @@
         );
     in
     {
+      packages = forAllSystems (
+        { pkgs, ... }:
+        let
+          craneLib = crane.mkLib pkgs;
+          commonArgs = {
+            src = craneLib.cleanCargoSource ./.;
+            strictDeps = true;
+          };
+          cargoArtifacts = craneLib.buildDepsOnly (
+            commonArgs
+            // {
+              pname = "pyroclast";
+              version = "0.1.0";
+              cargoExtraArgs = "--bin pyroclast";
+              doCheck = false;
+            }
+          );
+          pyroclast = craneLib.buildPackage (
+            commonArgs
+            // {
+              pname = "pyroclast";
+              version = "0.1.0";
+              inherit cargoArtifacts;
+              cargoExtraArgs = "--bin pyroclast";
+              doCheck = false;
+            }
+          );
+        in
+        {
+          default = pyroclast;
+        }
+      );
+
+      apps = forAllSystems (
+        { system, ... }:
+        {
+          default = {
+            type = "app";
+            program = "${self.packages.${system}.default}/bin/pyroclast";
+          };
+          pyroclast = {
+            type = "app";
+            program = "${self.packages.${system}.default}/bin/pyroclast";
+          };
+        }
+      );
+
       devShells = forAllSystems (
         { pkgs, ... }:
         let
