@@ -14,6 +14,7 @@
       ...
     }:
     let
+      packageDescription = "pyroclast CLI and development shell";
       systems = [
         "aarch64-darwin"
         "aarch64-linux"
@@ -57,6 +58,10 @@
               inherit cargoArtifacts;
               cargoExtraArgs = "--bin pyroclast";
               doCheck = false;
+              meta = {
+                description = packageDescription;
+                mainProgram = "pyroclast";
+              };
             }
           );
         in
@@ -71,10 +76,12 @@
           default = {
             type = "app";
             program = "${self.packages.${system}.default}/bin/pyroclast";
+            meta.description = packageDescription;
           };
           pyroclast = {
             type = "app";
             program = "${self.packages.${system}.default}/bin/pyroclast";
+            meta.description = packageDescription;
           };
         }
       );
