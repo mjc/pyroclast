@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::hash::Hash;
 
 use hashbrown::HashMap;
@@ -40,6 +41,15 @@ pub struct RawStackAccumulator<T = u64> {
     node_ids: HashMap<StackNodeKey<T>, NodeId, FxBuildHasher>,
     comms: Vec<String>,
     comm_ids: HashMap<String, CommId, FxBuildHasher>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RawStackEntryRef<'a, T> {
+    pid: Option<u32>,
+    comm: Option<&'a str>,
+    tail: Option<NodeId>,
+    count: u64,
+    nodes: &'a [StackNode<T>],
 }
 
 impl<T> Default for RawStackAccumulator<T> {
@@ -135,6 +145,30 @@ where
         collapsed
     }
 
+    #[must_use]
+    pub fn sorted_entries(&self) -> Vec<RawStackEntryRef<'_, T>> {
+        let mut entries = self
+            .counts
+            .iter()
+            .map(|(key, &count)| RawStackEntryRef {
+                pid: key.pid,
+                comm: key
+                    .comm
+                    .and_then(|comm| self.comms.get(comm).map(String::as_str)),
+                tail: key.tail,
+                count,
+                nodes: &self.nodes,
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            left.pid
+                .cmp(&right.pid)
+                .then_with(|| left.comm.cmp(&right.comm))
+                .then_with(|| compare_callchain_tails(left.nodes, left.tail, right.tail))
+        });
+        entries
+    }
+
     fn intern_comm(&mut self, comm: Option<String>) -> Option<CommId> {
         let comm = comm?;
         if let Some(&id) = self.comm_ids.get(comm.as_str()) {
@@ -184,6 +218,16 @@ where
 
 fn rebuild_callchain<T: Clone>(nodes: &[StackNode<T>], tail: Option<NodeId>) -> Vec<T> {
     let mut callchain = Vec::new();
+    rebuild_callchain_into(nodes, tail, &mut callchain);
+    callchain
+}
+
+fn rebuild_callchain_into<T: Clone>(
+    nodes: &[StackNode<T>],
+    tail: Option<NodeId>,
+    callchain: &mut Vec<T>,
+) {
+    callchain.clear();
     let mut current = tail;
     while let Some(node) = current {
         let entry = &nodes[node];
@@ -191,7 +235,54 @@ fn rebuild_callchain<T: Clone>(nodes: &[StackNode<T>], tail: Option<NodeId>) -> 
         current = entry.parent;
     }
     callchain.reverse();
-    callchain
+}
+
+fn compare_callchain_tails<T: Ord>(
+    nodes: &[StackNode<T>],
+    left: Option<NodeId>,
+    right: Option<NodeId>,
+) -> Ordering {
+    match (left, right) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(left), Some(right)) => {
+            if left == right {
+                return Ordering::Equal;
+            }
+            let left_node = &nodes[left];
+            let right_node = &nodes[right];
+            compare_callchain_tails(nodes, left_node.parent, right_node.parent)
+                .then_with(|| left_node.frame.cmp(&right_node.frame))
+        }
+    }
+}
+
+impl<'a, T> RawStackEntryRef<'a, T> {
+    #[must_use]
+    pub fn pid(self) -> Option<u32> {
+        self.pid
+    }
+
+    #[must_use]
+    pub fn comm(self) -> Option<&'a str> {
+        self.comm
+    }
+
+    #[must_use]
+    pub fn count(self) -> u64 {
+        self.count
+    }
+}
+
+impl<T> RawStackEntryRef<'_, T>
+where
+    T: Clone,
+{
+    pub fn callchain<'a>(&self, scratch: &'a mut Vec<T>) -> &'a [T] {
+        rebuild_callchain_into(self.nodes, self.tail, scratch);
+        scratch
+    }
 }
 
 #[cfg(test)]
@@ -293,5 +384,33 @@ mod tests {
         assert_eq!(collapsed[0].comm.as_deref(), Some("pyroclast"));
         assert!(collapsed[0].callchain.is_empty());
         assert_eq!(collapsed[0].count, 5);
+    }
+
+    #[test]
+    fn sorted_entries_follow_pid_comm_and_callchain_order() {
+        let mut accumulator = RawStackAccumulator::new();
+
+        accumulator.add_slice_with_comm(Some(8), Some("beta".to_string()), &[2, 1], 3);
+        accumulator.add_slice_with_comm(Some(7), Some("alpha".to_string()), &[1, 2], 1);
+        accumulator.add_slice_with_comm(Some(7), Some("alpha".to_string()), &[1, 1], 2);
+
+        let entries = accumulator.sorted_entries();
+        let mut scratch = Vec::new();
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].pid(), Some(7));
+        assert_eq!(entries[0].comm(), Some("alpha"));
+        assert_eq!(entries[0].count(), 2);
+        assert_eq!(entries[0].callchain(&mut scratch), [1, 1]);
+
+        assert_eq!(entries[1].pid(), Some(7));
+        assert_eq!(entries[1].comm(), Some("alpha"));
+        assert_eq!(entries[1].count(), 1);
+        assert_eq!(entries[1].callchain(&mut scratch), [1, 2]);
+
+        assert_eq!(entries[2].pid(), Some(8));
+        assert_eq!(entries[2].comm(), Some("beta"));
+        assert_eq!(entries[2].count(), 3);
+        assert_eq!(entries[2].callchain(&mut scratch), [2, 1]);
     }
 }

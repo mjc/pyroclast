@@ -1194,6 +1194,63 @@ fn folds_perfdata_from_file_path() {
 }
 
 #[test]
+fn folds_perfdata_from_multiple_finished_rounds_into_one_total() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(9, &sample_payload_with_period(0x1000, 11, 12, 7, [0x2000])),
+            record_bytes(PERF_RECORD_FINISHED_ROUND, b""),
+            record_bytes(9, &sample_payload_with_period(0x1000, 11, 12, 3, [0x2000])),
+            record_bytes(PERF_RECORD_FINISHED_ROUND, b""),
+        ],
+    );
+    std::fs::write(&perfdata, bytes).expect("write perfdata");
+
+    let folded = fold_perfdata_file_with_options(
+        &perfdata,
+        FoldOptions {
+            count_periods: true,
+        },
+    )
+    .expect("folded");
+
+    assert_eq!(folded, "[unknown];0x2000 10\n");
+}
+
+#[test]
+fn folds_identical_rendered_stacks_across_pids_into_one_line() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(3, &comm_payload(11, 12, "pyroclast")),
+            record_bytes(3, &comm_payload(21, 22, "pyroclast")),
+            record_bytes(9, &sample_payload_with_period(0x1000, 11, 12, 7, [0x2000])),
+            record_bytes(9, &sample_payload_with_period(0x1000, 21, 22, 3, [0x2000])),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains_with_options(
+        &bytes,
+        FoldOptions {
+            count_periods: true,
+        },
+    )
+    .expect("folded");
+
+    assert_eq!(folded, "pyroclast;0x2000 10\n");
+}
+
+#[test]
 fn applies_comm_records_by_perf_timestamp_from_file_path_like_perf_script() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");

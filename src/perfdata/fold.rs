@@ -14,7 +14,7 @@ use crate::perfdata::header::{PerfFeatureSection, PerfHeader, parse_header};
 use crate::perfdata::mappings::{
     FileIdentity, MmapTable, ResolvedMapping, file_matches_recorded_identity,
 };
-use crate::perfdata::raw_stack::{CollapsedRawStack, RawStackAccumulator};
+use crate::perfdata::raw_stack::{RawStackAccumulator, RawStackEntryRef};
 use crate::perfdata::records::{
     Mmap2Record, PERF_RECORD_FINISHED_ROUND, PERF_RECORD_MISC_CPUMODE_MASK, ParsedRecord,
     PerfRecord, PerfRecordHeader, iter_records, parse_record, parse_record_header,
@@ -61,7 +61,7 @@ pub struct PerfSampleStack {
 
 struct PerfFoldData {
     mmap_table: MmapTable,
-    raw_stacks: Vec<CollapsedRawStack<FoldFrame>>,
+    raw_stacks: RawStackAccumulator<FoldFrame>,
 }
 
 struct FoldAccumulator {
@@ -293,8 +293,9 @@ pub fn fold_perfdata_file_with_options(
     options: FoldOptions,
 ) -> Result<String, String> {
     let file = File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
-    let fold_data = collect_fold_data_from_file(&file, options)?;
-    render_fold_data::<NoopSymbolResolver>(fold_data, None)
+    let mut folded = Vec::new();
+    write_folded_perfdata_from_file::<NoopSymbolResolver, _>(&file, options, None, &mut folded)?;
+    String::from_utf8(folded).map_err(|error| format!("folded output is not utf-8: {error}"))
 }
 
 /// Collapses parsed perf sample callchains, symbolizing mapped frames through
@@ -331,9 +332,10 @@ where
     R: SymbolResolver,
 {
     let file = File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
-    let fold_data = collect_fold_data_from_file(&file, options)?;
     let mut symbol_cache = SymbolFrameCache::new(symbol_resolver);
-    render_fold_data(fold_data, Some(&mut symbol_cache))
+    let mut folded = Vec::new();
+    write_folded_perfdata_from_file(&file, options, Some(&mut symbol_cache), &mut folded)?;
+    String::from_utf8(folded).map_err(|error| format!("folded output is not utf-8: {error}"))
 }
 
 pub(crate) fn write_folded_perfdata_file_with_options<W>(
@@ -345,8 +347,7 @@ where
     W: IoWrite + ?Sized,
 {
     let file = File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
-    let fold_data = collect_fold_data_from_file(&file, options)?;
-    write_fold_data::<NoopSymbolResolver, _>(fold_data, None, writer)
+    write_folded_perfdata_from_file::<NoopSymbolResolver, _>(&file, options, None, writer)
 }
 
 pub(crate) fn write_folded_perfdata_file_with_symbols<R, W>(
@@ -360,9 +361,8 @@ where
     W: IoWrite + ?Sized,
 {
     let file = File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
-    let fold_data = collect_fold_data_from_file(&file, options)?;
     let mut symbol_cache = SymbolFrameCache::new(symbol_resolver);
-    write_fold_data(fold_data, Some(&mut symbol_cache), writer)
+    write_folded_perfdata_from_file(&file, options, Some(&mut symbol_cache), writer)
 }
 
 pub(crate) fn write_inferno_perf_script_file_with_options<W>(
@@ -529,6 +529,115 @@ fn collect_fold_data_from_file(file: &File, options: FoldOptions) -> Result<Perf
     )?;
 
     Ok(accumulator.into_fold_data())
+}
+
+fn write_folded_perfdata_from_file<R, W>(
+    file: &File,
+    options: FoldOptions,
+    mut symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+    writer: &mut W,
+) -> Result<(), String>
+where
+    R: SymbolResolver,
+    W: IoWrite + ?Sized,
+{
+    let (header, header_bytes) = perfdata_header_from_file(file)?;
+    let sample_layouts = sample_layouts_from_file(file, header)?;
+    let header_build_ids = header_build_ids_by_filename_from_file(file, header, &header_bytes)?;
+    let mut accumulator = FoldAccumulator::new(header_build_ids);
+    let data_end = header
+        .data_offset
+        .checked_add(header.data_size)
+        .ok_or_else(|| "perf data section size overflows u64".to_string())?;
+    if file
+        .metadata()
+        .map_err(|error| format!("failed to stat perf.data: {error}"))?
+        .len()
+        < data_end
+    {
+        return Err("perf data section extends past end of file".to_string());
+    }
+
+    let mut reader = BufReader::with_capacity(
+        RECORD_READER_BUFFER_CAPACITY,
+        file.try_clone()
+            .map_err(|error| format!("failed to clone perf.data handle: {error}"))?,
+    );
+    reader
+        .seek(SeekFrom::Start(header.data_offset))
+        .map_err(|error| format!("failed to seek perf data section: {error}"))?;
+
+    let mut counts = BTreeMap::<String, u64>::new();
+    let mut pending_records = Vec::new();
+    let mut header_bytes = [0_u8; 8];
+    let mut payload = Vec::new();
+    let mut offset = usize::try_from(header.data_offset)
+        .map_err(|_| "perf data section offset exceeds usize".to_string())?;
+    let end =
+        usize::try_from(data_end).map_err(|_| "perf data section end exceeds usize".to_string())?;
+    let mut index = 0usize;
+
+    while offset < end {
+        reader.read_exact(&mut header_bytes).map_err(|error| {
+            format!("failed to read perf record header at offset {offset}: {error}")
+        })?;
+        let record_header = parse_record_header(&header_bytes)?;
+        let size = usize::from(record_header.size);
+        if size < 8 {
+            return Err(format!(
+                "invalid perf record size {size} at offset {offset}"
+            ));
+        }
+        let next = offset
+            .checked_add(size)
+            .ok_or_else(|| format!("perf record size overflows at offset {offset}"))?;
+        if next > end {
+            return Err(format!(
+                "perf record overruns data section at offset {offset}"
+            ));
+        }
+
+        payload.resize(size - 8, 0);
+        reader.read_exact(&mut payload).map_err(|error| {
+            format!("failed to read perf record payload at offset {offset}: {error}")
+        })?;
+
+        if record_header.record_type == PERF_RECORD_FINISHED_ROUND {
+            flush_pending_records(
+                &mut pending_records,
+                &mut accumulator,
+                &sample_layouts,
+                options,
+            )?;
+            accumulator.drain_fold_counts(&mut counts, symbol_cache.as_deref_mut())?;
+            offset = next;
+            continue;
+        }
+
+        let record = PerfRecord {
+            offset,
+            header: record_header,
+            payload: &payload,
+        };
+        let time = record_time(record, &sample_layouts)?;
+        let parsed_record = parse_record_with_context(record)?;
+        pending_records.push(PendingParsedRecord {
+            index,
+            time,
+            record: parsed_record,
+        });
+        index += 1;
+        offset = next;
+    }
+
+    flush_pending_records(
+        &mut pending_records,
+        &mut accumulator,
+        &sample_layouts,
+        options,
+    )?;
+    accumulator.drain_fold_counts(&mut counts, symbol_cache)?;
+    write_fold_counts(counts, writer)
 }
 
 fn flush_pending_records(
@@ -820,7 +929,7 @@ impl FoldAccumulator {
     fn into_fold_data(self) -> PerfFoldData {
         PerfFoldData {
             mmap_table: self.mmap_table,
-            raw_stacks: self.raw_stacks.into_collapsed(),
+            raw_stacks: self.raw_stacks,
         }
     }
 }
@@ -1073,6 +1182,18 @@ impl FoldAccumulator {
             .or_else(|| sample.pid.and_then(|pid| self.process_comms.get(&pid)))
             .cloned()
     }
+
+    fn drain_fold_counts<R>(
+        &mut self,
+        counts: &mut BTreeMap<String, u64>,
+        symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+    ) -> Result<(), String>
+    where
+        R: SymbolResolver,
+    {
+        let raw_stacks = std::mem::take(&mut self.raw_stacks);
+        accumulate_fold_counts(&raw_stacks, &self.mmap_table, counts, symbol_cache)
+    }
 }
 
 fn is_valid_unwound_user_frame(pid: Option<u32>, frame: FoldFrame, mmap_table: &MmapTable) -> bool {
@@ -1100,7 +1221,7 @@ where
 
 fn write_fold_data<R, W>(
     fold_data: PerfFoldData,
-    mut symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+    symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
     writer: &mut W,
 ) -> Result<(), String>
 where
@@ -1111,36 +1232,9 @@ where
         mmap_table,
         raw_stacks,
     } = fold_data;
-    if let Some(cache) = symbol_cache.as_deref_mut() {
-        prefetch_symbols(&raw_stacks, &mmap_table, cache)?;
-    }
     let mut counts = BTreeMap::<String, u64>::new();
-    let frame_resolver = FoldFrameResolver::new(&mmap_table);
-    for stack in raw_stacks {
-        let frames = frame_resolver.frames_for_stack(
-            stack.pid,
-            stack.comm.as_deref(),
-            &stack.callchain,
-            symbol_cache.as_deref_mut(),
-        )?;
-        let rendered = render_inferno_perf_stack(frames.iter().map(String::as_str));
-        *counts.entry(rendered).or_insert(0) += stack.count;
-    }
-    for (callchain, count) in counts {
-        writer
-            .write_all(callchain.as_bytes())
-            .map_err(|error| format!("failed to write folded output: {error}"))?;
-        writer
-            .write_all(b" ")
-            .map_err(|error| format!("failed to write folded output: {error}"))?;
-        writer
-            .write_all(count.to_string().as_bytes())
-            .map_err(|error| format!("failed to write folded output: {error}"))?;
-        writer
-            .write_all(b"\n")
-            .map_err(|error| format!("failed to write folded output: {error}"))?;
-    }
-    Ok(())
+    accumulate_fold_counts(&raw_stacks, &mmap_table, &mut counts, symbol_cache)?;
+    write_fold_counts(counts, writer)
 }
 
 fn write_inferno_perf_script<R, W>(
@@ -1156,18 +1250,20 @@ where
         mmap_table,
         raw_stacks,
     } = fold_data;
+    let raw_stacks = raw_stacks.sorted_entries();
     if let Some(cache) = symbol_cache.as_deref_mut() {
         prefetch_symbols(&raw_stacks, &mmap_table, cache)?;
     }
     let frame_resolver = FoldFrameResolver::new(&mmap_table);
+    let mut callchain = Vec::new();
     for stack in raw_stacks {
-        let comm = stack.comm.as_deref().unwrap_or("[unknown]");
-        let pid = stack.pid.unwrap_or(0);
-        writeln!(writer, "{comm} {pid}/{pid} 0: {} cycles:", stack.count)
+        let comm = stack.comm().unwrap_or("[unknown]");
+        let pid = stack.pid().unwrap_or(0);
+        writeln!(writer, "{comm} {pid}/{pid} 0: {} cycles:", stack.count())
             .map_err(|error| format!("failed to write perf script output: {error}"))?;
         frame_resolver.write_script_frames_for_stack(
-            stack.pid,
-            &stack.callchain,
+            stack.pid(),
+            stack.callchain(&mut callchain),
             symbol_cache.as_deref_mut(),
             writer,
         )?;
@@ -1179,7 +1275,7 @@ where
 }
 
 fn prefetch_symbols<R>(
-    raw_stacks: &[CollapsedRawStack<FoldFrame>],
+    raw_stacks: &[RawStackEntryRef<'_, FoldFrame>],
     mmap_table: &MmapTable,
     symbol_cache: &mut SymbolFrameCache<'_, R>,
 ) -> Result<(), String>
@@ -1187,8 +1283,14 @@ where
     R: SymbolResolver,
 {
     let mut requests = Vec::new();
+    let mut callchain = Vec::new();
     for stack in raw_stacks {
-        extend_symbol_requests_for_stack(stack.pid, &stack.callchain, mmap_table, &mut requests);
+        extend_symbol_requests_for_stack(
+            stack.pid(),
+            stack.callchain(&mut callchain),
+            mmap_table,
+            &mut requests,
+        );
         if requests.len() >= PREFETCH_SYMBOL_REQUEST_BATCH_SIZE {
             symbol_cache.resolve_many(&requests)?;
             requests.clear();
@@ -1198,6 +1300,62 @@ where
         symbol_cache.resolve_many(&requests)?;
     }
     Ok(())
+}
+
+fn accumulate_fold_counts<R>(
+    raw_stacks: &RawStackAccumulator<FoldFrame>,
+    mmap_table: &MmapTable,
+    counts: &mut BTreeMap<String, u64>,
+    mut symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+) -> Result<(), String>
+where
+    R: SymbolResolver,
+{
+    let raw_stacks = raw_stacks.sorted_entries();
+    if let Some(cache) = symbol_cache.as_deref_mut() {
+        prefetch_symbols(&raw_stacks, mmap_table, cache)?;
+    }
+    let frame_resolver = FoldFrameResolver::new(mmap_table);
+    let mut callchain = Vec::new();
+    for stack in raw_stacks {
+        let frames = frame_resolver.frames_for_stack(
+            stack.pid(),
+            stack.comm(),
+            stack.callchain(&mut callchain),
+            symbol_cache.as_deref_mut(),
+        )?;
+        let rendered = render_inferno_perf_stack(frames.iter().map(String::as_str));
+        *counts.entry(rendered).or_insert(0) += stack.count();
+    }
+    Ok(())
+}
+
+fn write_fold_counts<W>(counts: BTreeMap<String, u64>, writer: &mut W) -> Result<(), String>
+where
+    W: IoWrite + ?Sized,
+{
+    for (callchain, count) in counts {
+        write_folded_line(writer, &callchain, count)?;
+    }
+    Ok(())
+}
+
+fn write_folded_line<W>(writer: &mut W, callchain: &str, count: u64) -> Result<(), String>
+where
+    W: IoWrite + ?Sized,
+{
+    writer
+        .write_all(callchain.as_bytes())
+        .map_err(|error| format!("failed to write folded output: {error}"))?;
+    writer
+        .write_all(b" ")
+        .map_err(|error| format!("failed to write folded output: {error}"))?;
+    writer
+        .write_all(count.to_string().as_bytes())
+        .map_err(|error| format!("failed to write folded output: {error}"))?;
+    writer
+        .write_all(b"\n")
+        .map_err(|error| format!("failed to write folded output: {error}"))
 }
 
 fn extend_symbol_requests_for_stack(
