@@ -34,6 +34,8 @@ use crate::symbols::{SymbolFrameCache, SymbolRequest, SymbolResolver, perf_build
 const UNKNOWN_FRAME: &str = "[unknown]";
 const PREFETCH_SYMBOL_REQUEST_BATCH_SIZE: usize = 4096;
 const RECORD_READER_BUFFER_CAPACITY: usize = 4 * 1024 * 1024;
+const FOLD_COUNT_STORAGE_LINEAR_GROWTH_THRESHOLD: usize = 64 * 1024 * 1024;
+const FOLD_COUNT_STORAGE_LINEAR_GROWTH_CHUNK: usize = 8 * 1024 * 1024;
 
 type FoldFrameRenderCache = HashMap<String, String, FxBuildHasher>;
 
@@ -41,7 +43,7 @@ type FoldFrameRenderCache = HashMap<String, String, FxBuildHasher>;
 struct FoldCounts {
     storage: Vec<u8>,
     entries: Vec<FoldCountEntry>,
-    by_hash: HashMap<u64, Vec<usize>, FxBuildHasher>,
+    by_hash: HashMap<u64, FoldHashBucket, FxBuildHasher>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -49,6 +51,12 @@ struct FoldCountEntry {
     offset: usize,
     len: usize,
     count: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FoldHashBucket {
+    One(usize),
+    Many(Vec<usize>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -178,11 +186,16 @@ impl FoldCounts {
     fn add_rendered(&mut self, rendered: &str, count: u64) {
         let rendered = rendered.as_bytes();
         let hash = fold_count_hash(rendered);
+        self.add_rendered_with_hash(rendered, count, hash);
+    }
+
+    fn add_rendered_with_hash(&mut self, rendered: &[u8], count: u64, hash: u64) {
         if let Some(entry_id) = self.find_entry_id(hash, rendered) {
             self.entries[entry_id].count += count;
             return;
         }
 
+        self.reserve_storage_for(rendered.len());
         let offset = self.storage.len();
         self.storage.extend_from_slice(rendered);
         let entry_id = self.entries.len();
@@ -191,20 +204,57 @@ impl FoldCounts {
             len: rendered.len(),
             count,
         });
-        self.by_hash.entry(hash).or_default().push(entry_id);
+        match self.by_hash.entry(hash) {
+            hashbrown::hash_map::Entry::Occupied(mut entry) => entry.get_mut().push(entry_id),
+            hashbrown::hash_map::Entry::Vacant(entry) => {
+                entry.insert(FoldHashBucket::One(entry_id));
+            }
+        }
     }
 
     fn find_entry_id(&self, hash: u64, rendered: &[u8]) -> Option<usize> {
-        self.by_hash.get(&hash).and_then(|entry_ids| {
-            entry_ids
-                .iter()
-                .copied()
-                .find(|&entry_id| self.entry_bytes(&self.entries[entry_id]) == rendered)
-        })
+        self.by_hash
+            .get(&hash)
+            .and_then(|bucket| bucket.find_entry_id(self, rendered))
     }
 
     fn entry_bytes<'a>(&'a self, entry: &FoldCountEntry) -> &'a [u8] {
         &self.storage[entry.offset..entry.offset + entry.len]
+    }
+
+    fn reserve_storage_for(&mut self, additional: usize) {
+        let available = self.storage.capacity().saturating_sub(self.storage.len());
+        if available >= additional {
+            return;
+        }
+        let missing = additional - available;
+        if self.storage.capacity() >= FOLD_COUNT_STORAGE_LINEAR_GROWTH_THRESHOLD {
+            self.storage
+                .reserve_exact(missing.max(FOLD_COUNT_STORAGE_LINEAR_GROWTH_CHUNK));
+        } else {
+            self.storage.reserve(missing);
+        }
+    }
+}
+
+impl FoldHashBucket {
+    fn push(&mut self, entry_id: usize) {
+        match self {
+            Self::One(existing) => *self = Self::Many(vec![*existing, entry_id]),
+            Self::Many(entries) => entries.push(entry_id),
+        }
+    }
+
+    fn find_entry_id(&self, counts: &FoldCounts, rendered: &[u8]) -> Option<usize> {
+        match self {
+            Self::One(entry_id) => {
+                (counts.entry_bytes(&counts.entries[*entry_id]) == rendered).then_some(*entry_id)
+            }
+            Self::Many(entry_ids) => entry_ids
+                .iter()
+                .copied()
+                .find(|&entry_id| counts.entry_bytes(&counts.entries[entry_id]) == rendered),
+        }
     }
 }
 
@@ -1406,9 +1456,6 @@ fn extend_symbol_mappings_for_stack<'a>(
     mappings: &mut Vec<ResolvedMappingRef<'a>>,
 ) {
     for frame in callchain.iter().copied() {
-        if !is_valid_unwound_user_frame(pid, frame, mmap_table) {
-            continue;
-        }
         let frame = frame.address();
         if let Some(mapping) = pid
             .and_then(|pid| mmap_table.resolve_ref(pid, frame))
@@ -2189,5 +2236,54 @@ mod tests {
                 });
 
         assert_eq!(String::from_utf8(written).expect("utf-8"), expected);
+    }
+
+    #[test]
+    fn fold_counts_round_trip_many_large_entries_after_growth() {
+        let mut counts = super::FoldCounts::default();
+        let mut expected = Vec::new();
+
+        for index in 0..192_u64 {
+            let callchain = format!("root;frame-{index:03};{}", "x".repeat(2048));
+            counts.add_rendered(&callchain, index + 1);
+            expected.push((callchain, index + 1));
+        }
+
+        counts.add_rendered(&expected[17].0, 5);
+        expected[17].1 += 5;
+
+        let mut written = Vec::new();
+        super::write_fold_counts(counts, &mut written).expect("write fold counts");
+
+        expected.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let expected =
+            expected
+                .into_iter()
+                .fold(String::new(), |mut rendered, (callchain, count)| {
+                    rendered.push_str(&callchain);
+                    rendered.push(' ');
+                    rendered.push_str(&count.to_string());
+                    rendered.push('\n');
+                    rendered
+                });
+
+        assert_eq!(String::from_utf8(written).expect("utf-8"), expected);
+    }
+
+    #[test]
+    fn fold_counts_handle_hash_collisions_without_losing_entries() {
+        let mut counts = super::FoldCounts::default();
+
+        counts.add_rendered_with_hash(b"alpha;leaf", 2, 7);
+        counts.add_rendered_with_hash(b"beta;leaf", 3, 7);
+        counts.add_rendered_with_hash(b"alpha;leaf", 5, 7);
+
+        let mut written = Vec::new();
+        super::write_fold_counts(counts, &mut written).expect("write fold counts");
+
+        assert_eq!(
+            String::from_utf8(written).expect("utf-8"),
+            "alpha;leaf 7\nbeta;leaf 3\n"
+        );
     }
 }
