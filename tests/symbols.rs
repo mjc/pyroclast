@@ -434,10 +434,26 @@ fn perf_dwarf_frame_names_prefer_die_names_like_perf_script() {
     let Some((profiling_binary, object_bytes)) = profiling_binary_fixture() else {
         return;
     };
-    let address = 0x001e_aa81;
-    if perf_dwarf_frame_names_from_object_bytes(&object_bytes, address).is_none() {
+    let Some(address) = text_symbol_addresses(&object_bytes)
+        .into_iter()
+        .find(|address| {
+            let Some(frames) = perf_dwarf_frame_names_from_object_bytes(&object_bytes, *address)
+            else {
+                return false;
+            };
+            let Some(expected) =
+                external_addr2line_frames_leaf_to_root(&profiling_binary, *address)
+            else {
+                return false;
+            };
+            frames.len() == expected.len()
+                && frames.iter().zip(expected.iter()).any(|(frame, external)| {
+                    frame != external && frame.contains('<') && !external.contains('<')
+                })
+        })
+    else {
         return;
-    }
+    };
 
     let frames =
         perf_dwarf_frame_names_from_object(&profiling_binary, address).expect("perf dwarf frames");

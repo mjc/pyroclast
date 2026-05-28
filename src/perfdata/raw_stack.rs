@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::hash::Hash;
 
 use hashbrown::HashMap;
@@ -164,7 +163,7 @@ where
             left.pid
                 .cmp(&right.pid)
                 .then_with(|| left.comm.cmp(&right.comm))
-                .then_with(|| compare_callchain_tails(left.nodes, left.tail, right.tail))
+                .then_with(|| left.tail.cmp(&right.tail))
         });
         entries
     }
@@ -235,27 +234,6 @@ fn rebuild_callchain_into<T: Clone>(
         current = entry.parent;
     }
     callchain.reverse();
-}
-
-fn compare_callchain_tails<T: Ord>(
-    nodes: &[StackNode<T>],
-    left: Option<NodeId>,
-    right: Option<NodeId>,
-) -> Ordering {
-    match (left, right) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Less,
-        (Some(_), None) => Ordering::Greater,
-        (Some(left), Some(right)) => {
-            if left == right {
-                return Ordering::Equal;
-            }
-            let left_node = &nodes[left];
-            let right_node = &nodes[right];
-            compare_callchain_tails(nodes, left_node.parent, right_node.parent)
-                .then_with(|| left_node.frame.cmp(&right_node.frame))
-        }
-    }
 }
 
 impl<'a, T> RawStackEntryRef<'a, T> {
@@ -387,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn sorted_entries_follow_pid_comm_and_callchain_order() {
+    fn sorted_entries_follow_pid_and_comm_order() {
         let mut accumulator = RawStackAccumulator::new();
 
         accumulator.add_slice_with_comm(Some(8), Some("beta".to_string()), &[2, 1], 3);
@@ -400,17 +378,24 @@ mod tests {
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].pid(), Some(7));
         assert_eq!(entries[0].comm(), Some("alpha"));
-        assert_eq!(entries[0].count(), 2);
-        assert_eq!(entries[0].callchain(&mut scratch), [1, 1]);
-
         assert_eq!(entries[1].pid(), Some(7));
         assert_eq!(entries[1].comm(), Some("alpha"));
-        assert_eq!(entries[1].count(), 1);
-        assert_eq!(entries[1].callchain(&mut scratch), [1, 2]);
-
         assert_eq!(entries[2].pid(), Some(8));
         assert_eq!(entries[2].comm(), Some("beta"));
         assert_eq!(entries[2].count(), 3);
         assert_eq!(entries[2].callchain(&mut scratch), [2, 1]);
+
+        let mut alpha_callchains = [
+            (
+                entries[0].callchain(&mut scratch).to_vec(),
+                entries[0].count(),
+            ),
+            (
+                entries[1].callchain(&mut scratch).to_vec(),
+                entries[1].count(),
+            ),
+        ];
+        alpha_callchains.sort_unstable();
+        assert_eq!(alpha_callchains, [(vec![1, 1], 2), (vec![1, 2], 1)]);
     }
 }

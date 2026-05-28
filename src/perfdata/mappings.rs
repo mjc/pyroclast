@@ -13,6 +13,7 @@ const PROT_EXEC: u32 = 4;
 pub struct MmapTable {
     mappings: Vec<Mapping>,
     mappings_by_pid: HashMap<u32, Vec<IndexedMapping>, FxBuildHasher>,
+    symbol_source_ids: HashMap<SymbolSourceKey, usize, FxBuildHasher>,
     pids_with_mappings: HashSet<u32, FxBuildHasher>,
     executable_pids: HashSet<u32, FxBuildHasher>,
     has_global_mappings: bool,
@@ -28,7 +29,17 @@ pub struct ResolvedMapping {
     pub kernel_relocation: Option<KernelRelocation>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedMappingRef<'a> {
+    pub symbol_source_id: usize,
+    pub path: &'a str,
+    pub relative_address: u64,
+    pub build_id: Option<&'a [u8]>,
+    pub file_identity: Option<FileIdentity>,
+    pub kernel_relocation: Option<KernelRelocation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FileIdentity {
     pub major: u32,
     pub minor: u32,
@@ -64,6 +75,7 @@ struct Mapping {
     start: u64,
     len: u64,
     pgoff: u64,
+    symbol_source_id: usize,
     path: String,
     build_id: Option<Vec<u8>>,
     file_identity: Option<FileIdentity>,
@@ -76,6 +88,14 @@ struct IndexedMapping {
     index: usize,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct SymbolSourceKey {
+    path: String,
+    build_id: Option<Vec<u8>>,
+    file_identity: Option<FileIdentity>,
+    kernel_relocation: Option<KernelRelocation>,
+}
+
 impl MmapTable {
     pub fn insert_mmap(&mut self, record: MmapRecord) {
         self.insert_mapping(Mapping {
@@ -83,6 +103,7 @@ impl MmapTable {
             start: record.start,
             len: record.len,
             pgoff: record.pgoff,
+            symbol_source_id: 0,
             path: record.path,
             build_id: None,
             file_identity: None,
@@ -100,6 +121,7 @@ impl MmapTable {
             start: record.start,
             len: record.len,
             pgoff: record.pgoff,
+            symbol_source_id: 0,
             path: record.path,
             build_id,
             file_identity: Some(FileIdentity {
@@ -118,6 +140,7 @@ impl MmapTable {
             start: record.start,
             len: record.len,
             pgoff: record.pgoff,
+            symbol_source_id: 0,
             path: record.path,
             build_id: Some(record.build_id),
             file_identity: None,
@@ -125,10 +148,11 @@ impl MmapTable {
         });
     }
 
-    fn insert_mapping(&mut self, mapping: Mapping) {
+    fn insert_mapping(&mut self, mut mapping: Mapping) {
         let pid = mapping.pid;
         let start = mapping.start;
         let may_execute = mapping.may_execute();
+        mapping.symbol_source_id = self.intern_symbol_source(&mapping);
         let index = self.mappings.len();
         self.mappings.push(mapping);
         let bucket = self.mappings_by_pid.entry(pid).or_default();
@@ -147,11 +171,23 @@ impl MmapTable {
 
     #[must_use]
     pub fn resolve(&self, pid: u32, ip: u64) -> Option<ResolvedMapping> {
-        self.resolve_mapping(pid, ip)
-            .map(|mapping| ResolvedMapping {
-                path: mapping.path.clone(),
+        self.resolve_ref(pid, ip).map(|mapping| ResolvedMapping {
+            path: mapping.path.to_string(),
+            relative_address: mapping.relative_address,
+            build_id: mapping.build_id.map(<[u8]>::to_vec),
+            file_identity: mapping.file_identity,
+            kernel_relocation: mapping.kernel_relocation,
+        })
+    }
+
+    #[must_use]
+    pub fn resolve_ref(&self, pid: u32, ip: u64) -> Option<ResolvedMappingRef<'_>> {
+        self.resolve_mapping_with_index(pid, ip)
+            .map(|(_, mapping)| ResolvedMappingRef {
+                symbol_source_id: mapping.symbol_source_id,
+                path: mapping.path.as_str(),
                 relative_address: mapping.relative_address(ip),
-                build_id: mapping.build_id.clone(),
+                build_id: mapping.build_id.as_deref(),
                 file_identity: mapping.file_identity,
                 kernel_relocation: mapping.kernel_relocation(),
             })
@@ -200,34 +236,51 @@ impl MmapTable {
     }
 
     fn resolve_mapping(&self, pid: u32, ip: u64) -> Option<&Mapping> {
+        self.resolve_mapping_with_index(pid, ip)
+            .map(|(_, mapping)| mapping)
+    }
+
+    fn resolve_mapping_with_index(&self, pid: u32, ip: u64) -> Option<(usize, &Mapping)> {
         if pid == u32::MAX {
-            return self.resolve_mapping_for_pid(pid, ip);
+            let index = self.resolve_mapping_index_for_pid(pid, ip)?;
+            return Some((index, &self.mappings[index]));
         }
         match (
-            self.resolve_mapping_for_pid(pid, ip),
-            self.resolve_mapping_for_pid(u32::MAX, ip),
+            self.resolve_mapping_index_for_pid(pid, ip),
+            self.resolve_mapping_index_for_pid(u32::MAX, ip),
         ) {
-            (Some(left), Some(right)) => Some(if left.start >= right.start {
-                left
-            } else {
-                right
-            }),
-            (Some(mapping), None) | (None, Some(mapping)) => Some(mapping),
+            (Some(left), Some(right)) => {
+                let left_mapping = &self.mappings[left];
+                let right_mapping = &self.mappings[right];
+                Some(if left_mapping.start >= right_mapping.start {
+                    (left, left_mapping)
+                } else {
+                    (right, right_mapping)
+                })
+            }
+            (Some(index), None) | (None, Some(index)) => Some((index, &self.mappings[index])),
             (None, None) => None,
         }
     }
 
-    fn resolve_mapping_for_pid(&self, pid: u32, ip: u64) -> Option<&Mapping> {
+    fn resolve_mapping_index_for_pid(&self, pid: u32, ip: u64) -> Option<usize> {
         let bucket = self.mappings_by_pid.get(&pid)?;
         let mut upper_bound = bucket.partition_point(|indexed| indexed.start <= ip);
         while upper_bound > 0 {
             upper_bound -= 1;
-            let mapping = &self.mappings[bucket[upper_bound].index];
+            let index = bucket[upper_bound].index;
+            let mapping = &self.mappings[index];
             if mapping.contains_ip(ip) {
-                return Some(mapping);
+                return Some(index);
             }
         }
         None
+    }
+
+    fn intern_symbol_source(&mut self, mapping: &Mapping) -> usize {
+        let key = mapping.symbol_source_key();
+        let next_id = self.symbol_source_ids.len();
+        *self.symbol_source_ids.entry(key).or_insert(next_id)
     }
 }
 
@@ -268,6 +321,19 @@ impl Mapping {
 
     fn is_kernel_symbol_mapping(&self) -> bool {
         self.pid == u32::MAX && self.path.starts_with('[')
+    }
+
+    fn symbol_source_key(&self) -> SymbolSourceKey {
+        SymbolSourceKey {
+            path: if self.is_kernel_symbol_mapping() && self.path.starts_with("[kernel") {
+                "[kernel.kallsyms]".to_string()
+            } else {
+                self.path.clone()
+            },
+            build_id: self.build_id.clone(),
+            file_identity: self.file_identity,
+            kernel_relocation: self.kernel_relocation(),
+        }
     }
 }
 

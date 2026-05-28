@@ -4,6 +4,9 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write as IoWrite};
 use std::path::{Path, PathBuf};
 
+use hashbrown::{HashMap, hash_map::RawEntryMut};
+use rustc_hash::FxBuildHasher;
+
 use crate::folded::append_inferno_perf_frame;
 use crate::perfdata::attrs::{PerfFileAttr, parse_file_attr_ids, parse_file_attrs};
 use crate::perfdata::build_id::{
@@ -12,7 +15,7 @@ use crate::perfdata::build_id::{
 use crate::perfdata::endian::read_u64;
 use crate::perfdata::header::{PerfFeatureSection, PerfHeader, parse_header};
 use crate::perfdata::mappings::{
-    FileIdentity, MmapTable, ResolvedMapping, file_matches_recorded_identity,
+    FileIdentity, MmapTable, ResolvedMappingRef, file_matches_recorded_identity,
 };
 use crate::perfdata::raw_stack::{RawStackAccumulator, RawStackEntryRef};
 use crate::perfdata::records::{
@@ -30,6 +33,9 @@ use crate::symbols::{SymbolFrameCache, SymbolRequest, SymbolResolver, perf_build
 const UNKNOWN_FRAME: &str = "[unknown]";
 const PREFETCH_SYMBOL_REQUEST_BATCH_SIZE: usize = 4096;
 const RECORD_READER_BUFFER_CAPACITY: usize = 4 * 1024 * 1024;
+
+type FoldCounts = HashMap<String, u64, FxBuildHasher>;
+type FoldFrameRenderCache = HashMap<String, String, FxBuildHasher>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PerfSummary {
@@ -567,7 +573,7 @@ where
         .seek(SeekFrom::Start(header.data_offset))
         .map_err(|error| format!("failed to seek perf data section: {error}"))?;
 
-    let mut counts = BTreeMap::<String, u64>::new();
+    let mut counts = FoldCounts::default();
     let mut pending_records = Vec::new();
     let mut header_bytes = [0_u8; 8];
     let mut payload = Vec::new();
@@ -1185,7 +1191,7 @@ impl FoldAccumulator {
 
     fn drain_fold_counts<R>(
         &mut self,
-        counts: &mut BTreeMap<String, u64>,
+        counts: &mut FoldCounts,
         symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
     ) -> Result<(), String>
     where
@@ -1232,7 +1238,7 @@ where
         mmap_table,
         raw_stacks,
     } = fold_data;
-    let mut counts = BTreeMap::<String, u64>::new();
+    let mut counts = FoldCounts::default();
     accumulate_fold_counts(&raw_stacks, &mmap_table, &mut counts, symbol_cache)?;
     write_fold_counts(counts, writer)
 }
@@ -1282,22 +1288,22 @@ fn prefetch_symbols<R>(
 where
     R: SymbolResolver,
 {
-    let mut requests = Vec::new();
+    let mut mappings = Vec::new();
     let mut callchain = Vec::new();
     for stack in raw_stacks {
-        extend_symbol_requests_for_stack(
+        extend_symbol_mappings_for_stack(
             stack.pid(),
             stack.callchain(&mut callchain),
             mmap_table,
-            &mut requests,
+            &mut mappings,
         );
-        if requests.len() >= PREFETCH_SYMBOL_REQUEST_BATCH_SIZE {
-            symbol_cache.prefetch_many(&requests)?;
-            requests.clear();
+        if mappings.len() >= PREFETCH_SYMBOL_REQUEST_BATCH_SIZE {
+            symbol_cache.prefetch_mapping_refs(&mappings)?;
+            mappings.clear();
         }
     }
-    if !requests.is_empty() {
-        symbol_cache.prefetch_many(&requests)?;
+    if !mappings.is_empty() {
+        symbol_cache.prefetch_mapping_refs(&mappings)?;
     }
     Ok(())
 }
@@ -1305,13 +1311,14 @@ where
 fn accumulate_fold_counts<R>(
     raw_stacks: &RawStackAccumulator<FoldFrame>,
     mmap_table: &MmapTable,
-    counts: &mut BTreeMap<String, u64>,
+    counts: &mut FoldCounts,
     mut symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
 ) -> Result<(), String>
 where
     R: SymbolResolver,
 {
     let raw_stacks = raw_stacks.sorted_entries();
+    counts.reserve(raw_stacks.len());
     if let Some(cache) = symbol_cache.as_deref_mut() {
         prefetch_symbols(&raw_stacks, mmap_table, cache)?;
     }
@@ -1326,19 +1333,24 @@ where
             symbol_cache.as_deref_mut(),
             &mut buffers,
         )?;
-        if let Some(count) = counts.get_mut(buffers.rendered.as_str()) {
-            *count += stack.count();
-        } else {
-            counts.insert(buffers.rendered.clone(), stack.count());
+        match counts.raw_entry_mut().from_key(buffers.rendered.as_str()) {
+            RawEntryMut::Occupied(mut entry) => {
+                *entry.get_mut() += stack.count();
+            }
+            RawEntryMut::Vacant(entry) => {
+                entry.insert(buffers.rendered.clone(), stack.count());
+            }
         }
     }
     Ok(())
 }
 
-fn write_fold_counts<W>(counts: BTreeMap<String, u64>, writer: &mut W) -> Result<(), String>
+fn write_fold_counts<W>(counts: FoldCounts, writer: &mut W) -> Result<(), String>
 where
     W: IoWrite + ?Sized,
 {
+    let mut counts = counts.into_iter().collect::<Vec<_>>();
+    counts.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     for (callchain, count) in counts {
         write_folded_line(writer, &callchain, count)?;
     }
@@ -1363,11 +1375,11 @@ where
         .map_err(|error| format!("failed to write folded output: {error}"))
 }
 
-fn extend_symbol_requests_for_stack(
+fn extend_symbol_mappings_for_stack<'a>(
     pid: Option<u32>,
     callchain: &[FoldFrame],
-    mmap_table: &MmapTable,
-    requests: &mut Vec<SymbolRequest>,
+    mmap_table: &'a MmapTable,
+    mappings: &mut Vec<ResolvedMappingRef<'a>>,
 ) {
     for frame in callchain.iter().copied() {
         if !is_valid_unwound_user_frame(pid, frame, mmap_table) {
@@ -1375,10 +1387,10 @@ fn extend_symbol_requests_for_stack(
         }
         let frame = frame.address();
         if let Some(mapping) = pid
-            .and_then(|pid| mmap_table.resolve(pid, frame))
-            .filter(|mapping| !is_kernel_space_frame(frame) || is_kernel_mapping(mapping))
+            .and_then(|pid| mmap_table.resolve_ref(pid, frame))
+            .filter(|mapping| !is_kernel_space_frame(frame) || is_kernel_mapping_ref(mapping))
         {
-            requests.push(symbol_request(&mapping));
+            mappings.push(mapping);
         }
     }
 }
@@ -1392,6 +1404,8 @@ struct FoldedRenderBuffers {
     rendered: String,
     render_scratch: String,
     label_scratch: String,
+    frame_rendered: String,
+    frame_cache: FoldFrameRenderCache,
 }
 
 struct NoopSymbolResolver;
@@ -1426,17 +1440,10 @@ impl<'a> FoldFrameResolver<'a> {
                     .label_scratch
                     .push(if character == ' ' { '_' } else { character });
             }
-            append_inferno_perf_frame(
-                &mut buffers.rendered,
-                &buffers.label_scratch,
-                &mut buffers.render_scratch,
-            );
+            let root_label = buffers.label_scratch.clone();
+            append_cached_inferno_perf_frame(buffers, &root_label);
         } else {
-            append_inferno_perf_frame(
-                &mut buffers.rendered,
-                UNKNOWN_FRAME,
-                &mut buffers.render_scratch,
-            );
+            append_cached_inferno_perf_frame(buffers, UNKNOWN_FRAME);
         }
 
         for frame in callchain.iter().copied() {
@@ -1450,9 +1457,7 @@ impl<'a> FoldFrameResolver<'a> {
                 pid,
                 frame.address(),
                 symbol_cache.as_deref_mut(),
-                &mut buffers.rendered,
-                &mut buffers.render_scratch,
-                &mut buffers.label_scratch,
+                buffers,
             )?;
         }
         Ok(())
@@ -1478,18 +1483,18 @@ impl<'a> FoldFrameResolver<'a> {
             }
             let address = frame.address();
             let symbolizing = symbol_cache.is_some();
-            if let Some(mapping) = pid.and_then(|pid| self.mmap_table.resolve(pid, address)) {
-                if is_kernel_space_frame(address) && !is_kernel_mapping(&mapping) {
+            if let Some(mapping) = pid.and_then(|pid| self.mmap_table.resolve_ref(pid, address)) {
+                if is_kernel_space_frame(address) && !is_kernel_mapping_ref(&mapping) {
                     write_perf_script_address_frame(writer, address)?;
                     continue;
                 }
                 if let Some(cache) = symbol_cache.as_deref_mut() {
-                    let frames = cache.resolve(&symbol_request(&mapping))?;
+                    let frames = cache.resolve_mapping_ref(&mapping)?;
                     if frames.is_empty() {
                         write_perf_script_frame_for_label(
                             writer,
                             address,
-                            &symbol_fallback_frame(&mapping),
+                            &symbol_fallback_frame_ref(&mapping),
                         )?;
                     } else {
                         for label in frames.iter().rev() {
@@ -1504,7 +1509,7 @@ impl<'a> FoldFrameResolver<'a> {
                     write_perf_script_mapped_frame(
                         writer,
                         address,
-                        mapping.path.as_str(),
+                        mapping.path,
                         mapping.relative_address,
                     )?;
                 }
@@ -1522,55 +1527,90 @@ impl<'a> FoldFrameResolver<'a> {
         pid: Option<u32>,
         frame: u64,
         symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
-        rendered: &mut String,
-        render_scratch: &mut String,
-        label_scratch: &mut String,
+        buffers: &mut FoldedRenderBuffers,
     ) -> Result<(), String>
     where
         R: SymbolResolver,
     {
         let symbolizing = symbol_cache.is_some();
-        if let Some(mapping) = pid.and_then(|pid| self.mmap_table.resolve(pid, frame)) {
-            if is_kernel_space_frame(frame) && !is_kernel_mapping(&mapping) {
-                label_scratch.clear();
-                write!(label_scratch, "0x{frame:x}").expect("writing to a string cannot fail");
-                append_inferno_perf_frame(rendered, label_scratch, render_scratch);
+        if let Some(mapping) = pid.and_then(|pid| self.mmap_table.resolve_ref(pid, frame)) {
+            if is_kernel_space_frame(frame) && !is_kernel_mapping_ref(&mapping) {
+                buffers.label_scratch.clear();
+                write!(buffers.label_scratch, "0x{frame:x}")
+                    .expect("writing to a string cannot fail");
+                append_inferno_perf_frame(
+                    &mut buffers.rendered,
+                    &buffers.label_scratch,
+                    &mut buffers.render_scratch,
+                );
                 return Ok(());
             }
             if let Some(cache) = symbol_cache {
-                let request = symbol_request(&mapping);
-                let frames = cache.resolve_ref(&request)?;
-                if frames.is_empty() {
-                    let fallback = symbol_fallback_frame(&mapping);
-                    append_inferno_perf_frame(rendered, &fallback, render_scratch);
+                if let Some(rendered) = cache.resolve_folded_mapping_ref(&mapping)? {
+                    append_cached_rendered_frame(&mut buffers.rendered, rendered);
                 } else {
-                    for label in frames {
-                        append_inferno_perf_frame(rendered, label, render_scratch);
-                    }
+                    let fallback = symbol_fallback_frame_ref(&mapping);
+                    append_cached_inferno_perf_frame(buffers, &fallback);
                 }
                 return Ok(());
             }
             if is_kernel_space_frame(frame) {
-                append_inferno_perf_frame(rendered, UNKNOWN_FRAME, render_scratch);
+                append_cached_inferno_perf_frame(buffers, UNKNOWN_FRAME);
             } else {
-                label_scratch.clear();
+                buffers.label_scratch.clear();
                 write!(
-                    label_scratch,
+                    buffers.label_scratch,
                     "{}+0x{:x}",
                     mapping.path, mapping.relative_address
                 )
                 .expect("writing to a string cannot fail");
-                append_inferno_perf_frame(rendered, label_scratch, render_scratch);
+                append_inferno_perf_frame(
+                    &mut buffers.rendered,
+                    &buffers.label_scratch,
+                    &mut buffers.render_scratch,
+                );
             }
         } else if is_kernel_space_frame(frame) || symbolizing {
-            append_inferno_perf_frame(rendered, UNKNOWN_FRAME, render_scratch);
+            append_cached_inferno_perf_frame(buffers, UNKNOWN_FRAME);
         } else {
-            label_scratch.clear();
-            write!(label_scratch, "0x{frame:x}").expect("writing to a string cannot fail");
-            append_inferno_perf_frame(rendered, label_scratch, render_scratch);
+            buffers.label_scratch.clear();
+            write!(buffers.label_scratch, "0x{frame:x}").expect("writing to a string cannot fail");
+            append_inferno_perf_frame(
+                &mut buffers.rendered,
+                &buffers.label_scratch,
+                &mut buffers.render_scratch,
+            );
         }
         Ok(())
     }
+}
+
+fn append_cached_inferno_perf_frame(buffers: &mut FoldedRenderBuffers, frame: &str) {
+    if let Some(cached) = buffers.frame_cache.get(frame).cloned() {
+        append_cached_rendered_frame(&mut buffers.rendered, &cached);
+        return;
+    }
+    buffers.frame_rendered.clear();
+    append_inferno_perf_frame(
+        &mut buffers.frame_rendered,
+        frame,
+        &mut buffers.render_scratch,
+    );
+    let rendered_frame = buffers.frame_rendered.clone();
+    append_cached_rendered_frame(&mut buffers.rendered, &rendered_frame);
+    buffers
+        .frame_cache
+        .insert(frame.to_string(), rendered_frame);
+}
+
+fn append_cached_rendered_frame(rendered: &mut String, cached: &str) {
+    if cached.is_empty() {
+        return;
+    }
+    if !rendered.is_empty() {
+        rendered.push(';');
+    }
+    rendered.push_str(cached);
 }
 
 fn write_perf_script_frame_for_label<W>(
@@ -1675,33 +1715,15 @@ fn is_perf_data_mapping_path(path: &str) -> bool {
         .is_some_and(|file_name| file_name == "perf.data" || file_name.starts_with("perf.data."))
 }
 
-fn symbol_fallback_frame(mapping: &ResolvedMapping) -> String {
-    if is_kernel_mapping(mapping) {
+fn symbol_fallback_frame_ref(mapping: &ResolvedMappingRef<'_>) -> String {
+    if is_kernel_mapping_ref(mapping) {
         UNKNOWN_FRAME.to_string()
     } else if mapping.path == UNKNOWN_FRAME {
-        mapping.path.clone()
+        mapping.path.to_string()
     } else if mapping.path.starts_with('[') {
-        mapped_frame_label(mapping)
+        mapped_frame_label_ref(mapping)
     } else {
-        module_fallback_frame(&mapping.path)
-    }
-}
-
-fn symbol_request(mapping: &ResolvedMapping) -> SymbolRequest {
-    SymbolRequest {
-        path: symbol_request_path(mapping),
-        relative_address: mapping.relative_address,
-        build_id: mapping.build_id.as_deref().map(build_id_hex),
-        file_identity: mapping.file_identity,
-        kernel_relocation: mapping.kernel_relocation.clone(),
-    }
-}
-
-fn symbol_request_path(mapping: &ResolvedMapping) -> PathBuf {
-    if is_kernel_mapping(mapping) && mapping.path.starts_with("[kernel") {
-        PathBuf::from("[kernel.kallsyms]")
-    } else {
-        PathBuf::from(&mapping.path)
+        module_fallback_frame(mapping.path)
     }
 }
 
@@ -1713,7 +1735,7 @@ fn build_id_hex(bytes: &[u8]) -> String {
     hex
 }
 
-fn mapped_frame_label(mapping: &ResolvedMapping) -> String {
+fn mapped_frame_label_ref(mapping: &ResolvedMappingRef<'_>) -> String {
     format!("{}+0x{:x}", mapping.path, mapping.relative_address)
 }
 
@@ -1725,7 +1747,7 @@ fn module_fallback_frame(path: &str) -> String {
     format!("[{name}]")
 }
 
-fn is_kernel_mapping(mapping: &ResolvedMapping) -> bool {
+fn is_kernel_mapping_ref(mapping: &ResolvedMappingRef<'_>) -> bool {
     is_kernel_space_frame(mapping.relative_address) && mapping.path.starts_with('[')
 }
 

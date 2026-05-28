@@ -1848,9 +1848,13 @@ fn prefetches_unique_symbol_requests_before_folding() {
         .expect("folded");
 
     assert_eq!(folded, "[unknown];app::work;app::main 2\n");
+    let mut calls = resolver.calls();
+    assert_eq!(calls.len(), 1);
+    let mut requests = calls.pop().expect("prefetch batch");
+    requests.sort_by_key(|request| request.relative_address);
     assert_eq!(
-        resolver.calls(),
-        vec![vec![
+        requests,
+        vec![
             SymbolRequest {
                 path: std::path::PathBuf::from("/bin/app"),
                 relative_address: 0x10,
@@ -1865,7 +1869,7 @@ fn prefetches_unique_symbol_requests_before_folding() {
                 file_identity: None,
                 kernel_relocation: None,
             }
-        ]]
+        ]
     );
 }
 

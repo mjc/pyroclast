@@ -1,32 +1,79 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use clap::ValueEnum;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol, SymbolKind};
 use rustc_hash::FxBuildHasher;
 use serde::Serialize;
 
+use crate::folded::render_inferno_perf_stack;
 use crate::perfdata::build_id::kernel_build_id_from_perfdata;
-use crate::perfdata::mappings::{FileIdentity, file_matches_recorded_identity};
+use crate::perfdata::mappings::{FileIdentity, ResolvedMappingRef, file_matches_recorded_identity};
 use crate::process::{CommandRunner, CommandSpec};
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
+type FxHashSet<T> = HashSet<T, FxBuildHasher>;
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct KernelRelocation {
     pub reference_symbol: String,
     pub recorded_reference_address: u64,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug)]
 pub struct SymbolRequest {
     pub path: PathBuf,
     pub relative_address: u64,
     pub build_id: Option<String>,
     pub file_identity: Option<FileIdentity>,
     pub kernel_relocation: Option<KernelRelocation>,
+}
+
+impl PartialEq for SymbolRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.relative_address == other.relative_address
+            && self.build_id == other.build_id
+            && self.file_identity == other.file_identity
+            && self.kernel_relocation == other.kernel_relocation
+            && self.path.as_os_str() == other.path.as_os_str()
+    }
+}
+
+impl Eq for SymbolRequest {}
+
+impl Hash for SymbolRequest {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.path.as_os_str().hash(state);
+        self.relative_address.hash(state);
+        self.build_id.hash(state);
+        self.file_identity.hash(state);
+        self.kernel_relocation.hash(state);
+    }
+}
+
+impl PartialOrd for SymbolRequest {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SymbolRequest {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.path
+            .as_os_str()
+            .cmp(other.path.as_os_str())
+            .then_with(|| self.relative_address.cmp(&other.relative_address))
+            .then_with(|| self.build_id.cmp(&other.build_id))
+            .then_with(|| self.file_identity.cmp(&other.file_identity))
+            .then_with(|| self.kernel_relocation.cmp(&other.kernel_relocation))
+    }
 }
 
 pub trait SymbolResolver {
@@ -54,12 +101,24 @@ pub trait SymbolResolver {
 
 pub struct SymbolCache<'a, R> {
     resolver: &'a R,
-    resolved: BTreeMap<SymbolRequest, Option<String>>,
+    resolved: FxHashMap<SymbolRequest, Option<String>>,
 }
 
 pub struct SymbolFrameCache<'a, R> {
     resolver: &'a R,
-    resolved: BTreeMap<SymbolRequest, Vec<String>>,
+    resolved: FxHashMap<SymbolRequest, Vec<String>>,
+    resolved_by_mapping: FxHashMap<MappingFrameKey, CachedMappingFrames>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct MappingFrameKey {
+    symbol_source_id: usize,
+    relative_address: u64,
+}
+
+struct CachedMappingFrames {
+    frames: Vec<String>,
+    folded_rendered: String,
 }
 
 pub struct Addr2lineResolver<'a, R> {
@@ -80,12 +139,12 @@ pub enum SymbolizerKind {
 
 #[derive(Default)]
 pub struct RustAddr2lineResolver {
-    metadata_cache: OnceLock<Mutex<BTreeMap<PathBuf, Option<Arc<CachedObjectMetadata>>>>>,
+    metadata_cache: OnceLock<Mutex<FxHashMap<OsString, Option<Arc<CachedObjectMetadata>>>>>,
 }
 
 #[derive(Default)]
 struct ObjectAddressCache {
-    segments_by_path: BTreeMap<PathBuf, Option<Vec<ObjectSegmentRange>>>,
+    segments_by_path: FxHashMap<OsString, Option<Vec<ObjectSegmentRange>>>,
 }
 
 struct ObjectSegmentRange {
@@ -159,7 +218,7 @@ pub struct PerfSymbolResolver<O> {
     live_kallsyms_path: Option<PathBuf>,
     live_kallsyms_cache: OnceLock<Option<Kallsyms>>,
     live_module_kallsyms_text_cache: OnceLock<Option<Arc<String>>>,
-    live_module_kallsyms_cache: Mutex<BTreeMap<String, Option<Arc<Kallsyms>>>>,
+    live_module_kallsyms_cache: Mutex<FxHashMap<String, Option<Arc<Kallsyms>>>>,
     system_map_kallsyms: Option<Kallsyms>,
     system_map_candidates: Vec<PathBuf>,
     system_map_kallsyms_cache: OnceLock<Option<Kallsyms>>,
@@ -371,11 +430,12 @@ impl RustAddr2lineResolver {
     fn object_metadata(&self, path: &Path) -> Option<Arc<CachedObjectMetadata>> {
         let cache = self
             .metadata_cache
-            .get_or_init(|| Mutex::new(BTreeMap::new()));
+            .get_or_init(|| Mutex::new(FxHashMap::default()));
+        let path_key = path.as_os_str().to_owned();
         if let Some(cached) = cache
             .lock()
             .expect("rust addr2line metadata cache lock")
-            .get(path)
+            .get(&path_key)
             .cloned()
         {
             return cached;
@@ -390,7 +450,7 @@ impl RustAddr2lineResolver {
 
         let mut cache = cache.lock().expect("rust addr2line metadata cache lock");
         cache
-            .entry(path.to_path_buf())
+            .entry(path_key)
             .or_insert_with(|| loaded.clone())
             .clone()
     }
@@ -454,7 +514,7 @@ where
             live_kallsyms_path: None,
             live_kallsyms_cache: OnceLock::new(),
             live_module_kallsyms_text_cache: OnceLock::new(),
-            live_module_kallsyms_cache: Mutex::new(BTreeMap::new()),
+            live_module_kallsyms_cache: Mutex::new(FxHashMap::default()),
             system_map_kallsyms: None,
             system_map_candidates: Vec::new(),
             system_map_kallsyms_cache: OnceLock::new(),
@@ -692,7 +752,7 @@ where
     pub fn new(resolver: &'a R) -> Self {
         Self {
             resolver,
-            resolved: BTreeMap::new(),
+            resolved: FxHashMap::default(),
         }
     }
 
@@ -733,13 +793,15 @@ where
     }
 
     fn unique_misses(&self, requests: &[SymbolRequest]) -> Vec<SymbolRequest> {
-        requests
-            .iter()
-            .filter(|request| !self.resolved.contains_key(*request))
-            .cloned()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
+        let mut seen = FxHashSet::default();
+        let mut missing = Vec::new();
+        for request in requests {
+            if self.resolved.contains_key(request) || !seen.insert(request) {
+                continue;
+            }
+            missing.push(request.clone());
+        }
+        missing
     }
 
     fn resolve_missing(&mut self, missing: Vec<SymbolRequest>) -> Result<(), String> {
@@ -751,6 +813,7 @@ where
                 missing.len()
             ));
         }
+        self.resolved.reserve(missing.len());
         for (request, symbol) in missing.into_iter().zip(resolved) {
             self.resolved.insert(request, symbol);
         }
@@ -766,7 +829,8 @@ where
     pub fn new(resolver: &'a R) -> Self {
         Self {
             resolver,
-            resolved: BTreeMap::new(),
+            resolved: FxHashMap::default(),
+            resolved_by_mapping: FxHashMap::default(),
         }
     }
 
@@ -791,6 +855,48 @@ where
         self.resolved
             .get(request)
             .map(Vec::as_slice)
+            .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())
+    }
+
+    /// Resolves one borrowed perfdata mapping through the cache and returns a
+    /// borrowed frame slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backing resolver fails.
+    pub fn resolve_mapping_ref(
+        &mut self,
+        mapping: &ResolvedMappingRef<'_>,
+    ) -> Result<&[String], String> {
+        let key = mapping_frame_key(mapping);
+        if !self.resolved_by_mapping.contains_key(&key) {
+            self.prefetch_mapping_refs(std::slice::from_ref(mapping))?;
+        }
+        self.resolved_by_mapping
+            .get(&key)
+            .map(|cached| cached.frames.as_slice())
+            .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())
+    }
+
+    /// Resolves one borrowed perfdata mapping through the cache and returns the
+    /// pre-rendered folded fragment for its symbolized inline frames.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backing resolver fails.
+    pub fn resolve_folded_mapping_ref(
+        &mut self,
+        mapping: &ResolvedMappingRef<'_>,
+    ) -> Result<Option<&str>, String> {
+        let key = mapping_frame_key(mapping);
+        if !self.resolved_by_mapping.contains_key(&key) {
+            self.prefetch_mapping_refs(std::slice::from_ref(mapping))?;
+        }
+        self.resolved_by_mapping
+            .get(&key)
+            .map(|cached| {
+                (!cached.folded_rendered.is_empty()).then_some(cached.folded_rendered.as_str())
+            })
             .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())
     }
 
@@ -829,14 +935,68 @@ where
         Ok(())
     }
 
+    /// Resolves many borrowed perfdata mappings through the cache without
+    /// materializing path-keyed lookups on cache hits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backing resolver fails or returns the wrong
+    /// number of results.
+    pub fn prefetch_mapping_refs(
+        &mut self,
+        mappings: &[ResolvedMappingRef<'_>],
+    ) -> Result<(), String> {
+        let mut seen = FxHashSet::default();
+        seen.reserve(mappings.len());
+        let mut missing_keys = Vec::with_capacity(mappings.len());
+        let mut missing_requests = Vec::with_capacity(mappings.len());
+        for mapping in mappings {
+            let key = mapping_frame_key(mapping);
+            if self.resolved_by_mapping.contains_key(&key) || !seen.insert(key) {
+                continue;
+            }
+            missing_keys.push(key);
+            missing_requests.push(symbol_request_from_mapping_ref(mapping));
+        }
+        if missing_requests.is_empty() {
+            return Ok(());
+        }
+        let resolved = self.resolver.resolve_frame_batch(&missing_requests)?;
+        if resolved.len() != missing_requests.len() {
+            return Err(format!(
+                "symbol resolver returned {} frame results for {} requests",
+                resolved.len(),
+                missing_requests.len()
+            ));
+        }
+        self.resolved_by_mapping.reserve(missing_keys.len());
+        for (key, frames) in missing_keys.into_iter().zip(resolved) {
+            let folded_rendered = if frames.is_empty() {
+                String::new()
+            } else {
+                render_inferno_perf_stack(frames.iter().map(String::as_str))
+            };
+            self.resolved_by_mapping.insert(
+                key,
+                CachedMappingFrames {
+                    frames,
+                    folded_rendered,
+                },
+            );
+        }
+        Ok(())
+    }
+
     fn unique_misses(&self, requests: &[SymbolRequest]) -> Vec<SymbolRequest> {
-        requests
-            .iter()
-            .filter(|request| !self.resolved.contains_key(*request))
-            .cloned()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
+        let mut seen = FxHashSet::default();
+        let mut missing = Vec::new();
+        for request in requests {
+            if self.resolved.contains_key(request) || !seen.insert(request) {
+                continue;
+            }
+            missing.push(request.clone());
+        }
+        missing
     }
 
     fn resolve_missing(&mut self, missing: Vec<SymbolRequest>) -> Result<(), String> {
@@ -848,6 +1008,7 @@ where
                 missing.len()
             ));
         }
+        self.resolved.reserve(missing.len());
         for (request, frames) in missing.into_iter().zip(resolved) {
             self.resolved.insert(request, frames);
         }
@@ -1135,7 +1296,7 @@ fn object_virtual_address_for_file_offset_cached(
 ) -> Option<u64> {
     let segments = address_cache
         .segments_by_path
-        .entry(path.to_path_buf())
+        .entry(path.as_os_str().to_owned())
         .or_insert_with(|| object_load_segment_ranges(path));
     segments.as_ref()?.iter().find_map(|segment| {
         (file_offset >= segment.file_offset && file_offset < segment.file_end)
@@ -1167,13 +1328,14 @@ where
     fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
         let mut resolved_by_request = BTreeMap::<SymbolRequest, Option<String>>::new();
         for (path, indexes) in grouped_request_indexes(requests) {
+            let path = Path::new(path);
             let grouped_requests = indexes
                 .iter()
                 .map(|index| requests[*index].clone())
                 .collect::<Vec<_>>();
             let output = self
                 .runner
-                .run(&build_addr2line_command(&path, &grouped_requests))
+                .run(&build_addr2line_command(path, &grouped_requests))
                 .map_err(|error| format!("failed to run addr2line: {error}"))?;
             let symbols = if output.status_code == Some(0) {
                 parse_addr2line_stdout(&output.stdout, grouped_requests.len())?
@@ -1220,10 +1382,11 @@ impl SymbolResolver for RustAddr2lineResolver {
     fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
         let mut resolved = vec![None; requests.len()];
         for (path, indexes) in grouped_request_indexes(requests) {
-            let Ok(loader) = addr2line::Loader::new(&path) else {
+            let path = Path::new(path);
+            let Ok(loader) = addr2line::Loader::new(path) else {
                 continue;
             };
-            let object_metadata = self.object_metadata(&path);
+            let object_metadata = self.object_metadata(path);
             for index in indexes {
                 let request = &requests[index];
                 let object_symbol = object_metadata.as_ref().and_then(|metadata| {
@@ -1251,7 +1414,8 @@ impl SymbolResolver for RustAddr2lineResolver {
     fn resolve_frame_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Vec<String>>, String> {
         let mut resolved = vec![Vec::new(); requests.len()];
         for (path, indexes) in grouped_request_indexes(requests) {
-            let object_metadata = self.object_metadata(&path);
+            let path = Path::new(path);
+            let object_metadata = self.object_metadata(path);
             let mut loader = None;
             let mut loader_attempted = false;
             for index in indexes {
@@ -1272,12 +1436,12 @@ impl SymbolResolver for RustAddr2lineResolver {
                     .map(perf_inline_frame_order)
                     .or_else(|| object_symbol.map(|name| vec![name.to_string()]))
                     .or_else(|| {
-                        rust_addr2line_loader(&path, &mut loader, &mut loader_attempted)?
+                        rust_addr2line_loader(path, &mut loader, &mut loader_attempted)?
                             .find_symbol(request.relative_address)
                             .map(|name| vec![demangle_addr2line_name(name)])
                     })
                     .or_else(|| {
-                        rust_addr2line_loader(&path, &mut loader, &mut loader_attempted).and_then(
+                        rust_addr2line_loader(path, &mut loader, &mut loader_attempted).and_then(
                             |loader| rust_addr2line_frame_names(loader, request.relative_address),
                         )
                     })
@@ -2068,12 +2232,46 @@ pub fn perf_inline_frame_order(mut frames: Vec<String>) -> Vec<String> {
     frames
 }
 
-fn grouped_request_indexes(requests: &[SymbolRequest]) -> BTreeMap<PathBuf, Vec<usize>> {
-    let mut grouped = BTreeMap::<PathBuf, Vec<usize>>::new();
+fn grouped_request_indexes(requests: &[SymbolRequest]) -> FxHashMap<&OsStr, Vec<usize>> {
+    let mut grouped = FxHashMap::<&OsStr, Vec<usize>>::default();
     for (index, request) in requests.iter().enumerate() {
-        grouped.entry(request.path.clone()).or_default().push(index);
+        grouped
+            .entry(request.path.as_os_str())
+            .or_default()
+            .push(index);
     }
     grouped
+}
+
+fn mapping_frame_key(mapping: &ResolvedMappingRef<'_>) -> MappingFrameKey {
+    MappingFrameKey {
+        symbol_source_id: mapping.symbol_source_id,
+        relative_address: mapping.relative_address,
+    }
+}
+
+fn symbol_request_from_mapping_ref(mapping: &ResolvedMappingRef<'_>) -> SymbolRequest {
+    SymbolRequest {
+        path: if is_kernel_symbol_path(Path::new(mapping.path))
+            && mapping.path.starts_with("[kernel")
+        {
+            PathBuf::from("[kernel.kallsyms]")
+        } else {
+            PathBuf::from(mapping.path)
+        },
+        relative_address: mapping.relative_address,
+        build_id: mapping.build_id.map(build_id_hex),
+        file_identity: mapping.file_identity,
+        kernel_relocation: mapping.kernel_relocation.clone(),
+    }
+}
+
+fn build_id_hex(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut hex, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    hex
 }
 
 fn resolve_kernel_kallsyms(kallsyms: &Kallsyms, request: &SymbolRequest) -> Option<String> {
@@ -2187,10 +2385,10 @@ mod tests {
 
     use super::{
         PerfAddressRange, PerfDwarfDieKind, PerfDwarfDieNode, PerfDwarfNameInterner,
-        PerfSymbolBinding, PerfSymbolCandidate, RustAddr2lineResolver, SymbolFrameCache,
-        SymbolRequest, SymbolResolver, clean_object_symbol_request, perf_best_duplicate_symbol,
-        perf_dwarf_frame_names_from_index, perf_dwarf_frame_ranges_from_roots,
-        perf_frames_with_object_alias,
+        PerfSymbolBinding, PerfSymbolCandidate, ResolvedMappingRef, RustAddr2lineResolver,
+        SymbolFrameCache, SymbolRequest, SymbolResolver, clean_object_symbol_request,
+        perf_best_duplicate_symbol, perf_dwarf_frame_names_from_index,
+        perf_dwarf_frame_ranges_from_roots, perf_frames_with_object_alias,
     };
 
     #[test]
@@ -2419,6 +2617,56 @@ mod tests {
         assert_eq!(resolver.calls.get(), 1);
     }
 
+    #[test]
+    fn symbol_frame_cache_resolve_mapping_ref_reuses_cached_frame_slice() {
+        let resolver = CountingFrameResolver::new(vec![vec!["one".to_string(), "two".to_string()]]);
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let mapping = test_mapping_ref("/bin/demo", 0x1234);
+
+        let first_ptr = {
+            let first = cache.resolve_mapping_ref(&mapping).expect("first resolve");
+            assert_eq!(first, ["one".to_string(), "two".to_string()]);
+            first.as_ptr()
+        };
+
+        let second_ptr = {
+            let second = cache.resolve_mapping_ref(&mapping).expect("second resolve");
+            assert_eq!(second, ["one".to_string(), "two".to_string()]);
+            second.as_ptr()
+        };
+
+        assert_eq!(first_ptr, second_ptr);
+        assert_eq!(resolver.calls.get(), 1);
+    }
+
+    #[test]
+    fn symbol_frame_cache_resolve_folded_mapping_ref_reuses_cached_rendered_stack() {
+        let resolver = CountingFrameResolver::new(vec![vec!["one".to_string(), "two".to_string()]]);
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let mapping = test_mapping_ref("/bin/demo", 0x1234);
+
+        let first_ptr = {
+            let first = cache
+                .resolve_folded_mapping_ref(&mapping)
+                .expect("first resolve")
+                .expect("folded render");
+            assert_eq!(first, "one;two");
+            first.as_ptr()
+        };
+
+        let second_ptr = {
+            let second = cache
+                .resolve_folded_mapping_ref(&mapping)
+                .expect("second resolve")
+                .expect("folded render");
+            assert_eq!(second, "one;two");
+            second.as_ptr()
+        };
+
+        assert_eq!(first_ptr, second_ptr);
+        assert_eq!(resolver.calls.get(), 1);
+    }
+
     fn frame_names(names: &PerfDwarfNameInterner, frames: &[u32]) -> Vec<String> {
         frames
             .iter()
@@ -2433,6 +2681,17 @@ mod tests {
     fn test_request(path: &str, relative_address: u64) -> SymbolRequest {
         SymbolRequest {
             path: path.into(),
+            relative_address,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        }
+    }
+
+    fn test_mapping_ref(path: &'static str, relative_address: u64) -> ResolvedMappingRef<'static> {
+        ResolvedMappingRef {
+            symbol_source_id: 1,
+            path,
             relative_address,
             build_id: None,
             file_identity: None,
