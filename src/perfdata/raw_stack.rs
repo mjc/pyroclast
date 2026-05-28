@@ -117,6 +117,21 @@ where
             .or_insert(0) += count;
     }
 
+    pub fn add_slice_with_borrowed_comm(
+        &mut self,
+        pid: Option<u32>,
+        comm: Option<&str>,
+        callchain: &[T],
+        count: u64,
+    ) {
+        let comm = self.intern_comm_ref(comm);
+        let tail = self.intern_callchain(callchain.iter().cloned());
+        *self
+            .counts
+            .entry(RawStackKey { pid, comm, tail })
+            .or_insert(0) += count;
+    }
+
     #[must_use]
     pub fn into_collapsed(self) -> Vec<CollapsedRawStack<T>> {
         let Self {
@@ -176,6 +191,18 @@ where
         let id = self.comms.len();
         self.comms.push(comm.clone());
         self.comm_ids.insert(comm, id);
+        Some(id)
+    }
+
+    fn intern_comm_ref(&mut self, comm: Option<&str>) -> Option<CommId> {
+        let comm = comm?;
+        if let Some(&id) = self.comm_ids.get(comm) {
+            return Some(id);
+        }
+        let owned = comm.to_owned();
+        let id = self.comms.len();
+        self.comms.push(owned.clone());
+        self.comm_ids.insert(owned, id);
         Some(id)
     }
 
@@ -397,5 +424,15 @@ mod tests {
         ];
         alpha_callchains.sort_unstable();
         assert_eq!(alpha_callchains, [(vec![1, 1], 2), (vec![1, 2], 1)]);
+    }
+
+    #[test]
+    fn borrows_comm_names_without_reinterning_duplicates() {
+        let mut accumulator = RawStackAccumulator::new();
+
+        accumulator.add_slice_with_borrowed_comm(Some(7), Some("pyroclast"), &[1, 2, 3], 1);
+        accumulator.add_slice_with_borrowed_comm(Some(8), Some("pyroclast"), &[1, 2, 4], 1);
+
+        assert_eq!(accumulator.interned_comm_count(), 1);
     }
 }

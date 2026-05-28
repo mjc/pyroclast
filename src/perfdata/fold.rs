@@ -80,6 +80,7 @@ struct FoldAccumulator {
     header_build_ids: BTreeMap<String, Vec<u8>>,
     raw_stacks: RawStackAccumulator<FoldFrame>,
     deferred_samples: BTreeMap<u64, Vec<DeferredFoldSample>>,
+    sample_frames: Vec<FoldFrame>,
     callchain: Vec<FoldFrame>,
     unwind_debug_dir: Option<PathBuf>,
     first_event_index: Option<usize>,
@@ -96,15 +97,6 @@ struct PendingParsedRecord {
     index: usize,
     time: Option<u64>,
     record: ParsedRecord,
-}
-
-struct FoldSample {
-    pid: Option<u32>,
-    tid: Option<u32>,
-    count: u64,
-    frames: Vec<FoldFrame>,
-    deferred_cookie: Option<u64>,
-    event_index: usize,
 }
 
 struct DeferredFoldSample {
@@ -839,6 +831,7 @@ impl FoldAccumulator {
             header_build_ids,
             raw_stacks: RawStackAccumulator::<FoldFrame>::new(),
             deferred_samples: BTreeMap::new(),
+            sample_frames: Vec::new(),
             callchain: Vec::new(),
             unwind_debug_dir: current_perf_debug_dir(),
             first_event_index: None,
@@ -874,15 +867,11 @@ impl FoldAccumulator {
                 self.mmap_table.insert_mmap(record);
                 Ok(())
             }
-            ParsedRecord::Sample(record) => parse_sample_for_fold(
-                &record.payload,
-                sample_layouts,
-                options,
-                &mut self.object_unwinder,
-            )
-            .map(|sample| self.add_fold_sample(sample)),
+            ParsedRecord::Sample(record) => {
+                parse_sample_for_fold(self, &record.payload, sample_layouts, options)
+            }
             ParsedRecord::CallchainDeferred(record) => {
-                self.add_deferred_callchain(record.cookie, record.ips);
+                self.add_deferred_callchain(record.cookie, &record.ips);
                 Ok(())
             }
             ParsedRecord::Mmap2(record) => {
@@ -1095,16 +1084,16 @@ fn update_comm_tables(
 
 fn add_fold_stack(
     pid: Option<u32>,
-    comm: Option<String>,
+    comm: Option<&str>,
     count: u64,
-    frames: Vec<FoldFrame>,
+    frames: &[FoldFrame],
     mmap_table: &MmapTable,
     raw_stacks: &mut RawStackAccumulator<FoldFrame>,
     callchain: &mut Vec<FoldFrame>,
 ) {
     callchain.clear();
     callchain.reserve(frames.len());
-    callchain.extend(frames.into_iter().rev().filter(|frame| {
+    callchain.extend(frames.iter().rev().copied().filter(|frame| {
         let address = frame.address();
         if is_perf_context_marker(address) {
             return false;
@@ -1115,41 +1104,11 @@ fn add_fold_stack(
         true
     }));
     if !callchain.is_empty() {
-        raw_stacks.add_slice_with_comm(pid, comm, callchain, count);
+        raw_stacks.add_slice_with_borrowed_comm(pid, comm, callchain, count);
     }
 }
 
 impl FoldAccumulator {
-    fn add_fold_sample(&mut self, sample: Option<FoldSample>) {
-        if let Some(sample) = sample {
-            if !self.accepts_sample_event(sample.event_index) {
-                return;
-            }
-            let comm = self.comm_for_sample(&sample);
-            if let Some(cookie) = sample.deferred_cookie {
-                self.deferred_samples
-                    .entry(cookie)
-                    .or_default()
-                    .push(DeferredFoldSample {
-                        pid: sample.pid,
-                        comm,
-                        count: sample.count,
-                        frames: sample.frames,
-                    });
-            } else {
-                add_fold_stack(
-                    sample.pid,
-                    comm,
-                    sample.count,
-                    sample.frames,
-                    &self.mmap_table,
-                    &mut self.raw_stacks,
-                    &mut self.callchain,
-                );
-            }
-        }
-    }
-
     fn accepts_sample_event(&mut self, event_index: usize) -> bool {
         if let Some(first_event_index) = self.first_event_index {
             return event_index == first_event_index;
@@ -1158,35 +1117,24 @@ impl FoldAccumulator {
         true
     }
 
-    fn add_deferred_callchain(&mut self, cookie: u64, ips: Vec<u64>) {
+    fn add_deferred_callchain(&mut self, cookie: u64, ips: &[u64]) {
         let Some(samples) = self.deferred_samples.remove(&cookie) else {
             return;
         };
-        let deferred_frames = ips
-            .into_iter()
-            .map(FoldFrame::Callchain)
-            .collect::<Vec<_>>();
         for mut sample in samples {
-            sample.frames.extend(deferred_frames.iter().copied());
+            sample
+                .frames
+                .extend(ips.iter().copied().map(FoldFrame::Callchain));
             add_fold_stack(
                 sample.pid,
-                sample.comm,
+                sample.comm.as_deref(),
                 sample.count,
-                sample.frames,
+                &sample.frames,
                 &self.mmap_table,
                 &mut self.raw_stacks,
                 &mut self.callchain,
             );
         }
-    }
-
-    fn comm_for_sample(&self, sample: &FoldSample) -> Option<String> {
-        sample
-            .pid
-            .and_then(|pid| self.exec_process_comms.get(&pid))
-            .or_else(|| sample.tid.and_then(|tid| self.thread_comms.get(&tid)))
-            .or_else(|| sample.pid.and_then(|pid| self.process_comms.get(&pid)))
-            .cloned()
     }
 
     fn drain_fold_counts<R>(
@@ -1211,6 +1159,19 @@ fn is_valid_unwound_user_frame(pid: Option<u32>, frame: FoldFrame, mmap_table: &
             || mmap_table.has_mapping_for_pid(pid, address)
             || is_kernel_space_frame(address)
     })
+}
+
+fn comm_for_ids<'a>(
+    process_comms: &'a BTreeMap<u32, String>,
+    exec_process_comms: &'a BTreeMap<u32, String>,
+    thread_comms: &'a BTreeMap<u32, String>,
+    pid: Option<u32>,
+    tid: Option<u32>,
+) -> Option<&'a str> {
+    pid.and_then(|pid| exec_process_comms.get(&pid))
+        .or_else(|| tid.and_then(|tid| thread_comms.get(&tid)))
+        .or_else(|| pid.and_then(|pid| process_comms.get(&pid)))
+        .map(String::as_str)
 }
 
 fn render_fold_data<R>(
@@ -1797,56 +1758,77 @@ fn perf_user_reg_value(mask: u64, values: &[u64], register: u32) -> Option<u64> 
 }
 
 fn parse_sample_for_fold(
+    accumulator: &mut FoldAccumulator,
     payload: &[u8],
     sample_layouts: &SampleLayouts,
     options: FoldOptions,
-    object_unwinder: &mut FramehopUnwinder,
-) -> Result<Option<FoldSample>, String> {
-    if let Some(event) = sample_layouts.layout_for_payload(payload)? {
-        parse_sample_record_callchain(payload, event.layout).map(|sample| {
-            sample.map(|sample| {
-                let count = if options.count_periods {
-                    sample.period.unwrap_or(1)
-                } else {
-                    1
-                };
-                let mut frames = sample.frames.map(FoldFrame::Callchain).collect::<Vec<_>>();
-                let deferred_cookie = take_deferred_cookie(&mut frames);
-                if let (Some(regs), Some(stack)) = (&sample.user_regs, &sample.user_stack)
-                    && has_perf_captured_user_stack(stack)
-                    && let Ok(regs) = PerfX86_64Regs::from_perf_masked_values(
-                        event.layout.sample_regs_user,
-                        &regs.values,
-                    )
-                {
-                    let unwound_frames = if object_unwinder.module_count() == 0 {
-                        unwind_x86_64_stack(regs, stack.bytes, 256)
-                    } else {
-                        object_unwinder.unwind_stack(regs, stack.bytes, 256)
-                    };
-                    let unwound_frames = unwound_frames
-                        .into_iter()
-                        .map(FoldFrame::UserUnwind)
-                        .collect::<Vec<_>>();
-                    if frames.is_empty() {
-                        frames = unwound_frames;
-                    } else {
-                        frames.extend(unwound_frames);
-                    }
-                }
-                FoldSample {
-                    pid: sample.pid,
-                    tid: sample.tid,
-                    count,
-                    frames,
-                    deferred_cookie,
-                    event_index: event.index,
-                }
-            })
-        })
-    } else {
-        Ok(None)
+) -> Result<(), String> {
+    let Some(event) = sample_layouts.layout_for_payload(payload)? else {
+        return Ok(());
+    };
+    if !accumulator.accepts_sample_event(event.index) {
+        return Ok(());
     }
+    let Some(sample) = parse_sample_record_callchain(payload, event.layout)? else {
+        return Ok(());
+    };
+    let count = if options.count_periods {
+        sample.period.unwrap_or(1)
+    } else {
+        1
+    };
+    accumulator.sample_frames.clear();
+    accumulator.sample_frames.reserve(sample.frames.len());
+    accumulator
+        .sample_frames
+        .extend(sample.frames.map(FoldFrame::Callchain));
+    let deferred_cookie = take_deferred_cookie(&mut accumulator.sample_frames);
+    if let (Some(regs), Some(stack)) = (&sample.user_regs, &sample.user_stack)
+        && has_perf_captured_user_stack(stack)
+        && let Ok(regs) =
+            PerfX86_64Regs::from_perf_masked_values(event.layout.sample_regs_user, &regs.values)
+    {
+        let unwound_frames = if accumulator.object_unwinder.module_count() == 0 {
+            unwind_x86_64_stack(regs, stack.bytes, 256)
+        } else {
+            accumulator
+                .object_unwinder
+                .unwind_stack(regs, stack.bytes, 256)
+        };
+        accumulator
+            .sample_frames
+            .extend(unwound_frames.into_iter().map(FoldFrame::UserUnwind));
+    }
+    let comm = comm_for_ids(
+        &accumulator.process_comms,
+        &accumulator.exec_process_comms,
+        &accumulator.thread_comms,
+        sample.pid,
+        sample.tid,
+    );
+    if let Some(cookie) = deferred_cookie {
+        accumulator
+            .deferred_samples
+            .entry(cookie)
+            .or_default()
+            .push(DeferredFoldSample {
+                pid: sample.pid,
+                comm: comm.map(str::to_owned),
+                count,
+                frames: std::mem::take(&mut accumulator.sample_frames),
+            });
+    } else {
+        add_fold_stack(
+            sample.pid,
+            comm,
+            count,
+            &accumulator.sample_frames,
+            &accumulator.mmap_table,
+            &mut accumulator.raw_stacks,
+            &mut accumulator.callchain,
+        );
+    }
+    Ok(())
 }
 
 fn take_deferred_cookie(frames: &mut Vec<FoldFrame>) -> Option<u64> {
