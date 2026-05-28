@@ -1,6 +1,6 @@
 use pyroclast::perfdata::build_id::{
     BuildIdEvent, build_id_events_from_perfdata, kernel_build_id_from_perfdata,
-    parse_build_id_events,
+    kernel_build_id_from_perfdata_file, parse_build_id_events,
 };
 
 #[test]
@@ -76,6 +76,30 @@ fn extracts_all_build_id_events_from_perfdata_header_feature() {
     );
 }
 
+#[test]
+fn extracts_kernel_build_id_from_perfdata_file() {
+    let build_id = [
+        0x16, 0xed, 0x3d, 0x53, 0x17, 0xad, 0x21, 0x9c, 0x89, 0xd0, 0xe3, 0xc5, 0xea, 0x0e, 0xa2,
+        0xca, 0xa3, 0xcd, 0x49, 0x49,
+    ];
+    let payload = build_id_event_payload(u32::MAX, &build_id, "[kernel.kallsyms]");
+    let bytes = perfdata_with_build_id_feature(&payload);
+    let path = std::env::temp_dir().join(format!(
+        "pyroclast-build-id-{}-{}.perf.data",
+        std::process::id(),
+        unique_suffix()
+    ));
+    std::fs::write(&path, bytes).expect("write perf.data");
+
+    let kernel_build_id = kernel_build_id_from_perfdata_file(&path).expect("build id");
+
+    std::fs::remove_file(&path).expect("remove perf.data");
+    assert_eq!(
+        kernel_build_id,
+        Some("16ed3d5317ad219c89d0e3c5ea0ea2caa3cd4949".to_string())
+    );
+}
+
 fn build_id_event_payload(pid: u32, build_id: &[u8; 20], filename: &str) -> Vec<u8> {
     let size = 36 + filename.len() + 1;
     let mut payload = Vec::new();
@@ -111,4 +135,11 @@ fn perfdata_with_build_id_feature(payload: &[u8]) -> Vec<u8> {
 
 fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn unique_suffix() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time went backwards")
+        .as_nanos()
 }

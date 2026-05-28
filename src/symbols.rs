@@ -14,7 +14,9 @@ use rustc_hash::FxBuildHasher;
 use serde::Serialize;
 
 use crate::folded::render_inferno_perf_stack;
-use crate::perfdata::build_id::kernel_build_id_from_perfdata;
+use crate::perfdata::build_id::{
+    kernel_build_id_from_perfdata, kernel_build_id_from_perfdata_file,
+};
 use crate::perfdata::mappings::{FileIdentity, ResolvedMappingRef, file_matches_recorded_identity};
 use crate::process::{CommandRunner, CommandSpec};
 
@@ -575,9 +577,21 @@ where
         let Some(build_id) = kernel_build_id_from_perfdata(perfdata).ok().flatten() else {
             return self.with_debug_dir(debug_dir.to_path_buf());
         };
+        self.with_perfdata_kernel_build_id(&build_id, debug_dir)
+    }
+
+    #[must_use]
+    pub fn with_perfdata_file_kernel_cache(self, perfdata: &Path, debug_dir: &Path) -> Self {
+        match kernel_build_id_from_perfdata_file(perfdata) {
+            Ok(Some(build_id)) => self.with_perfdata_kernel_build_id(&build_id, debug_dir),
+            Ok(None) | Err(_) => self,
+        }
+    }
+
+    fn with_perfdata_kernel_build_id(self, build_id: &str, debug_dir: &Path) -> Self {
         let self_with_debug_dir = self.with_debug_dir(debug_dir.to_path_buf());
-        let kernel_elf = perf_build_id_elf_path(debug_dir, &build_id);
-        let self_with_kallsyms = match Kallsyms::load_perf_build_id_cache(debug_dir, &build_id) {
+        let kernel_elf = perf_build_id_elf_path(debug_dir, build_id);
+        let self_with_kallsyms = match Kallsyms::load_perf_build_id_cache(debug_dir, build_id) {
             Some(kallsyms) => self_with_debug_dir.with_kallsyms(kallsyms),
             None => self_with_debug_dir,
         };
@@ -585,14 +599,6 @@ where
             self_with_kallsyms.with_kernel_elf(kernel_elf)
         } else {
             self_with_kallsyms
-        }
-    }
-
-    #[must_use]
-    pub fn with_perfdata_file_kernel_cache(self, perfdata: &Path, debug_dir: &Path) -> Self {
-        match std::fs::read(perfdata) {
-            Ok(bytes) => self.with_perfdata_kernel_cache(&bytes, debug_dir),
-            Err(_) => self,
         }
     }
 
@@ -950,6 +956,7 @@ where
         seen.reserve(mappings.len());
         let mut missing_keys = Vec::with_capacity(mappings.len());
         let mut missing_requests = Vec::with_capacity(mappings.len());
+        let mut missing_fallbacks = Vec::with_capacity(mappings.len());
         for mapping in mappings {
             let key = mapping_frame_key(mapping);
             if self.resolved_by_mapping.contains_key(&key) || !seen.insert(key) {
@@ -957,6 +964,10 @@ where
             }
             missing_keys.push(key);
             missing_requests.push(symbol_request_from_mapping_ref(mapping));
+            let fallback_frame = mapping_fallback_frame(mapping);
+            missing_fallbacks.push(render_inferno_perf_stack(std::iter::once(
+                fallback_frame.as_str(),
+            )));
         }
         if missing_requests.is_empty() {
             return Ok(());
@@ -970,9 +981,13 @@ where
             ));
         }
         self.resolved_by_mapping.reserve(missing_keys.len());
-        for (key, frames) in missing_keys.into_iter().zip(resolved) {
+        for ((key, fallback_rendered), frames) in missing_keys
+            .into_iter()
+            .zip(missing_fallbacks)
+            .zip(resolved)
+        {
             let folded_rendered = if frames.is_empty() {
-                String::new()
+                fallback_rendered
             } else {
                 render_inferno_perf_stack(frames.iter().map(String::as_str))
             };
@@ -2250,6 +2265,27 @@ fn mapping_frame_key(mapping: &ResolvedMappingRef<'_>) -> MappingFrameKey {
     }
 }
 
+fn mapping_fallback_frame(mapping: &ResolvedMappingRef<'_>) -> String {
+    if is_kernel_mapping_ref(mapping) {
+        "[unknown]".to_string()
+    } else if mapping.path == "[unknown]" {
+        mapping.path.to_string()
+    } else if mapping.path.starts_with('[') {
+        format!("{}+0x{:x}", mapping.path, mapping.relative_address)
+    } else {
+        let name = Path::new(mapping.path)
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or(mapping.path);
+        format!("[{name}]")
+    }
+}
+
+fn is_kernel_mapping_ref(mapping: &ResolvedMappingRef<'_>) -> bool {
+    crate::perfdata::samples::is_kernel_space_frame(mapping.relative_address)
+        && mapping.path.starts_with('[')
+}
+
 fn symbol_request_from_mapping_ref(mapping: &ResolvedMappingRef<'_>) -> SymbolRequest {
     SymbolRequest {
         path: if is_kernel_symbol_path(Path::new(mapping.path))
@@ -2660,6 +2696,34 @@ mod tests {
                 .expect("second resolve")
                 .expect("folded render");
             assert_eq!(second, "one;two");
+            second.as_ptr()
+        };
+
+        assert_eq!(first_ptr, second_ptr);
+        assert_eq!(resolver.calls.get(), 1);
+    }
+
+    #[test]
+    fn symbol_frame_cache_resolve_folded_mapping_ref_caches_fallback_rendering() {
+        let resolver = CountingFrameResolver::new(vec![Vec::new()]);
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let mapping = test_mapping_ref("/usr/lib/libdemo.so", 0x1234);
+
+        let first_ptr = {
+            let first = cache
+                .resolve_folded_mapping_ref(&mapping)
+                .expect("first resolve")
+                .expect("folded fallback render");
+            assert_eq!(first, "[libdemo.so]");
+            first.as_ptr()
+        };
+
+        let second_ptr = {
+            let second = cache
+                .resolve_folded_mapping_ref(&mapping)
+                .expect("second resolve")
+                .expect("folded fallback render");
+            assert_eq!(second, "[libdemo.so]");
             second.as_ptr()
         };
 
