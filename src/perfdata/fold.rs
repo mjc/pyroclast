@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::fs::File;
+use std::hash::Hasher;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write as IoWrite};
 use std::path::{Path, PathBuf};
 
-use hashbrown::{HashMap, hash_map::RawEntryMut};
-use rustc_hash::FxBuildHasher;
+use hashbrown::HashMap;
+use rustc_hash::{FxBuildHasher, FxHasher};
 
 use crate::folded::append_inferno_perf_frame;
 use crate::perfdata::attrs::{PerfFileAttr, parse_file_attr_ids, parse_file_attrs};
@@ -34,8 +35,21 @@ const UNKNOWN_FRAME: &str = "[unknown]";
 const PREFETCH_SYMBOL_REQUEST_BATCH_SIZE: usize = 4096;
 const RECORD_READER_BUFFER_CAPACITY: usize = 4 * 1024 * 1024;
 
-type FoldCounts = HashMap<String, u64, FxBuildHasher>;
 type FoldFrameRenderCache = HashMap<String, String, FxBuildHasher>;
+
+#[derive(Default)]
+struct FoldCounts {
+    storage: Vec<u8>,
+    entries: Vec<FoldCountEntry>,
+    by_hash: HashMap<u64, Vec<usize>, FxBuildHasher>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FoldCountEntry {
+    offset: usize,
+    len: usize,
+    count: u64,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PerfSummary {
@@ -151,6 +165,53 @@ impl PerfSummary {
     pub fn record_count(&self, record_type: u32) -> usize {
         self.record_counts.get(&record_type).copied().unwrap_or(0)
     }
+}
+
+impl FoldCounts {
+    fn reserve_first_drain(&mut self, additional_entries: usize) {
+        if self.entries.is_empty() {
+            self.entries.reserve(additional_entries);
+            self.by_hash.reserve(additional_entries);
+        }
+    }
+
+    fn add_rendered(&mut self, rendered: &str, count: u64) {
+        let rendered = rendered.as_bytes();
+        let hash = fold_count_hash(rendered);
+        if let Some(entry_id) = self.find_entry_id(hash, rendered) {
+            self.entries[entry_id].count += count;
+            return;
+        }
+
+        let offset = self.storage.len();
+        self.storage.extend_from_slice(rendered);
+        let entry_id = self.entries.len();
+        self.entries.push(FoldCountEntry {
+            offset,
+            len: rendered.len(),
+            count,
+        });
+        self.by_hash.entry(hash).or_default().push(entry_id);
+    }
+
+    fn find_entry_id(&self, hash: u64, rendered: &[u8]) -> Option<usize> {
+        self.by_hash.get(&hash).and_then(|entry_ids| {
+            entry_ids
+                .iter()
+                .copied()
+                .find(|&entry_id| self.entry_bytes(&self.entries[entry_id]) == rendered)
+        })
+    }
+
+    fn entry_bytes<'a>(&'a self, entry: &FoldCountEntry) -> &'a [u8] {
+        &self.storage[entry.offset..entry.offset + entry.len]
+    }
+}
+
+fn fold_count_hash(rendered: &[u8]) -> u64 {
+    let mut hasher = FxHasher::default();
+    hasher.write(rendered);
+    hasher.finish()
 }
 
 /// Summarizes record counts and parsed sample callchains from `perf.data`.
@@ -1279,7 +1340,7 @@ where
     R: SymbolResolver,
 {
     let raw_stacks = raw_stacks.sorted_entries();
-    counts.reserve(raw_stacks.len());
+    counts.reserve_first_drain(raw_stacks.len());
     if let Some(cache) = symbol_cache.as_deref_mut() {
         prefetch_symbols(&raw_stacks, mmap_table, cache)?;
     }
@@ -1294,14 +1355,7 @@ where
             symbol_cache.as_deref_mut(),
             &mut buffers,
         )?;
-        match counts.raw_entry_mut().from_key(buffers.rendered.as_str()) {
-            RawEntryMut::Occupied(mut entry) => {
-                *entry.get_mut() += stack.count();
-            }
-            RawEntryMut::Vacant(entry) => {
-                entry.insert(buffers.rendered.clone(), stack.count());
-            }
-        }
+        counts.add_rendered(buffers.rendered.as_str(), stack.count());
     }
     Ok(())
 }
@@ -1310,10 +1364,19 @@ fn write_fold_counts<W>(counts: FoldCounts, writer: &mut W) -> Result<(), String
 where
     W: IoWrite + ?Sized,
 {
-    let mut counts = counts.into_iter().collect::<Vec<_>>();
-    counts.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-    for (callchain, count) in counts {
-        write_folded_line(writer, &callchain, count)?;
+    let FoldCounts {
+        storage,
+        mut entries,
+        by_hash: _,
+    } = counts;
+    entries.sort_unstable_by(|left, right| {
+        storage[left.offset..left.offset + left.len]
+            .cmp(&storage[right.offset..right.offset + right.len])
+    });
+    for entry in entries {
+        let callchain = std::str::from_utf8(&storage[entry.offset..entry.offset + entry.len])
+            .map_err(|error| format!("stored folded output is not utf-8: {error}"))?;
+        write_folded_line(writer, callchain, entry.count)?;
     }
     Ok(())
 }
@@ -2073,5 +2136,58 @@ mod tests {
         );
 
         assert_eq!(resolved, cached);
+    }
+
+    #[test]
+    fn fold_counts_coalesce_duplicate_rendered_lines() {
+        let mut counts = super::FoldCounts::default();
+
+        counts.add_rendered("alpha;beta", 2);
+        counts.add_rendered("alpha;beta", 3);
+        counts.add_rendered("alpha;gamma", 5);
+
+        assert_eq!(counts.entries.len(), 2);
+
+        let alpha_beta = counts
+            .find_entry_id(super::fold_count_hash(b"alpha;beta"), b"alpha;beta")
+            .expect("alpha beta entry");
+        let alpha_gamma = counts
+            .find_entry_id(super::fold_count_hash(b"alpha;gamma"), b"alpha;gamma")
+            .expect("alpha gamma entry");
+
+        assert_eq!(counts.entries[alpha_beta].count, 5);
+        assert_eq!(counts.entries[alpha_gamma].count, 5);
+    }
+
+    #[test]
+    fn write_fold_counts_matches_string_sort_order() {
+        let mut counts = super::FoldCounts::default();
+        let mut expected = vec![
+            ("zeta;leaf".to_string(), 4_u64),
+            ("alpha;leaf".to_string(), 2_u64),
+            ("éclair;leaf".to_string(), 3_u64),
+            ("beta;leaf".to_string(), 1_u64),
+        ];
+
+        for (callchain, count) in &expected {
+            counts.add_rendered(callchain, *count);
+        }
+
+        let mut written = Vec::new();
+        super::write_fold_counts(counts, &mut written).expect("write fold counts");
+
+        expected.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let expected =
+            expected
+                .into_iter()
+                .fold(String::new(), |mut rendered, (callchain, count)| {
+                    rendered.push_str(&callchain);
+                    rendered.push(' ');
+                    rendered.push_str(&count.to_string());
+                    rendered.push('\n');
+                    rendered
+                });
+
+        assert_eq!(String::from_utf8(written).expect("utf-8"), expected);
     }
 }
