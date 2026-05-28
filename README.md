@@ -30,6 +30,15 @@ pyroclast syscalls -- <command...>
 pyroclast latency -- <command...>
 ```
 
+Pyroclast also ships a cargo-subcommand wrapper that mirrors `cargo-flamegraph` target
+selection/build behavior and forwards trailing arguments to the built executable:
+
+```sh
+cargo pyroclast cpu -- --tui
+cargo pyroclast cpu --profile profiling -- --tui
+cargo pyroclast memory --example demo -- --serve
+```
+
 ## Plumbing
 
 ```sh
