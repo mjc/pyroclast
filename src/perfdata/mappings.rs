@@ -296,7 +296,7 @@ impl MmapTable {
             }
             let index = indexed.index;
             let mapping = &self.mappings[index];
-            if mapping.contains_ip(ip) {
+            if ip < mapping.end() {
                 return Some(index);
             }
         }
@@ -313,10 +313,6 @@ impl MmapTable {
 impl Mapping {
     fn end(&self) -> u64 {
         self.start.saturating_add(self.len)
-    }
-
-    fn contains_ip(&self, ip: u64) -> bool {
-        ip >= self.start && ip < self.end()
     }
 
     fn relative_address(&self, ip: u64) -> u64 {

@@ -137,7 +137,7 @@ where
             request.duration_secs,
         );
         let output = self.runner.run(&command)?;
-        if output.status_code != Some(0) {
+        if !output.succeeded_or_interrupted() {
             std::fs::write(layout.stdout_log(), &output.stdout)?;
             std::fs::write(layout.stderr_log(), &output.stderr)?;
             let error = format!(

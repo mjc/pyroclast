@@ -48,3 +48,18 @@ fn real_runner_can_run_interactive_commands_without_capturing_output() {
     assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
 }
+
+#[test]
+fn real_runner_can_inherit_stderr_while_capturing_stdout() {
+    let output = RealCommandRunner::default()
+        .run(
+            &CommandSpec::new("sh")
+                .args(["-c", "printf out; printf err >&2"])
+                .inherit_stderr(),
+        )
+        .expect("stderr inherited command");
+
+    assert_eq!(output.status_code, Some(0));
+    assert_eq!(output.stdout, b"out");
+    assert!(output.stderr.is_empty());
+}

@@ -56,7 +56,7 @@ where
             format!("{}\n", request.command.join(" ")),
         )?;
 
-        if output.status_code != Some(0) {
+        if !output.succeeded_or_interrupted() {
             let error = format!(
                 "heaptrack exited with {:?}: {}",
                 output.status_code,

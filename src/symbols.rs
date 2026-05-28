@@ -110,6 +110,10 @@ pub struct SymbolFrameCache<'a, R> {
     resolver: &'a R,
     resolved: FxHashMap<SymbolRequest, Vec<String>>,
     resolved_by_mapping: FxHashMap<MappingFrameKey, CachedMappingFrames>,
+    scratch_seen_mapping: FxHashSet<MappingFrameKey>,
+    scratch_missing_keys: Vec<MappingFrameKey>,
+    scratch_missing_requests: Vec<SymbolRequest>,
+    scratch_missing_fallbacks: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -837,6 +841,10 @@ where
             resolver,
             resolved: FxHashMap::default(),
             resolved_by_mapping: FxHashMap::default(),
+            scratch_seen_mapping: FxHashSet::default(),
+            scratch_missing_keys: Vec::new(),
+            scratch_missing_requests: Vec::new(),
+            scratch_missing_fallbacks: Vec::new(),
         }
     }
 
@@ -952,54 +960,70 @@ where
         &mut self,
         mappings: &[ResolvedMappingRef<'_>],
     ) -> Result<(), String> {
-        let mut seen = FxHashSet::default();
-        seen.reserve(mappings.len());
-        let mut missing_keys = Vec::with_capacity(mappings.len());
-        let mut missing_requests = Vec::with_capacity(mappings.len());
-        let mut missing_fallbacks = Vec::with_capacity(mappings.len());
-        for mapping in mappings {
-            let key = mapping_frame_key(mapping);
-            if self.resolved_by_mapping.contains_key(&key) || !seen.insert(key) {
-                continue;
+        let mut seen = std::mem::take(&mut self.scratch_seen_mapping);
+        let mut missing_keys = std::mem::take(&mut self.scratch_missing_keys);
+        let mut missing_requests = std::mem::take(&mut self.scratch_missing_requests);
+        let mut missing_fallbacks = std::mem::take(&mut self.scratch_missing_fallbacks);
+        seen.clear();
+        missing_keys.clear();
+        missing_requests.clear();
+        missing_fallbacks.clear();
+
+        let result = (|| {
+            seen.reserve(mappings.len());
+            missing_keys.reserve(mappings.len());
+            missing_requests.reserve(mappings.len());
+            missing_fallbacks.reserve(mappings.len());
+            for mapping in mappings {
+                let key = mapping_frame_key(mapping);
+                if self.resolved_by_mapping.contains_key(&key) || !seen.insert(key) {
+                    continue;
+                }
+                missing_keys.push(key);
+                missing_requests.push(symbol_request_from_mapping_ref(mapping));
+                let fallback_frame = mapping_fallback_frame(mapping);
+                missing_fallbacks.push(render_inferno_perf_stack(std::iter::once(
+                    fallback_frame.as_str(),
+                )));
             }
-            missing_keys.push(key);
-            missing_requests.push(symbol_request_from_mapping_ref(mapping));
-            let fallback_frame = mapping_fallback_frame(mapping);
-            missing_fallbacks.push(render_inferno_perf_stack(std::iter::once(
-                fallback_frame.as_str(),
-            )));
-        }
-        if missing_requests.is_empty() {
-            return Ok(());
-        }
-        let resolved = self.resolver.resolve_frame_batch(&missing_requests)?;
-        if resolved.len() != missing_requests.len() {
-            return Err(format!(
-                "symbol resolver returned {} frame results for {} requests",
-                resolved.len(),
-                missing_requests.len()
-            ));
-        }
-        self.resolved_by_mapping.reserve(missing_keys.len());
-        for ((key, fallback_rendered), frames) in missing_keys
-            .into_iter()
-            .zip(missing_fallbacks)
-            .zip(resolved)
-        {
-            let folded_rendered = if frames.is_empty() {
-                fallback_rendered
-            } else {
-                render_inferno_perf_stack(frames.iter().map(String::as_str))
-            };
-            self.resolved_by_mapping.insert(
-                key,
-                CachedMappingFrames {
-                    frames,
-                    folded_rendered,
-                },
-            );
-        }
-        Ok(())
+            if missing_requests.is_empty() {
+                return Ok(());
+            }
+            let resolved = self.resolver.resolve_frame_batch(&missing_requests)?;
+            if resolved.len() != missing_requests.len() {
+                return Err(format!(
+                    "symbol resolver returned {} frame results for {} requests",
+                    resolved.len(),
+                    missing_requests.len()
+                ));
+            }
+            self.resolved_by_mapping.reserve(missing_keys.len());
+            for ((key, fallback_rendered), frames) in missing_keys
+                .drain(..)
+                .zip(missing_fallbacks.drain(..))
+                .zip(resolved)
+            {
+                let folded_rendered = if frames.is_empty() {
+                    fallback_rendered
+                } else {
+                    render_inferno_perf_stack(frames.iter().map(String::as_str))
+                };
+                self.resolved_by_mapping.insert(
+                    key,
+                    CachedMappingFrames {
+                        frames,
+                        folded_rendered,
+                    },
+                );
+            }
+            Ok(())
+        })();
+
+        self.scratch_seen_mapping = seen;
+        self.scratch_missing_keys = missing_keys;
+        self.scratch_missing_requests = missing_requests;
+        self.scratch_missing_fallbacks = missing_fallbacks;
+        result
     }
 
     fn unique_misses(&self, requests: &[SymbolRequest]) -> Vec<SymbolRequest> {
@@ -2728,6 +2752,36 @@ mod tests {
         };
 
         assert_eq!(first_ptr, second_ptr);
+        assert_eq!(resolver.calls.get(), 1);
+    }
+
+    #[test]
+    fn symbol_frame_cache_prefetch_mapping_refs_deduplicates_duplicate_batch_entries() {
+        let resolver =
+            CountingFrameResolver::new(vec![vec!["one".to_string()], vec!["two".to_string()]]);
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let first = test_mapping_ref("/bin/demo", 0x1234);
+        let second = test_mapping_ref("/bin/demo", 0x5678);
+        let batch = [
+            test_mapping_ref("/bin/demo", 0x1234),
+            test_mapping_ref("/bin/demo", 0x1234),
+            test_mapping_ref("/bin/demo", 0x5678),
+            test_mapping_ref("/bin/demo", 0x1234),
+            test_mapping_ref("/bin/demo", 0x5678),
+        ];
+
+        cache
+            .prefetch_mapping_refs(&batch)
+            .expect("prefetch duplicate mapping refs");
+
+        assert_eq!(
+            cache.resolve_mapping_ref(&first).expect("first mapping"),
+            ["one".to_string()]
+        );
+        assert_eq!(
+            cache.resolve_mapping_ref(&second).expect("second mapping"),
+            ["two".to_string()]
+        );
         assert_eq!(resolver.calls.get(), 1);
     }
 

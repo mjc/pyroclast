@@ -10,6 +10,9 @@ use pyroclast::platform::ThreadLister;
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
 use pyroclast::tools::{ResolvedTool, ToolSource, ToolSpec};
 
+#[cfg(unix)]
+use signal_hook::consts::SIGINT;
+
 #[test]
 fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
     let root = tempfile::tempdir().expect("tempdir");
@@ -230,6 +233,39 @@ fn linux_perf_backend_stops_when_perf_record_fails() {
         "perf record exited with Some(13): permission denied\n"
     );
     assert!(!root.path().join("cpu/stacks.folded").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn linux_perf_backend_keeps_processing_after_ctrl_c_interrupt() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let runner = InterruptedPerfRunner::default();
+    let backend = LinuxPerfBackend::new(&runner);
+    let request = ProfileRequest {
+        kind: ProfileKind::Cpu,
+        command: vec!["true".to_string()],
+        out_dir: root.path().join("cpu"),
+        name: None,
+        json: false,
+        symbols: false,
+        symbolizer: SymbolizerKind::Addr2line,
+        frequency: 997,
+        event: PerfEvent::CpuClock,
+        call_graph: PerfCallGraph::Fp,
+        pid: None,
+        tids: Vec::new(),
+        threads_of_pid: None,
+        duration_secs: 3600,
+        offcpu_method: None,
+    };
+
+    let result = backend.profile(&request).expect("profile");
+
+    assert_eq!(result.manifest.exit_status, Some(-SIGINT));
+    assert!(result.layout.raw_profile("perf.data").is_file());
+    assert!(result.layout.stacks_folded().is_file());
+    assert!(result.layout.flamegraph_svg().is_file());
+    assert_eq!(runner.programs(), vec!["perf", "inferno-flamegraph"]);
 }
 
 #[test]
@@ -500,6 +536,55 @@ impl CommandRunner for FailingPerfRunner {
         Ok(CommandOutput {
             status_code: Some(0),
             stdout: Vec::new(),
+            stderr: Vec::new(),
+        })
+    }
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct InterruptedPerfRunner {
+    commands: Mutex<Vec<CommandSpec>>,
+}
+
+#[cfg(unix)]
+impl InterruptedPerfRunner {
+    fn programs(&self) -> Vec<String> {
+        self.commands
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|command| command.program.clone())
+            .collect()
+    }
+}
+
+#[cfg(unix)]
+impl CommandRunner for InterruptedPerfRunner {
+    fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
+        self.commands.lock().unwrap().push(command.clone());
+        if command.args == ["--version"] {
+            return Ok(CommandOutput {
+                status_code: Some(0),
+                stdout: format!("{} fake version\n", command.program).into_bytes(),
+                stderr: Vec::new(),
+            });
+        }
+        if let Some(output_path) = perf_output_path(command) {
+            std::fs::write(output_path, tiny_perfdata())?;
+        }
+        let stdout = match command.program.as_str() {
+            "inferno-flamegraph" => b"<svg></svg>\n".to_vec(),
+            _ => Vec::new(),
+        };
+        let status_code = if command.program == "perf" {
+            Some(-SIGINT)
+        } else {
+            Some(0)
+        };
+        Ok(CommandOutput {
+            status_code,
+            stdout,
             stderr: Vec::new(),
         })
     }

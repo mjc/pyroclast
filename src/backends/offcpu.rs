@@ -220,7 +220,7 @@ where
         let perf_data = layout.raw_profile("perf.data");
         let record = build_perf_sched_record_command(&perf_data, request.command.clone());
         let record_output = self.runner.run(&record)?;
-        if record_output.status_code != Some(0) {
+        if !record_output.succeeded_or_interrupted() {
             return offcpu_command_error("perf sched record", &record_output, layout);
         }
 
@@ -260,7 +260,7 @@ where
             request.command.clone(),
         );
         let output = self.runner.run(&command)?;
-        if output.status_code != Some(0) {
+        if !output.succeeded_or_interrupted() {
             return offcpu_command_error("perf record", &output, layout);
         }
 
@@ -284,7 +284,7 @@ where
         let profiled_command = request.command.join(" ");
         let command = build_bpftrace_offcpu_command(profiled_command, request.duration_secs);
         let output = self.runner.run(&command)?;
-        if output.status_code != Some(0) {
+        if !output.succeeded_or_interrupted() {
             return offcpu_command_error("bpftrace", &output, layout);
         }
 

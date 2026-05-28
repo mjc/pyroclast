@@ -2,6 +2,11 @@ use std::sync::Mutex;
 
 use crate::tools::{ResolvedTool, ResolverContext, SystemToolResolver, ToolSpec, tool_spec_named};
 
+#[cfg(unix)]
+use signal_hook::consts::{SIGINT, SIGTERM};
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandSpec {
     pub program: String,
@@ -9,6 +14,7 @@ pub struct CommandSpec {
     pub env: Vec<(String, String)>,
     pub stdin: Option<Vec<u8>>,
     pub interactive: bool,
+    pub inherit_stderr: bool,
 }
 
 impl CommandSpec {
@@ -20,6 +26,7 @@ impl CommandSpec {
             env: Vec::new(),
             stdin: None,
             interactive: false,
+            inherit_stderr: false,
         }
     }
 
@@ -52,6 +59,12 @@ impl CommandSpec {
         self.interactive = true;
         self
     }
+
+    #[must_use]
+    pub fn inherit_stderr(mut self) -> Self {
+        self.inherit_stderr = true;
+        self
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,6 +72,13 @@ pub struct CommandOutput {
     pub status_code: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+}
+
+impl CommandOutput {
+    #[must_use]
+    pub fn succeeded_or_interrupted(&self) -> bool {
+        self.status_code == Some(0) || status_is_interrupt(self.status_code)
+    }
 }
 
 pub trait CommandRunner {
@@ -146,7 +166,11 @@ fn run_process(command: &CommandSpec) -> std::io::Result<CommandOutput> {
         std_command.stderr(std::process::Stdio::inherit());
     } else {
         std_command.stdout(std::process::Stdio::piped());
-        std_command.stderr(std::process::Stdio::piped());
+        if command.inherit_stderr {
+            std_command.stderr(std::process::Stdio::inherit());
+        } else {
+            std_command.stderr(std::process::Stdio::piped());
+        }
     }
     for (key, value) in &command.env {
         std_command.env(key, value);
@@ -169,8 +193,24 @@ fn run_process(command: &CommandSpec) -> std::io::Result<CommandOutput> {
             Err(error) => return Err(error),
         }
     }
+
+    #[cfg(unix)]
+    let sigint_handler = if command.interactive {
+        Some(unsafe {
+            signal_hook::low_level::register(SIGINT, || {})
+                .map_err(|error| std::io::Error::other(error.to_string()))?
+        })
+    } else {
+        None
+    };
+
     let output = if command.interactive {
-        let status = child.wait()?;
+        let status = child.wait();
+        #[cfg(unix)]
+        if let Some(sigint_handler) = sigint_handler {
+            signal_hook::low_level::unregister(sigint_handler);
+        }
+        let status = status?;
         std::process::Output {
             status,
             stdout: Vec::new(),
@@ -180,8 +220,30 @@ fn run_process(command: &CommandSpec) -> std::io::Result<CommandOutput> {
         child.wait_with_output()?
     };
     Ok(CommandOutput {
-        status_code: output.status.code(),
+        status_code: status_code(output.status),
         stdout: output.stdout,
         stderr: output.stderr,
     })
+}
+
+#[cfg(unix)]
+fn status_code(status: std::process::ExitStatus) -> Option<i32> {
+    status
+        .code()
+        .or_else(|| status.signal().map(|signal| -signal))
+}
+
+#[cfg(not(unix))]
+fn status_code(status: std::process::ExitStatus) -> Option<i32> {
+    status.code()
+}
+
+#[cfg(unix)]
+fn status_is_interrupt(status_code: Option<i32>) -> bool {
+    matches!(status_code, Some(code) if code == -SIGINT || code == -SIGTERM)
+}
+
+#[cfg(not(unix))]
+fn status_is_interrupt(_status_code: Option<i32>) -> bool {
+    false
 }
