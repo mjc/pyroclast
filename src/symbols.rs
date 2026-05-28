@@ -780,6 +780,20 @@ where
             .map(|resolved| resolved.into_iter().next().unwrap_or_default())
     }
 
+    /// Resolves one object-relative address through the cache and returns a
+    /// borrowed frame slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backing resolver fails.
+    pub fn resolve_ref(&mut self, request: &SymbolRequest) -> Result<&[String], String> {
+        self.prefetch_many(std::slice::from_ref(request))?;
+        self.resolved
+            .get(request)
+            .map(Vec::as_slice)
+            .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())
+    }
+
     /// Resolves many object-relative addresses to frame lists, batching cache misses.
     ///
     /// # Errors
@@ -787,10 +801,7 @@ where
     /// Returns an error when the backing resolver fails or returns the wrong
     /// number of results.
     pub fn resolve_many(&mut self, requests: &[SymbolRequest]) -> Result<Vec<Vec<String>>, String> {
-        let missing = self.unique_misses(requests);
-        if !missing.is_empty() {
-            self.resolve_missing(missing)?;
-        }
+        self.prefetch_many(requests)?;
 
         requests
             .iter()
@@ -801,6 +812,21 @@ where
                     .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())
             })
             .collect()
+    }
+
+    /// Resolves many object-relative addresses through the cache without
+    /// cloning the cached frame vectors back out.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backing resolver fails or returns the wrong
+    /// number of results.
+    pub fn prefetch_many(&mut self, requests: &[SymbolRequest]) -> Result<(), String> {
+        let missing = self.unique_misses(requests);
+        if !missing.is_empty() {
+            self.resolve_missing(missing)?;
+        }
+        Ok(())
     }
 
     fn unique_misses(&self, requests: &[SymbolRequest]) -> Vec<SymbolRequest> {
@@ -2159,14 +2185,15 @@ fn parse_module_kallsyms_line(line: &str) -> Option<(u64, String, String)> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::sync::Arc;
 
     use object::{Object, ObjectSegment, ObjectSymbol};
 
     use super::{
         PerfAddressRange, PerfDwarfDieKind, PerfDwarfDieNode, PerfDwarfNameInterner,
-        PerfSymbolBinding, PerfSymbolCandidate, RustAddr2lineResolver, SymbolRequest,
-        SymbolResolver, clean_object_symbol_request, perf_best_duplicate_symbol,
+        PerfSymbolBinding, PerfSymbolCandidate, RustAddr2lineResolver, SymbolFrameCache,
+        SymbolRequest, SymbolResolver, clean_object_symbol_request, perf_best_duplicate_symbol,
         perf_dwarf_frame_names_from_index, perf_dwarf_frame_ranges_from_roots,
         perf_frames_with_object_alias,
     };
@@ -2357,6 +2384,46 @@ mod tests {
         assert_eq!(resolver.cached_object_count(), 1);
     }
 
+    #[test]
+    fn symbol_frame_cache_resolve_ref_reuses_cached_frame_slice() {
+        let resolver = CountingFrameResolver::new(vec![vec!["one".to_string(), "two".to_string()]]);
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let request = test_request("/bin/demo", 0x1234);
+
+        let first_ptr = {
+            let first = cache.resolve_ref(&request).expect("first resolve");
+            assert_eq!(first, ["one".to_string(), "two".to_string()]);
+            first.as_ptr()
+        };
+
+        let second_ptr = {
+            let second = cache.resolve_ref(&request).expect("second resolve");
+            assert_eq!(second, ["one".to_string(), "two".to_string()]);
+            second.as_ptr()
+        };
+
+        assert_eq!(first_ptr, second_ptr);
+        assert_eq!(resolver.calls.get(), 1);
+    }
+
+    #[test]
+    fn symbol_frame_cache_prefetch_many_warms_cache_without_re_resolving() {
+        let resolver = CountingFrameResolver::new(vec![vec!["frame".to_string()]]);
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let request = test_request("/bin/demo", 0x1234);
+
+        cache
+            .prefetch_many(std::slice::from_ref(&request))
+            .expect("prefetch frames");
+        assert_eq!(resolver.calls.get(), 1);
+
+        let frames = cache
+            .resolve_ref(&request)
+            .expect("resolve from prefetched cache");
+        assert_eq!(frames, ["frame".to_string()]);
+        assert_eq!(resolver.calls.get(), 1);
+    }
+
     fn frame_names(names: &PerfDwarfNameInterner, frames: &[u32]) -> Vec<String> {
         frames
             .iter()
@@ -2366,5 +2433,50 @@ mod tests {
 
     fn test_range(begin: u64, end: u64) -> PerfAddressRange {
         PerfAddressRange { begin, end }
+    }
+
+    fn test_request(path: &str, relative_address: u64) -> SymbolRequest {
+        SymbolRequest {
+            path: path.into(),
+            relative_address,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        }
+    }
+
+    struct CountingFrameResolver {
+        calls: Cell<usize>,
+        response: Vec<Vec<String>>,
+    }
+
+    impl CountingFrameResolver {
+        fn new(response: Vec<Vec<String>>) -> Self {
+            Self {
+                calls: Cell::new(0),
+                response,
+            }
+        }
+    }
+
+    impl SymbolResolver for CountingFrameResolver {
+        fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
+            Ok(vec![None; requests.len()])
+        }
+
+        fn resolve_frame_batch(
+            &self,
+            requests: &[SymbolRequest],
+        ) -> Result<Vec<Vec<String>>, String> {
+            self.calls.set(self.calls.get() + 1);
+            if requests.len() != self.response.len() {
+                return Err(format!(
+                    "expected {} frame requests, got {}",
+                    self.response.len(),
+                    requests.len()
+                ));
+            }
+            Ok(self.response.clone())
+        }
     }
 }

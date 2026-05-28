@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write as IoWrite};
 use std::path::{Path, PathBuf};
 
-use crate::folded::render_inferno_perf_stack;
+use crate::folded::append_inferno_perf_frame;
 use crate::perfdata::attrs::{PerfFileAttr, parse_file_attr_ids, parse_file_attrs};
 use crate::perfdata::build_id::{
     BuildIdEvent, build_id_events_from_perfdata, parse_build_id_events,
@@ -1292,12 +1292,12 @@ where
             &mut requests,
         );
         if requests.len() >= PREFETCH_SYMBOL_REQUEST_BATCH_SIZE {
-            symbol_cache.resolve_many(&requests)?;
+            symbol_cache.prefetch_many(&requests)?;
             requests.clear();
         }
     }
     if !requests.is_empty() {
-        symbol_cache.resolve_many(&requests)?;
+        symbol_cache.prefetch_many(&requests)?;
     }
     Ok(())
 }
@@ -1317,15 +1317,20 @@ where
     }
     let frame_resolver = FoldFrameResolver::new(mmap_table);
     let mut callchain = Vec::new();
+    let mut buffers = FoldedRenderBuffers::default();
     for stack in raw_stacks {
-        let frames = frame_resolver.frames_for_stack(
+        frame_resolver.render_folded_stack_for_stack(
             stack.pid(),
             stack.comm(),
             stack.callchain(&mut callchain),
             symbol_cache.as_deref_mut(),
+            &mut buffers,
         )?;
-        let rendered = render_inferno_perf_stack(frames.iter().map(String::as_str));
-        *counts.entry(rendered).or_insert(0) += stack.count();
+        if let Some(count) = counts.get_mut(buffers.rendered.as_str()) {
+            *count += stack.count();
+        } else {
+            counts.insert(buffers.rendered.clone(), stack.count());
+        }
     }
     Ok(())
 }
@@ -1382,6 +1387,13 @@ struct FoldFrameResolver<'a> {
     mmap_table: &'a MmapTable,
 }
 
+#[derive(Default)]
+struct FoldedRenderBuffers {
+    rendered: String,
+    render_scratch: String,
+    label_scratch: String,
+}
+
 struct NoopSymbolResolver;
 
 impl SymbolResolver for NoopSymbolResolver {
@@ -1395,17 +1407,38 @@ impl<'a> FoldFrameResolver<'a> {
         Self { mmap_table }
     }
 
-    fn frames_for_stack<R>(
+    fn render_folded_stack_for_stack<R>(
         &self,
         pid: Option<u32>,
         comm: Option<&str>,
         callchain: &[FoldFrame],
         mut symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
-    ) -> Result<Vec<String>, String>
+        buffers: &mut FoldedRenderBuffers,
+    ) -> Result<(), String>
     where
         R: SymbolResolver,
     {
-        let mut frames = vec![folded_comm_label(comm)];
+        buffers.rendered.clear();
+        buffers.label_scratch.clear();
+        if let Some(comm) = comm {
+            for character in comm.chars() {
+                buffers
+                    .label_scratch
+                    .push(if character == ' ' { '_' } else { character });
+            }
+            append_inferno_perf_frame(
+                &mut buffers.rendered,
+                &buffers.label_scratch,
+                &mut buffers.render_scratch,
+            );
+        } else {
+            append_inferno_perf_frame(
+                &mut buffers.rendered,
+                UNKNOWN_FRAME,
+                &mut buffers.render_scratch,
+            );
+        }
+
         for frame in callchain.iter().copied() {
             if symbol_cache.is_none() && !is_valid_unwound_user_frame(pid, frame, self.mmap_table) {
                 continue;
@@ -1413,10 +1446,16 @@ impl<'a> FoldFrameResolver<'a> {
             if should_drop_perf_data_user_unwind_frame(pid, frame, self.mmap_table) {
                 continue;
             }
-            let frame = frame.address();
-            frames.extend(self.format_frames(pid, frame, symbol_cache.as_deref_mut())?);
+            self.append_folded_frame_labels(
+                pid,
+                frame.address(),
+                symbol_cache.as_deref_mut(),
+                &mut buffers.rendered,
+                &mut buffers.render_scratch,
+                &mut buffers.label_scratch,
+            )?;
         }
-        Ok(frames)
+        Ok(())
     }
 
     fn write_script_frames_for_stack<R, W>(
@@ -1478,41 +1517,60 @@ impl<'a> FoldFrameResolver<'a> {
         Ok(())
     }
 
-    fn format_frames<R>(
+    fn append_folded_frame_labels<R>(
         &self,
         pid: Option<u32>,
         frame: u64,
         symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
-    ) -> Result<Vec<String>, String>
+        rendered: &mut String,
+        render_scratch: &mut String,
+        label_scratch: &mut String,
+    ) -> Result<(), String>
     where
         R: SymbolResolver,
     {
         let symbolizing = symbol_cache.is_some();
         if let Some(mapping) = pid.and_then(|pid| self.mmap_table.resolve(pid, frame)) {
             if is_kernel_space_frame(frame) && !is_kernel_mapping(&mapping) {
-                return Ok(vec![format!("0x{frame:x}")]);
+                label_scratch.clear();
+                write!(label_scratch, "0x{frame:x}").expect("writing to a string cannot fail");
+                append_inferno_perf_frame(rendered, label_scratch, render_scratch);
+                return Ok(());
             }
             if let Some(cache) = symbol_cache {
-                let frames = cache.resolve(&symbol_request(&mapping))?;
+                let request = symbol_request(&mapping);
+                let frames = cache.resolve_ref(&request)?;
                 if frames.is_empty() {
-                    return Ok(vec![symbol_fallback_frame(&mapping)]);
+                    let fallback = symbol_fallback_frame(&mapping);
+                    append_inferno_perf_frame(rendered, &fallback, render_scratch);
+                } else {
+                    for label in frames {
+                        append_inferno_perf_frame(rendered, label, render_scratch);
+                    }
                 }
-                return Ok(frames);
+                return Ok(());
             }
             if is_kernel_space_frame(frame) {
-                return Ok(vec![UNKNOWN_FRAME.to_string()]);
+                append_inferno_perf_frame(rendered, UNKNOWN_FRAME, render_scratch);
+            } else {
+                label_scratch.clear();
+                write!(
+                    label_scratch,
+                    "{}+0x{:x}",
+                    mapping.path, mapping.relative_address
+                )
+                .expect("writing to a string cannot fail");
+                append_inferno_perf_frame(rendered, label_scratch, render_scratch);
             }
-            Ok(vec![mapped_frame_label(&mapping)])
         } else if is_kernel_space_frame(frame) || symbolizing {
-            Ok(vec![UNKNOWN_FRAME.to_string()])
+            append_inferno_perf_frame(rendered, UNKNOWN_FRAME, render_scratch);
         } else {
-            Ok(vec![format!("0x{frame:x}")])
+            label_scratch.clear();
+            write!(label_scratch, "0x{frame:x}").expect("writing to a string cannot fail");
+            append_inferno_perf_frame(rendered, label_scratch, render_scratch);
         }
+        Ok(())
     }
-}
-
-fn folded_comm_label(comm: Option<&str>) -> String {
-    comm.map_or_else(|| UNKNOWN_FRAME.to_string(), |comm| comm.replace(' ', "_"))
 }
 
 fn write_perf_script_frame_for_label<W>(
