@@ -1218,12 +1218,9 @@ where
 
 impl SymbolResolver for RustAddr2lineResolver {
     fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
-        let mut resolved_by_request = BTreeMap::<SymbolRequest, Option<String>>::new();
+        let mut resolved = vec![None; requests.len()];
         for (path, indexes) in grouped_request_indexes(requests) {
             let Ok(loader) = addr2line::Loader::new(&path) else {
-                for index in indexes {
-                    resolved_by_request.insert(requests[index].clone(), None);
-                }
                 continue;
             };
             let object_metadata = self.object_metadata(&path);
@@ -1245,31 +1242,18 @@ impl SymbolResolver for RustAddr2lineResolver {
                         &metadata.object_metadata.debug_names,
                     );
                 }
-                resolved_by_request.insert(request.clone(), symbol);
+                resolved[index] = symbol;
             }
         }
-
-        requests
-            .iter()
-            .map(|request| {
-                resolved_by_request
-                    .get(request)
-                    .cloned()
-                    .ok_or_else(|| "missing rust addr2line result for request".to_string())
-            })
-            .collect()
+        Ok(resolved)
     }
 
     fn resolve_frame_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Vec<String>>, String> {
-        let mut resolved_by_request = BTreeMap::<SymbolRequest, Vec<String>>::new();
+        let mut resolved = vec![Vec::new(); requests.len()];
         for (path, indexes) in grouped_request_indexes(requests) {
-            let Ok(loader) = addr2line::Loader::new(&path) else {
-                for index in indexes {
-                    resolved_by_request.insert(requests[index].clone(), Vec::new());
-                }
-                continue;
-            };
             let object_metadata = self.object_metadata(&path);
+            let mut loader = None;
+            let mut loader_attempted = false;
             for index in indexes {
                 let request = &requests[index];
                 let object_symbol = object_metadata.as_ref().and_then(|metadata| {
@@ -1280,19 +1264,23 @@ impl SymbolResolver for RustAddr2lineResolver {
                 let mut frames = object_metadata
                     .as_ref()
                     .and_then(|resolver| {
-                        resolver.perf_dwarf.as_ref()?.frame_names_for_base_symbol(
-                            request.relative_address,
-                            object_symbol.as_deref(),
-                        )
+                        resolver
+                            .perf_dwarf
+                            .as_ref()?
+                            .frame_names_for_base_symbol(request.relative_address, object_symbol)
                     })
                     .map(perf_inline_frame_order)
-                    .or_else(|| object_symbol.clone().map(|name| vec![name]))
+                    .or_else(|| object_symbol.map(|name| vec![name.to_string()]))
                     .or_else(|| {
-                        loader
+                        rust_addr2line_loader(&path, &mut loader, &mut loader_attempted)?
                             .find_symbol(request.relative_address)
                             .map(|name| vec![demangle_addr2line_name(name)])
                     })
-                    .or_else(|| rust_addr2line_frame_names(&loader, request.relative_address))
+                    .or_else(|| {
+                        rust_addr2line_loader(&path, &mut loader, &mut loader_attempted).and_then(
+                            |loader| rust_addr2line_frame_names(loader, request.relative_address),
+                        )
+                    })
                     .unwrap_or_default();
                 frames = perf_frames_with_object_alias(frames, object_symbol);
                 if let Some(metadata) = &object_metadata {
@@ -1301,19 +1289,10 @@ impl SymbolResolver for RustAddr2lineResolver {
                         &metadata.object_metadata.debug_names,
                     );
                 }
-                resolved_by_request.insert(request.clone(), frames);
+                resolved[index] = frames;
             }
         }
-
-        requests
-            .iter()
-            .map(|request| {
-                resolved_by_request
-                    .get(request)
-                    .cloned()
-                    .ok_or_else(|| "missing rust addr2line frame result for request".to_string())
-            })
-            .collect()
+        Ok(resolved)
     }
 }
 
@@ -1321,30 +1300,27 @@ fn demangle_addr2line_name(name: &str) -> String {
     perf_dwarf_function_name(&addr2line::demangle_auto(Cow::Borrowed(name), None))
 }
 
-fn perf_name_with_object_alias(
-    name: Option<String>,
-    object_alias: Option<String>,
-) -> Option<String> {
+fn perf_name_with_object_alias(name: Option<String>, object_alias: Option<&str>) -> Option<String> {
     match (name, object_alias) {
         (Some(name), Some(object_alias))
-            if perf_object_alias_improves_name(&name, &object_alias) =>
+            if perf_object_alias_improves_name(&name, object_alias) =>
         {
-            Some(object_alias)
+            Some(object_alias.to_string())
         }
         (Some(name), _) => Some(name),
-        (None, object_alias) => object_alias,
+        (None, object_alias) => object_alias.map(str::to_string),
     }
 }
 
 fn perf_frames_with_object_alias(
     mut frames: Vec<String>,
-    object_alias: Option<String>,
+    object_alias: Option<&str>,
 ) -> Vec<String> {
     if frames.len() == 1
         && let Some(alias) = object_alias
-        && perf_object_alias_improves_name(&frames[0], &alias)
+        && perf_object_alias_improves_name(&frames[0], alias)
     {
-        frames[0] = alias;
+        frames[0] = alias.to_string();
     }
     frames
 }
@@ -1427,7 +1403,7 @@ impl PreparedObjectMetadata {
         }
     }
 
-    fn object_symbol(&self, address: u64) -> Option<String> {
+    fn object_symbol(&self, address: u64) -> Option<&str> {
         self.object_symbols.symbol_name(address)
     }
 }
@@ -1458,7 +1434,7 @@ impl PerfObjectSymbolIndex {
         Self { symbols }
     }
 
-    fn symbol_name(&self, address: u64) -> Option<String> {
+    fn symbol_name(&self, address: u64) -> Option<&str> {
         let mut best = None::<&PerfSymbolCandidate>;
         for candidate in &self.symbols {
             if !perf_symbol_candidate_contains_address(candidate, address) {
@@ -1472,8 +1448,20 @@ impl PerfObjectSymbolIndex {
                 _ => candidate,
             });
         }
-        best.map(|candidate| candidate.name.clone())
+        best.map(|candidate| candidate.name.as_str())
     }
+}
+
+fn rust_addr2line_loader<'a>(
+    path: &Path,
+    loader: &'a mut Option<addr2line::Loader>,
+    loader_attempted: &mut bool,
+) -> Option<&'a addr2line::Loader> {
+    if !*loader_attempted {
+        *loader = addr2line::Loader::new(path).ok();
+        *loader_attempted = true;
+    }
+    loader.as_ref()
 }
 
 fn rust_addr2line_frame_name(loader: &addr2line::Loader, address: u64) -> Option<String> {
@@ -1871,15 +1859,18 @@ fn specialize_symbol_from_debug_strings(
 ) {
     if let Some(symbol) = symbol
         && let Some(specialized) = debug_names.get(symbol)
+        && specialized != symbol
     {
-        *symbol = specialized;
+        *symbol = specialized.to_string();
     }
 }
 
 fn specialize_frames_from_debug_strings(frames: &mut [String], debug_names: &DebugStringNameIndex) {
     for frame in frames {
-        if let Some(specialized) = debug_names.get(frame) {
-            *frame = specialized;
+        if let Some(specialized) = debug_names.get(frame)
+            && specialized != frame
+        {
+            *frame = specialized.to_string();
         }
     }
 }
@@ -1944,13 +1935,15 @@ impl DebugStringNameIndex {
         index
     }
 
-    fn get(&self, function_leaf: &str) -> Option<String> {
+    fn get(&self, function_leaf: &str) -> Option<&str> {
         if function_leaf.is_empty() {
             return None;
         }
         let normalized = perf_dwarf_function_name(function_leaf);
         let lookup_leaf = generic_function_leaf(&normalized).unwrap_or(&normalized);
-        self.names_by_leaf.get(lookup_leaf).cloned().flatten()
+        self.names_by_leaf
+            .get(lookup_leaf)
+            .and_then(Option::as_deref)
     }
 }
 
@@ -1959,7 +1952,9 @@ pub fn more_specific_dwarf_name_from_debug_strings(
     function_leaf: &str,
     object_bytes: &[u8],
 ) -> Option<String> {
-    DebugStringNameIndex::from_object_bytes(object_bytes).get(function_leaf)
+    DebugStringNameIndex::from_object_bytes(object_bytes)
+        .get(function_leaf)
+        .map(str::to_string)
 }
 
 fn generic_function_leaf(name: &str) -> Option<&str> {
@@ -2242,13 +2237,13 @@ mod tests {
     #[test]
     fn perf_object_alias_only_replaces_more_underscored_frame_names() {
         assert_eq!(
-            perf_frames_with_object_alias(vec!["__read".to_string()], Some("read".to_string())),
+            perf_frames_with_object_alias(vec!["__read".to_string()], Some("read")),
             vec!["read".to_string()]
         );
         assert_eq!(
             perf_frames_with_object_alias(
                 vec!["alloc::collections::btree::map::IntoIter<K,V,A>::dying_next".to_string()],
-                Some("dying_next<u64, alloc::string::String, alloc::alloc::Global>".to_string())
+                Some("dying_next<u64, alloc::string::String, alloc::alloc::Global>")
             ),
             vec!["alloc::collections::btree::map::IntoIter<K,V,A>::dying_next".to_string()]
         );
