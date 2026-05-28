@@ -2,10 +2,12 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use clap::ValueEnum;
+use hashbrown::HashMap;
 use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol, SymbolKind};
+use rustc_hash::FxBuildHasher;
 use serde::Serialize;
 
 use crate::perfdata::build_id::kernel_build_id_from_perfdata;
@@ -76,8 +78,10 @@ pub enum SymbolizerKind {
     RustAddr2line,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct RustAddr2lineResolver;
+#[derive(Default)]
+pub struct RustAddr2lineResolver {
+    metadata_cache: OnceLock<Mutex<BTreeMap<PathBuf, Option<Arc<CachedObjectMetadata>>>>>,
+}
 
 #[derive(Default)]
 struct ObjectAddressCache {
@@ -91,8 +95,11 @@ struct ObjectSegmentRange {
 }
 
 struct PerfDwarfNameResolver {
+    names: Vec<String>,
     units: Vec<PerfDwarfUnitIndex>,
 }
+
+type PerfDwarfNameId = u32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PerfAddressRange {
@@ -110,14 +117,14 @@ struct PerfDwarfUnitIndex {
 struct PerfDwarfDieNode {
     kind: PerfDwarfDieKind,
     ranges: Vec<PerfAddressRange>,
-    name: Option<String>,
+    name: Option<PerfDwarfNameId>,
     children: Vec<PerfDwarfDieNode>,
 }
 
 #[derive(Debug)]
 struct PerfDwarfFrameRange {
     range: PerfAddressRange,
-    frames: Arc<[String]>,
+    frames: Arc<[PerfDwarfNameId]>,
     base_symbol_sensitive: bool,
 }
 
@@ -133,6 +140,11 @@ struct PreparedObjectMetadata {
     debug_names: DebugStringNameIndex,
 }
 
+struct CachedObjectMetadata {
+    object_metadata: PreparedObjectMetadata,
+    perf_dwarf: Option<PerfDwarfNameResolver>,
+}
+
 #[derive(Default)]
 struct PerfObjectSymbolIndex {
     symbols: Vec<PerfSymbolCandidate>,
@@ -146,7 +158,8 @@ pub struct PerfSymbolResolver<O> {
     live_kallsyms: Option<Kallsyms>,
     live_kallsyms_path: Option<PathBuf>,
     live_kallsyms_cache: OnceLock<Option<Kallsyms>>,
-    live_module_kallsyms_cache: OnceLock<BTreeMap<String, Arc<Kallsyms>>>,
+    live_module_kallsyms_text_cache: OnceLock<Option<Arc<String>>>,
+    live_module_kallsyms_cache: Mutex<BTreeMap<String, Option<Arc<Kallsyms>>>>,
     system_map_kallsyms: Option<Kallsyms>,
     system_map_candidates: Vec<PathBuf>,
     system_map_kallsyms_cache: OnceLock<Option<Kallsyms>>,
@@ -352,7 +365,44 @@ where
 impl RustAddr2lineResolver {
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    fn object_metadata(&self, path: &Path) -> Option<Arc<CachedObjectMetadata>> {
+        let cache = self
+            .metadata_cache
+            .get_or_init(|| Mutex::new(BTreeMap::new()));
+        if let Some(cached) = cache
+            .lock()
+            .expect("rust addr2line metadata cache lock")
+            .get(path)
+            .cloned()
+        {
+            return cached;
+        }
+
+        let loaded = std::fs::read(path).ok().map(|bytes| {
+            Arc::new(CachedObjectMetadata {
+                object_metadata: PreparedObjectMetadata::from_object_bytes(&bytes),
+                perf_dwarf: PerfDwarfNameResolver::from_object_bytes(&bytes).ok(),
+            })
+        });
+
+        let mut cache = cache.lock().expect("rust addr2line metadata cache lock");
+        cache
+            .entry(path.to_path_buf())
+            .or_insert_with(|| loaded.clone())
+            .clone()
+    }
+
+    #[cfg(test)]
+    fn cached_object_count(&self) -> usize {
+        self.metadata_cache.get().map_or(0, |cache| {
+            cache
+                .lock()
+                .expect("rust addr2line metadata cache lock")
+                .len()
+        })
     }
 }
 
@@ -403,7 +453,8 @@ where
             live_kallsyms: None,
             live_kallsyms_path: None,
             live_kallsyms_cache: OnceLock::new(),
-            live_module_kallsyms_cache: OnceLock::new(),
+            live_module_kallsyms_text_cache: OnceLock::new(),
+            live_module_kallsyms_cache: Mutex::new(BTreeMap::new()),
             system_map_kallsyms: None,
             system_map_candidates: Vec::new(),
             system_map_kallsyms_cache: OnceLock::new(),
@@ -948,22 +999,39 @@ where
         })
     }
 
-    fn live_module_kallsyms_for_path(&self, module_path: &str) -> Option<&Kallsyms> {
-        if let Some(kallsyms) = &self.live_kallsyms {
-            return Some(kallsyms);
-        }
+    fn live_module_kallsyms_for_path(&self, module_path: &str) -> Option<Arc<Kallsyms>> {
         if !is_kernel_module_symbol_path_str(module_path) {
             return None;
         }
-        self.live_module_kallsyms_cache
+        if let Some(cached) = self
+            .live_module_kallsyms_cache
+            .lock()
+            .expect("live module kallsyms cache lock")
+            .get(module_path)
+            .cloned()
+        {
+            return cached;
+        }
+
+        let text = self
+            .live_module_kallsyms_text_cache
             .get_or_init(|| {
                 self.live_kallsyms_path
                     .as_ref()
                     .and_then(|path| std::fs::read_to_string(path).ok())
-                    .map_or_else(BTreeMap::new, |text| parse_module_kallsyms_by_path(&text))
+                    .map(Arc::new)
             })
-            .get(module_path)
-            .map(Arc::as_ref)
+            .clone();
+        let parsed = text.and_then(|text| {
+            Kallsyms::parse_modules_for_path(text.as_ref(), module_path)
+                .ok()
+                .map(Arc::new)
+        });
+        self.live_module_kallsyms_cache
+            .lock()
+            .expect("live module kallsyms cache lock")
+            .insert(module_path.to_string(), parsed.clone());
+        parsed
     }
 
     fn system_map_kallsyms_ref(&self) -> Option<&Kallsyms> {
@@ -980,11 +1048,16 @@ where
 
     fn resolve_kernel_symbol(&self, request: &SymbolRequest) -> Option<String> {
         if is_kernel_module_symbol_path(&request.path) {
-            request
-                .path
-                .to_str()
-                .and_then(|module_path| self.live_module_kallsyms_for_path(module_path))
+            self.live_kallsyms
+                .as_ref()
                 .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
+                .or_else(|| {
+                    request
+                        .path
+                        .to_str()
+                        .and_then(|module_path| self.live_module_kallsyms_for_path(module_path))
+                        .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms.as_ref(), request))
+                })
                 .or_else(|| {
                     self.kallsyms
                         .as_ref()
@@ -1127,20 +1200,25 @@ impl SymbolResolver for RustAddr2lineResolver {
                 }
                 continue;
             };
-            let object_bytes = std::fs::read(&path).ok();
-            let object_metadata = object_bytes
-                .as_deref()
-                .map(PreparedObjectMetadata::from_object_bytes)
-                .unwrap_or_default();
+            let object_metadata = self.object_metadata(&path);
             for index in indexes {
                 let request = &requests[index];
-                let object_symbol = object_metadata.object_symbol(request.relative_address);
+                let object_symbol = object_metadata.as_ref().and_then(|metadata| {
+                    metadata
+                        .object_metadata
+                        .object_symbol(request.relative_address)
+                });
                 let symbol = loader
                     .find_symbol(request.relative_address)
                     .map(demangle_addr2line_name)
                     .or_else(|| rust_addr2line_frame_name(&loader, request.relative_address));
                 let mut symbol = perf_name_with_object_alias(symbol, object_symbol);
-                specialize_symbol_from_debug_strings(&mut symbol, &object_metadata.debug_names);
+                if let Some(metadata) = &object_metadata {
+                    specialize_symbol_from_debug_strings(
+                        &mut symbol,
+                        &metadata.object_metadata.debug_names,
+                    );
+                }
                 resolved_by_request.insert(request.clone(), symbol);
             }
         }
@@ -1165,21 +1243,18 @@ impl SymbolResolver for RustAddr2lineResolver {
                 }
                 continue;
             };
-            let object_bytes = std::fs::read(&path).ok();
-            let object_metadata = object_bytes
-                .as_deref()
-                .map(PreparedObjectMetadata::from_object_bytes)
-                .unwrap_or_default();
-            let perf_dwarf = object_bytes
-                .as_deref()
-                .and_then(|bytes| PerfDwarfNameResolver::from_object_bytes(bytes).ok());
+            let object_metadata = self.object_metadata(&path);
             for index in indexes {
                 let request = &requests[index];
-                let object_symbol = object_metadata.object_symbol(request.relative_address);
-                let mut frames = perf_dwarf
+                let object_symbol = object_metadata.as_ref().and_then(|metadata| {
+                    metadata
+                        .object_metadata
+                        .object_symbol(request.relative_address)
+                });
+                let mut frames = object_metadata
                     .as_ref()
                     .and_then(|resolver| {
-                        resolver.frame_names_for_base_symbol(
+                        resolver.perf_dwarf.as_ref()?.frame_names_for_base_symbol(
                             request.relative_address,
                             object_symbol.as_deref(),
                         )
@@ -1194,7 +1269,12 @@ impl SymbolResolver for RustAddr2lineResolver {
                     .or_else(|| rust_addr2line_frame_names(&loader, request.relative_address))
                     .unwrap_or_default();
                 frames = perf_frames_with_object_alias(frames, object_symbol);
-                specialize_frames_from_debug_strings(&mut frames, &object_metadata.debug_names);
+                if let Some(metadata) = &object_metadata {
+                    specialize_frames_from_debug_strings(
+                        &mut frames,
+                        &metadata.object_metadata.debug_names,
+                    );
+                }
                 resolved_by_request.insert(request.clone(), frames);
             }
         }
@@ -1414,6 +1494,7 @@ impl PerfDwarfNameResolver {
         } else {
             gimli::RunTimeEndian::Big
         };
+        let mut names = PerfDwarfNameInterner::default();
         let dwarf_sections = gimli::DwarfSections::load(|id| {
             Ok::<_, gimli::Error>(
                 object
@@ -1430,13 +1511,16 @@ impl PerfDwarfNameResolver {
             let Ok(unit) = dwarf.unit(header) else {
                 continue;
             };
-            let roots = perf_dwarf_unit_roots(&dwarf, &unit);
+            let roots = perf_dwarf_unit_roots(&dwarf, &unit, &mut names);
             units.push(PerfDwarfUnitIndex {
                 ranges: perf_dwarf_ranges(dwarf.unit_ranges(&unit).ok()),
                 segments: perf_dwarf_frame_ranges_from_roots(&roots),
             });
         }
-        Ok(Self { units })
+        Ok(Self {
+            names: names.into_names(),
+            units,
+        })
     }
 
     fn frame_names(&self, address: u64) -> Option<Vec<String>> {
@@ -1453,7 +1537,7 @@ impl PerfDwarfNameResolver {
                 continue;
             }
             if let Some(frames) =
-                perf_dwarf_frame_names_from_index(&unit.segments, address, base_symbol)
+                perf_dwarf_frame_names_from_index(&unit.segments, &self.names, address, base_symbol)
             {
                 return Some(frames);
             }
@@ -1462,7 +1546,11 @@ impl PerfDwarfNameResolver {
     }
 }
 
-fn perf_dwarf_unit_roots<R>(dwarf: &gimli::Dwarf<R>, unit: &gimli::Unit<R>) -> Vec<PerfDwarfDieNode>
+fn perf_dwarf_unit_roots<R>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    names: &mut PerfDwarfNameInterner,
+) -> Vec<PerfDwarfDieNode>
 where
     R: gimli::Reader,
 {
@@ -1475,7 +1563,7 @@ where
     let mut roots = Vec::new();
     let mut children = root.children();
     while let Ok(Some(child)) = children.next() {
-        perf_dwarf_collect_relevant_nodes(dwarf, unit, child, &mut roots);
+        perf_dwarf_collect_relevant_nodes(dwarf, unit, child, names, &mut roots);
     }
     roots
 }
@@ -1484,6 +1572,7 @@ fn perf_dwarf_collect_relevant_nodes<R>(
     dwarf: &gimli::Dwarf<R>,
     unit: &gimli::Unit<R>,
     node: gimli::EntriesTreeNode<'_, '_, R>,
+    names: &mut PerfDwarfNameInterner,
     out: &mut Vec<PerfDwarfDieNode>,
 ) where
     R: gimli::Reader,
@@ -1497,13 +1586,14 @@ fn perf_dwarf_collect_relevant_nodes<R>(
     let ranges = kind
         .map(|_| perf_dwarf_ranges(dwarf.die_ranges(unit, node.entry()).ok()).unwrap_or_default());
     let name = kind.and_then(|_| {
-        perf_dwarf_die_name(dwarf, unit, node.entry()).map(|name| perf_dwarf_function_name(&name))
+        perf_dwarf_die_name(dwarf, unit, node.entry())
+            .map(|name| names.intern(perf_dwarf_function_name(&name)))
     });
     if let Some(kind) = kind {
         let mut children = Vec::new();
         let mut child_iter = node.children();
         while let Ok(Some(child)) = child_iter.next() {
-            perf_dwarf_collect_relevant_nodes(dwarf, unit, child, &mut children);
+            perf_dwarf_collect_relevant_nodes(dwarf, unit, child, names, &mut children);
         }
         out.push(PerfDwarfDieNode {
             kind,
@@ -1515,7 +1605,7 @@ fn perf_dwarf_collect_relevant_nodes<R>(
     }
     let mut child_iter = node.children();
     while let Ok(Some(child)) = child_iter.next() {
-        perf_dwarf_collect_relevant_nodes(dwarf, unit, child, out);
+        perf_dwarf_collect_relevant_nodes(dwarf, unit, child, names, out);
     }
 }
 
@@ -1548,7 +1638,7 @@ fn perf_dwarf_ranges_contain(ranges: &[PerfAddressRange], address: u64) -> bool 
 
 fn perf_dwarf_frame_ranges_from_roots(roots: &[PerfDwarfDieNode]) -> Vec<PerfDwarfFrameRange> {
     let mut segments = Vec::new();
-    let root_frames: Arc<[String]> = Arc::from([]);
+    let root_frames: Arc<[PerfDwarfNameId]> = Arc::from([]);
     for root in roots {
         perf_dwarf_collect_frame_ranges(root, &root_frames, &mut segments);
     }
@@ -1558,10 +1648,10 @@ fn perf_dwarf_frame_ranges_from_roots(roots: &[PerfDwarfDieNode]) -> Vec<PerfDwa
 
 fn perf_dwarf_collect_frame_ranges(
     node: &PerfDwarfDieNode,
-    parent_frames: &Arc<[String]>,
+    parent_frames: &Arc<[PerfDwarfNameId]>,
     out: &mut Vec<PerfDwarfFrameRange>,
 ) -> Vec<PerfAddressRange> {
-    let frames = perf_dwarf_node_frames(parent_frames, node.name.as_ref());
+    let frames = perf_dwarf_node_frames(parent_frames, node.name);
 
     let mut child_coverage = Vec::new();
     for child in &node.children {
@@ -1582,11 +1672,14 @@ fn perf_dwarf_collect_frame_ranges(
     perf_dwarf_merge_ranges(node.ranges.clone())
 }
 
-fn perf_dwarf_node_frames(parent_frames: &Arc<[String]>, name: Option<&String>) -> Arc<[String]> {
+fn perf_dwarf_node_frames(
+    parent_frames: &Arc<[PerfDwarfNameId]>,
+    name: Option<PerfDwarfNameId>,
+) -> Arc<[PerfDwarfNameId]> {
     name.map_or(parent_frames.clone(), |name| {
         let mut frames = Vec::with_capacity(parent_frames.len() + 1);
-        frames.extend(parent_frames.iter().cloned());
-        frames.push(name.clone());
+        frames.extend(parent_frames.iter().copied());
+        frames.push(name);
         Arc::from(frames)
     })
 }
@@ -1653,6 +1746,7 @@ fn perf_dwarf_subtract_ranges(
 
 fn perf_dwarf_frame_names_from_index(
     segments: &[PerfDwarfFrameRange],
+    names: &[String],
     address: u64,
     base_symbol: Option<&str>,
 ) -> Option<Vec<String>> {
@@ -1668,11 +1762,17 @@ fn perf_dwarf_frame_names_from_index(
         && !segment
             .frames
             .first()
+            .and_then(|name| names.get(usize::try_from(*name).ok()?))
             .is_some_and(|name| perf_realfunc_name_replaces_base_symbol(name, base_symbol))
     {
         return None;
     }
-    let mut frames = segment.frames.as_ref().to_vec();
+    let mut frames = segment
+        .frames
+        .iter()
+        .filter_map(|name| names.get(usize::try_from(*name).ok()?))
+        .cloned()
+        .collect::<Vec<_>>();
     frames.reverse();
     Some(frames)
 }
@@ -1761,6 +1861,28 @@ fn specialize_frames_from_debug_strings(frames: &mut [String], debug_names: &Deb
 #[derive(Default)]
 struct DebugStringNameIndex {
     names_by_leaf: BTreeMap<String, Option<String>>,
+}
+
+#[derive(Default)]
+struct PerfDwarfNameInterner {
+    names: Vec<String>,
+    ids_by_name: HashMap<String, PerfDwarfNameId, FxBuildHasher>,
+}
+
+impl PerfDwarfNameInterner {
+    fn intern(&mut self, name: String) -> PerfDwarfNameId {
+        if let Some(&id) = self.ids_by_name.get(name.as_str()) {
+            return id;
+        }
+        let id = PerfDwarfNameId::try_from(self.names.len()).expect("dwarf name table fits in u32");
+        self.ids_by_name.insert(name.clone(), id);
+        self.names.push(name);
+        id
+    }
+
+    fn into_names(self) -> Vec<String> {
+        self.names
+    }
 }
 
 impl DebugStringNameIndex {
@@ -2012,32 +2134,6 @@ fn insert_kallsyms_symbol(
     addresses_by_name.entry(symbol).or_insert(address);
 }
 
-fn parse_module_kallsyms_by_path(text: &str) -> BTreeMap<String, Arc<Kallsyms>> {
-    let mut grouped = BTreeMap::<String, (BTreeMap<u64, String>, BTreeMap<String, u64>)>::new();
-    for (address, symbol, module) in text.lines().filter_map(parse_module_kallsyms_line) {
-        if address == 0 {
-            continue;
-        }
-        let (symbols, addresses_by_name) = grouped
-            .entry(module)
-            .or_insert_with(|| (BTreeMap::new(), BTreeMap::new()));
-        insert_kallsyms_symbol(symbols, addresses_by_name, address, symbol);
-    }
-
-    grouped
-        .into_iter()
-        .filter_map(|(module, (symbols, addresses_by_name))| {
-            (!symbols.is_empty()).then_some((
-                module,
-                Arc::new(Kallsyms {
-                    symbols,
-                    addresses_by_name,
-                }),
-            ))
-        })
-        .collect()
-}
-
 fn perf_build_id_kallsyms_paths(debug_dir: &Path, build_id: &str) -> [PathBuf; 2] {
     let base = debug_dir.join("[kernel.kallsyms]").join(build_id);
     [base.join("kallsyms"), base]
@@ -2065,11 +2161,12 @@ fn parse_module_kallsyms_line(line: &str) -> Option<(u64, String, String)> {
 mod tests {
     use std::sync::Arc;
 
-    use object::{Object, ObjectSegment};
+    use object::{Object, ObjectSegment, ObjectSymbol};
 
     use super::{
-        PerfAddressRange, PerfDwarfDieKind, PerfDwarfDieNode, PerfSymbolBinding,
-        PerfSymbolCandidate, clean_object_symbol_request, perf_best_duplicate_symbol,
+        PerfAddressRange, PerfDwarfDieKind, PerfDwarfDieNode, PerfDwarfNameInterner,
+        PerfSymbolBinding, PerfSymbolCandidate, RustAddr2lineResolver, SymbolRequest,
+        SymbolResolver, clean_object_symbol_request, perf_best_duplicate_symbol,
         perf_dwarf_frame_names_from_index, perf_dwarf_frame_ranges_from_roots,
         perf_frames_with_object_alias,
     };
@@ -2132,67 +2229,76 @@ mod tests {
 
     #[test]
     fn flattened_dwarf_ranges_share_frame_slices_for_the_same_node() {
+        let mut names = PerfDwarfNameInterner::default();
         let segments = perf_dwarf_frame_ranges_from_roots(&[PerfDwarfDieNode {
             kind: PerfDwarfDieKind::Subprogram,
             ranges: vec![test_range(0, 100)],
-            name: Some("outer".to_string()),
+            name: Some(names.intern("outer".to_string())),
             children: vec![PerfDwarfDieNode {
                 kind: PerfDwarfDieKind::Inline,
                 ranges: vec![test_range(10, 20)],
-                name: Some("inner".to_string()),
+                name: Some(names.intern("inner".to_string())),
                 children: Vec::new(),
             }],
         }]);
 
         assert_eq!(segments.len(), 3);
-        assert_eq!(segments[0].frames.as_ref(), &["outer".to_string()]);
         assert_eq!(
-            segments[1].frames.as_ref(),
-            &["outer".to_string(), "inner".to_string()]
+            frame_names(&names, &segments[0].frames),
+            vec!["outer".to_string()]
         );
-        assert_eq!(segments[2].frames.as_ref(), &["outer".to_string()]);
+        assert_eq!(
+            frame_names(&names, &segments[1].frames),
+            vec!["outer".to_string(), "inner".to_string()]
+        );
+        assert_eq!(
+            frame_names(&names, &segments[2].frames),
+            vec!["outer".to_string()]
+        );
         assert!(Arc::ptr_eq(&segments[0].frames, &segments[2].frames));
         assert!(!Arc::ptr_eq(&segments[0].frames, &segments[1].frames));
     }
 
     #[test]
     fn flattened_dwarf_lookup_keeps_inline_and_base_symbol_rules() {
+        let mut names = PerfDwarfNameInterner::default();
         let segments = perf_dwarf_frame_ranges_from_roots(&[PerfDwarfDieNode {
             kind: PerfDwarfDieKind::Subprogram,
             ranges: vec![test_range(0, 100)],
-            name: Some("outer".to_string()),
+            name: Some(names.intern("outer".to_string())),
             children: vec![PerfDwarfDieNode {
                 kind: PerfDwarfDieKind::Inline,
                 ranges: vec![test_range(10, 20)],
-                name: Some("inner".to_string()),
+                name: Some(names.intern("inner".to_string())),
                 children: Vec::new(),
             }],
         }]);
 
         assert_eq!(
-            perf_dwarf_frame_names_from_index(&segments, 15, Some("outer")),
+            perf_dwarf_frame_names_from_index(&segments, &names.names, 15, Some("outer")),
             Some(vec!["inner".to_string(), "outer".to_string()])
         );
         assert_eq!(
-            perf_dwarf_frame_names_from_index(&segments, 5, Some("outer")),
+            perf_dwarf_frame_names_from_index(&segments, &names.names, 5, Some("outer")),
             None
         );
         assert_eq!(
-            perf_dwarf_frame_names_from_index(&segments, 5, Some("different_base")),
+            perf_dwarf_frame_names_from_index(&segments, &names.names, 5, Some("different_base")),
             Some(vec!["outer".to_string()])
         );
         assert_eq!(
-            perf_dwarf_frame_names_from_index(&segments, 150, None),
+            perf_dwarf_frame_names_from_index(&segments, &names.names, 150, None),
             None
         );
     }
 
     #[test]
     fn flattened_dwarf_lookup_ignores_unnamed_intermediate_nodes() {
+        let mut names = PerfDwarfNameInterner::default();
         let segments = perf_dwarf_frame_ranges_from_roots(&[PerfDwarfDieNode {
             kind: PerfDwarfDieKind::Subprogram,
             ranges: vec![test_range(0, 100)],
-            name: Some("outer".to_string()),
+            name: Some(names.intern("outer".to_string())),
             children: vec![PerfDwarfDieNode {
                 kind: PerfDwarfDieKind::Inline,
                 ranges: vec![test_range(20, 80)],
@@ -2200,16 +2306,62 @@ mod tests {
                 children: vec![PerfDwarfDieNode {
                     kind: PerfDwarfDieKind::Inline,
                     ranges: vec![test_range(30, 40)],
-                    name: Some("inner".to_string()),
+                    name: Some(names.intern("inner".to_string())),
                     children: Vec::new(),
                 }],
             }],
         }]);
 
         assert_eq!(
-            perf_dwarf_frame_names_from_index(&segments, 35, Some("outer")),
+            perf_dwarf_frame_names_from_index(&segments, &names.names, 35, Some("outer")),
             Some(vec!["inner".to_string(), "outer".to_string()])
         );
+    }
+
+    #[test]
+    fn rust_addr2line_resolver_reuses_cached_object_metadata_across_batches() {
+        let path = std::env::current_exe().expect("current test binary");
+        let bytes = std::fs::read(&path).expect("current test binary bytes");
+        let object = object::File::parse(bytes.as_slice()).expect("current test binary object");
+        let addresses = object
+            .symbols()
+            .filter(|symbol| symbol.address() != 0 && symbol.kind() == object::SymbolKind::Text)
+            .map(|symbol| symbol.address())
+            .take(2)
+            .collect::<Vec<_>>();
+        if addresses.len() < 2 {
+            return;
+        }
+
+        let resolver = RustAddr2lineResolver::new();
+        resolver
+            .resolve_frame_batch(&[SymbolRequest {
+                path: path.clone(),
+                relative_address: addresses[0],
+                build_id: None,
+                file_identity: None,
+                kernel_relocation: None,
+            }])
+            .expect("first resolve");
+        assert_eq!(resolver.cached_object_count(), 1);
+
+        resolver
+            .resolve_frame_batch(&[SymbolRequest {
+                path,
+                relative_address: addresses[1],
+                build_id: None,
+                file_identity: None,
+                kernel_relocation: None,
+            }])
+            .expect("second resolve");
+        assert_eq!(resolver.cached_object_count(), 1);
+    }
+
+    fn frame_names(names: &PerfDwarfNameInterner, frames: &[u32]) -> Vec<String> {
+        frames
+            .iter()
+            .map(|name| names.names[*name as usize].clone())
+            .collect()
     }
 
     fn test_range(begin: u64, end: u64) -> PerfAddressRange {

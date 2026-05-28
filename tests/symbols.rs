@@ -478,7 +478,7 @@ fn rust_addr2line_resolver_uses_perf_dwarf_names_for_inline_frames() {
         return;
     };
 
-    let resolver = RustAddr2lineResolver;
+    let resolver = RustAddr2lineResolver::new();
     let frames = resolver
         .resolve_frame_batch(&[SymbolRequest {
             path: profiling_binary.clone(),
@@ -508,7 +508,7 @@ fn rust_addr2line_resolver_uses_object_symbol_for_non_inline_frames_like_perf_sc
         return;
     };
 
-    let resolver = RustAddr2lineResolver;
+    let resolver = RustAddr2lineResolver::new();
     let frames = resolver
         .resolve_frame_batch(&[SymbolRequest {
             path: profiling_binary.clone(),
@@ -547,7 +547,7 @@ fn rust_addr2line_resolver_replaces_base_symbol_when_perf_inline_name_differs() 
         return;
     };
 
-    let resolver = RustAddr2lineResolver;
+    let resolver = RustAddr2lineResolver::new();
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
             path: profiling_binary,
@@ -609,7 +609,9 @@ fn rust_resolved_frames_for_text_symbols(
         .take(512)
         .collect::<Vec<_>>();
     let requests = symbol_requests(profiling_binary, &addresses);
-    let resolved = RustAddr2lineResolver.resolve_frame_batch(&requests).ok()?;
+    let resolved = RustAddr2lineResolver::new()
+        .resolve_frame_batch(&requests)
+        .ok()?;
     Some(addresses.into_iter().zip(resolved).collect())
 }
 
@@ -622,7 +624,7 @@ fn rust_resolved_symbols_for_text_symbols(
         .take(512)
         .collect::<Vec<_>>();
     let requests = symbol_requests(profiling_binary, &addresses);
-    let resolved = RustAddr2lineResolver.resolve_batch(&requests).ok()?;
+    let resolved = RustAddr2lineResolver::new().resolve_batch(&requests).ok()?;
     Some(addresses.into_iter().zip(resolved).collect())
 }
 

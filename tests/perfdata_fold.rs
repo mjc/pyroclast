@@ -6,7 +6,8 @@ use pyroclast::perfdata::fold::{
 };
 use pyroclast::perfdata::mappings::FileIdentity;
 use pyroclast::perfdata::records::{
-    PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_CPUMODE_KERNEL, PERF_RECORD_MISC_CPUMODE_USER,
+    PERF_RECORD_FINISHED_ROUND, PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_CPUMODE_KERNEL,
+    PERF_RECORD_MISC_CPUMODE_USER,
 };
 use pyroclast::perfdata::samples::{
     PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP,
@@ -1193,6 +1194,102 @@ fn folds_perfdata_from_file_path() {
 }
 
 #[test]
+fn applies_comm_records_by_perf_timestamp_from_file_path_like_perf_script() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_flags(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CALLCHAIN,
+            1 << 18,
+        )],
+        [
+            record_bytes(3, &comm_payload(11, 12, "perf-exec")),
+            record_bytes(9, &sample_payload_with_time(0x1000, 11, 12, 30, [0x2000])),
+            record_bytes_with_misc(
+                3,
+                PERF_RECORD_MISC_COMM_EXEC,
+                &comm_payload_with_sample_id_time(11, 11, "pyroclast", 20),
+            ),
+            record_bytes(PERF_RECORD_FINISHED_ROUND, b""),
+        ],
+    );
+    std::fs::write(&perfdata, bytes).expect("write perfdata");
+
+    let folded =
+        fold_perfdata_file_with_options(&perfdata, FoldOptions::default()).expect("folded");
+
+    assert_eq!(folded, "pyroclast;0x2000 1\n");
+}
+
+#[test]
+fn folds_only_first_encountered_event_type_from_file_path_like_inferno_collapse_perf() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    let attr1 = file_attr_bytes_with_ids(
+        PERF_SAMPLE_IDENTIFIER
+            | PERF_SAMPLE_IP
+            | PERF_SAMPLE_TID
+            | PERF_SAMPLE_TIME
+            | PERF_SAMPLE_PERIOD
+            | PERF_SAMPLE_CALLCHAIN,
+        392,
+        [111],
+    );
+    let attr2 = file_attr_bytes_with_ids(
+        PERF_SAMPLE_IDENTIFIER
+            | PERF_SAMPLE_IP
+            | PERF_SAMPLE_TID
+            | PERF_SAMPLE_TIME
+            | PERF_SAMPLE_PERIOD
+            | PERF_SAMPLE_CALLCHAIN,
+        400,
+        [222],
+    );
+    let bytes = perfdata_with_attrs_ids_and_records(
+        [attr1, attr2],
+        [111, 222],
+        [
+            record_bytes(
+                9,
+                &sample_payload_with_identifier_time_and_period(
+                    222,
+                    0x1000,
+                    11,
+                    12,
+                    30,
+                    2,
+                    [0x2222],
+                ),
+            ),
+            record_bytes(
+                9,
+                &sample_payload_with_identifier_time_and_period(
+                    111,
+                    0x1000,
+                    11,
+                    12,
+                    20,
+                    1,
+                    [0x1111],
+                ),
+            ),
+            record_bytes(PERF_RECORD_FINISHED_ROUND, b""),
+        ],
+    );
+    std::fs::write(&perfdata, bytes).expect("write perfdata");
+
+    let folded = fold_perfdata_file_with_options(
+        &perfdata,
+        FoldOptions {
+            count_periods: true,
+        },
+    )
+    .expect("folded");
+
+    assert_eq!(folded, "[unknown];0x1111 1\n");
+}
+
+#[test]
 fn folds_mapped_user_frames_as_file_relative_addresses() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
@@ -1977,6 +2074,29 @@ fn sample_payload_with_identifier_and_period<const N: usize>(
     payload.extend(ip.to_le_bytes());
     payload.extend(pid.to_le_bytes());
     payload.extend(tid.to_le_bytes());
+    payload.extend(period.to_le_bytes());
+    payload.extend((callchain.len() as u64).to_le_bytes());
+    for frame in callchain {
+        payload.extend(frame.to_le_bytes());
+    }
+    payload
+}
+
+fn sample_payload_with_identifier_time_and_period<const N: usize>(
+    identifier: u64,
+    ip: u64,
+    pid: u32,
+    tid: u32,
+    time: u64,
+    period: u64,
+    callchain: [u64; N],
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(identifier.to_le_bytes());
+    payload.extend(ip.to_le_bytes());
+    payload.extend(pid.to_le_bytes());
+    payload.extend(tid.to_le_bytes());
+    payload.extend(time.to_le_bytes());
     payload.extend(period.to_le_bytes());
     payload.extend((callchain.len() as u64).to_le_bytes());
     for frame in callchain {

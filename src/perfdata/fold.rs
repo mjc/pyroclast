@@ -1,23 +1,23 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
-use std::io::Write as IoWrite;
+use std::fs::File;
+use std::io::{BufReader, Read, Seek, SeekFrom, Write as IoWrite};
 use std::path::{Path, PathBuf};
-
-#[cfg(unix)]
-use memmap2::{Advice, UncheckedAdvice};
 
 use crate::folded::render_inferno_perf_stack;
 use crate::perfdata::attrs::{PerfFileAttr, parse_file_attr_ids, parse_file_attrs};
-use crate::perfdata::build_id::build_id_events_from_perfdata;
+use crate::perfdata::build_id::{
+    BuildIdEvent, build_id_events_from_perfdata, parse_build_id_events,
+};
 use crate::perfdata::endian::read_u64;
-use crate::perfdata::header::parse_header;
+use crate::perfdata::header::{PerfFeatureSection, PerfHeader, parse_header};
 use crate::perfdata::mappings::{
     FileIdentity, MmapTable, ResolvedMapping, file_matches_recorded_identity,
 };
 use crate::perfdata::raw_stack::{CollapsedRawStack, RawStackAccumulator};
 use crate::perfdata::records::{
-    Mmap2Record, PERF_RECORD_MISC_CPUMODE_MASK, ParsedRecord, PerfRecord, PerfRecordHeader,
-    iter_records, parse_record, parse_record_header,
+    Mmap2Record, PERF_RECORD_FINISHED_ROUND, PERF_RECORD_MISC_CPUMODE_MASK, ParsedRecord,
+    PerfRecord, PerfRecordHeader, iter_records, parse_record, parse_record_header,
 };
 use crate::perfdata::samples::{
     PERF_SAMPLE_ADDR, PERF_SAMPLE_CPU, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP,
@@ -29,7 +29,7 @@ use crate::symbols::{SymbolFrameCache, SymbolRequest, SymbolResolver, perf_build
 
 const UNKNOWN_FRAME: &str = "[unknown]";
 const PREFETCH_SYMBOL_REQUEST_BATCH_SIZE: usize = 4096;
-const MMAP_RELEASE_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+const RECORD_READER_BUFFER_CAPACITY: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PerfSummary {
@@ -84,6 +84,12 @@ struct TimedRecord {
     time: Option<u64>,
     offset: usize,
     header: PerfRecordHeader,
+}
+
+struct PendingParsedRecord {
+    index: usize,
+    time: Option<u64>,
+    record: ParsedRecord,
 }
 
 struct FoldSample {
@@ -286,10 +292,8 @@ pub fn fold_perfdata_file_with_options(
     path: &Path,
     options: FoldOptions,
 ) -> Result<String, String> {
-    let file =
-        std::fs::File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
-    let mapping = map_perfdata_file(&file)?;
-    let fold_data = collect_fold_data_from_mmap(&mapping, options)?;
+    let file = File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
+    let fold_data = collect_fold_data_from_file(&file, options)?;
     render_fold_data::<NoopSymbolResolver>(fold_data, None)
 }
 
@@ -326,10 +330,8 @@ pub fn fold_perfdata_file_with_symbols<R>(
 where
     R: SymbolResolver,
 {
-    let file =
-        std::fs::File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
-    let mapping = map_perfdata_file(&file)?;
-    let fold_data = collect_fold_data_from_mmap(&mapping, options)?;
+    let file = File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
+    let fold_data = collect_fold_data_from_file(&file, options)?;
     let mut symbol_cache = SymbolFrameCache::new(symbol_resolver);
     render_fold_data(fold_data, Some(&mut symbol_cache))
 }
@@ -342,10 +344,8 @@ pub(crate) fn write_folded_perfdata_file_with_options<W>(
 where
     W: IoWrite + ?Sized,
 {
-    let file =
-        std::fs::File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
-    let mapping = map_perfdata_file(&file)?;
-    let fold_data = collect_fold_data_from_mmap(&mapping, options)?;
+    let file = File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
+    let fold_data = collect_fold_data_from_file(&file, options)?;
     write_fold_data::<NoopSymbolResolver, _>(fold_data, None, writer)
 }
 
@@ -359,10 +359,8 @@ where
     R: SymbolResolver,
     W: IoWrite + ?Sized,
 {
-    let file =
-        std::fs::File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
-    let mapping = map_perfdata_file(&file)?;
-    let fold_data = collect_fold_data_from_mmap(&mapping, options)?;
+    let file = File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
+    let fold_data = collect_fold_data_from_file(&file, options)?;
     let mut symbol_cache = SymbolFrameCache::new(symbol_resolver);
     write_fold_data(fold_data, Some(&mut symbol_cache), writer)
 }
@@ -375,10 +373,8 @@ pub(crate) fn write_inferno_perf_script_file_with_options<W>(
 where
     W: IoWrite + ?Sized,
 {
-    let file =
-        std::fs::File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
-    let mapping = map_perfdata_file(&file)?;
-    let fold_data = collect_fold_data_from_mmap(&mapping, options)?;
+    let file = File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
+    let fold_data = collect_fold_data_from_file(&file, options)?;
     write_inferno_perf_script::<NoopSymbolResolver, _>(fold_data, None, writer)
 }
 
@@ -392,51 +388,10 @@ where
     R: SymbolResolver,
     W: IoWrite + ?Sized,
 {
-    let file =
-        std::fs::File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
-    let mapping = map_perfdata_file(&file)?;
-    let fold_data = collect_fold_data_from_mmap(&mapping, options)?;
+    let file = File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
+    let fold_data = collect_fold_data_from_file(&file, options)?;
     let mut symbol_cache = SymbolFrameCache::new(symbol_resolver);
     write_inferno_perf_script(fold_data, Some(&mut symbol_cache), writer)
-}
-
-fn map_perfdata_file(file: &std::fs::File) -> Result<memmap2::Mmap, String> {
-    // SAFETY: The returned mapping is read-only and is only exposed as an
-    // immutable byte slice while the file handle and mapping are alive in this
-    // function's callers.
-    unsafe { memmap2::MmapOptions::new().map(file) }
-        .map_err(|error| format!("failed to map perf.data: {error}"))
-}
-
-fn advise_mmap_sequential(mapping: &memmap2::Mmap) {
-    #[cfg(unix)]
-    {
-        let _ = mapping.advise(Advice::Sequential);
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = mapping;
-    }
-}
-
-fn release_mmap_range(mapping: &memmap2::Mmap, offset: usize, len: usize) {
-    if len == 0 {
-        return;
-    }
-    #[cfg(unix)]
-    {
-        if !UncheckedAdvice::DontNeed.is_supported() {
-            return;
-        }
-        // SAFETY: The mapping is read-only, the advised range is always within
-        // the mapping bounds, and we only hint that already-processed pages can
-        // be dropped and faulted back in later if needed.
-        let _ = unsafe { mapping.unchecked_advise_range(UncheckedAdvice::DontNeed, offset, len) };
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (mapping, offset, len);
-    }
 }
 
 fn parse_record_with_context(record: PerfRecord<'_>) -> Result<ParsedRecord, String> {
@@ -471,42 +426,277 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
     Ok(accumulator.into_fold_data())
 }
 
-fn collect_fold_data_from_mmap(
-    mapping: &memmap2::Mmap,
-    options: FoldOptions,
-) -> Result<PerfFoldData, String> {
-    advise_mmap_sequential(mapping);
-    let header = parse_header(mapping)?;
-    let sample_layouts = sample_layouts(mapping, header)?;
-    let mut records =
-        timed_records_with_release(mapping, header, &sample_layouts, |offset, len| {
-            release_mmap_range(mapping, offset, len);
-        })?;
-    let header_build_ids = header_build_ids_by_filename(mapping)?;
-    let mut accumulator = FoldAccumulator::new(header_build_ids);
-
-    records.sort_by_key(|record| (record.time.unwrap_or(0), record.index));
-    for timed_record in records {
-        let record = timed_record.record(mapping)?;
-        let parsed_record = parse_record_with_context(record)?;
-        let record_result = accumulator.apply_record(parsed_record, &sample_layouts, options);
-        record_result.map_err(|error| {
-            format!(
-                "failed to parse record type {} at offset {}: {error}",
-                record.header.record_type, record.offset
-            )
-        })?;
-        release_mmap_range(mapping, record.offset, usize::from(record.header.size));
-    }
-
-    Ok(accumulator.into_fold_data())
-}
-
 fn header_build_ids_by_filename(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, String> {
     build_id_events_from_perfdata(bytes)?
         .into_iter()
         .map(|event| hex_build_id_bytes(&event.build_id).map(|build_id| (event.filename, build_id)))
         .collect()
+}
+
+fn collect_fold_data_from_file(file: &File, options: FoldOptions) -> Result<PerfFoldData, String> {
+    let (header, header_bytes) = perfdata_header_from_file(file)?;
+    let sample_layouts = sample_layouts_from_file(file, header)?;
+    let header_build_ids = header_build_ids_by_filename_from_file(file, header, &header_bytes)?;
+    let mut accumulator = FoldAccumulator::new(header_build_ids);
+    let data_end = header
+        .data_offset
+        .checked_add(header.data_size)
+        .ok_or_else(|| "perf data section size overflows u64".to_string())?;
+    if file
+        .metadata()
+        .map_err(|error| format!("failed to stat perf.data: {error}"))?
+        .len()
+        < data_end
+    {
+        return Err("perf data section extends past end of file".to_string());
+    }
+
+    let mut reader = BufReader::with_capacity(
+        RECORD_READER_BUFFER_CAPACITY,
+        file.try_clone()
+            .map_err(|error| format!("failed to clone perf.data handle: {error}"))?,
+    );
+    reader
+        .seek(SeekFrom::Start(header.data_offset))
+        .map_err(|error| format!("failed to seek perf data section: {error}"))?;
+
+    let mut pending_records = Vec::new();
+    let mut header_bytes = [0_u8; 8];
+    let mut payload = Vec::new();
+    let mut offset = usize::try_from(header.data_offset)
+        .map_err(|_| "perf data section offset exceeds usize".to_string())?;
+    let end =
+        usize::try_from(data_end).map_err(|_| "perf data section end exceeds usize".to_string())?;
+    let mut index = 0usize;
+
+    while offset < end {
+        reader.read_exact(&mut header_bytes).map_err(|error| {
+            format!("failed to read perf record header at offset {offset}: {error}")
+        })?;
+        let record_header = parse_record_header(&header_bytes)?;
+        let size = usize::from(record_header.size);
+        if size < 8 {
+            return Err(format!(
+                "invalid perf record size {size} at offset {offset}"
+            ));
+        }
+        let next = offset
+            .checked_add(size)
+            .ok_or_else(|| format!("perf record size overflows at offset {offset}"))?;
+        if next > end {
+            return Err(format!(
+                "perf record overruns data section at offset {offset}"
+            ));
+        }
+
+        payload.resize(size - 8, 0);
+        reader.read_exact(&mut payload).map_err(|error| {
+            format!("failed to read perf record payload at offset {offset}: {error}")
+        })?;
+
+        if record_header.record_type == PERF_RECORD_FINISHED_ROUND {
+            flush_pending_records(
+                &mut pending_records,
+                &mut accumulator,
+                &sample_layouts,
+                options,
+            )?;
+            offset = next;
+            continue;
+        }
+
+        let record = PerfRecord {
+            offset,
+            header: record_header,
+            payload: &payload,
+        };
+        let time = record_time(record, &sample_layouts)?;
+        let parsed_record = parse_record_with_context(record)?;
+        pending_records.push(PendingParsedRecord {
+            index,
+            time,
+            record: parsed_record,
+        });
+        index += 1;
+        offset = next;
+    }
+
+    flush_pending_records(
+        &mut pending_records,
+        &mut accumulator,
+        &sample_layouts,
+        options,
+    )?;
+
+    Ok(accumulator.into_fold_data())
+}
+
+fn flush_pending_records(
+    pending_records: &mut Vec<PendingParsedRecord>,
+    accumulator: &mut FoldAccumulator,
+    sample_layouts: &SampleLayouts,
+    options: FoldOptions,
+) -> Result<(), String> {
+    pending_records.sort_by_key(|record| (record.time.unwrap_or(0), record.index));
+    for pending_record in pending_records.drain(..) {
+        accumulator.apply_record(pending_record.record, sample_layouts, options)?;
+    }
+    Ok(())
+}
+
+fn perfdata_header_from_file(file: &File) -> Result<(PerfHeader, [u8; 104]), String> {
+    let mut bytes = [0_u8; 104];
+    let mut reader = file
+        .try_clone()
+        .map_err(|error| format!("failed to clone perf.data handle: {error}"))?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("failed to seek perf.data header: {error}"))?;
+    reader
+        .read_exact(&mut bytes)
+        .map_err(|error| format!("failed to read perf.data header: {error}"))?;
+    let header = parse_header(&bytes)?;
+    Ok((header, bytes))
+}
+
+fn sample_layouts_from_file(file: &File, header: PerfHeader) -> Result<SampleLayouts, String> {
+    let attr_size = usize::try_from(header.attr_size)
+        .map_err(|_| "perf attr section size exceeds usize".to_string())?;
+    let attr_bytes = read_file_range(file, header.attr_offset, attr_size, "perf attr section")?;
+    let attrs = parse_file_attrs(
+        &attr_bytes,
+        PerfHeader {
+            header_size: header.header_size,
+            attr_offset: 0,
+            attr_size: header.attr_size,
+            data_offset: 0,
+            data_size: 0,
+        },
+    )?;
+
+    let mut layouts = SampleLayouts {
+        fallback: attrs.first().map(|attr| SampleEventLayout {
+            index: 0,
+            layout: layout_from_attr(attr),
+        }),
+        by_identifier: BTreeMap::new(),
+    };
+    for (index, attr) in attrs.iter().enumerate() {
+        let event = SampleEventLayout {
+            index,
+            layout: layout_from_attr(attr),
+        };
+        for id in file_attr_ids_from_file(file, attr)? {
+            layouts.by_identifier.insert(id, event);
+        }
+    }
+    Ok(layouts)
+}
+
+fn file_attr_ids_from_file(file: &File, attr: &PerfFileAttr) -> Result<Vec<u64>, String> {
+    let ids_size = usize::try_from(attr.ids_size)
+        .map_err(|_| "perf attr id section size exceeds usize".to_string())?;
+    let ids_bytes = read_file_range(file, attr.ids_offset, ids_size, "perf attr id section")?;
+    parse_file_attr_ids(
+        &ids_bytes,
+        &PerfFileAttr {
+            ids_offset: 0,
+            ..attr.clone()
+        },
+    )
+}
+
+fn header_build_ids_by_filename_from_file(
+    file: &File,
+    header: PerfHeader,
+    header_bytes: &[u8; 104],
+) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    build_id_events_from_file(file, header, header_bytes)?
+        .into_iter()
+        .map(|event| hex_build_id_bytes(&event.build_id).map(|build_id| (event.filename, build_id)))
+        .collect()
+}
+
+fn build_id_events_from_file(
+    file: &File,
+    header: PerfHeader,
+    header_bytes: &[u8; 104],
+) -> Result<Vec<BuildIdEvent>, String> {
+    let Some(section) = feature_sections_from_file(file, header, header_bytes)?
+        .into_iter()
+        .find(|section| section.feature == 2)
+    else {
+        return Ok(Vec::new());
+    };
+    let size = usize::try_from(section.size)
+        .map_err(|_| "build-id feature size exceeds usize".to_string())?;
+    let payload = read_file_range(file, section.offset, size, "build-id feature payload")?;
+    parse_build_id_events(&payload)
+}
+
+fn feature_sections_from_file(
+    file: &File,
+    header: PerfHeader,
+    header_bytes: &[u8; 104],
+) -> Result<Vec<PerfFeatureSection>, String> {
+    let features = perf_feature_bits(header_bytes)?;
+    if features.is_empty() {
+        return Ok(Vec::new());
+    }
+    let table_offset = header
+        .data_offset
+        .checked_add(header.data_size)
+        .ok_or_else(|| "perf.data feature table offset overflows u64".to_string())?;
+    let table_size = features
+        .len()
+        .checked_mul(16)
+        .ok_or_else(|| "perf.data feature table size overflows usize".to_string())?;
+    let table = read_file_range(file, table_offset, table_size, "perf feature table")?;
+
+    let mut sections = Vec::with_capacity(features.len());
+    for (index, feature) in features.into_iter().enumerate() {
+        let entry_offset = index * 16;
+        sections.push(PerfFeatureSection {
+            feature,
+            offset: read_u64(&table, entry_offset)?,
+            size: read_u64(&table, entry_offset + 8)?,
+        });
+    }
+    Ok(sections)
+}
+
+fn perf_feature_bits(header_bytes: &[u8; 104]) -> Result<Vec<u16>, String> {
+    let mut features = Vec::new();
+    for word_index in 0..4 {
+        let word = read_u64(header_bytes, 56 + word_index * 8)?;
+        for bit_index in 0..64 {
+            if word & (1_u64 << bit_index) != 0 {
+                let feature = u16::try_from(word_index * 64 + bit_index)
+                    .map_err(|_| "perf.data feature bit exceeds u16".to_string())?;
+                features.push(feature);
+            }
+        }
+    }
+    Ok(features)
+}
+
+fn read_file_range(
+    file: &File,
+    offset: u64,
+    len: usize,
+    range_name: &str,
+) -> Result<Vec<u8>, String> {
+    let mut bytes = vec![0; len];
+    let mut reader = file
+        .try_clone()
+        .map_err(|error| format!("failed to clone perf.data handle: {error}"))?;
+    reader
+        .seek(SeekFrom::Start(offset))
+        .map_err(|error| format!("failed to seek {range_name}: {error}"))?;
+    reader
+        .read_exact(&mut bytes)
+        .map_err(|error| format!("failed to read {range_name}: {error}"))?;
+    Ok(bytes)
 }
 
 fn hex_build_id_bytes(hex: &str) -> Result<Vec<u8>, String> {
@@ -637,21 +827,9 @@ impl FoldAccumulator {
 
 fn timed_records(
     bytes: &[u8],
-    header: crate::perfdata::header::PerfHeader,
+    header: PerfHeader,
     sample_layouts: &SampleLayouts,
 ) -> Result<Vec<TimedRecord>, String> {
-    timed_records_with_release(bytes, header, sample_layouts, |_, _| {})
-}
-
-fn timed_records_with_release<F>(
-    bytes: &[u8],
-    header: crate::perfdata::header::PerfHeader,
-    sample_layouts: &SampleLayouts,
-    mut release: F,
-) -> Result<Vec<TimedRecord>, String>
-where
-    F: FnMut(usize, usize),
-{
     let mut timed = Vec::new();
     let mut offset = usize::try_from(header.data_offset)
         .map_err(|_| "perf data section offset exceeds usize".to_string())?;
@@ -665,7 +843,6 @@ where
     }
 
     let mut index = 0usize;
-    let mut released_offset = offset;
     while offset < end {
         let header = parse_record_header(
             bytes
@@ -698,15 +875,8 @@ where
             offset,
             header,
         });
-        if next.saturating_sub(released_offset) >= MMAP_RELEASE_CHUNK_SIZE {
-            release(released_offset, next - released_offset);
-            released_offset = next;
-        }
         index += 1;
         offset = next;
-    }
-    if end > released_offset {
-        release(released_offset, end - released_offset);
     }
     Ok(timed)
 }
