@@ -13,7 +13,7 @@ fn readme_documents_primary_commands() {
         "pyroclast heap -- <command...>",
         "pyroclast syscalls -- <command...>",
         "cargo pyroclast cpu -- --tui",
-        "cargo pyroclast cpu --profile profiling -- --tui",
+        "cargo pyroclast --profile profiling cpu -- --tui",
         "pyroclast plumbing fold <perf.data>",
         "pyroclast plumbing flamegraph <perf.data>",
         "pyroclast plumbing summarize <artifact-dir>",

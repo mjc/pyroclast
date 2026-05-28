@@ -35,7 +35,7 @@ selection/build behavior and forwards trailing arguments to the built executable
 
 ```sh
 cargo pyroclast cpu -- --tui
-cargo pyroclast cpu --profile profiling -- --tui
+cargo pyroclast --profile profiling cpu -- --tui
 cargo pyroclast memory --example demo -- --serve
 ```
 

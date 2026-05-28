@@ -206,7 +206,110 @@ where
     {
         normalized.insert(1, OsString::from("pyroclast"));
     }
-    normalized
+    reorder_leading_cargo_build_args(normalized)
+}
+
+fn reorder_leading_cargo_build_args(args: Vec<OsString>) -> Vec<OsString> {
+    if args.len() < 4 {
+        return args;
+    }
+
+    let mut index = 2usize;
+    while index < args.len() {
+        let token = args[index].to_string_lossy();
+        if is_profile_kind(&token) {
+            if index == 2 {
+                return args;
+            }
+            let mut reordered = Vec::with_capacity(args.len());
+            reordered.extend(args[..2].iter().cloned());
+            reordered.push(args[index].clone());
+            reordered.extend(args[2..index].iter().cloned());
+            reordered.extend(args[index + 1..].iter().cloned());
+            return reordered;
+        }
+        if token == "--" {
+            return args;
+        }
+        let Some(consumed) = leading_cargo_build_arg_len(&args, index) else {
+            return args;
+        };
+        index += consumed;
+    }
+
+    args
+}
+
+fn is_profile_kind(token: &str) -> bool {
+    matches!(
+        token,
+        "memory" | "heap" | "cpu" | "offcpu" | "latency" | "syscalls" | "async"
+    )
+}
+
+fn leading_cargo_build_arg_len(args: &[OsString], index: usize) -> Option<usize> {
+    let token = args[index].to_string_lossy();
+
+    if has_inline_value(
+        &token,
+        &[
+            "--profile",
+            "--package",
+            "--bin",
+            "--example",
+            "--test",
+            "--bench",
+            "--manifest-path",
+            "--features",
+            "--target",
+            "--unit-test-kind",
+        ],
+    ) {
+        return Some(1);
+    }
+
+    if matches!(
+        token.as_ref(),
+        "--dev" | "--no-default-features" | "--release" | "-r"
+    ) {
+        return Some(1);
+    }
+
+    if matches!(
+        token.as_ref(),
+        "--profile"
+            | "--package"
+            | "-p"
+            | "--bin"
+            | "--example"
+            | "--test"
+            | "--bench"
+            | "--manifest-path"
+            | "--features"
+            | "-f"
+            | "--target"
+            | "--unit-test-kind"
+    ) {
+        return Some(if index + 1 < args.len() { 2 } else { 1 });
+    }
+
+    if matches!(token.as_ref(), "--unit-test" | "--unit-bench") {
+        let next = args.get(index + 1).map(|value| value.to_string_lossy());
+        let consumes_value = next
+            .as_ref()
+            .is_some_and(|next| !next.starts_with('-') && !is_profile_kind(next));
+        return Some(if consumes_value { 2 } else { 1 });
+    }
+
+    None
+}
+
+fn has_inline_value(token: &str, flags: &[&str]) -> bool {
+    flags.iter().any(|flag| {
+        token.len() > flag.len()
+            && token.starts_with(flag)
+            && token.as_bytes().get(flag.len()) == Some(&b'=')
+    })
 }
 
 fn auto_select_target(args: &mut CargoRunArgs) -> BackendResult<Vec<TargetKind>> {
@@ -342,7 +445,9 @@ where
         command = command.arg("--no-default-features");
     }
 
-    command = command.arg("--message-format=json-render-diagnostics");
+    command = command
+        .arg("--message-format=json-render-diagnostics")
+        .inherit_stderr();
 
     let output = runner.run(&command)?;
     if output.status_code != Some(0) {
@@ -623,9 +728,9 @@ mod tests {
         let cli = CargoCli::parse_from(normalize_cargo_args([
             "cargo",
             "pyroclast",
-            "cpu",
             "--profile",
             "profiling",
+            "cpu",
             "--frequency",
             "199",
             "--event",
@@ -644,6 +749,26 @@ mod tests {
         assert_eq!(args.frequency, 199);
         assert_eq!(args.event, PerfEvent::TaskClock);
         assert_eq!(args.call_graph, PerfCallGraph::Fp);
+        assert_eq!(args.trailing_arguments, vec!["--tui"]);
+    }
+
+    #[test]
+    fn parses_leading_manifest_path_before_profile_kind() {
+        let cli = CargoCli::parse_from(normalize_cargo_args([
+            "cargo",
+            "pyroclast",
+            "--manifest-path",
+            "demo/Cargo.toml",
+            "memory",
+            "--",
+            "--tui",
+        ]));
+
+        let CargoCommand::Pyroclast { command } = cli.command;
+        let CargoPyroclastCommand::Memory(args) = command else {
+            panic!("expected memory command");
+        };
+        assert_eq!(args.manifest_path, Some(PathBuf::from("demo/Cargo.toml")));
         assert_eq!(args.trailing_arguments, vec!["--tui"]);
     }
 
@@ -696,6 +821,7 @@ mod tests {
                 "--message-format=json-render-diagnostics".to_string(),
             ]
         );
+        assert!(runner.commands()[0].inherit_stderr);
     }
 
     #[test]
@@ -740,6 +866,7 @@ mod tests {
                 "--message-format=json-render-diagnostics".to_string(),
             ]
         );
+        assert!(runner.commands()[0].inherit_stderr);
     }
 
     #[test]
@@ -773,6 +900,7 @@ mod tests {
         assert!(runner.commands()[0].args.contains(&"--profile".to_string()));
         assert!(runner.commands()[0].args.contains(&"profiling".to_string()));
         assert!(!runner.commands()[0].args.contains(&"--release".to_string()));
+        assert!(runner.commands()[0].inherit_stderr);
     }
 
     #[test]
@@ -838,6 +966,7 @@ mod tests {
                 "--message-format=json-render-diagnostics".to_string(),
             ]
         );
+        assert!(runner.commands()[0].inherit_stderr);
     }
 
     #[test]
