@@ -3,8 +3,8 @@ use std::hash::Hash;
 use hashbrown::HashMap;
 use rustc_hash::FxBuildHasher;
 
-type CommId = usize;
-type NodeId = usize;
+type CommId = u32;
+type NodeId = u32;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollapsedRawStack<T = u64> {
@@ -145,7 +145,9 @@ where
             .into_iter()
             .map(|(key, count)| CollapsedRawStack {
                 pid: key.pid,
-                comm: key.comm.and_then(|comm| comms.get(comm).cloned()),
+                comm: key
+                    .comm
+                    .and_then(|comm| comms.get(node_index(comm)).cloned()),
                 callchain: rebuild_callchain(&nodes, key.tail),
                 count,
             })
@@ -168,7 +170,7 @@ where
                 pid: key.pid,
                 comm: key
                     .comm
-                    .and_then(|comm| self.comms.get(comm).map(String::as_str)),
+                    .and_then(|comm| self.comms.get(node_index(comm)).map(String::as_str)),
                 tail: key.tail,
                 count,
                 nodes: &self.nodes,
@@ -188,7 +190,7 @@ where
         if let Some(&id) = self.comm_ids.get(comm.as_str()) {
             return Some(id);
         }
-        let id = self.comms.len();
+        let id = next_comm_id(self.comms.len());
         self.comms.push(comm.clone());
         self.comm_ids.insert(comm, id);
         Some(id)
@@ -200,7 +202,7 @@ where
             return Some(id);
         }
         let owned = comm.to_owned();
-        let id = self.comms.len();
+        let id = next_comm_id(self.comms.len());
         self.comms.push(owned.clone());
         self.comm_ids.insert(owned, id);
         Some(id)
@@ -219,7 +221,7 @@ where
             tail = Some(if let Some(&id) = self.node_ids.get(&key) {
                 id
             } else {
-                let id = self.nodes.len();
+                let id = next_node_id(self.nodes.len());
                 self.nodes.push(StackNode {
                     parent: tail,
                     frame: frame.clone(),
@@ -256,11 +258,23 @@ fn rebuild_callchain_into<T: Clone>(
     callchain.clear();
     let mut current = tail;
     while let Some(node) = current {
-        let entry = &nodes[node];
+        let entry = &nodes[node_index(node)];
         callchain.push(entry.frame.clone());
         current = entry.parent;
     }
     callchain.reverse();
+}
+
+fn next_comm_id(len: usize) -> CommId {
+    CommId::try_from(len).expect("raw stack comm ids exceeded u32::MAX")
+}
+
+fn next_node_id(len: usize) -> NodeId {
+    NodeId::try_from(len).expect("raw stack node ids exceeded u32::MAX")
+}
+
+fn node_index(node: NodeId) -> usize {
+    usize::try_from(node).expect("raw stack node id does not fit in usize")
 }
 
 impl<'a, T> RawStackEntryRef<'a, T> {
