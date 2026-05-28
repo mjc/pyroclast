@@ -1715,10 +1715,62 @@ fn prefetches_unique_symbol_requests_before_folding() {
     );
 }
 
+#[test]
+fn prefetches_symbol_requests_in_batches_before_folding() {
+    let mut records = vec![record_bytes(
+        1,
+        &mmap_payload(11, 11, 0x1000, 0x3000, 0, "/bin/app"),
+    )];
+    for index in 0..4097_u64 {
+        records.push(record_bytes(
+            9,
+            &sample_payload(0x1000, 11, 12, [0x1030 + index]),
+        ));
+    }
+    let bytes = perfdata_with_records_and_attrs_vec(
+        vec![file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        records,
+    );
+    let resolver = RecordingSymbolResolver::default();
+
+    let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
+        .expect("folded");
+
+    assert_eq!(folded, "[unknown];[app] 4097\n");
+    let calls = resolver.calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].len(), 4096);
+    assert_eq!(calls[1].len(), 1);
+}
+
 fn perfdata_with_records_and_attrs<const A: usize, const R: usize>(
     attrs: [[u8; 144]; A],
     records: [Vec<u8>; R],
 ) -> Vec<u8> {
+    let attr_size = attrs.len() * 144;
+    let data_size = records.iter().map(Vec::len).sum::<usize>();
+    let data_offset = 104 + attr_size;
+    let mut bytes = vec![0; 104];
+    bytes[..8].copy_from_slice(b"PERFILE2");
+    put_u64(&mut bytes, 8, 104);
+    put_u64(&mut bytes, 24, 104);
+    put_u64(&mut bytes, 32, attr_size as u64);
+    put_u64(&mut bytes, 40, data_offset as u64);
+    put_u64(&mut bytes, 48, data_size as u64);
+    for attr in attrs {
+        bytes.extend(attr);
+    }
+    for record in records {
+        bytes.extend(record);
+    }
+    bytes
+}
+
+fn perfdata_with_records_and_attrs_vec(attrs: Vec<[u8; 144]>, records: Vec<Vec<u8>>) -> Vec<u8> {
     let attr_size = attrs.len() * 144;
     let data_size = records.iter().map(Vec::len).sum::<usize>();
     let data_offset = 104 + attr_size;
