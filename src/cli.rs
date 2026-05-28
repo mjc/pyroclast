@@ -237,7 +237,7 @@ impl ProfileInvocation {
     }
 }
 
-fn profile_symbols_enabled(kind: ProfileKind, no_symbols: bool) -> bool {
+pub(crate) fn profile_symbols_enabled(kind: ProfileKind, no_symbols: bool) -> bool {
     !no_symbols && matches!(kind, ProfileKind::Cpu | ProfileKind::Offcpu)
 }
 

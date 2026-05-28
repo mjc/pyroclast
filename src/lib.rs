@@ -1,6 +1,7 @@
 pub mod artifacts;
 pub mod backends;
 pub mod benchmarks;
+pub mod cargo_cli;
 pub mod cli;
 pub mod config;
 pub mod errors;
@@ -24,6 +25,7 @@ use backends::macos_xctrace::MacosXctraceBackend;
 use backends::offcpu::OffcpuBackend;
 use backends::strace::StraceBackend;
 use backends::{ProfileRequest, ProfilerBackend};
+use clap::Parser;
 use cli::{
     AnalyzeFlamegraphArgs, AnalyzePerfdataArgs, Cli, CliCommand, FlamegraphAnalysisMode,
     ParseCommand, ParseFlamegraphCommand, ParsePerfCommand, PlumbingCommand,
@@ -58,6 +60,21 @@ where
     run_parsed_cli(cli)
 }
 
+/// Parses cargo-subcommand arguments and runs the requested Pyroclast profile.
+///
+/// # Errors
+///
+/// Returns an error when cargo target resolution, command execution, artifact
+/// I/O, or input parsing fails.
+pub fn run_cargo_cli<I, T>(args: I) -> backends::BackendResult<CliOutput>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let cli = cargo_cli::CargoCli::parse_from(cargo_cli::normalize_cargo_args(args));
+    run_parsed_cargo_cli(cli)
+}
+
 /// Runs a parsed CLI command with the real process runner.
 ///
 /// # Errors
@@ -67,6 +84,17 @@ where
 pub fn run_parsed_cli(cli: Cli) -> backends::BackendResult<CliOutput> {
     let runner = RealCommandRunner::default();
     run_parsed_cli_with_runner(cli, &runner)
+}
+
+/// Runs a parsed cargo-subcommand command with the real process runner.
+///
+/// # Errors
+///
+/// Returns an error when cargo target resolution, command execution, artifact
+/// I/O, or input parsing fails.
+pub fn run_parsed_cargo_cli(cli: cargo_cli::CargoCli) -> backends::BackendResult<CliOutput> {
+    let runner = RealCommandRunner::default();
+    run_parsed_cargo_cli_with_runner(cli, &runner)
 }
 
 /// Runs a parsed CLI command with an injected process runner.
@@ -80,6 +108,26 @@ where
     R: CommandRunner,
 {
     run_parsed_cli_with_runner_and_renderer(cli, runner, InfernoFlamegraphRenderer::new(runner))
+}
+
+/// Runs a parsed cargo-subcommand command with an injected process runner.
+///
+/// # Errors
+///
+/// Returns an error when cargo target resolution, command execution, artifact
+/// I/O, or input parsing fails.
+pub fn run_parsed_cargo_cli_with_runner<R>(
+    cli: cargo_cli::CargoCli,
+    runner: &R,
+) -> backends::BackendResult<CliOutput>
+where
+    R: CommandRunner,
+{
+    run_parsed_cargo_cli_with_runner_and_renderer(
+        cli,
+        runner,
+        InfernoFlamegraphRenderer::new(runner),
+    )
 }
 
 /// Runs a parsed CLI command with injected process and flamegraph renderers.
@@ -98,6 +146,30 @@ where
     F: FlamegraphRenderer,
 {
     run_parsed_cli_with_runner_and_renderer_on_platform(
+        cli,
+        runner,
+        flamegraph_renderer,
+        std::env::consts::OS,
+    )
+}
+
+/// Runs a parsed cargo-subcommand command with injected process and flamegraph
+/// renderers.
+///
+/// # Errors
+///
+/// Returns an error when cargo target resolution, command execution, artifact
+/// I/O, rendering, or input parsing fails.
+pub fn run_parsed_cargo_cli_with_runner_and_renderer<R, F>(
+    cli: cargo_cli::CargoCli,
+    runner: &R,
+    flamegraph_renderer: F,
+) -> backends::BackendResult<CliOutput>
+where
+    R: CommandRunner,
+    F: FlamegraphRenderer,
+{
+    run_parsed_cargo_cli_with_runner_and_renderer_on_platform(
         cli,
         runner,
         flamegraph_renderer,
@@ -129,7 +201,32 @@ where
     run_non_profile_command(cli.command, runner, &flamegraph_renderer)
 }
 
-fn run_profile_invocation<R, F>(
+/// Runs a parsed cargo-subcommand command with injected dependencies and
+/// platform routing.
+///
+/// # Errors
+///
+/// Returns an error when cargo target resolution, command execution, artifact
+/// I/O, rendering, or input parsing fails.
+pub fn run_parsed_cargo_cli_with_runner_and_renderer_on_platform<R, F>(
+    cli: cargo_cli::CargoCli,
+    runner: &R,
+    flamegraph_renderer: F,
+    platform: &str,
+) -> backends::BackendResult<CliOutput>
+where
+    R: CommandRunner,
+    F: FlamegraphRenderer,
+{
+    let invocation = cli
+        .command
+        .pyroclast_command()
+        .into_profile_invocation(runner)?;
+    run_profile_invocation(invocation, runner, flamegraph_renderer, platform)?;
+    Ok(CliOutput::default())
+}
+
+pub(crate) fn run_profile_invocation<R, F>(
     invocation: cli::ProfileInvocation,
     runner: &R,
     flamegraph_renderer: F,

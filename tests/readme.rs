@@ -12,6 +12,8 @@ fn readme_documents_primary_commands() {
         "pyroclast profile --kind latency -- <command...>",
         "pyroclast heap -- <command...>",
         "pyroclast syscalls -- <command...>",
+        "cargo pyroclast cpu -- --tui",
+        "cargo pyroclast cpu --profile profiling -- --tui",
         "pyroclast plumbing fold <perf.data>",
         "pyroclast plumbing flamegraph <perf.data>",
         "pyroclast plumbing summarize <artifact-dir>",
