@@ -85,6 +85,7 @@ struct Mapping {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct IndexedMapping {
     start: u64,
+    max_end: u64,
     index: usize,
 }
 
@@ -154,10 +155,31 @@ impl MmapTable {
         let may_execute = mapping.may_execute();
         mapping.symbol_source_id = self.intern_symbol_source(&mapping);
         let index = self.mappings.len();
+        let end = mapping.end();
         self.mappings.push(mapping);
         let bucket = self.mappings_by_pid.entry(pid).or_default();
         let position = bucket.partition_point(|indexed| indexed.start <= start);
-        bucket.insert(position, IndexedMapping { start, index });
+        let max_end = if position == 0 {
+            end
+        } else {
+            bucket[position - 1].max_end.max(end)
+        };
+        bucket.insert(
+            position,
+            IndexedMapping {
+                start,
+                max_end,
+                index,
+            },
+        );
+        for bucket_index in position + 1..bucket.len() {
+            let mapping_end = self.mappings[bucket[bucket_index].index].end();
+            let updated_max_end = bucket[bucket_index - 1].max_end.max(mapping_end);
+            if bucket[bucket_index].max_end == updated_max_end {
+                break;
+            }
+            bucket[bucket_index].max_end = updated_max_end;
+        }
         if pid == u32::MAX {
             self.has_global_mappings = true;
             self.has_global_executable_mappings |= may_execute;
@@ -268,7 +290,11 @@ impl MmapTable {
         let mut upper_bound = bucket.partition_point(|indexed| indexed.start <= ip);
         while upper_bound > 0 {
             upper_bound -= 1;
-            let index = bucket[upper_bound].index;
+            let indexed = &bucket[upper_bound];
+            if indexed.max_end <= ip {
+                break;
+            }
+            let index = indexed.index;
             let mapping = &self.mappings[index];
             if mapping.contains_ip(ip) {
                 return Some(index);
@@ -285,8 +311,12 @@ impl MmapTable {
 }
 
 impl Mapping {
+    fn end(&self) -> u64 {
+        self.start.saturating_add(self.len)
+    }
+
     fn contains_ip(&self, ip: u64) -> bool {
-        ip >= self.start && ip < self.start.saturating_add(self.len)
+        ip >= self.start && ip < self.end()
     }
 
     fn relative_address(&self, ip: u64) -> u64 {
@@ -341,4 +371,36 @@ fn is_perf_data_path(path: &str) -> bool {
     path.rsplit('/')
         .next()
         .is_some_and(|file_name| file_name == "perf.data" || file_name.starts_with("perf.data."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MmapTable;
+    use crate::perfdata::records::MmapRecord;
+
+    #[test]
+    fn updates_prefix_max_end_when_inserting_earlier_mapping() {
+        let mut table = MmapTable::default();
+        table.insert_mmap(MmapRecord {
+            pid: 7,
+            tid: 7,
+            start: 0x3000,
+            len: 0x100,
+            pgoff: 0,
+            path: "/later".to_string(),
+        });
+        table.insert_mmap(MmapRecord {
+            pid: 7,
+            tid: 7,
+            start: 0x1000,
+            len: 0x4000,
+            pgoff: 0,
+            path: "/earlier".to_string(),
+        });
+
+        let bucket = table.mappings_by_pid.get(&7).expect("bucket");
+        assert_eq!(bucket.len(), 2);
+        assert_eq!(bucket[0].max_end, 0x5000);
+        assert_eq!(bucket[1].max_end, 0x5000);
+    }
 }

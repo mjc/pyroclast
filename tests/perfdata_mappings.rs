@@ -357,3 +357,27 @@ fn uses_most_specific_mapping_for_non_executable_checks() {
     assert!(!table.is_known_non_executable(42, 0x1400));
     assert!(table.is_known_non_executable(42, 0x1810));
 }
+
+#[test]
+fn prefers_latest_mapping_when_ranges_share_the_same_start() {
+    let mut table = MmapTable::default();
+    table.insert_mmap(MmapRecord {
+        pid: 42,
+        tid: 42,
+        start: 0x1000,
+        len: 0x200,
+        pgoff: 0,
+        path: "/bin/old".to_string(),
+    });
+    table.insert_mmap(MmapRecord {
+        pid: 42,
+        tid: 42,
+        start: 0x1000,
+        len: 0x100,
+        pgoff: 0x20,
+        path: "/bin/new".to_string(),
+    });
+
+    assert_eq!(table.resolve(42, 0x1050).unwrap().path, "/bin/new");
+    assert_eq!(table.resolve(42, 0x1150).unwrap().path, "/bin/old");
+}
