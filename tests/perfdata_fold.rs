@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 
+use proptest::prelude::*;
 use pyroclast::perfdata::fold::{
     FoldOptions, fold_perfdata_callchains, fold_perfdata_callchains_with_options,
     fold_perfdata_callchains_with_symbols, fold_perfdata_file_with_options, summarize_perfdata,
@@ -15,6 +16,21 @@ use pyroclast::perfdata::samples::{
     PERF_SAMPLE_TIME,
 };
 use pyroclast::symbols::{SymbolRequest, SymbolResolver};
+
+fn render_unknown_folded_callchain(frames: &[u64], count: u64) -> String {
+    if frames.is_empty() {
+        return String::new();
+    }
+
+    let mut rendered = String::from("[unknown]");
+    for frame in frames.iter().rev() {
+        rendered.push_str(&format!(";0x{frame:x}"));
+    }
+    rendered.push(' ');
+    rendered.push_str(&count.to_string());
+    rendered.push('\n');
+    rendered
+}
 
 #[test]
 fn summarizes_record_counts_and_comm_names() {
@@ -1372,6 +1388,158 @@ fn folds_only_first_encountered_event_type_from_file_path_like_inferno_collapse_
     assert_eq!(folded, "[unknown];0x1111 1\n");
 }
 
+proptest! {
+    #[test]
+    fn property_summarizes_generated_lost_record_totals(
+        entries in prop::collection::vec((any::<bool>(), any::<u64>()), 0..32),
+    ) {
+        let records = entries
+            .iter()
+            .enumerate()
+            .map(|(index, (is_lost_samples, lost))| {
+                if *is_lost_samples {
+                    record_bytes(13, &lost.to_le_bytes())
+                } else {
+                    record_bytes(2, &lost_payload(index as u64, *lost))
+                }
+            })
+            .collect::<Vec<_>>();
+        let bytes = perfdata_with_records_and_attrs_vec(Vec::new(), records);
+
+        let summary = summarize_perfdata(&bytes).expect("summary");
+        let expected_lost = entries
+            .iter()
+            .fold(0_u64, |total, (_, lost)| total.saturating_add(*lost));
+        let expected_lost_records = entries.iter().filter(|(is_lost_samples, _)| !is_lost_samples).count();
+        let expected_lost_samples = entries.iter().filter(|(is_lost_samples, _)| *is_lost_samples).count();
+
+        prop_assert_eq!(summary.total_records, entries.len());
+        prop_assert_eq!(summary.record_count(2), expected_lost_records);
+        prop_assert_eq!(summary.record_count(13), expected_lost_samples);
+        prop_assert_eq!(summary.lost_records, expected_lost);
+    }
+
+    #[test]
+    fn property_folds_generated_periods_for_filtered_callchains(
+        frames in prop::collection::vec(
+            prop_oneof![
+                0x1000_u64..0x0001_0000_0000_u64,
+                0xffff_ffff_ffff_f000_u64..=u64::MAX,
+            ],
+            1..12,
+        ),
+        periods in prop::collection::vec(1_u64..10_000, 1..16),
+    ) {
+        let records = periods
+            .iter()
+            .map(|period| {
+                record_bytes(
+                    9,
+                    &sample_payload_with_period_vec(0x1000, 11, 12, *period, &frames),
+                )
+            })
+            .collect::<Vec<_>>();
+        let bytes = perfdata_with_records_and_attrs_vec(
+            vec![file_attr_bytes(
+                PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN,
+                0,
+                0,
+            )],
+            records,
+        );
+
+        let folded = fold_perfdata_callchains_with_options(
+            &bytes,
+            FoldOptions { count_periods: true },
+        )
+        .expect("folded");
+        let filtered = frames
+            .iter()
+            .copied()
+            .filter(|frame| *frame < 0xffff_ffff_ffff_f000)
+            .collect::<Vec<_>>();
+        let expected = render_unknown_folded_callchain(&filtered, periods.iter().sum());
+
+        prop_assert_eq!(folded, expected);
+    }
+
+    #[test]
+    fn property_selects_sample_layout_by_identifier(
+        base_id in 1_u64..u64::MAX,
+        period in 1_u64..10_000,
+        frame in 0x1000_u64..0x0001_0000_0000_u64,
+    ) {
+        let attr1 = file_attr_bytes_with_ids(
+            PERF_SAMPLE_IDENTIFIER | PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            392,
+            [base_id],
+        );
+        let attr2 = file_attr_bytes_with_ids(
+            PERF_SAMPLE_IDENTIFIER
+                | PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_PERIOD
+                | PERF_SAMPLE_CALLCHAIN,
+            400,
+            [base_id + 1],
+        );
+        let bytes = perfdata_with_attrs_ids_and_records(
+            [attr1, attr2],
+            [base_id, base_id + 1],
+            [record_bytes(
+                9,
+                &sample_payload_with_identifier_and_period_vec(base_id + 1, 0x1000, 11, 12, period, &[frame]),
+            )],
+        );
+
+        let folded = fold_perfdata_callchains_with_options(
+            &bytes,
+            FoldOptions { count_periods: true },
+        )
+        .expect("folded");
+
+        prop_assert_eq!(folded, render_unknown_folded_callchain(&[frame], period));
+    }
+
+    #[test]
+    fn property_selects_sample_layout_by_id_field(
+        base_id in 1_u64..u64::MAX,
+        period in 1_u64..10_000,
+        frame in 0x1000_u64..0x0001_0000_0000_u64,
+    ) {
+        let attr1 = file_attr_bytes_with_ids(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_ID | PERF_SAMPLE_CALLCHAIN,
+            392,
+            [base_id],
+        );
+        let attr2 = file_attr_bytes_with_ids(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_ID
+                | PERF_SAMPLE_PERIOD
+                | PERF_SAMPLE_CALLCHAIN,
+            400,
+            [base_id + 1],
+        );
+        let bytes = perfdata_with_attrs_ids_and_records(
+            [attr1, attr2],
+            [base_id, base_id + 1],
+            [record_bytes(
+                9,
+                &sample_payload_with_id_and_period_vec(0x1000, 11, 12, base_id + 1, period, &[frame]),
+            )],
+        );
+
+        let folded = fold_perfdata_callchains_with_options(
+            &bytes,
+            FoldOptions { count_periods: true },
+        )
+        .expect("folded");
+
+        prop_assert_eq!(folded, render_unknown_folded_callchain(&[frame], period));
+    }
+}
+
 #[test]
 fn folds_mapped_user_frames_as_file_relative_addresses() {
     let bytes = perfdata_with_records_and_attrs(
@@ -2199,6 +2367,67 @@ fn sample_payload_with_id_and_period<const N: usize>(
     id: u64,
     period: u64,
     callchain: [u64; N],
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(ip.to_le_bytes());
+    payload.extend(pid.to_le_bytes());
+    payload.extend(tid.to_le_bytes());
+    payload.extend(id.to_le_bytes());
+    payload.extend(period.to_le_bytes());
+    payload.extend((callchain.len() as u64).to_le_bytes());
+    for frame in callchain {
+        payload.extend(frame.to_le_bytes());
+    }
+    payload
+}
+
+fn sample_payload_with_period_vec(
+    ip: u64,
+    pid: u32,
+    tid: u32,
+    period: u64,
+    callchain: &[u64],
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(ip.to_le_bytes());
+    payload.extend(pid.to_le_bytes());
+    payload.extend(tid.to_le_bytes());
+    payload.extend(period.to_le_bytes());
+    payload.extend((callchain.len() as u64).to_le_bytes());
+    for frame in callchain {
+        payload.extend(frame.to_le_bytes());
+    }
+    payload
+}
+
+fn sample_payload_with_identifier_and_period_vec(
+    identifier: u64,
+    ip: u64,
+    pid: u32,
+    tid: u32,
+    period: u64,
+    callchain: &[u64],
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(identifier.to_le_bytes());
+    payload.extend(ip.to_le_bytes());
+    payload.extend(pid.to_le_bytes());
+    payload.extend(tid.to_le_bytes());
+    payload.extend(period.to_le_bytes());
+    payload.extend((callchain.len() as u64).to_le_bytes());
+    for frame in callchain {
+        payload.extend(frame.to_le_bytes());
+    }
+    payload
+}
+
+fn sample_payload_with_id_and_period_vec(
+    ip: u64,
+    pid: u32,
+    tid: u32,
+    id: u64,
+    period: u64,
+    callchain: &[u64],
 ) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.extend(ip.to_le_bytes());

@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use proptest::prelude::*;
 use proptest::string::string_regex;
 use pyroclast::parsers::xctrace::parse_cpu_profile;
@@ -26,16 +28,16 @@ proptest! {
     ) {
         let xml = render_profile_xml(&rows, &[]);
         let profile = parse_cpu_profile(&xml);
+        let expected_total_weight = rows
+            .iter()
+            .fold(0.0, |total, (_, weight)| total + f64::from(*weight));
 
         prop_assert_eq!(profile.rows.len(), rows.len());
-        prop_assert_eq!(
-            profile.total_weight,
-            rows.iter().fold(0.0, |total, (_, weight)| total + f64::from(*weight)),
-        );
+        prop_assert!((profile.total_weight - expected_total_weight).abs() < f64::EPSILON);
 
         for (actual, (symbol, weight)) in profile.rows.iter().zip(&rows) {
             prop_assert_eq!(&actual.symbol, symbol.trim());
-            prop_assert_eq!(actual.weight, f64::from(*weight));
+            prop_assert!((actual.weight - f64::from(*weight)).abs() < f64::EPSILON);
         }
     }
 
@@ -62,9 +64,10 @@ fn symbol_name() -> impl Strategy<Value = String> {
 fn render_profile_xml(rows: &[(String, u16)], malformed_rows: &[String]) -> String {
     let mut xml = String::from("<table>");
     for (symbol, weight) in rows {
-        xml.push_str(&format!(
+        let _ = write!(
+            xml,
             "<row><symbol>{symbol}</symbol><weight>{weight}</weight></row>"
-        ));
+        );
     }
     for row in malformed_rows {
         xml.push_str(row);

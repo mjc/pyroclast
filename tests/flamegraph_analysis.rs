@@ -162,12 +162,13 @@ fn flamegraph_name() -> impl Strategy<Value = String> {
 fn render_svg(entries: &[FlamegraphEntry]) -> String {
     let mut svg = String::from("<svg><title>all (1,000 samples, 100%)</title>");
     for entry in entries {
-        svg.push_str(&format!(
+        let _ = write!(
+            svg,
             "<g><title>{} ({} samples, {}%)</title></g>",
             entry.name,
             format_with_commas(entry.samples),
             entry.percent,
-        ));
+        );
     }
     svg.push_str("</svg>");
     svg
@@ -186,3 +187,4 @@ fn format_with_commas(value: u64) -> String {
 
     formatted.chars().rev().collect()
 }
+use std::fmt::Write as _;

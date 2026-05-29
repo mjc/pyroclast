@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use proptest::prelude::*;
 use proptest::string::string_regex;
 use pyroclast::parsers::bpftrace::collapse_offcpu;
@@ -70,14 +72,14 @@ fn render_offcpu_blocks(blocks: &[OffcpuBlock]) -> String {
         for frame in &block.frames {
             match frame {
                 FrameSpec::Valid(symbol) => {
-                    input.push_str(&format!("    55 {symbol}+12 (/bin/app)\n"));
+                    let _ = writeln!(input, "    55 {symbol}+12 (/bin/app)");
                 }
                 FrameSpec::Unknown(symbol) => {
-                    input.push_str(&format!("    55 {symbol}\n"));
+                    let _ = writeln!(input, "    55 {symbol}");
                 }
             }
         }
-        input.push_str(&format!("]: {}\n", block.count));
+        let _ = writeln!(input, "]: {}", block.count);
     }
     input
 }

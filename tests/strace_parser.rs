@@ -52,13 +52,13 @@ proptest! {
         }
 
         prop_assert_eq!(summary.total_calls, calls.len() as u64);
-        prop_assert_eq!(summary.total_seconds, expected_total_seconds);
+        prop_assert!((summary.total_seconds - expected_total_seconds).abs() < f64::EPSILON);
         prop_assert_eq!(summary.by_syscall.len(), expected.len());
 
         for (syscall, (calls, total_seconds)) in expected {
             let actual = summary.by_syscall.get(&syscall).expect("syscall entry");
             prop_assert_eq!(actual.calls, calls);
-            prop_assert_eq!(actual.total_seconds, total_seconds);
+            prop_assert!((actual.total_seconds - total_seconds).abs() < f64::EPSILON);
         }
     }
 

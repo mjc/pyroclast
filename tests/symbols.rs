@@ -80,11 +80,13 @@ fn kallsyms_resolve_case() -> impl Strategy<Value = KallsymsResolveCase> {
                 .enumerate()
                 .map(|(position, offset)| BASE + (position as u64) * 0x1000 + u64::from(*offset))
                 .collect::<Vec<_>>();
-            let text = addresses
-                .iter()
-                .enumerate()
-                .map(|(position, address)| format!("{address:016x} T symbol_{position}\n"))
-                .collect::<String>();
+            let text = addresses.iter().enumerate().fold(
+                String::new(),
+                |mut text, (position, address)| {
+                    let _ = writeln!(text, "{address:016x} T symbol_{position}");
+                    text
+                },
+            );
 
             KallsymsResolveCase {
                 text,
@@ -2026,3 +2028,4 @@ impl CommandRunner for Addr2lineRunner {
         })
     }
 }
+use std::fmt::Write as _;
