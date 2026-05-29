@@ -1,3 +1,5 @@
+use proptest::prelude::*;
+use proptest::string::string_regex;
 use pyroclast::flamegraph::analysis::{
     FlamegraphEntry, categorize_flamegraph_frame, diff_flamegraphs, parse_flamegraph_entries,
     syscall_breakdown, top_entries,
@@ -99,4 +101,88 @@ fn assert_float_eq(actual: f64, expected: f64) {
         (actual - expected).abs() < f64::EPSILON,
         "expected {actual} to equal {expected}"
     );
+}
+
+proptest! {
+    #[test]
+    fn property_parses_svg_titles_and_sorts_by_percent_then_name(
+        entries in prop::collection::vec(flamegraph_entry(), 0..64),
+    ) {
+        let svg = render_svg(&entries);
+        let mut expected = entries.clone();
+        expected.sort_by(|left, right| {
+            right
+                .percent
+                .total_cmp(&left.percent)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+
+        prop_assert_eq!(parse_flamegraph_entries(&svg), expected);
+    }
+
+    #[test]
+    fn property_top_entries_match_filter_sort_and_limit(
+        entries in prop::collection::vec(flamegraph_entry(), 0..64),
+        limit in 0_usize..16,
+        min_percent in 0_u8..=100_u8,
+    ) {
+        let mut expected = entries
+            .iter()
+            .filter(|entry| entry.percent >= f64::from(min_percent))
+            .cloned()
+            .collect::<Vec<_>>();
+        expected.sort_by(|left, right| {
+            right
+                .percent
+                .total_cmp(&left.percent)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        expected.truncate(limit);
+
+        prop_assert_eq!(top_entries(&entries, limit, f64::from(min_percent)), expected);
+    }
+}
+
+fn flamegraph_entry() -> impl Strategy<Value = FlamegraphEntry> {
+    (flamegraph_name(), any::<u64>(), 0_u8..=100_u8).prop_map(|(name, samples, percent)| {
+        FlamegraphEntry {
+            name,
+            samples,
+            percent: f64::from(percent),
+        }
+    })
+}
+
+fn flamegraph_name() -> impl Strategy<Value = String> {
+    string_regex(r"[A-Za-z_][A-Za-z0-9_:]{0,15}")
+        .expect("valid flamegraph name regex")
+        .prop_filter("exclude reserved aggregate frame", |name| name != "all")
+}
+
+fn render_svg(entries: &[FlamegraphEntry]) -> String {
+    let mut svg = String::from("<svg><title>all (1,000 samples, 100%)</title>");
+    for entry in entries {
+        svg.push_str(&format!(
+            "<g><title>{} ({} samples, {}%)</title></g>",
+            entry.name,
+            format_with_commas(entry.samples),
+            entry.percent,
+        ));
+    }
+    svg.push_str("</svg>");
+    svg
+}
+
+fn format_with_commas(value: u64) -> String {
+    let digits = value.to_string();
+    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
+
+    for (index, character) in digits.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            formatted.push(',');
+        }
+        formatted.push(character);
+    }
+
+    formatted.chars().rev().collect()
 }
