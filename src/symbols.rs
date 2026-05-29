@@ -2461,10 +2461,9 @@ mod tests {
             .find_map(|segment| {
                 let (file_offset, file_size) = segment.file_range();
                 let virtual_address = segment.address();
-                (file_size > 8 && virtual_address != file_offset)
-                    .then_some((file_offset + 8, virtual_address + 8))
+                (file_size > 8).then_some((file_offset + 8, virtual_address + 8))
             })
-            .expect("current test binary has a biased load segment");
+            .expect("current test binary has a load segment");
 
         let request = clean_object_symbol_request(path, file_offset);
 
