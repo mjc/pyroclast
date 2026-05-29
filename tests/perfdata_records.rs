@@ -1068,6 +1068,238 @@ fn dispatches_callchain_deferred_record_by_perf_record_type() {
     assert!(matches!(parsed, ParsedRecord::CallchainDeferred(_)));
 }
 
+proptest! {
+    #[test]
+    fn dispatches_generated_comm_and_sample_records(
+        pid in any::<u32>(),
+        tid in any::<u32>(),
+        comm in "[ -~]{0,32}",
+        is_exec in any::<bool>(),
+        misc in any::<u16>(),
+        sample_payload in prop::collection::vec(any::<u8>(), 0..64),
+    ) {
+        let comm_payload = comm_payload_from(pid, tid, &comm);
+        let comm_misc = if is_exec { PERF_RECORD_MISC_COMM_EXEC } else { 0 };
+
+        prop_assert_eq!(
+            parse_record(perf_record_with_misc(3, comm_misc, &comm_payload)).expect("comm"),
+            ParsedRecord::Comm(pyroclast::perfdata::records::CommRecord {
+                pid,
+                tid,
+                comm,
+                is_exec,
+            })
+        );
+
+        prop_assert_eq!(
+            parse_record(perf_record_with_misc(9, misc, &sample_payload)).expect("sample"),
+            ParsedRecord::Sample(pyroclast::perfdata::records::SamplePayloadRecord {
+                misc,
+                payload: sample_payload,
+            })
+        );
+    }
+
+    #[test]
+    fn dispatches_generated_lifecycle_counter_and_read_records(
+        pid in any::<u32>(),
+        ppid in any::<u32>(),
+        tid in any::<u32>(),
+        ptid in any::<u32>(),
+        time in any::<u64>(),
+        lost_id in any::<u64>(),
+        lost in any::<u64>(),
+        stream_id in any::<u64>(),
+        read_values in prop::collection::vec(any::<u8>(), 0..32),
+    ) {
+        let lifecycle_payload = lifecycle_payload_from(pid, ppid, tid, ptid, time);
+        prop_assert_eq!(
+            parse_record(perf_record(7, &lifecycle_payload)).expect("fork"),
+            ParsedRecord::Fork(parse_fork_record(&lifecycle_payload).expect("fork payload"))
+        );
+        prop_assert_eq!(
+            parse_record(perf_record(4, &lifecycle_payload)).expect("exit"),
+            ParsedRecord::Exit(parse_exit_record(&lifecycle_payload).expect("exit payload"))
+        );
+
+        let lost_payload = lost_payload_from(lost_id, lost);
+        prop_assert_eq!(
+            parse_record(perf_record(2, &lost_payload)).expect("lost"),
+            ParsedRecord::Lost(parse_lost_record(&lost_payload).expect("lost payload"))
+        );
+
+        let lost_samples_payload = lost.to_le_bytes();
+        prop_assert_eq!(
+            parse_record(perf_record(13, &lost_samples_payload)).expect("lost samples"),
+            ParsedRecord::LostSamples(
+                parse_lost_samples_record(&lost_samples_payload).expect("lost samples payload")
+            )
+        );
+
+        let throttle_payload = throttle_payload_from(time, lost_id, stream_id);
+        prop_assert_eq!(
+            parse_record(perf_record(5, &throttle_payload)).expect("throttle"),
+            ParsedRecord::Throttle(
+                parse_throttle_record(&throttle_payload).expect("throttle payload")
+            )
+        );
+        prop_assert_eq!(
+            parse_record(perf_record(6, &throttle_payload)).expect("unthrottle"),
+            ParsedRecord::Unthrottle(
+                parse_unthrottle_record(&throttle_payload).expect("unthrottle payload")
+            )
+        );
+
+        let read_payload = read_payload_from(pid, tid, &read_values);
+        prop_assert_eq!(
+            parse_record(perf_record(8, &read_payload)).expect("read"),
+            ParsedRecord::Read(parse_read_record(&read_payload).expect("read payload"))
+        );
+    }
+
+    #[test]
+    fn dispatches_generated_auxiliary_records(
+        pid in any::<u32>(),
+        tid in any::<u32>(),
+        aux_offset in any::<u64>(),
+        aux_size in any::<u64>(),
+        aux_flags in any::<u64>(),
+        aux_sample_id in prop::collection::vec(any::<u8>(), 0..16),
+        switch_sample_id in prop::collection::vec(any::<u8>(), 0..16),
+        namespaces in prop::collection::vec((any::<u64>(), any::<u64>()), 0..8),
+        namespace_sample_id in prop::collection::vec(any::<u8>(), 0..16),
+        ksymbol_addr in any::<u64>(),
+        ksymbol_len in any::<u32>(),
+        ksymbol_type in any::<u16>(),
+        ksymbol_flags in any::<u16>(),
+        ksymbol_name in "[ -~]{0,32}",
+        ksymbol_sample_id in prop::collection::vec(any::<u8>(), 0..16),
+        bpf_event_type in any::<u16>(),
+        bpf_flags in any::<u16>(),
+        bpf_id in any::<u32>(),
+        bpf_tag in any::<[u8; 8]>(),
+        bpf_sample_id in prop::collection::vec(any::<u8>(), 0..16),
+        cgroup_id in any::<u64>(),
+        cgroup_path in "[ -~]{0,32}",
+        cgroup_sample_id in prop::collection::vec(any::<u8>(), 0..16),
+        text_poke_addr in any::<u64>(),
+        old_bytes in prop::collection::vec(any::<u8>(), 0..16),
+        new_bytes in prop::collection::vec(any::<u8>(), 0..16),
+        text_poke_sample_id in prop::collection::vec(any::<u8>(), 0..16),
+        hw_id in any::<u64>(),
+        hw_sample_id in prop::collection::vec(any::<u8>(), 0..16),
+        cookie in any::<u64>(),
+        ips in prop::collection::vec(any::<u64>(), 0..16),
+        deferred_sample_id in prop::collection::vec(any::<u8>(), 0..16),
+    ) {
+        let aux_payload = aux_payload(aux_offset, aux_size, aux_flags, &aux_sample_id);
+        prop_assert_eq!(
+            parse_record(perf_record(11, &aux_payload)).expect("aux"),
+            ParsedRecord::Aux(parse_aux_record(&aux_payload).expect("aux payload"))
+        );
+
+        let itrace_payload = two_u32_payload(pid, tid, &aux_sample_id);
+        prop_assert_eq!(
+            parse_record(perf_record(12, &itrace_payload)).expect("itrace"),
+            ParsedRecord::ItraceStart(
+                parse_itrace_start_record(&itrace_payload).expect("itrace payload")
+            )
+        );
+
+        prop_assert_eq!(
+            parse_record(perf_record(14, &switch_sample_id)).expect("switch"),
+            ParsedRecord::Switch(
+                parse_switch_record(&switch_sample_id).expect("switch payload")
+            )
+        );
+
+        let switch_cpu_wide_payload = two_u32_payload(pid, tid, &switch_sample_id);
+        prop_assert_eq!(
+            parse_record(perf_record(15, &switch_cpu_wide_payload)).expect("switch cpu wide"),
+            ParsedRecord::SwitchCpuWide(
+                parse_switch_cpu_wide_record(&switch_cpu_wide_payload)
+                    .expect("switch cpu wide payload")
+            )
+        );
+
+        let namespaces_payload = namespaces_payload_from(pid, tid, &namespaces, &namespace_sample_id);
+        prop_assert_eq!(
+            parse_record(perf_record(16, &namespaces_payload)).expect("namespaces"),
+            ParsedRecord::Namespaces(
+                parse_namespaces_record(&namespaces_payload).expect("namespaces payload")
+            )
+        );
+
+        let ksymbol_payload = ksymbol_payload_from(
+            ksymbol_addr,
+            ksymbol_len,
+            ksymbol_type,
+            ksymbol_flags,
+            &ksymbol_name,
+            &ksymbol_sample_id,
+        );
+        prop_assert_eq!(
+            parse_record(perf_record(17, &ksymbol_payload)).expect("ksymbol"),
+            ParsedRecord::Ksymbol(
+                parse_ksymbol_record(&ksymbol_payload).expect("ksymbol payload")
+            )
+        );
+
+        let bpf_payload = bpf_event_payload(
+            bpf_event_type,
+            bpf_flags,
+            bpf_id,
+            bpf_tag,
+            &bpf_sample_id,
+        );
+        prop_assert_eq!(
+            parse_record(perf_record(18, &bpf_payload)).expect("bpf"),
+            ParsedRecord::BpfEvent(
+                parse_bpf_event_record(&bpf_payload).expect("bpf payload")
+            )
+        );
+
+        let cgroup_payload = cgroup_payload_from(cgroup_id, &cgroup_path, &cgroup_sample_id);
+        prop_assert_eq!(
+            parse_record(perf_record(19, &cgroup_payload)).expect("cgroup"),
+            ParsedRecord::Cgroup(
+                parse_cgroup_record(&cgroup_payload).expect("cgroup payload")
+            )
+        );
+
+        let text_poke_payload = text_poke_payload_from(
+            text_poke_addr,
+            &old_bytes,
+            &new_bytes,
+            &text_poke_sample_id,
+        );
+        prop_assert_eq!(
+            parse_record(perf_record(20, &text_poke_payload)).expect("text poke"),
+            ParsedRecord::TextPoke(
+                parse_text_poke_record(&text_poke_payload).expect("text poke payload")
+            )
+        );
+
+        let aux_output_hw_id_payload = one_u64_payload(hw_id, &hw_sample_id);
+        prop_assert_eq!(
+            parse_record(perf_record(21, &aux_output_hw_id_payload)).expect("aux output hw id"),
+            ParsedRecord::AuxOutputHwId(
+                parse_aux_output_hw_id_record(&aux_output_hw_id_payload)
+                    .expect("aux output hw id payload")
+            )
+        );
+
+        let deferred_payload = callchain_deferred_payload_from(cookie, &ips, &deferred_sample_id);
+        prop_assert_eq!(
+            parse_record(perf_record(22, &deferred_payload)).expect("callchain deferred"),
+            ParsedRecord::CallchainDeferred(
+                parse_callchain_deferred_record(&deferred_payload)
+                    .expect("callchain deferred payload")
+            )
+        );
+    }
+}
+
 fn perfdata_with_records<const N: usize>(records: [Vec<u8>; N]) -> Vec<u8> {
     let data_size = records.iter().map(Vec::len).sum::<usize>();
     let mut bytes = vec![0; 104];
@@ -1406,11 +1638,15 @@ fn callchain_deferred_payload_from(cookie: u64, ips: &[u64], sample_id: &[u8]) -
 }
 
 fn perf_record(record_type: u32, payload: &[u8]) -> PerfRecord<'_> {
+    perf_record_with_misc(record_type, 0, payload)
+}
+
+fn perf_record_with_misc(record_type: u32, misc: u16, payload: &[u8]) -> PerfRecord<'_> {
     PerfRecord {
         offset: 104,
         header: PerfRecordHeader {
             record_type,
-            misc: 0,
+            misc,
             size: u16::try_from(8 + payload.len()).expect("record size"),
         },
         payload,
