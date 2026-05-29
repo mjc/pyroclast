@@ -1,10 +1,64 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use proptest::prelude::*;
+use proptest::string::string_regex;
 use pyroclast::cli::{
     Cli, CliCommand, FlamegraphAnalysisMode, ParseCommand, ParseFlamegraphCommand,
-    ParsePerfCommand, PerfCallGraph, PerfEvent, PlumbingCommand, ProfileKind, SymbolizerKind,
+    ParsePerfCommand, PerfCallGraph, PerfEvent, PlumbingCommand, ProfileArgs, ProfileKind, RunArgs,
+    SymbolizerKind,
 };
+
+fn profile_kind_from_case(case: u8) -> ProfileKind {
+    match case % 5 {
+        0 => ProfileKind::Cpu,
+        1 => ProfileKind::Memory,
+        2 => ProfileKind::Offcpu,
+        3 => ProfileKind::Latency,
+        _ => ProfileKind::Async,
+    }
+}
+
+fn perf_event_from_case(case: u8) -> PerfEvent {
+    match case % 4 {
+        0 => PerfEvent::Default,
+        1 => PerfEvent::CpuClock,
+        2 => PerfEvent::TaskClock,
+        _ => PerfEvent::Cycles,
+    }
+}
+
+fn perf_call_graph_from_case(case: u8) -> PerfCallGraph {
+    match case % 2 {
+        0 => PerfCallGraph::Fp,
+        _ => PerfCallGraph::Dwarf,
+    }
+}
+
+fn run_args_for_property(
+    no_symbols: bool,
+    frequency: u32,
+    event: PerfEvent,
+    call_graph: PerfCallGraph,
+    duration_secs: u32,
+    command: Vec<String>,
+) -> RunArgs {
+    RunArgs {
+        out: Some(PathBuf::from("runs/out")),
+        name: Some("named-run".to_string()),
+        json: true,
+        no_symbols,
+        symbolizer: SymbolizerKind::RustAddr2line,
+        frequency,
+        event,
+        call_graph,
+        pid: None,
+        tids: Vec::new(),
+        threads_of_pid: None,
+        duration_secs,
+        command,
+    }
+}
 
 #[test]
 fn parses_profile_defaults() {
@@ -473,4 +527,143 @@ fn rejects_removed_top_level_plumbing_commands() {
     assert!(Cli::try_parse_from(["pyroclast", "summarize", "run-dir"]).is_err());
     assert!(Cli::try_parse_from(["pyroclast", "analyze-flamegraph", "graph.svg"]).is_err());
     assert!(Cli::try_parse_from(["pyroclast", "analyze-perfdata", "perf.data"]).is_err());
+}
+
+proptest! {
+    #[test]
+    fn property_profile_command_invocation_preserves_generated_fields(
+        profile_kind_case in any::<u8>(),
+        no_symbols in any::<bool>(),
+        frequency in 1_u32..20_000,
+        perf_event_case in any::<u8>(),
+        call_graph_case in any::<u8>(),
+        duration_secs in 0_u32..10_000,
+        command in prop::collection::vec(
+            string_regex("[A-Za-z0-9][A-Za-z0-9._/-]{0,15}").expect("valid command-arg regex"),
+            1..4,
+        ),
+    ) {
+        let kind = profile_kind_from_case(profile_kind_case);
+        let event = perf_event_from_case(perf_event_case);
+        let call_graph = perf_call_graph_from_case(call_graph_case);
+        let cli_command = CliCommand::Profile(ProfileArgs {
+            kind,
+            out: Some(PathBuf::from("runs/out")),
+            name: Some("named-run".to_string()),
+            json: true,
+            no_symbols,
+            symbolizer: SymbolizerKind::RustAddr2line,
+            frequency,
+            event,
+            call_graph,
+            pid: None,
+            tids: Vec::new(),
+            threads_of_pid: None,
+            duration_secs,
+            command: command.clone(),
+        });
+
+        let profile = cli_command.profile_invocation().expect("profile invocation");
+
+        prop_assert_eq!(profile.kind, kind);
+        prop_assert_eq!(profile.out, Some(PathBuf::from("runs/out")));
+        prop_assert_eq!(profile.name.as_deref(), Some("named-run"));
+        prop_assert!(profile.json);
+        prop_assert_eq!(
+            profile.symbols,
+            !no_symbols && matches!(kind, ProfileKind::Cpu | ProfileKind::Offcpu)
+        );
+        prop_assert_eq!(profile.symbolizer, SymbolizerKind::RustAddr2line);
+        prop_assert_eq!(profile.frequency, frequency);
+        prop_assert_eq!(profile.event, event);
+        prop_assert_eq!(profile.call_graph, call_graph);
+        prop_assert_eq!(profile.duration_secs, duration_secs);
+        prop_assert_eq!(profile.command, command);
+        prop_assert_eq!(profile.pid, None);
+        prop_assert!(profile.tids.is_empty());
+        prop_assert_eq!(profile.threads_of_pid, None);
+    }
+
+    #[test]
+    fn property_top_level_profile_commands_map_to_expected_kind(
+        kind_case in 0_u8..5,
+        no_symbols in any::<bool>(),
+        frequency in 1_u32..20_000,
+        perf_event_case in any::<u8>(),
+        call_graph_case in any::<u8>(),
+        duration_secs in 0_u32..10_000,
+        command in prop::collection::vec(
+            string_regex("[A-Za-z0-9][A-Za-z0-9._/-]{0,15}").expect("valid top-level command-arg regex"),
+            1..4,
+        ),
+    ) {
+        let event = perf_event_from_case(perf_event_case);
+        let call_graph = perf_call_graph_from_case(call_graph_case);
+        let cli_command = match kind_case {
+            0 => CliCommand::Memory(run_args_for_property(
+                no_symbols,
+                frequency,
+                event,
+                call_graph,
+                duration_secs,
+                command.clone(),
+            )),
+            1 => CliCommand::Cpu(run_args_for_property(
+                no_symbols,
+                frequency,
+                event,
+                call_graph,
+                duration_secs,
+                command.clone(),
+            )),
+            2 => CliCommand::Offcpu(run_args_for_property(
+                no_symbols,
+                frequency,
+                event,
+                call_graph,
+                duration_secs,
+                command.clone(),
+            )),
+            3 => CliCommand::Latency(run_args_for_property(
+                no_symbols,
+                frequency,
+                event,
+                call_graph,
+                duration_secs,
+                command.clone(),
+            )),
+            _ => CliCommand::Async(run_args_for_property(
+                no_symbols,
+                frequency,
+                event,
+                call_graph,
+                duration_secs,
+                command.clone(),
+            )),
+        };
+
+        let profile = cli_command.profile_invocation().expect("profile invocation");
+        let expected_kind = match kind_case {
+            0 => ProfileKind::Memory,
+            1 => ProfileKind::Cpu,
+            2 => ProfileKind::Offcpu,
+            3 => ProfileKind::Latency,
+            _ => ProfileKind::Async,
+        };
+
+        prop_assert_eq!(profile.kind, expected_kind);
+        prop_assert_eq!(profile.out, Some(PathBuf::from("runs/out")));
+        prop_assert_eq!(profile.name.as_deref(), Some("named-run"));
+        prop_assert!(profile.json);
+        prop_assert_eq!(
+            profile.symbols,
+            !no_symbols && matches!(expected_kind, ProfileKind::Cpu | ProfileKind::Offcpu)
+        );
+        prop_assert_eq!(profile.symbolizer, SymbolizerKind::RustAddr2line);
+        prop_assert_eq!(profile.frequency, frequency);
+        prop_assert_eq!(profile.event, event);
+        prop_assert_eq!(profile.call_graph, call_graph);
+        prop_assert_eq!(profile.duration_secs, duration_secs);
+        prop_assert_eq!(profile.command, command);
+    }
 }
