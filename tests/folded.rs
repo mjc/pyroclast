@@ -1,3 +1,4 @@
+use proptest::prelude::*;
 use pyroclast::folded::{
     escape_frame, render_address_stack, render_folded_stack, render_inferno_perf_folded_stack,
 };
@@ -43,4 +44,65 @@ fn renders_inferno_perf_tidy_generic_names() {
         stack,
         "fn; core::option::Option<(u64, alloc::string::String)>_[i];method;java:semi 5",
     );
+}
+
+proptest! {
+    #[test]
+    fn escaping_frames_removes_newlines_and_only_keeps_escaped_semicolons(frame in arbitrary_frame()) {
+        let escaped = escape_frame(&frame);
+
+        prop_assert!(!escaped.contains('\n'));
+        prop_assert!(!escaped.contains('\r'));
+
+        for (index, byte) in escaped.bytes().enumerate() {
+            if byte == b';' {
+                prop_assert!(index > 0);
+                prop_assert_eq!(escaped.as_bytes()[index - 1], b'\\');
+            }
+        }
+    }
+
+    #[test]
+    fn rendered_folded_stacks_escape_each_frame(
+        frames in prop::collection::vec(arbitrary_frame(), 0..8),
+        count in any::<u64>(),
+    ) {
+        let rendered = render_folded_stack(frames.iter().map(String::as_str), count);
+        let (stack, rendered_count) = rendered.rsplit_once(' ').expect("count suffix");
+        let mut expected_stack = String::new();
+        for frame in &frames {
+            if !expected_stack.is_empty() {
+                expected_stack.push(';');
+            }
+            expected_stack.push_str(&escape_frame(frame));
+        }
+
+        prop_assert_eq!(stack, expected_stack);
+        prop_assert_eq!(rendered_count, count.to_string());
+    }
+
+    #[test]
+    fn rendered_address_stacks_format_all_frames_as_lower_hex(
+        frames in prop::collection::vec(any::<u64>(), 0..8),
+        count in any::<u64>(),
+    ) {
+        let rendered = render_address_stack(frames.iter().copied(), count);
+        let (stack, rendered_count) = rendered.rsplit_once(' ').expect("count suffix");
+        let expected_stack = frames
+            .iter()
+            .map(|frame| format!("0x{frame:x}"))
+            .collect::<Vec<_>>()
+            .join(";");
+
+        prop_assert_eq!(stack, expected_stack);
+        prop_assert_eq!(rendered_count, count.to_string());
+    }
+}
+
+fn arbitrary_frame() -> impl Strategy<Value = String> {
+    prop::collection::vec(
+        prop_oneof![Just(b';'), Just(b'\n'), Just(b'\r'), b' '..=b'~'],
+        0..24,
+    )
+    .prop_map(|bytes| String::from_utf8(bytes).expect("ASCII frame"))
 }
