@@ -1,7 +1,11 @@
+use std::collections::BTreeSet;
+
+use proptest::prelude::*;
+use proptest::string::string_regex;
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
 use pyroclast::tools::{
     ResolverContext, SystemToolResolver, ToolKind, ToolSource, ToolSpec, collect_tool_versions,
-    required_tools, tool_spec_named,
+    find_executable_on_path, find_nearest_flake_dir, required_tools, tool_spec_named,
 };
 
 #[test]
@@ -495,6 +499,132 @@ fn resolver_reports_ephemeral_nix_probe_failure_detail() {
 
     assert!(error.to_string().contains("nix shell probe failed"));
     assert!(error.to_string().contains("inferno package blew up"));
+}
+
+fn supported_tool_names() -> BTreeSet<&'static str> {
+    required_tools("linux")
+        .into_iter()
+        .chain(required_tools("macos"))
+        .chain(required_tools("other"))
+        .map(|tool| tool.name)
+        .collect()
+}
+
+proptest! {
+    #[test]
+    fn property_required_tools_have_unique_round_trippable_names(platform_case in 0_u8..3) {
+        let platform = match platform_case {
+            0 => "linux",
+            1 => "macos",
+            _ => "freebsd",
+        };
+        let tools = required_tools(platform);
+        let mut seen = BTreeSet::new();
+
+        for tool in &tools {
+            prop_assert!(seen.insert(tool.name));
+            prop_assert_eq!(tool_spec_named(tool.name), Some(*tool));
+        }
+
+        match platform {
+            "linux" => {
+                prop_assert!(tools.iter().all(|tool| tool.kind == ToolKind::NixManaged));
+                prop_assert!(tools.iter().any(|tool| tool.name == "perf"));
+                prop_assert!(tools.iter().any(|tool| tool.name == "heaptrack"));
+            }
+            "macos" => {
+                let apple_provided = tools
+                    .iter()
+                    .filter(|tool| tool.kind == ToolKind::AppleProvided)
+                    .collect::<Vec<_>>();
+                prop_assert_eq!(apple_provided.len(), 1);
+                prop_assert_eq!(apple_provided[0].name, "xctrace");
+            }
+            _ => {
+                prop_assert!(tools.iter().all(|tool| tool.kind == ToolKind::NixManaged));
+                prop_assert!(tools.iter().all(|tool| tool.name != "xctrace"));
+            }
+        }
+    }
+
+    #[test]
+    fn property_unknown_tool_names_do_not_resolve(
+        name in string_regex("[a-z][a-z0-9_-]{0,20}").expect("valid tool-name regex"),
+    ) {
+        let supported = supported_tool_names();
+        prop_assume!(!supported.contains(name.as_str()));
+
+        prop_assert_eq!(tool_spec_named(&name), None);
+    }
+
+    #[test]
+    fn property_find_nearest_flake_dir_prefers_nearest_ancestor(
+        flake_levels in prop::collection::vec(any::<bool>(), 1..8),
+    ) {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut ancestors = Vec::with_capacity(flake_levels.len());
+        let mut current = root.path().join("project");
+        std::fs::create_dir_all(&current).expect("project dir");
+        ancestors.push(current.clone());
+
+        for index in 1..flake_levels.len() {
+            current = current.join(format!("level-{index}"));
+            std::fs::create_dir_all(&current).expect("nested dir");
+            ancestors.push(current.clone());
+        }
+
+        for (directory, has_flake) in ancestors.iter().zip(&flake_levels) {
+            if *has_flake {
+                std::fs::write(directory.join("flake.nix"), "{}").expect("flake");
+            }
+        }
+
+        let expected = flake_levels
+            .iter()
+            .rposition(|has_flake| *has_flake)
+            .map(|index| ancestors[index].clone());
+
+        prop_assert_eq!(
+            find_nearest_flake_dir(ancestors.last().expect("cwd ancestor")),
+            expected
+        );
+    }
+
+    #[test]
+    fn property_find_executable_on_path_prefers_first_file_match(
+        command in string_regex("[a-z][a-z0-9_-]{0,12}").expect("valid command-name regex"),
+        entries in prop::collection::vec(0_u8..=2, 1..8),
+    ) {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut path_entries = Vec::with_capacity(entries.len());
+        let mut expected = None;
+
+        for (index, state) in entries.iter().enumerate() {
+            let directory = root.path().join(format!("bin-{index}"));
+            std::fs::create_dir_all(&directory).expect("bin dir");
+            let candidate = directory.join(&command);
+            match state {
+                1 => {
+                    std::fs::create_dir_all(&candidate).expect("directory candidate");
+                }
+                2 => {
+                    std::fs::write(&candidate, "").expect("file candidate");
+                    if expected.is_none() {
+                        expected = Some(candidate.clone());
+                    }
+                }
+                _ => {}
+            }
+            path_entries.push(directory);
+        }
+
+        let path = std::env::join_paths(&path_entries).expect("join path");
+
+        prop_assert_eq!(
+            find_executable_on_path(&command, Some(path.as_os_str())),
+            expected
+        );
+    }
 }
 
 struct VersionRunner;
