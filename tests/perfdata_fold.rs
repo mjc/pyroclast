@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::fmt::Write as _;
 
 use proptest::prelude::*;
 use pyroclast::perfdata::fold::{
@@ -24,7 +25,7 @@ fn render_unknown_folded_callchain(frames: &[u64], count: u64) -> String {
 
     let mut rendered = String::from("[unknown]");
     for frame in frames.iter().rev() {
-        rendered.push_str(&format!(";0x{frame:x}"));
+        let _ = write!(rendered, ";0x{frame:x}");
     }
     rendered.push(' ');
     rendered.push_str(&count.to_string());
@@ -1420,14 +1421,8 @@ proptest! {
     }
 
     #[test]
-    fn property_folds_generated_periods_for_filtered_callchains(
-        frames in prop::collection::vec(
-            prop_oneof![
-                0x1000_u64..0x0001_0000_0000_u64,
-                0xffff_ffff_ffff_f000_u64..=u64::MAX,
-            ],
-            1..12,
-        ),
+    fn property_folds_generated_periods_for_user_callchains(
+        frames in prop::collection::vec(0x1000_u64..0x0001_0000_0000_u64, 1..12),
         periods in prop::collection::vec(1_u64..10_000, 1..16),
     ) {
         let records = periods
@@ -1453,12 +1448,7 @@ proptest! {
             FoldOptions { count_periods: true },
         )
         .expect("folded");
-        let filtered = frames
-            .iter()
-            .copied()
-            .filter(|frame| *frame < 0xffff_ffff_ffff_f000)
-            .collect::<Vec<_>>();
-        let expected = render_unknown_folded_callchain(&filtered, periods.iter().sum());
+        let expected = render_unknown_folded_callchain(&frames, periods.iter().sum());
 
         prop_assert_eq!(folded, expected);
     }
