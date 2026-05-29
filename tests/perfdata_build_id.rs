@@ -1,3 +1,5 @@
+use proptest::prelude::*;
+use proptest::string::string_regex;
 use pyroclast::perfdata::build_id::{
     BuildIdEvent, build_id_events_from_perfdata, kernel_build_id_from_perfdata,
     kernel_build_id_from_perfdata_file, parse_build_id_events,
@@ -98,6 +100,103 @@ fn extracts_kernel_build_id_from_perfdata_file() {
         kernel_build_id,
         Some("16ed3d5317ad219c89d0e3c5ea0ea2caa3cd4949".to_string())
     );
+}
+
+proptest! {
+    #[test]
+    fn property_parses_concatenated_build_id_events_in_order(
+        specs in prop::collection::vec(build_id_spec(), 0..32),
+    ) {
+        let payload = specs.iter().flat_map(BuildIdSpec::payload).collect::<Vec<_>>();
+        let expected = specs
+            .iter()
+            .map(|spec| BuildIdEvent {
+                pid: spec.pid,
+                build_id: build_id_hex(&spec.build_id),
+                filename: spec.filename.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        prop_assert_eq!(parse_build_id_events(&payload).expect("build-id events"), expected);
+    }
+
+    #[test]
+    fn property_kernel_build_id_picks_first_kernelish_filename(
+        specs in prop::collection::vec(build_id_spec(), 0..32),
+    ) {
+        let payload = specs.iter().flat_map(BuildIdSpec::payload).collect::<Vec<_>>();
+        let perfdata = perfdata_with_build_id_feature(&payload);
+        let expected = specs
+            .iter()
+            .find(|spec| is_kernel_filename(&spec.filename))
+            .map(|spec| build_id_hex(&spec.build_id));
+
+        prop_assert_eq!(
+            kernel_build_id_from_perfdata(&perfdata).expect("kernel build id"),
+            expected
+        );
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BuildIdSpec {
+    pid: u32,
+    build_id: [u8; 20],
+    filename: String,
+}
+
+impl BuildIdSpec {
+    fn payload(&self) -> Vec<u8> {
+        build_id_event_payload(self.pid, &self.build_id, &self.filename)
+    }
+}
+
+fn build_id_spec() -> impl Strategy<Value = BuildIdSpec> {
+    (
+        any::<u32>(),
+        prop::array::uniform20(any::<u8>()),
+        prop_oneof![
+            kernel_filename().prop_map(str::to_string),
+            non_kernel_filename(),
+        ],
+    )
+        .prop_map(|(pid, build_id, filename)| BuildIdSpec {
+            pid,
+            build_id,
+            filename,
+        })
+}
+
+fn kernel_filename() -> impl Strategy<Value = &'static str> {
+    prop_oneof![
+        Just("[kernel.kallsyms]"),
+        Just("[kernel]"),
+        Just("[guest.kernel]"),
+    ]
+}
+
+fn non_kernel_filename() -> impl Strategy<Value = String> {
+    string_regex(r"[A-Za-z0-9_./-]{1,24}")
+        .expect("valid filename regex")
+        .prop_filter("exclude kernel-like paths", |filename| {
+            !is_kernel_filename(filename)
+        })
+}
+
+fn is_kernel_filename(filename: &str) -> bool {
+    matches!(
+        filename,
+        "[kernel.kallsyms]" | "[kernel]" | "[guest.kernel]"
+    )
+}
+
+fn build_id_hex(build_id: &[u8; 20]) -> String {
+    let mut hex = String::with_capacity(build_id.len() * 2);
+    for byte in build_id {
+        use std::fmt::Write as _;
+        write!(&mut hex, "{byte:02x}").expect("write hex");
+    }
+    hex
 }
 
 fn build_id_event_payload(pid: u32, build_id: &[u8; 20], filename: &str) -> Vec<u8> {
