@@ -45,6 +45,80 @@ fn layout(sample_type: u64) -> SampleLayout {
     }
 }
 
+#[derive(Clone, Debug)]
+struct CallchainUnwindCase {
+    pid: u32,
+    tid: u32,
+    time: u64,
+    period: u64,
+    frames: Vec<u64>,
+    regs_mask: u64,
+    abi: u64,
+    regs_values: Vec<u64>,
+    user_stack: Vec<u8>,
+    dynamic_size: u64,
+}
+
+fn callchain_unwind_case() -> impl Strategy<Value = CallchainUnwindCase> {
+    (
+        any::<u32>(),
+        any::<u32>(),
+        any::<u64>(),
+        any::<u64>(),
+        prop::collection::vec(any::<u64>(), 0..32),
+        0_u64..=0xffff,
+        any::<u64>(),
+        prop::collection::vec(any::<u8>(), 0..31),
+        any::<u64>(),
+    )
+        .prop_flat_map(
+            |(pid, tid, time, period, frames, regs_mask, abi, user_stack, dynamic_size)| {
+                let reg_count = if abi == 0 {
+                    0
+                } else {
+                    regs_mask.count_ones() as usize
+                };
+                (
+                    Just(pid),
+                    Just(tid),
+                    Just(time),
+                    Just(period),
+                    Just(frames),
+                    Just(regs_mask),
+                    Just(abi),
+                    prop::collection::vec(any::<u64>(), reg_count),
+                    Just(user_stack),
+                    Just(dynamic_size),
+                )
+            },
+        )
+        .prop_map(
+            |(
+                pid,
+                tid,
+                time,
+                period,
+                frames,
+                regs_mask,
+                abi,
+                regs_values,
+                user_stack,
+                dynamic_size,
+            )| CallchainUnwindCase {
+                pid,
+                tid,
+                time,
+                period,
+                frames,
+                regs_mask,
+                abi,
+                regs_values,
+                user_stack,
+                dynamic_size,
+            },
+        )
+}
+
 #[test]
 fn parses_ip_tid_and_callchain_sample_payload() {
     let mut payload = Vec::new();
@@ -560,5 +634,78 @@ proptest! {
         prop_assert_eq!(sample.tid, Some(tid));
         prop_assert_eq!(sample.period, Some(period));
         prop_assert_eq!(sample.callchain, frames);
+    }
+
+    #[test]
+    fn property_callchain_parser_preserves_generated_unwind_metadata(
+        case in callchain_unwind_case(),
+    ) {
+        let mut payload = Vec::new();
+        payload.extend(case.pid.to_le_bytes());
+        payload.extend(case.tid.to_le_bytes());
+        payload.extend(case.time.to_le_bytes());
+        payload.extend(case.period.to_le_bytes());
+        payload.extend((case.frames.len() as u64).to_le_bytes());
+        for frame in &case.frames {
+            payload.extend(frame.to_le_bytes());
+        }
+        payload.extend(case.abi.to_le_bytes());
+        for value in &case.regs_values {
+            payload.extend(value.to_le_bytes());
+        }
+        payload.extend((case.user_stack.len() as u64).to_le_bytes());
+        payload.extend(&case.user_stack);
+        let padding = case.user_stack.len().next_multiple_of(8) - case.user_stack.len();
+        payload.extend(std::iter::repeat_n(0, padding));
+        if !case.user_stack.is_empty() {
+            payload.extend(case.dynamic_size.to_le_bytes());
+        }
+
+        let sample = parse_sample_record_callchain(
+            &payload,
+            SampleLayout {
+                sample_type: PERF_SAMPLE_TID
+                    | PERF_SAMPLE_TIME
+                    | PERF_SAMPLE_PERIOD
+                    | PERF_SAMPLE_CALLCHAIN
+                    | PERF_SAMPLE_REGS_USER
+                    | PERF_SAMPLE_STACK_USER,
+                sample_regs_user: case.regs_mask,
+                ..layout(0)
+            },
+        )
+        .expect("sample")
+        .expect("callchain");
+
+        prop_assert_eq!(sample.pid, Some(case.pid));
+        prop_assert_eq!(sample.tid, Some(case.tid));
+        prop_assert_eq!(sample.time, Some(case.time));
+        prop_assert_eq!(sample.period, Some(case.period));
+        prop_assert_eq!(sample.frames.len(), case.frames.len());
+        prop_assert_eq!(sample.frames.collect::<Vec<_>>(), case.frames);
+
+        let user_regs = sample.user_regs.expect("user regs");
+        prop_assert_eq!(user_regs.abi, case.abi);
+        prop_assert_eq!(user_regs.values, case.regs_values);
+
+        let user_stack = sample.user_stack.expect("user stack");
+        prop_assert_eq!(user_stack.bytes, case.user_stack.as_slice());
+        prop_assert_eq!(
+            user_stack.dynamic_size,
+            if case.user_stack.is_empty() {
+                0
+            } else {
+                case.dynamic_size
+            }
+        );
+    }
+
+    #[test]
+    fn property_classifies_context_markers_and_kernel_frames(frame in any::<u64>()) {
+        prop_assert_eq!(is_perf_context_marker(frame), frame >= 0xffff_ffff_ffff_f000);
+        prop_assert_eq!(
+            is_kernel_space_frame(frame),
+            (0xffff_8000_0000_0000..0xffff_ffff_ffff_f000).contains(&frame)
+        );
     }
 }
