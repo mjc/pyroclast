@@ -1,10 +1,93 @@
 use std::os::unix::fs::MetadataExt;
 
+use proptest::prelude::*;
 use pyroclast::perfdata::mappings::{
     FileIdentity, MmapTable, ResolvedMapping, file_matches_recorded_identity,
 };
 use pyroclast::perfdata::records::{Mmap2BuildIdRecord, Mmap2Record, MmapRecord};
 use pyroclast::symbols::KernelRelocation;
+
+#[derive(Clone, Debug)]
+struct OverlapMappingCase {
+    pid: u32,
+    outer_start: u64,
+    outer_len: u64,
+    inner_start: u64,
+    inner_len: u64,
+    outer_pgoff: u64,
+    inner_pgoff: u64,
+    ip: u64,
+    ip_offset: u64,
+}
+
+fn overlap_mapping_case() -> impl Strategy<Value = OverlapMappingCase> {
+    (
+        1_u32..u32::MAX,
+        0x1000_u64..0x0001_0000_0000_u64,
+        2_u64..0x3000,
+        0_u64..0x0010_0000,
+        0_u64..0x0010_0000,
+    )
+        .prop_flat_map(|(pid, outer_start, outer_len, outer_pgoff, inner_pgoff)| {
+            (
+                Just(pid),
+                Just(outer_start),
+                Just(outer_len),
+                Just(outer_pgoff),
+                Just(inner_pgoff),
+                1_u64..outer_len,
+            )
+        })
+        .prop_flat_map(
+            |(pid, outer_start, outer_len, outer_pgoff, inner_pgoff, inner_offset)| {
+                (
+                    Just(pid),
+                    Just(outer_start),
+                    Just(outer_len),
+                    Just(outer_pgoff),
+                    Just(inner_pgoff),
+                    Just(inner_offset),
+                    1_u64..(outer_len - inner_offset + 1),
+                )
+            },
+        )
+        .prop_flat_map(
+            |(pid, outer_start, outer_len, outer_pgoff, inner_pgoff, inner_offset, inner_len)| {
+                (
+                    Just(pid),
+                    Just(outer_start),
+                    Just(outer_len),
+                    Just(outer_pgoff),
+                    Just(inner_pgoff),
+                    Just(inner_offset),
+                    Just(inner_len),
+                    0_u64..inner_len,
+                )
+            },
+        )
+        .prop_map(
+            |(
+                pid,
+                outer_start,
+                outer_len,
+                outer_pgoff,
+                inner_pgoff,
+                inner_offset,
+                inner_len,
+                ip_offset,
+            )| OverlapMappingCase {
+                pid,
+                outer_start,
+                outer_len,
+                inner_start: outer_start + inner_offset,
+                inner_len,
+                outer_pgoff,
+                inner_pgoff,
+                ip: outer_start + inner_offset + ip_offset,
+                ip_offset,
+            },
+        )
+}
 
 #[test]
 fn resolves_user_ip_to_mapping_relative_address() {
@@ -380,4 +463,114 @@ fn prefers_latest_mapping_when_ranges_share_the_same_start() {
 
     assert_eq!(table.resolve(42, 0x1050).unwrap().path, "/bin/new");
     assert_eq!(table.resolve(42, 0x1150).unwrap().path, "/bin/old");
+}
+
+proptest! {
+    #[test]
+    fn property_resolve_matches_mapping_path_and_relative_address(
+        pid in 1_u32..u32::MAX,
+        start in 0x1000_u64..0x0001_0000_0000_u64,
+        len in 1_u64..0x2000,
+        pgoff in 0_u64..0x0010_0000,
+        offset in 0_u64..0x2000,
+    ) {
+        prop_assume!(offset < len);
+
+        let mut table = MmapTable::default();
+        table.insert_mmap(MmapRecord {
+            pid,
+            tid: pid,
+            start,
+            len,
+            pgoff,
+            path: "/usr/bin/test-app".to_string(),
+        });
+
+        let ip = start + offset;
+        let resolved = table.resolve(pid, ip).expect("resolved mapping");
+        let resolved_ref = table.resolve_ref(pid, ip).expect("resolved ref");
+
+        prop_assert_eq!(resolved.path.as_str(), "/usr/bin/test-app");
+        prop_assert_eq!(resolved.path.as_str(), resolved_ref.path);
+        prop_assert_eq!(resolved.relative_address, pgoff + offset);
+        prop_assert_eq!(resolved.relative_address, resolved_ref.relative_address);
+        prop_assert_eq!(table.mapping_path(pid, ip), Some("/usr/bin/test-app"));
+        prop_assert!(table.has_mapping_for_pid(pid, ip));
+    }
+
+    #[test]
+    fn property_prefers_more_specific_mapping_in_overlap(
+        case in overlap_mapping_case(),
+    ) {
+        let mut table = MmapTable::default();
+        table.insert_mmap(MmapRecord {
+            pid: case.pid,
+            tid: case.pid,
+            start: case.outer_start,
+            len: case.outer_len,
+            pgoff: case.outer_pgoff,
+            path: "/usr/bin/base".to_string(),
+        });
+        table.insert_mmap(MmapRecord {
+            pid: case.pid,
+            tid: case.pid,
+            start: case.inner_start,
+            len: case.inner_len,
+            pgoff: case.inner_pgoff,
+            path: "/usr/lib/plugin.so".to_string(),
+        });
+
+        let resolved = table
+            .resolve(case.pid, case.ip)
+            .expect("resolved overlap");
+
+        prop_assert_eq!(resolved.path.as_str(), "/usr/lib/plugin.so");
+        prop_assert_eq!(resolved.relative_address, case.inner_pgoff + case.ip_offset);
+    }
+
+    #[test]
+    fn property_prefers_latest_mapping_when_starts_match(
+        pid in 1_u32..u32::MAX,
+        start in 0x1000_u64..0x0001_0000_0000_u64,
+        newer_len in 1_u64..0x2000,
+        tail_len in 0_u64..0x1000,
+        older_pgoff in 0_u64..0x0010_0000,
+        newer_pgoff in 0_u64..0x0010_0000,
+        offset in 0_u64..0x2000,
+    ) {
+        prop_assume!(offset < newer_len);
+
+        let older_len = newer_len + tail_len;
+        let mut table = MmapTable::default();
+        table.insert_mmap(MmapRecord {
+            pid,
+            tid: pid,
+            start,
+            len: older_len,
+            pgoff: older_pgoff,
+            path: "/usr/bin/older".to_string(),
+        });
+        table.insert_mmap(MmapRecord {
+            pid,
+            tid: pid,
+            start,
+            len: newer_len,
+            pgoff: newer_pgoff,
+            path: "/usr/bin/newer".to_string(),
+        });
+
+        let ip = start + offset;
+        let resolved = table.resolve(pid, ip).expect("resolved same-start mapping");
+        prop_assert_eq!(resolved.path.as_str(), "/usr/bin/newer");
+        prop_assert_eq!(resolved.relative_address, newer_pgoff + offset);
+
+        if tail_len > 0 {
+            let older_only_ip = start + newer_len;
+            let older_only = table
+                .resolve(pid, older_only_ip)
+                .expect("older mapping still covers tail");
+            prop_assert_eq!(older_only.path.as_str(), "/usr/bin/older");
+            prop_assert_eq!(older_only.relative_address, older_pgoff + newer_len);
+        }
+    }
 }
