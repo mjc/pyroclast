@@ -39,6 +39,13 @@ pub struct ResolvedMappingRef<'a> {
     pub kernel_relocation: Option<KernelRelocation>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct MappingResolveCache {
+    pid: Option<u32>,
+    pid_index: Option<usize>,
+    global_index: Option<usize>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FileIdentity {
     pub major: u32,
@@ -216,13 +223,52 @@ impl MmapTable {
     }
 
     #[must_use]
+    pub(crate) fn resolve_ref_cached(
+        &self,
+        pid: u32,
+        ip: u64,
+        cache: &mut MappingResolveCache,
+    ) -> Option<ResolvedMappingRef<'_>> {
+        self.resolve_mapping_with_index_cached(pid, ip, cache)
+            .map(|(_, mapping)| ResolvedMappingRef {
+                symbol_source_id: mapping.symbol_source_id,
+                path: mapping.path.as_str(),
+                relative_address: mapping.relative_address(ip),
+                build_id: mapping.build_id.as_deref(),
+                file_identity: mapping.file_identity,
+                kernel_relocation: mapping.kernel_relocation(),
+            })
+    }
+
+    #[must_use]
     pub fn has_mapping_for_pid(&self, pid: u32, ip: u64) -> bool {
         self.resolve_mapping(pid, ip).is_some()
     }
 
     #[must_use]
+    pub(crate) fn has_mapping_for_pid_cached(
+        &self,
+        pid: u32,
+        ip: u64,
+        cache: &mut MappingResolveCache,
+    ) -> bool {
+        self.resolve_mapping_cached(pid, ip, cache).is_some()
+    }
+
+    #[must_use]
     pub fn mapping_path(&self, pid: u32, ip: u64) -> Option<&str> {
         self.resolve_mapping(pid, ip)
+            .map(|mapping| mapping.path.as_str())
+    }
+
+    #[must_use]
+    pub(crate) fn mapping_path_cached(
+        &self,
+        pid: u32,
+        ip: u64,
+        cache: &mut MappingResolveCache,
+    ) -> Option<&str> {
+        self.resolve_mapping_cached(pid, ip, cache)
             .map(|mapping| mapping.path.as_str())
     }
 
@@ -262,6 +308,16 @@ impl MmapTable {
             .map(|(_, mapping)| mapping)
     }
 
+    fn resolve_mapping_cached(
+        &self,
+        pid: u32,
+        ip: u64,
+        cache: &mut MappingResolveCache,
+    ) -> Option<&Mapping> {
+        self.resolve_mapping_with_index_cached(pid, ip, cache)
+            .map(|(_, mapping)| mapping)
+    }
+
     fn resolve_mapping_with_index(&self, pid: u32, ip: u64) -> Option<(usize, &Mapping)> {
         if pid == u32::MAX {
             let index = self.resolve_mapping_index_for_pid(pid, ip)?;
@@ -270,6 +326,39 @@ impl MmapTable {
         match (
             self.resolve_mapping_index_for_pid(pid, ip),
             self.resolve_mapping_index_for_pid(u32::MAX, ip),
+        ) {
+            (Some(left), Some(right)) => {
+                let left_mapping = &self.mappings[left];
+                let right_mapping = &self.mappings[right];
+                Some(if left_mapping.start >= right_mapping.start {
+                    (left, left_mapping)
+                } else {
+                    (right, right_mapping)
+                })
+            }
+            (Some(index), None) | (None, Some(index)) => Some((index, &self.mappings[index])),
+            (None, None) => None,
+        }
+    }
+
+    fn resolve_mapping_with_index_cached(
+        &self,
+        pid: u32,
+        ip: u64,
+        cache: &mut MappingResolveCache,
+    ) -> Option<(usize, &Mapping)> {
+        if pid == u32::MAX {
+            let index =
+                self.resolve_mapping_index_for_pid_with_cache(pid, ip, &mut cache.global_index)?;
+            return Some((index, &self.mappings[index]));
+        }
+        if cache.pid != Some(pid) {
+            cache.pid = Some(pid);
+            cache.pid_index = None;
+        }
+        match (
+            self.resolve_mapping_index_for_pid_with_cache(pid, ip, &mut cache.pid_index),
+            self.resolve_mapping_index_for_pid_with_cache(u32::MAX, ip, &mut cache.global_index),
         ) {
             (Some(left), Some(right)) => {
                 let left_mapping = &self.mappings[left];
@@ -301,6 +390,26 @@ impl MmapTable {
             }
         }
         None
+    }
+
+    fn resolve_mapping_index_for_pid_with_cache(
+        &self,
+        pid: u32,
+        ip: u64,
+        cached_index: &mut Option<usize>,
+    ) -> Option<usize> {
+        if let Some(index) = cached_index
+            .as_ref()
+            .copied()
+            .filter(|&index| self.mappings[index].pid == pid)
+            .filter(|&index| self.mappings[index].start <= ip)
+            .filter(|&index| ip < self.mappings[index].end())
+        {
+            return Some(index);
+        }
+        let resolved = self.resolve_mapping_index_for_pid(pid, ip);
+        *cached_index = resolved;
+        resolved
     }
 
     fn intern_symbol_source(&mut self, mapping: &Mapping) -> usize {
@@ -371,7 +480,7 @@ fn is_perf_data_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::MmapTable;
+    use super::{MappingResolveCache, MmapTable};
     use crate::perfdata::records::MmapRecord;
 
     #[test]
@@ -398,5 +507,63 @@ mod tests {
         assert_eq!(bucket.len(), 2);
         assert_eq!(bucket[0].max_end, 0x5000);
         assert_eq!(bucket[1].max_end, 0x5000);
+    }
+
+    #[test]
+    fn cached_lookup_tracks_pid_specific_and_global_mappings() {
+        let mut table = MmapTable::default();
+        table.insert_mmap(MmapRecord {
+            pid: 7,
+            tid: 7,
+            start: 0x1000,
+            len: 0x100,
+            pgoff: 0,
+            path: "/app".to_string(),
+        });
+        table.insert_mmap(MmapRecord {
+            pid: u32::MAX,
+            tid: u32::MAX,
+            start: 0xffff_ffff_8100_0000,
+            len: 0x1000,
+            pgoff: 0,
+            path: "[kernel.kallsyms]".to_string(),
+        });
+
+        let mut cache = MappingResolveCache::default();
+        let local = table
+            .resolve_ref_cached(7, 0x1010, &mut cache)
+            .expect("local mapping");
+        assert_eq!(local.path, "/app");
+        assert_eq!(cache.pid, Some(7));
+        assert_eq!(cache.pid_index, Some(0));
+        assert_eq!(cache.global_index, None);
+
+        let global = table
+            .resolve_ref_cached(42, 0xffff_ffff_8100_0010, &mut cache)
+            .expect("global mapping");
+        assert_eq!(global.path, "[kernel.kallsyms]");
+        assert_eq!(cache.pid, Some(42));
+        assert_eq!(cache.pid_index, None);
+        assert_eq!(cache.global_index, Some(1));
+    }
+
+    #[test]
+    fn cached_lookup_clears_stale_pid_mapping_after_miss() {
+        let mut table = MmapTable::default();
+        table.insert_mmap(MmapRecord {
+            pid: 7,
+            tid: 7,
+            start: 0x1000,
+            len: 0x100,
+            pgoff: 0,
+            path: "/app".to_string(),
+        });
+
+        let mut cache = MappingResolveCache::default();
+        assert!(table.has_mapping_for_pid_cached(7, 0x1010, &mut cache));
+        assert_eq!(cache.pid_index, Some(0));
+
+        assert!(!table.has_mapping_for_pid_cached(7, 0x5000, &mut cache));
+        assert_eq!(cache.pid_index, None);
     }
 }
