@@ -1,7 +1,10 @@
 use std::sync::Mutex;
 
+use proptest::prelude::*;
+use proptest::string::string_regex;
 use pyroclast::benchmarks::{
-    BenchArgs, DEFAULT_BENCHMARK_INPUT, compare_with_inferno_collapse,
+    BenchArgs, DEFAULT_BENCHMARK_INPUT, FoldBenchmarkReport, FoldComparisonReport,
+    StreamingComparisonReport, compare_with_inferno_collapse,
     compare_with_inferno_collapse_with_symbols, export_perf_script, format_bench_output,
     format_comparison_report, run_bench_command, run_fold_benchmark,
     run_fold_benchmark_with_runner, run_inferno_collapse_benchmark,
@@ -365,6 +368,190 @@ fn formats_streaming_benchmark_output() {
     assert!(output.contains("pyroclast_fold.input=profile.perf.data"));
     assert!(output.contains("inferno_collapse_perf.input=profile.perf.script"));
     assert!(output.contains("inferno_compare.matches=false"));
+}
+
+proptest! {
+    #[test]
+    fn property_parses_canonical_benchmark_arguments(
+        perf_data in prop::option::of(string_regex("[A-Za-z0-9][A-Za-z0-9._/-]{0,31}").expect("valid perf-data path regex")),
+        perf_script in prop::option::of(string_regex("[A-Za-z0-9][A-Za-z0-9._/-]{0,31}").expect("valid perf-script path regex")),
+        export_perf_script in prop::option::of(string_regex("[A-Za-z0-9][A-Za-z0-9._/-]{0,31}").expect("valid exported perf-script path regex")),
+        symbols in any::<bool>(),
+    ) {
+        let expected_perf_data = perf_data.as_ref().map(std::path::PathBuf::from);
+        let expected_perf_script = perf_script.as_ref().map(std::path::PathBuf::from);
+        let expected_export_perf_script = export_perf_script.as_ref().map(std::path::PathBuf::from);
+        let mut argv = Vec::new();
+
+        if let Some(path) = &expected_perf_data {
+            argv.push(path.clone());
+        }
+        if symbols {
+            argv.push("--symbols".into());
+        }
+        if let Some(path) = &expected_export_perf_script {
+            argv.push("--export-perf-script".into());
+            argv.push(path.clone());
+        }
+        if let Some(path) = &expected_perf_script {
+            argv.push("--perf-script".into());
+            argv.push(path.clone());
+        }
+
+        let args = BenchArgs::parse(argv);
+
+        prop_assert_eq!(args.perf_data, expected_perf_data);
+        prop_assert_eq!(args.perf_script, expected_perf_script);
+        prop_assert_eq!(args.export_perf_script, expected_export_perf_script);
+        prop_assert_eq!(args.symbols, symbols);
+    }
+
+    #[test]
+    fn property_benchmark_input_path_prefers_explicit_perf_data(
+        perf_data in prop::option::of(string_regex("[A-Za-z0-9][A-Za-z0-9._/-]{0,31}").expect("valid input-path regex")),
+    ) {
+        let args = BenchArgs {
+            perf_data: perf_data.as_ref().map(std::path::PathBuf::from),
+            perf_script: None,
+            export_perf_script: None,
+            symbols: false,
+        };
+
+        let expected = perf_data
+            .as_ref()
+            .map_or_else(
+                || std::path::PathBuf::from(DEFAULT_BENCHMARK_INPUT),
+                std::path::PathBuf::from,
+            );
+
+        prop_assert_eq!(args.input_path(), expected);
+    }
+
+    #[test]
+    fn property_formats_comparison_report_using_difference_counts(
+        name in string_regex("[a-z][a-z0-9_]{0,15}").expect("valid comparison-name regex"),
+        pyroclast_folded_lines in 0_usize..10_000,
+        inferno_folded_lines in 0_usize..10_000,
+        pyroclast_svg_bytes in 0_usize..10_000,
+        inferno_svg_bytes in 0_usize..10_000,
+        matches in any::<bool>(),
+        svg_matches in any::<bool>(),
+        only_pyroclast in prop::collection::vec(string_regex("[a-z]{1,8}").expect("valid only-pyroclast entry regex"), 0..8),
+        only_inferno in prop::collection::vec(string_regex("[a-z]{1,8}").expect("valid only-inferno entry regex"), 0..8),
+    ) {
+        let report = FoldComparisonReport {
+            pyroclast_folded_lines,
+            inferno_folded_lines,
+            matches,
+            svg_matches,
+            pyroclast_svg_bytes,
+            inferno_svg_bytes,
+            only_pyroclast,
+            only_inferno,
+        };
+
+        let output = format_comparison_report(&name, &report);
+        let expected_matches = format!("{name}.matches={matches}\n");
+        let expected_svg_matches = format!("{name}.svg_matches={svg_matches}\n");
+        let expected_pyroclast_lines =
+            format!("{name}.pyroclast_folded_lines={pyroclast_folded_lines}\n");
+        let expected_inferno_lines =
+            format!("{name}.inferno_folded_lines={inferno_folded_lines}\n");
+        let expected_pyroclast_svg_bytes =
+            format!("{name}.pyroclast_svg_bytes={pyroclast_svg_bytes}\n");
+        let expected_inferno_svg_bytes =
+            format!("{name}.inferno_svg_bytes={inferno_svg_bytes}\n");
+        let only_pyroclast_len = report.only_pyroclast.len();
+        let only_inferno_len = report.only_inferno.len();
+        let expected_only_pyroclast =
+            format!("{name}.only_pyroclast={only_pyroclast_len}\n");
+        let expected_only_inferno =
+            format!("{name}.only_inferno={only_inferno_len}\n");
+
+        prop_assert!(output.contains(&expected_matches));
+        prop_assert!(output.contains(&expected_svg_matches));
+        prop_assert!(output.contains(&expected_pyroclast_lines));
+        prop_assert!(output.contains(&expected_inferno_lines));
+        prop_assert!(output.contains(&expected_pyroclast_svg_bytes));
+        prop_assert!(output.contains(&expected_inferno_svg_bytes));
+        prop_assert!(output.contains(&expected_only_pyroclast));
+        prop_assert!(output.contains(&expected_only_inferno));
+    }
+
+    #[test]
+    fn property_formats_streaming_benchmark_output_with_named_sections(
+        pyro_input in string_regex("[A-Za-z0-9][A-Za-z0-9._/-]{0,31}").expect("valid pyro input regex"),
+        inferno_input in string_regex("[A-Za-z0-9][A-Za-z0-9._/-]{0,31}").expect("valid inferno input regex"),
+        pyro_elapsed_ms in 0_u64..10_000,
+        inferno_elapsed_ms in 0_u64..10_000,
+        pyro_folded_bytes in 0_usize..10_000,
+        inferno_folded_bytes in 0_usize..10_000,
+        pyro_folded_lines in 0_usize..10_000,
+        inferno_folded_lines in 0_usize..10_000,
+        matches in any::<bool>(),
+        svg_matches in any::<bool>(),
+        pyro_svg_bytes in 0_usize..10_000,
+        inferno_svg_bytes in 0_usize..10_000,
+        only_pyroclast in prop::collection::vec(string_regex("[a-z]{1,8}").expect("valid streaming only-pyroclast entry regex"), 0..8),
+        only_inferno in prop::collection::vec(string_regex("[a-z]{1,8}").expect("valid streaming only-inferno entry regex"), 0..8),
+    ) {
+        let report = StreamingComparisonReport {
+            pyroclast_fold: FoldBenchmarkReport {
+                input: pyro_input.clone().into(),
+                elapsed: std::time::Duration::from_millis(pyro_elapsed_ms),
+                folded_bytes: pyro_folded_bytes,
+                folded_lines: pyro_folded_lines,
+            },
+            inferno_fold: FoldBenchmarkReport {
+                input: inferno_input.clone().into(),
+                elapsed: std::time::Duration::from_millis(inferno_elapsed_ms),
+                folded_bytes: inferno_folded_bytes,
+                folded_lines: inferno_folded_lines,
+            },
+            comparison: FoldComparisonReport {
+                pyroclast_folded_lines: pyro_folded_lines,
+                inferno_folded_lines,
+                matches,
+                svg_matches,
+                pyroclast_svg_bytes: pyro_svg_bytes,
+                inferno_svg_bytes,
+                only_pyroclast,
+                only_inferno,
+            },
+        };
+
+        let output = format_bench_output(&report);
+        let expected_pyro_input = format!("pyroclast_fold.input={pyro_input}\n");
+        let expected_pyro_elapsed = format!("pyroclast_fold.elapsed_ms={pyro_elapsed_ms}\n");
+        let expected_pyro_bytes = format!("pyroclast_fold.folded_bytes={pyro_folded_bytes}\n");
+        let expected_pyro_lines = format!("pyroclast_fold.folded_lines={pyro_folded_lines}\n");
+        let expected_inferno_input = format!("inferno_collapse_perf.input={inferno_input}\n");
+        let expected_inferno_elapsed =
+            format!("inferno_collapse_perf.elapsed_ms={inferno_elapsed_ms}\n");
+        let expected_inferno_bytes =
+            format!("inferno_collapse_perf.folded_bytes={inferno_folded_bytes}\n");
+        let expected_inferno_lines =
+            format!("inferno_collapse_perf.folded_lines={inferno_folded_lines}\n");
+        let expected_matches = format!("inferno_compare.matches={matches}\n");
+        let expected_svg_matches = format!("inferno_compare.svg_matches={svg_matches}\n");
+        let expected_pyro_svg_bytes =
+            format!("inferno_compare.pyroclast_svg_bytes={pyro_svg_bytes}\n");
+        let expected_inferno_svg_bytes =
+            format!("inferno_compare.inferno_svg_bytes={inferno_svg_bytes}\n");
+
+        prop_assert!(output.contains(&expected_pyro_input));
+        prop_assert!(output.contains(&expected_pyro_elapsed));
+        prop_assert!(output.contains(&expected_pyro_bytes));
+        prop_assert!(output.contains(&expected_pyro_lines));
+        prop_assert!(output.contains(&expected_inferno_input));
+        prop_assert!(output.contains(&expected_inferno_elapsed));
+        prop_assert!(output.contains(&expected_inferno_bytes));
+        prop_assert!(output.contains(&expected_inferno_lines));
+        prop_assert!(output.contains(&expected_matches));
+        prop_assert!(output.contains(&expected_svg_matches));
+        prop_assert!(output.contains(&expected_pyro_svg_bytes));
+        prop_assert!(output.contains(&expected_inferno_svg_bytes));
+    }
 }
 
 #[derive(Default)]
