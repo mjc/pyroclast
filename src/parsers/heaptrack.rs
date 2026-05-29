@@ -37,12 +37,16 @@ fn number_after_prefix(line: &str, prefix: &str) -> Option<u64> {
 #[must_use]
 pub fn render_heaptrack_summary_text(summary: &HeaptrackSummary) -> String {
     format!(
-        "total allocations: {}\npeak heap bytes: {}\n",
+        "total allocations: {}\npeak heap memory consumption: {}\n",
         optional_u64(summary.total_allocations),
-        optional_u64(summary.peak_heap_bytes)
+        optional_bytes(summary.peak_heap_bytes)
     )
 }
 
 fn optional_u64(value: Option<u64>) -> String {
     value.map_or_else(|| "unknown".to_string(), |value| value.to_string())
+}
+
+fn optional_bytes(value: Option<u64>) -> String {
+    value.map_or_else(|| "unknown".to_string(), |value| format!("{value} bytes"))
 }

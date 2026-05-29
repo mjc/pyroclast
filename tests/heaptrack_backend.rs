@@ -40,7 +40,7 @@ fn heaptrack_backend_writes_heap_summary_artifacts() {
     );
     assert_eq!(
         std::fs::read_to_string(result.layout.summary_txt()).expect("summary txt"),
-        "total allocations: 42\npeak heap bytes: 1024\n"
+        "total allocations: 42\npeak heap memory consumption: 1024 bytes\n"
     );
     let summary_json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(result.layout.summary_json()).unwrap())
