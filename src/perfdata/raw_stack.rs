@@ -1,10 +1,11 @@
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash, Hasher};
 
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashTable};
 use rustc_hash::FxBuildHasher;
 
-type CommId = u32;
-type NodeId = u32;
+type CommId = u64;
+type NodeId = u64;
+const RAW_STACK_GROWTH_MIN_CHUNK: usize = 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollapsedRawStack<T = u64> {
@@ -21,12 +22,6 @@ struct RawStackKey {
     tail: Option<NodeId>,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct StackNodeKey<T> {
-    parent: Option<NodeId>,
-    frame: T,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StackNode<T> {
     parent: Option<NodeId>,
@@ -37,7 +32,7 @@ struct StackNode<T> {
 pub struct RawStackAccumulator<T = u64> {
     counts: HashMap<RawStackKey, u64, FxBuildHasher>,
     nodes: Vec<StackNode<T>>,
-    node_ids: HashMap<StackNodeKey<T>, NodeId, FxBuildHasher>,
+    node_ids: HashTable<NodeId>,
     comms: Vec<String>,
     comm_ids: HashMap<String, CommId, FxBuildHasher>,
 }
@@ -51,12 +46,18 @@ pub struct RawStackEntryRef<'a, T> {
     nodes: &'a [StackNode<T>],
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct RawStackFrameIter<'a, T> {
+    nodes: &'a [StackNode<T>],
+    current: Option<NodeId>,
+}
+
 impl<T> Default for RawStackAccumulator<T> {
     fn default() -> Self {
         Self {
             counts: HashMap::default(),
             nodes: Vec::new(),
-            node_ids: HashMap::default(),
+            node_ids: HashTable::new(),
             comms: Vec::new(),
             comm_ids: HashMap::default(),
         }
@@ -92,6 +93,7 @@ where
     ) {
         let comm = self.intern_comm(comm);
         let tail = self.intern_callchain(callchain);
+        self.reserve_counts_growth(1);
         *self
             .counts
             .entry(RawStackKey { pid, comm, tail })
@@ -111,6 +113,7 @@ where
     ) {
         let comm = self.intern_comm(comm);
         let tail = self.intern_callchain(callchain.iter().cloned());
+        self.reserve_counts_growth(1);
         *self
             .counts
             .entry(RawStackKey { pid, comm, tail })
@@ -126,6 +129,7 @@ where
     ) {
         let comm = self.intern_comm_ref(comm);
         let tail = self.intern_callchain(callchain.iter().cloned());
+        self.reserve_counts_growth(1);
         *self
             .counts
             .entry(RawStackKey { pid, comm, tail })
@@ -162,9 +166,8 @@ where
     }
 
     #[must_use]
-    pub fn sorted_entries(&self) -> Vec<RawStackEntryRef<'_, T>> {
-        let mut entries = self
-            .counts
+    pub fn entries(&self) -> Vec<RawStackEntryRef<'_, T>> {
+        self.counts
             .iter()
             .map(|(key, &count)| RawStackEntryRef {
                 pid: key.pid,
@@ -175,7 +178,12 @@ where
                 count,
                 nodes: &self.nodes,
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    #[must_use]
+    pub fn sorted_entries(&self) -> Vec<RawStackEntryRef<'_, T>> {
+        let mut entries = self.entries();
         entries.sort_by(|left, right| {
             left.pid
                 .cmp(&right.pid)
@@ -212,25 +220,59 @@ where
     where
         I: IntoIterator<Item = T>,
     {
+        let callchain = callchain.into_iter();
+        let (lower_bound, upper_bound) = callchain.size_hint();
+        self.reserve_node_growth(upper_bound.unwrap_or(lower_bound));
         let mut tail = None;
         for frame in callchain {
-            let key = StackNodeKey {
-                parent: tail,
-                frame: frame.clone(),
-            };
-            tail = Some(if let Some(&id) = self.node_ids.get(&key) {
-                id
-            } else {
-                let id = next_node_id(self.nodes.len());
-                self.nodes.push(StackNode {
-                    parent: tail,
-                    frame: frame.clone(),
-                });
-                self.node_ids.insert(key, id);
-                id
-            });
+            let hash = node_key_hash(tail, &frame);
+            tail = Some(
+                if let Some(id) = {
+                    let nodes = &self.nodes;
+                    self.node_ids
+                        .find(hash, |&id| node_matches(nodes, id, tail, &frame))
+                        .copied()
+                } {
+                    id
+                } else {
+                    let id = next_node_id(self.nodes.len());
+                    self.nodes.push(StackNode {
+                        parent: tail,
+                        frame,
+                    });
+                    let nodes = &self.nodes;
+                    self.node_ids
+                        .insert_unique(hash, id, |&id| interned_node_hash(nodes, id));
+                    id
+                },
+            );
         }
         tail
+    }
+
+    fn reserve_counts_growth(&mut self, additional: usize) {
+        if self.counts.capacity().saturating_sub(self.counts.len()) >= additional {
+            return;
+        }
+        self.counts
+            .reserve(growth_chunk(self.counts.len(), additional));
+    }
+
+    fn reserve_node_growth(&mut self, additional: usize) {
+        if additional == 0 {
+            return;
+        }
+        if self.nodes.capacity().saturating_sub(self.nodes.len()) < additional {
+            self.nodes
+                .reserve(growth_chunk(self.nodes.len(), additional));
+        }
+        if self.node_ids.capacity().saturating_sub(self.node_ids.len()) < additional {
+            let nodes = &self.nodes;
+            self.node_ids
+                .reserve(growth_chunk(self.node_ids.len(), additional), |&id| {
+                    interned_node_hash(nodes, id)
+                });
+        }
     }
 
     #[cfg(test)]
@@ -266,15 +308,41 @@ fn rebuild_callchain_into<T: Clone>(
 }
 
 fn next_comm_id(len: usize) -> CommId {
-    CommId::try_from(len).expect("raw stack comm ids exceeded u32::MAX")
+    CommId::try_from(len).expect("raw stack comm ids exceeded u64::MAX")
 }
 
 fn next_node_id(len: usize) -> NodeId {
-    NodeId::try_from(len).expect("raw stack node ids exceeded u32::MAX")
+    NodeId::try_from(len).expect("raw stack node ids exceeded u64::MAX")
 }
 
 fn node_index(node: NodeId) -> usize {
     usize::try_from(node).expect("raw stack node id does not fit in usize")
+}
+
+fn growth_chunk(len: usize, additional: usize) -> usize {
+    len.max(additional).max(RAW_STACK_GROWTH_MIN_CHUNK)
+}
+
+fn node_key_hash<T: Hash>(parent: Option<NodeId>, frame: &T) -> u64 {
+    let mut hasher = FxBuildHasher.build_hasher();
+    parent.hash(&mut hasher);
+    frame.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn interned_node_hash<T: Hash>(nodes: &[StackNode<T>], id: NodeId) -> u64 {
+    let entry = &nodes[node_index(id)];
+    node_key_hash(entry.parent, &entry.frame)
+}
+
+fn node_matches<T: Eq>(
+    nodes: &[StackNode<T>],
+    id: NodeId,
+    parent: Option<NodeId>,
+    frame: &T,
+) -> bool {
+    let entry = &nodes[node_index(id)];
+    entry.parent == parent && entry.frame == *frame
 }
 
 impl<'a, T> RawStackEntryRef<'a, T> {
@@ -292,6 +360,14 @@ impl<'a, T> RawStackEntryRef<'a, T> {
     pub fn count(self) -> u64 {
         self.count
     }
+
+    #[must_use]
+    pub fn frames_leaf_to_root(self) -> RawStackFrameIter<'a, T> {
+        RawStackFrameIter {
+            nodes: self.nodes,
+            current: self.tail,
+        }
+    }
 }
 
 impl<T> RawStackEntryRef<'_, T>
@@ -301,6 +377,17 @@ where
     pub fn callchain<'a>(&self, scratch: &'a mut Vec<T>) -> &'a [T] {
         rebuild_callchain_into(self.nodes, self.tail, scratch);
         scratch
+    }
+}
+
+impl<'a, T> Iterator for RawStackFrameIter<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let node = self.current?;
+        let entry = &self.nodes[node_index(node)];
+        self.current = entry.parent;
+        Some(&entry.frame)
     }
 }
 
@@ -388,6 +475,54 @@ mod tests {
         assert_eq!(collapsed[0].count, 2);
         assert_eq!(collapsed[1].callchain, vec![1, 2, 3]);
         assert_eq!(collapsed[1].count, 1);
+    }
+
+    #[test]
+    fn reuses_interned_nodes_across_owned_and_borrowed_insert_paths() {
+        let mut accumulator = RawStackAccumulator::new();
+
+        accumulator.add_vec(Some(7), vec![1, 2, 3], 1);
+        accumulator.add_slice(Some(7), &[1, 2, 3], 2);
+
+        assert_eq!(accumulator.interned_node_count(), 3);
+
+        let collapsed = accumulator.into_collapsed();
+
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].callchain, vec![1, 2, 3]);
+        assert_eq!(collapsed[0].count, 3);
+    }
+
+    #[test]
+    fn preserves_counts_across_large_table_growth() {
+        let mut accumulator = RawStackAccumulator::new();
+
+        for value in 0..2048_u64 {
+            accumulator.add(Some(7), [value, value + 1], 1);
+        }
+
+        let collapsed = accumulator.into_collapsed();
+
+        assert_eq!(collapsed.len(), 2048);
+        assert_eq!(collapsed[0].callchain, vec![0, 1]);
+        assert_eq!(collapsed[0].count, 1);
+        assert_eq!(collapsed[2047].callchain, vec![2047, 2048]);
+        assert_eq!(collapsed[2047].count, 1);
+    }
+
+    #[test]
+    fn iterates_frames_leaf_to_root_without_rebuild_allocation() {
+        let mut accumulator = RawStackAccumulator::new();
+
+        accumulator.add(Some(7), [1, 2, 3], 1);
+
+        let entries = accumulator.sorted_entries();
+        let frames = entries[0]
+            .frames_leaf_to_root()
+            .copied()
+            .collect::<Vec<_>>();
+
+        assert_eq!(frames, vec![3, 2, 1]);
     }
 
     #[test]
