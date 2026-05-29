@@ -6,6 +6,7 @@ use std::process::Command;
 use std::sync::Mutex;
 
 use object::{Object, ObjectSegment, ObjectSymbol, SymbolKind};
+use proptest::prelude::*;
 use pyroclast::cli::SymbolizerKind;
 use pyroclast::perfdata::mappings::FileIdentity;
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
@@ -18,6 +19,80 @@ use pyroclast::symbols::{
     perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources,
     perf_symbol_resolver_for_perfdata_file_with_symbolizer,
 };
+
+fn test_symbol_request(path_index: u8, relative_address: u16) -> SymbolRequest {
+    SymbolRequest {
+        path: PathBuf::from(format!("/bin/app{}", path_index % 4)),
+        relative_address: u64::from(relative_address),
+        build_id: None,
+        file_identity: None,
+        kernel_relocation: None,
+    }
+}
+
+fn test_symbol_name(request: &SymbolRequest) -> String {
+    format!("{}::{:x}", request.path.display(), request.relative_address)
+}
+
+fn expected_unique_requests(requests: &[SymbolRequest]) -> Vec<SymbolRequest> {
+    let mut unique = Vec::new();
+    for request in requests {
+        if !unique.contains(request) {
+            unique.push(request.clone());
+        }
+    }
+    unique
+}
+
+fn recording_resolver_for(requests: &[SymbolRequest]) -> RecordingResolver {
+    let symbols = expected_unique_requests(requests)
+        .into_iter()
+        .map(|request| {
+            let symbol = test_symbol_name(&request);
+            (request, symbol)
+        })
+        .collect();
+    RecordingResolver {
+        symbols,
+        frames: BTreeMap::new(),
+        calls: RefCell::new(Vec::new()),
+    }
+}
+
+#[derive(Clone, Debug)]
+struct KallsymsResolveCase {
+    text: String,
+    query: u64,
+    expected: String,
+}
+
+fn kallsyms_resolve_case() -> impl Strategy<Value = KallsymsResolveCase> {
+    prop::collection::vec(any::<u8>(), 1..20)
+        .prop_flat_map(|offsets| {
+            let len = offsets.len();
+            (Just(offsets), 0..len, 0_u64..0x800)
+        })
+        .prop_map(|(offsets, index, delta)| {
+            const BASE: u64 = 0xffff_ffff_8800_0000;
+
+            let addresses = offsets
+                .iter()
+                .enumerate()
+                .map(|(position, offset)| BASE + (position as u64) * 0x1000 + u64::from(*offset))
+                .collect::<Vec<_>>();
+            let text = addresses
+                .iter()
+                .enumerate()
+                .map(|(position, address)| format!("{address:016x} T symbol_{position}\n"))
+                .collect::<String>();
+
+            KallsymsResolveCase {
+                text,
+                query: addresses[index] + delta,
+                expected: format!("symbol_{index}"),
+            }
+        })
+}
 
 #[test]
 fn resolves_each_unique_symbol_address_once() {
@@ -180,6 +255,91 @@ fn batches_only_uncached_symbol_addresses() {
             }],
         ]
     );
+}
+
+proptest! {
+    #[test]
+    fn property_symbol_cache_batches_first_seen_unique_requests(
+        specs in prop::collection::vec((0_u8..8, any::<u16>()), 0..40),
+    ) {
+        let requests = specs
+            .into_iter()
+            .map(|(path_index, relative_address)| test_symbol_request(path_index, relative_address))
+            .collect::<Vec<_>>();
+        let resolver = recording_resolver_for(&requests);
+        let mut cache = SymbolCache::new(&resolver);
+
+        let symbols = cache.resolve_many(&requests).expect("symbols");
+
+        let expected_symbols = requests
+            .iter()
+            .map(|request| Some(test_symbol_name(request)))
+            .collect::<Vec<_>>();
+        prop_assert_eq!(symbols, expected_symbols);
+
+        let expected_calls = expected_unique_requests(&requests);
+        let expected_batches = if expected_calls.is_empty() {
+            Vec::new()
+        } else {
+            vec![expected_calls]
+        };
+        prop_assert_eq!(resolver.batch_calls(), expected_batches);
+    }
+
+    #[test]
+    fn property_symbol_cache_only_batches_new_misses_after_priming(
+        first_specs in prop::collection::vec((0_u8..8, any::<u16>()), 0..24),
+        second_specs in prop::collection::vec((0_u8..8, any::<u16>()), 0..24),
+    ) {
+        let first_requests = first_specs
+            .into_iter()
+            .map(|(path_index, relative_address)| test_symbol_request(path_index, relative_address))
+            .collect::<Vec<_>>();
+        let second_requests = second_specs
+            .into_iter()
+            .map(|(path_index, relative_address)| test_symbol_request(path_index, relative_address))
+            .collect::<Vec<_>>();
+        let mut all_requests = first_requests.clone();
+        all_requests.extend(second_requests.iter().cloned());
+
+        let resolver = recording_resolver_for(&all_requests);
+        let mut cache = SymbolCache::new(&resolver);
+
+        let primed = cache.resolve_many(&first_requests).expect("primed");
+        let resolved = cache.resolve_many(&second_requests).expect("resolved");
+
+        let expected_primed = first_requests
+            .iter()
+            .map(|request| Some(test_symbol_name(request)))
+            .collect::<Vec<_>>();
+        let expected_resolved = second_requests
+            .iter()
+            .map(|request| Some(test_symbol_name(request)))
+            .collect::<Vec<_>>();
+        prop_assert_eq!(primed, expected_primed);
+        prop_assert_eq!(resolved, expected_resolved);
+
+        let first_batch = expected_unique_requests(&first_requests);
+        let second_batch = expected_unique_requests(&second_requests)
+            .into_iter()
+            .filter(|request| !first_batch.contains(request))
+            .collect::<Vec<_>>();
+        let mut expected_batches = Vec::new();
+        if !first_batch.is_empty() {
+            expected_batches.push(first_batch);
+        }
+        if !second_batch.is_empty() {
+            expected_batches.push(second_batch);
+        }
+        prop_assert_eq!(resolver.batch_calls(), expected_batches);
+    }
+
+    #[test]
+    fn property_kallsyms_resolves_nearest_lower_symbol(case in kallsyms_resolve_case()) {
+        let symbols = Kallsyms::parse(&case.text).expect("kallsyms");
+
+        prop_assert_eq!(symbols.resolve(case.query), Some(case.expected));
+    }
 }
 
 #[test]
