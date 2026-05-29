@@ -1,3 +1,4 @@
+use proptest::prelude::*;
 use pyroclast::perfdata::header::{
     PerfFeatureSection, PerfHeader, parse_feature_sections, parse_header,
 };
@@ -48,6 +49,71 @@ fn parses_feature_sections_from_set_header_bits() {
             size: 72,
         }]
     );
+}
+
+proptest! {
+    #[test]
+    fn property_parses_arbitrary_valid_headers(
+        header_size in 104_u64..1_000_000_u64,
+        attr_offset in any::<u64>(),
+        attr_size in any::<u64>(),
+        data_offset in any::<u64>(),
+        data_size in any::<u64>(),
+    ) {
+        let bytes = header_bytes(
+            "PERFILE2",
+            header_size,
+            attr_offset,
+            attr_size,
+            data_offset,
+            data_size,
+        );
+
+        prop_assert_eq!(
+            parse_header(&bytes).expect("valid header"),
+            PerfHeader {
+                header_size,
+                attr_offset,
+                attr_size,
+                data_offset,
+                data_size,
+            }
+        );
+    }
+
+    #[test]
+    fn property_parses_feature_sections_for_any_set_bits(
+        features in prop::collection::btree_set(0_u16..256_u16, 0..32),
+    ) {
+        let table_offset = 104_usize;
+        let mut bytes = vec![0; table_offset + features.len() * 16];
+        bytes[..104].copy_from_slice(&header_bytes("PERFILE2", 104, 128, 64, 104, 0));
+        let mut expected = Vec::new();
+
+        for (index, feature) in features.iter().copied().enumerate() {
+            let word_offset = 56 + usize::from(feature / 64) * 8;
+            let bit = 1_u64 << u32::from(feature % 64);
+            let word = u64::from_le_bytes(
+                bytes[word_offset..word_offset + 8]
+                    .try_into()
+                    .expect("word"),
+            );
+            put_u64(&mut bytes, word_offset, word | bit);
+
+            let offset = 1_000_u64 + (index as u64) * 17;
+            let size = 2_000_u64 + (index as u64) * 19;
+            put_u64(&mut bytes, table_offset + index * 16, offset);
+            put_u64(&mut bytes, table_offset + index * 16 + 8, size);
+            expected.push(PerfFeatureSection {
+                feature,
+                offset,
+                size,
+            });
+        }
+
+        let header = parse_header(&bytes).expect("valid header");
+        prop_assert_eq!(parse_feature_sections(&bytes, &header).expect("feature sections"), expected);
+    }
 }
 
 fn header_bytes(
