@@ -32,7 +32,6 @@ pub struct FramehopUnwinder {
 struct ReportedModule {
     base: u64,
     range: Range<u64>,
-    mapping_range: Range<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -115,8 +114,6 @@ impl FramehopUnwinder {
             return Ok(false);
         };
         let mapping_range = start..start.saturating_add(len);
-        self.reported_modules
-            .retain(|module| !ranges_overlap(&module.mapping_range, &mapping_range));
         if self
             .reported_modules
             .iter()
@@ -143,7 +140,6 @@ impl FramehopUnwinder {
         self.reported_modules.push(ReportedModule {
             base,
             range: module_range,
-            mapping_range: start..start.saturating_add(len),
         });
         self.module_count += 1;
         Ok(true)

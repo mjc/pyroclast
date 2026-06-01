@@ -111,6 +111,28 @@ fn rejected_overlapping_module_range_does_not_unwind_through_prior_module() {
     assert_eq!(unwinder.unwind_stack(regs, &stack, 4), Vec::<u64>::new());
 }
 
+#[test]
+fn overlapping_raw_mapping_keeps_prior_reported_module_like_libdw() {
+    let current_exe = std::env::current_exe().expect("current exe");
+    let first_start = 0x5555_0000;
+    let first_len = adjacent_mapping_gap_for_overlapping_module_ranges(&current_exe) * 4;
+    let second_pgoff = first_len / 2;
+    let second_start = first_start + second_pgoff + 0x1000;
+    let mut unwinder = FramehopUnwinder::new();
+
+    assert!(
+        unwinder
+            .add_object_mapping(&current_exe, first_start, first_len, 0)
+            .expect("load first object mapping")
+    );
+
+    assert!(
+        !unwinder
+            .add_object_mapping(&current_exe, second_start, 0x1000, second_pgoff)
+            .expect("reject shifted overlapping object mapping")
+    );
+}
+
 fn adjacent_mapping_gap_for_overlapping_module_ranges(path: &std::path::Path) -> u64 {
     let bytes = std::fs::read(path).expect("read object");
     let object = object::File::parse(&bytes[..]).expect("parse object");
