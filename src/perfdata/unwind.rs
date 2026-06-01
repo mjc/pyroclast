@@ -132,7 +132,7 @@ impl FramehopUnwinder {
         let section_info = explicit_module_section_info(&mapped, &object);
         let module = framehop::Module::<ModuleBytes>::new(
             path.to_string_lossy().into_owned(),
-            start..start.saturating_add(len),
+            module_range.clone(),
             base,
             section_info,
         );

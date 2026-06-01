@@ -2123,7 +2123,7 @@ fn load_unwind_mapping(
             request.len,
             request.pgoff,
         )
-        .is_ok_and(|loaded| loaded)
+        .is_ok_and(|loaded| loaded || object_unwinder.has_reported_module_for_ip(request.start))
     {
         loaded_unwind_mappings.insert(key);
     }
@@ -2175,7 +2175,7 @@ fn load_build_id_unwind_mapping(
     }
     if object_unwinder
         .add_object_mapping(&object_path, request.start, request.len, request.pgoff)
-        .is_ok_and(|loaded| loaded)
+        .is_ok_and(|loaded| loaded || object_unwinder.has_reported_module_for_ip(request.start))
     {
         loaded_unwind_mappings.insert(key);
     }

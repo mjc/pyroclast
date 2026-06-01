@@ -775,6 +775,52 @@ fn uses_mapped_object_unwinder_for_dwarf_user_stack_frames() {
 }
 
 #[test]
+fn uses_whole_elf_range_for_unwind_module_after_first_non_text_mapping_like_libdw() {
+    let current_exe = std::env::current_exe().expect("current exe");
+    let current_exe = current_exe.to_string_lossy();
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            (1 << 6) | (1 << 7) | (1 << 8),
+        )],
+        [
+            record_bytes(
+                1,
+                &mmap_payload(11, 11, 0x1000_0000, 0x1000, 0, current_exe.as_ref()),
+            ),
+            record_bytes(
+                1,
+                &mmap_payload(11, 11, 0x1000_1000, 0x1000, 0x1000, current_exe.as_ref()),
+            ),
+            record_bytes(
+                9,
+                &sample_payload_with_user_stack(
+                    0x4000,
+                    11,
+                    12,
+                    [],
+                    1,
+                    [0x7fff_0008, 0x7fff_0000, 0x1000_1000],
+                    [
+                        0, 0, 0, 0, 0, 0, 0, 0, //
+                        0x40, 0, 0, 0, 0, 0, 0, 0, //
+                        0x34, 0x12, 0, 0, 0, 0, 0, 0,
+                    ],
+                ),
+            ),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, format!("[unknown];{current_exe}+0x1000 1\n"));
+}
+
+#[test]
 fn drops_dwarf_user_stack_when_only_synthetic_mappings_exist_like_perf_script() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
