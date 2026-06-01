@@ -18,8 +18,9 @@ use crate::perfdata::header::{PerfFeatureSection, PerfHeader, parse_header};
 use crate::perfdata::mappings::{FileIdentity, MappingResolveCache, MmapTable, ResolvedMappingRef};
 use crate::perfdata::raw_stack::{RawStackAccumulator, RawStackEntryRef};
 use crate::perfdata::records::{
-    Mmap2Record, PERF_RECORD_FINISHED_ROUND, PERF_RECORD_MISC_CPUMODE_MASK, ParsedRecord,
-    PerfRecord, PerfRecordHeader, iter_records, parse_record, parse_record_header,
+    Mmap2Record, PERF_RECORD_FINISHED_ROUND, PERF_RECORD_MISC_CPUMODE_KERNEL,
+    PERF_RECORD_MISC_CPUMODE_MASK, ParsedRecord, PerfRecord, PerfRecordHeader, iter_records,
+    parse_record, parse_record_header,
 };
 use crate::perfdata::samples::{
     PERF_SAMPLE_ADDR, PERF_SAMPLE_CPU, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP,
@@ -163,6 +164,26 @@ enum UserUnwindSource {
     None,
     FramePointer,
     Object,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SampleCallchainState {
+    KernelWithoutCallchain,
+    Other { has_frames: bool },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InitialIpMappingState {
+    NoRecordedMapping,
+    RecordedMappingLoaded,
+    RecordedMappingMissing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UserUnwindContext {
+    callchain: SampleCallchainState,
+    initial_ip_mapping: InitialIpMappingState,
+    module_count: usize,
 }
 
 impl FoldFrame {
@@ -2089,7 +2110,7 @@ fn perf_user_reg_value(mask: u64, values: &[u64], register: u32) -> Option<u64> 
 
 fn parse_sample_for_fold(
     accumulator: &mut FoldAccumulator,
-    _misc: u16,
+    misc: u16,
     payload: &[u8],
     sample_layouts: &SampleLayouts,
     options: FoldOptions,
@@ -2110,7 +2131,7 @@ fn parse_sample_for_fold(
         .sample_frames
         .extend(sample.frames.clone().map(FoldFrame::Callchain));
     let deferred_cookie = take_deferred_cookie(&mut accumulator.sample_frames);
-    append_perf_user_unwind_frames(accumulator, event, &sample);
+    append_perf_user_unwind_frames(accumulator, misc, event, &sample);
     let comm = comm_for_ids(
         &accumulator.process_comms,
         &accumulator.exec_process_comms,
@@ -2145,6 +2166,7 @@ fn parse_sample_for_fold(
 
 fn append_perf_user_unwind_frames(
     accumulator: &mut FoldAccumulator,
+    misc: u16,
     event: SampleEventLayout,
     sample: &crate::perfdata::samples::SampleCallchain<'_>,
 ) {
@@ -2159,22 +2181,42 @@ fn append_perf_user_unwind_frames(
     else {
         return;
     };
-    let has_recorded_mapping_for_ip = sample
+    let initial_ip_mapping = if sample
         .pid
-        .is_some_and(|pid| accumulator.mmap_table.has_mapping_for_pid(pid, regs.ip));
-    let has_loaded_mapping_for_ip =
-        accumulator.has_loaded_unwind_mapping_for_ip(sample.pid, regs.ip);
-    let unwind_module_count = sample
+        .is_some_and(|pid| accumulator.mmap_table.has_mapping_for_pid(pid, regs.ip))
+    {
+        if accumulator.has_loaded_unwind_mapping_for_ip(sample.pid, regs.ip) {
+            InitialIpMappingState::RecordedMappingLoaded
+        } else {
+            InitialIpMappingState::RecordedMappingMissing
+        }
+    } else {
+        InitialIpMappingState::NoRecordedMapping
+    };
+    let module_count = sample
         .pid
         .and_then(|pid| accumulator.unwind_states.get(&pid))
         .map_or(0, |state| state.object_unwinder.module_count());
+    // perf script on kernel samples with an empty FP chain prints no stack,
+    // even when PERF_SAMPLE_REGS_USER/PERF_SAMPLE_STACK_USER are present.
+    let callchain = if (misc & PERF_RECORD_MISC_CPUMODE_MASK) == PERF_RECORD_MISC_CPUMODE_KERNEL
+        && sample.frames.is_empty()
+    {
+        SampleCallchainState::KernelWithoutCallchain
+    } else {
+        SampleCallchainState::Other {
+            has_frames: !accumulator.sample_frames.is_empty(),
+        }
+    };
     let unwound_frames = unwind_user_stack_like_perf(
         accumulator,
         sample,
         &regs,
-        has_recorded_mapping_for_ip,
-        has_loaded_mapping_for_ip,
-        unwind_module_count,
+        UserUnwindContext {
+            callchain,
+            initial_ip_mapping,
+            module_count,
+        },
     );
     let mut unwound_frames = perf_accepted_unwind_frames(unwound_frames)
         .into_iter()
@@ -2194,9 +2236,7 @@ fn unwind_user_stack_like_perf(
     accumulator: &mut FoldAccumulator,
     sample: &crate::perfdata::samples::SampleCallchain<'_>,
     regs: &PerfX86_64Regs,
-    has_recorded_mapping_for_ip: bool,
-    has_loaded_mapping_for_ip: bool,
-    unwind_module_count: usize,
+    context: UserUnwindContext,
 ) -> Vec<u64> {
     let Some(stack) = &sample.user_stack else {
         return Vec::new();
@@ -2204,12 +2244,7 @@ fn unwind_user_stack_like_perf(
     let Some(stack_bytes) = perf_effective_user_stack_bytes(stack) else {
         return Vec::new();
     };
-    match choose_user_unwind_source(
-        !accumulator.sample_frames.is_empty(),
-        has_recorded_mapping_for_ip,
-        has_loaded_mapping_for_ip,
-        unwind_module_count,
-    ) {
+    match choose_user_unwind_source(context) {
         UserUnwindSource::None => Vec::new(),
         UserUnwindSource::FramePointer => unwind_x86_64_stack(*regs, stack_bytes, 256),
         UserUnwindSource::Object => sample
@@ -2224,16 +2259,15 @@ fn unwind_user_stack_like_perf(
     }
 }
 
-fn choose_user_unwind_source(
-    has_callchain_frames: bool,
-    has_recorded_mapping_for_ip: bool,
-    has_loaded_mapping_for_ip: bool,
-    unwind_module_count: usize,
-) -> UserUnwindSource {
-    if has_recorded_mapping_for_ip && !has_loaded_mapping_for_ip {
+fn choose_user_unwind_source(context: UserUnwindContext) -> UserUnwindSource {
+    if context.callchain == SampleCallchainState::KernelWithoutCallchain
+        || context.initial_ip_mapping == InitialIpMappingState::RecordedMappingMissing
+    {
         UserUnwindSource::None
-    } else if unwind_module_count == 0 {
-        if has_callchain_frames && !has_recorded_mapping_for_ip {
+    } else if context.module_count == 0 {
+        if context.callchain == (SampleCallchainState::Other { has_frames: true })
+            && context.initial_ip_mapping == InitialIpMappingState::NoRecordedMapping
+        {
             UserUnwindSource::FramePointer
         } else {
             UserUnwindSource::None
@@ -2736,7 +2770,11 @@ mod tests {
     #[test]
     fn user_unwind_source_skips_recorded_ip_without_loaded_unwind_module() {
         assert_eq!(
-            super::choose_user_unwind_source(true, true, false, 1),
+            super::choose_user_unwind_source(super::UserUnwindContext {
+                callchain: super::SampleCallchainState::Other { has_frames: true },
+                initial_ip_mapping: super::InitialIpMappingState::RecordedMappingMissing,
+                module_count: 1,
+            }),
             super::UserUnwindSource::None
         );
     }
@@ -2744,15 +2782,27 @@ mod tests {
     #[test]
     fn user_unwind_source_uses_frame_pointer_only_for_callchain_without_modules() {
         assert_eq!(
-            super::choose_user_unwind_source(true, false, false, 0),
+            super::choose_user_unwind_source(super::UserUnwindContext {
+                callchain: super::SampleCallchainState::Other { has_frames: true },
+                initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
+                module_count: 0,
+            }),
             super::UserUnwindSource::FramePointer
         );
         assert_eq!(
-            super::choose_user_unwind_source(false, false, false, 0),
+            super::choose_user_unwind_source(super::UserUnwindContext {
+                callchain: super::SampleCallchainState::Other { has_frames: false },
+                initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
+                module_count: 0,
+            }),
             super::UserUnwindSource::None
         );
         assert_eq!(
-            super::choose_user_unwind_source(true, true, true, 0),
+            super::choose_user_unwind_source(super::UserUnwindContext {
+                callchain: super::SampleCallchainState::Other { has_frames: true },
+                initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
+                module_count: 0,
+            }),
             super::UserUnwindSource::None
         );
     }
@@ -2760,8 +2810,24 @@ mod tests {
     #[test]
     fn user_unwind_source_uses_object_unwinder_after_modules_are_loaded() {
         assert_eq!(
-            super::choose_user_unwind_source(false, false, false, 1),
+            super::choose_user_unwind_source(super::UserUnwindContext {
+                callchain: super::SampleCallchainState::Other { has_frames: false },
+                initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
+                module_count: 1,
+            }),
             super::UserUnwindSource::Object
+        );
+    }
+
+    #[test]
+    fn user_unwind_source_skips_kernel_samples_without_kernel_callchain_like_perf_script() {
+        assert_eq!(
+            super::choose_user_unwind_source(super::UserUnwindContext {
+                callchain: super::SampleCallchainState::KernelWithoutCallchain,
+                initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
+                module_count: 1,
+            }),
+            super::UserUnwindSource::None
         );
     }
 
