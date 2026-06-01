@@ -1,5 +1,5 @@
 use framehop::x86_64::Reg;
-use object::{Object, ObjectSegment};
+use object::{Object, ObjectSection, ObjectSegment};
 use proptest::prelude::*;
 use pyroclast::perfdata::unwind::{
     FramehopUnwinder, PerfStackReader, PerfX86_64Regs, unwind_x86_64_stack,
@@ -112,6 +112,32 @@ fn reads_mapped_object_memory_outside_sampled_stack_like_perf_libdw() {
         unwinder.read_process_u64(base + segment.address()),
         Some(expected)
     );
+}
+
+#[test]
+fn loaded_object_does_not_imply_unwind_info_for_every_address_like_perf_libdw() {
+    let current_exe = std::env::current_exe().expect("current exe");
+    let bytes = std::fs::read(&current_exe).expect("read object");
+    let object = object::File::parse(&bytes[..]).expect("parse object");
+    let data_section = object
+        .sections()
+        .find(|section| {
+            section.size() != 0
+                && matches!(section.name(), Ok(".data" | ".bss" | "__data" | "__bss"))
+        })
+        .expect("data section");
+    let base = 0x5555_0000;
+    let mut unwinder = FramehopUnwinder::new();
+
+    assert!(
+        unwinder
+            .add_object_mapping(&current_exe, base, 0x1000_0000, 0)
+            .expect("load object mapping")
+    );
+    let data_address = base + data_section.address();
+
+    assert!(unwinder.has_reported_module_for_ip(data_address));
+    assert!(!unwinder.has_unwind_info_for_ip(data_address));
 }
 
 #[test]

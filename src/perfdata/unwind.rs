@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use framehop::x86_64::{CacheX86_64, Reg, UnwindRegsX86_64, UnwinderX86_64};
 use framehop::{ExplicitModuleSectionInfo, Unwinder};
+use gimli::{BaseAddresses, CieOrFde, DebugFrame, EhFrame, LittleEndian, UnwindSection};
 use memmap2::Mmap;
 use object::read::{Object, ObjectSection, ObjectSegment};
 
@@ -34,6 +35,7 @@ struct ReportedModule {
     base: u64,
     range: Range<u64>,
     memory_segments: Vec<ModuleMemorySegment>,
+    unwind_ranges: Vec<Range<u64>>,
 }
 
 #[derive(Clone, Debug)]
@@ -139,6 +141,7 @@ impl FramehopUnwinder {
         }
         let section_info = explicit_module_section_info(&mapped, &object);
         let memory_segments = module_memory_segments(&mapped, &object, base);
+        let unwind_ranges = object_unwind_ranges(&object, base);
         let module = framehop::Module::<ModuleBytes>::new(
             path.to_string_lossy().into_owned(),
             module_range.clone(),
@@ -150,6 +153,7 @@ impl FramehopUnwinder {
             base,
             range: module_range,
             memory_segments,
+            unwind_ranges,
         });
         self.module_count += 1;
         Ok(true)
@@ -175,6 +179,13 @@ impl FramehopUnwinder {
     }
 
     #[must_use]
+    pub fn has_unwind_info_for_ip(&self, ip: u64) -> bool {
+        self.reported_modules
+            .iter()
+            .any(|module| module.unwind_ranges.iter().any(|range| range.contains(&ip)))
+    }
+
+    #[must_use]
     pub fn read_process_u64(&self, address: u64) -> Option<u64> {
         read_reported_module_u64(&self.reported_modules, address)
     }
@@ -191,6 +202,9 @@ impl FramehopUnwinder {
             .iter()
             .any(|range| range.contains(&regs.ip))
         {
+            return Vec::new();
+        }
+        if !self.has_unwind_info_for_ip(regs.ip) {
             return Vec::new();
         }
         let stack_reader = PerfStackReader::new(regs.sp, stack);
@@ -277,6 +291,117 @@ fn object_load_range<'a>(object: &object::File<'a, &'a [u8]>) -> Option<Range<u6
             start..start.saturating_add(segment.size())
         })
         .reduce(|left, right| left.start.min(right.start)..left.end.max(right.end))
+}
+
+fn object_unwind_ranges<'a>(object: &object::File<'a, &'a [u8]>, base: u64) -> Vec<Range<u64>> {
+    let bases = object_cfi_base_addresses(object);
+    let mut ranges = Vec::new();
+    append_eh_frame_unwind_ranges(object, base, &bases, &mut ranges);
+    append_debug_frame_unwind_ranges(object, base, &bases, &mut ranges);
+    normalize_ranges(&mut ranges);
+    ranges
+}
+
+fn append_eh_frame_unwind_ranges<'a>(
+    object: &object::File<'a, &'a [u8]>,
+    base: u64,
+    bases: &BaseAddresses,
+    ranges: &mut Vec<Range<u64>>,
+) {
+    let Some(section) = object.section_by_name_bytes(b".eh_frame") else {
+        return;
+    };
+    let Ok(data) = section.data() else {
+        return;
+    };
+    let eh_frame = EhFrame::new(data, LittleEndian);
+    let mut entries = eh_frame.entries(bases);
+    while let Ok(Some(entry)) = entries.next() {
+        let CieOrFde::Fde(partial) = entry else {
+            continue;
+        };
+        let Ok(fde) = partial.parse(EhFrame::cie_from_offset) else {
+            continue;
+        };
+        push_unwind_range(ranges, base, fde.initial_address(), fde.end_address());
+    }
+}
+
+fn append_debug_frame_unwind_ranges<'a>(
+    object: &object::File<'a, &'a [u8]>,
+    base: u64,
+    bases: &BaseAddresses,
+    ranges: &mut Vec<Range<u64>>,
+) {
+    let Some(section) = object.section_by_name_bytes(b".debug_frame") else {
+        return;
+    };
+    let Ok(data) = section.data() else {
+        return;
+    };
+    let debug_frame = DebugFrame::new(data, LittleEndian);
+    let mut entries = debug_frame.entries(bases);
+    while let Ok(Some(entry)) = entries.next() {
+        let CieOrFde::Fde(partial) = entry else {
+            continue;
+        };
+        let Ok(fde) = partial.parse(DebugFrame::cie_from_offset) else {
+            continue;
+        };
+        push_unwind_range(ranges, base, fde.initial_address(), fde.end_address());
+    }
+}
+
+fn object_cfi_base_addresses<'a>(object: &object::File<'a, &'a [u8]>) -> BaseAddresses {
+    let mut bases = BaseAddresses::default();
+    if let Some(address) = section_address(object, b".eh_frame_hdr") {
+        bases = bases.set_eh_frame_hdr(address);
+    }
+    if let Some(address) = section_address(object, b".eh_frame") {
+        bases = bases.set_eh_frame(address);
+    }
+    if let Some(address) = first_section_address(object, &[b"__text", b".text"]) {
+        bases = bases.set_text(address);
+    }
+    if let Some(address) = first_section_address(object, &[b"__got", b".got"]) {
+        bases = bases.set_got(address);
+    }
+    bases
+}
+
+fn section_address<'a>(object: &object::File<'a, &'a [u8]>, name: &[u8]) -> Option<u64> {
+    object
+        .section_by_name_bytes(name)
+        .map(|section| section.address())
+}
+
+fn first_section_address<'a>(object: &object::File<'a, &'a [u8]>, names: &[&[u8]]) -> Option<u64> {
+    names.iter().find_map(|name| section_address(object, name))
+}
+
+fn push_unwind_range(ranges: &mut Vec<Range<u64>>, base: u64, start: u64, end: u64) {
+    let Some(start) = base.checked_add(start) else {
+        return;
+    };
+    let Some(end) = base.checked_add(end) else {
+        return;
+    };
+    if start < end {
+        ranges.push(start..end);
+    }
+}
+
+fn normalize_ranges(ranges: &mut Vec<Range<u64>>) {
+    ranges.sort_unstable_by_key(|range| (range.start, range.end));
+    let mut index = 0;
+    while index + 1 < ranges.len() {
+        if ranges[index].end >= ranges[index + 1].start {
+            ranges[index].end = ranges[index].end.max(ranges[index + 1].end);
+            ranges.remove(index + 1);
+        } else {
+            index += 1;
+        }
+    }
 }
 
 fn module_memory_segments<'a>(
