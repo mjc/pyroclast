@@ -26,7 +26,8 @@ use crate::perfdata::samples::{
     PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_ID,
     PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID,
     PERF_SAMPLE_TIME, SampleLayout, is_kernel_space_frame, is_perf_context_marker,
-    is_perf_user_deferred_context_marker, parse_sample_record_callchain,
+    is_perf_user_context_marker, is_perf_user_deferred_context_marker,
+    parse_sample_record_callchain,
 };
 use crate::perfdata::unwind::{FramehopUnwinder, PerfX86_64Regs, unwind_x86_64_stack};
 use crate::symbols::{SymbolFrameCache, SymbolRequest, SymbolResolver, perf_build_id_elf_path};
@@ -177,6 +178,7 @@ enum UserUnwindSource {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SampleCallchainState {
     KernelWithoutCallchain,
+    KernelWithUserContext,
     Other {
         has_callchain: bool,
         has_frames: bool,
@@ -2323,12 +2325,16 @@ fn append_perf_user_unwind_frames(
         .pid
         .and_then(|pid| accumulator.unwind_states.get(&pid))
         .map_or(0, |state| state.object_unwinder.module_count());
-    // perf script on kernel samples with an empty FP chain prints no stack,
-    // even when PERF_SAMPLE_REGS_USER/PERF_SAMPLE_STACK_USER are present.
     let callchain = if (misc & PERF_RECORD_MISC_CPUMODE_MASK) == PERF_RECORD_MISC_CPUMODE_KERNEL
         && sample.frames.is_empty()
     {
         SampleCallchainState::KernelWithoutCallchain
+    } else if (misc & PERF_RECORD_MISC_CPUMODE_MASK) == PERF_RECORD_MISC_CPUMODE_KERNEL
+        && sample.frames.clone().any(is_perf_user_context_marker)
+    {
+        // perf script keeps the recorded callchain for kernel samples and does
+        // not append extra user DWARF callers after the PERF_CONTEXT_USER frame.
+        SampleCallchainState::KernelWithUserContext
     } else {
         SampleCallchainState::Other {
             has_callchain: event.layout.sample_type & PERF_SAMPLE_CALLCHAIN != 0,
@@ -2388,8 +2394,10 @@ fn unwind_user_stack_like_perf(
 }
 
 fn choose_user_unwind_source(context: UserUnwindContext) -> UserUnwindSource {
-    if context.callchain == SampleCallchainState::KernelWithoutCallchain
-        || context.initial_ip_mapping == InitialIpMappingState::RecordedMappingMissing
+    if matches!(
+        context.callchain,
+        SampleCallchainState::KernelWithoutCallchain | SampleCallchainState::KernelWithUserContext
+    ) || context.initial_ip_mapping == InitialIpMappingState::RecordedMappingMissing
     {
         UserUnwindSource::None
     } else if context.module_count == 0 {
@@ -3061,10 +3069,22 @@ mod tests {
     }
 
     #[test]
-    fn user_unwind_source_skips_kernel_samples_without_kernel_callchain_like_perf_script() {
+    fn user_unwind_source_skips_kernel_samples_without_callchain_like_perf_script() {
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
                 callchain: super::SampleCallchainState::KernelWithoutCallchain,
+                initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
+                module_count: 1,
+            }),
+            super::UserUnwindSource::None
+        );
+    }
+
+    #[test]
+    fn user_unwind_source_skips_kernel_samples_with_user_context_like_perf_script() {
+        assert_eq!(
+            super::choose_user_unwind_source(super::UserUnwindContext {
+                callchain: super::SampleCallchainState::KernelWithUserContext,
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
                 module_count: 1,
             }),
