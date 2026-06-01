@@ -158,6 +158,13 @@ enum FoldFrame {
     UserUnwind(u64),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UserUnwindSource {
+    None,
+    FramePointer,
+    Object,
+}
+
 impl FoldFrame {
     fn address(self) -> u64 {
         match self {
@@ -2208,21 +2215,39 @@ fn unwind_user_stack_like_perf(
     let Some(stack) = &sample.user_stack else {
         return Vec::new();
     };
-    if has_recorded_mapping_for_ip && !has_loaded_mapping_for_ip {
-        Vec::new()
-    } else if unwind_module_count == 0 {
-        if accumulator.sample_frames.is_empty() || has_recorded_mapping_for_ip {
-            Vec::new()
-        } else {
-            unwind_x86_64_stack(*regs, stack.bytes, 256)
-        }
-    } else {
-        sample
+    match choose_user_unwind_source(
+        !accumulator.sample_frames.is_empty(),
+        has_recorded_mapping_for_ip,
+        has_loaded_mapping_for_ip,
+        unwind_module_count,
+    ) {
+        UserUnwindSource::None => Vec::new(),
+        UserUnwindSource::FramePointer => unwind_x86_64_stack(*regs, stack.bytes, 256),
+        UserUnwindSource::Object => sample
             .pid
             .and_then(|pid| accumulator.unwind_states.get_mut(&pid))
             .map_or_else(Vec::new, |state| {
                 state.object_unwinder.unwind_stack(*regs, stack.bytes, 256)
-            })
+            }),
+    }
+}
+
+fn choose_user_unwind_source(
+    has_callchain_frames: bool,
+    has_recorded_mapping_for_ip: bool,
+    has_loaded_mapping_for_ip: bool,
+    unwind_module_count: usize,
+) -> UserUnwindSource {
+    if has_recorded_mapping_for_ip && !has_loaded_mapping_for_ip {
+        UserUnwindSource::None
+    } else if unwind_module_count == 0 {
+        if has_callchain_frames && !has_recorded_mapping_for_ip {
+            UserUnwindSource::FramePointer
+        } else {
+            UserUnwindSource::None
+        }
+    } else {
+        UserUnwindSource::Object
     }
 }
 
@@ -2697,6 +2722,38 @@ mod tests {
         );
 
         assert_eq!(frames, vec![super::FoldFrame::UserUnwind(0x1010)]);
+    }
+
+    #[test]
+    fn user_unwind_source_skips_recorded_ip_without_loaded_unwind_module() {
+        assert_eq!(
+            super::choose_user_unwind_source(true, true, false, 1),
+            super::UserUnwindSource::None
+        );
+    }
+
+    #[test]
+    fn user_unwind_source_uses_frame_pointer_only_for_callchain_without_modules() {
+        assert_eq!(
+            super::choose_user_unwind_source(true, false, false, 0),
+            super::UserUnwindSource::FramePointer
+        );
+        assert_eq!(
+            super::choose_user_unwind_source(false, false, false, 0),
+            super::UserUnwindSource::None
+        );
+        assert_eq!(
+            super::choose_user_unwind_source(true, true, true, 0),
+            super::UserUnwindSource::None
+        );
+    }
+
+    #[test]
+    fn user_unwind_source_uses_object_unwinder_after_modules_are_loaded() {
+        assert_eq!(
+            super::choose_user_unwind_source(false, false, false, 1),
+            super::UserUnwindSource::Object
+        );
     }
 
     #[test]
