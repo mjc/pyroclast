@@ -758,6 +758,28 @@ fn rust_addr2line_resolver_uses_object_symbol_for_non_inline_frames_like_perf_sc
 }
 
 #[test]
+fn rust_addr2line_resolver_synthesizes_x86_64_plt_symbols_like_perf_script() {
+    let libc =
+        PathBuf::from("/nix/store/57iz36553175g3178pvxjij8z5rcsd4n-glibc-2.42-61/lib/libc.so.6");
+    if !libc.exists() {
+        return;
+    }
+
+    let resolver = RustAddr2lineResolver::new();
+    let frames = resolver
+        .resolve_frame_batch(&[SymbolRequest {
+            path: libc,
+            relative_address: 0x287a4,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        }])
+        .expect("resolve frames");
+
+    assert_eq!(frames, vec![vec!["strcmp@plt".to_string()]]);
+}
+
+#[test]
 fn rust_addr2line_resolver_replaces_base_symbol_when_perf_inline_name_differs() {
     let Some((profiling_binary, object_bytes)) = profiling_binary_fixture() else {
         return;

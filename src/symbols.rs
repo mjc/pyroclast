@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use clap::ValueEnum;
 use hashbrown::{HashMap, HashSet};
-use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol, SymbolKind};
+use object::{
+    Object, ObjectSection, ObjectSegment, ObjectSymbol, ObjectSymbolTable, SymbolIndex, SymbolKind,
+};
 use rustc_hash::FxBuildHasher;
 use serde::Serialize;
 
@@ -1724,6 +1726,7 @@ impl PerfObjectSymbolIndex {
             .chain(object.dynamic_symbols())
             .filter_map(|symbol| perf_symbol_candidate_from_object_symbol(&symbol))
             .collect::<Vec<_>>();
+        symbols.extend(perf_synthesized_plt_symbols(&object, &symbols));
         symbols.sort_by_key(|symbol| symbol.address);
         Self { symbols }
     }
@@ -1744,6 +1747,123 @@ impl PerfObjectSymbolIndex {
         }
         best.map(|candidate| candidate.name.as_str())
     }
+}
+
+fn perf_synthesized_plt_symbols(
+    object: &object::File<'_>,
+    base_symbols: &[PerfSymbolCandidate],
+) -> Vec<PerfSymbolCandidate> {
+    if object.architecture() != object::Architecture::X86_64 {
+        return Vec::new();
+    }
+    let Some(plt) = object.section_by_name(".plt") else {
+        return Vec::new();
+    };
+    let Some((plt_sec_offset, lazy_plt)) = object
+        .section_by_name(".plt.sec")
+        .and_then(|section| section.file_range().map(|(offset, _)| (offset, false)))
+        .or_else(|| {
+            let (offset, size) = plt.file_range()?;
+            let has_header = perf_x86_64_plt_relocations(object).is_none_or(|relocations| {
+                u64::try_from(relocations.len()).map_or(true, |len| len * 16 != size)
+            });
+            Some((offset + u64::from(has_header) * 16, true))
+        })
+    else {
+        return Vec::new();
+    };
+
+    let Some(mut relocations) = perf_x86_64_plt_relocations(object) else {
+        return Vec::new();
+    };
+    relocations.sort_by_key(|relocation| relocation.offset);
+
+    let mut plt_offset = plt_sec_offset;
+    let mut symbols = Vec::with_capacity(relocations.len() + usize::from(lazy_plt));
+    if lazy_plt {
+        symbols.push(PerfSymbolCandidate {
+            name: ".plt".to_string(),
+            address: plt.file_range().map_or(plt.address(), |(offset, _)| offset),
+            size: 16,
+            scope: PerfSymbolScope::Global,
+            binding: PerfSymbolBinding::Global,
+        });
+    }
+    for relocation in relocations {
+        let name = relocation
+            .symbol_name
+            .filter(|name| !name.is_empty())
+            .map(|name| format!("{name}@plt"))
+            .or_else(|| {
+                relocation
+                    .ifunc_addend
+                    .and_then(|addend| perf_best_symbol_at(base_symbols, addend))
+                    .map(|symbol| format!("{}@plt", symbol.name))
+            })
+            .unwrap_or_else(|| format!("offset_{plt_offset:#x}@plt"));
+        symbols.push(PerfSymbolCandidate {
+            name,
+            address: plt_offset,
+            size: 16,
+            scope: PerfSymbolScope::Global,
+            binding: PerfSymbolBinding::Global,
+        });
+        plt_offset += 16;
+    }
+    symbols
+}
+
+struct PerfPltRelocation {
+    offset: u64,
+    symbol_name: Option<String>,
+    ifunc_addend: Option<u64>,
+}
+
+fn perf_x86_64_plt_relocations(object: &object::File<'_>) -> Option<Vec<PerfPltRelocation>> {
+    let dynamic_symbols = object.dynamic_symbol_table()?;
+    let rela_plt = object.section_by_name(".rela.plt")?.data().ok()?;
+    let relocations = rela_plt
+        .chunks_exact(24)
+        .filter_map(|entry| {
+            let offset = u64::from_le_bytes(entry[0..8].try_into().ok()?);
+            let info = u64::from_le_bytes(entry[8..16].try_into().ok()?);
+            let addend = i64::from_le_bytes(entry[16..24].try_into().ok()?);
+            let symbol_index = usize::try_from(info >> 32).ok()?;
+            match u32::try_from(info & 0xffff_ffff).ok()? {
+                object::elf::R_X86_64_JUMP_SLOT => dynamic_symbols
+                    .symbol_by_index(SymbolIndex(symbol_index))
+                    .ok()
+                    .and_then(|symbol| symbol.name().ok())
+                    .map(|name| PerfPltRelocation {
+                        offset,
+                        symbol_name: Some(perf_symbol_name(&addr2line::demangle_auto(
+                            Cow::Borrowed(name),
+                            None,
+                        ))),
+                        ifunc_addend: None,
+                    }),
+                object::elf::R_X86_64_IRELATIVE => {
+                    u64::try_from(addend).ok().map(|addend| PerfPltRelocation {
+                        offset,
+                        symbol_name: None,
+                        ifunc_addend: Some(addend),
+                    })
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    (!relocations.is_empty()).then_some(relocations)
+}
+
+fn perf_best_symbol_at(
+    symbols: &[PerfSymbolCandidate],
+    address: u64,
+) -> Option<&PerfSymbolCandidate> {
+    symbols
+        .iter()
+        .filter(|symbol| symbol.address == address)
+        .reduce(perf_best_duplicate_symbol)
 }
 
 fn perf_symbol_candidate_from_object_symbol(
