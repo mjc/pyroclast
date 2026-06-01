@@ -287,6 +287,18 @@ impl MmapTable {
             })
     }
 
+    pub(crate) fn user_mapping_for_pid_ip(&self, pid: u32, ip: u64) -> Option<UserMapping<'_>> {
+        self.resolve_mapping(pid, ip).map(|mapping| UserMapping {
+            pid: mapping.pid,
+            start: mapping.start,
+            len: mapping.len,
+            pgoff: mapping.pgoff,
+            path: &mapping.path,
+            build_id: mapping.build_id.as_deref(),
+            file_identity: mapping.file_identity,
+        })
+    }
+
     #[must_use]
     pub fn has_mappings_for_pid(&self, pid: u32) -> bool {
         self.has_global_mappings || self.pids_with_mappings.contains(&pid)

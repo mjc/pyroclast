@@ -102,6 +102,7 @@ struct FoldAccumulator {
     thread_comms: BTreeMap<u32, String>,
     mmap_table: MmapTable,
     object_unwinder: FramehopUnwinder,
+    attempted_unwind_mappings: BTreeSet<(String, u64, u64, u64)>,
     loaded_unwind_mappings: BTreeSet<(String, u64, u64, u64)>,
     header_build_ids: BTreeMap<String, Vec<u8>>,
     raw_stacks: RawStackAccumulator<FoldFrame>,
@@ -138,7 +139,8 @@ struct UnwindMappingRequest<'a> {
     len: u64,
     pgoff: u64,
     path: &'a str,
-    build_id: &'a [u8],
+    file_identity: Option<FileIdentity>,
+    build_id: Option<&'a [u8]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -959,6 +961,7 @@ impl FoldAccumulator {
             thread_comms: BTreeMap::new(),
             mmap_table: MmapTable::default(),
             object_unwinder: FramehopUnwinder::new(),
+            attempted_unwind_mappings: BTreeSet::new(),
             loaded_unwind_mappings: BTreeSet::new(),
             header_build_ids,
             raw_stacks: RawStackAccumulator::<FoldFrame>::new(),
@@ -989,12 +992,16 @@ impl FoldAccumulator {
             ParsedRecord::Mmap(record) => {
                 load_unwind_mapping(
                     &mut self.object_unwinder,
+                    &mut self.attempted_unwind_mappings,
                     &mut self.loaded_unwind_mappings,
-                    record.start,
-                    record.len,
-                    record.pgoff,
-                    &record.path,
-                    None,
+                    UnwindMappingRequest {
+                        start: record.start,
+                        len: record.len,
+                        pgoff: record.pgoff,
+                        path: &record.path,
+                        file_identity: None,
+                        build_id: None,
+                    },
                 );
                 self.mmap_table.insert_mmap(record);
                 Ok(())
@@ -1011,13 +1018,15 @@ impl FoldAccumulator {
                 if let Some(build_id) = build_id {
                     load_build_id_unwind_mapping(
                         &mut self.object_unwinder,
+                        &mut self.attempted_unwind_mappings,
                         &mut self.loaded_unwind_mappings,
                         UnwindMappingRequest {
                             start: record.start,
                             len: record.len,
                             pgoff: record.pgoff,
                             path: &record.path,
-                            build_id: &build_id,
+                            file_identity: Some(mmap2_file_identity(&record)),
+                            build_id: Some(&build_id),
                         },
                         self.unwind_debug_dir.as_deref(),
                     );
@@ -1026,6 +1035,7 @@ impl FoldAccumulator {
                 } else {
                     load_mmap2_unwind_mapping(
                         &mut self.object_unwinder,
+                        &mut self.attempted_unwind_mappings,
                         &mut self.loaded_unwind_mappings,
                         &record,
                     );
@@ -1036,13 +1046,15 @@ impl FoldAccumulator {
             ParsedRecord::Mmap2BuildId(record) => {
                 load_build_id_unwind_mapping(
                     &mut self.object_unwinder,
+                    &mut self.attempted_unwind_mappings,
                     &mut self.loaded_unwind_mappings,
                     UnwindMappingRequest {
                         start: record.start,
                         len: record.len,
                         pgoff: record.pgoff,
                         path: &record.path,
-                        build_id: &record.build_id,
+                        file_identity: None,
+                        build_id: Some(&record.build_id),
                     },
                     self.unwind_debug_dir.as_deref(),
                 );
@@ -1268,6 +1280,29 @@ impl FoldAccumulator {
                 &mut self.callchain,
             );
         }
+    }
+
+    fn has_loaded_unwind_mapping_for_ip(&self, pid: Option<u32>, ip: u64) -> bool {
+        let Some(mapping) = pid.and_then(|pid| self.mmap_table.user_mapping_for_pid_ip(pid, ip))
+        else {
+            return false;
+        };
+        let object_path = mapping.build_id.map_or_else(
+            || PathBuf::from(mapping.path),
+            |build_id| {
+                unwind_object_path_for_build_id(
+                    mapping.path,
+                    build_id,
+                    self.unwind_debug_dir.as_deref(),
+                )
+            },
+        );
+        self.loaded_unwind_mappings.contains(&(
+            object_path.to_string_lossy().into_owned(),
+            mapping.start,
+            mapping.len,
+            mapping.pgoff,
+        ))
     }
 
     fn drain_fold_counts<R>(
@@ -1999,11 +2034,9 @@ fn parse_sample_for_fold(
         let has_recorded_mapping_for_ip = sample
             .pid
             .is_some_and(|pid| accumulator.mmap_table.has_mapping_for_pid(pid, regs.ip));
-        let unwound_frames = if has_recorded_mapping_for_ip
-            && !accumulator
-                .object_unwinder
-                .has_reported_module_for_ip(regs.ip)
-        {
+        let has_loaded_mapping_for_ip =
+            accumulator.has_loaded_unwind_mapping_for_ip(sample.pid, regs.ip);
+        let unwound_frames = if has_recorded_mapping_for_ip && !has_loaded_mapping_for_ip {
             Vec::new()
         } else if accumulator.object_unwinder.module_count() == 0 {
             if accumulator.sample_frames.is_empty() || has_recorded_mapping_for_ip {
@@ -2087,46 +2120,67 @@ fn has_perf_captured_user_stack(stack: &crate::perfdata::samples::SampleUserStac
 
 fn load_unwind_mapping(
     object_unwinder: &mut FramehopUnwinder,
+    attempted_unwind_mappings: &mut BTreeSet<(String, u64, u64, u64)>,
     loaded_unwind_mappings: &mut BTreeSet<(String, u64, u64, u64)>,
-    start: u64,
-    len: u64,
-    pgoff: u64,
-    path: &str,
-    file_identity: Option<FileIdentity>,
+    request: UnwindMappingRequest<'_>,
 ) {
-    if !should_load_unwind_object(path, file_identity) {
+    if !should_load_unwind_object(request.path, request.file_identity) {
         return;
     }
-    let key = (path.to_string(), start, len, pgoff);
-    if !loaded_unwind_mappings.insert(key) {
+    let key = (
+        request.path.to_string(),
+        request.start,
+        request.len,
+        request.pgoff,
+    );
+    if !attempted_unwind_mappings.insert(key.clone()) {
         return;
     }
-    let _ = object_unwinder.add_object_mapping(Path::new(path), start, len, pgoff);
+    if object_unwinder
+        .add_object_mapping(
+            Path::new(request.path),
+            request.start,
+            request.len,
+            request.pgoff,
+        )
+        .is_ok_and(|loaded| loaded)
+    {
+        loaded_unwind_mappings.insert(key);
+    }
 }
 
 fn load_mmap2_unwind_mapping(
     object_unwinder: &mut FramehopUnwinder,
+    attempted_unwind_mappings: &mut BTreeSet<(String, u64, u64, u64)>,
     loaded_unwind_mappings: &mut BTreeSet<(String, u64, u64, u64)>,
     record: &Mmap2Record,
 ) {
     load_unwind_mapping(
         object_unwinder,
+        attempted_unwind_mappings,
         loaded_unwind_mappings,
-        record.start,
-        record.len,
-        record.pgoff,
-        &record.path,
-        Some(mmap2_file_identity(record)),
+        UnwindMappingRequest {
+            start: record.start,
+            len: record.len,
+            pgoff: record.pgoff,
+            path: &record.path,
+            file_identity: Some(mmap2_file_identity(record)),
+            build_id: None,
+        },
     );
 }
 
 fn load_build_id_unwind_mapping(
     object_unwinder: &mut FramehopUnwinder,
+    attempted_unwind_mappings: &mut BTreeSet<(String, u64, u64, u64)>,
     loaded_unwind_mappings: &mut BTreeSet<(String, u64, u64, u64)>,
     request: UnwindMappingRequest<'_>,
     debug_dir: Option<&Path>,
 ) {
-    let object_path = unwind_object_path_for_build_id(request.path, request.build_id, debug_dir);
+    let Some(build_id) = request.build_id else {
+        return;
+    };
+    let object_path = unwind_object_path_for_build_id(request.path, build_id, debug_dir);
     if object_path.to_string_lossy().starts_with('[') {
         return;
     }
@@ -2136,11 +2190,15 @@ fn load_build_id_unwind_mapping(
         request.len,
         request.pgoff,
     );
-    if !loaded_unwind_mappings.insert(key) {
+    if !attempted_unwind_mappings.insert(key.clone()) {
         return;
     }
-    let _ =
-        object_unwinder.add_object_mapping(&object_path, request.start, request.len, request.pgoff);
+    if object_unwinder
+        .add_object_mapping(&object_path, request.start, request.len, request.pgoff)
+        .is_ok_and(|loaded| loaded)
+    {
+        loaded_unwind_mappings.insert(key);
+    }
 }
 
 fn unwind_object_path_for_build_id(

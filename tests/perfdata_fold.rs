@@ -315,6 +315,56 @@ fn drops_dwarf_user_stack_when_current_object_is_missing_even_if_other_modules_l
 }
 
 #[test]
+fn drops_dwarf_user_stack_when_current_mapping_replaces_broad_loaded_mapping_like_perf_script() {
+    let current_exe = std::env::current_exe().expect("current exe");
+    let current_exe = current_exe.to_string_lossy();
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            (1 << 6) | (1 << 7) | (1 << 8),
+        )],
+        [
+            record_bytes(
+                1,
+                &mmap_payload(11, 11, 0x4000, 0x3000, 0, current_exe.as_ref()),
+            ),
+            record_bytes(
+                1,
+                &mmap_payload(11, 11, 0x4800, 0x1000, 0, "/tmp/missing-app"),
+            ),
+            record_bytes(
+                9,
+                &sample_payload_with_user_stack(
+                    0x4900,
+                    11,
+                    12,
+                    [
+                        0xffff_ffff_ffff_fe00,
+                        0xffff_ffff_8100_0000,
+                        0xffff_ffff_8200_0000,
+                    ],
+                    1,
+                    [0x7fff_0008, 0x7fff_0000, 0x4900],
+                    [
+                        0, 0, 0, 0, 0, 0, 0, 0, //
+                        0x49, 0, 0, 0, 0, 0, 0, 0, //
+                        0x34, 0x12, 0, 0, 0, 0, 0, 0,
+                    ],
+                ),
+            ),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, "[unknown];[unknown];[unknown] 1\n");
+}
+
+#[test]
 fn drops_dwarf_user_stack_when_newer_mapping_module_overlaps_prior_report_like_perf_script() {
     let current_exe = std::env::current_exe().expect("current exe");
     let current_exe = current_exe.to_string_lossy();
@@ -353,6 +403,104 @@ fn drops_dwarf_user_stack_when_newer_mapping_module_overlaps_prior_report_like_p
                 ),
             ),
         ],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, "");
+}
+
+#[test]
+fn drops_dwarf_user_stack_when_build_id_mapping_module_overlaps_prior_report_like_perf_script() {
+    let current_exe = std::env::current_exe().expect("current exe");
+    let current_exe = current_exe.to_string_lossy();
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            (1 << 6) | (1 << 7) | (1 << 8),
+        )],
+        [
+            record_bytes(
+                23,
+                &mmap2_build_id_payload(11, 11, 0x4000, 0x3000, 0, current_exe.as_ref()),
+            ),
+            record_bytes(
+                23,
+                &mmap2_build_id_payload(11, 11, 0x4800, 0x1000, 0x1000, current_exe.as_ref()),
+            ),
+            record_bytes(
+                9,
+                &sample_payload_with_user_stack(
+                    0x4900,
+                    11,
+                    12,
+                    [],
+                    1,
+                    [0x7fff_0008, 0x7fff_0000, 0x4900],
+                    [
+                        0, 0, 0, 0, 0, 0, 0, 0, //
+                        0x49, 0, 0, 0, 0, 0, 0, 0, //
+                        0x34, 0x12, 0, 0, 0, 0, 0, 0,
+                    ],
+                ),
+            ),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, "");
+}
+
+#[test]
+fn drops_dwarf_user_stack_when_header_build_id_mmap2_module_overlaps_prior_report_like_perf_script()
+{
+    let build_id = [
+        0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90,
+        0xa0, 0xb0, 0xc0, 0xd0, 0xe0,
+    ];
+    let current_exe = std::env::current_exe().expect("current exe");
+    let current_exe = current_exe.to_string_lossy();
+    let bytes = perfdata_with_records_attrs_and_build_id_feature(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            (1 << 6) | (1 << 7) | (1 << 8),
+        )],
+        [
+            record_bytes(
+                10,
+                &mmap2_payload(11, 11, 0x4000, 0x3000, 0, 5, current_exe.as_ref()),
+            ),
+            record_bytes(
+                10,
+                &mmap2_payload(11, 11, 0x4800, 0x1000, 0x1000, 5, current_exe.as_ref()),
+            ),
+            record_bytes(
+                9,
+                &sample_payload_with_user_stack(
+                    0x4900,
+                    11,
+                    12,
+                    [],
+                    1,
+                    [0x7fff_0008, 0x7fff_0000, 0x4900],
+                    [
+                        0, 0, 0, 0, 0, 0, 0, 0, //
+                        0x49, 0, 0, 0, 0, 0, 0, 0, //
+                        0x34, 0x12, 0, 0, 0, 0, 0, 0,
+                    ],
+                ),
+            ),
+        ],
+        &build_id_event_payload(u32::MAX, &build_id, current_exe.as_ref()),
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
