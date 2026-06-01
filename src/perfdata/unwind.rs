@@ -546,11 +546,6 @@ impl PerfX86_64Regs {
             && self.bp < 4096
     }
 
-    #[must_use]
-    pub fn frame_pointer_points_above_stack_pointer(self) -> bool {
-        self.bp >= self.sp
-    }
-
     /// Builds the minimal `x86_64` register set needed for stack unwinding from
     /// perf's ascending register-mask encoding.
     ///
