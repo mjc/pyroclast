@@ -141,6 +141,14 @@ struct DeferredFoldSample {
     frames: Vec<FoldFrame>,
 }
 
+struct PreparedFoldSample {
+    pid: Option<u32>,
+    comm: Option<String>,
+    count: u64,
+    frames: Vec<FoldFrame>,
+    deferred_cookie: Option<u64>,
+}
+
 #[derive(Clone, Copy)]
 struct UnwindMappingRequest<'a> {
     start: u64,
@@ -537,8 +545,7 @@ where
     W: IoWrite + ?Sized,
 {
     let file = File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
-    let fold_data = collect_fold_data_from_file(&file, options)?;
-    write_inferno_perf_script::<NoopSymbolResolver, _>(fold_data, None, writer)
+    write_inferno_perf_script_from_file::<NoopSymbolResolver, _>(&file, options, None, writer)
 }
 
 pub(crate) fn write_inferno_perf_script_file_with_symbols<R, W>(
@@ -552,9 +559,8 @@ where
     W: IoWrite + ?Sized,
 {
     let file = File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
-    let fold_data = collect_fold_data_from_file(&file, options)?;
     let mut symbol_cache = SymbolFrameCache::new(symbol_resolver);
-    write_inferno_perf_script(fold_data, Some(&mut symbol_cache), writer)
+    write_inferno_perf_script_from_file(&file, options, Some(&mut symbol_cache), writer)
 }
 
 fn parse_record_with_context(record: PerfRecord<'_>) -> Result<ParsedRecord, String> {
@@ -802,7 +808,235 @@ where
     write_fold_counts(counts, writer)
 }
 
+fn write_inferno_perf_script_from_file<R, W>(
+    file: &File,
+    options: FoldOptions,
+    symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+    writer: &mut W,
+) -> Result<(), String>
+where
+    R: SymbolResolver,
+    W: IoWrite + ?Sized,
+{
+    let (header, header_bytes) = perfdata_header_from_file(file)?;
+    let sample_layouts = sample_layouts_from_file(file, header)?;
+    let header_build_ids = header_build_ids_by_filename_from_file(file, header, &header_bytes)?;
+    let data_end = header
+        .data_offset
+        .checked_add(header.data_size)
+        .ok_or_else(|| "perf data section size overflows u64".to_string())?;
+    if file
+        .metadata()
+        .map_err(|error| format!("failed to stat perf.data: {error}"))?
+        .len()
+        < data_end
+    {
+        return Err("perf data section extends past end of file".to_string());
+    }
+
+    let mut reader = BufReader::with_capacity(
+        RECORD_READER_BUFFER_CAPACITY,
+        file.try_clone()
+            .map_err(|error| format!("failed to clone perf.data handle: {error}"))?,
+    );
+    reader
+        .seek(SeekFrom::Start(header.data_offset))
+        .map_err(|error| format!("failed to seek perf data section: {error}"))?;
+
+    let mut sink = PerfScriptSink::new(header_build_ids, symbol_cache, writer);
+    let mut ordered_records = OrderedRecordQueue::default();
+    let mut header_bytes = [0_u8; 8];
+    let mut payload = Vec::new();
+    let mut offset = usize::try_from(header.data_offset)
+        .map_err(|_| "perf data section offset exceeds usize".to_string())?;
+    let end =
+        usize::try_from(data_end).map_err(|_| "perf data section end exceeds usize".to_string())?;
+    let mut index = 0usize;
+
+    while offset < end {
+        reader.read_exact(&mut header_bytes).map_err(|error| {
+            format!("failed to read perf record header at offset {offset}: {error}")
+        })?;
+        let record_header = parse_record_header(&header_bytes)?;
+        let size = usize::from(record_header.size);
+        if size < 8 {
+            return Err(format!(
+                "invalid perf record size {size} at offset {offset}"
+            ));
+        }
+        let next = offset
+            .checked_add(size)
+            .ok_or_else(|| format!("perf record size overflows at offset {offset}"))?;
+        if next > end {
+            return Err(format!(
+                "perf record overruns data section at offset {offset}"
+            ));
+        }
+
+        payload.resize(size - 8, 0);
+        reader.read_exact(&mut payload).map_err(|error| {
+            format!("failed to read perf record payload at offset {offset}: {error}")
+        })?;
+
+        if record_header.record_type == PERF_RECORD_FINISHED_ROUND {
+            ordered_records
+                .flush_round_with(|record| sink.apply_record(record, &sample_layouts, options))?;
+            offset = next;
+            continue;
+        }
+
+        let record = PerfRecord {
+            offset,
+            header: record_header,
+            payload: &payload,
+        };
+        let time = record_time(record, &sample_layouts)?;
+        let parsed_record = parse_record_with_context(record)?;
+        ordered_records.apply_or_queue_with(index, time, parsed_record, |record| {
+            sink.apply_record(record, &sample_layouts, options)
+        })?;
+        index += 1;
+        offset = next;
+    }
+
+    ordered_records.flush_final_with(|record| sink.apply_record(record, &sample_layouts, options))
+}
+
+struct PerfScriptSink<'io, 'cache, R, W: ?Sized> {
+    accumulator: FoldAccumulator,
+    symbol_cache: Option<&'io mut SymbolFrameCache<'cache, R>>,
+    writer: &'io mut W,
+}
+
+impl<'io, 'cache, R, W> PerfScriptSink<'io, 'cache, R, W>
+where
+    R: SymbolResolver,
+    W: IoWrite + ?Sized,
+{
+    fn new(
+        header_build_ids: BTreeMap<String, Vec<u8>>,
+        symbol_cache: Option<&'io mut SymbolFrameCache<'cache, R>>,
+        writer: &'io mut W,
+    ) -> Self {
+        Self {
+            accumulator: FoldAccumulator::new(header_build_ids),
+            symbol_cache,
+            writer,
+        }
+    }
+
+    fn apply_record(
+        &mut self,
+        record: ParsedRecord,
+        sample_layouts: &SampleLayouts,
+        options: FoldOptions,
+    ) -> Result<(), String> {
+        match record {
+            ParsedRecord::Sample(record) => {
+                self.write_sample(record.misc, &record.payload, sample_layouts, options)
+            }
+            ParsedRecord::CallchainDeferred(record) => {
+                self.write_deferred_callchain(record.cookie, &record.ips)
+            }
+            record => self
+                .accumulator
+                .apply_record(record, sample_layouts, options),
+        }
+    }
+
+    fn write_sample(
+        &mut self,
+        misc: u16,
+        payload: &[u8],
+        sample_layouts: &SampleLayouts,
+        options: FoldOptions,
+    ) -> Result<(), String> {
+        let Some(sample) = prepare_sample_for_fold(
+            &mut self.accumulator,
+            misc,
+            payload,
+            sample_layouts,
+            options,
+        )?
+        else {
+            return Ok(());
+        };
+        if let Some(cookie) = sample.deferred_cookie {
+            self.accumulator
+                .deferred_samples
+                .entry(cookie)
+                .or_default()
+                .push(DeferredFoldSample {
+                    pid: sample.pid,
+                    comm: sample.comm,
+                    count: sample.count,
+                    frames: sample.frames,
+                });
+            return Ok(());
+        }
+        self.write_sample_event(&sample)
+    }
+
+    fn write_deferred_callchain(&mut self, cookie: u64, ips: &[u64]) -> Result<(), String> {
+        let Some(samples) = self.accumulator.deferred_samples.remove(&cookie) else {
+            return Ok(());
+        };
+        for mut sample in samples {
+            sample
+                .frames
+                .extend(ips.iter().copied().map(FoldFrame::Callchain));
+            let sample = PreparedFoldSample {
+                pid: sample.pid,
+                comm: sample.comm,
+                count: sample.count,
+                frames: sample.frames,
+                deferred_cookie: None,
+            };
+            self.write_sample_event(&sample)?;
+        }
+        Ok(())
+    }
+
+    fn write_sample_event(&mut self, sample: &PreparedFoldSample) -> Result<(), String> {
+        let comm = sample.comm.as_deref().unwrap_or("[unknown]");
+        let pid = sample.pid.unwrap_or(0);
+        writeln!(
+            self.writer,
+            "{comm} {pid} 0: {} cpu/cycles/P:",
+            sample.count
+        )
+        .map_err(|error| format!("failed to write perf script output: {error}"))?;
+        FoldFrameResolver::new(&self.accumulator.mmap_table).write_script_frames_for_stack(
+            sample.pid,
+            &sample.frames,
+            self.symbol_cache.as_deref_mut(),
+            self.writer,
+        )?;
+        self.writer
+            .write_all(b"\n")
+            .map_err(|error| format!("failed to write perf script output: {error}"))
+    }
+}
+
 impl OrderedRecordQueue {
+    fn apply_or_queue_with<F>(
+        &mut self,
+        index: usize,
+        time: Option<u64>,
+        record: ParsedRecord,
+        mut apply: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(ParsedRecord) -> Result<(), String>,
+    {
+        if let Some(time) = time {
+            self.queue(index, time, record);
+            Ok(())
+        } else {
+            apply(record)
+        }
+    }
+
     fn apply_or_queue(
         &mut self,
         index: usize,
@@ -812,12 +1046,9 @@ impl OrderedRecordQueue {
         sample_layouts: &SampleLayouts,
         options: FoldOptions,
     ) -> Result<(), String> {
-        if let Some(time) = time {
-            self.queue(index, time, record);
-            Ok(())
-        } else {
+        self.apply_or_queue_with(index, time, record, |record| {
             accumulator.apply_record(record, sample_layouts, options)
-        }
+        })
     }
 
     fn queue(&mut self, index: usize, time: u64, record: ParsedRecord) {
@@ -835,8 +1066,15 @@ impl OrderedRecordQueue {
         sample_layouts: &SampleLayouts,
         options: FoldOptions,
     ) -> Result<(), String> {
+        self.flush_round_with(|record| accumulator.apply_record(record, sample_layouts, options))
+    }
+
+    fn flush_round_with<F>(&mut self, apply: F) -> Result<(), String>
+    where
+        F: FnMut(ParsedRecord) -> Result<(), String>,
+    {
         if let Some(limit) = self.next_flush_time {
-            self.flush_through(Some(limit), accumulator, sample_layouts, options)?;
+            self.flush_through_with(Some(limit), apply)?;
         }
         self.next_flush_time = self.max_timestamp;
         Ok(())
@@ -848,7 +1086,14 @@ impl OrderedRecordQueue {
         sample_layouts: &SampleLayouts,
         options: FoldOptions,
     ) -> Result<(), String> {
-        self.flush_through(None, accumulator, sample_layouts, options)
+        self.flush_final_with(|record| accumulator.apply_record(record, sample_layouts, options))
+    }
+
+    fn flush_final_with<F>(&mut self, apply: F) -> Result<(), String>
+    where
+        F: FnMut(ParsedRecord) -> Result<(), String>,
+    {
+        self.flush_through_with(None, apply)
     }
 
     fn flush_through(
@@ -858,6 +1103,15 @@ impl OrderedRecordQueue {
         sample_layouts: &SampleLayouts,
         options: FoldOptions,
     ) -> Result<(), String> {
+        self.flush_through_with(limit, |record| {
+            accumulator.apply_record(record, sample_layouts, options)
+        })
+    }
+
+    fn flush_through_with<F>(&mut self, limit: Option<u64>, mut apply: F) -> Result<(), String>
+    where
+        F: FnMut(ParsedRecord) -> Result<(), String>,
+    {
         self.pending_records
             .sort_by_key(|record| (record.time, record.index));
         let split = limit.map_or(self.pending_records.len(), |limit| {
@@ -865,7 +1119,7 @@ impl OrderedRecordQueue {
                 .partition_point(|record| record.time <= limit)
         });
         for pending_record in self.pending_records.drain(..split) {
-            accumulator.apply_record(pending_record.record, sample_layouts, options)?;
+            apply(pending_record.record)?;
         }
         Ok(())
     }
@@ -2102,11 +2356,48 @@ fn parse_sample_for_fold(
     sample_layouts: &SampleLayouts,
     options: FoldOptions,
 ) -> Result<(), String> {
-    let Some(event) = sample_layouts.layout_for_payload(payload)? else {
+    let Some(sample) =
+        prepare_sample_for_fold(accumulator, misc, payload, sample_layouts, options)?
+    else {
         return Ok(());
     };
+    if let Some(cookie) = sample.deferred_cookie {
+        accumulator
+            .deferred_samples
+            .entry(cookie)
+            .or_default()
+            .push(DeferredFoldSample {
+                pid: sample.pid,
+                comm: sample.comm,
+                count: sample.count,
+                frames: sample.frames,
+            });
+    } else {
+        add_fold_stack(
+            sample.pid,
+            sample.comm.as_deref(),
+            sample.count,
+            &sample.frames,
+            &accumulator.mmap_table,
+            &mut accumulator.raw_stacks,
+            &mut accumulator.callchain,
+        );
+    }
+    Ok(())
+}
+
+fn prepare_sample_for_fold(
+    accumulator: &mut FoldAccumulator,
+    misc: u16,
+    payload: &[u8],
+    sample_layouts: &SampleLayouts,
+    options: FoldOptions,
+) -> Result<Option<PreparedFoldSample>, String> {
+    let Some(event) = sample_layouts.layout_for_payload(payload)? else {
+        return Ok(None);
+    };
     let Some(sample) = parse_sample_record_callchain(payload, event.layout)? else {
-        return Ok(());
+        return Ok(None);
     };
     let count = sample_fold_count(sample.period, options);
     accumulator.sample_frames.clear();
@@ -2123,29 +2414,13 @@ fn parse_sample_for_fold(
         sample.pid,
         sample.tid,
     );
-    if let Some(cookie) = deferred_cookie {
-        accumulator
-            .deferred_samples
-            .entry(cookie)
-            .or_default()
-            .push(DeferredFoldSample {
-                pid: sample.pid,
-                comm: comm.map(str::to_owned),
-                count,
-                frames: std::mem::take(&mut accumulator.sample_frames),
-            });
-    } else {
-        add_fold_stack(
-            sample.pid,
-            comm,
-            count,
-            &accumulator.sample_frames,
-            &accumulator.mmap_table,
-            &mut accumulator.raw_stacks,
-            &mut accumulator.callchain,
-        );
-    }
-    Ok(())
+    Ok(Some(PreparedFoldSample {
+        pid: sample.pid,
+        comm: comm.map(str::to_owned),
+        count,
+        frames: std::mem::take(&mut accumulator.sample_frames),
+        deferred_cookie,
+    }))
 }
 
 fn append_perf_user_unwind_frames(
