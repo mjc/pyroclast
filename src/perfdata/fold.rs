@@ -95,9 +95,7 @@ struct FoldAccumulator {
     exec_process_comms: BTreeMap<u32, String>,
     thread_comms: BTreeMap<u32, String>,
     mmap_table: MmapTable,
-    object_unwinder: FramehopUnwinder,
-    attempted_unwind_mappings: BTreeSet<(String, u64, u64, u64)>,
-    loaded_unwind_mappings: BTreeSet<(String, u64, u64, u64)>,
+    unwind_states: HashMap<u32, PidUnwindState, FxBuildHasher>,
     header_build_ids: BTreeMap<String, Vec<u8>>,
     raw_stacks: RawStackAccumulator<FoldFrame>,
     deferred_samples: BTreeMap<u64, Vec<DeferredFoldSample>>,
@@ -106,6 +104,15 @@ struct FoldAccumulator {
     unwind_debug_dir: Option<PathBuf>,
     first_event_index: Option<usize>,
 }
+
+#[derive(Default)]
+struct PidUnwindState {
+    object_unwinder: FramehopUnwinder,
+    attempted_unwind_mappings: BTreeSet<UnwindMappingKey>,
+    loaded_unwind_mappings: BTreeSet<UnwindMappingKey>,
+}
+
+type UnwindMappingKey = (String, u64, u64, u64);
 
 struct TimedRecord {
     index: usize,
@@ -945,9 +952,7 @@ impl FoldAccumulator {
             exec_process_comms: BTreeMap::new(),
             thread_comms: BTreeMap::new(),
             mmap_table: MmapTable::default(),
-            object_unwinder: FramehopUnwinder::new(),
-            attempted_unwind_mappings: BTreeSet::new(),
-            loaded_unwind_mappings: BTreeSet::new(),
+            unwind_states: HashMap::with_hasher(FxBuildHasher),
             header_build_ids,
             raw_stacks: RawStackAccumulator::<FoldFrame>::new(),
             deferred_samples: BTreeMap::new(),
@@ -975,10 +980,11 @@ impl FoldAccumulator {
                 Ok(())
             }
             ParsedRecord::Mmap(record) => {
+                let unwind_state = self.unwind_state_mut(record.pid);
                 load_unwind_mapping(
-                    &mut self.object_unwinder,
-                    &mut self.attempted_unwind_mappings,
-                    &mut self.loaded_unwind_mappings,
+                    &mut unwind_state.object_unwinder,
+                    &mut unwind_state.attempted_unwind_mappings,
+                    &mut unwind_state.loaded_unwind_mappings,
                     UnwindMappingRequest {
                         start: record.start,
                         len: record.len,
@@ -1002,10 +1008,12 @@ impl FoldAccumulator {
             ParsedRecord::Mmap2(record) => {
                 let build_id = self.header_build_ids.get(&record.path).cloned();
                 if let Some(build_id) = build_id {
+                    let unwind_debug_dir = self.unwind_debug_dir.clone();
+                    let unwind_state = self.unwind_state_mut(record.pid);
                     load_build_id_unwind_mapping(
-                        &mut self.object_unwinder,
-                        &mut self.attempted_unwind_mappings,
-                        &mut self.loaded_unwind_mappings,
+                        &mut unwind_state.object_unwinder,
+                        &mut unwind_state.attempted_unwind_mappings,
+                        &mut unwind_state.loaded_unwind_mappings,
                         UnwindMappingRequest {
                             start: record.start,
                             len: record.len,
@@ -1015,15 +1023,16 @@ impl FoldAccumulator {
                             file_identity: Some(mmap2_file_identity(&record)),
                             build_id: Some(&build_id),
                         },
-                        self.unwind_debug_dir.as_deref(),
+                        unwind_debug_dir.as_deref(),
                     );
                     self.mmap_table
                         .insert_mmap2_with_build_id(record, Some(build_id));
                 } else {
+                    let unwind_state = self.unwind_state_mut(record.pid);
                     load_mmap2_unwind_mapping(
-                        &mut self.object_unwinder,
-                        &mut self.attempted_unwind_mappings,
-                        &mut self.loaded_unwind_mappings,
+                        &mut unwind_state.object_unwinder,
+                        &mut unwind_state.attempted_unwind_mappings,
+                        &mut unwind_state.loaded_unwind_mappings,
                         &record,
                     );
                     self.mmap_table.insert_mmap2(record);
@@ -1031,10 +1040,12 @@ impl FoldAccumulator {
                 Ok(())
             }
             ParsedRecord::Mmap2BuildId(record) => {
+                let unwind_debug_dir = self.unwind_debug_dir.clone();
+                let unwind_state = self.unwind_state_mut(record.pid);
                 load_build_id_unwind_mapping(
-                    &mut self.object_unwinder,
-                    &mut self.attempted_unwind_mappings,
-                    &mut self.loaded_unwind_mappings,
+                    &mut unwind_state.object_unwinder,
+                    &mut unwind_state.attempted_unwind_mappings,
+                    &mut unwind_state.loaded_unwind_mappings,
                     UnwindMappingRequest {
                         start: record.start,
                         len: record.len,
@@ -1044,7 +1055,7 @@ impl FoldAccumulator {
                         file_identity: None,
                         build_id: Some(&record.build_id),
                     },
-                    self.unwind_debug_dir.as_deref(),
+                    unwind_debug_dir.as_deref(),
                 );
                 self.mmap_table.insert_mmap2_build_id(record);
                 Ok(())
@@ -1058,6 +1069,10 @@ impl FoldAccumulator {
             mmap_table: self.mmap_table,
             raw_stacks: self.raw_stacks,
         }
+    }
+
+    fn unwind_state_mut(&mut self, pid: u32) -> &mut PidUnwindState {
+        self.unwind_states.entry(pid).or_default()
     }
 }
 
@@ -1271,8 +1286,13 @@ impl FoldAccumulator {
     }
 
     fn has_loaded_unwind_mapping_for_ip(&self, pid: Option<u32>, ip: u64) -> bool {
-        let Some(mapping) = pid.and_then(|pid| self.mmap_table.user_mapping_for_pid_ip(pid, ip))
-        else {
+        let Some(pid) = pid else {
+            return false;
+        };
+        let Some(mapping) = self.mmap_table.user_mapping_for_pid_ip(pid, ip) else {
+            return false;
+        };
+        let Some(unwind_state) = self.unwind_states.get(&pid) else {
             return false;
         };
         let object_path = mapping.build_id.map_or_else(
@@ -1285,7 +1305,7 @@ impl FoldAccumulator {
                 )
             },
         );
-        self.loaded_unwind_mappings.contains(&(
+        unwind_state.loaded_unwind_mappings.contains(&(
             object_path.to_string_lossy().into_owned(),
             mapping.start,
             mapping.len,
@@ -2023,21 +2043,31 @@ fn parse_sample_for_fold(
             .is_some_and(|pid| accumulator.mmap_table.has_mapping_for_pid(pid, regs.ip));
         let has_loaded_mapping_for_ip =
             accumulator.has_loaded_unwind_mapping_for_ip(sample.pid, regs.ip);
-        let has_rejected_mapping_for_ip = accumulator
-            .object_unwinder
-            .has_rejected_mapping_for_ip(regs.ip);
+        let has_rejected_mapping_for_ip = sample.pid.is_some_and(|pid| {
+            accumulator
+                .unwind_states
+                .get(&pid)
+                .is_some_and(|state| state.object_unwinder.has_rejected_mapping_for_ip(regs.ip))
+        });
+        let unwind_module_count = sample
+            .pid
+            .and_then(|pid| accumulator.unwind_states.get(&pid))
+            .map_or(0, |state| state.object_unwinder.module_count());
         let unwound_frames = if has_recorded_mapping_for_ip && !has_loaded_mapping_for_ip {
             Vec::new()
-        } else if accumulator.object_unwinder.module_count() == 0 {
+        } else if unwind_module_count == 0 {
             if accumulator.sample_frames.is_empty() || has_recorded_mapping_for_ip {
                 Vec::new()
             } else {
                 unwind_x86_64_stack(regs, stack.bytes, 256)
             }
         } else {
-            accumulator
-                .object_unwinder
-                .unwind_stack(regs, stack.bytes, 256)
+            sample
+                .pid
+                .and_then(|pid| accumulator.unwind_states.get_mut(&pid))
+                .map_or_else(Vec::new, |state| {
+                    state.object_unwinder.unwind_stack(regs, stack.bytes, 256)
+                })
         };
         accumulator.sample_frames.extend(
             perf_unwind_frames_or_current_ip(

@@ -875,6 +875,52 @@ fn loads_dwarf_unwind_module_from_executable_mmap2_containing_sample_ip_like_per
     assert_eq!(folded, format!("[unknown];{current_exe}+0x4000 1\n"));
 }
 
+#[test]
+fn loads_dwarf_unwind_modules_per_pid_like_perf_maps() {
+    let current_exe = std::env::current_exe().expect("current exe");
+    let current_exe = current_exe.to_string_lossy();
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            (1 << 6) | (1 << 7) | (1 << 8),
+        )],
+        [
+            record_bytes(
+                10,
+                &mmap2_payload(11, 11, 0x1000_0000, 0x30_0000, 0, 5, current_exe.as_ref()),
+            ),
+            record_bytes(
+                10,
+                &mmap2_payload(12, 12, 0x1000_1000, 0x30_0000, 0, 5, current_exe.as_ref()),
+            ),
+            record_bytes(
+                9,
+                &sample_payload_with_user_stack(
+                    0x1000_5000,
+                    12,
+                    12,
+                    [],
+                    1,
+                    [0x7fff_0008, 0x7fff_0000, 0x1000_5000],
+                    [
+                        0, 0, 0, 0, 0, 0, 0, 0, //
+                        0x40, 0, 0, 0, 0, 0, 0, 0, //
+                        0x34, 0x12, 0, 0, 0, 0, 0, 0,
+                    ],
+                ),
+            ),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, format!("[unknown];{current_exe}+0x4000 1\n"));
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn keeps_current_ip_when_loaded_dwarf_module_has_no_unwind_frames_like_perf_script() {
