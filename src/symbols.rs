@@ -2304,7 +2304,7 @@ fn mapping_frame_key(mapping: &ResolvedMappingRef<'_>) -> MappingFrameKey {
 
 fn mapping_fallback_frame(mapping: &ResolvedMappingRef<'_>) -> String {
     if is_kernel_mapping_ref(mapping) {
-        "[unknown]".to_string()
+        kernel_module_fallback_frame(mapping.path)
     } else if mapping.path == "[unknown]" {
         mapping.path.to_string()
     } else if mapping.path.starts_with('[') {
@@ -2314,6 +2314,18 @@ fn mapping_fallback_frame(mapping: &ResolvedMappingRef<'_>) -> String {
             .file_name()
             .and_then(OsStr::to_str)
             .unwrap_or(mapping.path);
+        format!("[{name}]")
+    }
+}
+
+fn kernel_module_fallback_frame(path: &str) -> String {
+    if path.starts_with("[kernel.kallsyms]") {
+        "[[kernel.kallsyms]]".to_string()
+    } else {
+        let name = Path::new(path)
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or(path);
         format!("[{name}]")
     }
 }

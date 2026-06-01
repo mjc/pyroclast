@@ -1876,7 +1876,7 @@ fn is_perf_data_mapping_path(path: &str) -> bool {
 
 fn symbol_fallback_frame_ref(mapping: &ResolvedMappingRef<'_>) -> String {
     if is_kernel_mapping_ref(mapping) {
-        UNKNOWN_FRAME.to_string()
+        kernel_module_fallback_frame(mapping.path)
     } else if mapping.path == UNKNOWN_FRAME {
         mapping.path.to_string()
     } else if mapping.path.starts_with('[') {
@@ -1904,6 +1904,14 @@ fn module_fallback_frame(path: &str) -> String {
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or(path);
     format!("[{name}]")
+}
+
+fn kernel_module_fallback_frame(path: &str) -> String {
+    if path.starts_with("[kernel.kallsyms]") {
+        "[[kernel.kallsyms]]".to_string()
+    } else {
+        module_fallback_frame(path)
+    }
 }
 
 fn is_kernel_mapping_ref(mapping: &ResolvedMappingRef<'_>) -> bool {
