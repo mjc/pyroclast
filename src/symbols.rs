@@ -129,6 +129,7 @@ struct CachedMappingFrames {
 
 pub struct Addr2lineResolver<'a, R> {
     runner: &'a R,
+    metadata_cache: OnceLock<Mutex<FxHashMap<OsString, Option<Arc<PreparedObjectMetadata>>>>>,
 }
 
 pub enum SelectedObjectResolver<'a, R> {
@@ -492,7 +493,35 @@ where
 {
     #[must_use]
     pub fn new(runner: &'a R) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            metadata_cache: OnceLock::new(),
+        }
+    }
+
+    fn object_metadata(&self, path: &Path) -> Option<Arc<PreparedObjectMetadata>> {
+        let cache = self
+            .metadata_cache
+            .get_or_init(|| Mutex::new(FxHashMap::default()));
+        let path_key = path.as_os_str().to_owned();
+        if let Some(cached) = cache
+            .lock()
+            .expect("addr2line metadata cache lock")
+            .get(&path_key)
+            .cloned()
+        {
+            return cached;
+        }
+
+        let loaded = std::fs::read(path)
+            .ok()
+            .map(|bytes| Arc::new(PreparedObjectMetadata::from_object_bytes(&bytes)));
+
+        let mut cache = cache.lock().expect("addr2line metadata cache lock");
+        cache
+            .entry(path_key)
+            .or_insert_with(|| loaded.clone())
+            .clone()
     }
 }
 
@@ -1388,7 +1417,12 @@ where
             } else {
                 vec![None; grouped_requests.len()]
             };
+            let object_metadata = self.object_metadata(path);
             for (request, symbol) in grouped_requests.into_iter().zip(symbols) {
+                let object_symbol = object_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.object_symbol(request.relative_address));
+                let symbol = perf_name_with_object_alias(symbol, object_symbol);
                 resolved_by_request.insert(request, symbol);
             }
         }

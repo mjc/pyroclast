@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 
-use object::{Object, ObjectSegment, ObjectSymbol, SymbolKind};
+use object::{Object, ObjectSegment, ObjectSymbol, SymbolKind, build, elf};
 use proptest::prelude::*;
 use pyroclast::cli::SymbolizerKind;
 use pyroclast::perfdata::mappings::FileIdentity;
@@ -377,6 +377,31 @@ fn addr2line_resolver_batches_requests_by_binary() {
         runner.commands()[0].stdin.as_deref(),
         Some(&b"0x10\n0x20\n"[..])
     );
+}
+
+#[test]
+fn addr2line_resolver_prefers_perf_object_alias_over_underscored_addr2line_name() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let object_path = root.path().join("libc.so.6");
+    std::fs::write(
+        &object_path,
+        elf_with_dynamic_text_symbol(b"read", 0x1000, 46),
+    )
+    .expect("write object");
+    let runner = Addr2lineRunner::new(b"__libc_read\n??:0\n");
+    let resolver = Addr2lineResolver::new(&runner);
+
+    let symbols = resolver
+        .resolve_batch(&[SymbolRequest {
+            path: object_path,
+            relative_address: 0x1008,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        }])
+        .expect("symbols");
+
+    assert_eq!(symbols, vec![Some("read".to_string())]);
 }
 
 #[test]
@@ -2068,5 +2093,67 @@ impl CommandRunner for Addr2lineRunner {
             stderr: Vec::new(),
         })
     }
+}
+
+fn elf_with_dynamic_text_symbol(name: &'static [u8], address: u64, size: usize) -> Vec<u8> {
+    let mut builder = build::elf::Builder::new(object::Endianness::Little, true);
+    builder.header.e_type = elf::ET_DYN;
+    builder.header.e_machine = elf::EM_X86_64;
+    builder.header.e_phoff = 0x40;
+
+    let section = builder.sections.add();
+    section.name = b".shstrtab"[..].into();
+    section.sh_type = elf::SHT_STRTAB;
+    section.data = build::elf::SectionData::SectionString;
+
+    let section = builder.sections.add();
+    section.name = b".text"[..].into();
+    section.sh_type = elf::SHT_PROGBITS;
+    section.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_EXECINSTR);
+    section.sh_addr = address;
+    section.sh_addralign = 16;
+    section.data = build::elf::SectionData::Data(vec![0xcc; size].into());
+    let text_id = section.id();
+
+    let section = builder.sections.add();
+    section.name = b".dynsym"[..].into();
+    section.sh_type = elf::SHT_DYNSYM;
+    section.sh_flags = u64::from(elf::SHF_ALLOC);
+    section.sh_addralign = 8;
+    section.data = build::elf::SectionData::DynamicSymbol;
+    let dynsym_id = section.id();
+
+    let section = builder.sections.add();
+    section.name = b".dynstr"[..].into();
+    section.sh_type = elf::SHT_STRTAB;
+    section.sh_flags = u64::from(elf::SHF_ALLOC);
+    section.sh_addralign = 1;
+    section.data = build::elf::SectionData::DynamicString;
+    let dynstr_id = section.id();
+
+    let symbol = builder.dynamic_symbols.add();
+    symbol.name = name.into();
+    symbol.st_value = address;
+    symbol.st_size = u64::try_from(size).expect("fixture size fits in u64");
+    symbol.set_st_info(elf::STB_GLOBAL, elf::STT_FUNC);
+    symbol.section = Some(text_id);
+
+    builder.set_section_sizes();
+
+    let segment = builder.segments.add();
+    segment.p_type = elf::PT_LOAD;
+    segment.p_flags = elf::PF_R | elf::PF_X;
+    segment.p_vaddr = address;
+    segment.p_paddr = address;
+    segment.p_filesz = 0x1000;
+    segment.p_memsz = 0x1000;
+    segment.p_align = 16;
+    segment.append_section(builder.sections.get_mut(text_id));
+    segment.append_section(builder.sections.get_mut(dynsym_id));
+    segment.append_section(builder.sections.get_mut(dynstr_id));
+
+    let mut bytes = Vec::new();
+    builder.write(&mut bytes).expect("write dynamic-symbol ELF");
+    bytes
 }
 use std::fmt::Write as _;
