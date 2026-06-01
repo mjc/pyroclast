@@ -2023,6 +2023,9 @@ fn parse_sample_for_fold(
             .is_some_and(|pid| accumulator.mmap_table.has_mapping_for_pid(pid, regs.ip));
         let has_loaded_mapping_for_ip =
             accumulator.has_loaded_unwind_mapping_for_ip(sample.pid, regs.ip);
+        let has_rejected_mapping_for_ip = accumulator
+            .object_unwinder
+            .has_rejected_mapping_for_ip(regs.ip);
         let unwound_frames = if has_recorded_mapping_for_ip && !has_loaded_mapping_for_ip {
             Vec::new()
         } else if accumulator.object_unwinder.module_count() == 0 {
@@ -2036,9 +2039,15 @@ fn parse_sample_for_fold(
                 .object_unwinder
                 .unwind_stack(regs, stack.bytes, 256)
         };
-        accumulator
-            .sample_frames
-            .extend(unwound_frames.into_iter().map(FoldFrame::UserUnwind));
+        accumulator.sample_frames.extend(
+            perf_unwind_frames_or_current_ip(
+                unwound_frames,
+                has_loaded_mapping_for_ip && !has_rejected_mapping_for_ip,
+                regs.ip,
+            )
+            .into_iter()
+            .map(FoldFrame::UserUnwind),
+        );
     }
     let comm = comm_for_ids(
         &accumulator.process_comms,
@@ -2089,6 +2098,18 @@ fn take_deferred_cookie(frames: &mut Vec<FoldFrame>) -> Option<u64> {
 
 fn has_perf_captured_user_stack(stack: &crate::perfdata::samples::SampleUserStack<'_>) -> bool {
     !stack.bytes.is_empty() && stack.dynamic_size != 0
+}
+
+fn perf_unwind_frames_or_current_ip(
+    unwound_frames: Vec<u64>,
+    has_loaded_mapping_for_ip: bool,
+    ip: u64,
+) -> Vec<u64> {
+    if unwound_frames.is_empty() && has_loaded_mapping_for_ip {
+        return vec![ip];
+    }
+
+    unwound_frames
 }
 
 fn load_unwind_mapping(
@@ -2337,6 +2358,14 @@ mod tests {
         );
 
         assert_eq!(resolved, cached);
+    }
+
+    #[test]
+    fn empty_unwind_for_loaded_module_keeps_current_ip_like_perf_libdw() {
+        assert_eq!(
+            super::perf_unwind_frames_or_current_ip(Vec::new(), true, 0x7fff_f7f0_1f40),
+            vec![0x7fff_f7f0_1f40]
+        );
     }
 
     #[test]

@@ -168,6 +168,13 @@ impl FramehopUnwinder {
     }
 
     #[must_use]
+    pub fn has_rejected_mapping_for_ip(&self, ip: u64) -> bool {
+        self.rejected_mapping_ranges
+            .iter()
+            .any(|range| range.contains(&ip))
+    }
+
+    #[must_use]
     pub fn read_process_u64(&self, address: u64) -> Option<u64> {
         read_reported_module_u64(&self.reported_modules, address)
     }

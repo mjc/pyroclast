@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::fmt::Write as _;
 
+use object::{Object as _, ObjectSegment as _, ObjectSymbol as _};
 use proptest::prelude::*;
 use pyroclast::perfdata::fold::{
     FoldOptions, fold_perfdata_callchains, fold_perfdata_callchains_with_options,
@@ -872,6 +873,79 @@ fn loads_dwarf_unwind_module_from_executable_mmap2_containing_sample_ip_like_per
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
     assert_eq!(folded, format!("[unknown];{current_exe}+0x4000 1\n"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn keeps_current_ip_when_loaded_dwarf_module_has_no_unwind_frames_like_perf_script() {
+    let Some(libc) = process_libc_path() else {
+        return;
+    };
+    let libc_bytes = std::fs::read(&libc).expect("read libc");
+    let object = object::File::parse(&libc_bytes[..]).expect("parse libc");
+    let Some(symbol) = object
+        .symbols()
+        .find(|symbol| symbol.name() == Ok("__memcmp_avx2_movbe"))
+    else {
+        return;
+    };
+    let Some(segment) = object.segments().find(|segment| {
+        let start = segment.address();
+        let end = start.saturating_add(segment.size());
+        start <= symbol.address() && symbol.address() < end
+    }) else {
+        return;
+    };
+    let base = 0x7000_0000_0000_u64;
+    let pgoff = segment.file_range().0;
+    let start = base + pgoff;
+    let ip_offset = symbol.address() + 0xe0;
+    let ip = base + ip_offset;
+    let libc = libc.to_string_lossy();
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            (1 << 6) | (1 << 7) | (1 << 8),
+        )],
+        [
+            record_bytes(
+                10,
+                &mmap2_payload(
+                    11,
+                    11,
+                    start,
+                    segment.file_range().1,
+                    pgoff,
+                    5,
+                    libc.as_ref(),
+                ),
+            ),
+            record_bytes(
+                9,
+                &sample_payload_with_user_stack(
+                    ip,
+                    11,
+                    12,
+                    [],
+                    1,
+                    [0x7fff_0008, 0x7fff_0000, ip],
+                    [
+                        0, 0, 0, 0, 0, 0, 0, 0, //
+                        0x40, 0, 0, 0, 0, 0, 0, 0, //
+                        0x34, 0x12, 0, 0, 0, 0, 0, 0,
+                    ],
+                ),
+            ),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, format!("[unknown];{libc}+0x{ip_offset:x} 1\n"));
 }
 
 #[test]
@@ -3010,6 +3084,24 @@ fn append_user_stack_payload<const R: usize, const S: usize>(
     payload.extend(stack);
     payload.extend(vec![0; stack.len().next_multiple_of(8) - stack.len()]);
     payload.extend(dynamic_size.to_le_bytes());
+}
+
+#[cfg(target_os = "linux")]
+fn process_libc_path() -> Option<std::path::PathBuf> {
+    std::fs::read_to_string("/proc/self/maps")
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let _range = fields.next()?;
+            let perms = fields.next()?;
+            let _offset = fields.next()?;
+            let _dev = fields.next()?;
+            let _inode = fields.next()?;
+            let path = fields.next()?;
+            (perms.contains('x') && path.contains("libc.so.6"))
+                .then(|| std::path::PathBuf::from(path))
+        })
 }
 
 fn comm_payload(pid: u32, tid: u32, comm: &str) -> Vec<u8> {
