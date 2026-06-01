@@ -34,8 +34,6 @@ const PREFETCH_SYMBOL_REQUEST_BATCH_SIZE: usize = 4096;
 const RECORD_READER_BUFFER_CAPACITY: usize = 4 * 1024 * 1024;
 const FOLD_COUNT_STORAGE_LINEAR_GROWTH_THRESHOLD: usize = 64 * 1024 * 1024;
 const FOLD_COUNT_STORAGE_LINEAR_GROWTH_CHUNK: usize = 8 * 1024 * 1024;
-const PENDING_RECORDS_FLUSH_THRESHOLD: usize = 10_000;
-
 type FoldFrameRenderCache = HashMap<String, String, FxBuildHasher>;
 
 #[derive(Default)]
@@ -743,16 +741,6 @@ where
             record: parsed_record,
         });
         index += 1;
-
-        if pending_records.len() >= PENDING_RECORDS_FLUSH_THRESHOLD {
-            flush_pending_records(
-                &mut pending_records,
-                &mut accumulator,
-                &sample_layouts,
-                options,
-            )?;
-            accumulator.drain_fold_counts(&mut counts, symbol_cache.as_deref_mut())?;
-        }
 
         offset = next;
     }
