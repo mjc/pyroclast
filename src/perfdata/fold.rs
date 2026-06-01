@@ -178,7 +178,7 @@ enum UserUnwindSource {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SampleCallchainState {
     KernelWithoutCallchain,
-    KernelWithUserContext,
+    KernelWithUserFrame,
     Other {
         has_callchain: bool,
         has_frames: bool,
@@ -2330,11 +2330,11 @@ fn append_perf_user_unwind_frames(
     {
         SampleCallchainState::KernelWithoutCallchain
     } else if (misc & PERF_RECORD_MISC_CPUMODE_MASK) == PERF_RECORD_MISC_CPUMODE_KERNEL
-        && sample.frames.clone().any(is_perf_user_context_marker)
+        && sample.frames.clone().any(is_recorded_user_callchain_frame)
     {
         // perf script keeps the recorded callchain for kernel samples and does
-        // not append extra user DWARF callers after the PERF_CONTEXT_USER frame.
-        SampleCallchainState::KernelWithUserContext
+        // not append extra user DWARF callers after a user-space frame.
+        SampleCallchainState::KernelWithUserFrame
     } else {
         SampleCallchainState::Other {
             has_callchain: event.layout.sample_type & PERF_SAMPLE_CALLCHAIN != 0,
@@ -2396,7 +2396,7 @@ fn unwind_user_stack_like_perf(
 fn choose_user_unwind_source(context: UserUnwindContext) -> UserUnwindSource {
     if matches!(
         context.callchain,
-        SampleCallchainState::KernelWithoutCallchain | SampleCallchainState::KernelWithUserContext
+        SampleCallchainState::KernelWithoutCallchain | SampleCallchainState::KernelWithUserFrame
     ) || context.initial_ip_mapping == InitialIpMappingState::RecordedMappingMissing
     {
         UserUnwindSource::None
@@ -2431,6 +2431,11 @@ fn sample_fold_count(period: Option<u64>, options: FoldOptions) -> u64 {
     } else {
         1
     }
+}
+
+fn is_recorded_user_callchain_frame(frame: u64) -> bool {
+    is_perf_user_context_marker(frame)
+        || (!is_perf_context_marker(frame) && !is_kernel_space_frame(frame))
 }
 
 fn take_deferred_cookie(frames: &mut Vec<FoldFrame>) -> Option<u64> {
@@ -3081,10 +3086,10 @@ mod tests {
     }
 
     #[test]
-    fn user_unwind_source_skips_kernel_samples_with_user_context_like_perf_script() {
+    fn user_unwind_source_skips_kernel_samples_with_user_frame_like_perf_script() {
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
-                callchain: super::SampleCallchainState::KernelWithUserContext,
+                callchain: super::SampleCallchainState::KernelWithUserFrame,
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
                 module_count: 1,
             }),

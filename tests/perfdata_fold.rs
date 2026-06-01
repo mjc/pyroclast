@@ -735,6 +735,41 @@ fn keeps_recorded_user_frame_without_dwarf_callers_for_kernel_user_context_like_
 }
 
 #[test]
+fn keeps_recorded_user_frame_without_dwarf_callers_for_kernel_user_frame_like_perf_script() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            (1 << 6) | (1 << 7) | (1 << 8),
+        )],
+        [record_bytes_with_misc(
+            9,
+            PERF_RECORD_MISC_CPUMODE_KERNEL,
+            &sample_payload_with_user_stack(
+                0x4000,
+                11,
+                12,
+                [0xffff_ffff_8100_0000, 0xffff_ffff_8200_0000, 0x4000],
+                1,
+                [0x7fff_0008, 0x7fff_0000, 0x4000],
+                [
+                    0, 0, 0, 0, 0, 0, 0, 0, //
+                    0x40, 0, 0, 0, 0, 0, 0, 0, //
+                    0x34, 0x12, 0, 0, 0, 0, 0, 0,
+                ],
+            ),
+        )],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, "[unknown];0x4000;[unknown];[unknown] 1\n");
+}
+
+#[test]
 fn drops_dwarf_user_stack_for_kernel_sample_without_kernel_callchain_like_perf_script() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
