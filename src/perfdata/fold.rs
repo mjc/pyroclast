@@ -353,8 +353,15 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
                 summary.mmap_table.insert_mmap2_build_id(record);
                 Ok(())
             }
+            ParsedRecord::Fork(record) => {
+                if record.clone_maps {
+                    summary
+                        .mmap_table
+                        .clone_pid_mappings(record.ppid, record.pid);
+                }
+                Ok(())
+            }
             ParsedRecord::Unsupported { .. }
-            | ParsedRecord::Fork(_)
             | ParsedRecord::Exit(_)
             | ParsedRecord::Throttle(_)
             | ParsedRecord::Unthrottle(_)
@@ -1119,6 +1126,12 @@ impl FoldAccumulator {
                     unwind_debug_dir.as_deref(),
                 );
                 self.mmap_table.insert_mmap2_build_id(record);
+                Ok(())
+            }
+            ParsedRecord::Fork(record) => {
+                if record.clone_maps {
+                    self.mmap_table.clone_pid_mappings(record.ppid, record.pid);
+                }
                 Ok(())
             }
             _ => Ok(()),

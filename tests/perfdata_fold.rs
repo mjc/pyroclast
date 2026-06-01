@@ -9,8 +9,8 @@ use pyroclast::perfdata::fold::{
 };
 use pyroclast::perfdata::mappings::FileIdentity;
 use pyroclast::perfdata::records::{
-    PERF_RECORD_FINISHED_ROUND, PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_CPUMODE_KERNEL,
-    PERF_RECORD_MISC_CPUMODE_USER,
+    PERF_RECORD_FINISHED_ROUND, PERF_RECORD_FORK, PERF_RECORD_MISC_COMM_EXEC,
+    PERF_RECORD_MISC_CPUMODE_KERNEL, PERF_RECORD_MISC_CPUMODE_USER,
 };
 use pyroclast::perfdata::samples::{
     PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP,
@@ -2013,6 +2013,62 @@ fn folds_identical_rendered_stacks_across_pids_into_one_line() {
 }
 
 #[test]
+fn forked_process_inherits_parent_mappings_like_perf_script() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(1, &mmap_payload(11, 11, 0x2000, 0x100, 0, "/bin/app")),
+            record_bytes(PERF_RECORD_FORK, &fork_payload(22, 11, 22, 11, 99)),
+            record_bytes(9, &sample_payload_with_period(0x1000, 22, 22, 7, [0x2000])),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains_with_options(
+        &bytes,
+        FoldOptions {
+            count_periods: true,
+        },
+    )
+    .expect("folded");
+
+    assert_eq!(folded, "[unknown];/bin/app+0x0 7\n");
+}
+
+#[test]
+fn synthesized_fork_does_not_clone_parent_mappings_like_perf_script() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(1, &mmap_payload(11, 11, 0x2000, 0x100, 0, "/bin/app")),
+            record_bytes_with_misc(
+                PERF_RECORD_FORK,
+                PERF_RECORD_MISC_COMM_EXEC,
+                &fork_payload(22, 11, 22, 11, 99),
+            ),
+            record_bytes(9, &sample_payload_with_period(0x1000, 22, 22, 7, [0x2000])),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains_with_options(
+        &bytes,
+        FoldOptions {
+            count_periods: true,
+        },
+    )
+    .expect("folded");
+
+    assert_eq!(folded, "[unknown];0x2000 7\n");
+}
+
+#[test]
 fn applies_comm_records_by_perf_timestamp_from_file_path_like_perf_script() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
@@ -3250,6 +3306,23 @@ fn comm_payload_with_sample_id_time(pid: u32, tid: u32, comm: &str, time: u64) -
     let mut payload = comm_payload(pid, tid, comm);
     payload.extend(pid.to_le_bytes());
     payload.extend(tid.to_le_bytes());
+    payload.extend(time.to_le_bytes());
+    payload
+}
+
+#[allow(clippy::similar_names)]
+fn fork_payload(
+    child_pid: u32,
+    parent_pid: u32,
+    child_tid: u32,
+    parent_tid: u32,
+    time: u64,
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(child_pid.to_le_bytes());
+    payload.extend(parent_pid.to_le_bytes());
+    payload.extend(child_tid.to_le_bytes());
+    payload.extend(parent_tid.to_le_bytes());
     payload.extend(time.to_le_bytes());
     payload
 }

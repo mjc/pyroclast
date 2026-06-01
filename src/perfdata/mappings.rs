@@ -156,6 +156,29 @@ impl MmapTable {
         });
     }
 
+    pub fn clone_pid_mappings(&mut self, parent_pid: u32, child_pid: u32) {
+        if parent_pid == child_pid {
+            return;
+        }
+
+        self.mappings.retain(|mapping| mapping.pid != child_pid);
+        let cloned_mappings = self
+            .mappings
+            .iter()
+            .filter(|mapping| mapping.pid == parent_pid)
+            .cloned()
+            .map(|mut mapping| {
+                mapping.pid = child_pid;
+                mapping.symbol_source_id = 0;
+                mapping
+            })
+            .collect::<Vec<_>>();
+        self.rebuild_pid_indexes();
+        for mapping in cloned_mappings {
+            self.insert_mapping(mapping);
+        }
+    }
+
     fn insert_mapping(&mut self, mut mapping: Mapping) {
         let pid = mapping.pid;
         let start = mapping.start;
@@ -194,6 +217,57 @@ impl MmapTable {
             self.pids_with_mappings.insert(pid);
             if may_execute {
                 self.executable_pids.insert(pid);
+            }
+        }
+    }
+
+    fn rebuild_pid_indexes(&mut self) {
+        self.mappings_by_pid.clear();
+        self.pids_with_mappings.clear();
+        self.executable_pids.clear();
+        self.has_global_mappings = false;
+        self.has_global_executable_mappings = false;
+
+        let indexed_mappings = self
+            .mappings
+            .iter()
+            .enumerate()
+            .map(|(index, mapping)| (index, mapping.pid, mapping.start, mapping.end()))
+            .collect::<Vec<_>>();
+        for (index, pid, start, end) in indexed_mappings {
+            let bucket = self.mappings_by_pid.entry(pid).or_default();
+            let position = bucket.partition_point(|indexed| indexed.start <= start);
+            let max_end = if position == 0 {
+                end
+            } else {
+                bucket[position - 1].max_end.max(end)
+            };
+            bucket.insert(
+                position,
+                IndexedMapping {
+                    start,
+                    max_end,
+                    index,
+                },
+            );
+            for bucket_index in position + 1..bucket.len() {
+                let mapping_end = self.mappings[bucket[bucket_index].index].end();
+                let updated_max_end = bucket[bucket_index - 1].max_end.max(mapping_end);
+                if bucket[bucket_index].max_end == updated_max_end {
+                    break;
+                }
+                bucket[bucket_index].max_end = updated_max_end;
+            }
+
+            let may_execute = self.mappings[index].may_execute();
+            if pid == u32::MAX {
+                self.has_global_mappings = true;
+                self.has_global_executable_mappings |= may_execute;
+            } else {
+                self.pids_with_mappings.insert(pid);
+                if may_execute {
+                    self.executable_pids.insert(pid);
+                }
             }
         }
     }

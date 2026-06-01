@@ -26,6 +26,7 @@ pub const PERF_RECORD_CALLCHAIN_DEFERRED: u32 = 22;
 pub const PERF_RECORD_HEADER_BUILD_ID: u32 = 67;
 pub const PERF_RECORD_FINISHED_ROUND: u32 = 68;
 pub const PERF_RECORD_MISC_COMM_EXEC: u16 = 1 << 13;
+pub const PERF_RECORD_MISC_FORK_EXEC: u16 = PERF_RECORD_MISC_COMM_EXEC;
 pub const PERF_RECORD_MISC_MMAP_BUILD_ID: u16 = 1 << 14;
 pub const PERF_RECORD_MISC_CPUMODE_MASK: u16 = 7;
 pub const PERF_RECORD_MISC_CPUMODE_KERNEL: u16 = 1;
@@ -158,6 +159,7 @@ pub struct ForkRecord {
     pub tid: u32,
     pub ptid: u32,
     pub time: u64,
+    pub clone_maps: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -411,7 +413,10 @@ pub fn parse_record(record: PerfRecord<'_>) -> Result<ParsedRecord, String> {
             parse_lost_samples_record(record.payload).map(ParsedRecord::LostSamples)
         }
         PERF_RECORD_EXIT => parse_exit_record(record.payload).map(ParsedRecord::Exit),
-        PERF_RECORD_FORK => parse_fork_record(record.payload).map(ParsedRecord::Fork),
+        PERF_RECORD_FORK => parse_fork_record(record.payload).map(|mut fork| {
+            fork.clone_maps = !has_misc_flag(record.header.misc, PERF_RECORD_MISC_FORK_EXEC);
+            ParsedRecord::Fork(fork)
+        }),
         PERF_RECORD_READ => parse_read_record(record.payload).map(ParsedRecord::Read),
         PERF_RECORD_SAMPLE => Ok(ParsedRecord::Sample(parse_sample_payload_record_with_misc(
             record.payload,
@@ -983,6 +988,7 @@ impl From<ProcessLifecycleRecord> for ForkRecord {
             tid: record.tid,
             ptid: record.ptid,
             time: record.time,
+            clone_maps: true,
         }
     }
 }
