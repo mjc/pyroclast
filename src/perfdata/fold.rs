@@ -2216,7 +2216,10 @@ fn unwind_user_stack_like_perf(
             .pid
             .and_then(|pid| accumulator.unwind_states.get_mut(&pid))
             .map_or_else(Vec::new, |state| {
-                state.object_unwinder.unwind_stack(*regs, stack_bytes, 256)
+                perf_accepted_object_unwind_frames(
+                    regs,
+                    state.object_unwinder.unwind_stack(*regs, stack_bytes, 256),
+                )
             }),
     }
 }
@@ -2291,6 +2294,16 @@ fn truncate_user_unwind_at_first_unmapped_frame(
 
 fn perf_accepted_unwind_frames(unwound_frames: Vec<u64>) -> Vec<u64> {
     unwound_frames
+}
+
+fn perf_accepted_object_unwind_frames(regs: &PerfX86_64Regs, unwound_frames: Vec<u64>) -> Vec<u64> {
+    // framehop yields the sampled instruction pointer before trying to advance.
+    // perf's libdw path reports the IP to DWFL as initial state, then only
+    // prints entries accepted via frame_callback/entry.
+    match unwound_frames.as_slice() {
+        [ip] if *ip == regs.ip => Vec::new(),
+        _ => unwound_frames,
+    }
 }
 
 fn load_unwind_mapping(

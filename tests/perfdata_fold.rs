@@ -778,7 +778,7 @@ fn limits_dwarf_unwind_to_perf_user_stack_dynamic_size_like_perf_script() {
 }
 
 #[test]
-fn uses_mapped_object_unwinder_for_dwarf_user_stack_frames() {
+fn drops_current_ip_only_object_unwind_for_mapped_dwarf_user_stack_like_perf_libdw() {
     let current_exe = std::env::current_exe().expect("current exe");
     let current_exe = current_exe.to_string_lossy();
     let bytes = perfdata_with_records_and_attrs(
@@ -816,11 +816,11 @@ fn uses_mapped_object_unwinder_for_dwarf_user_stack_frames() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, format!("[unknown];{current_exe}+0x4000 1\n"));
+    assert_eq!(folded, "");
 }
 
 #[test]
-fn uses_whole_elf_range_for_unwind_module_after_first_non_text_mapping_like_libdw() {
+fn drops_current_ip_only_object_unwind_after_first_non_text_mapping_like_perf_libdw() {
     let current_exe = std::env::current_exe().expect("current exe");
     let current_exe = current_exe.to_string_lossy();
     let bytes = perfdata_with_records_and_attrs(
@@ -862,11 +862,11 @@ fn uses_whole_elf_range_for_unwind_module_after_first_non_text_mapping_like_libd
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, format!("[unknown];{current_exe}+0x1000 1\n"));
+    assert_eq!(folded, "");
 }
 
 #[test]
-fn loads_dwarf_unwind_module_from_executable_mmap2_containing_sample_ip_like_perf() {
+fn drops_current_ip_only_object_unwind_from_executable_mmap2_like_perf_libdw() {
     let current_exe = std::env::current_exe().expect("current exe");
     let current_exe = current_exe.to_string_lossy();
     let bytes = perfdata_with_records_and_attrs(
@@ -916,11 +916,11 @@ fn loads_dwarf_unwind_module_from_executable_mmap2_containing_sample_ip_like_per
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, format!("[unknown];{current_exe}+0x4000 1\n"));
+    assert_eq!(folded, "");
 }
 
 #[test]
-fn loads_dwarf_unwind_modules_per_pid_like_perf_maps() {
+fn drops_current_ip_only_object_unwind_from_pid_specific_modules_like_perf_libdw() {
     let current_exe = std::env::current_exe().expect("current exe");
     let current_exe = current_exe.to_string_lossy();
     let bytes = perfdata_with_records_and_attrs(
@@ -962,12 +962,12 @@ fn loads_dwarf_unwind_modules_per_pid_like_perf_maps() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, format!("[unknown];{current_exe}+0x4000 1\n"));
+    assert_eq!(folded, "");
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn keeps_current_ip_when_loaded_dwarf_module_has_no_unwind_frames_like_perf_script() {
+fn drops_object_unwind_when_framehop_only_returns_current_ip_like_perf_libdw() {
     let Some(libc) = process_libc_path() else {
         return;
     };
@@ -1035,7 +1035,7 @@ fn keeps_current_ip_when_loaded_dwarf_module_has_no_unwind_frames_like_perf_scri
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, format!("[unknown];{libc}+0x{ip_offset:x} 1\n"));
+    assert_eq!(folded, "");
 }
 
 #[test]
