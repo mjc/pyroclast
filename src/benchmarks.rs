@@ -408,31 +408,32 @@ pub fn export_perf_script<R>(
     perf_data: &Path,
     output: &Path,
     runner: &R,
-    symbols: bool,
+    _symbols: bool,
 ) -> Result<(), String>
 where
     R: CommandRunner,
 {
-    let file = std::fs::File::create(output)
-        .map_err(|error| format!("failed to create perf script output: {error}"))?;
-    let mut writer = std::io::BufWriter::new(file);
-    if symbols {
-        let resolver = perf_symbol_resolver_for_current_home(runner, perf_data);
-        write_inferno_perf_script_file_with_symbols(
-            perf_data,
-            benchmark_fold_options(),
-            &resolver,
-            &mut writer,
-        )?;
-    } else {
-        write_inferno_perf_script_file_with_options(
-            perf_data,
-            benchmark_fold_options(),
-            &mut writer,
-        )?;
+    let perf_data = perf_data
+        .to_str()
+        .ok_or_else(|| format!("perf.data path is not utf-8: {}", perf_data.display()))?;
+    let output_bytes = runner
+        .run(
+            &CommandSpec::new("perf")
+                .arg("script")
+                .arg("--force")
+                .arg("-i")
+                .arg(perf_data),
+        )
+        .map_err(|error| format!("failed to run perf script: {error}"))?;
+    if output_bytes.status_code != Some(0) {
+        return Err(format!(
+            "perf script exited with {:?}: {}",
+            output_bytes.status_code,
+            String::from_utf8_lossy(&output_bytes.stderr)
+        ));
     }
-    writer
-        .flush()
+
+    std::fs::write(output, output_bytes.stdout)
         .map_err(|error| format!("failed to flush perf script output: {error}"))
 }
 

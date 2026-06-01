@@ -218,9 +218,18 @@ fn exports_perf_script_for_old_pipeline_benchmarks() {
 
     assert_eq!(
         std::fs::read_to_string(&perf_script).unwrap(),
-        "[unknown] 1/1 0: 1 cycles:\n\t2000 0x2000 ([unknown])\n\n"
+        "perf script\n"
     );
-    assert!(runner.commands().is_empty());
+    assert_eq!(
+        runner.commands(),
+        vec![
+            CommandSpec::new("perf")
+                .arg("script")
+                .arg("--force")
+                .arg("-i")
+                .arg(perfdata.to_str().expect("perfdata path should be utf8"))
+        ]
+    );
 }
 
 #[test]
@@ -607,6 +616,7 @@ impl CommandRunner for BenchCommandRunner {
     fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
         self.commands.lock().unwrap().push(command.clone());
         let stdout = match command.program.as_str() {
+            "perf" => b"[unknown] 1/1 0: 1 cycles:\n\t2000 0x2000 ([unknown])\n\n".to_vec(),
             "inferno-collapse-perf" => b"[unknown];0x2000 1\n".to_vec(),
             "inferno-flamegraph" => {
                 let mut svg = b"<svg>".to_vec();
