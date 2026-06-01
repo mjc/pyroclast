@@ -145,7 +145,7 @@ fn summarizes_dwarf_user_stack_payloads() {
 }
 
 #[test]
-fn folds_dwarf_user_stack_payloads_when_callchain_is_empty() {
+fn drops_unmapped_dwarf_user_stack_payloads_like_perf_script() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -175,7 +175,7 @@ fn folds_dwarf_user_stack_payloads_when_callchain_is_empty() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "[unknown];0x1233;0x4000 1\n");
+    assert_eq!(folded, "");
 }
 
 #[test]
