@@ -2326,7 +2326,9 @@ fn truncate_user_unwind_at_first_unmapped_frame(
     else {
         return;
     };
-    frames.truncate(index);
+    if index + 1 != frames.len() {
+        frames.truncate(index);
+    }
 }
 
 fn perf_accepted_unwind_frames(unwound_frames: Vec<u64>) -> Vec<u64> {
@@ -2799,6 +2801,39 @@ mod tests {
         );
 
         assert_eq!(frames, vec![super::FoldFrame::UserUnwind(0x1010)]);
+    }
+
+    #[test]
+    fn keeps_terminal_unmapped_user_unwind_frame_like_perf_libdw_entry() {
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x1000,
+            len: 0x100,
+            pgoff: 0,
+            path: "/bin/demo".to_string(),
+        });
+        let mut mapping_cache = super::MappingResolveCache::default();
+        let mut frames = vec![
+            super::FoldFrame::UserUnwind(0x1010),
+            super::FoldFrame::UserUnwind(0x6),
+        ];
+
+        super::truncate_user_unwind_at_first_unmapped_frame(
+            Some(11),
+            &mut frames,
+            &mmap_table,
+            &mut mapping_cache,
+        );
+
+        assert_eq!(
+            frames,
+            vec![
+                super::FoldFrame::UserUnwind(0x1010),
+                super::FoldFrame::UserUnwind(0x6),
+            ]
+        );
     }
 
     #[test]
