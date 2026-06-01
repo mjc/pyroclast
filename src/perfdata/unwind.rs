@@ -3,7 +3,7 @@ use std::ops::{Deref, Range};
 use std::path::Path;
 use std::sync::Arc;
 
-use framehop::x86_64::{CacheX86_64, UnwindRegsX86_64, UnwinderX86_64};
+use framehop::x86_64::{CacheX86_64, Reg, UnwindRegsX86_64, UnwinderX86_64};
 use framehop::{ExplicitModuleSectionInfo, Unwinder};
 use memmap2::Mmap;
 use object::read::{Object, ObjectSection, ObjectSegment};
@@ -13,6 +13,7 @@ pub struct PerfX86_64Regs {
     pub ip: u64,
     pub sp: u64,
     pub bp: u64,
+    pub registers: [u64; 16],
 }
 
 pub struct PerfStackReader<'a> {
@@ -60,7 +61,7 @@ pub fn unwind_x86_64_stack(regs: PerfX86_64Regs, stack: &[u8], max_frames: usize
     let mut cache = CacheX86_64::new();
     let unwinder = UnwinderX86_64::<Vec<u8>>::new();
     let ip = regs.ip;
-    let regs = UnwindRegsX86_64::new(ip, regs.sp, regs.bp);
+    let regs = regs.to_framehop_regs();
     let mut iter = unwinder.iter_frames(ip, regs, &mut cache, &mut read_stack);
     let mut frames = Vec::new();
     while frames.len() < max_frames {
@@ -194,7 +195,7 @@ impl FramehopUnwinder {
                 .ok_or(())
         };
         let ip = regs.ip;
-        let regs = UnwindRegsX86_64::new(ip, regs.sp, regs.bp);
+        let regs = regs.to_framehop_regs();
         let mut iter = self
             .unwinder
             .iter_frames(ip, regs, &mut self.cache, &mut read_stack);
@@ -403,6 +404,7 @@ impl PerfX86_64Regs {
         let mut ip = None;
         let mut sp = None;
         let mut bp = None;
+        let mut registers = [0_u64; 16];
         let mut values = values.iter().copied();
         for register in 0..64 {
             if mask & (1 << register) == 0 {
@@ -412,9 +414,29 @@ impl PerfX86_64Regs {
                 .next()
                 .ok_or_else(|| "perf register value is missing".to_string())?;
             match register {
-                6 => bp = Some(value),
-                7 => sp = Some(value),
+                0 => registers[Reg::RAX as usize] = value,
+                1 => registers[Reg::RBX as usize] = value,
+                2 => registers[Reg::RCX as usize] = value,
+                3 => registers[Reg::RDX as usize] = value,
+                4 => registers[Reg::RSI as usize] = value,
+                5 => registers[Reg::RDI as usize] = value,
+                6 => {
+                    registers[Reg::RBP as usize] = value;
+                    bp = Some(value);
+                }
+                7 => {
+                    registers[Reg::RSP as usize] = value;
+                    sp = Some(value);
+                }
                 8 => ip = Some(value),
+                16 => registers[Reg::R8 as usize] = value,
+                17 => registers[Reg::R9 as usize] = value,
+                18 => registers[Reg::R10 as usize] = value,
+                19 => registers[Reg::R11 as usize] = value,
+                20 => registers[Reg::R12 as usize] = value,
+                21 => registers[Reg::R13 as usize] = value,
+                22 => registers[Reg::R14 as usize] = value,
+                23 => registers[Reg::R15 as usize] = value,
                 _ => {}
             }
         }
@@ -423,7 +445,30 @@ impl PerfX86_64Regs {
             ip: ip.ok_or_else(|| "perf sample is missing x86_64 IP register".to_string())?,
             sp: sp.ok_or_else(|| "perf sample is missing x86_64 SP register".to_string())?,
             bp: bp.ok_or_else(|| "perf sample is missing x86_64 BP register".to_string())?,
+            registers,
         })
+    }
+
+    #[must_use]
+    pub fn to_framehop_regs(self) -> UnwindRegsX86_64 {
+        let mut regs = UnwindRegsX86_64::new(self.ip, self.sp, self.bp);
+        regs.set(Reg::RAX, self.registers[Reg::RAX as usize]);
+        regs.set(Reg::RDX, self.registers[Reg::RDX as usize]);
+        regs.set(Reg::RCX, self.registers[Reg::RCX as usize]);
+        regs.set(Reg::RBX, self.registers[Reg::RBX as usize]);
+        regs.set(Reg::RSI, self.registers[Reg::RSI as usize]);
+        regs.set(Reg::RDI, self.registers[Reg::RDI as usize]);
+        regs.set(Reg::RBP, self.registers[Reg::RBP as usize]);
+        regs.set(Reg::RSP, self.registers[Reg::RSP as usize]);
+        regs.set(Reg::R8, self.registers[Reg::R8 as usize]);
+        regs.set(Reg::R9, self.registers[Reg::R9 as usize]);
+        regs.set(Reg::R10, self.registers[Reg::R10 as usize]);
+        regs.set(Reg::R11, self.registers[Reg::R11 as usize]);
+        regs.set(Reg::R12, self.registers[Reg::R12 as usize]);
+        regs.set(Reg::R13, self.registers[Reg::R13 as usize]);
+        regs.set(Reg::R14, self.registers[Reg::R14 as usize]);
+        regs.set(Reg::R15, self.registers[Reg::R15 as usize]);
+        regs
     }
 }
 

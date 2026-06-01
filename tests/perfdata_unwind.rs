@@ -1,3 +1,4 @@
+use framehop::x86_64::Reg;
 use object::{Object, ObjectSegment};
 use proptest::prelude::*;
 use pyroclast::perfdata::unwind::{
@@ -15,6 +16,21 @@ fn maps_perf_x86_64_register_mask_values_by_perf_register_number() {
     assert_eq!(regs.bp, 0x7000);
     assert_eq!(regs.sp, 0x8000);
     assert_eq!(regs.ip, 0x9000);
+}
+
+#[test]
+fn maps_perf_x86_64_callee_saved_registers_for_dwarf_unwinding() {
+    let regs = PerfX86_64Regs::from_perf_masked_values(
+        (1 << 1) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 20),
+        &[0xbbbb, 0x7000, 0x8000, 0x9000, 0x1212],
+    )
+    .expect("registers")
+    .to_framehop_regs();
+
+    assert_eq!(regs.get(Reg::RBX), 0xbbbb);
+    assert_eq!(regs.sp(), 0x8000);
+    assert_eq!(regs.ip(), 0x9000);
+    assert_eq!(regs.get(Reg::R12), 0x1212);
 }
 
 #[test]
@@ -41,6 +57,7 @@ fn unwinds_x86_64_frame_pointer_stack_from_sampled_stack_bytes() {
         ip: 0x4000,
         sp: 0x7fff_0000,
         bp: 0x7fff_0008,
+        registers: registers_with_bp_sp(0x7fff_0008, 0x7fff_0000),
     };
 
     let frames = unwind_x86_64_stack(regs, &stack, 4);
@@ -131,6 +148,7 @@ fn rejected_overlapping_module_range_does_not_unwind_through_prior_module() {
         ip: first_start + gap,
         sp: 0x7fff_0000,
         bp: 0x7fff_0008,
+        registers: registers_with_bp_sp(0x7fff_0008, 0x7fff_0000),
     };
 
     assert!(
@@ -185,6 +203,13 @@ fn adjacent_mapping_gap_for_overlapping_module_ranges(path: &std::path::Path) ->
     1_u64.max((range.end - range.start) / 2)
 }
 
+fn registers_with_bp_sp(bp: u64, sp: u64) -> [u64; 16] {
+    let mut registers = [0_u64; 16];
+    registers[Reg::RBP as usize] = bp;
+    registers[Reg::RSP as usize] = sp;
+    registers
+}
+
 proptest! {
     #[test]
     fn property_reads_little_endian_words_from_arbitrary_sampled_stack(
@@ -234,10 +259,13 @@ proptest! {
             values.push(*value);
         }
 
-        prop_assert_eq!(
-            PerfX86_64Regs::from_perf_masked_values(mask, &values).expect("registers"),
-            PerfX86_64Regs { ip, sp, bp }
-        );
+        let regs = PerfX86_64Regs::from_perf_masked_values(mask, &values).expect("registers");
+
+        prop_assert_eq!(regs.ip, ip);
+        prop_assert_eq!(regs.sp, sp);
+        prop_assert_eq!(regs.bp, bp);
+        prop_assert_eq!(regs.registers[Reg::RBP as usize], bp);
+        prop_assert_eq!(regs.registers[Reg::RSP as usize], sp);
     }
 
     #[test]
