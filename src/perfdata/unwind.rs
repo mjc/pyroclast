@@ -24,6 +24,13 @@ pub struct FramehopUnwinder {
     unwinder: UnwinderX86_64<ModuleBytes>,
     cache: CacheX86_64,
     module_count: usize,
+    reported_modules: Vec<ReportedModule>,
+}
+
+#[derive(Clone, Debug)]
+struct ReportedModule {
+    base: u64,
+    range: Range<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -70,6 +77,7 @@ impl FramehopUnwinder {
             unwinder: UnwinderX86_64::new(),
             cache: CacheX86_64::new(),
             module_count: 0,
+            reported_modules: Vec::new(),
         }
     }
 
@@ -97,14 +105,38 @@ impl FramehopUnwinder {
         let object = object::File::parse(&mapped[..]).map_err(|error| {
             format!("failed to parse unwind object {}: {error}", path.display())
         })?;
+        let base = start.saturating_sub(pgoff);
+        let Some(module_range) = object_load_range(&object)
+            .map(|range| base.saturating_add(range.start)..base.saturating_add(range.end))
+        else {
+            return Ok(false);
+        };
+        if self
+            .reported_modules
+            .iter()
+            .any(|module| ranges_overlap(&module.range, &module_range) && module.base != base)
+        {
+            return Ok(false);
+        }
+        if self
+            .reported_modules
+            .iter()
+            .any(|module| module.base == base)
+        {
+            return Ok(false);
+        }
         let section_info = explicit_module_section_info(&mapped, &object);
         let module = framehop::Module::<ModuleBytes>::new(
             path.to_string_lossy().into_owned(),
             start..start.saturating_add(len),
-            start.saturating_sub(pgoff),
+            base,
             section_info,
         );
         self.unwinder.add_module(module);
+        self.reported_modules.push(ReportedModule {
+            base,
+            range: module_range,
+        });
         self.module_count += 1;
         Ok(true)
     }
@@ -188,6 +220,21 @@ fn object_base_svma<'a>(object: &object::File<'a, &'a [u8]>) -> u64 {
             || object.relative_address_base(),
             |segment| segment.address(),
         )
+}
+
+fn object_load_range<'a>(object: &object::File<'a, &'a [u8]>) -> Option<Range<u64>> {
+    object
+        .segments()
+        .filter(|segment| segment.size() != 0)
+        .map(|segment| {
+            let start = segment.address();
+            start..start.saturating_add(segment.size())
+        })
+        .reduce(|left, right| left.start.min(right.start)..left.end.max(right.end))
+}
+
+fn ranges_overlap(left: &Range<u64>, right: &Range<u64>) -> bool {
+    left.start < right.end && right.start < left.end
 }
 
 fn first_section_svma_range<'a>(

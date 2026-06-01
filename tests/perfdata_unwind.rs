@@ -60,6 +60,23 @@ fn loads_framehop_module_from_object_mapping() {
     assert_eq!(unwinder.module_count(), 1);
 }
 
+#[test]
+fn rejects_overlapping_module_base_like_dwfl_report_elf() {
+    let current_exe = std::env::current_exe().expect("current exe");
+    let mut unwinder = FramehopUnwinder::new();
+
+    let first = unwinder
+        .add_object_mapping(&current_exe, 0x5555_0000, 0x1000_0000, 0)
+        .expect("load first object mapping");
+    let second = unwinder
+        .add_object_mapping(&current_exe, 0x5555_0800, 0x1000_0000, 0)
+        .expect("load overlapping object mapping");
+
+    assert!(first);
+    assert!(!second);
+    assert_eq!(unwinder.module_count(), 1);
+}
+
 proptest! {
     #[test]
     fn property_reads_little_endian_words_from_arbitrary_sampled_stack(
