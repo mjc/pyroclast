@@ -1857,6 +1857,31 @@ fn file_path_folding_applies_late_untimed_mmaps_before_timed_samples_like_global
 }
 
 #[test]
+fn file_path_folding_uses_finished_round_as_perf_ordered_event_watermark() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(9, &sample_payload_with_time(0x1000, 11, 12, 30, [0x2000])),
+            record_bytes(PERF_RECORD_FINISHED_ROUND, b""),
+            record_bytes(1, &mmap_payload(11, 11, 0x2000, 0x100, 0, "/bin/app")),
+            record_bytes(PERF_RECORD_FINISHED_ROUND, b""),
+        ],
+    );
+    std::fs::write(&perfdata, bytes).expect("write perfdata");
+
+    let folded =
+        fold_perfdata_file_with_options(&perfdata, FoldOptions::default()).expect("folded");
+
+    assert_eq!(folded, "[unknown];/bin/app+0x0 1\n");
+}
+
+#[test]
 fn folds_perfdata_from_multiple_finished_rounds_into_one_total() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");

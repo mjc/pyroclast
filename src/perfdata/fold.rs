@@ -123,8 +123,15 @@ struct TimedRecord {
 
 struct PendingParsedRecord {
     index: usize,
-    time: Option<u64>,
+    time: u64,
     record: ParsedRecord,
+}
+
+#[derive(Default)]
+struct OrderedRecordQueue {
+    pending_records: Vec<PendingParsedRecord>,
+    next_flush_time: Option<u64>,
+    max_timestamp: Option<u64>,
 }
 
 struct DeferredFoldSample {
@@ -529,15 +536,26 @@ fn parse_record_with_context(record: PerfRecord<'_>) -> Result<ParsedRecord, Str
 fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData, String> {
     let header = parse_header(bytes)?;
     let sample_layouts = sample_layouts(bytes, header)?;
-    let mut records = timed_records(bytes, header, &sample_layouts)?;
     let header_build_ids = header_build_ids_by_filename(bytes)?;
     let mut accumulator = FoldAccumulator::new(header_build_ids);
+    let records = timed_records(bytes, header, &sample_layouts)?;
+    let mut ordered_records = OrderedRecordQueue::default();
 
-    records.sort_by_key(|record| (record.time.unwrap_or(0), record.index));
     for timed_record in records {
         let record = timed_record.record(bytes)?;
+        if record.header.record_type == PERF_RECORD_FINISHED_ROUND {
+            ordered_records.flush_round(&mut accumulator, &sample_layouts, options)?;
+            continue;
+        }
         let parsed_record = parse_record_with_context(record)?;
-        let record_result = accumulator.apply_record(parsed_record, &sample_layouts, options);
+        let record_result = ordered_records.apply_or_queue(
+            timed_record.index,
+            timed_record.time,
+            parsed_record,
+            &mut accumulator,
+            &sample_layouts,
+            options,
+        );
         record_result.map_err(|error| {
             format!(
                 "failed to parse record type {} at offset {}: {error}",
@@ -545,6 +563,7 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
             )
         })?;
     }
+    ordered_records.flush_final(&mut accumulator, &sample_layouts, options)?;
 
     Ok(accumulator.into_fold_data())
 }
@@ -583,7 +602,7 @@ fn collect_fold_data_from_file(file: &File, options: FoldOptions) -> Result<Perf
         .seek(SeekFrom::Start(header.data_offset))
         .map_err(|error| format!("failed to seek perf data section: {error}"))?;
 
-    let mut pending_records = Vec::new();
+    let mut ordered_records = OrderedRecordQueue::default();
     let mut header_bytes = [0_u8; 8];
     let mut payload = Vec::new();
     let mut offset = usize::try_from(header.data_offset)
@@ -618,12 +637,7 @@ fn collect_fold_data_from_file(file: &File, options: FoldOptions) -> Result<Perf
         })?;
 
         if record_header.record_type == PERF_RECORD_FINISHED_ROUND {
-            flush_pending_records(
-                &mut pending_records,
-                &mut accumulator,
-                &sample_layouts,
-                options,
-            )?;
+            ordered_records.flush_round(&mut accumulator, &sample_layouts, options)?;
             offset = next;
             continue;
         }
@@ -635,21 +649,19 @@ fn collect_fold_data_from_file(file: &File, options: FoldOptions) -> Result<Perf
         };
         let time = record_time(record, &sample_layouts)?;
         let parsed_record = parse_record_with_context(record)?;
-        pending_records.push(PendingParsedRecord {
+        ordered_records.apply_or_queue(
             index,
             time,
-            record: parsed_record,
-        });
+            parsed_record,
+            &mut accumulator,
+            &sample_layouts,
+            options,
+        )?;
         index += 1;
         offset = next;
     }
 
-    flush_pending_records(
-        &mut pending_records,
-        &mut accumulator,
-        &sample_layouts,
-        options,
-    )?;
+    ordered_records.flush_final(&mut accumulator, &sample_layouts, options)?;
 
     Ok(accumulator.into_fold_data())
 }
@@ -691,7 +703,7 @@ where
         .map_err(|error| format!("failed to seek perf data section: {error}"))?;
 
     let mut counts = FoldCounts::default();
-    let mut pending_records = Vec::new();
+    let mut ordered_records = OrderedRecordQueue::default();
     let mut header_bytes = [0_u8; 8];
     let mut payload = Vec::new();
     let mut offset = usize::try_from(header.data_offset)
@@ -726,12 +738,7 @@ where
         })?;
 
         if record_header.record_type == PERF_RECORD_FINISHED_ROUND {
-            flush_pending_records(
-                &mut pending_records,
-                &mut accumulator,
-                &sample_layouts,
-                options,
-            )?;
+            ordered_records.flush_round(&mut accumulator, &sample_layouts, options)?;
             accumulator.drain_fold_counts(&mut counts, symbol_cache.as_deref_mut())?;
             offset = next;
             continue;
@@ -744,37 +751,91 @@ where
         };
         let time = record_time(record, &sample_layouts)?;
         let parsed_record = parse_record_with_context(record)?;
-        pending_records.push(PendingParsedRecord {
+        ordered_records.apply_or_queue(
             index,
             time,
-            record: parsed_record,
-        });
+            parsed_record,
+            &mut accumulator,
+            &sample_layouts,
+            options,
+        )?;
         index += 1;
 
         offset = next;
     }
 
-    flush_pending_records(
-        &mut pending_records,
-        &mut accumulator,
-        &sample_layouts,
-        options,
-    )?;
+    ordered_records.flush_final(&mut accumulator, &sample_layouts, options)?;
     accumulator.drain_fold_counts(&mut counts, symbol_cache)?;
     write_fold_counts(counts, writer)
 }
 
-fn flush_pending_records(
-    pending_records: &mut Vec<PendingParsedRecord>,
-    accumulator: &mut FoldAccumulator,
-    sample_layouts: &SampleLayouts,
-    options: FoldOptions,
-) -> Result<(), String> {
-    pending_records.sort_by_key(|record| (record.time.unwrap_or(0), record.index));
-    for pending_record in pending_records.drain(..) {
-        accumulator.apply_record(pending_record.record, sample_layouts, options)?;
+impl OrderedRecordQueue {
+    fn apply_or_queue(
+        &mut self,
+        index: usize,
+        time: Option<u64>,
+        record: ParsedRecord,
+        accumulator: &mut FoldAccumulator,
+        sample_layouts: &SampleLayouts,
+        options: FoldOptions,
+    ) -> Result<(), String> {
+        if let Some(time) = time {
+            self.queue(index, time, record);
+            Ok(())
+        } else {
+            accumulator.apply_record(record, sample_layouts, options)
+        }
     }
-    Ok(())
+
+    fn queue(&mut self, index: usize, time: u64, record: ParsedRecord) {
+        self.max_timestamp = Some(self.max_timestamp.map_or(time, |max| max.max(time)));
+        self.pending_records.push(PendingParsedRecord {
+            index,
+            time,
+            record,
+        });
+    }
+
+    fn flush_round(
+        &mut self,
+        accumulator: &mut FoldAccumulator,
+        sample_layouts: &SampleLayouts,
+        options: FoldOptions,
+    ) -> Result<(), String> {
+        if let Some(limit) = self.next_flush_time {
+            self.flush_through(Some(limit), accumulator, sample_layouts, options)?;
+        }
+        self.next_flush_time = self.max_timestamp;
+        Ok(())
+    }
+
+    fn flush_final(
+        &mut self,
+        accumulator: &mut FoldAccumulator,
+        sample_layouts: &SampleLayouts,
+        options: FoldOptions,
+    ) -> Result<(), String> {
+        self.flush_through(None, accumulator, sample_layouts, options)
+    }
+
+    fn flush_through(
+        &mut self,
+        limit: Option<u64>,
+        accumulator: &mut FoldAccumulator,
+        sample_layouts: &SampleLayouts,
+        options: FoldOptions,
+    ) -> Result<(), String> {
+        self.pending_records
+            .sort_by_key(|record| (record.time, record.index));
+        let split = limit.map_or(self.pending_records.len(), |limit| {
+            self.pending_records
+                .partition_point(|record| record.time <= limit)
+        });
+        for pending_record in self.pending_records.drain(..split) {
+            accumulator.apply_record(pending_record.record, sample_layouts, options)?;
+        }
+        Ok(())
+    }
 }
 
 fn perfdata_header_from_file(file: &File) -> Result<(PerfHeader, [u8; 104]), String> {
