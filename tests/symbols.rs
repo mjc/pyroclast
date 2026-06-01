@@ -700,6 +700,35 @@ fn rust_addr2line_resolver_uses_perf_dwarf_names_for_inline_frames() {
 }
 
 #[test]
+fn addr2line_resolver_uses_perf_dwarf_names_for_inline_frames() {
+    let Some((profiling_binary, object_bytes)) = profiling_binary_fixture() else {
+        return;
+    };
+    let Some(address) = find_profiling_address(&object_bytes, |frames| frames.len() > 1) else {
+        return;
+    };
+    let runner =
+        Addr2lineRunner::new(b"gimli::read::line::LineProgramHeader<R,Offset>::parse\n??:0\n");
+    let resolver = Addr2lineResolver::new(&runner);
+
+    let frames = resolver
+        .resolve_frame_batch(&[SymbolRequest {
+            path: profiling_binary.clone(),
+            relative_address: address,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        }])
+        .expect("resolve frames");
+
+    let expected = perf_dwarf_frame_names_from_object(&profiling_binary, address)
+        .map(perf_inline_frame_order)
+        .expect("perf dwarf frames");
+
+    assert_eq!(frames, vec![expected]);
+}
+
+#[test]
 fn rust_addr2line_resolver_uses_object_symbol_for_non_inline_frames_like_perf_script() {
     let Some((profiling_binary, object_bytes)) = profiling_binary_fixture() else {
         return;

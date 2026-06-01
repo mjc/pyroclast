@@ -129,7 +129,7 @@ struct CachedMappingFrames {
 
 pub struct Addr2lineResolver<'a, R> {
     runner: &'a R,
-    metadata_cache: OnceLock<Mutex<FxHashMap<OsString, Option<Arc<PreparedObjectMetadata>>>>>,
+    metadata_cache: OnceLock<Mutex<FxHashMap<OsString, Option<Arc<CachedObjectMetadata>>>>>,
 }
 
 pub enum SelectedObjectResolver<'a, R> {
@@ -499,7 +499,7 @@ where
         }
     }
 
-    fn object_metadata(&self, path: &Path) -> Option<Arc<PreparedObjectMetadata>> {
+    fn object_metadata(&self, path: &Path) -> Option<Arc<CachedObjectMetadata>> {
         let cache = self
             .metadata_cache
             .get_or_init(|| Mutex::new(FxHashMap::default()));
@@ -513,15 +513,34 @@ where
             return cached;
         }
 
-        let loaded = std::fs::read(path)
-            .ok()
-            .map(|bytes| Arc::new(PreparedObjectMetadata::from_object_bytes(&bytes)));
+        let loaded = std::fs::read(path).ok().map(|bytes| {
+            Arc::new(CachedObjectMetadata {
+                object_metadata: PreparedObjectMetadata::from_object_bytes(&bytes),
+                perf_dwarf: PerfDwarfNameResolver::from_object_bytes(&bytes).ok(),
+            })
+        });
 
         let mut cache = cache.lock().expect("addr2line metadata cache lock");
         cache
             .entry(path_key)
             .or_insert_with(|| loaded.clone())
             .clone()
+    }
+
+    fn resolve_group_symbols(
+        &self,
+        path: &Path,
+        grouped_requests: &[SymbolRequest],
+    ) -> Result<Vec<Option<String>>, String> {
+        let output = self
+            .runner
+            .run(&build_addr2line_command(path, grouped_requests))
+            .map_err(|error| format!("failed to run addr2line: {error}"))?;
+        if output.status_code == Some(0) {
+            parse_addr2line_stdout(&output.stdout, grouped_requests.len())
+        } else {
+            Ok(vec![None; grouped_requests.len()])
+        }
     }
 }
 
@@ -1408,20 +1427,14 @@ where
                 .iter()
                 .map(|index| requests[*index].clone())
                 .collect::<Vec<_>>();
-            let output = self
-                .runner
-                .run(&build_addr2line_command(path, &grouped_requests))
-                .map_err(|error| format!("failed to run addr2line: {error}"))?;
-            let symbols = if output.status_code == Some(0) {
-                parse_addr2line_stdout(&output.stdout, grouped_requests.len())?
-            } else {
-                vec![None; grouped_requests.len()]
-            };
+            let symbols = self.resolve_group_symbols(path, &grouped_requests)?;
             let object_metadata = self.object_metadata(path);
             for (request, symbol) in grouped_requests.into_iter().zip(symbols) {
-                let object_symbol = object_metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.object_symbol(request.relative_address));
+                let object_symbol = object_metadata.as_ref().and_then(|metadata| {
+                    metadata
+                        .object_metadata
+                        .object_symbol(request.relative_address)
+                });
                 let symbol = perf_name_with_object_alias(symbol, object_symbol);
                 resolved_by_request.insert(request, symbol);
             }
@@ -1436,6 +1449,42 @@ where
                     .ok_or_else(|| "missing addr2line result for request".to_string())
             })
             .collect()
+    }
+
+    fn resolve_frame_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Vec<String>>, String> {
+        let mut resolved = vec![Vec::new(); requests.len()];
+        for (path, indexes) in grouped_request_indexes(requests) {
+            let path = Path::new(path);
+            let grouped_requests = indexes
+                .iter()
+                .map(|index| requests[*index].clone())
+                .collect::<Vec<_>>();
+            let symbols = self.resolve_group_symbols(path, &grouped_requests)?;
+            let object_metadata = self.object_metadata(path);
+            for ((index, request), symbol) in indexes.into_iter().zip(grouped_requests).zip(symbols)
+            {
+                let object_symbol = object_metadata.as_ref().and_then(|metadata| {
+                    metadata
+                        .object_metadata
+                        .object_symbol(request.relative_address)
+                });
+                let mut frames = object_metadata
+                    .as_ref()
+                    .and_then(|metadata| {
+                        metadata
+                            .perf_dwarf
+                            .as_ref()?
+                            .frame_names_for_base_symbol(request.relative_address, object_symbol)
+                    })
+                    .map(perf_inline_frame_order)
+                    .or_else(|| object_symbol.map(|name| vec![name.to_string()]))
+                    .or_else(|| symbol.map(|name| vec![name]))
+                    .unwrap_or_default();
+                frames = perf_frames_with_object_alias(frames, object_symbol);
+                resolved[index] = frames;
+            }
+        }
+        Ok(resolved)
     }
 }
 
