@@ -4,6 +4,7 @@ use pyroclast::perfdata::build_id::{
     BuildIdEvent, build_id_events_from_perfdata, kernel_build_id_from_perfdata,
     kernel_build_id_from_perfdata_file, parse_build_id_events,
 };
+use pyroclast::perfdata::records::{PERF_RECORD_MISC_MMAP_BUILD_ID, PERF_RECORD_MMAP2};
 
 #[test]
 fn parses_build_id_events_from_header_feature_payload() {
@@ -53,6 +54,24 @@ fn extracts_kernel_build_id_from_perfdata_record_stream() {
     ];
     let payload = build_id_event_payload(u32::MAX, &build_id, "[kernel.kallsyms]");
     let bytes = perfdata_with_data_records(&payload);
+
+    let kernel_build_id = kernel_build_id_from_perfdata(&bytes).expect("build id");
+
+    assert_eq!(
+        kernel_build_id,
+        Some("b42ce521dbc9fc9943960211a7f64e448fc9071b".to_string())
+    );
+}
+
+#[test]
+fn extracts_kernel_build_id_from_mmap2_build_id_record() {
+    let build_id = [
+        0xb4, 0x2c, 0xe5, 0x21, 0xdb, 0xc9, 0xfc, 0x99, 0x43, 0x96, 0x02, 0x11, 0xa7, 0xf6, 0x4e,
+        0x44, 0x8f, 0xc9, 0x07, 0x1b,
+    ];
+    let payload = mmap2_build_id_payload(u32::MAX, &build_id, "[kernel.kallsyms]_text");
+    let record = perf_record(PERF_RECORD_MMAP2, PERF_RECORD_MISC_MMAP_BUILD_ID, &payload);
+    let bytes = perfdata_with_data_records(&record);
 
     let kernel_build_id = kernel_build_id_from_perfdata(&bytes).expect("build id");
 
@@ -262,6 +281,35 @@ fn perfdata_with_data_records(records: &[u8]) -> Vec<u8> {
     );
     bytes[data_offset..].copy_from_slice(records);
     bytes
+}
+
+fn perf_record(record_type: u32, misc: u16, payload: &[u8]) -> Vec<u8> {
+    let size = 8 + payload.len();
+    let mut record = Vec::new();
+    record.extend(record_type.to_le_bytes());
+    record.extend(misc.to_le_bytes());
+    record.extend(u16::try_from(size).expect("record size").to_le_bytes());
+    record.extend(payload);
+    record
+}
+
+fn mmap2_build_id_payload(pid: u32, build_id: &[u8], path: &str) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(pid.to_le_bytes());
+    payload.extend(0u32.to_le_bytes());
+    payload.extend(0xffff_ffff_8360_0000u64.to_le_bytes());
+    payload.extend(0x022a_8480_u64.to_le_bytes());
+    payload.extend(0xffff_ffff_8360_0000u64.to_le_bytes());
+    payload.push(u8::try_from(build_id.len()).expect("build id length"));
+    payload.push(0);
+    payload.extend(0u16.to_le_bytes());
+    payload.extend(build_id);
+    payload.extend(vec![0; 20 - build_id.len()]);
+    payload.extend(0u32.to_le_bytes());
+    payload.extend(0u32.to_le_bytes());
+    payload.extend(path.as_bytes());
+    payload.push(0);
+    payload
 }
 
 fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {

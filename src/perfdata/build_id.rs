@@ -5,7 +5,10 @@ use std::path::Path;
 
 use crate::perfdata::endian::{read_u16, read_u32};
 use crate::perfdata::header::{parse_feature_sections, parse_header};
-use crate::perfdata::records::{PERF_RECORD_HEADER_BUILD_ID, iter_records};
+use crate::perfdata::records::{
+    PERF_RECORD_HEADER_BUILD_ID, PERF_RECORD_MISC_MMAP_BUILD_ID, PERF_RECORD_MMAP2, iter_records,
+    parse_mmap2_build_id_record,
+};
 
 const HEADER_BUILD_ID: u16 = 2;
 const PERF_RECORD_MISC_BUILD_ID_SIZE: u16 = 1 << 15;
@@ -98,11 +101,24 @@ pub fn kernel_build_id_from_perfdata_file(path: &Path) -> Result<Option<String>,
 
 fn build_id_events_from_record_stream(bytes: &[u8]) -> Result<Vec<BuildIdEvent>, String> {
     let header = parse_header(bytes)?;
-    iter_records(bytes, header)?
-        .into_iter()
-        .filter(|record| record.header.record_type == PERF_RECORD_HEADER_BUILD_ID)
-        .map(|record| parse_build_id_record(record.header.misc, record.payload))
-        .collect()
+    let mut events = Vec::new();
+    for record in iter_records(bytes, header)? {
+        match record.header.record_type {
+            PERF_RECORD_HEADER_BUILD_ID => {
+                events.push(parse_build_id_record(record.header.misc, record.payload)?);
+            }
+            PERF_RECORD_MMAP2 if record.header.misc & PERF_RECORD_MISC_MMAP_BUILD_ID != 0 => {
+                let mmap = parse_mmap2_build_id_record(record.payload)?;
+                events.push(BuildIdEvent {
+                    pid: mmap.pid,
+                    build_id: build_id_hex(&mmap.build_id),
+                    filename: mmap.path,
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(events)
 }
 
 fn build_id_feature_payload(bytes: &[u8]) -> Result<Option<&[u8]>, String> {
@@ -166,6 +182,7 @@ fn parse_build_id_record(misc: u16, payload: &[u8]) -> Result<BuildIdEvent, Stri
 fn is_kernel_build_id_filename(filename: &str) -> bool {
     let path = Path::new(filename);
     path == Path::new("[kernel.kallsyms]")
+        || filename.starts_with("[kernel.kallsyms]")
         || path == Path::new("[kernel]")
         || path == Path::new("[guest.kernel]")
 }
