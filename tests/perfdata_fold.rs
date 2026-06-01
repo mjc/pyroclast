@@ -734,6 +734,50 @@ fn skips_dwarf_unwind_when_perf_user_stack_dynamic_size_is_zero_like_perf_script
 }
 
 #[test]
+fn limits_dwarf_unwind_to_perf_user_stack_dynamic_size_like_perf_script() {
+    let mut sample = sample_payload(
+        0x4000,
+        11,
+        12,
+        [
+            0xffff_ffff_ffff_ff80,
+            0xffff_ffff_8100_0000,
+            0xffff_ffff_8200_0000,
+        ],
+    );
+    append_user_stack_payload(
+        &mut sample,
+        1,
+        [0x7fff_0008, 0x7fff_0000, 0x4000],
+        [
+            0, 0, 0, 0, 0, 0, 0, 0, //
+            0x40, 0, 0, 0, 0, 0, 0, 0, //
+            0x34, 0x12, 0, 0, 0, 0, 0, 0,
+        ],
+        8,
+    );
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            (1 << 6) | (1 << 7) | (1 << 8),
+        )],
+        [record_bytes_with_misc(
+            9,
+            PERF_RECORD_MISC_CPUMODE_KERNEL,
+            &sample,
+        )],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, "[unknown];0x4000;[unknown];[unknown] 1\n");
+}
+
+#[test]
 fn uses_mapped_object_unwinder_for_dwarf_user_stack_frames() {
     let current_exe = std::env::current_exe().expect("current exe");
     let current_exe = current_exe.to_string_lossy();

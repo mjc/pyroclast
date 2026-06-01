@@ -2201,6 +2201,9 @@ fn unwind_user_stack_like_perf(
     let Some(stack) = &sample.user_stack else {
         return Vec::new();
     };
+    let Some(stack_bytes) = perf_effective_user_stack_bytes(stack) else {
+        return Vec::new();
+    };
     match choose_user_unwind_source(
         !accumulator.sample_frames.is_empty(),
         has_recorded_mapping_for_ip,
@@ -2208,12 +2211,12 @@ fn unwind_user_stack_like_perf(
         unwind_module_count,
     ) {
         UserUnwindSource::None => Vec::new(),
-        UserUnwindSource::FramePointer => unwind_x86_64_stack(*regs, stack.bytes, 256),
+        UserUnwindSource::FramePointer => unwind_x86_64_stack(*regs, stack_bytes, 256),
         UserUnwindSource::Object => sample
             .pid
             .and_then(|pid| accumulator.unwind_states.get_mut(&pid))
             .map_or_else(Vec::new, |state| {
-                state.object_unwinder.unwind_stack(*regs, stack.bytes, 256)
+                state.object_unwinder.unwind_stack(*regs, stack_bytes, 256)
             }),
     }
 }
@@ -2262,6 +2265,13 @@ fn take_deferred_cookie(frames: &mut Vec<FoldFrame>) -> Option<u64> {
 
 fn has_perf_captured_user_stack(stack: &crate::perfdata::samples::SampleUserStack<'_>) -> bool {
     !stack.bytes.is_empty() && stack.dynamic_size != 0
+}
+
+fn perf_effective_user_stack_bytes<'a>(
+    stack: &'a crate::perfdata::samples::SampleUserStack<'a>,
+) -> Option<&'a [u8]> {
+    let dynamic_size = usize::try_from(stack.dynamic_size).ok()?;
+    stack.bytes.get(..dynamic_size)
 }
 
 fn truncate_user_unwind_at_first_unmapped_frame(
