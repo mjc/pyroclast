@@ -107,7 +107,7 @@ fn perf_script_command_exports_inferno_compatible_perf_script() {
 
     assert_eq!(
         output.stdout,
-        "app 1/1 0: 144 cycles:\n\t2000 /bin/app+0x1000+0x0 ([unknown])\n\n"
+        "app 1 0: 144 cpu/cycles/P:\n\t2000 /bin/app+0x1000+0x0 ([unknown])\n\n"
     );
 }
 

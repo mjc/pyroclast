@@ -1488,7 +1488,7 @@ where
     for stack in raw_stacks {
         let comm = stack.comm().unwrap_or("[unknown]");
         let pid = stack.pid().unwrap_or(0);
-        writeln!(writer, "{comm} {pid}/{pid} 0: {} cycles:", stack.count())
+        writeln!(writer, "{comm} {pid} 0: {} cpu/cycles/P:", stack.count())
             .map_err(|error| format!("failed to write perf script output: {error}"))?;
         frame_resolver.write_script_frames_for_stack(
             stack.pid(),
