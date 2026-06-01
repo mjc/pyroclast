@@ -2273,8 +2273,10 @@ fn choose_user_unwind_source(context: UserUnwindContext) -> UserUnwindSource {
         } else {
             UserUnwindSource::None
         }
-    } else {
+    } else if context.callchain == (SampleCallchainState::Other { has_frames: true }) {
         UserUnwindSource::Object
+    } else {
+        UserUnwindSource::None
     }
 }
 
@@ -2847,7 +2849,7 @@ mod tests {
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
                 module_count: 1,
             }),
-            super::UserUnwindSource::Object
+            super::UserUnwindSource::None
         );
     }
 
