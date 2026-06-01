@@ -2518,6 +2518,17 @@ fn perf_accepted_object_unwind_frames(
         {
             vec![*ip]
         }
+        [ip, ..]
+            if *ip == regs.ip
+                && callchain
+                    == (SampleCallchainState::Other {
+                        has_callchain: true,
+                        has_frames: false,
+                    })
+                && !regs.frame_pointer_points_above_stack_pointer() =>
+        {
+            vec![*ip]
+        }
         [ip, _]
             if *ip == regs.ip
                 && callchain
@@ -3141,6 +3152,31 @@ mod tests {
                 vec![0x7fff_f7ea_3f4b, 0x5555_5578_8ba4, 0x5555_5578_8ba5],
             ),
             vec![0x7fff_f7ea_3f4b]
+        );
+    }
+
+    #[test]
+    fn object_unwind_stops_after_libc_leaf_with_empty_fp_chain_like_perf_libdw() {
+        // Real sample from target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
+        // perf script prints only __memmove_avx_unaligned_erms for this event,
+        // while framehop can advance through libc's no-op FDE using sampled stack bytes.
+        let regs = super::PerfX86_64Regs {
+            ip: 0x7fff_f7f0_277b,
+            sp: 0x7fff_ffff_8cf8,
+            bp: 0x4002,
+            registers: [0; 16],
+        };
+
+        assert_eq!(
+            super::perf_accepted_object_unwind_frames(
+                &regs,
+                super::SampleCallchainState::Other {
+                    has_callchain: true,
+                    has_frames: false,
+                },
+                vec![0x7fff_f7f0_277b, 0x5555_5579_6e23, 0x5555_5579_6e23],
+            ),
+            vec![0x7fff_f7f0_277b]
         );
     }
 
