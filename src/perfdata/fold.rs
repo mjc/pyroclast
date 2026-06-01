@@ -2253,6 +2253,7 @@ fn unwind_user_stack_like_perf(
             .map_or_else(Vec::new, |state| {
                 perf_accepted_object_unwind_frames(
                     regs,
+                    context.callchain,
                     state.object_unwinder.unwind_stack(*regs, stack_bytes, 256),
                 )
             }),
@@ -2330,12 +2331,22 @@ fn perf_accepted_unwind_frames(unwound_frames: Vec<u64>) -> Vec<u64> {
     unwound_frames
 }
 
-fn perf_accepted_object_unwind_frames(regs: &PerfX86_64Regs, unwound_frames: Vec<u64>) -> Vec<u64> {
+fn perf_accepted_object_unwind_frames(
+    regs: &PerfX86_64Regs,
+    callchain: SampleCallchainState,
+    unwound_frames: Vec<u64>,
+) -> Vec<u64> {
     // framehop yields the sampled instruction pointer before trying to advance.
     // perf's libdw path reports the IP to DWFL as initial state, then only
     // prints entries accepted via frame_callback/entry.
     match unwound_frames.as_slice() {
         [ip] if *ip == regs.ip => Vec::new(),
+        [ip, _]
+            if *ip == regs.ip
+                && callchain == (SampleCallchainState::Other { has_frames: false }) =>
+        {
+            Vec::new()
+        }
         _ => unwound_frames,
     }
 }
@@ -2550,6 +2561,15 @@ fn read_sample_u64(payload: &[u8], offset: usize) -> Result<u64, String> {
 mod tests {
     use crate::perfdata::mappings::FileIdentity;
 
+    fn test_regs(ip: u64) -> super::PerfX86_64Regs {
+        super::PerfX86_64Regs {
+            ip,
+            sp: 0x2000,
+            bp: 0x3000,
+            registers: [0; 16],
+        }
+    }
+
     #[test]
     fn loads_unwind_object_when_recorded_file_identity_mismatches_path_like_perf_libdw() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -2592,6 +2612,18 @@ mod tests {
     fn empty_unwind_for_loaded_module_does_not_invent_current_ip_like_perf_libdw() {
         assert_eq!(
             super::perf_accepted_unwind_frames(Vec::new()),
+            Vec::<u64>::new()
+        );
+    }
+
+    #[test]
+    fn object_unwind_drops_short_fallback_stack_without_callchain_like_perf_libdw() {
+        assert_eq!(
+            super::perf_accepted_object_unwind_frames(
+                &test_regs(0x1000),
+                super::SampleCallchainState::Other { has_frames: false },
+                vec![0x1000, 0x1100],
+            ),
             Vec::<u64>::new()
         );
     }
