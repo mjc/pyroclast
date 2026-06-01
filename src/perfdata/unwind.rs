@@ -539,6 +539,13 @@ fn truncate_at_first_uncovered_unwind_frame(
 }
 
 impl PerfX86_64Regs {
+    #[must_use]
+    pub fn is_syscall_return_state(self) -> bool {
+        self.registers[Reg::RCX as usize] == self.ip
+            && self.registers[Reg::R11 as usize] != 0
+            && self.bp < 4096
+    }
+
     /// Builds the minimal `x86_64` register set needed for stack unwinding from
     /// perf's ascending register-mask encoding.
     ///

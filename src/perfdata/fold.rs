@@ -177,6 +177,7 @@ enum UserUnwindSource {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SampleCallchainState {
     KernelWithoutCallchain,
+    KernelWithCallchain,
     KernelWithUserFrame,
     Other {
         has_callchain: bool,
@@ -2337,6 +2338,8 @@ fn append_perf_user_unwind_frames(
         // perf script keeps a recorded kernel-to-user callchain and does not
         // append extra user DWARF callers after the user-space frame.
         SampleCallchainState::KernelWithUserFrame
+    } else if (misc & PERF_RECORD_MISC_CPUMODE_MASK) == PERF_RECORD_MISC_CPUMODE_KERNEL {
+        SampleCallchainState::KernelWithCallchain
     } else {
         SampleCallchainState::Other {
             has_callchain: event.layout.sample_type & PERF_SAMPLE_CALLCHAIN != 0,
@@ -2403,11 +2406,7 @@ fn choose_user_unwind_source(context: UserUnwindContext) -> UserUnwindSource {
     {
         UserUnwindSource::None
     } else if context.module_count == 0 {
-        if context.callchain
-            == (SampleCallchainState::Other {
-                has_callchain: true,
-                has_frames: true,
-            })
+        if has_recorded_callchain_frames(context.callchain)
             && context.initial_ip_mapping == InitialIpMappingState::NoRecordedMapping
         {
             UserUnwindSource::FramePointer
@@ -2416,15 +2415,27 @@ fn choose_user_unwind_source(context: UserUnwindContext) -> UserUnwindSource {
         }
     } else if matches!(
         context.callchain,
-        SampleCallchainState::Other {
-            has_callchain: true,
-            ..
-        }
+        SampleCallchainState::KernelWithCallchain
+            | SampleCallchainState::Other {
+                has_callchain: true,
+                ..
+            }
     ) {
         UserUnwindSource::Object
     } else {
         UserUnwindSource::None
     }
+}
+
+fn has_recorded_callchain_frames(callchain: SampleCallchainState) -> bool {
+    matches!(
+        callchain,
+        SampleCallchainState::KernelWithCallchain
+            | SampleCallchainState::Other {
+                has_callchain: true,
+                has_frames: true,
+            }
+    )
 }
 
 fn sample_fold_count(period: Option<u64>, options: FoldOptions) -> u64 {
@@ -2500,6 +2511,13 @@ fn perf_accepted_object_unwind_frames(
     // prints entries accepted via frame_callback/entry.
     match unwound_frames.as_slice() {
         [ip] if *ip == regs.ip => Vec::new(),
+        [ip, ..]
+            if *ip == regs.ip
+                && callchain == SampleCallchainState::KernelWithCallchain
+                && regs.is_syscall_return_state() =>
+        {
+            vec![*ip]
+        }
         [ip, _]
             if *ip == regs.ip
                 && callchain
@@ -3099,6 +3117,30 @@ mod tests {
                 module_count: 1,
             }),
             super::UserUnwindSource::None
+        );
+    }
+
+    #[test]
+    fn object_unwind_stops_after_syscall_return_ip_for_kernel_callchain_like_perf_libdw() {
+        let regs = super::PerfX86_64Regs {
+            ip: 0x7fff_f7ea_3f4b,
+            sp: 0x7fff_ffff_9928,
+            bp: 3,
+            registers: {
+                let mut registers = [0; 16];
+                registers[framehop::x86_64::Reg::RCX as usize] = 0x7fff_f7ea_3f4b;
+                registers[framehop::x86_64::Reg::R11 as usize] = 0x206;
+                registers
+            },
+        };
+
+        assert_eq!(
+            super::perf_accepted_object_unwind_frames(
+                &regs,
+                super::SampleCallchainState::KernelWithCallchain,
+                vec![0x7fff_f7ea_3f4b, 0x5555_5578_8ba4, 0x5555_5578_8ba5],
+            ),
+            vec![0x7fff_f7ea_3f4b]
         );
     }
 
