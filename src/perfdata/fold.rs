@@ -1998,9 +1998,6 @@ fn parse_sample_for_fold(
     {
         let unwound_frames = if accumulator.sample_frames.is_empty()
             && accumulator.object_unwinder.module_count() == 0
-            && sample
-                .pid
-                .is_none_or(|pid| accumulator.mmap_table.resolve_ref(pid, regs.ip).is_none())
         {
             Vec::new()
         } else if accumulator.object_unwinder.module_count() == 0 {
