@@ -23,9 +23,10 @@ use crate::perfdata::records::{
     parse_record, parse_record_header,
 };
 use crate::perfdata::samples::{
-    PERF_SAMPLE_ADDR, PERF_SAMPLE_CPU, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP,
-    PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID, PERF_SAMPLE_TIME, SampleLayout, is_kernel_space_frame,
-    is_perf_context_marker, is_perf_user_deferred_context_marker, parse_sample_record_callchain,
+    PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_ID,
+    PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID,
+    PERF_SAMPLE_TIME, SampleLayout, is_kernel_space_frame, is_perf_context_marker,
+    is_perf_user_deferred_context_marker, parse_sample_record_callchain,
 };
 use crate::perfdata::unwind::{FramehopUnwinder, PerfX86_64Regs, unwind_x86_64_stack};
 use crate::symbols::{SymbolFrameCache, SymbolRequest, SymbolResolver, perf_build_id_elf_path};
@@ -176,7 +177,10 @@ enum UserUnwindSource {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SampleCallchainState {
     KernelWithoutCallchain,
-    Other { has_frames: bool },
+    Other {
+        has_callchain: bool,
+        has_frames: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2327,6 +2331,7 @@ fn append_perf_user_unwind_frames(
         SampleCallchainState::KernelWithoutCallchain
     } else {
         SampleCallchainState::Other {
+            has_callchain: event.layout.sample_type & PERF_SAMPLE_CALLCHAIN != 0,
             has_frames: !accumulator.sample_frames.is_empty(),
         }
     };
@@ -2388,14 +2393,24 @@ fn choose_user_unwind_source(context: UserUnwindContext) -> UserUnwindSource {
     {
         UserUnwindSource::None
     } else if context.module_count == 0 {
-        if context.callchain == (SampleCallchainState::Other { has_frames: true })
+        if context.callchain
+            == (SampleCallchainState::Other {
+                has_callchain: true,
+                has_frames: true,
+            })
             && context.initial_ip_mapping == InitialIpMappingState::NoRecordedMapping
         {
             UserUnwindSource::FramePointer
         } else {
             UserUnwindSource::None
         }
-    } else if context.callchain == (SampleCallchainState::Other { has_frames: true }) {
+    } else if matches!(
+        context.callchain,
+        SampleCallchainState::Other {
+            has_callchain: true,
+            ..
+        }
+    ) {
         UserUnwindSource::Object
     } else {
         UserUnwindSource::None
@@ -2469,7 +2484,11 @@ fn perf_accepted_object_unwind_frames(
         [ip] if *ip == regs.ip => Vec::new(),
         [ip, _]
             if *ip == regs.ip
-                && callchain == (SampleCallchainState::Other { has_frames: false }) =>
+                && callchain
+                    == (SampleCallchainState::Other {
+                        has_callchain: false,
+                        has_frames: false,
+                    }) =>
         {
             Vec::new()
         }
@@ -2745,7 +2764,10 @@ mod tests {
         assert_eq!(
             super::perf_accepted_object_unwind_frames(
                 &test_regs(0x1000),
-                super::SampleCallchainState::Other { has_frames: false },
+                super::SampleCallchainState::Other {
+                    has_callchain: false,
+                    has_frames: false,
+                },
                 vec![0x1000, 0x1100],
             ),
             Vec::<u64>::new()
@@ -2960,7 +2982,10 @@ mod tests {
     fn user_unwind_source_skips_recorded_ip_without_loaded_unwind_module() {
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
-                callchain: super::SampleCallchainState::Other { has_frames: true },
+                callchain: super::SampleCallchainState::Other {
+                    has_callchain: true,
+                    has_frames: true,
+                },
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingMissing,
                 module_count: 1,
             }),
@@ -2972,7 +2997,10 @@ mod tests {
     fn user_unwind_source_uses_frame_pointer_only_for_callchain_without_modules() {
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
-                callchain: super::SampleCallchainState::Other { has_frames: true },
+                callchain: super::SampleCallchainState::Other {
+                    has_callchain: true,
+                    has_frames: true,
+                },
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
                 module_count: 0,
             }),
@@ -2980,7 +3008,10 @@ mod tests {
         );
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
-                callchain: super::SampleCallchainState::Other { has_frames: false },
+                callchain: super::SampleCallchainState::Other {
+                    has_callchain: true,
+                    has_frames: false,
+                },
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
                 module_count: 0,
             }),
@@ -2988,7 +3019,10 @@ mod tests {
         );
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
-                callchain: super::SampleCallchainState::Other { has_frames: true },
+                callchain: super::SampleCallchainState::Other {
+                    has_callchain: true,
+                    has_frames: true,
+                },
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
                 module_count: 0,
             }),
@@ -2997,14 +3031,17 @@ mod tests {
     }
 
     #[test]
-    fn user_unwind_source_skips_object_unwinder_without_callchain_frames_like_perf_script() {
+    fn user_unwind_source_uses_object_unwinder_with_callchain_field_like_perf_script() {
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
-                callchain: super::SampleCallchainState::Other { has_frames: false },
+                callchain: super::SampleCallchainState::Other {
+                    has_callchain: true,
+                    has_frames: false,
+                },
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
                 module_count: 1,
             }),
-            super::UserUnwindSource::None
+            super::UserUnwindSource::Object
         );
     }
 
@@ -3012,7 +3049,10 @@ mod tests {
     fn user_unwind_source_uses_object_unwinder_for_nonempty_callchain_after_modules_are_loaded() {
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
-                callchain: super::SampleCallchainState::Other { has_frames: true },
+                callchain: super::SampleCallchainState::Other {
+                    has_callchain: true,
+                    has_frames: true,
+                },
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
                 module_count: 1,
             }),
