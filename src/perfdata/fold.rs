@@ -2047,6 +2047,10 @@ fn take_deferred_cookie(frames: &mut Vec<FoldFrame>) -> Option<u64> {
 }
 
 fn should_unwind_user_stack(misc: u16, frames: &[FoldFrame]) -> bool {
+    // Match `perf script`: DWARF unwinding is routed through
+    // `thread__resolve_callchain`, and kernel samples only contribute user
+    // frames when the recorded callchain has an explicit user context marker.
+    // See Linux perf `tools/perf/builtin-script.c` and `util/callchain.c`.
     if misc & PERF_RECORD_MISC_CPUMODE_MASK != PERF_RECORD_MISC_CPUMODE_KERNEL {
         return true;
     }
