@@ -34,6 +34,7 @@ const PREFETCH_SYMBOL_REQUEST_BATCH_SIZE: usize = 4096;
 const RECORD_READER_BUFFER_CAPACITY: usize = 4 * 1024 * 1024;
 const FOLD_COUNT_STORAGE_LINEAR_GROWTH_THRESHOLD: usize = 64 * 1024 * 1024;
 const FOLD_COUNT_STORAGE_LINEAR_GROWTH_CHUNK: usize = 8 * 1024 * 1024;
+const PROT_EXEC: u32 = 4;
 type FoldFrameRenderCache = HashMap<String, String, FxBuildHasher>;
 
 #[derive(Default)]
@@ -131,6 +132,7 @@ struct UnwindMappingRequest<'a> {
     start: u64,
     len: u64,
     pgoff: u64,
+    prot: Option<u32>,
     path: &'a str,
     file_identity: Option<FileIdentity>,
     build_id: Option<&'a [u8]>,
@@ -981,6 +983,7 @@ impl FoldAccumulator {
                         start: record.start,
                         len: record.len,
                         pgoff: record.pgoff,
+                        prot: None,
                         path: &record.path,
                         file_identity: None,
                         build_id: None,
@@ -1007,6 +1010,7 @@ impl FoldAccumulator {
                             start: record.start,
                             len: record.len,
                             pgoff: record.pgoff,
+                            prot: Some(record.prot),
                             path: &record.path,
                             file_identity: Some(mmap2_file_identity(&record)),
                             build_id: Some(&build_id),
@@ -1035,6 +1039,7 @@ impl FoldAccumulator {
                         start: record.start,
                         len: record.len,
                         pgoff: record.pgoff,
+                        prot: Some(record.prot),
                         path: &record.path,
                         file_identity: None,
                         build_id: Some(&record.build_id),
@@ -2095,6 +2100,9 @@ fn load_unwind_mapping(
     if !should_load_unwind_object(request.path, request.file_identity) {
         return;
     }
+    if request.prot.is_some_and(|prot| prot & PROT_EXEC == 0) {
+        return;
+    }
     let key = (
         request.path.to_string(),
         request.start,
@@ -2131,6 +2139,7 @@ fn load_mmap2_unwind_mapping(
             start: record.start,
             len: record.len,
             pgoff: record.pgoff,
+            prot: Some(record.prot),
             path: &record.path,
             file_identity: Some(mmap2_file_identity(record)),
             build_id: None,
