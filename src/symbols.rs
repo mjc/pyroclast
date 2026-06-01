@@ -25,6 +25,9 @@ use crate::process::{CommandRunner, CommandSpec};
 type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
 type FxHashSet<T> = HashSet<T, FxBuildHasher>;
 
+const X86_64_PLT_ENTRY_SIZE: u64 = 16;
+const ELF64_RELA_ENTRY_SIZE: usize = 24;
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct KernelRelocation {
     pub reference_symbol: String,
@@ -1765,9 +1768,10 @@ fn perf_synthesized_plt_symbols(
         .or_else(|| {
             let (offset, size) = plt.file_range()?;
             let has_header = perf_x86_64_plt_relocations(object).is_none_or(|relocations| {
-                u64::try_from(relocations.len()).map_or(true, |len| len * 16 != size)
+                u64::try_from(relocations.len())
+                    .map_or(true, |len| len * X86_64_PLT_ENTRY_SIZE != size)
             });
-            Some((offset + u64::from(has_header) * 16, true))
+            Some((offset + u64::from(has_header) * X86_64_PLT_ENTRY_SIZE, true))
         })
     else {
         return Vec::new();
@@ -1784,7 +1788,7 @@ fn perf_synthesized_plt_symbols(
         symbols.push(PerfSymbolCandidate {
             name: ".plt".to_string(),
             address: plt.file_range().map_or(plt.address(), |(offset, _)| offset),
-            size: 16,
+            size: X86_64_PLT_ENTRY_SIZE,
             scope: PerfSymbolScope::Global,
             binding: PerfSymbolBinding::Global,
         });
@@ -1804,11 +1808,11 @@ fn perf_synthesized_plt_symbols(
         symbols.push(PerfSymbolCandidate {
             name,
             address: plt_offset,
-            size: 16,
+            size: X86_64_PLT_ENTRY_SIZE,
             scope: PerfSymbolScope::Global,
             binding: PerfSymbolBinding::Global,
         });
-        plt_offset += 16;
+        plt_offset += X86_64_PLT_ENTRY_SIZE;
     }
     symbols
 }
@@ -1823,37 +1827,61 @@ fn perf_x86_64_plt_relocations(object: &object::File<'_>) -> Option<Vec<PerfPltR
     let dynamic_symbols = object.dynamic_symbol_table()?;
     let rela_plt = object.section_by_name(".rela.plt")?.data().ok()?;
     let relocations = rela_plt
-        .chunks_exact(24)
-        .filter_map(|entry| {
-            let offset = u64::from_le_bytes(entry[0..8].try_into().ok()?);
-            let info = u64::from_le_bytes(entry[8..16].try_into().ok()?);
-            let addend = i64::from_le_bytes(entry[16..24].try_into().ok()?);
-            let symbol_index = usize::try_from(info >> 32).ok()?;
-            match u32::try_from(info & 0xffff_ffff).ok()? {
-                object::elf::R_X86_64_JUMP_SLOT => dynamic_symbols
-                    .symbol_by_index(SymbolIndex(symbol_index))
-                    .ok()
-                    .and_then(|symbol| symbol.name().ok())
-                    .map(|name| PerfPltRelocation {
-                        offset,
-                        symbol_name: Some(perf_symbol_name(&addr2line::demangle_auto(
-                            Cow::Borrowed(name),
-                            None,
-                        ))),
-                        ifunc_addend: None,
-                    }),
-                object::elf::R_X86_64_IRELATIVE => {
-                    u64::try_from(addend).ok().map(|addend| PerfPltRelocation {
-                        offset,
-                        symbol_name: None,
-                        ifunc_addend: Some(addend),
-                    })
-                }
-                _ => None,
-            }
-        })
+        .chunks_exact(ELF64_RELA_ENTRY_SIZE)
+        .filter_map(parse_elf64_rela_entry)
+        .filter_map(|rela| perf_x86_64_plt_relocation_from_rela(&dynamic_symbols, rela))
         .collect::<Vec<_>>();
     (!relocations.is_empty()).then_some(relocations)
+}
+
+#[derive(Clone, Copy)]
+struct Elf64RelaEntry {
+    offset: u64,
+    symbol_index: usize,
+    relocation_type: u32,
+    addend: i64,
+}
+
+fn parse_elf64_rela_entry(entry: &[u8]) -> Option<Elf64RelaEntry> {
+    let offset = u64::from_le_bytes(entry[0..8].try_into().ok()?);
+    let info = u64::from_le_bytes(entry[8..16].try_into().ok()?);
+    let addend = i64::from_le_bytes(entry[16..24].try_into().ok()?);
+    Some(Elf64RelaEntry {
+        offset,
+        symbol_index: usize::try_from(info >> 32).ok()?,
+        relocation_type: u32::try_from(info & 0xffff_ffff).ok()?,
+        addend,
+    })
+}
+
+fn perf_x86_64_plt_relocation_from_rela<'data>(
+    dynamic_symbols: &impl ObjectSymbolTable<'data>,
+    rela: Elf64RelaEntry,
+) -> Option<PerfPltRelocation> {
+    match rela.relocation_type {
+        object::elf::R_X86_64_JUMP_SLOT => dynamic_symbols
+            .symbol_by_index(SymbolIndex(rela.symbol_index))
+            .ok()
+            .and_then(|symbol| symbol.name().ok())
+            .map(|name| PerfPltRelocation {
+                offset: rela.offset,
+                symbol_name: Some(perf_symbol_name(&addr2line::demangle_auto(
+                    Cow::Borrowed(name),
+                    None,
+                ))),
+                ifunc_addend: None,
+            }),
+        object::elf::R_X86_64_IRELATIVE => {
+            u64::try_from(rela.addend)
+                .ok()
+                .map(|addend| PerfPltRelocation {
+                    offset: rela.offset,
+                    symbol_name: None,
+                    ifunc_addend: Some(addend),
+                })
+        }
+        _ => None,
+    }
 }
 
 fn perf_best_symbol_at(
