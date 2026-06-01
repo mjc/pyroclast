@@ -103,7 +103,6 @@ struct FoldAccumulator {
     sample_frames: Vec<FoldFrame>,
     callchain: Vec<FoldFrame>,
     unwind_debug_dir: Option<PathBuf>,
-    first_event_index: Option<usize>,
 }
 
 #[derive(Default)]
@@ -208,7 +207,6 @@ struct SampleLayouts {
 
 #[derive(Clone, Copy, Debug)]
 struct SampleEventLayout {
-    index: usize,
     layout: SampleLayout,
 }
 
@@ -905,14 +903,12 @@ fn sample_layouts_from_file(file: &File, header: PerfHeader) -> Result<SampleLay
 
     let mut layouts = SampleLayouts {
         fallback: attrs.first().map(|attr| SampleEventLayout {
-            index: 0,
             layout: layout_from_attr(attr),
         }),
         by_identifier: BTreeMap::new(),
     };
-    for (index, attr) in attrs.iter().enumerate() {
+    for attr in &attrs {
         let event = SampleEventLayout {
-            index,
             layout: layout_from_attr(attr),
         };
         for id in file_attr_ids_from_file(file, attr)? {
@@ -1055,7 +1051,6 @@ impl FoldAccumulator {
             sample_frames: Vec::new(),
             callchain: Vec::new(),
             unwind_debug_dir: current_perf_debug_dir(),
-            first_event_index: None,
         }
     }
 
@@ -1359,14 +1354,6 @@ fn add_fold_stack(
 }
 
 impl FoldAccumulator {
-    fn accepts_sample_event(&mut self, event_index: usize) -> bool {
-        if let Some(first_event_index) = self.first_event_index {
-            return event_index == first_event_index;
-        }
-        self.first_event_index = Some(event_index);
-        true
-    }
-
     fn add_deferred_callchain(&mut self, cookie: u64, ips: &[u64]) {
         let Some(samples) = self.deferred_samples.remove(&cookie) else {
             return;
@@ -2118,9 +2105,6 @@ fn parse_sample_for_fold(
     let Some(event) = sample_layouts.layout_for_payload(payload)? else {
         return Ok(());
     };
-    if !accumulator.accepts_sample_event(event.index) {
-        return Ok(());
-    }
     let Some(sample) = parse_sample_record_callchain(payload, event.layout)? else {
         return Ok(());
     };
@@ -2477,14 +2461,12 @@ fn sample_layouts(
     let attrs = parse_file_attrs(bytes, header)?;
     let mut layouts = SampleLayouts {
         fallback: attrs.first().map(|attr| SampleEventLayout {
-            index: 0,
             layout: layout_from_attr(attr),
         }),
         by_identifier: BTreeMap::new(),
     };
-    for (index, attr) in attrs.iter().enumerate() {
+    for attr in &attrs {
         let event = SampleEventLayout {
-            index,
             layout: layout_from_attr(attr),
         };
         for id in parse_file_attr_ids(bytes, attr)? {

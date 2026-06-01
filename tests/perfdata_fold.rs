@@ -1894,7 +1894,8 @@ fn selects_sample_layout_by_id_field() {
 }
 
 #[test]
-fn folds_only_first_encountered_event_type_like_inferno_collapse_perf() {
+fn folds_samples_from_multiple_attrs_when_generated_perf_script_event_name_matches_inferno_filter()
+{
     let attr1 = file_attr_bytes_with_ids(
         PERF_SAMPLE_IDENTIFIER
             | PERF_SAMPLE_IP
@@ -1936,7 +1937,7 @@ fn folds_only_first_encountered_event_type_like_inferno_collapse_perf() {
     )
     .expect("folded");
 
-    assert_eq!(folded, "[unknown];0x2222 2\n");
+    assert_eq!(folded, "[unknown];0x1111 1\n[unknown];0x2222 2\n");
 }
 
 #[test]
@@ -2191,7 +2192,8 @@ fn applies_comm_records_by_perf_timestamp_from_file_path_like_perf_script() {
 }
 
 #[test]
-fn folds_only_first_encountered_event_type_from_file_path_like_inferno_collapse_perf() {
+fn folds_file_samples_from_multiple_attrs_when_generated_perf_script_event_name_matches_inferno_filter()
+ {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
     let attr1 = file_attr_bytes_with_ids(
@@ -2255,7 +2257,7 @@ fn folds_only_first_encountered_event_type_from_file_path_like_inferno_collapse_
     )
     .expect("folded");
 
-    assert_eq!(folded, "[unknown];0x1111 1\n");
+    assert_eq!(folded, "[unknown];0x1111 1\n[unknown];0x2222 2\n");
 }
 
 proptest! {
