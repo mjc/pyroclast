@@ -1856,7 +1856,10 @@ impl<'a> FoldFrameResolver<'a> {
         W: IoWrite + ?Sized,
     {
         let mut mapping_cache = MappingResolveCache::default();
-        for frame in callchain.iter().rev().copied() {
+        for frame in callchain.iter().copied() {
+            if is_perf_context_marker(frame.address()) {
+                continue;
+            }
             if symbol_cache.is_none()
                 && !is_valid_unwound_user_frame(pid, frame, self.mmap_table, &mut mapping_cache)
             {

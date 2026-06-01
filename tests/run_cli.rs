@@ -154,6 +154,55 @@ fn perf_script_command_preserves_sample_event_records_like_perf_script() {
 }
 
 #[test]
+fn perf_script_command_keeps_perf_stack_order_and_skips_context_markers() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    std::fs::write(
+        &perfdata,
+        perfdata_with_records_and_attrs(
+            [file_attr_bytes(
+                PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_PERIOD,
+                0,
+                0,
+            )],
+            [
+                record_bytes(3, &comm_payload(1, 2, "app")),
+                record_bytes(1, &mmap_payload(1, 2, 0x1000, 0x3000, 0, "/bin/app")),
+                record_bytes(
+                    9,
+                    &sample_payload_with_period(
+                        0x1000,
+                        1,
+                        2,
+                        13,
+                        [0x2000, 0x2100, 0xffff_ffff_ffff_ff80],
+                    ),
+                ),
+            ],
+        ),
+    )
+    .expect("write perfdata");
+
+    let output = pyroclast::run_cli([
+        "pyroclast",
+        "plumbing",
+        "perf-script",
+        "--no-symbols",
+        perfdata.to_str().unwrap(),
+    ])
+    .expect("perf script command");
+
+    assert_eq!(
+        output.stdout,
+        concat!(
+            "app 1 0: 13 cpu/cycles/P:\n",
+            "\t2000 /bin/app+0x1000+0x0 ([unknown])\n",
+            "\t2100 /bin/app+0x1100+0x0 ([unknown])\n\n",
+        )
+    );
+}
+
+#[test]
 fn fold_command_can_symbolize_mapped_frames() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
