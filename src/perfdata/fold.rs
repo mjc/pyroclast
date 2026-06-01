@@ -1999,7 +1999,13 @@ fn parse_sample_for_fold(
         let has_recorded_mapping_for_ip = sample
             .pid
             .is_some_and(|pid| accumulator.mmap_table.has_mapping_for_pid(pid, regs.ip));
-        let unwound_frames = if accumulator.object_unwinder.module_count() == 0 {
+        let unwound_frames = if has_recorded_mapping_for_ip
+            && !accumulator
+                .object_unwinder
+                .has_reported_module_for_ip(regs.ip)
+        {
+            Vec::new()
+        } else if accumulator.object_unwinder.module_count() == 0 {
             if accumulator.sample_frames.is_empty() || has_recorded_mapping_for_ip {
                 Vec::new()
             } else {

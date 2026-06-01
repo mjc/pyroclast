@@ -151,6 +151,13 @@ impl FramehopUnwinder {
     }
 
     #[must_use]
+    pub fn has_reported_module_for_ip(&self, ip: u64) -> bool {
+        self.reported_modules
+            .iter()
+            .any(|module| module.range.contains(&ip))
+    }
+
+    #[must_use]
     pub fn unwind_stack(
         &mut self,
         regs: PerfX86_64Regs,
