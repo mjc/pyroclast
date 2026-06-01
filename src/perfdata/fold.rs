@@ -2164,12 +2164,6 @@ fn append_perf_user_unwind_frames(
         .is_some_and(|pid| accumulator.mmap_table.has_mapping_for_pid(pid, regs.ip));
     let has_loaded_mapping_for_ip =
         accumulator.has_loaded_unwind_mapping_for_ip(sample.pid, regs.ip);
-    let has_rejected_mapping_for_ip = sample.pid.is_some_and(|pid| {
-        accumulator
-            .unwind_states
-            .get(&pid)
-            .is_some_and(|state| state.object_unwinder.has_rejected_mapping_for_ip(regs.ip))
-    });
     let unwind_module_count = sample
         .pid
         .and_then(|pid| accumulator.unwind_states.get(&pid))
@@ -2182,14 +2176,10 @@ fn append_perf_user_unwind_frames(
         has_loaded_mapping_for_ip,
         unwind_module_count,
     );
-    let mut unwound_frames = perf_unwind_frames_or_current_ip(
-        unwound_frames,
-        has_loaded_mapping_for_ip && !has_rejected_mapping_for_ip,
-        regs.ip,
-    )
-    .into_iter()
-    .map(FoldFrame::UserUnwind)
-    .collect::<Vec<_>>();
+    let mut unwound_frames = perf_accepted_unwind_frames(unwound_frames)
+        .into_iter()
+        .map(FoldFrame::UserUnwind)
+        .collect::<Vec<_>>();
     let mut mapping_cache = MappingResolveCache::default();
     truncate_user_unwind_at_first_unmapped_frame(
         sample.pid,
@@ -2289,15 +2279,7 @@ fn truncate_user_unwind_at_first_unmapped_frame(
     frames.truncate(index);
 }
 
-fn perf_unwind_frames_or_current_ip(
-    unwound_frames: Vec<u64>,
-    has_loaded_mapping_for_ip: bool,
-    ip: u64,
-) -> Vec<u64> {
-    if unwound_frames.is_empty() && has_loaded_mapping_for_ip {
-        return vec![ip];
-    }
-
+fn perf_accepted_unwind_frames(unwound_frames: Vec<u64>) -> Vec<u64> {
     unwound_frames
 }
 
@@ -2550,10 +2532,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_unwind_for_loaded_module_keeps_current_ip_like_perf_libdw() {
+    fn empty_unwind_for_loaded_module_does_not_invent_current_ip_like_perf_libdw() {
         assert_eq!(
-            super::perf_unwind_frames_or_current_ip(Vec::new(), true, 0x7fff_f7f0_1f40),
-            vec![0x7fff_f7f0_1f40]
+            super::perf_accepted_unwind_frames(Vec::new()),
+            Vec::<u64>::new()
         );
     }
 
