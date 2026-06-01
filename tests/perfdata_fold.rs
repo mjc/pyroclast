@@ -1429,6 +1429,37 @@ fn can_fold_samples_weighted_by_period() {
 }
 
 #[test]
+fn folds_sample_ip_when_callchain_is_absent_like_perf_script() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD,
+            0,
+            0,
+        )],
+        [
+            record_bytes(
+                9,
+                &sample_payload_with_period_no_callchain(0x2000, 11, 12, 7),
+            ),
+            record_bytes(
+                9,
+                &sample_payload_with_period_no_callchain(0x2000, 11, 12, 3),
+            ),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains_with_options(
+        &bytes,
+        FoldOptions {
+            count_periods: true,
+        },
+    )
+    .expect("folded");
+
+    assert_eq!(folded, "[unknown];0x2000 10\n");
+}
+
+#[test]
 fn selects_sample_layout_by_identifier() {
     let attr1 = file_attr_bytes_with_ids(
         PERF_SAMPLE_IDENTIFIER | PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
@@ -2667,6 +2698,15 @@ fn sample_payload_with_period<const N: usize>(
     for frame in callchain {
         payload.extend(frame.to_le_bytes());
     }
+    payload
+}
+
+fn sample_payload_with_period_no_callchain(ip: u64, pid: u32, tid: u32, period: u64) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(ip.to_le_bytes());
+    payload.extend(pid.to_le_bytes());
+    payload.extend(tid.to_le_bytes());
+    payload.extend(period.to_le_bytes());
     payload
 }
 

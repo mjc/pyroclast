@@ -106,6 +106,7 @@ pub struct SampleUserStack<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SampleCallchainFrames<'a> {
     payload: &'a [u8],
+    single_ip: Option<u64>,
 }
 
 #[must_use]
@@ -233,12 +234,13 @@ pub fn parse_sample_record_callchain(
     let mut tid = None;
     let mut time = None;
     let mut period = None;
+    let mut sample_ip = None;
 
     if layout.has(PERF_SAMPLE_IDENTIFIER) {
         cursor.skip_u64()?;
     }
     if layout.has(PERF_SAMPLE_IP) {
-        cursor.skip_u64()?;
+        sample_ip = Some(cursor.read_u64()?);
     }
     if layout.has(PERF_SAMPLE_TID) {
         pid = Some(cursor.read_u32()?);
@@ -267,7 +269,18 @@ pub fn parse_sample_record_callchain(
         cursor.skip_read_format(layout.read_format)?;
     }
     if !layout.has(PERF_SAMPLE_CALLCHAIN) {
-        return Ok(None);
+        return Ok(sample_ip.map(|ip| SampleCallchain {
+            pid,
+            tid,
+            time,
+            period,
+            frames: SampleCallchainFrames {
+                payload: &[],
+                single_ip: Some(ip),
+            },
+            user_regs: None,
+            user_stack: None,
+        }));
     }
 
     let callchain_len = usize::try_from(cursor.read_u64()?)
@@ -297,7 +310,10 @@ pub fn parse_sample_record_callchain(
         tid,
         time,
         period,
-        frames: SampleCallchainFrames { payload: frames },
+        frames: SampleCallchainFrames {
+            payload: frames,
+            single_ip: None,
+        },
         user_regs,
         user_stack,
     }))
@@ -348,12 +364,12 @@ fn supported_perf_sample_mask() -> u64 {
 impl SampleCallchainFrames<'_> {
     #[must_use]
     pub fn len(&self) -> usize {
-        self.payload.len() / 8
+        self.payload.len() / 8 + usize::from(self.single_ip.is_some())
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.payload.is_empty()
+        self.payload.is_empty() && self.single_ip.is_none()
     }
 }
 
@@ -361,6 +377,9 @@ impl Iterator for SampleCallchainFrames<'_> {
     type Item = u64;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if let Some(ip) = self.single_ip.take() {
+            return Some(ip);
+        }
         let (frame, remaining) = self.payload.split_first_chunk::<8>()?;
         self.payload = remaining;
         Some(u64::from_le_bytes(*frame))
