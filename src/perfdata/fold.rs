@@ -1996,12 +1996,15 @@ fn parse_sample_for_fold(
         && let Ok(regs) =
             PerfX86_64Regs::from_perf_masked_values(event.layout.sample_regs_user, &regs.values)
     {
-        let unwound_frames = if accumulator.sample_frames.is_empty()
-            && accumulator.object_unwinder.module_count() == 0
-        {
-            Vec::new()
-        } else if accumulator.object_unwinder.module_count() == 0 {
-            unwind_x86_64_stack(regs, stack.bytes, 256)
+        let has_recorded_mapping_for_ip = sample
+            .pid
+            .is_some_and(|pid| accumulator.mmap_table.has_mapping_for_pid(pid, regs.ip));
+        let unwound_frames = if accumulator.object_unwinder.module_count() == 0 {
+            if accumulator.sample_frames.is_empty() || has_recorded_mapping_for_ip {
+                Vec::new()
+            } else {
+                unwind_x86_64_stack(regs, stack.bytes, 256)
+            }
         } else {
             accumulator
                 .object_unwinder
