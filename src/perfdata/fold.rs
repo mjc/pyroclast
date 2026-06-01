@@ -15,10 +15,7 @@ use crate::perfdata::build_id::{
 };
 use crate::perfdata::endian::read_u64;
 use crate::perfdata::header::{PerfFeatureSection, PerfHeader, parse_header};
-use crate::perfdata::mappings::{
-    FileIdentity, MappingResolveCache, MmapTable, ResolvedMappingRef,
-    file_matches_recorded_identity,
-};
+use crate::perfdata::mappings::{FileIdentity, MappingResolveCache, MmapTable, ResolvedMappingRef};
 use crate::perfdata::raw_stack::{RawStackAccumulator, RawStackEntryRef};
 use crate::perfdata::records::{
     Mmap2Record, PERF_RECORD_FINISHED_ROUND, PERF_RECORD_MISC_CPUMODE_MASK, ParsedRecord,
@@ -2204,11 +2201,8 @@ fn mmap2_file_identity(record: &Mmap2Record) -> FileIdentity {
     }
 }
 
-fn should_load_unwind_object(path: &str, file_identity: Option<FileIdentity>) -> bool {
-    if path.starts_with('[') {
-        return false;
-    }
-    file_identity.is_none_or(|identity| file_matches_recorded_identity(Path::new(path), identity))
+fn should_load_unwind_object(path: &str, _file_identity: Option<FileIdentity>) -> bool {
+    !path.starts_with('[')
 }
 
 fn current_perf_debug_dir() -> Option<PathBuf> {
@@ -2308,23 +2302,20 @@ fn read_sample_u64(payload: &[u8], offset: usize) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::MetadataExt;
-
     use crate::perfdata::mappings::FileIdentity;
 
     #[test]
-    fn skips_unwind_object_when_recorded_file_identity_mismatches_path() {
+    fn loads_unwind_object_when_recorded_file_identity_mismatches_path_like_perf_libdw() {
         let root = tempfile::tempdir().expect("tempdir");
         let path = root.path().join("app");
         std::fs::write(&path, b"binary").expect("write app");
-        let inode = std::fs::metadata(&path).expect("metadata").ino();
 
-        assert!(!super::should_load_unwind_object(
+        assert!(super::should_load_unwind_object(
             path.to_str().expect("utf-8 path"),
             Some(FileIdentity {
                 major: 0,
                 minor: 0,
-                inode: inode + 1,
+                inode: u64::MAX,
                 inode_generation: 0,
             }),
         ));
