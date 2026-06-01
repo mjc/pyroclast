@@ -529,6 +529,43 @@ fn parses_sample_callchain_without_building_sample_record() {
 }
 
 #[test]
+fn callchain_parser_keeps_sample_ip_without_callchain_even_with_unwind_payload_like_perf_script() {
+    let mut payload = Vec::new();
+    payload.extend(0x1000u64.to_le_bytes());
+    payload.extend(123u32.to_le_bytes());
+    payload.extend(456u32.to_le_bytes());
+    payload.extend(9u64.to_le_bytes());
+    payload.extend(1u64.to_le_bytes());
+    payload.extend(0xaaaa_u64.to_le_bytes());
+    payload.extend(3u64.to_le_bytes());
+    payload.extend([1, 2, 3]);
+    payload.extend([0; 5]);
+    payload.extend(3u64.to_le_bytes());
+
+    let sample = parse_sample_record_callchain(
+        &payload,
+        SampleLayout {
+            sample_type: PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_PERIOD
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            sample_regs_user: 0b1,
+            ..layout(0)
+        },
+    )
+    .expect("sample")
+    .expect("perf script falls back to the sample ip when sample->callchain is null");
+
+    assert_eq!(sample.pid, Some(123));
+    assert_eq!(sample.tid, Some(456));
+    assert_eq!(sample.period, Some(9));
+    assert_eq!(sample.frames.collect::<Vec<_>>(), vec![0x1000]);
+    assert!(sample.user_regs.is_none());
+    assert!(sample.user_stack.is_none());
+}
+
+#[test]
 fn callchain_parser_preserves_user_regs_and_stack_for_dwarf_unwinding() {
     let mut payload = Vec::new();
     payload.extend(0x1000u64.to_le_bytes());

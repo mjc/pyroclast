@@ -1782,9 +1782,7 @@ fn folds_sample_ip_when_callchain_is_absent_like_perf_script() {
 }
 
 #[test]
-fn drops_dwarf_user_stack_when_callchain_field_is_absent_like_perf_script() {
-    let current_exe = std::env::current_exe().expect("current exe");
-    let current_exe = current_exe.to_string_lossy();
+fn emits_sample_ip_when_callchain_field_is_absent_even_with_dwarf_payload_like_perf_script() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -1794,28 +1792,22 @@ fn drops_dwarf_user_stack_when_callchain_field_is_absent_like_perf_script() {
                 | PERF_SAMPLE_STACK_USER,
             (1 << 6) | (1 << 7) | (1 << 8),
         )],
-        [
-            record_bytes(
+        [record_bytes(
+            9,
+            &sample_payload_with_period_and_user_stack_no_callchain(
+                0x4000,
+                11,
+                12,
+                7,
                 1,
-                &mmap_payload(11, 11, 0x4000, 0x1000, 0, current_exe.as_ref()),
+                [0x7fff_0008, 0x7fff_0000, 0x4000],
+                [
+                    0, 0, 0, 0, 0, 0, 0, 0, //
+                    0x40, 0, 0, 0, 0, 0, 0, 0, //
+                    0x34, 0x12, 0, 0, 0, 0, 0, 0,
+                ],
             ),
-            record_bytes(
-                9,
-                &sample_payload_with_period_and_user_stack_no_callchain(
-                    0x4000,
-                    11,
-                    12,
-                    7,
-                    1,
-                    [0x7fff_0008, 0x7fff_0000, 0x4000],
-                    [
-                        0, 0, 0, 0, 0, 0, 0, 0, //
-                        0x40, 0, 0, 0, 0, 0, 0, 0, //
-                        0x34, 0x12, 0, 0, 0, 0, 0, 0,
-                    ],
-                ),
-            ),
-        ],
+        )],
     );
 
     let folded = fold_perfdata_callchains_with_options(
@@ -1826,7 +1818,7 @@ fn drops_dwarf_user_stack_when_callchain_field_is_absent_like_perf_script() {
     )
     .expect("folded");
 
-    assert_eq!(folded, "");
+    assert_eq!(folded, "[unknown];0x4000 7\n");
 }
 
 #[test]

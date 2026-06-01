@@ -281,9 +281,6 @@ pub fn parse_sample_record_callchain(
         if layout.has(PERF_SAMPLE_STACK_USER) {
             cursor.skip_user_stack()?;
         }
-        if layout.has(PERF_SAMPLE_REGS_USER) || layout.has(PERF_SAMPLE_STACK_USER) {
-            return Ok(None);
-        }
         return Ok(sample_ip.map(|ip| SampleCallchain {
             pid,
             tid,
