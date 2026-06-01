@@ -1364,6 +1364,41 @@ fn perf_symbol_resolver_constructor_uses_perfdata_cache_before_system_kallsyms()
 }
 
 #[test]
+fn perf_symbol_resolver_does_not_use_system_map_for_recorded_kernel_build_id_without_cache() {
+    let home = tempfile::tempdir().expect("home");
+    let perfdata = home.path().join("perf.data");
+    std::fs::write(&perfdata, perfdata_with_kernel_build_id()).expect("perfdata");
+    let system_map = home.path().join("System.map");
+    std::fs::write(
+        &system_map,
+        "ffffffff88000080 T bogus_current_kernel_symbol\n",
+    )
+    .expect("system map");
+
+    let runner = Addr2lineRunner::new(b"");
+    let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+        pyroclast::symbols::Addr2lineResolver::new(&runner),
+        &perfdata,
+        home.path(),
+        [system_map],
+        &home.path().join("kallsyms"),
+    );
+
+    let symbols = resolver
+        .resolve_batch(&[SymbolRequest {
+            path: PathBuf::from("[kernel.kallsyms]"),
+            relative_address: 0xffff_ffff_8800_008f,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        }])
+        .expect("symbols");
+
+    assert_eq!(symbols, vec![None]);
+    assert!(runner.commands().is_empty());
+}
+
+#[test]
 fn perf_symbol_resolver_prefers_perfdata_kallsyms_over_kernel_elf() {
     let home = tempfile::tempdir().expect("home");
     let perfdata = home.path().join("perf.data");

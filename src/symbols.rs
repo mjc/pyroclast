@@ -219,6 +219,7 @@ pub struct PerfSymbolResolver<O> {
     object_resolver: O,
     debug_dir: Option<PathBuf>,
     kernel_elf: Option<PathBuf>,
+    recorded_kernel_build_id: Option<String>,
     kallsyms: Option<Kallsyms>,
     live_kallsyms: Option<Kallsyms>,
     live_kallsyms_path: Option<PathBuf>,
@@ -515,6 +516,7 @@ where
             object_resolver,
             debug_dir: None,
             kernel_elf: None,
+            recorded_kernel_build_id: None,
             kallsyms: None,
             live_kallsyms: None,
             live_kallsyms_path: None,
@@ -593,7 +595,8 @@ where
     }
 
     fn with_perfdata_kernel_build_id(self, build_id: &str, debug_dir: &Path) -> Self {
-        let self_with_debug_dir = self.with_debug_dir(debug_dir.to_path_buf());
+        let mut self_with_debug_dir = self.with_debug_dir(debug_dir.to_path_buf());
+        self_with_debug_dir.recorded_kernel_build_id = Some(build_id.to_string());
         let kernel_elf = perf_build_id_elf_path(debug_dir, build_id);
         let self_with_kallsyms = match Kallsyms::load_perf_build_id_cache(debug_dir, build_id) {
             Some(kallsyms) => self_with_debug_dir.with_kallsyms(kallsyms),
@@ -1294,10 +1297,20 @@ where
                 .as_ref()
                 .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
                 .or_else(|| {
+                    if self.recorded_kernel_build_id.is_some()
+                        && request.path == Path::new("[kernel.kallsyms]")
+                    {
+                        return None;
+                    }
                     self.system_map_kallsyms_ref()
                         .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
                 })
                 .or_else(|| {
+                    if self.recorded_kernel_build_id.is_some()
+                        && request.path == Path::new("[kernel.kallsyms]")
+                    {
+                        return None;
+                    }
                     self.live_kallsyms_ref()
                         .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
                 })
