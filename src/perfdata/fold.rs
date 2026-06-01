@@ -1423,8 +1423,8 @@ fn comm_for_ids<'a>(
     pid: Option<u32>,
     tid: Option<u32>,
 ) -> Option<&'a str> {
-    pid.and_then(|pid| exec_process_comms.get(&pid))
-        .or_else(|| tid.and_then(|tid| thread_comms.get(&tid)))
+    tid.and_then(|tid| thread_comms.get(&tid))
+        .or_else(|| pid.and_then(|pid| exec_process_comms.get(&pid)))
         .or_else(|| pid.and_then(|pid| process_comms.get(&pid)))
         .map(String::as_str)
 }
