@@ -62,6 +62,42 @@ fn loads_framehop_module_from_object_mapping() {
 }
 
 #[test]
+fn reads_mapped_object_memory_outside_sampled_stack_like_perf_libdw() {
+    let current_exe = std::env::current_exe().expect("current exe");
+    let bytes = std::fs::read(&current_exe).expect("read object");
+    let object = object::File::parse(&bytes[..]).expect("parse object");
+    let segment = object
+        .segments()
+        .find(|segment| segment.size() >= 8 && segment.file_range().1 >= 8)
+        .expect("load segment with bytes");
+    let (file_offset, _) = segment.file_range();
+    let file_offset_usize = usize::try_from(file_offset).expect("file offset fits usize");
+    let expected = u64::from_le_bytes(
+        bytes[file_offset_usize..file_offset_usize + 8]
+            .try_into()
+            .expect("word"),
+    );
+    let base = 0x5555_0000;
+    let mut unwinder = FramehopUnwinder::new();
+
+    assert!(
+        unwinder
+            .add_object_mapping(
+                &current_exe,
+                base + file_offset,
+                segment.size(),
+                file_offset,
+            )
+            .expect("load object mapping")
+    );
+
+    assert_eq!(
+        unwinder.read_process_u64(base + segment.address()),
+        Some(expected)
+    );
+}
+
+#[test]
 fn rejects_overlapping_module_base_like_dwfl_report_elf() {
     let current_exe = std::env::current_exe().expect("current exe");
     let first_start = 0x5555_0000;

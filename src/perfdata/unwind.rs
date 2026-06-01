@@ -32,6 +32,13 @@ pub struct FramehopUnwinder {
 struct ReportedModule {
     base: u64,
     range: Range<u64>,
+    memory_segments: Vec<ModuleMemorySegment>,
+}
+
+#[derive(Clone, Debug)]
+struct ModuleMemorySegment {
+    range: Range<u64>,
+    bytes: ModuleBytes,
 }
 
 #[derive(Clone, Debug)]
@@ -130,6 +137,7 @@ impl FramehopUnwinder {
             return Ok(false);
         }
         let section_info = explicit_module_section_info(&mapped, &object);
+        let memory_segments = module_memory_segments(&mapped, &object, base);
         let module = framehop::Module::<ModuleBytes>::new(
             path.to_string_lossy().into_owned(),
             module_range.clone(),
@@ -140,6 +148,7 @@ impl FramehopUnwinder {
         self.reported_modules.push(ReportedModule {
             base,
             range: module_range,
+            memory_segments,
         });
         self.module_count += 1;
         Ok(true)
@@ -158,6 +167,11 @@ impl FramehopUnwinder {
     }
 
     #[must_use]
+    pub fn read_process_u64(&self, address: u64) -> Option<u64> {
+        read_reported_module_u64(&self.reported_modules, address)
+    }
+
+    #[must_use]
     pub fn unwind_stack(
         &mut self,
         regs: PerfX86_64Regs,
@@ -172,7 +186,13 @@ impl FramehopUnwinder {
             return Vec::new();
         }
         let stack_reader = PerfStackReader::new(regs.sp, stack);
-        let mut read_stack = |address| stack_reader.read_u64(address).ok_or(());
+        let reported_modules = &self.reported_modules;
+        let mut read_stack = |address| {
+            stack_reader
+                .read_u64(address)
+                .or_else(|| read_reported_module_u64(reported_modules, address))
+                .ok_or(())
+        };
         let ip = regs.ip;
         let regs = UnwindRegsX86_64::new(ip, regs.sp, regs.bp);
         let mut iter = self
@@ -249,6 +269,37 @@ fn object_load_range<'a>(object: &object::File<'a, &'a [u8]>) -> Option<Range<u6
             start..start.saturating_add(segment.size())
         })
         .reduce(|left, right| left.start.min(right.start)..left.end.max(right.end))
+}
+
+fn module_memory_segments<'a>(
+    mapped: &Arc<Mmap>,
+    object: &object::File<'a, &'a [u8]>,
+    base: u64,
+) -> Vec<ModuleMemorySegment> {
+    object
+        .segments()
+        .filter_map(|segment| {
+            let bytes = map_file_range(mapped, segment.file_range())?;
+            let start = base.saturating_add(segment.address());
+            let len = u64::try_from(bytes.len()).ok()?;
+            Some(ModuleMemorySegment {
+                range: start..start.saturating_add(len),
+                bytes,
+            })
+        })
+        .collect()
+}
+
+fn read_reported_module_u64(modules: &[ReportedModule], address: u64) -> Option<u64> {
+    modules
+        .iter()
+        .flat_map(|module| module.memory_segments.iter())
+        .find_map(|segment| {
+            let offset = usize::try_from(address.checked_sub(segment.range.start)?).ok()?;
+            let bytes = segment.bytes.get(offset..offset.checked_add(8)?)?;
+            let bytes: [u8; 8] = bytes.try_into().ok()?;
+            Some(u64::from_le_bytes(bytes))
+        })
 }
 
 fn ranges_overlap(left: &Range<u64>, right: &Range<u64>) -> bool {
