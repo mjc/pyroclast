@@ -25,12 +25,14 @@ pub struct FramehopUnwinder {
     cache: CacheX86_64,
     module_count: usize,
     reported_modules: Vec<ReportedModule>,
+    rejected_mapping_ranges: Vec<Range<u64>>,
 }
 
 #[derive(Clone, Debug)]
 struct ReportedModule {
     base: u64,
     range: Range<u64>,
+    mapping_range: Range<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -78,6 +80,7 @@ impl FramehopUnwinder {
             cache: CacheX86_64::new(),
             module_count: 0,
             reported_modules: Vec::new(),
+            rejected_mapping_ranges: Vec::new(),
         }
     }
 
@@ -111,11 +114,15 @@ impl FramehopUnwinder {
         else {
             return Ok(false);
         };
+        let mapping_range = start..start.saturating_add(len);
+        self.reported_modules
+            .retain(|module| !ranges_overlap(&module.mapping_range, &mapping_range));
         if self
             .reported_modules
             .iter()
             .any(|module| ranges_overlap(&module.range, &module_range) && module.base != base)
         {
+            self.rejected_mapping_ranges.push(mapping_range);
             return Ok(false);
         }
         if self
@@ -136,6 +143,7 @@ impl FramehopUnwinder {
         self.reported_modules.push(ReportedModule {
             base,
             range: module_range,
+            mapping_range: start..start.saturating_add(len),
         });
         self.module_count += 1;
         Ok(true)
@@ -153,6 +161,13 @@ impl FramehopUnwinder {
         stack: &[u8],
         max_frames: usize,
     ) -> Vec<u64> {
+        if self
+            .rejected_mapping_ranges
+            .iter()
+            .any(|range| range.contains(&regs.ip))
+        {
+            return Vec::new();
+        }
         let stack_reader = PerfStackReader::new(regs.sp, stack);
         let mut read_stack = |address| stack_reader.read_u64(address).ok_or(());
         let ip = regs.ip;

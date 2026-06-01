@@ -1,3 +1,4 @@
+use object::{Object, ObjectSegment};
 use proptest::prelude::*;
 use pyroclast::perfdata::unwind::{
     FramehopUnwinder, PerfStackReader, PerfX86_64Regs, unwind_x86_64_stack,
@@ -63,18 +64,67 @@ fn loads_framehop_module_from_object_mapping() {
 #[test]
 fn rejects_overlapping_module_base_like_dwfl_report_elf() {
     let current_exe = std::env::current_exe().expect("current exe");
+    let first_start = 0x5555_0000;
+    let gap = adjacent_mapping_gap_for_overlapping_module_ranges(&current_exe);
     let mut unwinder = FramehopUnwinder::new();
 
     let first = unwinder
-        .add_object_mapping(&current_exe, 0x5555_0000, 0x1000_0000, 0)
+        .add_object_mapping(&current_exe, first_start, gap, 0)
         .expect("load first object mapping");
     let second = unwinder
-        .add_object_mapping(&current_exe, 0x5555_0800, 0x1000_0000, 0)
+        .add_object_mapping(&current_exe, first_start + gap, gap, 0)
         .expect("load overlapping object mapping");
 
     assert!(first);
     assert!(!second);
     assert_eq!(unwinder.module_count(), 1);
+}
+
+#[test]
+fn rejected_overlapping_module_range_does_not_unwind_through_prior_module() {
+    let current_exe = std::env::current_exe().expect("current exe");
+    let first_start = 0x5555_0000;
+    let gap = adjacent_mapping_gap_for_overlapping_module_ranges(&current_exe);
+    let mut unwinder = FramehopUnwinder::new();
+    let stack = [
+        0, 0, 0, 0, 0, 0, 0, 0, //
+        0x40, 0, 0, 0, 0, 0, 0, 0, //
+        0x34, 0x12, 0, 0, 0, 0, 0, 0,
+    ];
+    let regs = PerfX86_64Regs {
+        ip: first_start + gap,
+        sp: 0x7fff_0000,
+        bp: 0x7fff_0008,
+    };
+
+    assert!(
+        unwinder
+            .add_object_mapping(&current_exe, first_start, gap, 0)
+            .expect("load first object mapping")
+    );
+    assert!(
+        !unwinder
+            .add_object_mapping(&current_exe, first_start + gap, gap, 0)
+            .expect("reject overlapping object mapping")
+    );
+
+    assert_eq!(unwinder.unwind_stack(regs, &stack, 4), Vec::<u64>::new());
+}
+
+fn adjacent_mapping_gap_for_overlapping_module_ranges(path: &std::path::Path) -> u64 {
+    let bytes = std::fs::read(path).expect("read object");
+    let object = object::File::parse(&bytes[..]).expect("parse object");
+    let range = object
+        .segments()
+        .filter(|segment| segment.size() != 0)
+        .map(|segment| {
+            let start = segment.address();
+            start..start + segment.size()
+        })
+        .reduce(|left, right| left.start.min(right.start)..left.end.max(right.end))
+        .expect("object load range");
+
+    1_u64.max((range.end - range.start) / 2)
 }
 
 proptest! {
