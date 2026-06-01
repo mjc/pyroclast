@@ -531,7 +531,9 @@ fn truncate_at_first_uncovered_unwind_frame(
     frames: &mut Vec<u64>,
     mut has_unwind_info: impl FnMut(u64) -> bool,
 ) {
-    if let Some(index) = frames.iter().position(|address| !has_unwind_info(*address)) {
+    if let Some(index) = frames.iter().position(|address| !has_unwind_info(*address))
+        && index + 1 != frames.len()
+    {
         frames.truncate(index);
     }
 }
@@ -644,6 +646,15 @@ mod tests {
         super::truncate_at_first_uncovered_unwind_frame(&mut frames, |address| address < 0x3000);
 
         assert_eq!(frames, vec![0x1000, 0x2000]);
+    }
+
+    #[test]
+    fn keeps_terminal_object_unwind_frame_without_cfi_like_perf_libdw() {
+        let mut frames = vec![0x1000, 0x2000, 0x3000];
+
+        super::truncate_at_first_uncovered_unwind_frame(&mut frames, |address| address < 0x3000);
+
+        assert_eq!(frames, vec![0x1000, 0x2000, 0x3000]);
     }
 
     #[test]
