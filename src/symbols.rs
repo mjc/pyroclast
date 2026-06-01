@@ -17,7 +17,7 @@ use crate::folded::render_inferno_perf_stack;
 use crate::perfdata::build_id::{
     kernel_build_id_from_perfdata, kernel_build_id_from_perfdata_file,
 };
-use crate::perfdata::mappings::{FileIdentity, ResolvedMappingRef, file_matches_recorded_identity};
+use crate::perfdata::mappings::{FileIdentity, ResolvedMappingRef};
 use crate::process::{CommandRunner, CommandSpec};
 
 type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
@@ -1091,9 +1091,8 @@ where
                         &mut address_cache,
                     ));
                 }
-            } else if let Some(object_request) =
-                self.object_symbol_request(request, &mut address_cache)
-            {
+            } else {
+                let object_request = self.object_symbol_request(request, &mut address_cache);
                 user_indexes.push(index);
                 user_requests.push(object_request);
             }
@@ -1144,9 +1143,8 @@ where
                         &mut address_cache,
                     ));
                 }
-            } else if let Some(object_request) =
-                self.object_symbol_request(request, &mut address_cache)
-            {
+            } else {
+                let object_request = self.object_symbol_request(request, &mut address_cache);
                 user_indexes.push(index);
                 user_requests.push(object_request);
             }
@@ -1179,9 +1177,9 @@ where
         &self,
         request: &SymbolRequest,
         address_cache: &mut ObjectAddressCache,
-    ) -> Option<SymbolRequest> {
+    ) -> SymbolRequest {
         self.cached_object_symbol_request(request, address_cache)
-            .or_else(|| Self::live_object_symbol_request(request, address_cache))
+            .unwrap_or_else(|| Self::live_object_symbol_request(request, address_cache))
     }
 
     fn cached_object_symbol_request(
@@ -1200,18 +1198,14 @@ where
     fn live_object_symbol_request(
         request: &SymbolRequest,
         address_cache: &mut ObjectAddressCache,
-    ) -> Option<SymbolRequest> {
-        if request
-            .file_identity
-            .is_some_and(|identity| !file_matches_recorded_identity(&request.path, identity))
-        {
-            return None;
-        }
-        Some(clean_object_symbol_request_with_cache(
+    ) -> SymbolRequest {
+        // perf's __report_module reports the live DSO path (or build-id path)
+        // without rejecting it for recorded dev/inode drift.
+        clean_object_symbol_request_with_cache(
             request.path.clone(),
             request.relative_address,
             address_cache,
-        ))
+        )
     }
 
     fn live_kallsyms_ref(&self) -> Option<&Kallsyms> {

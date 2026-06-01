@@ -1816,7 +1816,7 @@ fn perf_symbol_resolver_preserves_pluggable_object_frame_lists() {
 }
 
 #[test]
-fn perf_symbol_resolver_skips_stale_user_objects() {
+fn perf_symbol_resolver_uses_live_user_object_despite_recorded_identity_mismatch_like_perf() {
     let object_path = tempfile::NamedTempFile::new().expect("object file");
     let object_resolver = RecordingResolver::with_symbols([(
         SymbolRequest {
@@ -1845,10 +1845,16 @@ fn perf_symbol_resolver_skips_stale_user_objects() {
         }])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![None]);
+    assert_eq!(symbols, vec![Some("app::main".to_string())]);
     assert_eq!(
         resolver.object_resolver().batch_calls(),
-        Vec::<Vec<SymbolRequest>>::new()
+        vec![vec![SymbolRequest {
+            path: object_path.path().to_path_buf(),
+            relative_address: 0x10,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        }]]
     );
 }
 
