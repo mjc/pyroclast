@@ -2105,54 +2105,9 @@ fn parse_sample_for_fold(
     accumulator.sample_frames.reserve(sample.frames.len());
     accumulator
         .sample_frames
-        .extend(sample.frames.map(FoldFrame::Callchain));
+        .extend(sample.frames.clone().map(FoldFrame::Callchain));
     let deferred_cookie = take_deferred_cookie(&mut accumulator.sample_frames);
-    if let (Some(regs), Some(stack)) = (&sample.user_regs, &sample.user_stack)
-        && has_perf_captured_user_stack(stack)
-        && let Ok(regs) =
-            PerfX86_64Regs::from_perf_masked_values(event.layout.sample_regs_user, &regs.values)
-    {
-        let has_recorded_mapping_for_ip = sample
-            .pid
-            .is_some_and(|pid| accumulator.mmap_table.has_mapping_for_pid(pid, regs.ip));
-        let has_loaded_mapping_for_ip =
-            accumulator.has_loaded_unwind_mapping_for_ip(sample.pid, regs.ip);
-        let has_rejected_mapping_for_ip = sample.pid.is_some_and(|pid| {
-            accumulator
-                .unwind_states
-                .get(&pid)
-                .is_some_and(|state| state.object_unwinder.has_rejected_mapping_for_ip(regs.ip))
-        });
-        let unwind_module_count = sample
-            .pid
-            .and_then(|pid| accumulator.unwind_states.get(&pid))
-            .map_or(0, |state| state.object_unwinder.module_count());
-        let unwound_frames = if has_recorded_mapping_for_ip && !has_loaded_mapping_for_ip {
-            Vec::new()
-        } else if unwind_module_count == 0 {
-            if accumulator.sample_frames.is_empty() || has_recorded_mapping_for_ip {
-                Vec::new()
-            } else {
-                unwind_x86_64_stack(regs, stack.bytes, 256)
-            }
-        } else {
-            sample
-                .pid
-                .and_then(|pid| accumulator.unwind_states.get_mut(&pid))
-                .map_or_else(Vec::new, |state| {
-                    state.object_unwinder.unwind_stack(regs, stack.bytes, 256)
-                })
-        };
-        accumulator.sample_frames.extend(
-            perf_unwind_frames_or_current_ip(
-                unwound_frames,
-                has_loaded_mapping_for_ip && !has_rejected_mapping_for_ip,
-                regs.ip,
-            )
-            .into_iter()
-            .map(FoldFrame::UserUnwind),
-        );
-    }
+    append_perf_user_unwind_frames(accumulator, event, &sample);
     let comm = comm_for_ids(
         &accumulator.process_comms,
         &accumulator.exec_process_comms,
@@ -2185,6 +2140,92 @@ fn parse_sample_for_fold(
     Ok(())
 }
 
+fn append_perf_user_unwind_frames(
+    accumulator: &mut FoldAccumulator,
+    event: SampleEventLayout,
+    sample: &crate::perfdata::samples::SampleCallchain<'_>,
+) {
+    let (Some(regs), Some(stack)) = (&sample.user_regs, &sample.user_stack) else {
+        return;
+    };
+    if !has_perf_captured_user_stack(stack) {
+        return;
+    }
+    let Ok(regs) =
+        PerfX86_64Regs::from_perf_masked_values(event.layout.sample_regs_user, &regs.values)
+    else {
+        return;
+    };
+    let has_recorded_mapping_for_ip = sample
+        .pid
+        .is_some_and(|pid| accumulator.mmap_table.has_mapping_for_pid(pid, regs.ip));
+    let has_loaded_mapping_for_ip =
+        accumulator.has_loaded_unwind_mapping_for_ip(sample.pid, regs.ip);
+    let has_rejected_mapping_for_ip = sample.pid.is_some_and(|pid| {
+        accumulator
+            .unwind_states
+            .get(&pid)
+            .is_some_and(|state| state.object_unwinder.has_rejected_mapping_for_ip(regs.ip))
+    });
+    let unwind_module_count = sample
+        .pid
+        .and_then(|pid| accumulator.unwind_states.get(&pid))
+        .map_or(0, |state| state.object_unwinder.module_count());
+    let unwound_frames = unwind_user_stack_like_perf(
+        accumulator,
+        sample,
+        &regs,
+        has_recorded_mapping_for_ip,
+        has_loaded_mapping_for_ip,
+        unwind_module_count,
+    );
+    let mut unwound_frames = perf_unwind_frames_or_current_ip(
+        unwound_frames,
+        has_loaded_mapping_for_ip && !has_rejected_mapping_for_ip,
+        regs.ip,
+    )
+    .into_iter()
+    .map(FoldFrame::UserUnwind)
+    .collect::<Vec<_>>();
+    let mut mapping_cache = MappingResolveCache::default();
+    truncate_user_unwind_at_first_unmapped_frame(
+        sample.pid,
+        &mut unwound_frames,
+        &accumulator.mmap_table,
+        &mut mapping_cache,
+    );
+    accumulator.sample_frames.extend(unwound_frames);
+}
+
+fn unwind_user_stack_like_perf(
+    accumulator: &mut FoldAccumulator,
+    sample: &crate::perfdata::samples::SampleCallchain<'_>,
+    regs: &PerfX86_64Regs,
+    has_recorded_mapping_for_ip: bool,
+    has_loaded_mapping_for_ip: bool,
+    unwind_module_count: usize,
+) -> Vec<u64> {
+    let Some(stack) = &sample.user_stack else {
+        return Vec::new();
+    };
+    if has_recorded_mapping_for_ip && !has_loaded_mapping_for_ip {
+        Vec::new()
+    } else if unwind_module_count == 0 {
+        if accumulator.sample_frames.is_empty() || has_recorded_mapping_for_ip {
+            Vec::new()
+        } else {
+            unwind_x86_64_stack(*regs, stack.bytes, 256)
+        }
+    } else {
+        sample
+            .pid
+            .and_then(|pid| accumulator.unwind_states.get_mut(&pid))
+            .map_or_else(Vec::new, |state| {
+                state.object_unwinder.unwind_stack(*regs, stack.bytes, 256)
+            })
+    }
+}
+
 fn take_deferred_cookie(frames: &mut Vec<FoldFrame>) -> Option<u64> {
     match frames.as_slice() {
         [
@@ -2202,6 +2243,21 @@ fn take_deferred_cookie(frames: &mut Vec<FoldFrame>) -> Option<u64> {
 
 fn has_perf_captured_user_stack(stack: &crate::perfdata::samples::SampleUserStack<'_>) -> bool {
     !stack.bytes.is_empty() && stack.dynamic_size != 0
+}
+
+fn truncate_user_unwind_at_first_unmapped_frame(
+    pid: Option<u32>,
+    frames: &mut Vec<FoldFrame>,
+    mmap_table: &MmapTable,
+    mapping_cache: &mut MappingResolveCache,
+) {
+    let Some(index) = frames
+        .iter()
+        .position(|frame| !is_valid_unwound_user_frame(pid, *frame, mmap_table, mapping_cache))
+    else {
+        return;
+    };
+    frames.truncate(index);
 }
 
 fn perf_unwind_frames_or_current_ip(
@@ -2613,6 +2669,34 @@ mod tests {
         assert_eq!(mappings.len(), 2);
         assert_eq!(mappings[0].relative_address, 0x10);
         assert_eq!(mappings[1].relative_address, 0x20);
+    }
+
+    #[test]
+    fn truncates_user_unwind_at_first_unmapped_frame_like_perf_libdw_entry() {
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x1000,
+            len: 0x100,
+            pgoff: 0,
+            path: "/bin/demo".to_string(),
+        });
+        let mut mapping_cache = super::MappingResolveCache::default();
+        let mut frames = vec![
+            super::FoldFrame::UserUnwind(0x1010),
+            super::FoldFrame::UserUnwind(0x6),
+            super::FoldFrame::UserUnwind(0x1020),
+        ];
+
+        super::truncate_user_unwind_at_first_unmapped_frame(
+            Some(11),
+            &mut frames,
+            &mmap_table,
+            &mut mapping_cache,
+        );
+
+        assert_eq!(frames, vec![super::FoldFrame::UserUnwind(0x1010)]);
     }
 
     #[test]
