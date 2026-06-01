@@ -288,6 +288,30 @@ impl MmapTable {
     }
 
     #[must_use]
+    pub(crate) fn has_overlapping_user_file_mapping_at(&self, pid: u32, ip: u64) -> bool {
+        let Some(bucket) = self.mappings_by_pid.get(&pid) else {
+            return false;
+        };
+        let mut matching_mappings = 0_usize;
+        let mut upper_bound = bucket.partition_point(|indexed| indexed.start <= ip);
+        while upper_bound > 0 {
+            upper_bound -= 1;
+            let indexed = &bucket[upper_bound];
+            if indexed.max_end <= ip {
+                break;
+            }
+            let mapping = &self.mappings[indexed.index];
+            if ip < mapping.end() && mapping.is_user_file_mapping() {
+                matching_mappings += 1;
+                if matching_mappings > 1 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[must_use]
     pub fn has_mappings_for_pid(&self, pid: u32) -> bool {
         self.has_global_mappings || self.pids_with_mappings.contains(&pid)
     }
