@@ -2103,11 +2103,7 @@ fn parse_sample_for_fold(
     let Some(sample) = parse_sample_record_callchain(payload, event.layout)? else {
         return Ok(());
     };
-    let count = if options.count_periods {
-        sample.period.unwrap_or(1)
-    } else {
-        1
-    };
+    let count = sample_fold_count(sample.period, options);
     accumulator.sample_frames.clear();
     accumulator.sample_frames.reserve(sample.frames.len());
     accumulator
@@ -2248,6 +2244,14 @@ fn choose_user_unwind_source(
         }
     } else {
         UserUnwindSource::Object
+    }
+}
+
+fn sample_fold_count(period: Option<u64>, options: FoldOptions) -> u64 {
+    if options.count_periods {
+        period.unwrap_or(1)
+    } else {
+        1
     }
 }
 
@@ -2753,6 +2757,41 @@ mod tests {
         assert_eq!(
             super::choose_user_unwind_source(false, false, false, 1),
             super::UserUnwindSource::Object
+        );
+    }
+
+    #[test]
+    fn sample_fold_count_uses_period_only_when_requested() {
+        assert_eq!(
+            super::sample_fold_count(
+                Some(37),
+                super::FoldOptions {
+                    count_periods: true
+                }
+            ),
+            37
+        );
+        assert_eq!(
+            super::sample_fold_count(
+                Some(37),
+                super::FoldOptions {
+                    count_periods: false
+                }
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn sample_fold_count_defaults_missing_period_to_one() {
+        assert_eq!(
+            super::sample_fold_count(
+                None,
+                super::FoldOptions {
+                    count_periods: true
+                }
+            ),
+            1
         );
     }
 
