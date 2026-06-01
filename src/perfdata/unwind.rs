@@ -227,6 +227,13 @@ impl FramehopUnwinder {
             };
             push_perf_unwind_address(&mut frames, frame.address());
         }
+        // perf's libdw unwinder only emits frames accepted by frame_callback ->
+        // entry in tools/perf/util/unwind-libdw.c. framehop can continue with
+        // architecture fallbacks when no FDE covers an address, so trim those
+        // fallback-only tails here.
+        truncate_at_first_uncovered_unwind_frame(&mut frames, |address| {
+            self.has_unwind_info_for_ip(address)
+        });
         frames
     }
 }
@@ -520,6 +527,15 @@ fn push_perf_unwind_address(frames: &mut Vec<u64>, address: u64) {
     frames.push(address);
 }
 
+fn truncate_at_first_uncovered_unwind_frame(
+    frames: &mut Vec<u64>,
+    mut has_unwind_info: impl FnMut(u64) -> bool,
+) {
+    if let Some(index) = frames.iter().position(|address| !has_unwind_info(*address)) {
+        frames.truncate(index);
+    }
+}
+
 impl PerfX86_64Regs {
     /// Builds the minimal `x86_64` register set needed for stack unwinding from
     /// perf's ascending register-mask encoding.
@@ -616,5 +632,35 @@ impl<'a> PerfStackReader<'a> {
         let bytes = self.bytes.get(offset..offset.checked_add(8)?)?;
         let bytes: [u8; 8] = bytes.try_into().ok()?;
         Some(u64::from_le_bytes(bytes))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn truncates_object_unwind_at_first_frame_without_cfi_like_perf_libdw() {
+        let mut frames = vec![0x1000, 0x2000, 0x3000, 0x4000];
+
+        super::truncate_at_first_uncovered_unwind_frame(&mut frames, |address| address < 0x3000);
+
+        assert_eq!(frames, vec![0x1000, 0x2000]);
+    }
+
+    #[test]
+    fn rejects_object_unwind_when_first_frame_has_no_cfi_like_perf_libdw() {
+        let mut frames = vec![0x3000, 0x4000];
+
+        super::truncate_at_first_uncovered_unwind_frame(&mut frames, |address| address < 0x3000);
+
+        assert_eq!(frames, Vec::<u64>::new());
+    }
+
+    #[test]
+    fn keeps_object_unwind_when_all_frames_have_cfi_like_perf_libdw() {
+        let mut frames = vec![0x1000, 0x2000];
+
+        super::truncate_at_first_uncovered_unwind_frame(&mut frames, |_| true);
+
+        assert_eq!(frames, vec![0x1000, 0x2000]);
     }
 }
