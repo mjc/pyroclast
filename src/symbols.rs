@@ -1297,24 +1297,24 @@ where
                 .as_ref()
                 .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
                 .or_else(|| {
-                    if self.recorded_kernel_build_id.is_some()
-                        && request.path == Path::new("[kernel.kallsyms]")
-                    {
+                    if !self.can_use_system_kernel_symbols(request) {
                         return None;
                     }
                     self.system_map_kallsyms_ref()
                         .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
                 })
                 .or_else(|| {
-                    if self.recorded_kernel_build_id.is_some()
-                        && request.path == Path::new("[kernel.kallsyms]")
-                    {
+                    if !self.can_use_system_kernel_symbols(request) {
                         return None;
                     }
                     self.live_kallsyms_ref()
                         .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
                 })
         }
+    }
+
+    fn can_use_system_kernel_symbols(&self, request: &SymbolRequest) -> bool {
+        self.recorded_kernel_build_id.is_none() || request.path != Path::new("[kernel.kallsyms]")
     }
 }
 
