@@ -1680,6 +1680,54 @@ fn folds_sample_ip_when_callchain_is_absent_like_perf_script() {
 }
 
 #[test]
+fn drops_dwarf_user_stack_when_callchain_field_is_absent_like_perf_script() {
+    let current_exe = std::env::current_exe().expect("current exe");
+    let current_exe = current_exe.to_string_lossy();
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_PERIOD
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            (1 << 6) | (1 << 7) | (1 << 8),
+        )],
+        [
+            record_bytes(
+                1,
+                &mmap_payload(11, 11, 0x4000, 0x1000, 0, current_exe.as_ref()),
+            ),
+            record_bytes(
+                9,
+                &sample_payload_with_period_and_user_stack_no_callchain(
+                    0x4000,
+                    11,
+                    12,
+                    7,
+                    1,
+                    [0x7fff_0008, 0x7fff_0000, 0x4000],
+                    [
+                        0, 0, 0, 0, 0, 0, 0, 0, //
+                        0x40, 0, 0, 0, 0, 0, 0, 0, //
+                        0x34, 0x12, 0, 0, 0, 0, 0, 0,
+                    ],
+                ),
+            ),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains_with_options(
+        &bytes,
+        FoldOptions {
+            count_periods: true,
+        },
+    )
+    .expect("folded");
+
+    assert_eq!(folded, "");
+}
+
+#[test]
 fn selects_sample_layout_by_identifier() {
     let attr1 = file_attr_bytes_with_ids(
         PERF_SAMPLE_IDENTIFIER | PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
@@ -2983,6 +3031,20 @@ fn sample_payload_with_period_no_callchain(ip: u64, pid: u32, tid: u32, period: 
     payload.extend(pid.to_le_bytes());
     payload.extend(tid.to_le_bytes());
     payload.extend(period.to_le_bytes());
+    payload
+}
+
+fn sample_payload_with_period_and_user_stack_no_callchain<const R: usize, const S: usize>(
+    ip: u64,
+    pid: u32,
+    tid: u32,
+    period: u64,
+    abi: u64,
+    regs: [u64; R],
+    stack: [u8; S],
+) -> Vec<u8> {
+    let mut payload = sample_payload_with_period_no_callchain(ip, pid, tid, period);
+    append_user_stack_payload(&mut payload, abi, regs, stack, S as u64);
     payload
 }
 

@@ -269,6 +269,21 @@ pub fn parse_sample_record_callchain(
         cursor.skip_read_format(layout.read_format)?;
     }
     if !layout.has(PERF_SAMPLE_CALLCHAIN) {
+        if layout.has(PERF_SAMPLE_RAW) {
+            cursor.skip_sized_u32_payload()?;
+        }
+        if layout.has(PERF_SAMPLE_BRANCH_STACK) {
+            cursor.skip_branch_stack(layout.branch_sample_type)?;
+        }
+        if layout.has(PERF_SAMPLE_REGS_USER) {
+            cursor.skip_regs(layout.sample_regs_user)?;
+        }
+        if layout.has(PERF_SAMPLE_STACK_USER) {
+            cursor.skip_user_stack()?;
+        }
+        if layout.has(PERF_SAMPLE_REGS_USER) || layout.has(PERF_SAMPLE_STACK_USER) {
+            return Ok(None);
+        }
         return Ok(sample_ip.map(|ip| SampleCallchain {
             pid,
             tid,
