@@ -253,6 +253,40 @@ fn folds_dwarf_user_stack_payloads_before_kernel_callchain_frames() {
 }
 
 #[test]
+fn drops_kernel_addresses_synthesized_from_dwarf_user_stack_like_perf_script() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            (1 << 6) | (1 << 7) | (1 << 8),
+        )],
+        [record_bytes(
+            9,
+            &sample_payload_with_user_stack(
+                0x4000,
+                11,
+                12,
+                [0x9000],
+                1,
+                [0x7fff_0008, 0x7fff_0000, 0x4000],
+                [
+                    0, 0, 0, 0, 0, 0, 0, 0, //
+                    0x40, 0, 0, 0, 0, 0, 0, 0, //
+                    0, 0, 0, 0x81, 0xff, 0xff, 0xff, 0xff,
+                ],
+            ),
+        )],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, "[unknown];0x4000;0x9000 1\n");
+}
+
+#[test]
 fn keeps_dwarf_user_stack_payloads_when_kernel_callchain_has_user_context_marker() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(

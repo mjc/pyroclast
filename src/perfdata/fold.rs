@@ -1856,8 +1856,8 @@ fn should_drop_perf_data_user_unwind_frame(
     let FoldFrame::UserUnwind(address) = frame else {
         return false;
     };
-    !is_kernel_space_frame(address)
-        && pid.is_some_and(|pid| {
+    is_kernel_space_frame(address)
+        || pid.is_some_and(|pid| {
             mmap_table
                 .mapping_path_cached(pid, address, mapping_cache)
                 .is_some_and(should_drop_user_unwind_mapping_path)
