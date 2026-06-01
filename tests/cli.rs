@@ -407,6 +407,17 @@ fn parses_plumbing_fold_and_summarize_commands() {
         matches!(rust_symbolized_fold.command, CliCommand::Plumbing { command: PlumbingCommand::Fold(command) } if command.input == std::path::Path::new("perf.data") && !command.symbols && command.symbolizer == SymbolizerKind::RustAddr2line)
     );
 
+    let perf_script = Cli::parse_from([
+        "pyroclast",
+        "plumbing",
+        "perf-script",
+        "--no-symbols",
+        "perf.data",
+    ]);
+    assert!(
+        matches!(perf_script.command, CliCommand::Plumbing { command: PlumbingCommand::PerfScript(command) } if command.input == std::path::Path::new("perf.data") && !command.symbols && command.symbolizer == SymbolizerKind::RustAddr2line)
+    );
+
     let summarize = Cli::parse_from(["pyroclast", "plumbing", "summarize", "--json", "run-dir"]);
     assert!(
         matches!(summarize.command, CliCommand::Plumbing { command: PlumbingCommand::Summarize(command) } if command.json && command.artifact_dir == std::path::Path::new("run-dir"))

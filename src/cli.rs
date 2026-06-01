@@ -44,6 +44,7 @@ pub enum CliCommand {
 #[derive(Debug, Subcommand)]
 pub enum PlumbingCommand {
     Fold(FoldArgs),
+    PerfScript(PerfScriptArgs),
     Flamegraph(FlamegraphArgs),
     Summarize(SummarizeArgs),
     Parse {
@@ -291,6 +292,17 @@ pub struct FoldArgs {
     #[arg(long)]
     pub count_periods: bool,
 
+    #[arg(long = "no-symbols", action = ArgAction::SetFalse, default_value_t = true)]
+    pub symbols: bool,
+
+    #[arg(long, value_enum, default_value_t = SymbolizerKind::RustAddr2line)]
+    pub symbolizer: SymbolizerKind,
+
+    pub input: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct PerfScriptArgs {
     #[arg(long = "no-symbols", action = ArgAction::SetFalse, default_value_t = true)]
     pub symbols: bool,
 

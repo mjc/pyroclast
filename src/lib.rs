@@ -39,7 +39,8 @@ pub use output::{CliOutput, write_cli_output};
 use perfdata::analysis::{PerfdataAnalysis, analyze_perfdata_file};
 use perfdata::fold::{
     FoldOptions, fold_perfdata_file, fold_perfdata_file_with_options,
-    fold_perfdata_file_with_symbols,
+    fold_perfdata_file_with_symbols, write_inferno_perf_script_file_with_options,
+    write_inferno_perf_script_file_with_symbols,
 };
 use process::{CommandRunner, RealCommandRunner};
 use summary::threads::{render_folded_stack_summary_text, summarize_folded_stacks};
@@ -328,6 +329,14 @@ where
                 stderr: String::new(),
             })
         }
+        PlumbingCommand::PerfScript(command) => {
+            let stdout =
+                perf_script_for_cli(&command.input, command.symbols, command.symbolizer, runner)?;
+            Ok(CliOutput {
+                stdout,
+                stderr: String::new(),
+            })
+        }
         PlumbingCommand::Flamegraph(command) => {
             let output = command
                 .output
@@ -611,4 +620,27 @@ where
     } else {
         Ok(fold_perfdata_file_with_options(path, options)?)
     }
+}
+
+fn perf_script_for_cli<R>(
+    path: &std::path::Path,
+    symbols: bool,
+    symbolizer: SymbolizerKind,
+    runner: &R,
+) -> backends::BackendResult<String>
+where
+    R: CommandRunner,
+{
+    let options = FoldOptions {
+        count_periods: true,
+    };
+    let mut output = Vec::new();
+    if symbols {
+        let symbol_resolver =
+            perf_symbol_resolver_for_current_home_with_symbolizer(runner, path, symbolizer);
+        write_inferno_perf_script_file_with_symbols(path, options, &symbol_resolver, &mut output)?;
+    } else {
+        write_inferno_perf_script_file_with_options(path, options, &mut output)?;
+    }
+    Ok(String::from_utf8(output)?)
 }

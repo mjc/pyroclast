@@ -76,6 +76,42 @@ fn fold_command_reads_perfdata_directly() {
 }
 
 #[test]
+fn perf_script_command_exports_inferno_compatible_perf_script() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    std::fs::write(
+        &perfdata,
+        perfdata_with_records_and_attrs(
+            [file_attr_bytes(
+                PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_PERIOD,
+                0,
+                0,
+            )],
+            [
+                record_bytes(3, &comm_payload(1, 2, "app")),
+                record_bytes(1, &mmap_payload(1, 2, 0x1000, 0x2000, 0, "/bin/app")),
+                record_bytes(9, &sample_payload_with_period(0x1000, 1, 2, 144, [0x2000])),
+            ],
+        ),
+    )
+    .expect("write perfdata");
+
+    let output = pyroclast::run_cli([
+        "pyroclast",
+        "plumbing",
+        "perf-script",
+        "--no-symbols",
+        perfdata.to_str().unwrap(),
+    ])
+    .expect("perf script command");
+
+    assert_eq!(
+        output.stdout,
+        "app 1/1 0: 144 cycles:\n\t2000 /bin/app+0x1000+0x0 ([unknown])\n\n"
+    );
+}
+
+#[test]
 fn fold_command_can_symbolize_mapped_frames() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
