@@ -1996,14 +1996,8 @@ fn parse_sample_for_fold(
         && let Ok(regs) =
             PerfX86_64Regs::from_perf_masked_values(event.layout.sample_regs_user, &regs.values)
     {
-        let has_overlapping_user_mapping = sample.pid.is_some_and(|pid| {
-            accumulator
-                .mmap_table
-                .has_overlapping_user_file_mapping_at(pid, regs.ip)
-        });
-        let unwound_frames = if has_overlapping_user_mapping
-            || (accumulator.sample_frames.is_empty()
-                && accumulator.object_unwinder.module_count() == 0)
+        let unwound_frames = if accumulator.sample_frames.is_empty()
+            && accumulator.object_unwinder.module_count() == 0
         {
             Vec::new()
         } else if accumulator.object_unwinder.module_count() == 0 {

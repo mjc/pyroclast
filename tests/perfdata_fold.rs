@@ -219,7 +219,7 @@ fn drops_dwarf_user_stack_when_mapped_object_cannot_be_loaded_like_perf_script()
 }
 
 #[test]
-fn drops_dwarf_user_stack_when_user_mappings_overlap_like_perf_script() {
+fn keeps_dwarf_user_stack_when_newer_mapping_replaces_overlap_like_perf_script() {
     let current_exe = std::env::current_exe().expect("current exe");
     let current_exe = current_exe.to_string_lossy();
     let bytes = perfdata_with_records_and_attrs(
@@ -261,7 +261,8 @@ fn drops_dwarf_user_stack_when_user_mappings_overlap_like_perf_script() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "");
+    let expected = format!("[unknown];{current_exe}+0x100 1\n");
+    assert_eq!(folded, expected);
 }
 
 #[test]
