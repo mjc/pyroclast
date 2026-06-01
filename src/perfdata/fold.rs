@@ -197,6 +197,7 @@ struct UserUnwindContext {
     callchain: SampleCallchainState,
     initial_ip_mapping: InitialIpMappingState,
     module_count: usize,
+    frame_pointer_at_or_above_stack_pointer: bool,
 }
 
 impl FoldFrame {
@@ -2354,6 +2355,7 @@ fn append_perf_user_unwind_frames(
             callchain,
             initial_ip_mapping,
             module_count,
+            frame_pointer_at_or_above_stack_pointer: regs.bp >= regs.sp,
         },
     );
     let mut unwound_frames = perf_accepted_unwind_frames(unwound_frames)
@@ -2406,36 +2408,48 @@ fn choose_user_unwind_source(context: UserUnwindContext) -> UserUnwindSource {
     {
         UserUnwindSource::None
     } else if context.module_count == 0 {
-        if has_recorded_callchain_frames(context.callchain)
+        if has_perf_frame_pointer_fallback(context)
             && context.initial_ip_mapping == InitialIpMappingState::NoRecordedMapping
         {
             UserUnwindSource::FramePointer
         } else {
             UserUnwindSource::None
         }
-    } else if matches!(
-        context.callchain,
-        SampleCallchainState::KernelWithCallchain
-            | SampleCallchainState::Other {
-                has_callchain: true,
-                ..
-            }
-    ) {
+    } else if has_perf_object_unwind(context) {
         UserUnwindSource::Object
     } else {
         UserUnwindSource::None
     }
 }
 
-fn has_recorded_callchain_frames(callchain: SampleCallchainState) -> bool {
-    matches!(
-        callchain,
-        SampleCallchainState::KernelWithCallchain
-            | SampleCallchainState::Other {
-                has_callchain: true,
-                has_frames: true,
-            }
-    )
+fn has_perf_frame_pointer_fallback(context: UserUnwindContext) -> bool {
+    match context.callchain {
+        SampleCallchainState::KernelWithCallchain => {
+            context.frame_pointer_at_or_above_stack_pointer
+        }
+        SampleCallchainState::Other {
+            has_callchain: true,
+            has_frames: true,
+        } => true,
+        SampleCallchainState::KernelWithoutCallchain
+        | SampleCallchainState::KernelWithUserFrame
+        | SampleCallchainState::Other { .. } => false,
+    }
+}
+
+fn has_perf_object_unwind(context: UserUnwindContext) -> bool {
+    match context.callchain {
+        SampleCallchainState::KernelWithCallchain => {
+            context.frame_pointer_at_or_above_stack_pointer
+        }
+        SampleCallchainState::Other {
+            has_callchain: true,
+            ..
+        } => true,
+        SampleCallchainState::KernelWithoutCallchain
+        | SampleCallchainState::KernelWithUserFrame
+        | SampleCallchainState::Other { .. } => false,
+    }
 }
 
 fn sample_fold_count(period: Option<u64>, options: FoldOptions) -> u64 {
@@ -3034,6 +3048,7 @@ mod tests {
                 },
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingMissing,
                 module_count: 1,
+                frame_pointer_at_or_above_stack_pointer: false,
             }),
             super::UserUnwindSource::None
         );
@@ -3049,6 +3064,7 @@ mod tests {
                 },
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
                 module_count: 0,
+                frame_pointer_at_or_above_stack_pointer: false,
             }),
             super::UserUnwindSource::FramePointer
         );
@@ -3060,6 +3076,7 @@ mod tests {
                 },
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
                 module_count: 0,
+                frame_pointer_at_or_above_stack_pointer: false,
             }),
             super::UserUnwindSource::None
         );
@@ -3071,6 +3088,7 @@ mod tests {
                 },
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
                 module_count: 0,
+                frame_pointer_at_or_above_stack_pointer: false,
             }),
             super::UserUnwindSource::None
         );
@@ -3086,6 +3104,7 @@ mod tests {
                 },
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
                 module_count: 1,
+                frame_pointer_at_or_above_stack_pointer: false,
             }),
             super::UserUnwindSource::Object
         );
@@ -3101,6 +3120,33 @@ mod tests {
                 },
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
                 module_count: 1,
+                frame_pointer_at_or_above_stack_pointer: false,
+            }),
+            super::UserUnwindSource::Object
+        );
+    }
+
+    #[test]
+    fn user_unwind_source_skips_object_unwind_for_invalid_kernel_bp_like_perf_script() {
+        assert_eq!(
+            super::choose_user_unwind_source(super::UserUnwindContext {
+                callchain: super::SampleCallchainState::KernelWithCallchain,
+                initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
+                module_count: 1,
+                frame_pointer_at_or_above_stack_pointer: false,
+            }),
+            super::UserUnwindSource::None
+        );
+    }
+
+    #[test]
+    fn user_unwind_source_uses_object_unwind_for_valid_kernel_bp_like_perf_script() {
+        assert_eq!(
+            super::choose_user_unwind_source(super::UserUnwindContext {
+                callchain: super::SampleCallchainState::KernelWithCallchain,
+                initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
+                module_count: 1,
+                frame_pointer_at_or_above_stack_pointer: true,
             }),
             super::UserUnwindSource::Object
         );
@@ -3113,6 +3159,7 @@ mod tests {
                 callchain: super::SampleCallchainState::KernelWithoutCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
                 module_count: 1,
+                frame_pointer_at_or_above_stack_pointer: false,
             }),
             super::UserUnwindSource::None
         );
@@ -3125,6 +3172,7 @@ mod tests {
                 callchain: super::SampleCallchainState::KernelWithUserFrame,
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
                 module_count: 1,
+                frame_pointer_at_or_above_stack_pointer: false,
             }),
             super::UserUnwindSource::None
         );
@@ -3151,6 +3199,36 @@ mod tests {
                 vec![0x7fff_f7ea_3f4b, 0x5555_5578_8ba4, 0x5555_5578_8ba5],
             ),
             vec![0x7fff_f7ea_3f4b]
+        );
+    }
+
+    #[test]
+    fn user_unwind_source_skips_frame_pointer_fallback_for_kernel_callchain_like_perf_script() {
+        // Real period 1593359 sample from target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
+        // perf script prints the recorded kernel callchain only. With no object
+        // module loaded yet, Pyroclast must not invent a frame-pointer fallback
+        // user frame from PERF_SAMPLE_REGS_USER/PERF_SAMPLE_STACK_USER.
+        assert_eq!(
+            super::choose_user_unwind_source(super::UserUnwindContext {
+                callchain: super::SampleCallchainState::KernelWithCallchain,
+                initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
+                module_count: 0,
+                frame_pointer_at_or_above_stack_pointer: false,
+            }),
+            super::UserUnwindSource::None
+        );
+    }
+
+    #[test]
+    fn user_unwind_source_uses_frame_pointer_for_valid_kernel_bp_like_perf_script() {
+        assert_eq!(
+            super::choose_user_unwind_source(super::UserUnwindContext {
+                callchain: super::SampleCallchainState::KernelWithCallchain,
+                initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
+                module_count: 0,
+                frame_pointer_at_or_above_stack_pointer: true,
+            }),
+            super::UserUnwindSource::FramePointer
         );
     }
 
