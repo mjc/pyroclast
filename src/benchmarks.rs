@@ -106,7 +106,7 @@ where
 
     let perf_script = match &args.export_perf_script {
         Some(path) => {
-            export_perf_script(&input, path, runner, args.symbols)
+            export_perf_script(&input, path, runner)
                 .map_err(|error| format!("perf script export failed: {error}"))?;
             Some(path.clone())
         }
@@ -404,12 +404,7 @@ where
 ///
 /// Returns an error when the `perf.data` input cannot be parsed, symbolized, or
 /// the output file cannot be written.
-pub fn export_perf_script<R>(
-    perf_data: &Path,
-    output: &Path,
-    runner: &R,
-    _symbols: bool,
-) -> Result<(), String>
+pub fn export_perf_script<R>(perf_data: &Path, output: &Path, runner: &R) -> Result<(), String>
 where
     R: CommandRunner,
 {

@@ -214,7 +214,7 @@ fn exports_perf_script_for_old_pipeline_benchmarks() {
     .expect("write perfdata");
     let runner = PerfScriptRunner::default();
 
-    export_perf_script(&perfdata, &perf_script, &runner, false).expect("export perf script");
+    export_perf_script(&perfdata, &perf_script, &runner).expect("export perf script");
 
     assert_eq!(
         std::fs::read_to_string(&perf_script).unwrap(),
