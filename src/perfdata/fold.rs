@@ -26,8 +26,7 @@ use crate::perfdata::samples::{
     PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_ID,
     PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID,
     PERF_SAMPLE_TIME, SampleLayout, is_kernel_space_frame, is_perf_context_marker,
-    is_perf_user_context_marker, is_perf_user_deferred_context_marker,
-    parse_sample_record_callchain,
+    is_perf_user_deferred_context_marker, parse_sample_record_callchain,
 };
 use crate::perfdata::unwind::{FramehopUnwinder, PerfX86_64Regs, unwind_x86_64_stack};
 use crate::symbols::{SymbolFrameCache, SymbolRequest, SymbolResolver, perf_build_id_elf_path};
@@ -2325,15 +2324,18 @@ fn append_perf_user_unwind_frames(
         .pid
         .and_then(|pid| accumulator.unwind_states.get(&pid))
         .map_or(0, |state| state.object_unwinder.module_count());
+    let has_recorded_user_frame = sample.frames.clone().any(is_recorded_user_callchain_frame);
+    let has_recorded_kernel_frame = sample
+        .frames
+        .clone()
+        .any(is_recorded_kernel_callchain_frame);
     let callchain = if (misc & PERF_RECORD_MISC_CPUMODE_MASK) == PERF_RECORD_MISC_CPUMODE_KERNEL
         && sample.frames.is_empty()
     {
         SampleCallchainState::KernelWithoutCallchain
-    } else if (misc & PERF_RECORD_MISC_CPUMODE_MASK) == PERF_RECORD_MISC_CPUMODE_KERNEL
-        && sample.frames.clone().any(is_recorded_user_callchain_frame)
-    {
-        // perf script keeps the recorded callchain for kernel samples and does
-        // not append extra user DWARF callers after a user-space frame.
+    } else if has_recorded_kernel_frame && has_recorded_user_frame {
+        // perf script keeps a recorded kernel-to-user callchain and does not
+        // append extra user DWARF callers after the user-space frame.
         SampleCallchainState::KernelWithUserFrame
     } else {
         SampleCallchainState::Other {
@@ -2434,8 +2436,11 @@ fn sample_fold_count(period: Option<u64>, options: FoldOptions) -> u64 {
 }
 
 fn is_recorded_user_callchain_frame(frame: u64) -> bool {
-    is_perf_user_context_marker(frame)
-        || (!is_perf_context_marker(frame) && !is_kernel_space_frame(frame))
+    !is_perf_context_marker(frame) && !is_kernel_space_frame(frame)
+}
+
+fn is_recorded_kernel_callchain_frame(frame: u64) -> bool {
+    !is_perf_context_marker(frame) && is_kernel_space_frame(frame)
 }
 
 fn take_deferred_cookie(frames: &mut Vec<FoldFrame>) -> Option<u64> {
