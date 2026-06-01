@@ -1544,7 +1544,14 @@ struct PerfSymbolCandidate {
     name: String,
     address: u64,
     size: u64,
+    scope: PerfSymbolScope,
     binding: PerfSymbolBinding,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PerfSymbolScope {
+    Global,
+    Local,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1579,6 +1586,12 @@ fn perf_best_duplicate_symbol<'a>(
     }
     if candidate.size == 0 && current.size > 0 {
         return current;
+    }
+    if current.scope == PerfSymbolScope::Global && candidate.scope != PerfSymbolScope::Global {
+        return current;
+    }
+    if candidate.scope == PerfSymbolScope::Global && current.scope != PerfSymbolScope::Global {
+        return candidate;
     }
     if candidate.binding == PerfSymbolBinding::Weak && current.binding != PerfSymbolBinding::Weak {
         return current;
@@ -1625,20 +1638,8 @@ impl PerfObjectSymbolIndex {
         };
         let mut symbols = object
             .symbols()
-            .filter(perf_symbol_is_candidate)
-            .map(|symbol| PerfSymbolCandidate {
-                name: perf_symbol_name(&addr2line::demangle_auto(
-                    Cow::Borrowed(symbol.name().unwrap_or_default()),
-                    None,
-                )),
-                address: symbol.address(),
-                size: symbol.size(),
-                binding: if symbol.is_weak() {
-                    PerfSymbolBinding::Weak
-                } else {
-                    PerfSymbolBinding::Global
-                },
-            })
+            .chain(object.dynamic_symbols())
+            .filter_map(|symbol| perf_symbol_candidate_from_object_symbol(&symbol))
             .collect::<Vec<_>>();
         symbols.sort_by_key(|symbol| symbol.address);
         Self { symbols }
@@ -1660,6 +1661,29 @@ impl PerfObjectSymbolIndex {
         }
         best.map(|candidate| candidate.name.as_str())
     }
+}
+
+fn perf_symbol_candidate_from_object_symbol(
+    symbol: &object::Symbol<'_, '_>,
+) -> Option<PerfSymbolCandidate> {
+    perf_symbol_is_candidate(symbol).then(|| PerfSymbolCandidate {
+        name: perf_symbol_name(&addr2line::demangle_auto(
+            Cow::Borrowed(symbol.name().unwrap_or_default()),
+            None,
+        )),
+        address: symbol.address(),
+        size: symbol.size(),
+        scope: if symbol.is_global() {
+            PerfSymbolScope::Global
+        } else {
+            PerfSymbolScope::Local
+        },
+        binding: if symbol.is_weak() {
+            PerfSymbolBinding::Weak
+        } else {
+            PerfSymbolBinding::Global
+        },
+    })
 }
 
 fn rust_addr2line_loader<'a>(
@@ -2460,13 +2484,13 @@ mod tests {
     use std::cell::Cell;
     use std::sync::Arc;
 
-    use object::{Object, ObjectSegment, ObjectSymbol};
+    use object::{Object, ObjectSegment, ObjectSymbol, build, elf};
 
     use super::{
         PerfAddressRange, PerfDwarfDieKind, PerfDwarfDieNode, PerfDwarfNameInterner,
-        PerfSymbolBinding, PerfSymbolCandidate, ResolvedMappingRef, RustAddr2lineResolver,
-        SymbolFrameCache, SymbolRequest, SymbolResolver, clean_object_symbol_request,
-        perf_best_duplicate_symbol, perf_dwarf_frame_names_from_index,
+        PerfSymbolBinding, PerfSymbolCandidate, PerfSymbolScope, ResolvedMappingRef,
+        RustAddr2lineResolver, SymbolFrameCache, SymbolRequest, SymbolResolver,
+        clean_object_symbol_request, perf_best_duplicate_symbol, perf_dwarf_frame_names_from_index,
         perf_dwarf_frame_ranges_from_roots, perf_frames_with_object_alias,
     };
 
@@ -2495,12 +2519,14 @@ mod tests {
             name: "__read".to_string(),
             address: 0x1000,
             size: 128,
+            scope: PerfSymbolScope::Global,
             binding: PerfSymbolBinding::Global,
         };
         let public_alias = PerfSymbolCandidate {
             name: "read".to_string(),
             address: 0x1000,
             size: 128,
+            scope: PerfSymbolScope::Global,
             binding: PerfSymbolBinding::Global,
         };
 
@@ -2508,6 +2534,37 @@ mod tests {
             perf_best_duplicate_symbol(&internal_alias, &public_alias).name,
             "read"
         );
+    }
+
+    #[test]
+    fn perf_alias_tie_breaker_prefers_global_symbol_like_perf() {
+        let local_alias = PerfSymbolCandidate {
+            name: "__libc_read".to_string(),
+            address: 0x1000,
+            size: 128,
+            scope: PerfSymbolScope::Local,
+            binding: PerfSymbolBinding::Global,
+        };
+        let global_alias = PerfSymbolCandidate {
+            name: "read".to_string(),
+            address: 0x1000,
+            size: 128,
+            scope: PerfSymbolScope::Global,
+            binding: PerfSymbolBinding::Global,
+        };
+
+        assert_eq!(
+            perf_best_duplicate_symbol(&local_alias, &global_alias).name,
+            "read"
+        );
+    }
+
+    #[test]
+    fn object_symbol_index_reads_dynamic_symbols_like_perf() {
+        let object_bytes = elf_with_dynamic_text_symbol(b"read", 0x1000, 46);
+        let symbols = super::PerfObjectSymbolIndex::from_object_bytes(&object_bytes);
+
+        assert_eq!(symbols.symbol_name(0x1008), Some("read"));
     }
 
     #[test]
@@ -2523,6 +2580,68 @@ mod tests {
             ),
             vec!["alloc::collections::btree::map::IntoIter<K,V,A>::dying_next".to_string()]
         );
+    }
+
+    fn elf_with_dynamic_text_symbol(name: &'static [u8], address: u64, size: usize) -> Vec<u8> {
+        let mut builder = build::elf::Builder::new(object::Endianness::Little, true);
+        builder.header.e_type = elf::ET_DYN;
+        builder.header.e_machine = elf::EM_X86_64;
+        builder.header.e_phoff = 0x40;
+
+        let section = builder.sections.add();
+        section.name = b".shstrtab"[..].into();
+        section.sh_type = elf::SHT_STRTAB;
+        section.data = build::elf::SectionData::SectionString;
+
+        let section = builder.sections.add();
+        section.name = b".text"[..].into();
+        section.sh_type = elf::SHT_PROGBITS;
+        section.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_EXECINSTR);
+        section.sh_addr = address;
+        section.sh_addralign = 16;
+        section.data = build::elf::SectionData::Data(vec![0xcc; size].into());
+        let text_id = section.id();
+
+        let section = builder.sections.add();
+        section.name = b".dynsym"[..].into();
+        section.sh_type = elf::SHT_DYNSYM;
+        section.sh_flags = u64::from(elf::SHF_ALLOC);
+        section.sh_addralign = 8;
+        section.data = build::elf::SectionData::DynamicSymbol;
+        let dynsym_id = section.id();
+
+        let section = builder.sections.add();
+        section.name = b".dynstr"[..].into();
+        section.sh_type = elf::SHT_STRTAB;
+        section.sh_flags = u64::from(elf::SHF_ALLOC);
+        section.sh_addralign = 1;
+        section.data = build::elf::SectionData::DynamicString;
+        let dynstr_id = section.id();
+
+        let symbol = builder.dynamic_symbols.add();
+        symbol.name = name.into();
+        symbol.st_value = address;
+        symbol.st_size = u64::try_from(size).expect("fixture size fits in u64");
+        symbol.set_st_info(elf::STB_GLOBAL, elf::STT_FUNC);
+        symbol.section = Some(text_id);
+
+        builder.set_section_sizes();
+
+        let segment = builder.segments.add();
+        segment.p_type = elf::PT_LOAD;
+        segment.p_flags = elf::PF_R | elf::PF_X;
+        segment.p_vaddr = address;
+        segment.p_paddr = address;
+        segment.p_filesz = 0x1000;
+        segment.p_memsz = 0x1000;
+        segment.p_align = 16;
+        segment.append_section(builder.sections.get_mut(text_id));
+        segment.append_section(builder.sections.get_mut(dynsym_id));
+        segment.append_section(builder.sections.get_mut(dynstr_id));
+
+        let mut bytes = Vec::new();
+        builder.write(&mut bytes).expect("write dynamic-symbol ELF");
+        bytes
     }
 
     #[test]

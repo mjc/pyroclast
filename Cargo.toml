@@ -35,7 +35,7 @@ signal-hook = "0.3"
 
 [dev-dependencies]
 inferno = "0.12.6"
-object = "0.39.1"
+object = { version = "0.39.1", features = ["build"] }
 proptest = "1.11.0"
 tempfile = "3"
 
