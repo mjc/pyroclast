@@ -377,6 +377,7 @@ impl MmapTable {
     fn resolve_mapping_index_for_pid(&self, pid: u32, ip: u64) -> Option<usize> {
         let bucket = self.mappings_by_pid.get(&pid)?;
         let mut upper_bound = bucket.partition_point(|indexed| indexed.start <= ip);
+        let mut latest_matching_index = None;
         while upper_bound > 0 {
             upper_bound -= 1;
             let indexed = &bucket[upper_bound];
@@ -386,10 +387,10 @@ impl MmapTable {
             let index = indexed.index;
             let mapping = &self.mappings[index];
             if ip < mapping.end() {
-                return Some(index);
+                latest_matching_index = latest_matching_index.max(Some(index));
             }
         }
-        None
+        latest_matching_index
     }
 
     fn resolve_mapping_index_for_pid_with_cache(
@@ -398,15 +399,6 @@ impl MmapTable {
         ip: u64,
         cached_index: &mut Option<usize>,
     ) -> Option<usize> {
-        if let Some(index) = cached_index
-            .as_ref()
-            .copied()
-            .filter(|&index| self.mappings[index].pid == pid)
-            .filter(|&index| self.mappings[index].start <= ip)
-            .filter(|&index| ip < self.mappings[index].end())
-        {
-            return Some(index);
-        }
         let resolved = self.resolve_mapping_index_for_pid(pid, ip);
         *cached_index = resolved;
         resolved

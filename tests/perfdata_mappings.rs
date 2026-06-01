@@ -159,6 +159,38 @@ fn prefers_most_specific_mapping_for_overlapping_ranges() {
 }
 
 #[test]
+fn prefers_newer_mapping_when_it_broadly_overlaps_older_mapping_like_perf() {
+    let mut table = MmapTable::default();
+    table.insert_mmap(MmapRecord {
+        pid: 42,
+        tid: 42,
+        start: 0x1800,
+        len: 0x100,
+        pgoff: 0x20,
+        path: "/bin/old-plugin.so".to_string(),
+    });
+    table.insert_mmap(MmapRecord {
+        pid: 42,
+        tid: 42,
+        start: 0x1000,
+        len: 0x1000,
+        pgoff: 0,
+        path: "/bin/new-app".to_string(),
+    });
+
+    assert_eq!(
+        table.resolve(42, 0x1810),
+        Some(ResolvedMapping {
+            path: "/bin/new-app".to_string(),
+            relative_address: 0x810,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        })
+    );
+}
+
+#[test]
 fn resolves_wildcard_pid_kernel_mapping() {
     let mut table = MmapTable::default();
     table.insert_mmap(MmapRecord {
