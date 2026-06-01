@@ -46,6 +46,23 @@ fn extracts_kernel_build_id_from_perfdata_header_feature() {
 }
 
 #[test]
+fn extracts_kernel_build_id_from_perfdata_record_stream() {
+    let build_id = [
+        0xb4, 0x2c, 0xe5, 0x21, 0xdb, 0xc9, 0xfc, 0x99, 0x43, 0x96, 0x02, 0x11, 0xa7, 0xf6, 0x4e,
+        0x44, 0x8f, 0xc9, 0x07, 0x1b,
+    ];
+    let payload = build_id_event_payload(u32::MAX, &build_id, "[kernel.kallsyms]");
+    let bytes = perfdata_with_data_records(&payload);
+
+    let kernel_build_id = kernel_build_id_from_perfdata(&bytes).expect("build id");
+
+    assert_eq!(
+        kernel_build_id,
+        Some("b42ce521dbc9fc9943960211a7f64e448fc9071b".to_string())
+    );
+}
+
+#[test]
 fn extracts_all_build_id_events_from_perfdata_header_feature() {
     let kernel_build_id = [
         0x16, 0xed, 0x3d, 0x53, 0x17, 0xad, 0x21, 0x9c, 0x89, 0xd0, 0xe3, 0xc5, 0xea, 0x0e, 0xa2,
@@ -229,6 +246,21 @@ fn perfdata_with_build_id_feature(payload: &[u8]) -> Vec<u8> {
         u64::try_from(payload.len()).expect("payload size"),
     );
     bytes[payload_offset..].copy_from_slice(payload);
+    bytes
+}
+
+fn perfdata_with_data_records(records: &[u8]) -> Vec<u8> {
+    let data_offset = 128;
+    let mut bytes = vec![0; data_offset + records.len()];
+    bytes[..8].copy_from_slice(b"PERFILE2");
+    put_u64(&mut bytes, 8, 104);
+    put_u64(&mut bytes, 40, data_offset as u64);
+    put_u64(
+        &mut bytes,
+        48,
+        u64::try_from(records.len()).expect("data size"),
+    );
+    bytes[data_offset..].copy_from_slice(records);
     bytes
 }
 
