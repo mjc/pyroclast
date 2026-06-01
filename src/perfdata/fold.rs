@@ -2842,7 +2842,7 @@ mod tests {
     }
 
     #[test]
-    fn user_unwind_source_uses_object_unwinder_after_modules_are_loaded() {
+    fn user_unwind_source_skips_object_unwinder_without_callchain_frames_like_perf_script() {
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
                 callchain: super::SampleCallchainState::Other { has_frames: false },
@@ -2850,6 +2850,18 @@ mod tests {
                 module_count: 1,
             }),
             super::UserUnwindSource::None
+        );
+    }
+
+    #[test]
+    fn user_unwind_source_uses_object_unwinder_for_nonempty_callchain_after_modules_are_loaded() {
+        assert_eq!(
+            super::choose_user_unwind_source(super::UserUnwindContext {
+                callchain: super::SampleCallchainState::Other { has_frames: true },
+                initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
+                module_count: 1,
+            }),
+            super::UserUnwindSource::Object
         );
     }
 
