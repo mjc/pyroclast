@@ -320,6 +320,7 @@ impl MmapTable {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn has_mapping_for_pid_cached(
         &self,
         pid: u32,

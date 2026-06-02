@@ -1581,19 +1581,15 @@ impl FoldAccumulator {
 }
 
 fn is_valid_unwound_user_frame(
-    pid: Option<u32>,
+    _pid: Option<u32>,
     frame: FoldFrame,
-    mmap_table: &MmapTable,
-    mapping_cache: &mut MappingResolveCache,
+    _mmap_table: &MmapTable,
+    _mapping_cache: &mut MappingResolveCache,
 ) -> bool {
     let FoldFrame::UserUnwind(address) = frame else {
         return true;
     };
-    pid.is_none_or(|pid| {
-        !mmap_table.has_executable_mappings_for_pid(pid)
-            || mmap_table.has_mapping_for_pid_cached(pid, address, mapping_cache)
-            || is_kernel_space_frame(address)
-    })
+    !is_kernel_space_frame(address)
 }
 
 fn comm_for_ids<'a>(
@@ -2399,17 +2395,66 @@ fn unwind_user_stack_like_perf(
             .pid
             .and_then(|pid| accumulator.unwind_states.get_mut(&pid))
             .map_or_else(Vec::new, |state| {
-                perf_accepted_object_unwind_frames(
+                let initial_frame_policy = object_unwind_initial_frame_policy(
+                    sample.pid,
+                    regs.ip,
+                    &accumulator.mmap_table,
+                );
+                let mut frames = perf_accepted_object_unwind_frames(
                     regs,
                     context.callchain,
-                    object_unwind_initial_frame_policy(
-                        sample.pid,
-                        regs.ip,
-                        &accumulator.mmap_table,
-                    ),
+                    initial_frame_policy,
                     state.object_unwinder.unwind_stack(*regs, stack_bytes, 256),
-                )
+                );
+                append_libdw_leaf_return_fallback(
+                    sample.pid,
+                    regs,
+                    stack_bytes,
+                    initial_frame_policy,
+                    &accumulator.mmap_table,
+                    &mut frames,
+                );
+                frames
             }),
+    }
+}
+
+fn append_libdw_leaf_return_fallback(
+    pid: Option<u32>,
+    regs: &PerfX86_64Regs,
+    stack_bytes: &[u8],
+    initial_frame_policy: ObjectUnwindInitialFramePolicy,
+    mmap_table: &MmapTable,
+    frames: &mut Vec<u64>,
+) {
+    if initial_frame_policy != ObjectUnwindInitialFramePolicy::KeepDsoLeaf
+        || frames.as_slice() != [regs.ip]
+    {
+        return;
+    }
+    let reader = crate::perfdata::unwind::PerfStackReader::new(regs.sp, stack_bytes);
+    let Some(return_address) = reader.read_u64(regs.sp) else {
+        return;
+    };
+    if return_address == 0
+        || is_kernel_space_frame(return_address)
+        || pid.is_some_and(|pid| mmap_table.has_mapping_for_pid(pid, return_address))
+    {
+        return;
+    }
+    frames.push(return_address.saturating_sub(1));
+
+    if regs.bp < regs.sp {
+        return;
+    }
+    let Some(frame_pointer_return) = reader.read_u64(regs.bp.saturating_add(8)) else {
+        return;
+    };
+    if frame_pointer_return != 0
+        && !is_kernel_space_frame(frame_pointer_return)
+        && pid.is_some_and(|pid| mmap_table.has_mapping_for_pid(pid, frame_pointer_return))
+    {
+        frames.push(frame_pointer_return.saturating_sub(1));
     }
 }
 
@@ -2513,15 +2558,7 @@ fn truncate_user_unwind_at_first_unmapped_frame(
     mmap_table: &MmapTable,
     mapping_cache: &mut MappingResolveCache,
 ) {
-    let Some(index) = frames
-        .iter()
-        .position(|frame| !is_valid_unwound_user_frame(pid, *frame, mmap_table, mapping_cache))
-    else {
-        return;
-    };
-    if index + 1 != frames.len() {
-        frames.truncate(index);
-    }
+    frames.retain(|frame| is_valid_unwound_user_frame(pid, *frame, mmap_table, mapping_cache));
 }
 
 fn perf_accepted_unwind_frames(unwound_frames: Vec<u64>) -> Vec<u64> {
@@ -3027,7 +3064,7 @@ mod tests {
     }
 
     #[test]
-    fn truncates_user_unwind_at_first_unmapped_frame_like_perf_libdw_entry() {
+    fn keeps_unmapped_middle_user_unwind_frame_like_perf_libdw_entry() {
         let mut mmap_table = super::MmapTable::default();
         mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
             pid: 11,
@@ -3051,7 +3088,14 @@ mod tests {
             &mut mapping_cache,
         );
 
-        assert_eq!(frames, vec![super::FoldFrame::UserUnwind(0x1010)]);
+        assert_eq!(
+            frames,
+            vec![
+                super::FoldFrame::UserUnwind(0x1010),
+                super::FoldFrame::UserUnwind(0x6),
+                super::FoldFrame::UserUnwind(0x1020),
+            ]
+        );
     }
 
     #[test]
@@ -3373,6 +3417,82 @@ mod tests {
             ),
             vec![0x7fff_f7e2_ecb7]
         );
+    }
+
+    #[test]
+    fn leaf_dso_fallback_keeps_unmapped_stack_return_and_mapped_frame_pointer_caller_like_libdw() {
+        // Real period 2918538 sample from target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
+        // perf script emits memmove, an unmapped `[unknown]` return from SP,
+        // then a mapped Pyro caller from BP+8.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x5555_5580_0000,
+            len: 0x10_0000,
+            pgoff: 0,
+            path: "/tmp/pyroclast".to_string(),
+        });
+        let regs = super::PerfX86_64Regs {
+            ip: 0x7fff_f7f0_2769,
+            sp: 0x7fff_ffff_8dd0,
+            bp: 0x7fff_ffff_9650,
+            registers: [0; 16],
+        };
+        let mut stack = vec![0; 0x890];
+        stack[..8].copy_from_slice(&0x0029_5b8b_u64.to_le_bytes());
+        stack[0x888..0x890].copy_from_slice(&0x5555_5580_4460_u64.to_le_bytes());
+        let mut frames = vec![regs.ip];
+
+        super::append_libdw_leaf_return_fallback(
+            Some(11),
+            &regs,
+            &stack,
+            super::ObjectUnwindInitialFramePolicy::KeepDsoLeaf,
+            &mmap_table,
+            &mut frames,
+        );
+
+        assert_eq!(
+            frames,
+            vec![0x7fff_f7f0_2769, 0x0029_5b8a, 0x5555_5580_445f]
+        );
+    }
+
+    #[test]
+    fn leaf_dso_fallback_does_not_invent_mapped_stack_return_like_libdw() {
+        // Real period 6798443 sample from target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
+        // SP points into the Pyro executable, but perf script prints only the
+        // memmove leaf.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x5555_5570_0000,
+            len: 0x20_0000,
+            pgoff: 0,
+            path: "/tmp/pyroclast".to_string(),
+        });
+        let regs = super::PerfX86_64Regs {
+            ip: 0x7fff_f7f0_277b,
+            sp: 0x7fff_ffff_8cf8,
+            bp: 0x4002,
+            registers: [0; 16],
+        };
+        let mut stack = vec![0; 8];
+        stack[..8].copy_from_slice(&0x5555_5579_6e24_u64.to_le_bytes());
+        let mut frames = vec![regs.ip];
+
+        super::append_libdw_leaf_return_fallback(
+            Some(11),
+            &regs,
+            &stack,
+            super::ObjectUnwindInitialFramePolicy::KeepDsoLeaf,
+            &mmap_table,
+            &mut frames,
+        );
+
+        assert_eq!(frames, vec![0x7fff_f7f0_277b]);
     }
 
     #[test]
