@@ -2508,6 +2508,13 @@ fn unwind_user_stack_like_perf(
                     initial_frame_policy,
                     state.object_unwinder.unwind_stack(*regs, stack_bytes, 256),
                 );
+                frames = prefer_frame_pointer_tail_for_object_unwind_divergence(
+                    sample.pid,
+                    &accumulator.mmap_table,
+                    regs,
+                    stack_bytes,
+                    frames,
+                );
                 frames = extend_initial_dso_leaf_with_same_mapping_frame_pointer_tail(
                     sample.pid,
                     &accumulator.mmap_table,
@@ -2564,6 +2571,60 @@ fn extend_initial_dso_leaf_with_same_mapping_frame_pointer_tail(
         }
     }
     extended_frames
+}
+
+fn prefer_frame_pointer_tail_for_object_unwind_divergence(
+    pid: Option<u32>,
+    mmap_table: &MmapTable,
+    regs: &PerfX86_64Regs,
+    stack_bytes: &[u8],
+    object_frames: Vec<u64>,
+) -> Vec<u64> {
+    let has_unmapped_user_frame =
+        object_frames.iter().skip(1).copied().any(|frame| {
+            !is_kernel_space_frame(frame) && !has_user_mapping(pid, frame, mmap_table)
+        });
+    if !has_unmapped_user_frame && object_frames.as_slice() != [regs.ip] {
+        return object_frames;
+    }
+
+    let mut frame_pointer_frames = unwind_x86_64_stack(*regs, stack_bytes, 256);
+    let mapped_prefix_len = frame_pointer_frames
+        .iter()
+        .copied()
+        .take_while(|frame| has_user_mapping(pid, *frame, mmap_table))
+        .count();
+    frame_pointer_frames.truncate(mapped_prefix_len);
+    let has_enough_frame_pointer_frames = if has_unmapped_user_frame {
+        frame_pointer_frames.len() >= object_frames.len()
+    } else {
+        frame_pointer_frames.len() > object_frames.len()
+    };
+    if frame_pointer_frames.first() != Some(&regs.ip) || !has_enough_frame_pointer_frames {
+        return object_frames;
+    }
+
+    if has_unmapped_user_frame {
+        return frame_pointer_frames;
+    }
+
+    let same_mapping_prefix_len = 1 + frame_pointer_frames
+        .iter()
+        .copied()
+        .skip(1)
+        .take_while(|frame| user_frames_share_mapping_path(pid, regs.ip, *frame, mmap_table))
+        .count();
+    frame_pointer_frames.truncate(same_mapping_prefix_len);
+    if frame_pointer_frames.len() > object_frames.len() {
+        return frame_pointer_frames;
+    }
+
+    object_frames
+}
+
+fn has_user_mapping(pid: Option<u32>, frame: u64, mmap_table: &MmapTable) -> bool {
+    !is_kernel_space_frame(frame)
+        && pid.is_some_and(|pid| mmap_table.has_mapping_for_pid(pid, frame))
 }
 
 fn user_frames_share_mapping_path(
@@ -4077,6 +4138,62 @@ mod tests {
                 0x5555_5559_21a3,
                 0x5555_5559_6488,
             ]
+        );
+    }
+
+    #[test]
+    fn object_unwind_prefers_frame_pointer_tail_after_unmapped_divergence_like_libdw() {
+        // Real period 144 _int_malloc sample from
+        // target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
+        // perf util/machine.c appends recorded kernel callchain frames, then
+        // thread__resolve_callchain_unwind() appends libdw frames. Real libdw
+        // emits _int_malloc -> _int_realloc -> realloc. framehop reports the
+        // leaf, then our SP fallback can diverge through an unmapped
+        // 0x7fff0000007a stack word unless we first keep the same-DSO
+        // frame-pointer prefix that matches libdw.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x7fff_f7db_b000,
+            len: 0x200_000,
+            pgoff: 0,
+            path: "/nix/store/glibc/lib/libc.so.6".to_string(),
+        });
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x5555_5570_0000,
+            len: 0x20_0000,
+            pgoff: 0,
+            path: "/tmp/pyroclast".to_string(),
+        });
+        let mut registers = [0; 16];
+        registers[framehop::x86_64::Reg::RBP as usize] = 0x7fff_ffff_8c90;
+        registers[framehop::x86_64::Reg::RSP as usize] = 0x7fff_ffff_8c40;
+        let regs = super::PerfX86_64Regs {
+            ip: 0x7fff_f7e3_029c,
+            sp: 0x7fff_ffff_8c40,
+            bp: 0x7fff_ffff_8c90,
+            registers,
+        };
+        let mut stack = vec![0; 0x120];
+        stack[0x50..0x58].copy_from_slice(&0x7fff_ffff_8ca0_u64.to_le_bytes());
+        stack[0x58..0x60].copy_from_slice(&0x7fff_f7e3_0f1a_u64.to_le_bytes());
+        stack[0x60..0x68].copy_from_slice(&0x7fff_ffff_8d40_u64.to_le_bytes());
+        stack[0x68..0x70].copy_from_slice(&0x7fff_f7e3_2429_u64.to_le_bytes());
+        stack[0x100..0x108].copy_from_slice(&0_u64.to_le_bytes());
+        stack[0x108..0x110].copy_from_slice(&0x5555_5570_de12_u64.to_le_bytes());
+
+        assert_eq!(
+            super::prefer_frame_pointer_tail_for_object_unwind_divergence(
+                Some(11),
+                &mmap_table,
+                &regs,
+                &stack,
+                vec![0x7fff_f7e3_029c],
+            ),
+            vec![0x7fff_f7e3_029c, 0x7fff_f7e3_0f19, 0x7fff_f7e3_2428]
         );
     }
 
