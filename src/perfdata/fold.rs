@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use hashbrown::{HashMap, HashSet};
 use rustc_hash::{FxBuildHasher, FxHasher};
 
-use crate::folded::append_inferno_perf_frame;
+use crate::folded::{append_inferno_perf_folded_label, append_inferno_perf_raw_function};
 use crate::perfdata::attrs::{PerfFileAttr, parse_file_attr_ids, parse_file_attrs};
 use crate::perfdata::build_id::{
     BuildIdEvent, build_id_events_from_perfdata, parse_build_id_events,
@@ -1989,7 +1989,8 @@ struct FoldedRenderBuffers {
     render_scratch: String,
     label_scratch: String,
     frame_rendered: String,
-    frame_cache: FoldFrameRenderCache,
+    raw_function_cache: FoldFrameRenderCache,
+    folded_label_cache: FoldFrameRenderCache,
     mapping_cache: MappingResolveCache,
 }
 
@@ -2021,25 +2022,23 @@ impl<'a> FoldFrameResolver<'a> {
         if let Some(comm) = comm {
             let FoldedRenderBuffers {
                 rendered,
-                render_scratch,
                 label_scratch,
                 frame_rendered,
-                frame_cache,
-                mapping_cache: _,
+                folded_label_cache,
+                ..
             } = buffers;
             label_scratch.clear();
             for character in comm.chars() {
                 label_scratch.push(if character == ' ' { '_' } else { character });
             }
-            append_cached_inferno_perf_frame(
+            append_cached_inferno_perf_folded_label(
                 rendered,
-                render_scratch,
                 frame_rendered,
-                frame_cache,
+                folded_label_cache,
                 label_scratch.as_str(),
             );
         } else {
-            append_cached_inferno_perf_frame_to_buffers(buffers, UNKNOWN_FRAME);
+            append_cached_inferno_perf_folded_label_to_buffers(buffers, UNKNOWN_FRAME);
         }
         let comm_prefix_len = buffers.rendered.len();
 
@@ -2236,7 +2235,7 @@ impl<'a> FoldFrameResolver<'a> {
             return Ok(());
         }
         for label in frames {
-            append_cached_inferno_perf_frame_to_buffers(buffers, label);
+            append_cached_inferno_perf_raw_function_to_buffers(buffers, label);
         }
         Ok(())
     }
@@ -2260,11 +2259,7 @@ impl<'a> FoldFrameResolver<'a> {
                 buffers.label_scratch.clear();
                 write!(buffers.label_scratch, "0x{frame:x}")
                     .expect("writing to a string cannot fail");
-                append_inferno_perf_frame(
-                    &mut buffers.rendered,
-                    &buffers.label_scratch,
-                    &mut buffers.render_scratch,
-                );
+                append_inferno_perf_folded_label(&mut buffers.rendered, &buffers.label_scratch);
                 return Ok(());
             }
             if let Some(cache) = symbol_cache {
@@ -2272,12 +2267,12 @@ impl<'a> FoldFrameResolver<'a> {
                     append_cached_rendered_frame(&mut buffers.rendered, rendered);
                 } else {
                     let fallback = symbol_fallback_frame_ref(&mapping);
-                    append_cached_inferno_perf_frame_to_buffers(buffers, &fallback);
+                    append_cached_inferno_perf_folded_label_to_buffers(buffers, &fallback);
                 }
                 return Ok(());
             }
             if is_kernel_space_frame(frame) {
-                append_cached_inferno_perf_frame_to_buffers(buffers, UNKNOWN_FRAME);
+                append_cached_inferno_perf_folded_label_to_buffers(buffers, UNKNOWN_FRAME);
             } else {
                 buffers.label_scratch.clear();
                 write!(
@@ -2286,28 +2281,20 @@ impl<'a> FoldFrameResolver<'a> {
                     mapping.path, mapping.relative_address
                 )
                 .expect("writing to a string cannot fail");
-                append_inferno_perf_frame(
-                    &mut buffers.rendered,
-                    &buffers.label_scratch,
-                    &mut buffers.render_scratch,
-                );
+                append_inferno_perf_folded_label(&mut buffers.rendered, &buffers.label_scratch);
             }
         } else if is_kernel_space_frame(frame) || symbolizing {
-            append_cached_inferno_perf_frame_to_buffers(buffers, UNKNOWN_FRAME);
+            append_cached_inferno_perf_folded_label_to_buffers(buffers, UNKNOWN_FRAME);
         } else {
             buffers.label_scratch.clear();
             write!(buffers.label_scratch, "0x{frame:x}").expect("writing to a string cannot fail");
-            append_inferno_perf_frame(
-                &mut buffers.rendered,
-                &buffers.label_scratch,
-                &mut buffers.render_scratch,
-            );
+            append_inferno_perf_folded_label(&mut buffers.rendered, &buffers.label_scratch);
         }
         Ok(())
     }
 }
 
-fn append_cached_inferno_perf_frame(
+fn append_cached_inferno_perf_raw_function(
     rendered: &mut String,
     render_scratch: &mut String,
     frame_rendered: &mut String,
@@ -2319,17 +2306,48 @@ fn append_cached_inferno_perf_frame(
         return;
     }
     frame_rendered.clear();
-    append_inferno_perf_frame(frame_rendered, frame, render_scratch);
+    append_inferno_perf_raw_function(frame_rendered, frame, render_scratch);
     append_cached_rendered_frame(rendered, frame_rendered.as_str());
     frame_cache.insert(frame.to_string(), std::mem::take(frame_rendered));
 }
 
-fn append_cached_inferno_perf_frame_to_buffers(buffers: &mut FoldedRenderBuffers, frame: &str) {
-    append_cached_inferno_perf_frame(
+fn append_cached_inferno_perf_raw_function_to_buffers(
+    buffers: &mut FoldedRenderBuffers,
+    frame: &str,
+) {
+    append_cached_inferno_perf_raw_function(
         &mut buffers.rendered,
         &mut buffers.render_scratch,
         &mut buffers.frame_rendered,
-        &mut buffers.frame_cache,
+        &mut buffers.raw_function_cache,
+        frame,
+    );
+}
+
+fn append_cached_inferno_perf_folded_label(
+    rendered: &mut String,
+    frame_rendered: &mut String,
+    frame_cache: &mut FoldFrameRenderCache,
+    frame: &str,
+) {
+    if let Some(cached) = frame_cache.get(frame) {
+        append_cached_rendered_frame(rendered, cached);
+        return;
+    }
+    frame_rendered.clear();
+    append_inferno_perf_folded_label(frame_rendered, frame);
+    append_cached_rendered_frame(rendered, frame_rendered.as_str());
+    frame_cache.insert(frame.to_string(), std::mem::take(frame_rendered));
+}
+
+fn append_cached_inferno_perf_folded_label_to_buffers(
+    buffers: &mut FoldedRenderBuffers,
+    frame: &str,
+) {
+    append_cached_inferno_perf_folded_label(
+        &mut buffers.rendered,
+        &mut buffers.frame_rendered,
+        &mut buffers.folded_label_cache,
         frame,
     );
 }
@@ -3898,6 +3916,19 @@ mod tests {
             String::from_utf8(written).expect("utf-8"),
             "\t1048 _Fork+0x48 (/nix/store/glibc/lib/libc.so.6)\n"
         );
+    }
+
+    #[test]
+    fn inferno_perf_render_cache_keeps_raw_functions_separate_from_folded_labels() {
+        let mut buffers = super::FoldedRenderBuffers::default();
+
+        super::append_cached_inferno_perf_folded_label_to_buffers(&mut buffers, "handler+0x2a");
+        assert_eq!(buffers.rendered, "handler+0x2a");
+
+        buffers.rendered.clear();
+        super::append_cached_inferno_perf_raw_function_to_buffers(&mut buffers, "handler+0x2a");
+
+        assert_eq!(buffers.rendered, "handler");
     }
 
     #[test]

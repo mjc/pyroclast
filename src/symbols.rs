@@ -15,7 +15,7 @@ use object::{
 use rustc_hash::FxBuildHasher;
 use serde::Serialize;
 
-use crate::folded::render_inferno_perf_stack;
+use crate::folded::{render_inferno_perf_folded_label, render_inferno_perf_raw_stack};
 use crate::perfdata::build_id::{
     kernel_build_id_from_perfdata, kernel_build_id_from_perfdata_file,
 };
@@ -1100,9 +1100,7 @@ where
                 missing_keys.push(key);
                 missing_requests.push(symbol_request_from_mapping_ref(mapping));
                 let fallback_frame = mapping_fallback_frame(mapping);
-                missing_fallbacks.push(render_inferno_perf_stack(std::iter::once(
-                    fallback_frame.as_str(),
-                )));
+                missing_fallbacks.push(render_inferno_perf_folded_label(fallback_frame.as_str()));
             }
             if missing_requests.is_empty() {
                 return Ok(());
@@ -1126,7 +1124,7 @@ where
                 let folded_rendered = if resolved_frames.frames.is_empty() {
                     fallback_rendered
                 } else {
-                    render_inferno_perf_stack(resolved_frames.frames.iter().map(String::as_str))
+                    render_inferno_perf_raw_stack(resolved_frames.frames.iter().map(String::as_str))
                 };
                 self.resolved_by_mapping.insert(
                     key,
@@ -3284,6 +3282,20 @@ mod tests {
 
         assert_eq!(first_ptr, second_ptr);
         assert_eq!(resolver.calls.get(), 1);
+    }
+
+    #[test]
+    fn symbol_frame_cache_resolve_folded_mapping_ref_strips_symbol_offsets_like_inferno_perf() {
+        let resolver = CountingFrameResolver::new(vec![vec!["handler+0x2a".to_string()]]);
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let mapping = test_mapping_ref("/bin/demo", 0x1234);
+
+        let folded = cache
+            .resolve_folded_mapping_ref(&mapping)
+            .expect("resolve")
+            .expect("folded render");
+
+        assert_eq!(folded, "handler");
     }
 
     #[test]

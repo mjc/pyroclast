@@ -20,16 +20,18 @@ pub fn render_inferno_perf_folded_stack<'a>(
     frames: impl IntoIterator<Item = &'a str>,
     count: u64,
 ) -> String {
-    let mut rendered = render_inferno_perf_stack(frames);
+    let mut rendered = render_inferno_perf_raw_stack(frames);
     write!(&mut rendered, " {count}").expect("writing to a string cannot fail");
     rendered
 }
 
 #[must_use]
-pub(crate) fn render_inferno_perf_stack<'a>(frames: impl IntoIterator<Item = &'a str>) -> String {
+pub(crate) fn render_inferno_perf_raw_stack<'a>(
+    frames: impl IntoIterator<Item = &'a str>,
+) -> String {
     let mut rendered = String::new();
     let mut scratch = String::new();
-    render_inferno_perf_stack_into(&mut rendered, frames, &mut scratch);
+    render_inferno_perf_raw_stack_into(&mut rendered, frames, &mut scratch);
     rendered
 }
 
@@ -42,25 +44,33 @@ pub fn render_address_stack(frames: impl IntoIterator<Item = u64>, count: u64) -
     render_folded_stack(rendered_frames.iter().map(String::as_str), count)
 }
 
-pub(crate) fn render_inferno_perf_stack_into<'a>(
+pub(crate) fn render_inferno_perf_raw_stack_into<'a>(
     rendered: &mut String,
     frames: impl IntoIterator<Item = &'a str>,
     scratch: &mut String,
 ) {
     rendered.clear();
     for frame in frames {
-        append_inferno_perf_frame(rendered, frame, scratch);
+        append_inferno_perf_raw_function(rendered, frame, scratch);
     }
 }
 
-pub(crate) fn append_inferno_perf_frame(rendered: &mut String, frame: &str, scratch: &mut String) {
+pub(crate) fn append_inferno_perf_raw_function(
+    rendered: &mut String,
+    mut frame: &str,
+    scratch: &mut String,
+) {
+    if let Some(offset) = frame.rfind("+0x") {
+        let suffix = &frame[offset + 3..];
+        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_hexdigit()) {
+            frame = &frame[..offset];
+        }
+    }
     if frame.starts_with('(') {
         return;
     }
     for (index, part) in frame.split("->").enumerate() {
-        if !rendered.is_empty() {
-            rendered.push(';');
-        }
+        append_separator(rendered);
         tidy_inferno_perf_generic_into(scratch, part);
         if index > 0 && !scratch.contains("_[i]") {
             scratch.push_str("_[i]");
@@ -69,12 +79,22 @@ pub(crate) fn append_inferno_perf_frame(rendered: &mut String, frame: &str, scra
     }
 }
 
+pub(crate) fn append_inferno_perf_folded_label(rendered: &mut String, frame: &str) {
+    append_separator(rendered);
+    escape_frame_into(rendered, frame);
+}
+
+#[must_use]
+pub(crate) fn render_inferno_perf_folded_label(frame: &str) -> String {
+    let mut rendered = String::new();
+    append_inferno_perf_folded_label(&mut rendered, frame);
+    rendered
+}
+
 fn render_folded_stack_into<'a>(rendered: &mut String, frames: impl IntoIterator<Item = &'a str>) {
     rendered.clear();
     for frame in frames {
-        if !rendered.is_empty() {
-            rendered.push(';');
-        }
+        append_separator(rendered);
         escape_frame_into(rendered, frame);
     }
 }
@@ -121,5 +141,11 @@ fn escape_frame_into(escaped: &mut String, frame: &str) {
             '\r' | '\n' => escaped.push(' '),
             _ => escaped.push(character),
         }
+    }
+}
+
+fn append_separator(rendered: &mut String) {
+    if !rendered.is_empty() {
+        rendered.push(';');
     }
 }
