@@ -2779,13 +2779,6 @@ fn perf_accepted_object_unwind_frames(
         {
             vec![*ip]
         }
-        [ip, ..]
-            if *ip == regs.ip
-                && callchain == SampleCallchainState::KernelWithoutCallchain
-                && initial_frame_policy == ObjectUnwindInitialFramePolicy::KeepDsoLeaf =>
-        {
-            vec![*ip]
-        }
         [ip, _]
             if *ip == regs.ip
                 && callchain
@@ -4049,14 +4042,18 @@ mod tests {
     }
 
     #[test]
-    fn object_unwind_stops_after_kernel_without_callchain_dso_leaf_like_perf_libdw() {
-        // Real period 4745147 sample from target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
-        // perf script records a kernel-mode sampled IP but libdw emits only
-        // the captured user-space memmove leaf.
+    fn object_unwind_keeps_kernel_without_callchain_dso_tail_like_perf_libdw() {
+        // Real period 144 __strlen_avx2 sample from
+        // target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
+        // perf script records a kernel-mode sampled IP with no recorded
+        // callchain, then libdw emits the captured user-space leaf and bash
+        // callers. In perf util/unwind-libdw.c, frame_callback reports every
+        // accepted frame via entry(); there is no kernel-without-callchain
+        // post-filter that truncates to the leaf.
         let regs = super::PerfX86_64Regs {
-            ip: 0x7fff_f7f0_2731,
-            sp: 0x7fff_ffff_9608,
-            bp: 1,
+            ip: 0x7fff_f7f2_d344,
+            sp: 0x7fff_ffff_a1d8,
+            bp: 0x7fff_ffff_a220,
             registers: [0; 16],
         };
 
@@ -4065,9 +4062,21 @@ mod tests {
                 &regs,
                 super::SampleCallchainState::KernelWithoutCallchain,
                 super::ObjectUnwindInitialFramePolicy::KeepDsoLeaf,
-                vec![0x7fff_f7f0_2731, 0x5555_5578_c601, 0x5555_5579_6e23],
+                vec![
+                    0x7fff_f7f2_d344,
+                    0x5555_5559_a556,
+                    0x5555_555a_019e,
+                    0x5555_5559_21a3,
+                    0x5555_5559_6488,
+                ],
             ),
-            vec![0x7fff_f7f0_2731]
+            vec![
+                0x7fff_f7f2_d344,
+                0x5555_5559_a556,
+                0x5555_555a_019e,
+                0x5555_5559_21a3,
+                0x5555_5559_6488,
+            ]
         );
     }
 
