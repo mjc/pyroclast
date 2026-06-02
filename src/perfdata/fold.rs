@@ -2539,14 +2539,9 @@ fn has_perf_frame_pointer_fallback(context: UserUnwindContext) -> bool {
 fn has_perf_object_unwind(context: UserUnwindContext) -> bool {
     match context.callchain {
         SampleCallchainState::KernelWithoutCallchain => context.initial_ip_is_dso,
-        SampleCallchainState::KernelWithCallchain => {
-            context.frame_pointer_at_or_above_stack_pointer || context.syscall_return_state
-        }
-        SampleCallchainState::Other {
-            has_callchain: true,
-            ..
-        } => true,
-        SampleCallchainState::KernelWithUserFrame | SampleCallchainState::Other { .. } => false,
+        SampleCallchainState::KernelWithCallchain => true,
+        SampleCallchainState::KernelWithUserFrame => false,
+        SampleCallchainState::Other { has_callchain, .. } => has_callchain,
     }
 }
 
@@ -3279,7 +3274,7 @@ mod tests {
     }
 
     #[test]
-    fn user_unwind_source_skips_object_unwind_for_invalid_kernel_bp_like_perf_script() {
+    fn user_unwind_source_uses_object_unwind_for_kernel_callchain_like_perf_libdw() {
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
                 callchain: super::SampleCallchainState::KernelWithCallchain,
@@ -3289,7 +3284,7 @@ mod tests {
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
             }),
-            super::UserUnwindSource::None
+            super::UserUnwindSource::Object
         );
     }
 
