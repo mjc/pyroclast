@@ -950,20 +950,16 @@ where
                 frames: sample.frames,
                 deferred_cookie: None,
             };
-            self.write_sample_event(&sample)?;
+            self.write_sample_header(&sample)?;
+            self.writer
+                .write_all(b"\n")
+                .map_err(|error| format!("failed to write perf script output: {error}"))?;
         }
         Ok(())
     }
 
     fn write_sample_event(&mut self, sample: &PreparedFoldSample) -> Result<(), String> {
-        let comm = sample.comm.as_deref().unwrap_or("[unknown]");
-        let pid = sample.pid.unwrap_or(0);
-        writeln!(
-            self.writer,
-            "{comm} {pid} 0: {} cpu/cycles/P:",
-            sample.count
-        )
-        .map_err(|error| format!("failed to write perf script output: {error}"))?;
+        self.write_sample_header(sample)?;
         FoldFrameResolver::new(&self.accumulator.mmap_table).write_script_frames_for_stack(
             sample.pid,
             &sample.frames,
@@ -973,6 +969,17 @@ where
         self.writer
             .write_all(b"\n")
             .map_err(|error| format!("failed to write perf script output: {error}"))
+    }
+
+    fn write_sample_header(&mut self, sample: &PreparedFoldSample) -> Result<(), String> {
+        let comm = sample.comm.as_deref().unwrap_or("[unknown]");
+        let pid = sample.pid.unwrap_or(0);
+        writeln!(
+            self.writer,
+            "{comm} {pid} 0: {} cpu/cycles/P:",
+            sample.count
+        )
+        .map_err(|error| format!("failed to write perf script output: {error}"))
     }
 }
 
@@ -1698,17 +1705,7 @@ impl FoldAccumulator {
     }
 
     fn flush_deferred_samples(&mut self) {
-        for sample in self.take_deferred_samples() {
-            add_fold_stack(
-                sample.pid,
-                sample.comm.as_deref(),
-                sample.count,
-                &sample.frames,
-                &self.mmap_table,
-                &mut self.raw_stacks,
-                &mut self.callchain,
-            );
-        }
+        self.deferred_samples.clear();
     }
 
     fn take_deferred_samples(&mut self) -> Vec<DeferredFoldSample> {

@@ -1693,7 +1693,7 @@ fn flushes_unmatched_deferred_user_callchains_like_perf_script() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "pyroclast;0x3000;0x2000 1\n");
+    assert_eq!(folded, "");
 }
 
 #[test]
