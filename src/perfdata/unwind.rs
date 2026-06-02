@@ -541,9 +541,7 @@ fn truncate_at_first_uncovered_unwind_frame(
 impl PerfX86_64Regs {
     #[must_use]
     pub fn is_syscall_return_state(self) -> bool {
-        self.registers[Reg::RCX as usize] == self.ip
-            && self.registers[Reg::R11 as usize] != 0
-            && self.bp < 4096
+        self.registers[Reg::RCX as usize] == self.ip && self.registers[Reg::R11 as usize] != 0
     }
 
     /// Builds the minimal `x86_64` register set needed for stack unwinding from
@@ -646,6 +644,24 @@ impl<'a> PerfStackReader<'a> {
 
 #[cfg(test)]
 mod tests {
+    use framehop::x86_64::Reg;
+
+    #[test]
+    fn detects_syscall_return_state_with_normal_frame_pointer_like_perf_libdw() {
+        let ip = 0x7fff_f7e9_a23e;
+        let mut registers = [0; 16];
+        registers[Reg::RCX as usize] = ip;
+        registers[Reg::R11 as usize] = 0x206;
+        let regs = super::PerfX86_64Regs {
+            ip,
+            sp: 0x7fff_ffff_88b8,
+            bp: 0x7fff_ffff_89e0,
+            registers,
+        };
+
+        assert!(regs.is_syscall_return_state());
+    }
+
     #[test]
     fn truncates_object_unwind_at_first_frame_without_cfi_like_perf_libdw() {
         let mut frames = vec![0x1000, 0x2000, 0x3000, 0x4000];
