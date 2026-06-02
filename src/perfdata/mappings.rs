@@ -180,7 +180,43 @@ impl MmapTable {
         }
     }
 
-    fn insert_mapping(&mut self, mut mapping: Mapping) {
+    fn insert_mapping(&mut self, mapping: Mapping) {
+        let split_mappings = self.remove_overlapping_mappings_like_perf(&mapping);
+        for split in split_mappings {
+            self.insert_mapping_without_overlap_fix(split);
+        }
+        self.insert_mapping_without_overlap_fix(mapping);
+    }
+
+    fn remove_overlapping_mappings_like_perf(&mut self, new_mapping: &Mapping) -> Vec<Mapping> {
+        let mut kept = Vec::with_capacity(self.mappings.len());
+        let mut split_mappings = Vec::new();
+        for mapping in std::mem::take(&mut self.mappings) {
+            if mapping.pid != new_mapping.pid || !mapping.overlaps(new_mapping) {
+                kept.push(mapping);
+                continue;
+            }
+            if mapping.start < new_mapping.start {
+                let mut before = mapping.clone();
+                before.len = new_mapping.start - mapping.start;
+                split_mappings.push(before);
+            }
+            if mapping.end() > new_mapping.end() {
+                let mut after = mapping;
+                let old_start = after.start;
+                let old_end = after.end();
+                after.start = new_mapping.end();
+                after.pgoff = after.pgoff.saturating_add(after.start - old_start);
+                after.len = old_end - after.start;
+                split_mappings.push(after);
+            }
+        }
+        self.mappings = kept;
+        self.rebuild_pid_indexes();
+        split_mappings
+    }
+
+    fn insert_mapping_without_overlap_fix(&mut self, mut mapping: Mapping) {
         let pid = mapping.pid;
         let start = mapping.start;
         let may_execute = mapping.may_execute();
@@ -506,6 +542,10 @@ impl Mapping {
         self.start.saturating_add(self.len)
     }
 
+    fn overlaps(&self, other: &Self) -> bool {
+        self.start < other.end() && other.start < self.end()
+    }
+
     fn relative_address(&self, ip: u64) -> u64 {
         if self.is_kernel_symbol_mapping() {
             ip
@@ -566,7 +606,7 @@ mod tests {
     use crate::perfdata::records::MmapRecord;
 
     #[test]
-    fn updates_prefix_max_end_when_inserting_earlier_mapping() {
+    fn broad_new_mapping_replaces_covered_old_mapping_like_perf_maps_fixup() {
         let mut table = MmapTable::default();
         table.insert_mmap(MmapRecord {
             pid: 7,
@@ -586,9 +626,40 @@ mod tests {
         });
 
         let bucket = table.mappings_by_pid.get(&7).expect("bucket");
-        assert_eq!(bucket.len(), 2);
+        assert_eq!(bucket.len(), 1);
         assert_eq!(bucket[0].max_end, 0x5000);
-        assert_eq!(bucket[1].max_end, 0x5000);
+        assert_eq!(table.resolve(7, 0x3000).expect("mapping").path, "/earlier");
+    }
+
+    #[test]
+    fn new_mapping_replaces_fully_overlapped_old_mapping_like_perf_maps_fixup() {
+        let mut table = MmapTable::default();
+        table.insert_mmap(MmapRecord {
+            pid: 7,
+            tid: 7,
+            start: 0x1000,
+            len: 0x1000,
+            pgoff: 0,
+            path: "/bin/sh".to_string(),
+        });
+        table.insert_mmap(MmapRecord {
+            pid: 7,
+            tid: 7,
+            start: 0x1000,
+            len: 0x1000,
+            pgoff: 0,
+            path: "/pyroclast".to_string(),
+        });
+
+        let paths = table
+            .user_mappings()
+            .map(|mapping| mapping.path)
+            .collect::<Vec<_>>();
+        assert_eq!(paths, ["/pyroclast"]);
+        assert_eq!(
+            table.resolve(7, 0x1000).expect("mapping").path,
+            "/pyroclast"
+        );
     }
 
     #[test]
