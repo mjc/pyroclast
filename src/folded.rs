@@ -54,6 +54,9 @@ pub(crate) fn render_inferno_perf_stack_into<'a>(
 }
 
 pub(crate) fn append_inferno_perf_frame(rendered: &mut String, frame: &str, scratch: &mut String) {
+    if frame.starts_with('(') {
+        return;
+    }
     for (index, part) in frame.split("->").enumerate() {
         if !rendered.is_empty() {
             rendered.push(';');
