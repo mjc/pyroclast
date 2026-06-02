@@ -115,6 +115,16 @@ struct PidUnwindState {
 
 type UnwindMappingKey = (String, u64, u64, u64);
 
+struct OwnedUnwindMappingRequest {
+    start: u64,
+    len: u64,
+    pgoff: u64,
+    prot: Option<u32>,
+    path: String,
+    build_id: Option<Vec<u8>>,
+    file_identity: Option<FileIdentity>,
+}
+
 struct TimedRecord {
     index: usize,
     time: Option<u64>,
@@ -1335,6 +1345,53 @@ impl FoldAccumulator {
         );
         if record.clone_maps {
             self.mmap_table.clone_pid_mappings(record.ppid, record.pid);
+            self.prepare_cloned_unwind_mappings(record.pid);
+        }
+    }
+
+    fn prepare_cloned_unwind_mappings(&mut self, pid: u32) {
+        let mappings = self
+            .mmap_table
+            .user_mappings()
+            .filter(|mapping| mapping.pid == pid)
+            .map(|mapping| OwnedUnwindMappingRequest {
+                start: mapping.start,
+                len: mapping.len,
+                pgoff: mapping.pgoff,
+                prot: mapping.prot,
+                path: mapping.path.to_owned(),
+                build_id: mapping.build_id.map(<[u8]>::to_vec),
+                file_identity: mapping.file_identity,
+            })
+            .collect::<Vec<_>>();
+        let unwind_debug_dir = self.unwind_debug_dir.clone();
+        let unwind_state = self.unwind_state_mut(pid);
+        for mapping in mappings {
+            let request = UnwindMappingRequest {
+                start: mapping.start,
+                len: mapping.len,
+                pgoff: mapping.pgoff,
+                prot: mapping.prot,
+                path: &mapping.path,
+                file_identity: mapping.file_identity,
+                build_id: mapping.build_id.as_deref(),
+            };
+            if request.build_id.is_some() {
+                load_build_id_unwind_mapping(
+                    &mut unwind_state.object_unwinder,
+                    &mut unwind_state.attempted_unwind_mappings,
+                    &mut unwind_state.loaded_unwind_mappings,
+                    request,
+                    unwind_debug_dir.as_deref(),
+                );
+            } else {
+                load_unwind_mapping(
+                    &mut unwind_state.object_unwinder,
+                    &mut unwind_state.attempted_unwind_mappings,
+                    &mut unwind_state.loaded_unwind_mappings,
+                    request,
+                );
+            }
         }
     }
 
@@ -2936,6 +2993,55 @@ mod tests {
         );
 
         assert_eq!(resolved, cached);
+    }
+
+    #[test]
+    fn fork_clone_prepares_child_unwind_maps_like_perf_maps_copy_from() {
+        let current_exe = std::env::current_exe().expect("current exe");
+        let current_exe = current_exe.to_string_lossy().into_owned();
+        let mut accumulator = super::FoldAccumulator::new(std::collections::BTreeMap::default());
+        let sample_layouts = super::SampleLayouts::default();
+        accumulator
+            .apply_record(
+                crate::perfdata::records::ParsedRecord::Mmap(
+                    crate::perfdata::records::MmapRecord {
+                        pid: 11,
+                        tid: 11,
+                        start: 0,
+                        len: 0x1000_0000,
+                        pgoff: 0,
+                        path: current_exe,
+                    },
+                ),
+                &sample_layouts,
+                super::FoldOptions::default(),
+            )
+            .expect("parent mmap");
+
+        accumulator
+            .apply_record(
+                crate::perfdata::records::ParsedRecord::Fork(
+                    crate::perfdata::records::ForkRecord {
+                        pid: 22,
+                        ppid: 11,
+                        tid: 22,
+                        ptid: 11,
+                        time: 99,
+                        clone_maps: true,
+                    },
+                ),
+                &sample_layouts,
+                super::FoldOptions::default(),
+            )
+            .expect("fork");
+
+        assert_eq!(
+            accumulator
+                .unwind_states
+                .get(&22)
+                .map(|state| state.object_unwinder.module_count()),
+            Some(1)
+        );
     }
 
     #[test]
