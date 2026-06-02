@@ -1983,6 +1983,13 @@ struct FoldFrameResolver<'a> {
     mmap_table: &'a MmapTable,
 }
 
+enum FrameMappingDecision<'a> {
+    Mapped(ResolvedMappingRef<'a>),
+    KernelAddress,
+    Unknown,
+    Address,
+}
+
 #[derive(Default)]
 struct FoldedRenderBuffers {
     rendered: String,
@@ -2005,6 +2012,29 @@ impl SymbolResolver for NoopSymbolResolver {
 impl<'a> FoldFrameResolver<'a> {
     fn new(mmap_table: &'a MmapTable) -> Self {
         Self { mmap_table }
+    }
+
+    fn mapping_decision(
+        &self,
+        pid: Option<u32>,
+        address: u64,
+        symbolizing: bool,
+        mapping_cache: &mut MappingResolveCache,
+    ) -> FrameMappingDecision<'a> {
+        if let Some(mapping) = pid.and_then(|pid| {
+            self.mmap_table
+                .resolve_ref_cached(pid, address, mapping_cache)
+        }) {
+            if is_kernel_space_frame(address) && !is_kernel_mapping_ref(&mapping) {
+                FrameMappingDecision::KernelAddress
+            } else {
+                FrameMappingDecision::Mapped(mapping)
+            }
+        } else if is_kernel_space_frame(address) || symbolizing {
+            FrameMappingDecision::Unknown
+        } else {
+            FrameMappingDecision::Address
+        }
     }
 
     fn render_folded_stack_for_stack<R>(
@@ -2124,53 +2154,50 @@ impl<'a> FoldFrameResolver<'a> {
                 continue;
             }
             let symbolizing = symbol_cache.is_some();
-            if let Some(mapping) = pid.and_then(|pid| {
-                self.mmap_table
-                    .resolve_ref_cached(pid, address, &mut mapping_cache)
-            }) {
-                if is_kernel_space_frame(address) && !is_kernel_mapping_ref(&mapping) {
-                    write_perf_script_address_frame(writer, address)?;
-                    continue;
-                }
-                if let Some(cache) = symbol_cache.as_deref_mut() {
-                    let frames = cache.resolve_mapping_ref(&mapping)?;
-                    if frames.is_empty() {
-                        write_perf_script_frame_for_label(
-                            writer,
-                            address,
-                            &symbol_fallback_frame_ref(&mapping),
-                        )?;
-                    } else if matches!(frame, FoldFrame::UserUnwind(_))
-                        && frames.len() == 1
-                        && !is_kernel_space_frame(address)
-                    {
-                        write_perf_script_mapped_symbol_frame(
-                            writer,
-                            address,
-                            &frames[0],
-                            mapping.path,
-                        )?;
-                    } else {
-                        for label in frames.iter().rev() {
-                            write_perf_script_frame_for_label(writer, address, label)?;
+            match self.mapping_decision(pid, address, symbolizing, &mut mapping_cache) {
+                FrameMappingDecision::Mapped(mapping) => {
+                    if let Some(cache) = symbol_cache.as_deref_mut() {
+                        let frames = cache.resolve_mapping_ref(&mapping)?;
+                        if frames.is_empty() {
+                            write_perf_script_frame_for_label(
+                                writer,
+                                address,
+                                &symbol_fallback_frame_ref(&mapping),
+                            )?;
+                        } else if matches!(frame, FoldFrame::UserUnwind(_))
+                            && frames.len() == 1
+                            && !is_kernel_space_frame(address)
+                        {
+                            write_perf_script_mapped_symbol_frame(
+                                writer,
+                                address,
+                                &frames[0],
+                                mapping.path,
+                            )?;
+                        } else {
+                            for label in frames.iter().rev() {
+                                write_perf_script_frame_for_label(writer, address, label)?;
+                            }
                         }
+                        continue;
                     }
-                    continue;
+                    if is_kernel_space_frame(address) {
+                        write_perf_script_unknown_frame(writer, address)?;
+                    } else {
+                        write_perf_script_mapped_frame(
+                            writer,
+                            address,
+                            mapping.path,
+                            mapping.relative_address,
+                        )?;
+                    }
                 }
-                if is_kernel_space_frame(address) {
+                FrameMappingDecision::KernelAddress | FrameMappingDecision::Address => {
+                    write_perf_script_address_frame(writer, address)?;
+                }
+                FrameMappingDecision::Unknown => {
                     write_perf_script_unknown_frame(writer, address)?;
-                } else {
-                    write_perf_script_mapped_frame(
-                        writer,
-                        address,
-                        mapping.path,
-                        mapping.relative_address,
-                    )?;
                 }
-            } else if is_kernel_space_frame(address) || symbolizing {
-                write_perf_script_unknown_frame(writer, address)?;
-            } else {
-                write_perf_script_address_frame(writer, address)?;
             }
         }
         Ok(())
@@ -2251,47 +2278,45 @@ impl<'a> FoldFrameResolver<'a> {
         R: SymbolResolver,
     {
         let symbolizing = symbol_cache.is_some();
-        if let Some(mapping) = pid.and_then(|pid| {
-            self.mmap_table
-                .resolve_ref_cached(pid, frame, &mut buffers.mapping_cache)
-        }) {
-            if is_kernel_space_frame(frame) && !is_kernel_mapping_ref(&mapping) {
-                buffers.label_scratch.clear();
-                write!(buffers.label_scratch, "0x{frame:x}")
-                    .expect("writing to a string cannot fail");
-                append_inferno_perf_folded_label(&mut buffers.rendered, &buffers.label_scratch);
-                return Ok(());
-            }
-            if let Some(cache) = symbol_cache {
-                if let Some(rendered) = cache.resolve_folded_mapping_ref(&mapping)? {
-                    append_cached_rendered_frame(&mut buffers.rendered, rendered);
-                } else {
-                    let fallback = symbol_fallback_frame_ref(&mapping);
-                    append_cached_inferno_perf_folded_label_to_buffers(buffers, &fallback);
+        match self.mapping_decision(pid, frame, symbolizing, &mut buffers.mapping_cache) {
+            FrameMappingDecision::Mapped(mapping) => {
+                if let Some(cache) = symbol_cache {
+                    if let Some(rendered) = cache.resolve_folded_mapping_ref(&mapping)? {
+                        append_cached_rendered_frame(&mut buffers.rendered, rendered);
+                    } else {
+                        let fallback = symbol_fallback_frame_ref(&mapping);
+                        append_cached_inferno_perf_folded_label_to_buffers(buffers, &fallback);
+                    }
+                    return Ok(());
                 }
-                return Ok(());
+                if is_kernel_space_frame(frame) {
+                    append_cached_inferno_perf_folded_label_to_buffers(buffers, UNKNOWN_FRAME);
+                } else {
+                    buffers.label_scratch.clear();
+                    write!(
+                        buffers.label_scratch,
+                        "{}+0x{:x}",
+                        mapping.path, mapping.relative_address
+                    )
+                    .expect("writing to a string cannot fail");
+                    append_inferno_perf_folded_label(&mut buffers.rendered, &buffers.label_scratch);
+                }
             }
-            if is_kernel_space_frame(frame) {
+            FrameMappingDecision::KernelAddress | FrameMappingDecision::Address => {
+                append_folded_address_label(buffers, frame);
+            }
+            FrameMappingDecision::Unknown => {
                 append_cached_inferno_perf_folded_label_to_buffers(buffers, UNKNOWN_FRAME);
-            } else {
-                buffers.label_scratch.clear();
-                write!(
-                    buffers.label_scratch,
-                    "{}+0x{:x}",
-                    mapping.path, mapping.relative_address
-                )
-                .expect("writing to a string cannot fail");
-                append_inferno_perf_folded_label(&mut buffers.rendered, &buffers.label_scratch);
             }
-        } else if is_kernel_space_frame(frame) || symbolizing {
-            append_cached_inferno_perf_folded_label_to_buffers(buffers, UNKNOWN_FRAME);
-        } else {
-            buffers.label_scratch.clear();
-            write!(buffers.label_scratch, "0x{frame:x}").expect("writing to a string cannot fail");
-            append_inferno_perf_folded_label(&mut buffers.rendered, &buffers.label_scratch);
         }
         Ok(())
     }
+}
+
+fn append_folded_address_label(buffers: &mut FoldedRenderBuffers, address: u64) {
+    buffers.label_scratch.clear();
+    write!(buffers.label_scratch, "0x{address:x}").expect("writing to a string cannot fail");
+    append_inferno_perf_folded_label(&mut buffers.rendered, &buffers.label_scratch);
 }
 
 fn append_cached_inferno_perf_raw_function(
