@@ -13,7 +13,7 @@ use crate::perfdata::attrs::{PerfFileAttr, parse_file_attr_ids, parse_file_attrs
 use crate::perfdata::build_id::{
     BuildIdEvent, build_id_events_from_perfdata, parse_build_id_events,
 };
-use crate::perfdata::endian::read_u64;
+use crate::perfdata::endian::{read_u32, read_u64};
 use crate::perfdata::header::{PerfFeatureSection, PerfHeader, parse_header};
 use crate::perfdata::mappings::{FileIdentity, MappingResolveCache, MmapTable, ResolvedMappingRef};
 use crate::perfdata::raw_stack::{RawStackAccumulator, RawStackEntryRef};
@@ -148,6 +148,7 @@ struct OrderedRecordQueue {
 
 struct DeferredFoldSample {
     pid: Option<u32>,
+    tid: Option<u32>,
     comm: Option<String>,
     count: u64,
     frames: Vec<FoldFrame>,
@@ -155,6 +156,7 @@ struct DeferredFoldSample {
 
 struct PreparedFoldSample {
     pid: Option<u32>,
+    tid: Option<u32>,
     comm: Option<String>,
     count: u64,
     frames: Vec<FoldFrame>,
@@ -879,7 +881,8 @@ where
                 self.write_sample(record.misc, &record.payload, sample_layouts, options)
             }
             ParsedRecord::CallchainDeferred(record) => {
-                self.write_deferred_callchain(record.cookie, &record.ips)
+                let tid = deferred_callchain_tid(&record.sample_id, sample_layouts);
+                self.write_deferred_callchain(record.cookie, tid, &record.ips)
             }
             record => self
                 .accumulator
@@ -911,6 +914,7 @@ where
                 .or_default()
                 .push(DeferredFoldSample {
                     pid: sample.pid,
+                    tid: sample.tid,
                     comm: sample.comm,
                     count: sample.count,
                     frames: sample.frames,
@@ -920,16 +924,25 @@ where
         self.write_sample_event(&sample)
     }
 
-    fn write_deferred_callchain(&mut self, cookie: u64, ips: &[u64]) -> Result<(), String> {
+    fn write_deferred_callchain(
+        &mut self,
+        cookie: u64,
+        tid: Option<u32>,
+        ips: &[u64],
+    ) -> Result<(), String> {
         let Some(samples) = self.accumulator.deferred_samples.remove(&cookie) else {
             return Ok(());
         };
         for mut sample in samples {
+            if tid.is_some() && tid != sample.tid {
+                continue;
+            }
             sample
                 .frames
                 .extend(ips.iter().copied().map(FoldFrame::Callchain));
             let sample = PreparedFoldSample {
                 pid: sample.pid,
+                tid: sample.tid,
                 comm: sample.comm,
                 count: sample.count,
                 frames: sample.frames,
@@ -945,6 +958,7 @@ where
         for sample in samples {
             let sample = PreparedFoldSample {
                 pid: sample.pid,
+                tid: sample.tid,
                 comm: sample.comm,
                 count: sample.count,
                 frames: sample.frames,
@@ -1300,7 +1314,8 @@ impl FoldAccumulator {
                 parse_sample_for_fold(self, record.misc, &record.payload, sample_layouts, options)
             }
             ParsedRecord::CallchainDeferred(record) => {
-                self.add_deferred_callchain(record.cookie, &record.ips);
+                let tid = deferred_callchain_tid(&record.sample_id, sample_layouts);
+                self.add_deferred_callchain(record.cookie, tid, &record.ips);
                 Ok(())
             }
             ParsedRecord::Mmap2(record) => {
@@ -1562,6 +1577,17 @@ fn sample_id_payload_time(payload: &[u8], layout: SampleLayout) -> Result<Option
     read_u64(payload, offset).map(Some)
 }
 
+fn sample_id_payload_tid(payload: &[u8], layout: SampleLayout) -> Option<u32> {
+    if layout.sample_type & PERF_SAMPLE_TID == 0 {
+        return None;
+    }
+    let sample_id_size = sample_id_size(layout);
+    if payload.len() < sample_id_size {
+        return None;
+    }
+    read_u32(payload, payload.len() - sample_id_size + 4).ok()
+}
+
 fn sample_id_size(layout: SampleLayout) -> usize {
     [
         PERF_SAMPLE_TID,
@@ -1575,6 +1601,13 @@ fn sample_id_size(layout: SampleLayout) -> usize {
     .filter(|flag| layout.sample_type & flag != 0)
     .count()
         * 8
+}
+
+fn deferred_callchain_tid(sample_id: &[u8], sample_layouts: &SampleLayouts) -> Option<u32> {
+    sample_layouts
+        .fallback
+        .filter(|event| event.layout.sample_id_all)
+        .and_then(|event| sample_id_payload_tid(sample_id, event.layout))
 }
 
 fn update_comm_tables(
@@ -1684,11 +1717,14 @@ impl FoldAccumulator {
         }
     }
 
-    fn add_deferred_callchain(&mut self, cookie: u64, ips: &[u64]) {
+    fn add_deferred_callchain(&mut self, cookie: u64, tid: Option<u32>, ips: &[u64]) {
         let Some(samples) = self.deferred_samples.remove(&cookie) else {
             return;
         };
         for mut sample in samples {
+            if tid.is_some() && tid != sample.tid {
+                continue;
+            }
             sample
                 .frames
                 .extend(ips.iter().copied().map(FoldFrame::Callchain));
@@ -2503,6 +2539,7 @@ fn parse_sample_for_fold(
             .or_default()
             .push(DeferredFoldSample {
                 pid: sample.pid,
+                tid: sample.tid,
                 comm: sample.comm,
                 count: sample.count,
                 frames: sample.frames,
@@ -2551,6 +2588,7 @@ fn prepare_sample_for_fold(
     );
     Ok(Some(PreparedFoldSample {
         pid: sample.pid,
+        tid: sample.tid,
         comm: comm.map(str::to_owned),
         count,
         frames: std::mem::take(&mut accumulator.sample_frames),

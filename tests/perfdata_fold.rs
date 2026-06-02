@@ -1669,6 +1669,36 @@ fn merges_deferred_user_callchains_like_perf_script() {
 }
 
 #[test]
+fn does_not_merge_deferred_callchains_from_a_different_tid_like_perf_script() {
+    let mut deferred = callchain_deferred_payload(0x4444, [0x5000, 0x6000]);
+    deferred.extend(11_u32.to_le_bytes());
+    deferred.extend(99_u32.to_le_bytes());
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_flags(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            1 << 18,
+        )],
+        [
+            record_bytes(3, &comm_payload(11, 11, "pyroclast")),
+            record_bytes(
+                9,
+                &sample_payload(
+                    0x1000,
+                    11,
+                    12,
+                    [0x2000, 0x3000, 0xffff_ffff_ffff_fd80, 0x4444],
+                ),
+            ),
+            record_bytes(22, &deferred),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, "");
+}
+
+#[test]
 fn flushes_unmatched_deferred_user_callchains_like_perf_script() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
