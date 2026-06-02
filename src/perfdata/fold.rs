@@ -2776,68 +2776,91 @@ fn unwind_user_stack_like_perf(
                 .map(FoldFrame::UserUnwind)
                 .collect()
         }
-        UserUnwindSource::Object => sample
-            .pid
-            .inspect(|pid| accumulator.prepare_pid_unwind_mappings(*pid))
-            .and_then(|pid| accumulator.unwind_states.get_mut(&pid))
-            .map_or_else(Vec::new, |state| {
-                let initial_frame_policy = object_unwind_initial_frame_policy(
-                    sample.pid,
-                    regs.ip,
-                    &accumulator.mmap_table,
-                );
-                let object_unwind = unwind_user_stack_with_diagnostics(
-                    &mut state.object_unwinder,
-                    *regs,
-                    stack_bytes,
-                    256,
-                );
-                let raw_frames = object_unwind.accepted_frames;
-                let maybe_inline_current_ip =
-                    should_salvage_inline_current_ip_after_empty_object_unwind(
-                        raw_frames.is_empty(),
-                        object_unwind.framehop_frame_count,
-                        regs,
-                        context,
-                    );
-                let mut frames = perf_accepted_object_unwind_frames(
-                    regs,
-                    context.callchain,
-                    initial_frame_policy,
-                    raw_frames,
-                );
-                frames = prefer_frame_pointer_tail_for_object_unwind_divergence(
-                    sample.pid,
-                    &accumulator.mmap_table,
-                    regs,
-                    stack_bytes,
-                    frames,
-                );
-                frames = extend_initial_dso_leaf_with_same_mapping_frame_pointer_tail(
-                    sample.pid,
-                    &accumulator.mmap_table,
-                    regs,
-                    stack_bytes,
-                    frames,
-                );
-                append_libdw_leaf_return_fallback(
-                    sample.pid,
-                    regs,
-                    stack_bytes,
-                    initial_frame_policy,
-                    &accumulator.mmap_table,
-                    &mut frames,
-                );
-                let mut fold_frames = frames
-                    .into_iter()
-                    .map(FoldFrame::UserUnwind)
-                    .collect::<Vec<_>>();
-                if maybe_inline_current_ip && fold_frames.is_empty() {
-                    fold_frames.push(FoldFrame::InlineCurrentIp(regs.ip));
-                }
-                fold_frames
-            }),
+        UserUnwindSource::Object => {
+            unwind_object_stack_like_perf(accumulator, sample.pid, regs, stack_bytes, context)
+        }
     }
+}
+
+fn unwind_object_stack_like_perf(
+    accumulator: &mut FoldAccumulator,
+    pid: Option<u32>,
+    regs: &PerfX86_64Regs,
+    stack_bytes: &[u8],
+    context: UserUnwindContext,
+) -> Vec<FoldFrame> {
+    let Some(pid_value) = pid else {
+        return Vec::new();
+    };
+    accumulator.prepare_pid_unwind_mappings(pid_value);
+    let Some(state) = accumulator.unwind_states.get_mut(&pid_value) else {
+        return Vec::new();
+    };
+    let (frames, maybe_inline_current_ip) = unwind_object_frame_addresses_like_perf(
+        state,
+        pid,
+        &accumulator.mmap_table,
+        regs,
+        stack_bytes,
+        context,
+    );
+    let mut fold_frames = frames
+        .into_iter()
+        .map(FoldFrame::UserUnwind)
+        .collect::<Vec<_>>();
+    if maybe_inline_current_ip && fold_frames.is_empty() {
+        fold_frames.push(FoldFrame::InlineCurrentIp(regs.ip));
+    }
+    fold_frames
+}
+
+fn unwind_object_frame_addresses_like_perf(
+    state: &mut PidUnwindState,
+    pid: Option<u32>,
+    mmap_table: &MmapTable,
+    regs: &PerfX86_64Regs,
+    stack_bytes: &[u8],
+    context: UserUnwindContext,
+) -> (Vec<u64>, bool) {
+    let initial_frame_policy = object_unwind_initial_frame_policy(pid, regs.ip, mmap_table);
+    let object_unwind =
+        unwind_user_stack_with_diagnostics(&mut state.object_unwinder, *regs, stack_bytes, 256);
+    let raw_frames = object_unwind.accepted_frames;
+    let maybe_inline_current_ip = should_salvage_inline_current_ip_after_empty_object_unwind(
+        raw_frames.is_empty(),
+        object_unwind.framehop_frame_count,
+        regs,
+        context,
+    );
+    let mut frames = perf_accepted_object_unwind_frames(
+        regs,
+        context.callchain,
+        initial_frame_policy,
+        raw_frames,
+    );
+    frames = prefer_frame_pointer_tail_for_object_unwind_divergence(
+        pid,
+        mmap_table,
+        regs,
+        stack_bytes,
+        frames,
+    );
+    frames = extend_initial_dso_leaf_with_same_mapping_frame_pointer_tail(
+        pid,
+        mmap_table,
+        regs,
+        stack_bytes,
+        frames,
+    );
+    append_libdw_leaf_return_fallback(
+        pid,
+        regs,
+        stack_bytes,
+        initial_frame_policy,
+        mmap_table,
+        &mut frames,
+    );
+    (frames, maybe_inline_current_ip)
 }
 
 fn unwind_user_stack_with_diagnostics(
