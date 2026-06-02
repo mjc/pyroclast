@@ -110,10 +110,11 @@ struct FoldAccumulator {
 struct PidUnwindState {
     object_unwinder: FramehopUnwinder,
     attempted_unwind_mappings: BTreeSet<UnwindMappingKey>,
-    loaded_unwind_mappings: BTreeSet<UnwindMappingKey>,
+    loaded_unwind_modules: BTreeSet<UnwindModuleKey>,
 }
 
 type UnwindMappingKey = (String, u64, u64, u64);
+type UnwindModuleKey = (String, u64);
 
 struct OwnedUnwindMappingRequest {
     start: u64,
@@ -1252,7 +1253,7 @@ impl FoldAccumulator {
                 load_unwind_mapping(
                     &mut unwind_state.object_unwinder,
                     &mut unwind_state.attempted_unwind_mappings,
-                    &mut unwind_state.loaded_unwind_mappings,
+                    &mut unwind_state.loaded_unwind_modules,
                     UnwindMappingRequest {
                         start: record.start,
                         len: record.len,
@@ -1281,7 +1282,7 @@ impl FoldAccumulator {
                     load_build_id_unwind_mapping(
                         &mut unwind_state.object_unwinder,
                         &mut unwind_state.attempted_unwind_mappings,
-                        &mut unwind_state.loaded_unwind_mappings,
+                        &mut unwind_state.loaded_unwind_modules,
                         UnwindMappingRequest {
                             start: record.start,
                             len: record.len,
@@ -1300,7 +1301,7 @@ impl FoldAccumulator {
                     load_mmap2_unwind_mapping(
                         &mut unwind_state.object_unwinder,
                         &mut unwind_state.attempted_unwind_mappings,
-                        &mut unwind_state.loaded_unwind_mappings,
+                        &mut unwind_state.loaded_unwind_modules,
                         &record,
                     );
                     self.mmap_table.insert_mmap2(record);
@@ -1313,7 +1314,7 @@ impl FoldAccumulator {
                 load_build_id_unwind_mapping(
                     &mut unwind_state.object_unwinder,
                     &mut unwind_state.attempted_unwind_mappings,
-                    &mut unwind_state.loaded_unwind_mappings,
+                    &mut unwind_state.loaded_unwind_modules,
                     UnwindMappingRequest {
                         start: record.start,
                         len: record.len,
@@ -1380,7 +1381,7 @@ impl FoldAccumulator {
                 load_build_id_unwind_mapping(
                     &mut unwind_state.object_unwinder,
                     &mut unwind_state.attempted_unwind_mappings,
-                    &mut unwind_state.loaded_unwind_mappings,
+                    &mut unwind_state.loaded_unwind_modules,
                     request,
                     unwind_debug_dir.as_deref(),
                 );
@@ -1388,7 +1389,7 @@ impl FoldAccumulator {
                 load_unwind_mapping(
                     &mut unwind_state.object_unwinder,
                     &mut unwind_state.attempted_unwind_mappings,
-                    &mut unwind_state.loaded_unwind_mappings,
+                    &mut unwind_state.loaded_unwind_modules,
                     request,
                 );
             }
@@ -1655,12 +1656,13 @@ impl FoldAccumulator {
                 )
             },
         );
-        unwind_state.loaded_unwind_mappings.contains(&(
-            object_path.to_string_lossy().into_owned(),
-            mapping.start,
-            mapping.len,
-            mapping.pgoff,
-        ))
+        unwind_state
+            .loaded_unwind_modules
+            .contains(&unwind_module_key(
+                object_path.to_string_lossy().as_ref(),
+                mapping.start,
+                mapping.pgoff,
+            ))
     }
 
     fn drain_fold_counts<R>(
@@ -2667,6 +2669,10 @@ fn perf_accepted_object_unwind_frames(
     // perf's libdw path reports the IP to DWFL as initial state, then only
     // prints entries accepted via frame_callback/entry.
     match unwound_frames.as_slice() {
+        [] => match initial_frame_policy {
+            ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp => Vec::new(),
+            ObjectUnwindInitialFramePolicy::KeepDsoLeaf => vec![regs.ip],
+        },
         [ip] if *ip == regs.ip => match initial_frame_policy {
             ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp => Vec::new(),
             ObjectUnwindInitialFramePolicy::KeepDsoLeaf => vec![*ip],
@@ -2742,8 +2748,8 @@ fn has_dylib_extension(file_name: &str) -> bool {
 
 fn load_unwind_mapping(
     object_unwinder: &mut FramehopUnwinder,
-    attempted_unwind_mappings: &mut BTreeSet<(String, u64, u64, u64)>,
-    loaded_unwind_mappings: &mut BTreeSet<(String, u64, u64, u64)>,
+    attempted_unwind_mappings: &mut BTreeSet<UnwindMappingKey>,
+    loaded_unwind_modules: &mut BTreeSet<UnwindModuleKey>,
     request: UnwindMappingRequest<'_>,
 ) {
     if !should_load_unwind_object(request.path, request.file_identity) {
@@ -2752,12 +2758,7 @@ fn load_unwind_mapping(
     if request.prot.is_some_and(|prot| prot & PROT_EXEC == 0) {
         return;
     }
-    let key = (
-        request.path.to_string(),
-        request.start,
-        request.len,
-        request.pgoff,
-    );
+    let key = unwind_mapping_key(request.path, request.start, request.len, request.pgoff);
     if !attempted_unwind_mappings.insert(key.clone()) {
         return;
     }
@@ -2770,20 +2771,24 @@ fn load_unwind_mapping(
         )
         .is_ok_and(|loaded| loaded || object_unwinder.has_reported_module_for_ip(request.start))
     {
-        loaded_unwind_mappings.insert(key);
+        loaded_unwind_modules.insert(unwind_module_key(
+            request.path,
+            request.start,
+            request.pgoff,
+        ));
     }
 }
 
 fn load_mmap2_unwind_mapping(
     object_unwinder: &mut FramehopUnwinder,
-    attempted_unwind_mappings: &mut BTreeSet<(String, u64, u64, u64)>,
-    loaded_unwind_mappings: &mut BTreeSet<(String, u64, u64, u64)>,
+    attempted_unwind_mappings: &mut BTreeSet<UnwindMappingKey>,
+    loaded_unwind_modules: &mut BTreeSet<UnwindModuleKey>,
     record: &Mmap2Record,
 ) {
     load_unwind_mapping(
         object_unwinder,
         attempted_unwind_mappings,
-        loaded_unwind_mappings,
+        loaded_unwind_modules,
         UnwindMappingRequest {
             start: record.start,
             len: record.len,
@@ -2798,8 +2803,8 @@ fn load_mmap2_unwind_mapping(
 
 fn load_build_id_unwind_mapping(
     object_unwinder: &mut FramehopUnwinder,
-    attempted_unwind_mappings: &mut BTreeSet<(String, u64, u64, u64)>,
-    loaded_unwind_mappings: &mut BTreeSet<(String, u64, u64, u64)>,
+    attempted_unwind_mappings: &mut BTreeSet<UnwindMappingKey>,
+    loaded_unwind_modules: &mut BTreeSet<UnwindModuleKey>,
     request: UnwindMappingRequest<'_>,
     debug_dir: Option<&Path>,
 ) {
@@ -2810,8 +2815,9 @@ fn load_build_id_unwind_mapping(
     if object_path.to_string_lossy().starts_with('[') {
         return;
     }
-    let key = (
-        object_path.to_string_lossy().into_owned(),
+    let object_path = object_path.to_string_lossy();
+    let key = unwind_mapping_key(
+        object_path.as_ref(),
         request.start,
         request.len,
         request.pgoff,
@@ -2820,11 +2826,28 @@ fn load_build_id_unwind_mapping(
         return;
     }
     if object_unwinder
-        .add_object_mapping(&object_path, request.start, request.len, request.pgoff)
+        .add_object_mapping(
+            Path::new(object_path.as_ref()),
+            request.start,
+            request.len,
+            request.pgoff,
+        )
         .is_ok_and(|loaded| loaded || object_unwinder.has_reported_module_for_ip(request.start))
     {
-        loaded_unwind_mappings.insert(key);
+        loaded_unwind_modules.insert(unwind_module_key(
+            object_path.as_ref(),
+            request.start,
+            request.pgoff,
+        ));
     }
+}
+
+fn unwind_mapping_key(path: &str, start: u64, len: u64, pgoff: u64) -> UnwindMappingKey {
+    (path.to_string(), start, len, pgoff)
+}
+
+fn unwind_module_key(path: &str, start: u64, pgoff: u64) -> UnwindModuleKey {
+    (path.to_string(), start.saturating_sub(pgoff))
 }
 
 fn unwind_object_path_for_build_id(
@@ -3600,6 +3623,69 @@ mod tests {
             ),
             vec![0x7fff_f7e2_ecb7]
         );
+    }
+
+    #[test]
+    fn object_unwind_keeps_empty_dso_leaf_like_perf_libdw_frame_callback() {
+        // Real period 4769907 sample from target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
+        // perf script prints realloc+0x245. tools/perf/util/unwind-libdw.c
+        // reports the sampled IP module, then frame_callback emits the current
+        // PC even when no caller is recovered.
+        let regs = super::PerfX86_64Regs {
+            ip: 0x7fff_f7e3_2455,
+            sp: 0x7fff_ffff_9608,
+            bp: 1,
+            registers: [0; 16],
+        };
+
+        assert_eq!(
+            super::perf_accepted_object_unwind_frames(
+                &regs,
+                super::SampleCallchainState::Other {
+                    has_callchain: true,
+                    has_frames: false,
+                },
+                super::ObjectUnwindInitialFramePolicy::KeepDsoLeaf,
+                Vec::new(),
+            ),
+            vec![0x7fff_f7e3_2455]
+        );
+    }
+
+    #[test]
+    fn loaded_unwind_module_applies_across_dso_segments_like_perf_dwfl() {
+        // perf's tools/perf/util/unwind-libdw.c reports a DSO to DWFL and then
+        // asks dwfl_addrmodule(ui->dwfl, ip). A module loaded from one ELF
+        // segment must therefore satisfy a later IP resolved through another
+        // segment with the same load base.
+        let path = "/nix/store/glibc/lib/libc.so.6";
+        let mut accumulator = super::FoldAccumulator::new(std::collections::BTreeMap::new());
+        accumulator
+            .mmap_table
+            .insert_mmap(crate::perfdata::records::MmapRecord {
+                pid: 11,
+                tid: 11,
+                start: 0x7fff_f7d8_2000,
+                len: 0x0020_b000,
+                pgoff: 0,
+                path: path.to_string(),
+            });
+        accumulator
+            .mmap_table
+            .insert_mmap(crate::perfdata::records::MmapRecord {
+                pid: 11,
+                tid: 11,
+                start: 0x7fff_f7da_a000,
+                len: 0x0018_1000,
+                pgoff: 0x28000,
+                path: path.to_string(),
+            });
+        accumulator
+            .unwind_state_mut(11)
+            .loaded_unwind_modules
+            .insert((path.to_string(), 0x7fff_f7d8_2000));
+
+        assert!(accumulator.has_loaded_unwind_mapping_for_ip(11.into(), 0x7fff_f7e3_2455));
     }
 
     #[test]
