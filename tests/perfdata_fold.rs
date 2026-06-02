@@ -1669,6 +1669,34 @@ fn merges_deferred_user_callchains_like_perf_script() {
 }
 
 #[test]
+fn flushes_unmatched_deferred_user_callchains_like_perf_script() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(3, &comm_payload(11, 11, "pyroclast")),
+            record_bytes(
+                9,
+                &sample_payload(
+                    0x1000,
+                    11,
+                    12,
+                    [0x2000, 0x3000, 0xffff_ffff_ffff_fd80, 0x4444],
+                ),
+            ),
+            record_bytes(22, &callchain_deferred_payload(0x5555, [0x5000, 0x6000])),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, "pyroclast;0x3000;0x2000 1\n");
+}
+
+#[test]
 fn omits_samples_that_have_no_frames_after_filtering_like_inferno() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(

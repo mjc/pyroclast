@@ -633,6 +633,7 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
         })?;
     }
     ordered_records.flush_final(&mut accumulator, &sample_layouts, options)?;
+    accumulator.flush_deferred_samples();
 
     Ok(accumulator.into_fold_data())
 }
@@ -743,6 +744,7 @@ where
     }
 
     ordered_records.flush_final(&mut accumulator, &sample_layouts, options)?;
+    accumulator.flush_deferred_samples();
     accumulator.drain_fold_counts(&mut counts, symbol_cache)?;
     write_fold_counts(counts, writer)
 }
@@ -838,7 +840,9 @@ where
         offset = next;
     }
 
-    ordered_records.flush_final_with(|record| sink.apply_record(record, &sample_layouts, options))
+    ordered_records
+        .flush_final_with(|record| sink.apply_record(record, &sample_layouts, options))?;
+    sink.flush_deferred_samples()
 }
 
 struct PerfScriptSink<'io, 'cache, R, W: ?Sized> {
@@ -924,6 +928,21 @@ where
             sample
                 .frames
                 .extend(ips.iter().copied().map(FoldFrame::Callchain));
+            let sample = PreparedFoldSample {
+                pid: sample.pid,
+                comm: sample.comm,
+                count: sample.count,
+                frames: sample.frames,
+                deferred_cookie: None,
+            };
+            self.write_sample_event(&sample)?;
+        }
+        Ok(())
+    }
+
+    fn flush_deferred_samples(&mut self) -> Result<(), String> {
+        let samples = self.accumulator.take_deferred_samples();
+        for sample in samples {
             let sample = PreparedFoldSample {
                 pid: sample.pid,
                 comm: sample.comm,
@@ -1676,6 +1695,27 @@ impl FoldAccumulator {
                 &mut self.callchain,
             );
         }
+    }
+
+    fn flush_deferred_samples(&mut self) {
+        for sample in self.take_deferred_samples() {
+            add_fold_stack(
+                sample.pid,
+                sample.comm.as_deref(),
+                sample.count,
+                &sample.frames,
+                &self.mmap_table,
+                &mut self.raw_stacks,
+                &mut self.callchain,
+            );
+        }
+    }
+
+    fn take_deferred_samples(&mut self) -> Vec<DeferredFoldSample> {
+        std::mem::take(&mut self.deferred_samples)
+            .into_values()
+            .flatten()
+            .collect()
     }
 
     fn has_loaded_unwind_mapping_for_ip(&self, pid: Option<u32>, ip: u64) -> bool {
