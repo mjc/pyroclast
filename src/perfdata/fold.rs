@@ -2786,19 +2786,6 @@ fn perf_accepted_object_unwind_frames(
         {
             vec![*ip]
         }
-        [ip, ..]
-            if *ip == regs.ip
-                && callchain
-                    == (SampleCallchainState::Other {
-                        has_callchain: true,
-                        has_frames: false,
-                    }) =>
-        {
-            match initial_frame_policy {
-                ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp => Vec::new(),
-                ObjectUnwindInitialFramePolicy::KeepDsoLeaf => vec![*ip],
-            }
-        }
         [ip, _]
             if *ip == regs.ip
                 && callchain
@@ -3668,11 +3655,12 @@ mod tests {
     }
 
     #[test]
-    fn object_unwind_drops_empty_callchain_executable_leaf_like_perf_libdw() {
+    fn object_unwind_acceptance_keeps_user_mode_executable_frames_like_libdw_entry() {
         // Real period 4633851 sample from target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
         // perf script prints no frames for add_fold_stack in the Pyroclast
-        // executable even though framehop can synthesize a stack from the
-        // sampled user registers and stack bytes.
+        // executable because the full unwind path rejects that synthesized
+        // stack before this acceptance step. tools/perf/util/unwind-libdw.c's
+        // entry callback does not drop already-accepted executable frames.
         let regs = super::PerfX86_64Regs {
             ip: 0x5555_5578_c601,
             sp: 0x7fff_ffff_8cf8,
@@ -3690,7 +3678,7 @@ mod tests {
                 super::ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp,
                 vec![0x5555_5578_c601, 0x5555_5579_6e23],
             ),
-            Vec::<u64>::new()
+            vec![0x5555_5578_c601, 0x5555_5579_6e23]
         );
     }
 
@@ -3968,10 +3956,12 @@ mod tests {
     }
 
     #[test]
-    fn object_unwind_stops_after_libc_leaf_with_empty_fp_chain_like_perf_libdw() {
+    fn object_unwind_acceptance_keeps_short_dso_tail_like_libdw_entry() {
         // Real sample from target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
         // perf script prints only __memmove_avx_unaligned_erms for this event,
-        // while framehop can advance through libc's no-op FDE using sampled stack bytes.
+        // but that decision belongs to the full unwind/truncation path. Once
+        // libdw entry has accepted frames, there is no user-mode empty-callchain
+        // filter here.
         let regs = super::PerfX86_64Regs {
             ip: 0x7fff_f7f0_277b,
             sp: 0x7fff_ffff_8cf8,
@@ -3989,15 +3979,54 @@ mod tests {
                 super::ObjectUnwindInitialFramePolicy::KeepDsoLeaf,
                 vec![0x7fff_f7f0_277b, 0x5555_5579_6e23, 0x5555_5579_6e23],
             ),
-            vec![0x7fff_f7f0_277b]
+            vec![0x7fff_f7f0_277b, 0x5555_5579_6e23, 0x5555_5579_6e23]
         );
     }
 
     #[test]
-    fn object_unwind_stops_after_libc_leaf_with_empty_fp_chain_and_plausible_bp_like_perf_libdw() {
+    fn object_unwind_keeps_user_mode_libdw_tail_for_empty_recorded_callchain() {
+        // Real sh period 3559 sample from target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
+        // perf/libdw emits _int_malloc followed by bash callers even though the
+        // recorded FP callchain has nr:0. tools/perf/util/unwind-libdw.c has no
+        // blanket filter for user-mode samples with an empty callchain; it emits
+        // each frame accepted by frame_callback -> entry.
+        let regs = super::PerfX86_64Regs {
+            ip: 0x7fff_f7e5_7982,
+            sp: 0x7fff_ffff_a1e0,
+            bp: 0x7fff_ffff_a220,
+            registers: [0; 16],
+        };
+
+        assert_eq!(
+            super::perf_accepted_object_unwind_frames(
+                &regs,
+                super::SampleCallchainState::Other {
+                    has_callchain: true,
+                    has_frames: false,
+                },
+                super::ObjectUnwindInitialFramePolicy::KeepDsoLeaf,
+                vec![
+                    0x7fff_f7e5_7982,
+                    0x5555_555a_019e,
+                    0x5555_5559_21a3,
+                    0x5555_5559_6488,
+                ],
+            ),
+            vec![
+                0x7fff_f7e5_7982,
+                0x5555_555a_019e,
+                0x5555_5559_21a3,
+                0x5555_5559_6488,
+            ]
+        );
+    }
+
+    #[test]
+    fn object_unwind_acceptance_keeps_two_frame_dso_tail_like_libdw_entry() {
         // Real period 5288210 sample from target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
         // perf script prints only __memmove_avx_unaligned_erms even though the
-        // sampled BP points above SP; the recorded FP callchain itself is empty.
+        // sampled BP points above SP; the full unwind path is responsible for
+        // rejecting framehop-only tails that libdw did not accept.
         let regs = super::PerfX86_64Regs {
             ip: 0x7fff_f7f0_277b,
             sp: 0x7fff_ffff_8938,
@@ -4015,7 +4044,7 @@ mod tests {
                 super::ObjectUnwindInitialFramePolicy::KeepDsoLeaf,
                 vec![0x7fff_f7f0_277b, 0x5555_556b_ab79],
             ),
-            vec![0x7fff_f7f0_277b]
+            vec![0x7fff_f7f0_277b, 0x5555_556b_ab79]
         );
     }
 
