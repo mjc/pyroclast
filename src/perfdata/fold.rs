@@ -3013,9 +3013,7 @@ fn append_mapped_frame_pointer_callers(
 }
 
 fn choose_user_unwind_source(context: UserUnwindContext) -> UserUnwindSource {
-    if matches!(context.callchain, SampleCallchainState::KernelWithUserFrame)
-        || context.initial_ip_mapping == InitialIpMappingState::RecordedMappingMissing
-    {
+    if context.initial_ip_mapping == InitialIpMappingState::RecordedMappingMissing {
         UserUnwindSource::None
     } else if context.module_count == 0 {
         if has_perf_frame_pointer_fallback(context)
@@ -3050,8 +3048,9 @@ fn has_perf_frame_pointer_fallback(context: UserUnwindContext) -> bool {
 fn has_perf_object_unwind(context: UserUnwindContext) -> bool {
     match context.callchain {
         SampleCallchainState::KernelWithoutCallchain => context.initial_ip_is_dso,
-        SampleCallchainState::KernelWithCallchain | SampleCallchainState::Other { .. } => true,
-        SampleCallchainState::KernelWithUserFrame => false,
+        SampleCallchainState::KernelWithCallchain
+        | SampleCallchainState::KernelWithUserFrame
+        | SampleCallchainState::Other { .. } => true,
     }
 }
 
@@ -4173,7 +4172,12 @@ mod tests {
     }
 
     #[test]
-    fn user_unwind_source_skips_kernel_samples_with_user_frame_like_perf_script() {
+    fn user_unwind_source_uses_object_unwind_for_kernel_samples_with_user_frame_like_perf_script() {
+        // tools/perf/util/machine.c __thread__resolve_callchain() calls
+        // thread__resolve_callchain_sample() and then
+        // thread__resolve_callchain_unwind() for ORDER_CALLEE. The unwind
+        // path checks captured regs/stack, not whether the recorded callchain
+        // already contains a user frame.
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
                 callchain: super::SampleCallchainState::KernelWithUserFrame,
@@ -4183,7 +4187,7 @@ mod tests {
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
             }),
-            super::UserUnwindSource::None
+            super::UserUnwindSource::Object
         );
     }
 
