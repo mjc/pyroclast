@@ -2508,6 +2508,13 @@ fn unwind_user_stack_like_perf(
                     initial_frame_policy,
                     state.object_unwinder.unwind_stack(*regs, stack_bytes, 256),
                 );
+                frames = extend_initial_dso_leaf_with_same_mapping_frame_pointer_tail(
+                    sample.pid,
+                    &accumulator.mmap_table,
+                    regs,
+                    stack_bytes,
+                    frames,
+                );
                 append_libdw_leaf_return_fallback(
                     sample.pid,
                     regs,
@@ -2519,6 +2526,63 @@ fn unwind_user_stack_like_perf(
                 frames
             }),
     }
+}
+
+fn extend_initial_dso_leaf_with_same_mapping_frame_pointer_tail(
+    pid: Option<u32>,
+    mmap_table: &MmapTable,
+    regs: &PerfX86_64Regs,
+    stack_bytes: &[u8],
+    object_frames: Vec<u64>,
+) -> Vec<u64> {
+    if object_frames.as_slice() != [regs.ip] {
+        return object_frames;
+    }
+    let mut extended_frames = object_frames;
+    let reader = crate::perfdata::unwind::PerfStackReader::new(regs.sp, stack_bytes);
+    if let Some(return_address) = reader.read_u64(regs.sp)
+        && return_address != 0
+        && !is_kernel_space_frame(return_address)
+        && user_frames_share_mapping_path(
+            pid,
+            regs.ip,
+            return_address.saturating_sub(1),
+            mmap_table,
+        )
+    {
+        extended_frames.push(return_address.saturating_sub(1));
+    }
+    if extended_frames.len() == 1 {
+        return extended_frames;
+    }
+    let frame_pointer_frames = unwind_x86_64_stack(*regs, stack_bytes, 256);
+    if frame_pointer_frames.first() == Some(&regs.ip) {
+        for frame in frame_pointer_frames.into_iter().skip(1) {
+            if extended_frames.last() != Some(&frame) {
+                extended_frames.push(frame);
+            }
+        }
+    }
+    extended_frames
+}
+
+fn user_frames_share_mapping_path(
+    pid: Option<u32>,
+    left: u64,
+    right: u64,
+    mmap_table: &MmapTable,
+) -> bool {
+    let Some(pid) = pid else {
+        return false;
+    };
+    let mut cache = MappingResolveCache::default();
+    let left_path = mmap_table
+        .resolve_ref_cached(pid, left, &mut cache)
+        .map(|mapping| mapping.path);
+    let right_path = mmap_table
+        .resolve_ref_cached(pid, right, &mut cache)
+        .map(|mapping| mapping.path);
+    left_path.is_some() && left_path == right_path
 }
 
 fn append_libdw_leaf_return_fallback(
@@ -3837,6 +3901,47 @@ mod tests {
             ),
             vec![0x7fff_f7f0_2731]
         );
+    }
+
+    #[test]
+    fn object_unwind_extends_initial_dso_leaf_with_same_mapping_return_like_libdw() {
+        // Real sh strcmp@plt sample from target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
+        // perf/libdw reports the PLT leaf, then advances through the sampled
+        // stack. The first caller is the stack return address minus one.
+        let mut registers = [0; 16];
+        registers[framehop::x86_64::Reg::RBP as usize] = 0x7fff_ffff_6750;
+        registers[framehop::x86_64::Reg::RSP as usize] = 0x7fff_ffff_6748;
+        let regs = super::PerfX86_64Regs {
+            ip: 0x7fff_f7dd_27a4,
+            sp: 0x7fff_ffff_6748,
+            bp: 0x7fff_ffff_6750,
+            registers,
+        };
+        let stack = [
+            0xeb, 0x66, 0xdd, 0xf7, 0xff, 0x7f, 0, 0, //
+            0, 0, 0, 0, 0, 0, 0, 0, //
+            0x11, 0x11, 0, 0, 0, 0, 0, 0,
+        ];
+
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x7fff_f7dd_0000,
+            len: 0x10_0000,
+            pgoff: 0,
+            path: "/nix/store/glibc/lib/libc.so.6".to_string(),
+        });
+
+        let frames = super::extend_initial_dso_leaf_with_same_mapping_frame_pointer_tail(
+            Some(11),
+            &mmap_table,
+            &regs,
+            &stack,
+            vec![regs.ip],
+        );
+
+        assert_eq!(frames, vec![regs.ip, 0x7fff_f7dd_66ea, 0x1110]);
     }
 
     #[test]
