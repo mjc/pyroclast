@@ -202,6 +202,7 @@ enum InitialIpMappingState {
 struct UserUnwindContext {
     callchain: SampleCallchainState,
     initial_ip_mapping: InitialIpMappingState,
+    initial_ip_is_dso: bool,
     module_count: usize,
     frame_pointer_at_or_above_stack_pointer: bool,
     syscall_return_state: bool,
@@ -2325,6 +2326,9 @@ fn append_perf_user_unwind_frames(
     } else {
         InitialIpMappingState::NoRecordedMapping
     };
+    let initial_ip_is_dso =
+        object_unwind_initial_frame_policy(sample.pid, regs.ip, &accumulator.mmap_table)
+            == ObjectUnwindInitialFramePolicy::KeepDsoLeaf;
     let module_count = sample
         .pid
         .and_then(|pid| accumulator.unwind_states.get(&pid))
@@ -2357,6 +2361,7 @@ fn append_perf_user_unwind_frames(
         UserUnwindContext {
             callchain,
             initial_ip_mapping,
+            initial_ip_is_dso,
             module_count,
             frame_pointer_at_or_above_stack_pointer: regs.bp >= regs.sp,
             syscall_return_state: regs.is_syscall_return_state(),
@@ -2459,10 +2464,8 @@ fn append_libdw_leaf_return_fallback(
 }
 
 fn choose_user_unwind_source(context: UserUnwindContext) -> UserUnwindSource {
-    if matches!(
-        context.callchain,
-        SampleCallchainState::KernelWithoutCallchain | SampleCallchainState::KernelWithUserFrame
-    ) || context.initial_ip_mapping == InitialIpMappingState::RecordedMappingMissing
+    if matches!(context.callchain, SampleCallchainState::KernelWithUserFrame)
+        || context.initial_ip_mapping == InitialIpMappingState::RecordedMappingMissing
     {
         UserUnwindSource::None
     } else if context.module_count == 0 {
@@ -2497,6 +2500,7 @@ fn has_perf_frame_pointer_fallback(context: UserUnwindContext) -> bool {
 
 fn has_perf_object_unwind(context: UserUnwindContext) -> bool {
     match context.callchain {
+        SampleCallchainState::KernelWithoutCallchain => context.initial_ip_is_dso,
         SampleCallchainState::KernelWithCallchain => {
             context.frame_pointer_at_or_above_stack_pointer || context.syscall_return_state
         }
@@ -2504,9 +2508,7 @@ fn has_perf_object_unwind(context: UserUnwindContext) -> bool {
             has_callchain: true,
             ..
         } => true,
-        SampleCallchainState::KernelWithoutCallchain
-        | SampleCallchainState::KernelWithUserFrame
-        | SampleCallchainState::Other { .. } => false,
+        SampleCallchainState::KernelWithUserFrame | SampleCallchainState::Other { .. } => false,
     }
 }
 
@@ -2583,6 +2585,13 @@ fn perf_accepted_object_unwind_frames(
             if *ip == regs.ip
                 && callchain == SampleCallchainState::KernelWithCallchain
                 && regs.is_syscall_return_state() =>
+        {
+            vec![*ip]
+        }
+        [ip, ..]
+            if *ip == regs.ip
+                && callchain == SampleCallchainState::KernelWithoutCallchain
+                && initial_frame_policy == ObjectUnwindInitialFramePolicy::KeepDsoLeaf =>
         {
             vec![*ip]
         }
@@ -3140,6 +3149,7 @@ mod tests {
                     has_frames: true,
                 },
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingMissing,
+                initial_ip_is_dso: false,
                 module_count: 1,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
@@ -3157,6 +3167,7 @@ mod tests {
                     has_frames: true,
                 },
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
+                initial_ip_is_dso: false,
                 module_count: 0,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
@@ -3170,6 +3181,7 @@ mod tests {
                     has_frames: false,
                 },
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
+                initial_ip_is_dso: false,
                 module_count: 0,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
@@ -3183,6 +3195,7 @@ mod tests {
                     has_frames: true,
                 },
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
+                initial_ip_is_dso: false,
                 module_count: 0,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
@@ -3200,6 +3213,7 @@ mod tests {
                     has_frames: false,
                 },
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
+                initial_ip_is_dso: false,
                 module_count: 1,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
@@ -3217,6 +3231,7 @@ mod tests {
                     has_frames: true,
                 },
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
+                initial_ip_is_dso: false,
                 module_count: 1,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
@@ -3231,6 +3246,7 @@ mod tests {
             super::choose_user_unwind_source(super::UserUnwindContext {
                 callchain: super::SampleCallchainState::KernelWithCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
+                initial_ip_is_dso: false,
                 module_count: 1,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
@@ -3245,6 +3261,7 @@ mod tests {
             super::choose_user_unwind_source(super::UserUnwindContext {
                 callchain: super::SampleCallchainState::KernelWithCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
+                initial_ip_is_dso: false,
                 module_count: 1,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: true,
@@ -3259,6 +3276,7 @@ mod tests {
             super::choose_user_unwind_source(super::UserUnwindContext {
                 callchain: super::SampleCallchainState::KernelWithCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
+                initial_ip_is_dso: false,
                 module_count: 1,
                 frame_pointer_at_or_above_stack_pointer: true,
                 syscall_return_state: false,
@@ -3268,11 +3286,33 @@ mod tests {
     }
 
     #[test]
-    fn user_unwind_source_skips_kernel_samples_without_callchain_like_perf_script() {
+    fn user_unwind_source_uses_object_unwind_for_kernel_sample_without_callchain_like_perf_libdw() {
+        // Real period 4745147 sample from target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
+        // perf script records a kernel-mode IP but still calls libdw with the
+        // captured user regs/stack and emits the user-space memmove leaf.
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
                 callchain: super::SampleCallchainState::KernelWithoutCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
+                initial_ip_is_dso: true,
+                module_count: 1,
+                frame_pointer_at_or_above_stack_pointer: false,
+                syscall_return_state: false,
+            }),
+            super::UserUnwindSource::Object
+        );
+    }
+
+    #[test]
+    fn user_unwind_source_skips_kernel_sample_without_callchain_from_executable_like_perf_libdw() {
+        // Real period 4745894 sample from target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
+        // perf script leaves the sample blank when the captured user IP is in
+        // the Pyro executable and libdw does not produce accepted entries.
+        assert_eq!(
+            super::choose_user_unwind_source(super::UserUnwindContext {
+                callchain: super::SampleCallchainState::KernelWithoutCallchain,
+                initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
+                initial_ip_is_dso: false,
                 module_count: 1,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
@@ -3287,6 +3327,7 @@ mod tests {
             super::choose_user_unwind_source(super::UserUnwindContext {
                 callchain: super::SampleCallchainState::KernelWithUserFrame,
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
+                initial_ip_is_dso: false,
                 module_count: 1,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
@@ -3330,6 +3371,7 @@ mod tests {
             super::choose_user_unwind_source(super::UserUnwindContext {
                 callchain: super::SampleCallchainState::KernelWithCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
+                initial_ip_is_dso: false,
                 module_count: 0,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
@@ -3344,6 +3386,7 @@ mod tests {
             super::choose_user_unwind_source(super::UserUnwindContext {
                 callchain: super::SampleCallchainState::KernelWithCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
+                initial_ip_is_dso: false,
                 module_count: 0,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: true,
@@ -3358,6 +3401,7 @@ mod tests {
             super::choose_user_unwind_source(super::UserUnwindContext {
                 callchain: super::SampleCallchainState::KernelWithCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
+                initial_ip_is_dso: false,
                 module_count: 0,
                 frame_pointer_at_or_above_stack_pointer: true,
                 syscall_return_state: false,
@@ -3544,6 +3588,29 @@ mod tests {
                 vec![0x7fff_f7f0_277b, 0x5555_556b_ab79],
             ),
             vec![0x7fff_f7f0_277b]
+        );
+    }
+
+    #[test]
+    fn object_unwind_stops_after_kernel_without_callchain_dso_leaf_like_perf_libdw() {
+        // Real period 4745147 sample from target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
+        // perf script records a kernel-mode sampled IP but libdw emits only
+        // the captured user-space memmove leaf.
+        let regs = super::PerfX86_64Regs {
+            ip: 0x7fff_f7f0_2731,
+            sp: 0x7fff_ffff_9608,
+            bp: 1,
+            registers: [0; 16],
+        };
+
+        assert_eq!(
+            super::perf_accepted_object_unwind_frames(
+                &regs,
+                super::SampleCallchainState::KernelWithoutCallchain,
+                super::ObjectUnwindInitialFramePolicy::KeepDsoLeaf,
+                vec![0x7fff_f7f0_2731, 0x5555_5578_c601, 0x5555_5579_6e23],
+            ),
+            vec![0x7fff_f7f0_2731]
         );
     }
 
