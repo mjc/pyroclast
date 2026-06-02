@@ -2667,59 +2667,8 @@ fn append_perf_user_unwind_frames(
         return;
     };
     accumulator.ensure_unwind_mapping_for_ip(sample.pid, regs.ip);
-    let initial_ip_mapping = if sample
-        .pid
-        .is_some_and(|pid| accumulator.mmap_table.has_mapping_for_pid(pid, regs.ip))
-    {
-        if accumulator.has_loaded_unwind_mapping_for_ip(sample.pid, regs.ip) {
-            InitialIpMappingState::RecordedMappingLoaded
-        } else {
-            InitialIpMappingState::RecordedMappingMissing
-        }
-    } else {
-        InitialIpMappingState::NoRecordedMapping
-    };
-    let initial_ip_is_dso =
-        object_unwind_initial_frame_policy(sample.pid, regs.ip, &accumulator.mmap_table)
-            == ObjectUnwindInitialFramePolicy::KeepDsoLeaf;
-    let module_count = sample
-        .pid
-        .and_then(|pid| accumulator.unwind_states.get(&pid))
-        .map_or(0, |state| state.object_unwinder.module_count());
-    let has_recorded_user_frame = sample.frames.clone().any(is_recorded_user_callchain_frame);
-    let has_recorded_kernel_frame = sample
-        .frames
-        .clone()
-        .any(is_recorded_kernel_callchain_frame);
-    let callchain = if (misc & PERF_RECORD_MISC_CPUMODE_MASK) == PERF_RECORD_MISC_CPUMODE_KERNEL
-        && sample.frames.is_empty()
-    {
-        SampleCallchainState::KernelWithoutCallchain
-    } else if has_recorded_kernel_frame && has_recorded_user_frame {
-        // perf script keeps a recorded kernel-to-user callchain and does not
-        // append extra user DWARF callers after the user-space frame.
-        SampleCallchainState::KernelWithUserFrame
-    } else if (misc & PERF_RECORD_MISC_CPUMODE_MASK) == PERF_RECORD_MISC_CPUMODE_KERNEL {
-        SampleCallchainState::KernelWithCallchain
-    } else {
-        SampleCallchainState::Other {
-            has_callchain: event.layout.sample_type & PERF_SAMPLE_CALLCHAIN != 0,
-            has_frames: !accumulator.sample_frames.is_empty(),
-        }
-    };
-    let mut unwound_frames = unwind_user_stack_like_perf(
-        accumulator,
-        sample,
-        &regs,
-        UserUnwindContext {
-            callchain,
-            initial_ip_mapping,
-            initial_ip_is_dso,
-            module_count,
-            frame_pointer_at_or_above_stack_pointer: regs.bp >= regs.sp,
-            syscall_return_state: regs.is_syscall_return_state(),
-        },
-    );
+    let context = build_user_unwind_context(accumulator, misc, event, sample, &regs);
+    let mut unwound_frames = unwind_user_stack_like_perf(accumulator, sample, &regs, context);
     let mut mapping_cache = MappingResolveCache::default();
     truncate_user_unwind_at_first_unmapped_frame(
         sample.pid,
@@ -2728,6 +2677,83 @@ fn append_perf_user_unwind_frames(
         &mut mapping_cache,
     );
     accumulator.sample_frames.extend(unwound_frames);
+}
+
+fn build_user_unwind_context(
+    accumulator: &FoldAccumulator,
+    misc: u16,
+    event: SampleEventLayout,
+    sample: &crate::perfdata::samples::SampleCallchain<'_>,
+    regs: &PerfX86_64Regs,
+) -> UserUnwindContext {
+    UserUnwindContext {
+        callchain: sample_callchain_state(
+            misc,
+            event,
+            sample,
+            !accumulator.sample_frames.is_empty(),
+        ),
+        initial_ip_mapping: initial_ip_mapping_state(accumulator, sample.pid, regs.ip),
+        initial_ip_is_dso: object_unwind_initial_frame_policy(
+            sample.pid,
+            regs.ip,
+            &accumulator.mmap_table,
+        ) == ObjectUnwindInitialFramePolicy::KeepDsoLeaf,
+        module_count: loaded_unwind_module_count(accumulator, sample.pid),
+        frame_pointer_at_or_above_stack_pointer: regs.bp >= regs.sp,
+        syscall_return_state: regs.is_syscall_return_state(),
+    }
+}
+
+fn initial_ip_mapping_state(
+    accumulator: &FoldAccumulator,
+    pid: Option<u32>,
+    ip: u64,
+) -> InitialIpMappingState {
+    if !pid.is_some_and(|pid| accumulator.mmap_table.has_mapping_for_pid(pid, ip)) {
+        return InitialIpMappingState::NoRecordedMapping;
+    }
+    if accumulator.has_loaded_unwind_mapping_for_ip(pid, ip) {
+        InitialIpMappingState::RecordedMappingLoaded
+    } else {
+        InitialIpMappingState::RecordedMappingMissing
+    }
+}
+
+fn loaded_unwind_module_count(accumulator: &FoldAccumulator, pid: Option<u32>) -> usize {
+    pid.and_then(|pid| accumulator.unwind_states.get(&pid))
+        .map_or(0, |state| state.object_unwinder.module_count())
+}
+
+fn sample_callchain_state(
+    misc: u16,
+    event: SampleEventLayout,
+    sample: &crate::perfdata::samples::SampleCallchain<'_>,
+    has_sample_frames: bool,
+) -> SampleCallchainState {
+    let is_kernel_sample =
+        (misc & PERF_RECORD_MISC_CPUMODE_MASK) == PERF_RECORD_MISC_CPUMODE_KERNEL;
+    if is_kernel_sample && sample.frames.is_empty() {
+        return SampleCallchainState::KernelWithoutCallchain;
+    }
+    let has_recorded_user_frame = sample.frames.clone().any(is_recorded_user_callchain_frame);
+    let has_recorded_kernel_frame = sample
+        .frames
+        .clone()
+        .any(is_recorded_kernel_callchain_frame);
+    if has_recorded_kernel_frame && has_recorded_user_frame {
+        // perf script keeps a recorded kernel-to-user callchain and does not
+        // append extra user DWARF callers after the user-space frame.
+        return SampleCallchainState::KernelWithUserFrame;
+    }
+    if is_kernel_sample {
+        SampleCallchainState::KernelWithCallchain
+    } else {
+        SampleCallchainState::Other {
+            has_callchain: event.layout.sample_type & PERF_SAMPLE_CALLCHAIN != 0,
+            has_frames: has_sample_frames,
+        }
+    }
 }
 
 fn unwind_user_stack_like_perf(
