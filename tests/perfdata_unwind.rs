@@ -141,6 +141,50 @@ fn loaded_object_does_not_imply_unwind_info_for_every_address_like_perf_libdw() 
 }
 
 #[test]
+fn object_unwind_attempts_initial_plt_frame_without_cfi_like_perf_libdw() {
+    let current_exe = std::env::current_exe().expect("current exe");
+    let bytes = std::fs::read(&current_exe).expect("read object");
+    let object = object::File::parse(&bytes[..]).expect("parse object");
+    let stub_section = object
+        .sections()
+        .find(|section| {
+            section.size() >= 8
+                && matches!(
+                    section.name(),
+                    Ok(".plt" | ".plt.sec" | "__stubs" | "__symbol_stub1")
+                )
+        })
+        .expect("plt or stub section");
+    let base = 0x5555_0000;
+    let ip = base + stub_section.address();
+    let sp = 0x7fff_0000;
+    let return_address = 0x1234_u64;
+    let stack = return_address.to_le_bytes();
+    let mut unwinder = FramehopUnwinder::new();
+
+    assert!(
+        unwinder
+            .add_object_mapping(&current_exe, base, 0x1000_0000, 0)
+            .expect("load object mapping")
+    );
+    assert!(unwinder.has_reported_module_for_ip(ip));
+    assert!(!unwinder.has_unwind_info_for_ip(ip));
+
+    let frames = unwinder.unwind_stack(
+        PerfX86_64Regs {
+            ip,
+            sp,
+            bp: sp,
+            registers: registers_with_bp_sp(sp, sp),
+        },
+        &stack,
+        4,
+    );
+
+    assert_eq!(frames.first(), Some(&ip));
+}
+
+#[test]
 fn rejects_overlapping_module_base_like_dwfl_report_elf() {
     let current_exe = std::env::current_exe().expect("current exe");
     let first_start = 0x5555_0000;

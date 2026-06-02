@@ -204,9 +204,6 @@ impl FramehopUnwinder {
         {
             return Vec::new();
         }
-        if !self.has_unwind_info_for_ip(regs.ip) {
-            return Vec::new();
-        }
         let stack_reader = PerfStackReader::new(regs.sp, stack);
         let reported_modules = &self.reported_modules;
         let mut read_stack = |address| {
@@ -531,7 +528,13 @@ fn truncate_at_first_uncovered_unwind_frame(
     frames: &mut Vec<u64>,
     mut has_unwind_info: impl FnMut(u64) -> bool,
 ) {
-    if let Some(index) = frames.iter().position(|address| !has_unwind_info(*address))
+    // perf's libdw path reports the current PC in frame_callback before
+    // advancing to callers, so the sampled frame is allowed to lack CFI.
+    if let Some(index) = frames
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find_map(|(index, address)| (!has_unwind_info(*address)).then_some(index))
         && index + 1 != frames.len()
     {
         frames.truncate(index);
@@ -681,12 +684,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_object_unwind_when_first_frame_has_no_cfi_like_perf_libdw() {
-        let mut frames = vec![0x3000, 0x4000];
+    fn keeps_initial_object_unwind_frame_without_cfi_like_perf_libdw() {
+        let mut frames = vec![0x3000, 0x1000];
 
         super::truncate_at_first_uncovered_unwind_frame(&mut frames, |address| address < 0x3000);
 
-        assert_eq!(frames, Vec::<u64>::new());
+        assert_eq!(frames, vec![0x3000, 0x1000]);
     }
 
     #[test]
