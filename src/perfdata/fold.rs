@@ -2186,7 +2186,9 @@ impl<'a> FoldFrameResolver<'a> {
         }) else {
             return Ok(());
         };
-        let frames = cache.resolve_mapping_ref(&mapping)?;
+        let Some(frames) = cache.resolve_mapping_ref_with_base_symbol(&mapping)? else {
+            return Ok(());
+        };
         if frames.len() <= 1 {
             return Ok(());
         }
@@ -2215,7 +2217,9 @@ impl<'a> FoldFrameResolver<'a> {
         }) else {
             return Ok(());
         };
-        let frames = cache.resolve_mapping_ref(&mapping)?;
+        let Some(frames) = cache.resolve_mapping_ref_with_base_symbol(&mapping)? else {
+            return Ok(());
+        };
         if frames.len() <= 1 {
             return Ok(());
         }
@@ -3367,10 +3371,11 @@ fn read_sample_u64(payload: &[u8], offset: usize) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use crate::perfdata::mappings::FileIdentity;
-    use crate::symbols::{SymbolFrameCache, SymbolRequest, SymbolResolver};
+    use crate::symbols::{ResolvedSymbolFrames, SymbolFrameCache, SymbolRequest, SymbolResolver};
 
     struct StaticFrameResolver {
         frames: Vec<String>,
+        has_base_symbol: bool,
     }
 
     impl SymbolResolver for StaticFrameResolver {
@@ -3383,6 +3388,19 @@ mod tests {
             requests: &[SymbolRequest],
         ) -> Result<Vec<Vec<String>>, String> {
             Ok(vec![self.frames.clone(); requests.len()])
+        }
+
+        fn resolve_frame_batch_with_metadata(
+            &self,
+            requests: &[SymbolRequest],
+        ) -> Result<Vec<ResolvedSymbolFrames>, String> {
+            Ok(vec![
+                ResolvedSymbolFrames {
+                    frames: self.frames.clone(),
+                    has_base_symbol: self.has_base_symbol,
+                };
+                requests.len()
+            ])
         }
     }
 
@@ -3599,6 +3617,7 @@ mod tests {
         });
         let resolver = StaticFrameResolver {
             frames: vec!["core::num::flt2dec::strategy::dragon::mul_pow10".to_string()],
+            has_base_symbol: false,
         };
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut buffers = super::FoldedRenderBuffers::default();
@@ -3608,6 +3627,43 @@ mod tests {
                 Some(11),
                 Some("pyroclast"),
                 &[super::FoldFrame::InlineCurrentIp(0x5555_5567_6876)],
+                Some(&mut symbol_cache),
+                &mut buffers,
+            )
+            .expect("render folded stack");
+
+        assert_eq!(buffers.rendered, "");
+    }
+
+    #[test]
+    fn inline_current_ip_without_base_symbol_renders_no_folded_stack_like_perf_append_inlines() {
+        // tools/perf/util/machine.c append_inlines() returns before expanding
+        // DWARF inline frames when thread__find_symbol() did not populate ms.sym.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x5555_5570_0000,
+            len: 0x10_0000,
+            pgoff: 0,
+            path: "/bin/pyroclast".to_string(),
+        });
+        let resolver = StaticFrameResolver {
+            frames: vec![
+                "index_mut<u8>".to_string(),
+                "default_read_exact<std::fs::File>".to_string(),
+                "read_file_range".to_string(),
+            ],
+            has_base_symbol: false,
+        };
+        let mut symbol_cache = SymbolFrameCache::new(&resolver);
+        let mut buffers = super::FoldedRenderBuffers::default();
+
+        super::FoldFrameResolver::new(&mmap_table)
+            .render_folded_stack_for_stack(
+                Some(11),
+                Some("pyroclast"),
+                &[super::FoldFrame::InlineCurrentIp(0x5555_557a_e068)],
                 Some(&mut symbol_cache),
                 &mut buffers,
             )
@@ -3636,6 +3692,7 @@ mod tests {
                 "sort8_stable<&str>".to_string(),
                 "quicksort<&str>".to_string(),
             ],
+            has_base_symbol: true,
         };
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut buffers = super::FoldedRenderBuffers::default();
