@@ -253,6 +253,12 @@ struct CachedObjectMetadata {
 }
 
 #[derive(Default)]
+struct PerfObjectSymbolNames<'a> {
+    bare: Option<&'a str>,
+    with_offset: Option<String>,
+}
+
+#[derive(Default)]
 struct PerfObjectSymbolIndex {
     symbols: Vec<PerfSymbolCandidate>,
 }
@@ -1555,16 +1561,9 @@ where
             let object_metadata = self.object_metadata(path);
             for ((index, request), symbol) in indexes.into_iter().zip(grouped_requests).zip(symbols)
             {
-                let object_symbol = object_metadata.as_ref().and_then(|metadata| {
-                    metadata
-                        .object_metadata
-                        .object_symbol(request.relative_address)
-                });
-                let object_symbol_with_offset = object_metadata.as_ref().and_then(|metadata| {
-                    metadata
-                        .object_metadata
-                        .object_symbol_with_offset(request.relative_address)
-                });
+                let object_symbols =
+                    object_symbols_for_frame(object_metadata.as_ref(), request.relative_address);
+                let object_symbol = object_symbols.bare;
                 let has_base_symbol = object_symbol.is_some();
                 let mut frames = if let Some(object_symbol) = object_symbol {
                     object_metadata
@@ -1582,7 +1581,7 @@ where
                 frames = perf_frames_with_object_alias_and_offset(
                     frames,
                     object_symbol,
-                    object_symbol_with_offset.as_deref(),
+                    object_symbols.with_offset.as_deref(),
                 );
                 resolved[index] = ResolvedSymbolFrames {
                     frames,
@@ -1678,16 +1677,9 @@ impl SymbolResolver for RustAddr2lineResolver {
             let mut loader_attempted = false;
             for index in indexes {
                 let request = &requests[index];
-                let object_symbol = object_metadata.as_ref().and_then(|metadata| {
-                    metadata
-                        .object_metadata
-                        .object_symbol(request.relative_address)
-                });
-                let object_symbol_with_offset = object_metadata.as_ref().and_then(|metadata| {
-                    metadata
-                        .object_metadata
-                        .object_symbol_with_offset(request.relative_address)
-                });
+                let object_symbols =
+                    object_symbols_for_frame(object_metadata.as_ref(), request.relative_address);
+                let object_symbol = object_symbols.bare;
                 let has_base_symbol = object_symbol.is_some();
                 let mut frames = if let Some(object_symbol) = object_symbol {
                     object_metadata
@@ -1714,7 +1706,7 @@ impl SymbolResolver for RustAddr2lineResolver {
                 frames = perf_frames_with_object_alias_and_offset(
                     frames,
                     object_symbol,
-                    object_symbol_with_offset.as_deref(),
+                    object_symbols.with_offset.as_deref(),
                 );
                 if let Some(metadata) = &object_metadata {
                     specialize_frames_from_debug_strings(
@@ -1772,6 +1764,15 @@ fn perf_frames_with_object_alias_and_offset(
         frames[0] = alias.to_string();
     }
     frames
+}
+
+fn object_symbols_for_frame(
+    metadata: Option<&Arc<CachedObjectMetadata>>,
+    address: u64,
+) -> PerfObjectSymbolNames<'_> {
+    metadata.map_or_else(PerfObjectSymbolNames::default, |metadata| {
+        metadata.object_metadata.object_symbol_names(address)
+    })
 }
 
 fn perf_object_alias_improves_name(name: &str, object_alias: &str) -> bool {
@@ -1871,6 +1872,13 @@ impl PreparedObjectMetadata {
 
     fn object_symbol_with_offset(&self, address: u64) -> Option<String> {
         self.object_symbols.symbol_name_with_offset(address)
+    }
+
+    fn object_symbol_names(&self, address: u64) -> PerfObjectSymbolNames<'_> {
+        PerfObjectSymbolNames {
+            bare: self.object_symbol(address),
+            with_offset: self.object_symbol_with_offset(address),
+        }
     }
 }
 
