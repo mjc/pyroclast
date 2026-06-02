@@ -2599,6 +2599,19 @@ fn append_libdw_leaf_return_fallback(
         return;
     }
     let reader = crate::perfdata::unwind::PerfStackReader::new(regs.sp, stack_bytes);
+    if regs.is_syscall_return_state() {
+        let Some(return_address) = reader.read_u64(regs.sp) else {
+            return;
+        };
+        if return_address == 0
+            || is_kernel_space_frame(return_address)
+            || pid.is_some_and(|pid| mmap_table.has_mapping_for_pid(pid, return_address))
+        {
+            return;
+        }
+        append_mapped_frame_pointer_callers(pid, regs, stack_bytes, mmap_table, frames);
+        return;
+    }
     let Some(return_address) = reader.read_u64(regs.sp) else {
         return;
     };
@@ -2621,6 +2634,24 @@ fn append_libdw_leaf_return_fallback(
         && pid.is_some_and(|pid| mmap_table.has_mapping_for_pid(pid, frame_pointer_return))
     {
         frames.push(frame_pointer_return.saturating_sub(1));
+    }
+}
+
+fn append_mapped_frame_pointer_callers(
+    pid: Option<u32>,
+    regs: &PerfX86_64Regs,
+    stack_bytes: &[u8],
+    mmap_table: &MmapTable,
+    frames: &mut Vec<u64>,
+) {
+    let mut frame_pointer_frames = unwind_x86_64_stack(*regs, stack_bytes, 256);
+    if frame_pointer_frames.first() != Some(&regs.ip) {
+        return;
+    }
+    for frame in frame_pointer_frames.drain(1..) {
+        if pid.is_some_and(|pid| mmap_table.has_mapping_for_pid(pid, frame)) {
+            frames.push(frame);
+        }
     }
 }
 
@@ -3790,6 +3821,114 @@ mod tests {
             frames,
             vec![0x7fff_f7f0_2769, 0x0029_5b8a, 0x5555_5580_445f]
         );
+    }
+
+    #[test]
+    fn syscall_leaf_fallback_skips_sp_return_and_uses_frame_pointer_callers_like_libdw() {
+        // Real sh period 113372 sample from target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
+        // perf/libdw reports _Fork, __libc_fork, then bash frame-pointer
+        // callers. The stack word at SP is not emitted as an intermediate
+        // `[unknown]` frame.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x7fff_f7d8_2000,
+            len: 0x1e_0000,
+            pgoff: 0,
+            path: "/nix/store/glibc/lib/libc.so.6".to_string(),
+        });
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x5555_5555_4000,
+            len: 0xc_0000,
+            pgoff: 0,
+            path: "/nix/store/bash/bin/bash".to_string(),
+        });
+        let mut registers = [0; 16];
+        registers[framehop::x86_64::Reg::RCX as usize] = 0x7fff_f7e9_80e8;
+        registers[framehop::x86_64::Reg::R11 as usize] = 0x246;
+        registers[framehop::x86_64::Reg::RBP as usize] = 0x7fff_ffff_9f10;
+        registers[framehop::x86_64::Reg::RSP as usize] = 0x7fff_ffff_9ef0;
+        let regs = super::PerfX86_64Regs {
+            ip: 0x7fff_f7e9_80e8,
+            sp: 0x7fff_ffff_9ef0,
+            bp: 0x7fff_ffff_9f10,
+            registers,
+        };
+        let mut stack = vec![0; 0x50];
+        stack[..8].copy_from_slice(&0x0801_4002_u64.to_le_bytes());
+        stack[0x20..0x28].copy_from_slice(&0x7fff_ffff_9f30_u64.to_le_bytes());
+        stack[0x28..0x30].copy_from_slice(&0x7fff_f7e9_df63_u64.to_le_bytes());
+        stack[0x40..0x48].copy_from_slice(&0_u64.to_le_bytes());
+        stack[0x48..0x50].copy_from_slice(&0x5555_555a_c610_u64.to_le_bytes());
+        let mut frames = vec![regs.ip];
+
+        super::append_libdw_leaf_return_fallback(
+            Some(11),
+            &regs,
+            &stack,
+            super::ObjectUnwindInitialFramePolicy::KeepDsoLeaf,
+            &mmap_table,
+            &mut frames,
+        );
+
+        assert_eq!(
+            frames,
+            vec![0x7fff_f7e9_80e8, 0x7fff_f7e9_df62, 0x5555_555a_c60f]
+        );
+    }
+
+    #[test]
+    fn syscall_leaf_fallback_keeps_mapped_sp_return_as_leaf_only_like_libdw() {
+        // Real Pyroclast statx samples from target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
+        // perf/libdw emits only the statx user leaf after the recorded kernel
+        // callchain even though the sampled frame pointer can reach callers.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x7fff_f7d8_2000,
+            len: 0x1e_0000,
+            pgoff: 0,
+            path: "/nix/store/glibc/lib/libc.so.6".to_string(),
+        });
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x5555_5555_4000,
+            len: 0x30_0000,
+            pgoff: 0,
+            path: "/tmp/pyroclast".to_string(),
+        });
+        let mut registers = [0; 16];
+        registers[framehop::x86_64::Reg::RCX as usize] = 0x7fff_f7e9_a23e;
+        registers[framehop::x86_64::Reg::R11 as usize] = 0x206;
+        registers[framehop::x86_64::Reg::RBP as usize] = 0x7fff_ffff_89e0;
+        registers[framehop::x86_64::Reg::RSP as usize] = 0x7fff_ffff_88b8;
+        let regs = super::PerfX86_64Regs {
+            ip: 0x7fff_f7e9_a23e,
+            sp: 0x7fff_ffff_88b8,
+            bp: 0x7fff_ffff_89e0,
+            registers,
+        };
+        let mut stack = vec![0; 0x1f0];
+        stack[..8].copy_from_slice(&0x5555_557d_e0c2_u64.to_le_bytes());
+        stack[0x1c8..0x1d0].copy_from_slice(&0x7fff_ffff_89f0_u64.to_le_bytes());
+        stack[0x1d0..0x1d8].copy_from_slice(&0x5555_557d_e0c2_u64.to_le_bytes());
+        let mut frames = vec![regs.ip];
+
+        super::append_libdw_leaf_return_fallback(
+            Some(11),
+            &regs,
+            &stack,
+            super::ObjectUnwindInitialFramePolicy::KeepDsoLeaf,
+            &mmap_table,
+            &mut frames,
+        );
+
+        assert_eq!(frames, vec![0x7fff_f7e9_a23e]);
     }
 
     #[test]
