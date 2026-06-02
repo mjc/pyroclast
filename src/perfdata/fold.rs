@@ -186,6 +186,12 @@ enum SampleCallchainState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObjectUnwindInitialFramePolicy {
+    DropSyntheticCurrentIp,
+    KeepDsoLeaf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InitialIpMappingState {
     NoRecordedMapping,
     RecordedMappingLoaded,
@@ -2396,6 +2402,11 @@ fn unwind_user_stack_like_perf(
                 perf_accepted_object_unwind_frames(
                     regs,
                     context.callchain,
+                    object_unwind_initial_frame_policy(
+                        sample.pid,
+                        regs.ip,
+                        &accumulator.mmap_table,
+                    ),
                     state.object_unwinder.unwind_stack(*regs, stack_bytes, 256),
                 )
             }),
@@ -2520,6 +2531,7 @@ fn perf_accepted_unwind_frames(unwound_frames: Vec<u64>) -> Vec<u64> {
 fn perf_accepted_object_unwind_frames(
     regs: &PerfX86_64Regs,
     callchain: SampleCallchainState,
+    initial_frame_policy: ObjectUnwindInitialFramePolicy,
     unwound_frames: Vec<u64>,
 ) -> Vec<u64> {
     // framehop yields the sampled instruction pointer before trying to advance.
@@ -2542,7 +2554,10 @@ fn perf_accepted_object_unwind_frames(
                         has_frames: false,
                     }) =>
         {
-            vec![*ip]
+            match initial_frame_policy {
+                ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp => Vec::new(),
+                ObjectUnwindInitialFramePolicy::KeepDsoLeaf => vec![*ip],
+            }
         }
         [ip, _]
             if *ip == regs.ip
@@ -2556,6 +2571,34 @@ fn perf_accepted_object_unwind_frames(
         }
         _ => unwound_frames,
     }
+}
+
+fn object_unwind_initial_frame_policy(
+    pid: Option<u32>,
+    ip: u64,
+    mmap_table: &MmapTable,
+) -> ObjectUnwindInitialFramePolicy {
+    let mut mapping_cache = MappingResolveCache::default();
+    if pid
+        .and_then(|pid| mmap_table.resolve_ref_cached(pid, ip, &mut mapping_cache))
+        .is_some_and(|mapping| is_shared_object_mapping_path(mapping.path))
+    {
+        ObjectUnwindInitialFramePolicy::KeepDsoLeaf
+    } else {
+        ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp
+    }
+}
+
+fn is_shared_object_mapping_path(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .is_some_and(|file_name| file_name.contains(".so") || has_dylib_extension(file_name))
+}
+
+fn has_dylib_extension(file_name: &str) -> bool {
+    Path::new(file_name)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("dylib"))
 }
 
 fn load_unwind_mapping(
@@ -2830,6 +2873,7 @@ mod tests {
                     has_callchain: false,
                     has_frames: false,
                 },
+                super::ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp,
                 vec![0x1000, 0x1100],
             ),
             Vec::<u64>::new()
@@ -3222,6 +3266,7 @@ mod tests {
             super::perf_accepted_object_unwind_frames(
                 &regs,
                 super::SampleCallchainState::KernelWithCallchain,
+                super::ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp,
                 vec![0x7fff_f7ea_3f4b, 0x5555_5578_8ba4, 0x5555_5578_8ba5],
             ),
             vec![0x7fff_f7ea_3f4b]
@@ -3275,6 +3320,33 @@ mod tests {
     }
 
     #[test]
+    fn object_unwind_drops_empty_callchain_executable_leaf_like_perf_libdw() {
+        // Real period 4633851 sample from target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
+        // perf script prints no frames for add_fold_stack in the Pyroclast
+        // executable even though framehop can synthesize a stack from the
+        // sampled user registers and stack bytes.
+        let regs = super::PerfX86_64Regs {
+            ip: 0x5555_5578_c601,
+            sp: 0x7fff_ffff_8cf8,
+            bp: 0x4002,
+            registers: [0; 16],
+        };
+
+        assert_eq!(
+            super::perf_accepted_object_unwind_frames(
+                &regs,
+                super::SampleCallchainState::Other {
+                    has_callchain: true,
+                    has_frames: false,
+                },
+                super::ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp,
+                vec![0x5555_5578_c601, 0x5555_5579_6e23],
+            ),
+            Vec::<u64>::new()
+        );
+    }
+
+    #[test]
     fn object_unwind_stops_after_libc_leaf_with_empty_fp_chain_like_perf_libdw() {
         // Real sample from target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
         // perf script prints only __memmove_avx_unaligned_erms for this event,
@@ -3293,6 +3365,7 @@ mod tests {
                     has_callchain: true,
                     has_frames: false,
                 },
+                super::ObjectUnwindInitialFramePolicy::KeepDsoLeaf,
                 vec![0x7fff_f7f0_277b, 0x5555_5579_6e23, 0x5555_5579_6e23],
             ),
             vec![0x7fff_f7f0_277b]
@@ -3318,6 +3391,7 @@ mod tests {
                     has_callchain: true,
                     has_frames: false,
                 },
+                super::ObjectUnwindInitialFramePolicy::KeepDsoLeaf,
                 vec![0x7fff_f7f0_277b, 0x5555_556b_ab79],
             ),
             vec![0x7fff_f7f0_277b]
