@@ -22,6 +22,12 @@ pub struct PerfStackReader<'a> {
     bytes: &'a [u8],
 }
 
+pub struct PerfUserMemoryReader<'a, F> {
+    sp: u64,
+    stack: &'a [u8],
+    mapped_read: F,
+}
+
 pub struct FramehopUnwinder {
     unwinder: UnwinderX86_64<ModuleBytes>,
     cache: CacheX86_64,
@@ -230,14 +236,11 @@ impl FramehopUnwinder {
         {
             return UserStackUnwindResult::default();
         }
-        let stack_reader = PerfStackReader::new(regs.sp, stack);
         let reported_modules = &self.reported_modules;
-        let mut read_stack = |address| {
-            stack_reader
-                .read_u64(address)
-                .or_else(|| read_reported_module_u64(reported_modules, address))
-                .ok_or(())
-        };
+        let mut memory_reader = PerfUserMemoryReader::new(regs.sp, stack, |address| {
+            read_reported_module_u64(reported_modules, address)
+        });
+        let mut read_stack = |address| memory_reader.read_u64(address).ok_or(());
         let ip = regs.ip;
         let regs = regs.to_framehop_regs();
         let mut iter = self
@@ -681,6 +684,36 @@ impl<'a> PerfStackReader<'a> {
     pub fn read_u64(&self, address: u64) -> Option<u64> {
         let offset = usize::try_from(address.checked_sub(self.sp)?).ok()?;
         let bytes = self.bytes.get(offset..offset.checked_add(8)?)?;
+        let bytes: [u8; 8] = bytes.try_into().ok()?;
+        Some(u64::from_le_bytes(bytes))
+    }
+}
+
+impl<'a, F> PerfUserMemoryReader<'a, F>
+where
+    F: FnMut(u64) -> Option<u64>,
+{
+    #[must_use]
+    pub fn new(sp: u64, stack: &'a [u8], mapped_read: F) -> Self {
+        Self {
+            sp,
+            stack,
+            mapped_read,
+        }
+    }
+
+    #[must_use]
+    pub fn read_u64(&mut self, address: u64) -> Option<u64> {
+        // Matches perf tools/perf/util/unwind-libdw.c memory_read(): reject
+        // overflowing words, read inside the captured user stack, otherwise
+        // fall back to mapped object memory through access_dso_mem().
+        let word_end = address.checked_add(8)?;
+        let stack_end = self.sp.checked_add(u64::try_from(self.stack.len()).ok()?)?;
+        if address < self.sp || word_end > stack_end {
+            return (self.mapped_read)(address);
+        }
+        let offset = usize::try_from(address - self.sp).ok()?;
+        let bytes = self.stack.get(offset..offset.checked_add(8)?)?;
         let bytes: [u8; 8] = bytes.try_into().ok()?;
         Some(u64::from_le_bytes(bytes))
     }

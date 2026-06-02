@@ -2,8 +2,8 @@ use framehop::x86_64::Reg;
 use object::{Object, ObjectSection, ObjectSegment};
 use proptest::prelude::*;
 use pyroclast::perfdata::unwind::{
-    FramehopUnwinder, PerfStackReader, PerfX86_64Regs, UserStackUnwindResult, UserStackUnwinder,
-    unwind_x86_64_stack,
+    FramehopUnwinder, PerfStackReader, PerfUserMemoryReader, PerfX86_64Regs, UserStackUnwindResult,
+    UserStackUnwinder, unwind_x86_64_stack,
 };
 
 #[test]
@@ -45,6 +45,25 @@ fn sampled_stack_reader_reads_little_endian_words_from_sampled_sp() {
     assert_eq!(reader.read_u64(0x7fff_0000), Some(0x10));
     assert_eq!(reader.read_u64(0x7fff_0008), Some(0x20));
     assert_eq!(reader.read_u64(0x7fff_0010), None);
+}
+
+#[test]
+fn perf_user_memory_reader_rejects_overflowing_word_like_perf_libdw() {
+    let stack = 0x10_u64.to_le_bytes();
+    let mut reader = PerfUserMemoryReader::new(0, &stack, |_| Some(0x20));
+
+    assert_eq!(reader.read_u64(u64::MAX - 3), None);
+}
+
+#[test]
+fn perf_user_memory_reader_falls_back_to_mapped_memory_outside_stack_like_perf_libdw() {
+    let stack = 0x10_u64.to_le_bytes();
+    let mut reader = PerfUserMemoryReader::new(0x1000, &stack, |address| {
+        (address == 0x5000).then_some(0xfeed_face)
+    });
+
+    assert_eq!(reader.read_u64(0x1000), Some(0x10));
+    assert_eq!(reader.read_u64(0x5000), Some(0xfeed_face));
 }
 
 #[test]
