@@ -2612,18 +2612,18 @@ fn prefer_frame_pointer_tail_for_object_unwind_divergence(
         return frame_pointer_frames;
     }
 
-    if object_frames.as_slice() == [regs.ip]
-        && sampled_stack_pointer_return_is_unmapped_user_frame(pid, mmap_table, regs, stack_bytes)
-    {
-        return object_frames;
-    }
-
     let same_mapping_prefix_len = 1 + frame_pointer_frames
         .iter()
         .copied()
         .skip(1)
         .take_while(|frame| user_frames_share_mapping_path(pid, regs.ip, *frame, mmap_table))
         .count();
+    if object_frames.as_slice() == [regs.ip]
+        && same_mapping_prefix_len <= 2
+        && sampled_stack_pointer_return_is_unmapped_user_frame(pid, mmap_table, regs, stack_bytes)
+    {
+        return object_frames;
+    }
     frame_pointer_frames.truncate(same_mapping_prefix_len);
     if frame_pointer_frames.len() > object_frames.len() {
         return frame_pointer_frames;
@@ -4275,6 +4275,49 @@ mod tests {
         assert_eq!(
             frames,
             vec![0x7fff_f7f0_2777, 0x0000_fb3f, 0x7fff_f7e3_08ae]
+        );
+    }
+
+    #[test]
+    fn object_unwind_prefers_multi_frame_same_mapping_tail_over_unmapped_sp_junk_like_libdw() {
+        // Real period 144 _int_free_chunk sample from
+        // target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
+        // SP contains 0x90, but perf/libdw emits the same-DSO allocator tail
+        // _int_free_chunk -> _int_realloc -> realloc.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x7fff_f7db_b000,
+            len: 0x200_000,
+            pgoff: 0,
+            path: "/nix/store/glibc/lib/libc.so.6".to_string(),
+        });
+        let mut registers = [0; 16];
+        registers[framehop::x86_64::Reg::RBP as usize] = 0x7fff_ffff_8c50;
+        registers[framehop::x86_64::Reg::RSP as usize] = 0x7fff_ffff_8c40;
+        let regs = super::PerfX86_64Regs {
+            ip: 0x7fff_f7e2_ec67,
+            sp: 0x7fff_ffff_8c40,
+            bp: 0x7fff_ffff_8c50,
+            registers,
+        };
+        let mut stack = vec![0; 0x40];
+        stack[..8].copy_from_slice(&0x90_u64.to_le_bytes());
+        stack[0x10..0x18].copy_from_slice(&0x7fff_ffff_8c70_u64.to_le_bytes());
+        stack[0x18..0x20].copy_from_slice(&0x7fff_f7e3_0fe3_u64.to_le_bytes());
+        stack[0x30..0x38].copy_from_slice(&0_u64.to_le_bytes());
+        stack[0x38..0x40].copy_from_slice(&0x7fff_f7e3_2429_u64.to_le_bytes());
+
+        assert_eq!(
+            super::prefer_frame_pointer_tail_for_object_unwind_divergence(
+                Some(11),
+                &mmap_table,
+                &regs,
+                &stack,
+                vec![0x7fff_f7e2_ec67],
+            ),
+            vec![0x7fff_f7e2_ec67, 0x7fff_f7e3_0fe2, 0x7fff_f7e3_2428]
         );
     }
 
