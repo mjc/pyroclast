@@ -2538,7 +2538,10 @@ fn perf_accepted_object_unwind_frames(
     // perf's libdw path reports the IP to DWFL as initial state, then only
     // prints entries accepted via frame_callback/entry.
     match unwound_frames.as_slice() {
-        [ip] if *ip == regs.ip => Vec::new(),
+        [ip] if *ip == regs.ip => match initial_frame_policy {
+            ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp => Vec::new(),
+            ObjectUnwindInitialFramePolicy::KeepDsoLeaf => vec![*ip],
+        },
         [ip, ..]
             if *ip == regs.ip
                 && callchain == SampleCallchainState::KernelWithCallchain
@@ -3343,6 +3346,32 @@ mod tests {
                 vec![0x5555_5578_c601, 0x5555_5579_6e23],
             ),
             Vec::<u64>::new()
+        );
+    }
+
+    #[test]
+    fn object_unwind_keeps_single_dso_leaf_with_empty_callchain_like_perf_libdw() {
+        // Real period 4754368 sample from target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
+        // perf script prints the _int_free_chunk glibc leaf even though the
+        // recorded FP callchain itself is empty.
+        let regs = super::PerfX86_64Regs {
+            ip: 0x7fff_f7e2_ecb7,
+            sp: 0x7fff_ffff_8cf8,
+            bp: 0x4002,
+            registers: [0; 16],
+        };
+
+        assert_eq!(
+            super::perf_accepted_object_unwind_frames(
+                &regs,
+                super::SampleCallchainState::Other {
+                    has_callchain: true,
+                    has_frames: false,
+                },
+                super::ObjectUnwindInitialFramePolicy::KeepDsoLeaf,
+                vec![0x7fff_f7e2_ecb7],
+            ),
+            vec![0x7fff_f7e2_ecb7]
         );
     }
 

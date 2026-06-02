@@ -1112,7 +1112,7 @@ fn drops_current_ip_only_object_unwind_from_pid_specific_modules_like_perf_libdw
 
 #[cfg(target_os = "linux")]
 #[test]
-fn drops_object_unwind_when_framehop_only_returns_current_ip_like_perf_libdw() {
+fn keeps_object_unwind_dso_leaf_when_framehop_only_returns_current_ip_like_perf_libdw() {
     let Some(libc) = process_libc_path() else {
         return;
     };
@@ -1179,8 +1179,9 @@ fn drops_object_unwind_when_framehop_only_returns_current_ip_like_perf_libdw() {
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
+    let expected = format!("[unknown];{}+0x{ip_offset:x} 1\n", libc.as_ref());
 
-    assert_eq!(folded, "");
+    assert_eq!(folded, expected);
 }
 
 #[test]
