@@ -2142,7 +2142,6 @@ impl<'a> FoldFrameResolver<'a> {
             ) {
                 continue;
             }
-            let address = frame.address();
             if let FoldFrame::InlineCurrentIp(address) = frame {
                 self.write_inline_current_ip_script_frames(
                     pid,
@@ -2153,51 +2152,46 @@ impl<'a> FoldFrameResolver<'a> {
                 )?;
                 continue;
             }
-            let symbolizing = symbol_cache.is_some();
-            match self.mapping_decision(pid, address, symbolizing, &mut mapping_cache) {
-                FrameMappingDecision::Mapped(mapping) => {
-                    if let Some(cache) = symbol_cache.as_deref_mut() {
-                        let frames = cache.resolve_mapping_ref(&mapping)?;
-                        if frames.is_empty() {
-                            write_perf_script_frame_for_label(
-                                writer,
-                                address,
-                                &symbol_fallback_frame_ref(&mapping),
-                            )?;
-                        } else if matches!(frame, FoldFrame::UserUnwind(_))
-                            && frames.len() == 1
-                            && !is_kernel_space_frame(address)
-                        {
-                            write_perf_script_mapped_symbol_frame(
-                                writer,
-                                address,
-                                &frames[0],
-                                mapping.path,
-                            )?;
-                        } else {
-                            for label in frames.iter().rev() {
-                                write_perf_script_frame_for_label(writer, address, label)?;
-                            }
-                        }
-                        continue;
-                    }
-                    if is_kernel_space_frame(address) {
-                        write_perf_script_unknown_frame(writer, address)?;
-                    } else {
-                        write_perf_script_mapped_frame(
-                            writer,
-                            address,
-                            mapping.path,
-                            mapping.relative_address,
-                        )?;
-                    }
-                }
-                FrameMappingDecision::KernelAddress | FrameMappingDecision::Address => {
-                    write_perf_script_address_frame(writer, address)?;
-                }
-                FrameMappingDecision::Unknown => {
-                    write_perf_script_unknown_frame(writer, address)?;
-                }
+            self.write_regular_script_frame(
+                pid,
+                frame,
+                symbol_cache.as_deref_mut(),
+                &mut mapping_cache,
+                writer,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn write_regular_script_frame<R, W>(
+        &self,
+        pid: Option<u32>,
+        frame: FoldFrame,
+        symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+        mapping_cache: &mut MappingResolveCache,
+        writer: &mut W,
+    ) -> Result<(), String>
+    where
+        R: SymbolResolver,
+        W: IoWrite + ?Sized,
+    {
+        let address = frame.address();
+        let symbolizing = symbol_cache.is_some();
+        match self.mapping_decision(pid, address, symbolizing, mapping_cache) {
+            FrameMappingDecision::Mapped(mapping) => {
+                write_perf_script_mapped_decision_frame(
+                    writer,
+                    address,
+                    frame,
+                    &mapping,
+                    symbol_cache,
+                )?;
+            }
+            FrameMappingDecision::KernelAddress | FrameMappingDecision::Address => {
+                write_perf_script_address_frame(writer, address)?;
+            }
+            FrameMappingDecision::Unknown => {
+                write_perf_script_unknown_frame(writer, address)?;
             }
         }
         Ok(())
@@ -2419,6 +2413,45 @@ where
             .map_err(|error| format!("failed to write perf script output: {error}"));
     }
     write_perf_script_label_frame(writer, address, label)
+}
+
+fn write_perf_script_mapped_decision_frame<R, W>(
+    writer: &mut W,
+    address: u64,
+    frame: FoldFrame,
+    mapping: &ResolvedMappingRef<'_>,
+    symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+) -> Result<(), String>
+where
+    R: SymbolResolver,
+    W: IoWrite + ?Sized,
+{
+    if let Some(cache) = symbol_cache {
+        let frames = cache.resolve_mapping_ref(mapping)?;
+        if frames.is_empty() {
+            write_perf_script_frame_for_label(
+                writer,
+                address,
+                &symbol_fallback_frame_ref(mapping),
+            )?;
+        } else if matches!(frame, FoldFrame::UserUnwind(_))
+            && frames.len() == 1
+            && !is_kernel_space_frame(address)
+        {
+            write_perf_script_mapped_symbol_frame(writer, address, &frames[0], mapping.path)?;
+        } else {
+            for label in frames.iter().rev() {
+                write_perf_script_frame_for_label(writer, address, label)?;
+            }
+        }
+        return Ok(());
+    }
+    if is_kernel_space_frame(address) {
+        write_perf_script_unknown_frame(writer, address)?;
+    } else {
+        write_perf_script_mapped_frame(writer, address, mapping.path, mapping.relative_address)?;
+    }
+    Ok(())
 }
 
 fn write_perf_script_unknown_frame<W>(writer: &mut W, address: u64) -> Result<(), String>
