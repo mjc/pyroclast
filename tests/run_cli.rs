@@ -1,4 +1,5 @@
 use object::{Object, ObjectSegment, ObjectSymbol};
+use pyroclast::perfdata::records::PERF_RECORD_FORK;
 use pyroclast::perfdata::samples::{
     PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_TID,
 };
@@ -150,6 +151,43 @@ fn perf_script_command_preserves_sample_event_records_like_perf_script() {
             "app 1 0: 11 cpu/cycles/P:\n",
             "\t2000 /bin/app+0x1000+0x0 ([unknown])\n\n",
         )
+    );
+}
+
+#[test]
+fn perf_script_command_inherits_parent_comm_on_fork_like_perf_script() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    std::fs::write(
+        &perfdata,
+        perfdata_with_records_and_attrs(
+            [file_attr_bytes(
+                PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_PERIOD,
+                0,
+                0,
+            )],
+            [
+                record_bytes(3, &comm_payload(11, 11, "sh")),
+                record_bytes(1, &mmap_payload(11, 11, 0x1000, 0x2000, 0, "/bin/sh")),
+                record_bytes(PERF_RECORD_FORK, &fork_payload([22, 11, 22, 11], 99)),
+                record_bytes(9, &sample_payload_with_period(0x1000, 22, 22, 5, [0x2000])),
+            ],
+        ),
+    )
+    .expect("write perfdata");
+
+    let output = pyroclast::run_cli([
+        "pyroclast",
+        "plumbing",
+        "perf-script",
+        "--no-symbols",
+        perfdata.to_str().unwrap(),
+    ])
+    .expect("perf script command");
+
+    assert_eq!(
+        output.stdout,
+        "sh 22 0: 5 cpu/cycles/P:\n\t2000 /bin/sh+0x1000+0x0 ([unknown])\n\n"
     );
 }
 
@@ -1132,6 +1170,15 @@ fn comm_payload(pid: u32, tid: u32, comm: &str) -> Vec<u8> {
     payload.extend(tid.to_le_bytes());
     payload.extend(comm.as_bytes());
     payload.push(0);
+    payload
+}
+
+fn fork_payload(ids: [u32; 4], time: u64) -> Vec<u8> {
+    let mut payload = Vec::new();
+    for id in ids {
+        payload.extend(id.to_le_bytes());
+    }
+    payload.extend(time.to_le_bytes());
     payload
 }
 

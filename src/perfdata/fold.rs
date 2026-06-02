@@ -403,6 +403,7 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
                 Ok(())
             }
             ParsedRecord::Fork(record) => {
+                inherit_fork_comm(&mut summary.comms_by_pid, &mut summary.comms_by_tid, record);
                 if record.clone_maps {
                     summary
                         .mmap_table
@@ -1318,12 +1319,22 @@ impl FoldAccumulator {
                 Ok(())
             }
             ParsedRecord::Fork(record) => {
-                if record.clone_maps {
-                    self.mmap_table.clone_pid_mappings(record.ppid, record.pid);
-                }
+                self.apply_fork_record(record);
                 Ok(())
             }
             _ => Ok(()),
+        }
+    }
+
+    fn apply_fork_record(&mut self, record: crate::perfdata::records::ForkRecord) {
+        inherit_fork_comm_tables(
+            &mut self.process_comms,
+            &mut self.exec_process_comms,
+            &mut self.thread_comms,
+            record,
+        );
+        if record.clone_maps {
+            self.mmap_table.clone_pid_mappings(record.ppid, record.pid);
         }
     }
 
@@ -1490,6 +1501,33 @@ fn update_comm_tables(
     }
     process_comms.insert(record.pid, record.comm.clone());
     thread_comms.insert(record.tid, record.comm);
+}
+
+fn inherit_fork_comm(
+    process_comms: &mut BTreeMap<u32, String>,
+    thread_comms: &mut BTreeMap<u32, String>,
+    record: crate::perfdata::records::ForkRecord,
+) {
+    let inherited = thread_comms
+        .get(&record.ptid)
+        .or_else(|| process_comms.get(&record.ppid))
+        .cloned();
+    if let Some(comm) = inherited {
+        process_comms.insert(record.pid, comm.clone());
+        thread_comms.insert(record.tid, comm);
+    }
+}
+
+fn inherit_fork_comm_tables(
+    process_comms: &mut BTreeMap<u32, String>,
+    exec_process_comms: &mut BTreeMap<u32, String>,
+    thread_comms: &mut BTreeMap<u32, String>,
+    record: crate::perfdata::records::ForkRecord,
+) {
+    inherit_fork_comm(process_comms, thread_comms, record);
+    if let Some(comm) = exec_process_comms.get(&record.ppid).cloned() {
+        exec_process_comms.insert(record.pid, comm);
+    }
 }
 
 fn add_fold_stack(
