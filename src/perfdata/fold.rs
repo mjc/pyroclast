@@ -2740,10 +2740,15 @@ fn unwind_user_stack_like_perf(
                     regs.ip,
                     &accumulator.mmap_table,
                 );
-                let raw_frames = state.object_unwinder.unwind_stack(*regs, stack_bytes, 256);
+                let object_unwind =
+                    state
+                        .object_unwinder
+                        .unwind_stack_with_diagnostics(*regs, stack_bytes, 256);
+                let raw_frames = object_unwind.accepted_frames;
                 let maybe_inline_current_ip =
                     should_salvage_inline_current_ip_after_empty_object_unwind(
                         raw_frames.is_empty(),
+                        object_unwind.framehop_frame_count,
                         regs,
                         context,
                     );
@@ -2789,10 +2794,12 @@ fn unwind_user_stack_like_perf(
 
 fn should_salvage_inline_current_ip_after_empty_object_unwind(
     raw_object_unwind_is_empty: bool,
+    raw_object_unwind_frame_count: usize,
     _regs: &PerfX86_64Regs,
     context: UserUnwindContext,
 ) -> bool {
     raw_object_unwind_is_empty
+        && raw_object_unwind_frame_count > 1
         && context.initial_ip_mapping == InitialIpMappingState::RecordedMappingLoaded
         && context.module_count > 0
 }
@@ -3596,6 +3603,39 @@ mod tests {
         assert!(
             super::should_salvage_inline_current_ip_after_empty_object_unwind(
                 true,
+                2,
+                &regs,
+                super::UserUnwindContext {
+                    callchain: super::SampleCallchainState::Other {
+                        has_callchain: true,
+                        has_frames: false,
+                    },
+                    initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
+                    initial_ip_is_dso: false,
+                    module_count: 1,
+                    frame_pointer_at_or_above_stack_pointer: false,
+                    syscall_return_state: false,
+                },
+            )
+        );
+    }
+
+    #[test]
+    fn single_synthetic_framehop_frame_does_not_salvage_inline_current_ip_like_blank_perf_libdw() {
+        // Real period 4703553 from
+        // target/profiling-runs/octo-symbolized-fold-final/profile.raw.perf.data:
+        // perf script -D shows user regs/stack and an inline-capable sampled IP,
+        // but perf -v has no matching unwind:...ip entry, so perf script prints
+        // a blank stack. framehop's synthetic initial frame is not enough to
+        // model a libdw frame_callback() -> entry() emission.
+        let mut regs = test_regs(0x5555_557e_8995);
+        regs.sp = 0x7fff_ffff_87a0;
+        regs.bp = 0x7fff_e91e_77c8;
+
+        assert!(
+            !super::should_salvage_inline_current_ip_after_empty_object_unwind(
+                true,
+                1,
                 &regs,
                 super::UserUnwindContext {
                     callchain: super::SampleCallchainState::Other {

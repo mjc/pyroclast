@@ -30,6 +30,12 @@ pub struct FramehopUnwinder {
     rejected_mapping_ranges: Vec<Range<u64>>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FramehopUnwindResult {
+    pub accepted_frames: Vec<u64>,
+    pub framehop_frame_count: usize,
+}
+
 #[derive(Clone, Debug)]
 struct ReportedModule {
     base: u64,
@@ -197,12 +203,23 @@ impl FramehopUnwinder {
         stack: &[u8],
         max_frames: usize,
     ) -> Vec<u64> {
+        self.unwind_stack_with_diagnostics(regs, stack, max_frames)
+            .accepted_frames
+    }
+
+    #[must_use]
+    pub fn unwind_stack_with_diagnostics(
+        &mut self,
+        regs: PerfX86_64Regs,
+        stack: &[u8],
+        max_frames: usize,
+    ) -> FramehopUnwindResult {
         if self
             .rejected_mapping_ranges
             .iter()
             .any(|range| range.contains(&regs.ip))
         {
-            return Vec::new();
+            return FramehopUnwindResult::default();
         }
         let stack_reader = PerfStackReader::new(regs.sp, stack);
         let reported_modules = &self.reported_modules;
@@ -224,6 +241,7 @@ impl FramehopUnwinder {
             };
             push_perf_unwind_address(&mut frames, frame.address());
         }
+        let framehop_frame_count = frames.len();
         // perf's libdw unwinder only emits frames accepted by frame_callback ->
         // entry in tools/perf/util/unwind-libdw.c. framehop can continue with
         // architecture fallbacks when no FDE covers an address, so trim those
@@ -231,7 +249,10 @@ impl FramehopUnwinder {
         truncate_at_first_uncovered_unwind_frame(&mut frames, |address| {
             self.has_unwind_info_for_ip(address)
         });
-        frames
+        FramehopUnwindResult {
+            accepted_frames: frames,
+            framehop_frame_count,
+        }
     }
 }
 
