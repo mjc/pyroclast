@@ -2215,23 +2215,12 @@ impl<'a> FoldFrameResolver<'a> {
         R: SymbolResolver,
         W: IoWrite + ?Sized,
     {
-        let Some(cache) = symbol_cache else {
-            return Ok(());
-        };
-        let Some(mapping) = pid.and_then(|pid| {
-            self.mmap_table
-                .resolve_ref_cached(pid, address, mapping_cache)
-        }) else {
-            return Ok(());
-        };
-        let Some(frames) = cache.resolve_mapping_ref_with_base_symbol(&mapping)? else {
-            return Ok(());
-        };
-        if frames.len() <= 1 {
-            return Ok(());
-        }
-        for label in frames.iter().rev() {
-            write_perf_script_frame_for_label(writer, address, label)?;
+        if let Some(frames) =
+            self.resolve_inline_current_ip_frames(pid, address, symbol_cache, mapping_cache)?
+        {
+            for label in frames.iter().rev() {
+                write_perf_script_frame_for_label(writer, address, label)?;
+            }
         }
         Ok(())
     }
@@ -2246,25 +2235,45 @@ impl<'a> FoldFrameResolver<'a> {
     where
         R: SymbolResolver,
     {
+        if let Some(frames) = self.resolve_inline_current_ip_frames(
+            pid,
+            address,
+            symbol_cache,
+            &mut buffers.mapping_cache,
+        )? {
+            for label in frames {
+                append_cached_inferno_perf_raw_function_to_buffers(buffers, label);
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_inline_current_ip_frames<'cache, R>(
+        &self,
+        pid: Option<u32>,
+        address: u64,
+        symbol_cache: Option<&'cache mut SymbolFrameCache<'_, R>>,
+        mapping_cache: &mut MappingResolveCache,
+    ) -> Result<Option<&'cache [String]>, String>
+    where
+        R: SymbolResolver,
+    {
         let Some(cache) = symbol_cache else {
-            return Ok(());
+            return Ok(None);
         };
         let Some(mapping) = pid.and_then(|pid| {
             self.mmap_table
-                .resolve_ref_cached(pid, address, &mut buffers.mapping_cache)
+                .resolve_ref_cached(pid, address, mapping_cache)
         }) else {
-            return Ok(());
+            return Ok(None);
         };
         let Some(frames) = cache.resolve_mapping_ref_with_base_symbol(&mapping)? else {
-            return Ok(());
+            return Ok(None);
         };
         if frames.len() <= 1 {
-            return Ok(());
+            return Ok(None);
         }
-        for label in frames {
-            append_cached_inferno_perf_raw_function_to_buffers(buffers, label);
-        }
-        Ok(())
+        Ok(Some(frames))
     }
 
     fn append_folded_frame_labels<R>(
