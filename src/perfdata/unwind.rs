@@ -79,8 +79,8 @@ struct MappedBytes {
 
 #[must_use]
 pub fn unwind_x86_64_stack(regs: PerfX86_64Regs, stack: &[u8], max_frames: usize) -> Vec<u64> {
-    let stack_reader = PerfStackReader::new(regs.sp, stack);
-    let mut read_stack = |address| stack_reader.read_u64(address).ok_or(());
+    let mut memory_reader = PerfUserMemoryReader::new(regs.sp, stack, |_| None);
+    let mut read_stack = |address| memory_reader.read_u64(address).ok_or(());
     let mut cache = CacheX86_64::new();
     let unwinder = UnwinderX86_64::<Vec<u8>>::new();
     let ip = regs.ip;
