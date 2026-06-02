@@ -621,7 +621,7 @@ fn perf_dwarf_frame_names_prefer_die_names_like_perf_script() {
     let Some((profiling_binary, object_bytes)) = profiling_binary_fixture() else {
         return;
     };
-    let Some(address) = text_symbol_addresses(&object_bytes)
+    let Some(address) = generic_dwarf_name_candidate_addresses(&object_bytes)
         .into_iter()
         .find(|address| {
             let Some(frames) = perf_dwarf_frame_names_from_object_bytes(&object_bytes, *address)
@@ -836,10 +836,29 @@ fn find_profiling_address(
 }
 
 fn text_symbol_addresses(object_bytes: &[u8]) -> Vec<u64> {
+    text_symbol_addresses_matching_name(object_bytes, |_| true)
+}
+
+fn generic_dwarf_name_candidate_addresses(object_bytes: &[u8]) -> Vec<u64> {
+    text_symbol_addresses_matching_name(object_bytes, |name| {
+        (name.contains("BTreeMap") && name.contains("insert"))
+            || (name.contains("IntoIter") && name.contains("dying_next"))
+            || name.contains("insert_recursing")
+    })
+}
+
+fn text_symbol_addresses_matching_name(
+    object_bytes: &[u8],
+    mut name_matches: impl FnMut(&str) -> bool,
+) -> Vec<u64> {
     let object = object::File::parse(object_bytes).expect("object file");
     let mut addresses = object
         .symbols()
-        .filter(|symbol| symbol.address() != 0 && symbol.kind() == SymbolKind::Text)
+        .filter(|symbol| {
+            symbol.address() != 0
+                && symbol.kind() == SymbolKind::Text
+                && symbol.name().is_ok_and(&mut name_matches)
+        })
         .flat_map(|symbol| {
             let mut candidates = vec![symbol.address()];
             if symbol.size() > 1 {
