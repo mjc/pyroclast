@@ -31,9 +31,18 @@ pub struct FramehopUnwinder {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct FramehopUnwindResult {
+pub struct UserStackUnwindResult {
     pub accepted_frames: Vec<u64>,
     pub framehop_frame_count: usize,
+}
+
+pub trait UserStackUnwinder {
+    fn unwind_user_stack(
+        &mut self,
+        regs: PerfX86_64Regs,
+        stack: &[u8],
+        max_frames: usize,
+    ) -> UserStackUnwindResult;
 }
 
 #[derive(Clone, Debug)]
@@ -213,13 +222,13 @@ impl FramehopUnwinder {
         regs: PerfX86_64Regs,
         stack: &[u8],
         max_frames: usize,
-    ) -> FramehopUnwindResult {
+    ) -> UserStackUnwindResult {
         if self
             .rejected_mapping_ranges
             .iter()
             .any(|range| range.contains(&regs.ip))
         {
-            return FramehopUnwindResult::default();
+            return UserStackUnwindResult::default();
         }
         let stack_reader = PerfStackReader::new(regs.sp, stack);
         let reported_modules = &self.reported_modules;
@@ -249,10 +258,21 @@ impl FramehopUnwinder {
         truncate_at_first_uncovered_unwind_frame(&mut frames, |address| {
             self.has_unwind_info_for_ip(address)
         });
-        FramehopUnwindResult {
+        UserStackUnwindResult {
             accepted_frames: frames,
             framehop_frame_count,
         }
+    }
+}
+
+impl UserStackUnwinder for FramehopUnwinder {
+    fn unwind_user_stack(
+        &mut self,
+        regs: PerfX86_64Regs,
+        stack: &[u8],
+        max_frames: usize,
+    ) -> UserStackUnwindResult {
+        self.unwind_stack_with_diagnostics(regs, stack, max_frames)
     }
 }
 

@@ -2,7 +2,8 @@ use framehop::x86_64::Reg;
 use object::{Object, ObjectSection, ObjectSegment};
 use proptest::prelude::*;
 use pyroclast::perfdata::unwind::{
-    FramehopUnwinder, PerfStackReader, PerfX86_64Regs, unwind_x86_64_stack,
+    FramehopUnwinder, PerfStackReader, PerfX86_64Regs, UserStackUnwindResult, UserStackUnwinder,
+    unwind_x86_64_stack,
 };
 
 #[test]
@@ -182,6 +183,21 @@ fn object_unwind_attempts_initial_plt_frame_without_cfi_like_perf_libdw() {
     );
 
     assert_eq!(frames.first(), Some(&ip));
+}
+
+#[test]
+fn framehop_unwinder_implements_pluggable_user_stack_unwinder_boundary() {
+    let mut unwinder: Box<dyn UserStackUnwinder> = Box::new(FramehopUnwinder::new());
+    let regs = PerfX86_64Regs {
+        ip: 0x4000,
+        sp: 0x7fff_0000,
+        bp: 0x7fff_0000,
+        registers: registers_with_bp_sp(0x7fff_0000, 0x7fff_0000),
+    };
+
+    let result: UserStackUnwindResult = unwinder.unwind_user_stack(regs, &[], 4);
+
+    assert_eq!(result.accepted_frames, vec![regs.ip]);
 }
 
 #[test]
