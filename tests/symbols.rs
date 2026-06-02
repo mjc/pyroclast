@@ -752,9 +752,11 @@ fn rust_addr2line_resolver_uses_object_symbol_for_non_inline_frames_like_perf_sc
         .expect("resolve frames");
 
     let expected = external_addr2line_frames_root_to_leaf(&profiling_binary, address)
-        .expect("external addr2line frames");
-
-    assert_eq!(frames, vec![expected]);
+        .and_then(|frames| frames.into_iter().next())
+        .expect("external addr2line frame");
+    // tools/perf/util/symbol_fprintf.c symbol__fprintf_symname_offs()
+    // appends +0xoffset for perf-script symbol output, including +0x0.
+    assert_eq!(frames, vec![vec![format!("{expected}+0x0")]]);
 }
 
 #[test]
@@ -776,7 +778,7 @@ fn rust_addr2line_resolver_synthesizes_x86_64_plt_symbols_like_perf_script() {
         }])
         .expect("resolve frames");
 
-    assert_eq!(frames, vec![vec!["strcmp@plt".to_string()]]);
+    assert_eq!(frames, vec![vec!["strcmp@plt+0x4".to_string()]]);
 }
 
 #[test]

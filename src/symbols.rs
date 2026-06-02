@@ -1560,6 +1560,11 @@ where
                         .object_metadata
                         .object_symbol(request.relative_address)
                 });
+                let object_symbol_with_offset = object_metadata.as_ref().and_then(|metadata| {
+                    metadata
+                        .object_metadata
+                        .object_symbol_with_offset(request.relative_address)
+                });
                 let has_base_symbol = object_symbol.is_some();
                 let mut frames = if let Some(object_symbol) = object_symbol {
                     object_metadata
@@ -1574,7 +1579,11 @@ where
                 } else {
                     symbol.map_or_else(Vec::new, |name| vec![name])
                 };
-                frames = perf_frames_with_object_alias(frames, object_symbol);
+                frames = perf_frames_with_object_alias_and_offset(
+                    frames,
+                    object_symbol,
+                    object_symbol_with_offset.as_deref(),
+                );
                 resolved[index] = ResolvedSymbolFrames {
                     frames,
                     has_base_symbol,
@@ -1674,6 +1683,11 @@ impl SymbolResolver for RustAddr2lineResolver {
                         .object_metadata
                         .object_symbol(request.relative_address)
                 });
+                let object_symbol_with_offset = object_metadata.as_ref().and_then(|metadata| {
+                    metadata
+                        .object_metadata
+                        .object_symbol_with_offset(request.relative_address)
+                });
                 let has_base_symbol = object_symbol.is_some();
                 let mut frames = if let Some(object_symbol) = object_symbol {
                     object_metadata
@@ -1697,7 +1711,11 @@ impl SymbolResolver for RustAddr2lineResolver {
                         })
                         .unwrap_or_default()
                 };
-                frames = perf_frames_with_object_alias(frames, object_symbol);
+                frames = perf_frames_with_object_alias_and_offset(
+                    frames,
+                    object_symbol,
+                    object_symbol_with_offset.as_deref(),
+                );
                 if let Some(metadata) = &object_metadata {
                     specialize_frames_from_debug_strings(
                         &mut frames,
@@ -1736,6 +1754,20 @@ fn perf_frames_with_object_alias(
 ) -> Vec<String> {
     if frames.len() == 1
         && let Some(alias) = object_alias
+    {
+        frames[0] = alias.to_string();
+    }
+    frames
+}
+
+fn perf_frames_with_object_alias_and_offset(
+    frames: Vec<String>,
+    object_alias: Option<&str>,
+    object_alias_with_offset: Option<&str>,
+) -> Vec<String> {
+    let mut frames = perf_frames_with_object_alias(frames, object_alias);
+    if frames.len() == 1
+        && let Some(alias) = object_alias_with_offset
     {
         frames[0] = alias.to_string();
     }
@@ -1836,6 +1868,10 @@ impl PreparedObjectMetadata {
     fn object_symbol(&self, address: u64) -> Option<&str> {
         self.object_symbols.symbol_name(address)
     }
+
+    fn object_symbol_with_offset(&self, address: u64) -> Option<String> {
+        self.object_symbols.symbol_name_with_offset(address)
+    }
 }
 
 impl PerfObjectSymbolIndex {
@@ -1854,6 +1890,17 @@ impl PerfObjectSymbolIndex {
     }
 
     fn symbol_name(&self, address: u64) -> Option<&str> {
+        self.symbol(address)
+            .map(|candidate| candidate.name.as_str())
+    }
+
+    fn symbol_name_with_offset(&self, address: u64) -> Option<String> {
+        let candidate = self.symbol(address)?;
+        let offset = address.saturating_sub(candidate.address);
+        Some(format!("{}+0x{offset:x}", candidate.name))
+    }
+
+    fn symbol(&self, address: u64) -> Option<&PerfSymbolCandidate> {
         let mut best = None::<&PerfSymbolCandidate>;
         for candidate in &self.symbols {
             if !perf_symbol_candidate_contains_address(candidate, address) {
@@ -1867,7 +1914,7 @@ impl PerfObjectSymbolIndex {
                 _ => candidate,
             });
         }
-        best.map(|candidate| candidate.name.as_str())
+        best
     }
 }
 
@@ -2915,6 +2962,23 @@ mod tests {
         let symbols = super::PerfObjectSymbolIndex::from_object_bytes(&object_bytes);
 
         assert_eq!(symbols.symbol_name(0x1008), Some("read"));
+    }
+
+    #[test]
+    fn object_symbol_index_formats_symbol_offsets_like_perf_script() {
+        // tools/perf/util/symbol_fprintf.c symbol__fprintf_symname_offs()
+        // prints symbol names with a hexadecimal +0x offset, including +0x0.
+        let object_bytes = elf_with_dynamic_text_symbol(b"read", 0x1000, 46);
+        let symbols = super::PerfObjectSymbolIndex::from_object_bytes(&object_bytes);
+
+        assert_eq!(
+            symbols.symbol_name_with_offset(0x1000),
+            Some("read+0x0".to_string())
+        );
+        assert_eq!(
+            symbols.symbol_name_with_offset(0x1008),
+            Some("read+0x8".to_string())
+        );
     }
 
     #[test]
