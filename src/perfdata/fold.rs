@@ -176,6 +176,7 @@ struct UnwindMappingRequest<'a> {
 enum FoldFrame {
     Callchain(u64),
     UserUnwind(u64),
+    InlineCurrentIp(u64),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -222,7 +223,9 @@ struct UserUnwindContext {
 impl FoldFrame {
     fn address(self) -> u64 {
         match self {
-            Self::Callchain(address) | Self::UserUnwind(address) => address,
+            Self::Callchain(address)
+            | Self::UserUnwind(address)
+            | Self::InlineCurrentIp(address) => address,
         }
     }
 }
@@ -1346,11 +1349,11 @@ impl FoldAccumulator {
         );
         if record.clone_maps {
             self.mmap_table.clone_pid_mappings(record.ppid, record.pid);
-            self.prepare_cloned_unwind_mappings(record.pid);
+            self.prepare_pid_unwind_mappings(record.pid);
         }
     }
 
-    fn prepare_cloned_unwind_mappings(&mut self, pid: u32) {
+    fn prepare_pid_unwind_mappings(&mut self, pid: u32) {
         let mappings = self
             .mmap_table
             .user_mappings()
@@ -1616,6 +1619,45 @@ fn add_fold_stack(
 }
 
 impl FoldAccumulator {
+    fn ensure_unwind_mapping_for_ip(&mut self, pid: Option<u32>, ip: u64) {
+        let Some(pid) = pid else {
+            return;
+        };
+        let Some(mapping) = self.mmap_table.user_mapping_for_pid_ip(pid, ip) else {
+            return;
+        };
+        let path = mapping.path.to_string();
+        let build_id = mapping.build_id.map(<[u8]>::to_vec);
+        let request = UnwindMappingRequest {
+            start: mapping.start,
+            len: mapping.len,
+            pgoff: mapping.pgoff,
+            prot: mapping.prot,
+            path: &path,
+            file_identity: mapping.file_identity,
+            build_id: build_id.as_deref(),
+        };
+        if build_id.is_some() {
+            let unwind_debug_dir = self.unwind_debug_dir.clone();
+            let unwind_state = self.unwind_state_mut(pid);
+            load_build_id_unwind_mapping(
+                &mut unwind_state.object_unwinder,
+                &mut unwind_state.attempted_unwind_mappings,
+                &mut unwind_state.loaded_unwind_modules,
+                request,
+                unwind_debug_dir.as_deref(),
+            );
+        } else {
+            let unwind_state = self.unwind_state_mut(pid);
+            load_unwind_mapping(
+                &mut unwind_state.object_unwinder,
+                &mut unwind_state.attempted_unwind_mappings,
+                &mut unwind_state.loaded_unwind_modules,
+                request,
+            );
+        }
+    }
+
     fn add_deferred_callchain(&mut self, cookie: u64, ips: &[u64]) {
         let Some(samples) = self.deferred_samples.remove(&cookie) else {
             return;
@@ -1684,7 +1726,7 @@ fn is_valid_unwound_user_frame(
     _mmap_table: &MmapTable,
     _mapping_cache: &mut MappingResolveCache,
 ) -> bool {
-    let FoldFrame::UserUnwind(address) = frame else {
+    let (FoldFrame::UserUnwind(address) | FoldFrame::InlineCurrentIp(address)) = frame else {
         return true;
     };
     !is_kernel_space_frame(address)
@@ -1791,7 +1833,9 @@ where
             symbol_cache.as_deref_mut(),
             &mut buffers,
         )?;
-        counts.add_rendered(buffers.rendered.as_str(), stack.count());
+        if !buffers.rendered.is_empty() {
+            counts.add_rendered(buffers.rendered.as_str(), stack.count());
+        }
     }
     Ok(())
 }
@@ -1922,6 +1966,7 @@ impl<'a> FoldFrameResolver<'a> {
         } else {
             append_cached_inferno_perf_frame_to_buffers(buffers, UNKNOWN_FRAME);
         }
+        let comm_prefix_len = buffers.rendered.len();
 
         for frame in callchain.iter().copied() {
             if symbol_cache.is_none()
@@ -1942,12 +1987,24 @@ impl<'a> FoldFrameResolver<'a> {
             ) {
                 continue;
             }
+            if let FoldFrame::InlineCurrentIp(address) = frame {
+                self.append_inline_current_ip_folded_frame(
+                    pid,
+                    address,
+                    symbol_cache.as_deref_mut(),
+                    buffers,
+                )?;
+                continue;
+            }
             self.append_folded_frame_labels(
                 pid,
                 frame.address(),
                 symbol_cache.as_deref_mut(),
                 buffers,
             )?;
+        }
+        if buffers.rendered.len() == comm_prefix_len {
+            buffers.rendered.clear();
         }
         Ok(())
     }
@@ -1982,6 +2039,16 @@ impl<'a> FoldFrameResolver<'a> {
                 continue;
             }
             let address = frame.address();
+            if let FoldFrame::InlineCurrentIp(address) = frame {
+                self.write_inline_current_ip_script_frames(
+                    pid,
+                    address,
+                    symbol_cache.as_deref_mut(),
+                    &mut mapping_cache,
+                    writer,
+                )?;
+                continue;
+            }
             let symbolizing = symbol_cache.is_some();
             if let Some(mapping) = pid.and_then(|pid| {
                 self.mmap_table
@@ -2021,6 +2088,66 @@ impl<'a> FoldFrameResolver<'a> {
             } else {
                 write_perf_script_address_frame(writer, address)?;
             }
+        }
+        Ok(())
+    }
+
+    fn write_inline_current_ip_script_frames<R, W>(
+        &self,
+        pid: Option<u32>,
+        address: u64,
+        symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+        mapping_cache: &mut MappingResolveCache,
+        writer: &mut W,
+    ) -> Result<(), String>
+    where
+        R: SymbolResolver,
+        W: IoWrite + ?Sized,
+    {
+        let Some(cache) = symbol_cache else {
+            return Ok(());
+        };
+        let Some(mapping) = pid.and_then(|pid| {
+            self.mmap_table
+                .resolve_ref_cached(pid, address, mapping_cache)
+        }) else {
+            return Ok(());
+        };
+        let frames = cache.resolve_mapping_ref(&mapping)?;
+        if frames.len() <= 1 {
+            return Ok(());
+        }
+        for label in frames.iter().rev() {
+            write_perf_script_frame_for_label(writer, address, label)?;
+        }
+        Ok(())
+    }
+
+    fn append_inline_current_ip_folded_frame<R>(
+        &self,
+        pid: Option<u32>,
+        address: u64,
+        symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+        buffers: &mut FoldedRenderBuffers,
+    ) -> Result<(), String>
+    where
+        R: SymbolResolver,
+    {
+        let Some(cache) = symbol_cache else {
+            return Ok(());
+        };
+        let Some(mapping) = pid.and_then(|pid| {
+            self.mmap_table
+                .resolve_ref_cached(pid, address, &mut buffers.mapping_cache)
+        }) else {
+            return Ok(());
+        };
+        let frames = cache.resolve_mapping_ref(&mapping)?;
+        if frames.len() <= 1 {
+            return Ok(());
+        }
+        for label in frames {
+            append_cached_inferno_perf_frame_to_buffers(buffers, label);
         }
         Ok(())
     }
@@ -2210,7 +2337,7 @@ fn should_drop_perf_data_user_unwind_frame(
     mmap_table: &MmapTable,
     mapping_cache: &mut MappingResolveCache,
 ) -> bool {
-    let FoldFrame::UserUnwind(address) = frame else {
+    let (FoldFrame::UserUnwind(address) | FoldFrame::InlineCurrentIp(address)) = frame else {
         return false;
     };
     is_kernel_space_frame(address)
@@ -2411,6 +2538,7 @@ fn append_perf_user_unwind_frames(
     else {
         return;
     };
+    accumulator.ensure_unwind_mapping_for_ip(sample.pid, regs.ip);
     let initial_ip_mapping = if sample
         .pid
         .is_some_and(|pid| accumulator.mmap_table.has_mapping_for_pid(pid, regs.ip))
@@ -2451,7 +2579,7 @@ fn append_perf_user_unwind_frames(
             has_frames: !accumulator.sample_frames.is_empty(),
         }
     };
-    let unwound_frames = unwind_user_stack_like_perf(
+    let mut unwound_frames = unwind_user_stack_like_perf(
         accumulator,
         sample,
         &regs,
@@ -2464,10 +2592,6 @@ fn append_perf_user_unwind_frames(
             syscall_return_state: regs.is_syscall_return_state(),
         },
     );
-    let mut unwound_frames = perf_accepted_unwind_frames(unwound_frames)
-        .into_iter()
-        .map(FoldFrame::UserUnwind)
-        .collect::<Vec<_>>();
     let mut mapping_cache = MappingResolveCache::default();
     truncate_user_unwind_at_first_unmapped_frame(
         sample.pid,
@@ -2483,7 +2607,7 @@ fn unwind_user_stack_like_perf(
     sample: &crate::perfdata::samples::SampleCallchain<'_>,
     regs: &PerfX86_64Regs,
     context: UserUnwindContext,
-) -> Vec<u64> {
+) -> Vec<FoldFrame> {
     let Some(stack) = &sample.user_stack else {
         return Vec::new();
     };
@@ -2492,9 +2616,15 @@ fn unwind_user_stack_like_perf(
     };
     match choose_user_unwind_source(context) {
         UserUnwindSource::None => Vec::new(),
-        UserUnwindSource::FramePointer => unwind_x86_64_stack(*regs, stack_bytes, 256),
+        UserUnwindSource::FramePointer => {
+            perf_accepted_unwind_frames(unwind_x86_64_stack(*regs, stack_bytes, 256))
+                .into_iter()
+                .map(FoldFrame::UserUnwind)
+                .collect()
+        }
         UserUnwindSource::Object => sample
             .pid
+            .inspect(|pid| accumulator.prepare_pid_unwind_mappings(*pid))
             .and_then(|pid| accumulator.unwind_states.get_mut(&pid))
             .map_or_else(Vec::new, |state| {
                 let initial_frame_policy = object_unwind_initial_frame_policy(
@@ -2502,11 +2632,21 @@ fn unwind_user_stack_like_perf(
                     regs.ip,
                     &accumulator.mmap_table,
                 );
+                let raw_frames = state.object_unwinder.unwind_stack(*regs, stack_bytes, 256);
+                let maybe_inline_current_ip = raw_frames.is_empty()
+                    && regs.bp < regs.sp
+                    && matches!(
+                        context.callchain,
+                        SampleCallchainState::Other {
+                            has_callchain: true,
+                            has_frames: false
+                        }
+                    );
                 let mut frames = perf_accepted_object_unwind_frames(
                     regs,
                     context.callchain,
                     initial_frame_policy,
-                    state.object_unwinder.unwind_stack(*regs, stack_bytes, 256),
+                    raw_frames,
                 );
                 frames = prefer_frame_pointer_tail_for_object_unwind_divergence(
                     sample.pid,
@@ -2530,7 +2670,14 @@ fn unwind_user_stack_like_perf(
                     &accumulator.mmap_table,
                     &mut frames,
                 );
-                frames
+                let mut fold_frames = frames
+                    .into_iter()
+                    .map(FoldFrame::UserUnwind)
+                    .collect::<Vec<_>>();
+                if maybe_inline_current_ip && fold_frames.is_empty() {
+                    fold_frames.push(FoldFrame::InlineCurrentIp(regs.ip));
+                }
+                fold_frames
             }),
     }
 }
@@ -2589,16 +2736,28 @@ fn prefer_frame_pointer_tail_for_object_unwind_divergence(
         object_frames.iter().skip(1).copied().any(|frame| {
             !is_kernel_space_frame(frame) && !has_user_mapping(pid, frame, mmap_table)
         });
-    if !has_unmapped_user_frame && object_frames.as_slice() != [regs.ip] {
-        return object_frames;
-    }
-
     let mapped_prefix_len = frame_pointer_frames
         .iter()
         .copied()
         .take_while(|frame| has_user_mapping(pid, *frame, mmap_table))
         .count();
     frame_pointer_frames.truncate(mapped_prefix_len);
+    let frame_pointer_tail_crosses_mapping = frame_pointer_frames
+        .iter()
+        .copied()
+        .skip(object_frames.len())
+        .any(|frame| !user_frames_share_mapping_path(pid, regs.ip, frame, mmap_table));
+    if object_frames.len() > 1
+        && frame_pointer_frames.len() > object_frames.len()
+        && frame_pointer_frames.starts_with(&object_frames)
+        && frame_pointer_tail_crosses_mapping
+    {
+        return frame_pointer_frames;
+    }
+    if !has_unmapped_user_frame && object_frames.as_slice() != [regs.ip] {
+        return object_frames;
+    }
+
     let has_enough_frame_pointer_frames = if has_unmapped_user_frame {
         frame_pointer_frames.len() >= object_frames.len()
     } else {
@@ -2778,9 +2937,8 @@ fn has_perf_frame_pointer_fallback(context: UserUnwindContext) -> bool {
 fn has_perf_object_unwind(context: UserUnwindContext) -> bool {
     match context.callchain {
         SampleCallchainState::KernelWithoutCallchain => context.initial_ip_is_dso,
-        SampleCallchainState::KernelWithCallchain => true,
+        SampleCallchainState::KernelWithCallchain | SampleCallchainState::Other { .. } => true,
         SampleCallchainState::KernelWithUserFrame => false,
-        SampleCallchainState::Other { has_callchain, .. } => has_callchain,
     }
 }
 
@@ -2852,6 +3010,10 @@ fn perf_accepted_object_unwind_frames(
         [] => match initial_frame_policy {
             ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp => Vec::new(),
             ObjectUnwindInitialFramePolicy::KeepDsoLeaf => vec![regs.ip],
+        },
+        [ip] if *ip == regs.ip && regs.bp < regs.sp => match initial_frame_policy {
+            ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp
+            | ObjectUnwindInitialFramePolicy::KeepDsoLeaf => vec![*ip],
         },
         [ip] if *ip == regs.ip => match initial_frame_policy {
             ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp => Vec::new(),
@@ -3130,6 +3292,24 @@ fn read_sample_u64(payload: &[u8], offset: usize) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use crate::perfdata::mappings::FileIdentity;
+    use crate::symbols::{SymbolFrameCache, SymbolRequest, SymbolResolver};
+
+    struct StaticFrameResolver {
+        frames: Vec<String>,
+    }
+
+    impl SymbolResolver for StaticFrameResolver {
+        fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
+            Ok(vec![None; requests.len()])
+        }
+
+        fn resolve_frame_batch(
+            &self,
+            requests: &[SymbolRequest],
+        ) -> Result<Vec<Vec<String>>, String> {
+            Ok(vec![self.frames.clone(); requests.len()])
+        }
+    }
 
     fn test_regs(ip: u64) -> super::PerfX86_64Regs {
         super::PerfX86_64Regs {
@@ -3252,6 +3432,29 @@ mod tests {
     }
 
     #[test]
+    fn object_unwind_acceptance_does_not_invent_sample_ip_for_empty_libdw_callbacks() {
+        // tools/perf/util/unwind-libdw.c only appends frames accepted by
+        // frame_callback -> entry after dwfl_getthread_frames runs. A captured
+        // stack with no accepted callbacks stays empty here; inline-only current
+        // IP salvage is represented later as FoldFrame::InlineCurrentIp.
+        let mut regs = test_regs(0x5555_556f_bbbb);
+        regs.sp = 0x7fff_ffff_7790;
+        regs.bp = 0x76c8;
+        assert_eq!(
+            super::perf_accepted_object_unwind_frames(
+                &regs,
+                super::SampleCallchainState::Other {
+                    has_callchain: true,
+                    has_frames: false,
+                },
+                super::ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp,
+                Vec::new(),
+            ),
+            Vec::<u64>::new()
+        );
+    }
+
+    #[test]
     fn fold_counts_coalesce_duplicate_rendered_lines() {
         let mut counts = super::FoldCounts::default();
 
@@ -3302,6 +3505,80 @@ mod tests {
                 });
 
         assert_eq!(String::from_utf8(written).expect("utf-8"), expected);
+    }
+
+    #[test]
+    fn inline_current_ip_with_single_symbol_renders_no_folded_stack_like_perf_libdw() {
+        // Real period 4753323 sample from
+        // target/profiling-runs/octo-symbolized-fold-final/profile.raw.perf.data:
+        // perf script -D shows captured user regs/stack and FP chain nr:0, but
+        // perf script emits an empty stack for IP 0x555555676876.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x5555_5567_0000,
+            len: 0x10_0000,
+            pgoff: 0,
+            path: "/bin/pyroclast".to_string(),
+        });
+        let resolver = StaticFrameResolver {
+            frames: vec!["core::num::flt2dec::strategy::dragon::mul_pow10".to_string()],
+        };
+        let mut symbol_cache = SymbolFrameCache::new(&resolver);
+        let mut buffers = super::FoldedRenderBuffers::default();
+
+        super::FoldFrameResolver::new(&mmap_table)
+            .render_folded_stack_for_stack(
+                Some(11),
+                Some("pyroclast"),
+                &[super::FoldFrame::InlineCurrentIp(0x5555_5567_6876)],
+                Some(&mut symbol_cache),
+                &mut buffers,
+            )
+            .expect("render folded stack");
+
+        assert_eq!(buffers.rendered, "");
+    }
+
+    #[test]
+    fn inline_current_ip_with_inline_chain_renders_folded_stack_like_perf_libdw() {
+        // Real period 4268704 sample from
+        // target/profiling-runs/octo-symbolized-fold-final/profile.raw.perf.data:
+        // libdw emits the sampled IP only as an inline chain.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x5555_5560_0000,
+            len: 0x20_0000,
+            pgoff: 0,
+            path: "/bin/pyroclast".to_string(),
+        });
+        let resolver = StaticFrameResolver {
+            frames: vec![
+                "add<&str>".to_string(),
+                "sort8_stable<&str>".to_string(),
+                "quicksort<&str>".to_string(),
+            ],
+        };
+        let mut symbol_cache = SymbolFrameCache::new(&resolver);
+        let mut buffers = super::FoldedRenderBuffers::default();
+
+        super::FoldFrameResolver::new(&mmap_table)
+            .render_folded_stack_for_stack(
+                Some(11),
+                Some("pyroclast"),
+                &[super::FoldFrame::InlineCurrentIp(0x5555_556f_bbbb)],
+                Some(&mut symbol_cache),
+                &mut buffers,
+            )
+            .expect("render folded stack");
+
+        assert_eq!(
+            buffers.rendered,
+            "pyroclast;add<&str>;sort8_stable<&str>;quicksort<&str>"
+        );
     }
 
     #[test]
@@ -3554,6 +3831,28 @@ mod tests {
                 },
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
                 initial_ip_is_dso: false,
+                module_count: 1,
+                frame_pointer_at_or_above_stack_pointer: false,
+                syscall_return_state: false,
+            }),
+            super::UserUnwindSource::Object
+        );
+    }
+
+    #[test]
+    fn user_unwind_source_uses_object_unwinder_for_captured_stack_without_recorded_callchain_like_perf()
+     {
+        // Perf's thread__resolve_callchain_unwind only requires PERF_SAMPLE_REGS_USER
+        // and PERF_SAMPLE_STACK_USER; __thread__resolve_callchain calls it even when
+        // PERF_SAMPLE_CALLCHAIN did not contribute recorded frames.
+        assert_eq!(
+            super::choose_user_unwind_source(super::UserUnwindContext {
+                callchain: super::SampleCallchainState::Other {
+                    has_callchain: false,
+                    has_frames: false,
+                },
+                initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
+                initial_ip_is_dso: true,
                 module_count: 1,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
@@ -3847,6 +4146,105 @@ mod tests {
             .insert((path.to_string(), 0x7fff_f7d8_2000));
 
         assert!(accumulator.has_loaded_unwind_mapping_for_ip(11.into(), 0x7fff_f7e3_2455));
+    }
+
+    #[test]
+    fn sample_unwind_loads_sampled_ip_module_like_perf_report_module() {
+        // perf's tools/perf/util/unwind-libdw.c calls report_module(ip, ui)
+        // before dwfl_getthread_frames, so the sampled IP can load its DSO even
+        // when no earlier mmap path was loaded into the unwinder.
+        let current_exe = std::env::current_exe().expect("current exe");
+        let current_exe = current_exe.to_string_lossy().into_owned();
+        let mut accumulator = super::FoldAccumulator::new(std::collections::BTreeMap::new());
+        accumulator
+            .mmap_table
+            .insert_mmap(crate::perfdata::records::MmapRecord {
+                pid: 11,
+                tid: 11,
+                start: 0x1000,
+                len: 0x1000_0000,
+                pgoff: 0,
+                path: current_exe,
+            });
+
+        accumulator.ensure_unwind_mapping_for_ip(Some(11), 0x2000);
+
+        assert!(accumulator.has_loaded_unwind_mapping_for_ip(Some(11), 0x2000));
+    }
+
+    #[test]
+    fn pid_unwind_preload_loads_executable_mappings_like_libdw_report_module_callbacks() {
+        // perf's libdw unwinder calls report_module for each frame address as
+        // dwfl_getthread_frames walks across DSOs. Framehop has no such callback
+        // path here, so the Rust perf path preloads executable PID mappings.
+        let current_exe = std::env::current_exe().expect("current exe");
+        let current_exe = current_exe.to_string_lossy().into_owned();
+        let mut accumulator = super::FoldAccumulator::new(std::collections::BTreeMap::new());
+        accumulator
+            .mmap_table
+            .insert_mmap(crate::perfdata::records::MmapRecord {
+                pid: 11,
+                tid: 11,
+                start: 0x1000,
+                len: 0x1000_0000,
+                pgoff: 0,
+                path: current_exe,
+            });
+
+        accumulator.prepare_pid_unwind_mappings(11);
+
+        assert!(accumulator.has_loaded_unwind_mapping_for_ip(Some(11), 0x2000));
+    }
+
+    #[test]
+    fn object_unwind_extends_mapped_prefix_with_frame_pointer_tail_like_perf_libdw() {
+        // Real period 1758779 sample from
+        // target/profiling-runs/octo-symbolized-fold-final/profile.raw.perf.data:
+        // perf/libdw emits __internal_syscall_cancel, __syscall_cancel, read,
+        // then mapped Pyro callers. Framehop may produce only the libc prefix,
+        // so Pyro appends the valid frame-pointer tail when it shares that
+        // exact prefix.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x7000,
+            len: 0x200,
+            pgoff: 0,
+            path: "/nix/store/glibc/lib/libc.so.6".to_string(),
+        });
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x8000,
+            len: 0x200,
+            pgoff: 0,
+            path: "/tmp/pyroclast".to_string(),
+        });
+        let mut registers = [0; 16];
+        registers[framehop::x86_64::Reg::RBP as usize] = 0x1010;
+        registers[framehop::x86_64::Reg::RSP as usize] = 0x1000;
+        let regs = super::PerfX86_64Regs {
+            ip: 0x7000,
+            sp: 0x1000,
+            bp: 0x1010,
+            registers,
+        };
+        let mut stack = vec![0; 0x30];
+        stack[0x10..0x18].copy_from_slice(&0x1020_u64.to_le_bytes());
+        stack[0x18..0x20].copy_from_slice(&0x7101_u64.to_le_bytes());
+        stack[0x20..0x28].copy_from_slice(&0_u64.to_le_bytes());
+        stack[0x28..0x30].copy_from_slice(&0x8001_u64.to_le_bytes());
+
+        let frames = super::prefer_frame_pointer_tail_for_object_unwind_divergence(
+            Some(11),
+            &mmap_table,
+            &regs,
+            &stack,
+            vec![0x7000, 0x7100],
+        );
+
+        assert_eq!(frames, vec![0x7000, 0x7100, 0x8000]);
     }
 
     #[test]
