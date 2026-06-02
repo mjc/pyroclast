@@ -2712,14 +2712,11 @@ fn unwind_user_stack_like_perf(
                     &accumulator.mmap_table,
                 );
                 let raw_frames = state.object_unwinder.unwind_stack(*regs, stack_bytes, 256);
-                let maybe_inline_current_ip = raw_frames.is_empty()
-                    && regs.bp < regs.sp
-                    && matches!(
-                        context.callchain,
-                        SampleCallchainState::Other {
-                            has_callchain: true,
-                            has_frames: false
-                        }
+                let maybe_inline_current_ip =
+                    should_salvage_inline_current_ip_after_empty_object_unwind(
+                        raw_frames.is_empty(),
+                        regs,
+                        context,
                     );
                 let mut frames = perf_accepted_object_unwind_frames(
                     regs,
@@ -2759,6 +2756,14 @@ fn unwind_user_stack_like_perf(
                 fold_frames
             }),
     }
+}
+
+fn should_salvage_inline_current_ip_after_empty_object_unwind(
+    _raw_object_unwind_is_empty: bool,
+    _regs: &PerfX86_64Regs,
+    _context: UserUnwindContext,
+) -> bool {
+    false
 }
 
 fn extend_initial_dso_leaf_with_same_mapping_frame_pointer_tail(
@@ -3528,8 +3533,7 @@ mod tests {
     fn object_unwind_acceptance_does_not_invent_sample_ip_for_empty_libdw_callbacks() {
         // tools/perf/util/unwind-libdw.c only appends frames accepted by
         // frame_callback -> entry after dwfl_getthread_frames runs. A captured
-        // stack with no accepted callbacks stays empty here; inline-only current
-        // IP salvage is represented later as FoldFrame::InlineCurrentIp.
+        // stack with no accepted callbacks stays empty.
         let mut regs = test_regs(0x5555_556f_bbbb);
         regs.sp = 0x7fff_ffff_7790;
         regs.bp = 0x76c8;
@@ -3544,6 +3548,35 @@ mod tests {
                 Vec::new(),
             ),
             Vec::<u64>::new()
+        );
+    }
+
+    #[test]
+    fn empty_object_unwind_does_not_salvage_inline_current_ip_like_perf_libdw() {
+        // tools/perf/util/unwind-libdw.c stores frames only from
+        // frame_callback() -> entry(); machine.c append_inlines() runs inside
+        // that entry path. When dwfl_getthread_frames produces no accepted
+        // frames, perf script prints no inline-only sampled-IP stack.
+        let mut regs = test_regs(0x5555_5577_096a);
+        regs.sp = 0x7fff_ffff_7830;
+        regs.bp = 0x76c8;
+
+        assert!(
+            !super::should_salvage_inline_current_ip_after_empty_object_unwind(
+                true,
+                &regs,
+                super::UserUnwindContext {
+                    callchain: super::SampleCallchainState::Other {
+                        has_callchain: true,
+                        has_frames: false,
+                    },
+                    initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
+                    initial_ip_is_dso: false,
+                    module_count: 1,
+                    frame_pointer_at_or_above_stack_pointer: false,
+                    syscall_return_state: false,
+                },
+            )
         );
     }
 
