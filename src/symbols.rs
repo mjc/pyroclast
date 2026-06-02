@@ -1616,7 +1616,6 @@ fn perf_frames_with_object_alias(
 ) -> Vec<String> {
     if frames.len() == 1
         && let Some(alias) = object_alias
-        && perf_object_alias_improves_name(&frames[0], alias)
     {
         frames[0] = alias.to_string();
     }
@@ -2799,7 +2798,7 @@ mod tests {
     }
 
     #[test]
-    fn perf_object_alias_only_replaces_more_underscored_frame_names() {
+    fn perf_object_alias_replaces_single_non_inline_frame_names_like_perf_script() {
         assert_eq!(
             perf_frames_with_object_alias(vec!["__read".to_string()], Some("read")),
             vec!["read".to_string()]
@@ -2809,7 +2808,7 @@ mod tests {
                 vec!["alloc::collections::btree::map::IntoIter<K,V,A>::dying_next".to_string()],
                 Some("dying_next<u64, alloc::string::String, alloc::alloc::Global>")
             ),
-            vec!["alloc::collections::btree::map::IntoIter<K,V,A>::dying_next".to_string()]
+            vec!["dying_next<u64, alloc::string::String, alloc::alloc::Global>".to_string()]
         );
     }
 
