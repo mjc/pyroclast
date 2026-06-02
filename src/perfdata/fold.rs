@@ -198,6 +198,7 @@ struct UserUnwindContext {
     initial_ip_mapping: InitialIpMappingState,
     module_count: usize,
     frame_pointer_at_or_above_stack_pointer: bool,
+    syscall_return_state: bool,
 }
 
 impl FoldFrame {
@@ -2356,6 +2357,7 @@ fn append_perf_user_unwind_frames(
             initial_ip_mapping,
             module_count,
             frame_pointer_at_or_above_stack_pointer: regs.bp >= regs.sp,
+            syscall_return_state: regs.is_syscall_return_state(),
         },
     );
     let mut unwound_frames = perf_accepted_unwind_frames(unwound_frames)
@@ -2440,7 +2442,7 @@ fn has_perf_frame_pointer_fallback(context: UserUnwindContext) -> bool {
 fn has_perf_object_unwind(context: UserUnwindContext) -> bool {
     match context.callchain {
         SampleCallchainState::KernelWithCallchain => {
-            context.frame_pointer_at_or_above_stack_pointer
+            context.frame_pointer_at_or_above_stack_pointer || context.syscall_return_state
         }
         SampleCallchainState::Other {
             has_callchain: true,
@@ -3049,6 +3051,7 @@ mod tests {
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingMissing,
                 module_count: 1,
                 frame_pointer_at_or_above_stack_pointer: false,
+                syscall_return_state: false,
             }),
             super::UserUnwindSource::None
         );
@@ -3065,6 +3068,7 @@ mod tests {
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
                 module_count: 0,
                 frame_pointer_at_or_above_stack_pointer: false,
+                syscall_return_state: false,
             }),
             super::UserUnwindSource::FramePointer
         );
@@ -3077,6 +3081,7 @@ mod tests {
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
                 module_count: 0,
                 frame_pointer_at_or_above_stack_pointer: false,
+                syscall_return_state: false,
             }),
             super::UserUnwindSource::None
         );
@@ -3089,6 +3094,7 @@ mod tests {
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
                 module_count: 0,
                 frame_pointer_at_or_above_stack_pointer: false,
+                syscall_return_state: false,
             }),
             super::UserUnwindSource::None
         );
@@ -3105,6 +3111,7 @@ mod tests {
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
                 module_count: 1,
                 frame_pointer_at_or_above_stack_pointer: false,
+                syscall_return_state: false,
             }),
             super::UserUnwindSource::Object
         );
@@ -3121,6 +3128,7 @@ mod tests {
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
                 module_count: 1,
                 frame_pointer_at_or_above_stack_pointer: false,
+                syscall_return_state: false,
             }),
             super::UserUnwindSource::Object
         );
@@ -3134,8 +3142,23 @@ mod tests {
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
                 module_count: 1,
                 frame_pointer_at_or_above_stack_pointer: false,
+                syscall_return_state: false,
             }),
             super::UserUnwindSource::None
+        );
+    }
+
+    #[test]
+    fn user_unwind_source_uses_object_unwind_for_syscall_return_like_perf_libdw() {
+        assert_eq!(
+            super::choose_user_unwind_source(super::UserUnwindContext {
+                callchain: super::SampleCallchainState::KernelWithCallchain,
+                initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
+                module_count: 1,
+                frame_pointer_at_or_above_stack_pointer: false,
+                syscall_return_state: true,
+            }),
+            super::UserUnwindSource::Object
         );
     }
 
@@ -3147,6 +3170,7 @@ mod tests {
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
                 module_count: 1,
                 frame_pointer_at_or_above_stack_pointer: true,
+                syscall_return_state: false,
             }),
             super::UserUnwindSource::Object
         );
@@ -3160,6 +3184,7 @@ mod tests {
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
                 module_count: 1,
                 frame_pointer_at_or_above_stack_pointer: false,
+                syscall_return_state: false,
             }),
             super::UserUnwindSource::None
         );
@@ -3173,6 +3198,7 @@ mod tests {
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
                 module_count: 1,
                 frame_pointer_at_or_above_stack_pointer: false,
+                syscall_return_state: false,
             }),
             super::UserUnwindSource::None
         );
@@ -3214,6 +3240,21 @@ mod tests {
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
                 module_count: 0,
                 frame_pointer_at_or_above_stack_pointer: false,
+                syscall_return_state: false,
+            }),
+            super::UserUnwindSource::None
+        );
+    }
+
+    #[test]
+    fn user_unwind_source_skips_frame_pointer_fallback_for_syscall_return_like_perf_script() {
+        assert_eq!(
+            super::choose_user_unwind_source(super::UserUnwindContext {
+                callchain: super::SampleCallchainState::KernelWithCallchain,
+                initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
+                module_count: 0,
+                frame_pointer_at_or_above_stack_pointer: false,
+                syscall_return_state: true,
             }),
             super::UserUnwindSource::None
         );
@@ -3227,6 +3268,7 @@ mod tests {
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
                 module_count: 0,
                 frame_pointer_at_or_above_stack_pointer: true,
+                syscall_return_state: false,
             }),
             super::UserUnwindSource::FramePointer
         );
