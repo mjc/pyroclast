@@ -2788,11 +2788,13 @@ fn unwind_user_stack_like_perf(
 }
 
 fn should_salvage_inline_current_ip_after_empty_object_unwind(
-    _raw_object_unwind_is_empty: bool,
+    raw_object_unwind_is_empty: bool,
     _regs: &PerfX86_64Regs,
-    _context: UserUnwindContext,
+    context: UserUnwindContext,
 ) -> bool {
-    false
+    raw_object_unwind_is_empty
+        && context.initial_ip_mapping == InitialIpMappingState::RecordedMappingLoaded
+        && context.module_count > 0
 }
 
 fn extend_initial_dso_leaf_with_same_mapping_frame_pointer_tail(
@@ -3580,17 +3582,19 @@ mod tests {
     }
 
     #[test]
-    fn empty_object_unwind_does_not_salvage_inline_current_ip_like_perf_libdw() {
-        // tools/perf/util/unwind-libdw.c stores frames only from
-        // frame_callback() -> entry(); machine.c append_inlines() runs inside
-        // that entry path. When dwfl_getthread_frames produces no accepted
-        // frames, perf script prints no inline-only sampled-IP stack.
+    fn empty_framehop_unwind_salvages_inline_current_ip_when_perf_libdw_can_emit_initial_frame() {
+        // tools/perf/util/unwind-libdw.c reports the sampled IP module, then
+        // stores frames from frame_callback() -> entry(). tools/perf/util/machine.c
+        // unwind_entry() lets append_inlines() replace a stored current-IP frame
+        // with inline frames. A framehop miss is therefore not proof that libdw
+        // produced no callbacks; rendering still drops this marker unless DWARF
+        // inline lookup finds a base symbol and an inline chain.
         let mut regs = test_regs(0x5555_5577_096a);
         regs.sp = 0x7fff_ffff_7830;
         regs.bp = 0x76c8;
 
         assert!(
-            !super::should_salvage_inline_current_ip_after_empty_object_unwind(
+            super::should_salvage_inline_current_ip_after_empty_object_unwind(
                 true,
                 &regs,
                 super::UserUnwindContext {
