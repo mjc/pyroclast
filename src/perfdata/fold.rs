@@ -2139,6 +2139,16 @@ impl<'a> FoldFrameResolver<'a> {
                             address,
                             &symbol_fallback_frame_ref(&mapping),
                         )?;
+                    } else if matches!(frame, FoldFrame::UserUnwind(_))
+                        && frames.len() == 1
+                        && !is_kernel_space_frame(address)
+                    {
+                        write_perf_script_mapped_symbol_frame(
+                            writer,
+                            address,
+                            &frames[0],
+                            mapping.path,
+                        )?;
                     } else {
                         for label in frames.iter().rev() {
                             write_perf_script_frame_for_label(writer, address, label)?;
@@ -2378,6 +2388,25 @@ where
     W: IoWrite + ?Sized,
 {
     writeln!(writer, "\t{address:x} {label} ({UNKNOWN_FRAME})")
+        .map_err(|error| format!("failed to write perf script output: {error}"))
+}
+
+fn write_perf_script_mapped_symbol_frame<W>(
+    writer: &mut W,
+    address: u64,
+    label: &str,
+    path: &str,
+) -> Result<(), String>
+where
+    W: IoWrite + ?Sized,
+{
+    if label == UNKNOWN_FRAME
+        || label.starts_with("0x")
+        || module_fallback_label_module(label).is_some()
+    {
+        return write_perf_script_frame_for_label(writer, address, label);
+    }
+    writeln!(writer, "\t{address:x} {label} ({path})")
         .map_err(|error| format!("failed to write perf script output: {error}"))
 }
 
@@ -3743,6 +3772,42 @@ mod tests {
         assert_eq!(
             buffers.rendered,
             "pyroclast;add<&str>;sort8_stable<&str>;quicksort<&str>"
+        );
+    }
+
+    #[test]
+    fn symbolized_user_unwind_script_frame_keeps_mapped_dso_like_perf_script() {
+        // tools/perf/util/machine.c add_callchain_ip() resolves every accepted
+        // unwound IP through thread__find_cpumode_addr_location(); builtin-script.c
+        // then prints the DSO name for that resolved map_symbol.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x1000,
+            len: 0x1000,
+            pgoff: 0,
+            path: "/nix/store/glibc/lib/libc.so.6".to_string(),
+        });
+        let resolver = StaticFrameResolver {
+            frames: vec!["_Fork+0x48".to_string()],
+            has_base_symbol: true,
+        };
+        let mut symbol_cache = SymbolFrameCache::new(&resolver);
+        let mut written = Vec::new();
+
+        super::FoldFrameResolver::new(&mmap_table)
+            .write_script_frames_for_stack(
+                Some(11),
+                &[super::FoldFrame::UserUnwind(0x1048)],
+                Some(&mut symbol_cache),
+                &mut written,
+            )
+            .expect("write perf script frames");
+
+        assert_eq!(
+            String::from_utf8(written).expect("utf-8"),
+            "\t1048 _Fork+0x48 (/nix/store/glibc/lib/libc.so.6)\n"
         );
     }
 
