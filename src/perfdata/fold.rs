@@ -28,7 +28,9 @@ use crate::perfdata::samples::{
     PERF_SAMPLE_TIME, SampleLayout, is_kernel_space_frame, is_perf_context_marker,
     is_perf_user_deferred_context_marker, parse_sample_record_callchain,
 };
-use crate::perfdata::unwind::{FramehopUnwinder, PerfX86_64Regs, unwind_x86_64_stack};
+use crate::perfdata::unwind::{
+    FramehopUnwinder, PerfX86_64Regs, UserStackUnwindResult, UserStackUnwinder, unwind_x86_64_stack,
+};
 use crate::symbols::{SymbolFrameCache, SymbolRequest, SymbolResolver, perf_build_id_elf_path};
 
 const UNKNOWN_FRAME: &str = "[unknown]";
@@ -2740,10 +2742,12 @@ fn unwind_user_stack_like_perf(
                     regs.ip,
                     &accumulator.mmap_table,
                 );
-                let object_unwind =
-                    state
-                        .object_unwinder
-                        .unwind_stack_with_diagnostics(*regs, stack_bytes, 256);
+                let object_unwind = unwind_user_stack_with_diagnostics(
+                    &mut state.object_unwinder,
+                    *regs,
+                    stack_bytes,
+                    256,
+                );
                 let raw_frames = object_unwind.accepted_frames;
                 let maybe_inline_current_ip =
                     should_salvage_inline_current_ip_after_empty_object_unwind(
@@ -2790,6 +2794,15 @@ fn unwind_user_stack_like_perf(
                 fold_frames
             }),
     }
+}
+
+fn unwind_user_stack_with_diagnostics(
+    unwinder: &mut impl UserStackUnwinder,
+    regs: PerfX86_64Regs,
+    stack_bytes: &[u8],
+    max_frames: usize,
+) -> UserStackUnwindResult {
+    unwinder.unwind_user_stack(regs, stack_bytes, max_frames)
 }
 
 fn should_salvage_inline_current_ip_after_empty_object_unwind(
@@ -3406,7 +3419,26 @@ fn read_sample_u64(payload: &[u8], offset: usize) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use crate::perfdata::mappings::FileIdentity;
+    use crate::perfdata::unwind::{UserStackUnwindResult, UserStackUnwinder};
     use crate::symbols::{ResolvedSymbolFrames, SymbolFrameCache, SymbolRequest, SymbolResolver};
+
+    #[derive(Default)]
+    struct FakeUserStackUnwinder {
+        calls: usize,
+        result: UserStackUnwindResult,
+    }
+
+    impl UserStackUnwinder for FakeUserStackUnwinder {
+        fn unwind_user_stack(
+            &mut self,
+            _regs: super::PerfX86_64Regs,
+            _stack: &[u8],
+            _max_frames: usize,
+        ) -> UserStackUnwindResult {
+            self.calls += 1;
+            self.result.clone()
+        }
+    }
 
     struct StaticFrameResolver {
         frames: Vec<String>,
@@ -3446,6 +3478,27 @@ mod tests {
             bp: 0x3000,
             registers: [0; 16],
         }
+    }
+
+    #[test]
+    fn object_unwind_diagnostics_use_pluggable_user_stack_unwinder() {
+        let mut unwinder = FakeUserStackUnwinder {
+            result: UserStackUnwindResult {
+                accepted_frames: vec![0x1111, 0x2222],
+                framehop_frame_count: 2,
+            },
+            ..FakeUserStackUnwinder::default()
+        };
+
+        let result = super::unwind_user_stack_with_diagnostics(
+            &mut unwinder,
+            test_regs(0x1111),
+            &[0; 16],
+            8,
+        );
+
+        assert_eq!(unwinder.calls, 1);
+        assert_eq!(result.accepted_frames, vec![0x1111, 0x2222]);
     }
 
     #[test]
