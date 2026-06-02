@@ -3140,13 +3140,6 @@ fn perf_accepted_object_unwind_frames(
             ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp => Vec::new(),
             ObjectUnwindInitialFramePolicy::KeepDsoLeaf => vec![*ip],
         },
-        [ip, ..]
-            if *ip == regs.ip
-                && callchain == SampleCallchainState::KernelWithCallchain
-                && regs.is_syscall_return_state() =>
-        {
-            vec![*ip]
-        }
         [ip, _]
             if *ip == regs.ip
                 && callchain
@@ -4236,7 +4229,7 @@ mod tests {
     }
 
     #[test]
-    fn object_unwind_stops_after_syscall_return_ip_for_kernel_callchain_like_perf_libdw() {
+    fn object_unwind_keeps_syscall_return_callers_like_perf_libdw() {
         let regs = super::PerfX86_64Regs {
             ip: 0x7fff_f7ea_3f4b,
             sp: 0x7fff_ffff_9928,
@@ -4256,7 +4249,7 @@ mod tests {
                 super::ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp,
                 vec![0x7fff_f7ea_3f4b, 0x5555_5578_8ba4, 0x5555_5578_8ba5],
             ),
-            vec![0x7fff_f7ea_3f4b]
+            vec![0x7fff_f7ea_3f4b, 0x5555_5578_8ba4, 0x5555_5578_8ba5]
         );
     }
 

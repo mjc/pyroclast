@@ -558,7 +558,7 @@ fn truncate_at_first_uncovered_unwind_frame(
         .find_map(|(index, address)| (!has_unwind_info(*address)).then_some(index))
         && index + 1 != frames.len()
     {
-        frames.truncate(index);
+        frames.truncate(index + 1);
     }
 }
 
@@ -687,12 +687,16 @@ mod tests {
     }
 
     #[test]
-    fn truncates_object_unwind_at_first_frame_without_cfi_like_perf_libdw() {
+    fn keeps_first_object_unwind_frame_without_cfi_before_truncating_like_perf_libdw() {
+        // elfutils libdwfl/dwfl_frame.c dwfl_thread_getframes() invokes the
+        // frame callback before calling __libdwfl_frame_unwind() for the next
+        // frame. perf util/unwind-libdw.c entry() stores that callback frame,
+        // so a later unwind failure does not erase the first no-CFI caller.
         let mut frames = vec![0x1000, 0x2000, 0x3000, 0x4000];
 
         super::truncate_at_first_uncovered_unwind_frame(&mut frames, |address| address < 0x3000);
 
-        assert_eq!(frames, vec![0x1000, 0x2000]);
+        assert_eq!(frames, vec![0x1000, 0x2000, 0x3000]);
     }
 
     #[test]
