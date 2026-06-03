@@ -827,7 +827,7 @@ fn find_profiling_address(
     object_bytes: &[u8],
     predicate: impl Fn(&[String]) -> bool,
 ) -> Option<u64> {
-    text_symbol_addresses(object_bytes)
+    profiling_dwarf_candidate_addresses(object_bytes)
         .into_iter()
         .find(|address| {
             perf_dwarf_frame_names_from_object_bytes(object_bytes, *address)
@@ -840,6 +840,10 @@ fn text_symbol_addresses(object_bytes: &[u8]) -> Vec<u64> {
 }
 
 fn generic_dwarf_name_candidate_addresses(object_bytes: &[u8]) -> Vec<u64> {
+    profiling_dwarf_candidate_addresses(object_bytes)
+}
+
+fn profiling_dwarf_candidate_addresses(object_bytes: &[u8]) -> Vec<u64> {
     text_symbol_addresses_matching_name(object_bytes, |name| {
         (name.contains("BTreeMap") && name.contains("insert"))
             || (name.contains("IntoIter") && name.contains("dying_next"))
