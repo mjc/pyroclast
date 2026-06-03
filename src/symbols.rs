@@ -2142,28 +2142,20 @@ fn rust_addr2line_frame_names(loader: &addr2line::Loader, address: u64) -> Optio
 
 #[must_use]
 pub fn perf_dwarf_frame_names_from_object(path: &Path, address: u64) -> Option<Vec<String>> {
-    PerfDwarfNameResolver::from_object(path)
+    let bytes = std::fs::read(path).ok()?;
+    PerfDwarfNameResolver::from_object_bytes_for_addresses(&bytes, &[address])
         .ok()?
         .frame_names(address)
 }
 
 #[must_use]
 pub fn perf_dwarf_frame_names_from_object_bytes(bytes: &[u8], address: u64) -> Option<Vec<String>> {
-    PerfDwarfNameResolver::from_object_bytes(bytes)
+    PerfDwarfNameResolver::from_object_bytes_for_addresses(bytes, &[address])
         .ok()?
         .frame_names(address)
 }
 
 impl PerfDwarfNameResolver {
-    fn from_object(path: &Path) -> Result<Self, gimli::Error> {
-        let bytes = std::fs::read(path).map_err(|_| gimli::Error::Io)?;
-        Self::from_object_bytes(&bytes)
-    }
-
-    fn from_object_bytes(bytes: &[u8]) -> Result<Self, gimli::Error> {
-        Self::from_object_bytes_matching_addresses(bytes, None)
-    }
-
     fn from_object_bytes_for_addresses(
         bytes: &[u8],
         addresses: &[u64],
