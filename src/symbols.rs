@@ -249,7 +249,7 @@ struct PreparedObjectMetadata {
 
 struct CachedObjectMetadata {
     object_metadata: PreparedObjectMetadata,
-    perf_dwarf: Option<PerfDwarfNameResolver>,
+    object_bytes: Arc<[u8]>,
 }
 
 #[derive(Default)]
@@ -499,7 +499,7 @@ impl RustAddr2lineResolver {
         let loaded = std::fs::read(path).ok().map(|bytes| {
             Arc::new(CachedObjectMetadata {
                 object_metadata: PreparedObjectMetadata::from_object_bytes(&bytes),
-                perf_dwarf: PerfDwarfNameResolver::from_object_bytes(&bytes).ok(),
+                object_bytes: bytes.into(),
             })
         });
 
@@ -563,7 +563,7 @@ where
         let loaded = std::fs::read(path).ok().map(|bytes| {
             Arc::new(CachedObjectMetadata {
                 object_metadata: PreparedObjectMetadata::from_object_bytes(&bytes),
-                perf_dwarf: PerfDwarfNameResolver::from_object_bytes(&bytes).ok(),
+                object_bytes: bytes.into(),
             })
         });
 
@@ -1557,6 +1557,17 @@ where
                 .collect::<Vec<_>>();
             let symbols = self.resolve_group_symbols(path, &grouped_requests)?;
             let object_metadata = self.object_metadata(path);
+            let perf_dwarf = object_metadata.as_ref().and_then(|metadata| {
+                let addresses = grouped_requests
+                    .iter()
+                    .map(|request| request.relative_address)
+                    .collect::<Vec<_>>();
+                PerfDwarfNameResolver::from_object_bytes_for_addresses(
+                    &metadata.object_bytes,
+                    &addresses,
+                )
+                .ok()
+            });
             for ((index, request), symbol) in indexes.into_iter().zip(grouped_requests).zip(symbols)
             {
                 let object_symbols =
@@ -1564,10 +1575,10 @@ where
                 let object_symbol = object_symbols.bare;
                 let has_base_symbol = object_symbol.is_some();
                 let mut frames = if let Some(object_symbol) = object_symbol {
-                    object_metadata
+                    perf_dwarf
                         .as_ref()
-                        .and_then(|metadata| {
-                            metadata.perf_dwarf.as_ref()?.frame_names_for_base_symbol(
+                        .and_then(|resolver| {
+                            resolver.frame_names_for_base_symbol(
                                 request.relative_address,
                                 Some(object_symbol),
                             )
@@ -1671,6 +1682,17 @@ impl SymbolResolver for RustAddr2lineResolver {
         for (path, indexes) in grouped_request_indexes(requests) {
             let path = Path::new(path);
             let object_metadata = self.object_metadata(path);
+            let perf_dwarf = object_metadata.as_ref().and_then(|metadata| {
+                let addresses = indexes
+                    .iter()
+                    .map(|index| requests[*index].relative_address)
+                    .collect::<Vec<_>>();
+                PerfDwarfNameResolver::from_object_bytes_for_addresses(
+                    &metadata.object_bytes,
+                    &addresses,
+                )
+                .ok()
+            });
             let mut loader = None;
             let mut loader_attempted = false;
             for index in indexes {
@@ -1680,10 +1702,10 @@ impl SymbolResolver for RustAddr2lineResolver {
                 let object_symbol = object_symbols.bare;
                 let has_base_symbol = object_symbol.is_some();
                 let mut frames = if let Some(object_symbol) = object_symbol {
-                    object_metadata
+                    perf_dwarf
                         .as_ref()
                         .and_then(|resolver| {
-                            resolver.perf_dwarf.as_ref()?.frame_names_for_base_symbol(
+                            resolver.frame_names_for_base_symbol(
                                 request.relative_address,
                                 Some(object_symbol),
                             )
@@ -2139,6 +2161,20 @@ impl PerfDwarfNameResolver {
     }
 
     fn from_object_bytes(bytes: &[u8]) -> Result<Self, gimli::Error> {
+        Self::from_object_bytes_matching_addresses(bytes, None)
+    }
+
+    fn from_object_bytes_for_addresses(
+        bytes: &[u8],
+        addresses: &[u64],
+    ) -> Result<Self, gimli::Error> {
+        Self::from_object_bytes_matching_addresses(bytes, Some(addresses))
+    }
+
+    fn from_object_bytes_matching_addresses(
+        bytes: &[u8],
+        addresses: Option<&[u64]>,
+    ) -> Result<Self, gimli::Error> {
         let object = object::File::parse(bytes).map_err(|_| gimli::Error::Io)?;
         let endian = if object.is_little_endian() {
             gimli::RunTimeEndian::Little
@@ -2162,9 +2198,15 @@ impl PerfDwarfNameResolver {
             let Ok(unit) = dwarf.unit(header) else {
                 continue;
             };
+            let ranges = perf_dwarf_ranges(dwarf.unit_ranges(&unit).ok());
+            if let Some(addresses) = addresses
+                && !perf_dwarf_unit_ranges_match_addresses(ranges.as_deref(), addresses)
+            {
+                continue;
+            }
             let roots = perf_dwarf_unit_roots(&dwarf, &unit, &mut names);
             units.push(PerfDwarfUnitIndex {
-                ranges: perf_dwarf_ranges(dwarf.unit_ranges(&unit).ok()),
+                ranges,
                 segments: perf_dwarf_frame_ranges_from_roots(&roots),
             });
         }
@@ -2195,6 +2237,17 @@ impl PerfDwarfNameResolver {
         }
         None
     }
+}
+
+fn perf_dwarf_unit_ranges_match_addresses(
+    ranges: Option<&[PerfAddressRange]>,
+    addresses: &[u64],
+) -> bool {
+    ranges.is_none_or(|ranges| {
+        addresses
+            .iter()
+            .any(|address| perf_dwarf_ranges_contain(ranges, *address))
+    })
 }
 
 fn perf_dwarf_unit_roots<R>(
