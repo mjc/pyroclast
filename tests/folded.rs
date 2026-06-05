@@ -46,6 +46,22 @@ fn renders_inferno_perf_tidy_generic_names() {
     );
 }
 
+#[test]
+fn renders_inferno_perf_partially_demangled_rust_symbols() {
+    let stack = render_inferno_perf_folded_stack(
+        [
+            "_$LT$std..fs..ReadDir$u20$as$u20$core..iter..traits..iterator..Iterator$GT$::next::hc14f1750ca79129b",
+            "_$LT$$RF$std..fs..File$u20$as$u20$std..io..Read$GT$::read::h5d84059cf335c8e6",
+        ],
+        2,
+    );
+
+    assert_eq!(
+        stack,
+        "<std::fs::ReadDir as core::iter::traits::iterator::Iterator>::next;<&std::fs::File as std::io::Read>::read 2",
+    );
+}
+
 proptest! {
     #[test]
     fn escaping_frames_removes_newlines_and_only_keeps_escaped_semicolons(frame in arbitrary_frame()) {

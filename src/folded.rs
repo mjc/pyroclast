@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::Write;
 
 #[must_use]
@@ -69,7 +70,8 @@ pub(crate) fn append_inferno_perf_raw_function(
     if frame.starts_with('(') {
         return;
     }
-    for (index, part) in frame.split("->").enumerate() {
+    let fixed_frame = fix_partially_demangled_rust_symbol(frame);
+    for (index, part) in fixed_frame.as_ref().split("->").enumerate() {
         append_separator(rendered);
         tidy_inferno_perf_generic_into(scratch, part);
         if index > 0 && !scratch.contains("_[i]") {
@@ -77,6 +79,83 @@ pub(crate) fn append_inferno_perf_raw_function(
         }
         escape_frame_into(rendered, scratch);
     }
+}
+
+fn fix_partially_demangled_rust_symbol(symbol: &str) -> Cow<'_, str> {
+    const RUST_HASH_LENGTH: usize = 17;
+
+    let is_rust_hash =
+        |value: &str| value.starts_with('h') && value[1..].chars().all(|c| c.is_ascii_hexdigit());
+
+    if symbol.len() < RUST_HASH_LENGTH || !is_rust_hash(&symbol[symbol.len() - RUST_HASH_LENGTH..])
+    {
+        return Cow::Borrowed(symbol);
+    }
+
+    let mut rest = &symbol[..symbol.len() - RUST_HASH_LENGTH];
+    if rest.ends_with("::") {
+        rest = &rest[..rest.len() - 2];
+    }
+    if rest.starts_with("_$") {
+        rest = &rest[1..];
+    }
+
+    let mut demangled = String::new();
+    while !rest.is_empty() {
+        if let Some(after_dot) = rest.strip_prefix('.') {
+            if let Some(after_double_dot) = after_dot.strip_prefix('.') {
+                demangled.push_str("::");
+                rest = after_double_dot;
+            } else {
+                demangled.push('.');
+                rest = after_dot;
+            }
+        } else if rest.starts_with('$') {
+            if let Some((encoded, decoded)) = rust_symbol_escape(rest) {
+                demangled.push_str(decoded);
+                rest = &rest[encoded.len()..];
+            } else {
+                demangled.push_str(rest);
+                break;
+            }
+        } else {
+            let next_escape = rest
+                .char_indices()
+                .find(|&(_, character)| character == '$' || character == '.')
+                .map_or(rest.len(), |(index, _)| index);
+            demangled.push_str(&rest[..next_escape]);
+            rest = &rest[next_escape..];
+        }
+    }
+
+    Cow::Owned(demangled)
+}
+
+fn rust_symbol_escape(rest: &str) -> Option<(&'static str, &'static str)> {
+    [
+        ("$SP$", "@"),
+        ("$BP$", "*"),
+        ("$RF$", "&"),
+        ("$LT$", "<"),
+        ("$GT$", ">"),
+        ("$LP$", "("),
+        ("$RP$", ")"),
+        ("$C$", ","),
+        ("$u7e$", "~"),
+        ("$u20$", " "),
+        ("$u27$", "'"),
+        ("$u3d$", "="),
+        ("$u5b$", "["),
+        ("$u5d$", "]"),
+        ("$u7b$", "{"),
+        ("$u7d$", "}"),
+        ("$u3b$", ";"),
+        ("$u2b$", "+"),
+        ("$u21$", "!"),
+        ("$u22$", "\""),
+    ]
+    .into_iter()
+    .find(|(encoded, _)| rest.starts_with(encoded))
 }
 
 pub(crate) fn append_inferno_perf_folded_label(rendered: &mut String, frame: &str) {
