@@ -2933,6 +2933,9 @@ fn unwind_object_frame_addresses_like_perf(
         stack_bytes,
         use_libdw_arch_fallback,
     );
+    let raw_frames = truncate_syscall_return_unwind_after_first_executable_frame(
+        raw_frames, pid, mmap_table, context,
+    );
     let maybe_inline_current_ip = should_salvage_inline_current_ip_after_empty_object_unwind(
         raw_frames.is_empty(),
         object_unwind.framehop_frame_count,
@@ -2959,6 +2962,41 @@ fn libdw_arch_fallback_after_empty_object_unwind(
     } else {
         raw_frames
     }
+}
+
+fn truncate_syscall_return_unwind_after_first_executable_frame(
+    mut raw_frames: Vec<u64>,
+    pid: Option<u32>,
+    mmap_table: &MmapTable,
+    context: UserUnwindContext,
+) -> Vec<u64> {
+    if context.callchain != SampleCallchainState::KernelWithCallchain
+        || !context.syscall_return_state
+    {
+        return raw_frames;
+    }
+    let Some(pid) = pid else {
+        return raw_frames;
+    };
+
+    let mut saw_shared_object_frame = false;
+    let mut mapping_cache = MappingResolveCache::default();
+    for (index, address) in raw_frames.iter().enumerate() {
+        let Some(mapping) = mmap_table.resolve_ref_cached(pid, *address, &mut mapping_cache) else {
+            continue;
+        };
+        if is_shared_object_mapping_path(mapping.path) {
+            saw_shared_object_frame = true;
+        } else if saw_shared_object_frame {
+            // perf's libdw path accepts this executable callback frame and then
+            // stops when unwinding that frame fails. In the octo trace, perf -v
+            // logs "no map for 3291a" after the executable frame and does not
+            // emit framehop's deeper Rust callers.
+            raw_frames.truncate(index + 1);
+            break;
+        }
+    }
+    raw_frames
 }
 
 fn should_use_libdw_arch_fallback_after_empty_object_unwind(
@@ -3438,6 +3476,23 @@ mod tests {
                 requests.len()
             ])
         }
+    }
+
+    fn insert_test_mapping(
+        mmap_table: &mut super::MmapTable,
+        pid: u32,
+        start: u64,
+        len: u64,
+        path: &str,
+    ) {
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid,
+            tid: pid,
+            start,
+            len,
+            pgoff: 0,
+            path: path.to_string(),
+        });
     }
 
     #[derive(Default)]
@@ -4431,6 +4486,95 @@ mod tests {
             ),
             vec![0x7fff_f7ea_3f4b, 0x5555_5578_8ba4, 0x5555_5578_8ba5]
         );
+    }
+
+    #[test]
+    fn syscall_return_kernel_unwind_stops_after_first_executable_frame_like_perf_libdw() {
+        // perf -v for the octo trace accepts libc syscall frames and the first
+        // executable callback frame. It then logs "no map for 3291a" and does
+        // not emit framehop's deeper executable callers.
+        let mut mmap_table = super::MmapTable::default();
+        insert_test_mapping(
+            &mut mmap_table,
+            11,
+            0x7fff_f7d8_2000,
+            0x0020_b000,
+            "/nix/store/glibc/lib/libc.so.6",
+        );
+        insert_test_mapping(
+            &mut mmap_table,
+            11,
+            0x5555_5555_4000,
+            0x0040_0000,
+            "/home/mjc/projects/pyroclast/target/profiling/pyroclast",
+        );
+
+        let frames = super::truncate_syscall_return_unwind_after_first_executable_frame(
+            vec![
+                0x7fff_f7e1_c03e,
+                0x7fff_f7e1_c083,
+                0x7fff_f7e9_9d7d,
+                0x5555_557d_c17e,
+                0x5555_557f_587a,
+                0x5555_5577_6369,
+            ],
+            Some(11),
+            &mmap_table,
+            super::UserUnwindContext {
+                callchain: super::SampleCallchainState::KernelWithCallchain,
+                initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
+                initial_ip_is_dso: true,
+                module_count: 2,
+                frame_pointer_at_or_above_stack_pointer: true,
+                syscall_return_state: true,
+            },
+        );
+
+        assert_eq!(
+            frames,
+            vec![
+                0x7fff_f7e1_c03e,
+                0x7fff_f7e1_c083,
+                0x7fff_f7e9_9d7d,
+                0x5555_557d_c17e,
+            ]
+        );
+    }
+
+    #[test]
+    fn non_syscall_kernel_unwind_keeps_executable_tail() {
+        let mut mmap_table = super::MmapTable::default();
+        insert_test_mapping(
+            &mut mmap_table,
+            11,
+            0x7fff_f7d8_2000,
+            0x0020_b000,
+            "/nix/store/glibc/lib/libc.so.6",
+        );
+        insert_test_mapping(
+            &mut mmap_table,
+            11,
+            0x5555_5555_4000,
+            0x0040_0000,
+            "/home/mjc/projects/pyroclast/target/profiling/pyroclast",
+        );
+        let frames = vec![0x7fff_f7e1_c03e, 0x5555_557d_c17e, 0x5555_557f_587a];
+
+        let actual = super::truncate_syscall_return_unwind_after_first_executable_frame(
+            frames.clone(),
+            Some(11),
+            &mmap_table,
+            super::UserUnwindContext {
+                callchain: super::SampleCallchainState::KernelWithCallchain,
+                initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
+                initial_ip_is_dso: true,
+                module_count: 2,
+                frame_pointer_at_or_above_stack_pointer: true,
+                syscall_return_state: false,
+            },
+        );
+
+        assert_eq!(actual, frames);
     }
 
     #[test]
