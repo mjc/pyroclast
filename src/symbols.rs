@@ -122,6 +122,19 @@ pub trait SymbolResolver {
                 .collect()
         })
     }
+
+    /// Resolves a batch to only the base object symbol frame perf would use
+    /// before expanding inline frames.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backing symbolizer cannot complete the batch.
+    fn resolve_base_frame_batch_with_metadata(
+        &self,
+        requests: &[SymbolRequest],
+    ) -> Result<Vec<ResolvedSymbolFrames>, String> {
+        self.resolve_frame_batch_with_metadata(requests)
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -150,6 +163,7 @@ pub struct SymbolFrameCache<'a, R> {
     resolver: &'a R,
     resolved: FxHashMap<SymbolRequest, Vec<String>>,
     resolved_by_mapping: FxHashMap<MappingFrameKey, CachedMappingFrames>,
+    resolved_base_by_mapping: FxHashMap<MappingFrameKey, CachedMappingFrames>,
     scratch_seen_mapping: FxHashSet<MappingFrameKey>,
     scratch_missing_keys: Vec<MappingFrameKey>,
     scratch_missing_requests: Vec<SymbolRequest>,
@@ -939,6 +953,7 @@ where
             resolver,
             resolved: FxHashMap::default(),
             resolved_by_mapping: FxHashMap::default(),
+            resolved_base_by_mapping: FxHashMap::default(),
             scratch_seen_mapping: FxHashSet::default(),
             scratch_missing_keys: Vec::new(),
             scratch_missing_requests: Vec::new(),
@@ -1023,13 +1038,90 @@ where
         mapping: &ResolvedMappingRef<'_>,
     ) -> Result<Option<&[String]>, String> {
         let key = mapping_frame_key(mapping);
-        if !self.resolved_by_mapping.contains_key(&key) {
-            self.prefetch_mapping_refs(std::slice::from_ref(mapping))?;
+        if !self.resolved_base_by_mapping.contains_key(&key) {
+            self.prefetch_base_mapping_refs(std::slice::from_ref(mapping))?;
         }
-        self.resolved_by_mapping
+        self.resolved_base_by_mapping
             .get(&key)
             .map(|cached| cached.has_base_symbol.then_some(cached.frames.as_slice()))
             .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())
+    }
+
+    /// Resolves many borrowed perfdata mappings to base symbols only.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backing resolver fails or returns the wrong
+    /// number of results.
+    pub fn prefetch_base_mapping_refs(
+        &mut self,
+        mappings: &[ResolvedMappingRef<'_>],
+    ) -> Result<(), String> {
+        let mut seen = std::mem::take(&mut self.scratch_seen_mapping);
+        let mut missing_keys = std::mem::take(&mut self.scratch_missing_keys);
+        let mut missing_requests = std::mem::take(&mut self.scratch_missing_requests);
+        let mut missing_fallbacks = std::mem::take(&mut self.scratch_missing_fallbacks);
+        seen.clear();
+        missing_keys.clear();
+        missing_requests.clear();
+        missing_fallbacks.clear();
+
+        let result = (|| {
+            seen.reserve(mappings.len());
+            missing_keys.reserve(mappings.len());
+            missing_requests.reserve(mappings.len());
+            missing_fallbacks.reserve(mappings.len());
+            for mapping in mappings {
+                let key = mapping_frame_key(mapping);
+                if self.resolved_base_by_mapping.contains_key(&key) || !seen.insert(key) {
+                    continue;
+                }
+                missing_keys.push(key);
+                missing_requests.push(symbol_request_from_mapping_ref(mapping));
+                let fallback_frame = mapping_fallback_frame(mapping);
+                missing_fallbacks.push(render_inferno_perf_folded_label(fallback_frame.as_str()));
+            }
+            if missing_requests.is_empty() {
+                return Ok(());
+            }
+            let resolved = self
+                .resolver
+                .resolve_base_frame_batch_with_metadata(&missing_requests)?;
+            if resolved.len() != missing_requests.len() {
+                return Err(format!(
+                    "symbol resolver returned {} base frame results for {} requests",
+                    resolved.len(),
+                    missing_requests.len()
+                ));
+            }
+            self.resolved_base_by_mapping.reserve(missing_keys.len());
+            for ((key, fallback_rendered), resolved_frames) in missing_keys
+                .drain(..)
+                .zip(missing_fallbacks.drain(..))
+                .zip(resolved)
+            {
+                let folded_rendered = if resolved_frames.frames.is_empty() {
+                    fallback_rendered
+                } else {
+                    render_inferno_perf_raw_stack(resolved_frames.frames.iter().map(String::as_str))
+                };
+                self.resolved_base_by_mapping.insert(
+                    key,
+                    CachedMappingFrames {
+                        frames: resolved_frames.frames,
+                        folded_rendered,
+                        has_base_symbol: resolved_frames.has_base_symbol,
+                    },
+                );
+            }
+            Ok(())
+        })();
+
+        self.scratch_seen_mapping = seen;
+        self.scratch_missing_keys = missing_keys;
+        self.scratch_missing_requests = missing_requests;
+        self.scratch_missing_fallbacks = missing_fallbacks;
+        result
     }
 
     /// Resolves many object-relative addresses to frame lists, batching cache misses.
@@ -1292,6 +1384,65 @@ where
             let user_frames = self
                 .object_resolver
                 .resolve_frame_batch_with_metadata(&user_requests)?;
+            for (index, frames) in user_indexes.into_iter().zip(user_frames) {
+                resolved[index] = frames;
+            }
+        }
+        Ok(resolved)
+    }
+
+    fn resolve_base_frame_batch_with_metadata(
+        &self,
+        requests: &[SymbolRequest],
+    ) -> Result<Vec<ResolvedSymbolFrames>, String> {
+        let mut resolved = vec![ResolvedSymbolFrames::default(); requests.len()];
+        let mut kernel_elf_requests = Vec::new();
+        let mut kernel_elf_indexes = Vec::new();
+        let mut user_requests = Vec::new();
+        let mut user_indexes = Vec::new();
+        let mut address_cache = ObjectAddressCache::default();
+
+        for (index, request) in requests.iter().enumerate() {
+            if is_kernel_module_symbol_path(&request.path) {
+                if let Some(object_request) =
+                    self.cached_object_symbol_request(request, &mut address_cache)
+                {
+                    user_indexes.push(index);
+                    user_requests.push(object_request);
+                } else if let Some(symbol) = self.resolve_kernel_symbol(request) {
+                    resolved[index] = ResolvedSymbolFrames::from_frames(vec![symbol]);
+                }
+            } else if is_kernel_symbol_path(&request.path) {
+                if let Some(symbol) = self.resolve_kernel_symbol(request) {
+                    resolved[index] = ResolvedSymbolFrames::from_frames(vec![symbol]);
+                } else if let Some(kernel_elf) = &self.kernel_elf {
+                    kernel_elf_indexes.push(index);
+                    kernel_elf_requests.push(clean_object_symbol_request_with_cache(
+                        kernel_elf.clone(),
+                        request.relative_address,
+                        &mut address_cache,
+                    ));
+                }
+            } else {
+                let object_request = self.object_symbol_request(request, &mut address_cache);
+                user_indexes.push(index);
+                user_requests.push(object_request);
+            }
+        }
+
+        if !kernel_elf_requests.is_empty() {
+            let kernel_frames = self
+                .object_resolver
+                .resolve_base_frame_batch_with_metadata(&kernel_elf_requests)?;
+            for (index, frames) in kernel_elf_indexes.into_iter().zip(kernel_frames) {
+                resolved[index] = frames;
+            }
+        }
+
+        if !user_requests.is_empty() {
+            let user_frames = self
+                .object_resolver
+                .resolve_base_frame_batch_with_metadata(&user_requests)?;
             for (index, frames) in user_indexes.into_iter().zip(user_frames) {
                 resolved[index] = frames;
             }
@@ -1600,6 +1751,15 @@ where
         }
         Ok(resolved)
     }
+
+    fn resolve_base_frame_batch_with_metadata(
+        &self,
+        requests: &[SymbolRequest],
+    ) -> Result<Vec<ResolvedSymbolFrames>, String> {
+        Ok(resolve_base_frames_from_object_metadata(requests, |path| {
+            self.object_metadata(path)
+        }))
+    }
 }
 
 impl<R> SymbolResolver for SelectedObjectResolver<'_, R>
@@ -1627,6 +1787,18 @@ where
         match self {
             Self::Addr2line(resolver) => resolver.resolve_frame_batch_with_metadata(requests),
             Self::RustAddr2line(resolver) => resolver.resolve_frame_batch_with_metadata(requests),
+        }
+    }
+
+    fn resolve_base_frame_batch_with_metadata(
+        &self,
+        requests: &[SymbolRequest],
+    ) -> Result<Vec<ResolvedSymbolFrames>, String> {
+        match self {
+            Self::Addr2line(resolver) => resolver.resolve_base_frame_batch_with_metadata(requests),
+            Self::RustAddr2line(resolver) => {
+                resolver.resolve_base_frame_batch_with_metadata(requests)
+            }
         }
     }
 }
@@ -1742,6 +1914,51 @@ impl SymbolResolver for RustAddr2lineResolver {
         }
         Ok(resolved)
     }
+
+    fn resolve_base_frame_batch_with_metadata(
+        &self,
+        requests: &[SymbolRequest],
+    ) -> Result<Vec<ResolvedSymbolFrames>, String> {
+        Ok(resolve_base_frames_from_object_metadata(requests, |path| {
+            self.object_metadata(path)
+        }))
+    }
+}
+
+fn resolve_base_frames_from_object_metadata(
+    requests: &[SymbolRequest],
+    object_metadata: impl Fn(&Path) -> Option<Arc<CachedObjectMetadata>>,
+) -> Vec<ResolvedSymbolFrames> {
+    let mut resolved = vec![ResolvedSymbolFrames::default(); requests.len()];
+    for (path, indexes) in grouped_request_indexes(requests) {
+        let path = Path::new(path);
+        let metadata = object_metadata(path);
+        for index in indexes {
+            let request = &requests[index];
+            let object_symbols =
+                object_symbols_for_frame(metadata.as_ref(), request.relative_address);
+            let Some(object_symbol) = object_symbols.bare else {
+                continue;
+            };
+            let mut frames = vec![object_symbol.to_string()];
+            frames = perf_frames_with_object_alias_and_offset(
+                frames,
+                Some(object_symbol),
+                object_symbols.with_offset.as_deref(),
+            );
+            if let Some(metadata) = &metadata {
+                specialize_frames_from_debug_strings(
+                    &mut frames,
+                    &metadata.object_metadata.debug_names,
+                );
+            }
+            resolved[index] = ResolvedSymbolFrames {
+                frames,
+                has_base_symbol: true,
+            };
+        }
+    }
+    resolved
 }
 
 fn demangle_addr2line_name(name: &str) -> String {

@@ -1859,8 +1859,7 @@ fn prefetch_symbols<R>(
 where
     R: SymbolResolver,
 {
-    let mut mappings = Vec::new();
-    let mut seen = HashSet::with_hasher(FxBuildHasher);
+    let mut batches = SymbolPrefetchBatches::new();
     let mut callchain = Vec::new();
     let mut mapping_cache = MappingResolveCache::default();
     for stack in raw_stacks {
@@ -1869,17 +1868,24 @@ where
             stack.callchain(&mut callchain),
             mmap_table,
             &mut mapping_cache,
-            &mut mappings,
-            &mut seen,
+            &mut batches,
         );
-        if mappings.len() >= PREFETCH_SYMBOL_REQUEST_BATCH_SIZE {
-            symbol_cache.prefetch_mapping_refs(&mappings)?;
-            mappings.clear();
-            seen.clear();
+        if batches.full_mappings.len() >= PREFETCH_SYMBOL_REQUEST_BATCH_SIZE {
+            symbol_cache.prefetch_mapping_refs(&batches.full_mappings)?;
+            batches.full_mappings.clear();
+            batches.seen_full.clear();
+        }
+        if batches.base_mappings.len() >= PREFETCH_SYMBOL_REQUEST_BATCH_SIZE {
+            symbol_cache.prefetch_base_mapping_refs(&batches.base_mappings)?;
+            batches.base_mappings.clear();
+            batches.seen_base.clear();
         }
     }
-    if !mappings.is_empty() {
-        symbol_cache.prefetch_mapping_refs(&mappings)?;
+    if !batches.full_mappings.is_empty() {
+        symbol_cache.prefetch_mapping_refs(&batches.full_mappings)?;
+    }
+    if !batches.base_mappings.is_empty() {
+        symbol_cache.prefetch_base_mapping_refs(&batches.base_mappings)?;
     }
     Ok(())
 }
@@ -1955,26 +1961,47 @@ where
         .map_err(|error| format!("failed to write folded output: {error}"))
 }
 
+struct SymbolPrefetchBatches<'a> {
+    full_mappings: Vec<ResolvedMappingRef<'a>>,
+    base_mappings: Vec<ResolvedMappingRef<'a>>,
+    seen_full: HashSet<PrefetchMappingKey, FxBuildHasher>,
+    seen_base: HashSet<PrefetchMappingKey, FxBuildHasher>,
+}
+
+impl SymbolPrefetchBatches<'_> {
+    fn new() -> Self {
+        Self {
+            full_mappings: Vec::new(),
+            base_mappings: Vec::new(),
+            seen_full: HashSet::with_hasher(FxBuildHasher),
+            seen_base: HashSet::with_hasher(FxBuildHasher),
+        }
+    }
+}
+
 fn extend_symbol_mappings_for_stack<'a>(
     pid: Option<u32>,
     callchain: &[FoldFrame],
     mmap_table: &'a MmapTable,
     mapping_cache: &mut MappingResolveCache,
-    mappings: &mut Vec<ResolvedMappingRef<'a>>,
-    seen: &mut HashSet<PrefetchMappingKey, FxBuildHasher>,
+    batches: &mut SymbolPrefetchBatches<'a>,
 ) {
     for frame in callchain {
-        let frame = frame.address();
+        let address = frame.address();
         if let Some(mapping) = pid
-            .and_then(|pid| mmap_table.resolve_ref_cached(pid, frame, mapping_cache))
-            .filter(|mapping| !is_kernel_space_frame(frame) || is_kernel_mapping_ref(mapping))
+            .and_then(|pid| mmap_table.resolve_ref_cached(pid, address, mapping_cache))
+            .filter(|mapping| !is_kernel_space_frame(address) || is_kernel_mapping_ref(mapping))
         {
             let key = PrefetchMappingKey {
                 symbol_source_id: mapping.symbol_source_id,
                 relative_address: mapping.relative_address,
             };
-            if seen.insert(key) {
-                mappings.push(mapping);
+            if matches!(frame, FoldFrame::InlineCurrentIp(_)) {
+                if batches.seen_base.insert(key) {
+                    batches.base_mappings.push(mapping);
+                }
+            } else if batches.seen_full.insert(key) {
+                batches.full_mappings.push(mapping);
             }
         }
     }
@@ -2265,9 +2292,6 @@ impl<'a> FoldFrameResolver<'a> {
         let Some(frames) = cache.resolve_mapping_ref_with_base_symbol(&mapping)? else {
             return Ok(None);
         };
-        if frames.len() <= 1 {
-            return Ok(None);
-        }
         Ok(Some(frames))
     }
 
@@ -2975,9 +2999,9 @@ fn should_salvage_inline_current_ip_after_empty_object_unwind(
     context: UserUnwindContext,
 ) -> bool {
     raw_object_unwind_is_empty
-        && raw_object_unwind_frame_count > 1
         && context.initial_ip_mapping == InitialIpMappingState::RecordedMappingLoaded
         && context.module_count > 0
+        && raw_object_unwind_frame_count > 1
 }
 
 fn choose_user_unwind_source(context: UserUnwindContext) -> UserUnwindSource {
@@ -3361,6 +3385,8 @@ fn read_sample_u64(payload: &[u8], offset: usize) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use crate::perfdata::mappings::FileIdentity;
     use crate::perfdata::unwind::{UserStackUnwindResult, UserStackUnwinder};
     use crate::symbols::{ResolvedSymbolFrames, SymbolFrameCache, SymbolRequest, SymbolResolver};
@@ -3411,6 +3437,50 @@ mod tests {
                 };
                 requests.len()
             ])
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingFrameResolver {
+        full_requests: RefCell<Vec<u64>>,
+        base_requests: RefCell<Vec<u64>>,
+    }
+
+    impl RecordingFrameResolver {
+        fn resolved_for(requests: &[SymbolRequest]) -> Vec<ResolvedSymbolFrames> {
+            requests
+                .iter()
+                .map(|request| ResolvedSymbolFrames {
+                    frames: vec![format!("symbol_{:x}", request.relative_address)],
+                    has_base_symbol: true,
+                })
+                .collect()
+        }
+    }
+
+    impl SymbolResolver for RecordingFrameResolver {
+        fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
+            Ok(vec![None; requests.len()])
+        }
+
+        fn resolve_frame_batch_with_metadata(
+            &self,
+            requests: &[SymbolRequest],
+        ) -> Result<Vec<ResolvedSymbolFrames>, String> {
+            self.full_requests
+                .borrow_mut()
+                .extend(requests.iter().map(|request| request.relative_address));
+            Ok(Self::resolved_for(requests))
+        }
+
+        fn resolve_base_frame_batch_with_metadata(
+            &self,
+            requests: &[SymbolRequest],
+        ) -> Result<Vec<ResolvedSymbolFrames>, String> {
+            self.base_requests
+                .borrow_mut()
+                .extend(requests.iter().map(|request| request.relative_address));
+            Ok(Self::resolved_for(requests))
         }
     }
 
@@ -3610,6 +3680,38 @@ mod tests {
     }
 
     #[test]
+    fn empty_callchain_sample_without_accepted_frame_does_not_prove_libdw_initial_callback() {
+        // tools/perf/util/machine.c calls thread__resolve_callchain_unwind()
+        // when PERF_SAMPLE_REGS_USER and PERF_SAMPLE_STACK_USER are present,
+        // even if the PERF_SAMPLE_CALLCHAIN payload has no recorded frames.
+        // That is not enough to prove perf's libdw frame_callback accepted
+        // the initial frame; real perf.data files contain blank events with
+        // the same high-level shape.
+        let mut regs = test_regs(0x5555_5567_a0be);
+        regs.sp = 0x7fff_ffff_9030;
+        regs.bp = 0;
+
+        assert!(
+            !super::should_salvage_inline_current_ip_after_empty_object_unwind(
+                true,
+                0,
+                &regs,
+                super::UserUnwindContext {
+                    callchain: super::SampleCallchainState::Other {
+                        has_callchain: true,
+                        has_frames: false,
+                    },
+                    initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
+                    initial_ip_is_dso: false,
+                    module_count: 1,
+                    frame_pointer_at_or_above_stack_pointer: false,
+                    syscall_return_state: false,
+                },
+            )
+        );
+    }
+
+    #[test]
     fn single_synthetic_framehop_frame_does_not_salvage_inline_current_ip_like_blank_perf_libdw() {
         // Real period 4703553 from
         // target/profiling-runs/octo-symbolized-fold-final/profile.raw.perf.data:
@@ -3727,6 +3829,42 @@ mod tests {
             .expect("render folded stack");
 
         assert_eq!(buffers.rendered, "");
+    }
+
+    #[test]
+    fn inline_current_ip_with_base_symbol_renders_single_frame_like_perf_unwind_entry() {
+        // tools/perf/util/machine.c unwind_entry() calls append_inlines(); when
+        // no inline chain is appended it still appends the current map_symbol.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x5555_5567_0000,
+            len: 0x10_0000,
+            pgoff: 0,
+            path: "/bin/pyroclast".to_string(),
+        });
+        let resolver = StaticFrameResolver {
+            frames: vec!["core::num::flt2dec::strategy::dragon::format_shortest".to_string()],
+            has_base_symbol: true,
+        };
+        let mut symbol_cache = SymbolFrameCache::new(&resolver);
+        let mut buffers = super::FoldedRenderBuffers::default();
+
+        super::FoldFrameResolver::new(&mmap_table)
+            .render_folded_stack_for_stack(
+                Some(11),
+                Some("pyroclast"),
+                &[super::FoldFrame::InlineCurrentIp(0x5555_5567_a0be)],
+                Some(&mut symbol_cache),
+                &mut buffers,
+            )
+            .expect("render folded stack");
+
+        assert_eq!(
+            buffers.rendered,
+            "pyroclast;core::num::flt2dec::strategy::dragon::format_shortest"
+        );
     }
 
     #[test]
@@ -3917,8 +4055,7 @@ mod tests {
         });
 
         let mut mapping_cache = super::MappingResolveCache::default();
-        let mut mappings = Vec::new();
-        let mut seen = hashbrown::HashSet::with_hasher(rustc_hash::FxBuildHasher);
+        let mut batches = super::SymbolPrefetchBatches::new();
         let callchain = [
             super::FoldFrame::Callchain(0x1010),
             super::FoldFrame::Callchain(0x1020),
@@ -3929,21 +4066,55 @@ mod tests {
             &callchain,
             &mmap_table,
             &mut mapping_cache,
-            &mut mappings,
-            &mut seen,
+            &mut batches,
         );
         super::extend_symbol_mappings_for_stack(
             Some(11),
             &callchain,
             &mmap_table,
             &mut mapping_cache,
-            &mut mappings,
-            &mut seen,
+            &mut batches,
         );
 
-        assert_eq!(mappings.len(), 2);
-        assert_eq!(mappings[0].relative_address, 0x10);
-        assert_eq!(mappings[1].relative_address, 0x20);
+        assert_eq!(batches.full_mappings.len(), 2);
+        assert_eq!(batches.full_mappings[0].relative_address, 0x10);
+        assert_eq!(batches.full_mappings[1].relative_address, 0x20);
+        assert!(batches.base_mappings.is_empty());
+    }
+
+    #[test]
+    fn prefetch_symbols_batches_inline_current_ip_as_base_symbol_only() {
+        // perf's libdw path emits the initial frame as a map symbol before any
+        // inline expansion. Prefetching InlineCurrentIp through the full DWARF
+        // frame path repeats expensive object work on large perf.data files.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x1000,
+            len: 0x1000,
+            pgoff: 0,
+            path: "/bin/demo".to_string(),
+        });
+        let mut raw_stacks = crate::perfdata::raw_stack::RawStackAccumulator::new();
+        raw_stacks.add_vec_with_comm(
+            Some(11),
+            Some("demo".to_string()),
+            vec![
+                super::FoldFrame::UserUnwind(0x1010),
+                super::FoldFrame::InlineCurrentIp(0x1020),
+            ],
+            1,
+        );
+        let entries = raw_stacks.sorted_entries();
+        let resolver = RecordingFrameResolver::default();
+        let mut symbol_cache = SymbolFrameCache::new(&resolver);
+
+        super::prefetch_symbols(&entries, &mmap_table, &mut symbol_cache)
+            .expect("prefetch folded stack symbols");
+
+        assert_eq!(*resolver.full_requests.borrow(), vec![0x10]);
+        assert_eq!(*resolver.base_requests.borrow(), vec![0x20]);
     }
 
     #[test]
