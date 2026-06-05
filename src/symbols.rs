@@ -2497,6 +2497,12 @@ fn perf_dwarf_collect_relevant_nodes<R>(
         gimli::DW_TAG_inlined_subroutine => Some(PerfDwarfDieKind::Inline),
         _ => None,
     };
+    let collect_children = match kind {
+        Some(PerfDwarfDieKind::Subprogram | PerfDwarfDieKind::Inline) => {
+            perf_dwarf_collect_inline_children
+        }
+        None => perf_dwarf_collect_relevant_nodes,
+    };
     let ranges = kind
         .map(|_| perf_dwarf_ranges(dwarf.die_ranges(unit, node.entry()).ok()).unwrap_or_default());
     let name = kind.and_then(|_| {
@@ -2507,7 +2513,7 @@ fn perf_dwarf_collect_relevant_nodes<R>(
         let mut children = Vec::new();
         let mut child_iter = node.children();
         while let Ok(Some(child)) = child_iter.next() {
-            perf_dwarf_collect_relevant_nodes(dwarf, unit, child, names, &mut children);
+            collect_children(dwarf, unit, child, names, &mut children);
         }
         out.push(PerfDwarfDieNode {
             kind,
@@ -2519,8 +2525,23 @@ fn perf_dwarf_collect_relevant_nodes<R>(
     }
     let mut child_iter = node.children();
     while let Ok(Some(child)) = child_iter.next() {
-        perf_dwarf_collect_relevant_nodes(dwarf, unit, child, names, out);
+        collect_children(dwarf, unit, child, names, out);
     }
+}
+
+fn perf_dwarf_collect_inline_children<R>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    node: gimli::EntriesTreeNode<'_, '_, R>,
+    names: &mut PerfDwarfNameInterner,
+    out: &mut Vec<PerfDwarfDieNode>,
+) where
+    R: gimli::Reader,
+{
+    if node.entry().tag() == gimli::DW_TAG_subprogram {
+        return;
+    }
+    perf_dwarf_collect_relevant_nodes(dwarf, unit, node, names, out);
 }
 
 fn perf_dwarf_ranges<R>(ranges: Option<gimli::RangeIter<R>>) -> Option<Vec<PerfAddressRange>>
@@ -2571,6 +2592,9 @@ fn perf_dwarf_collect_frame_ranges(
 
     let mut child_coverage = Vec::new();
     for child in &node.children {
+        if child.kind == PerfDwarfDieKind::Subprogram {
+            continue;
+        }
         child_coverage.extend(perf_dwarf_collect_frame_ranges(
             child, &frames, out, next_order,
         ));
@@ -3455,6 +3479,48 @@ mod tests {
         assert_eq!(
             perf_dwarf_frame_names_from_index(&segments, &names.names, 20, Some("outer")),
             Some(vec!["first".to_string(), "outer".to_string()])
+        );
+    }
+
+    #[test]
+    fn flattened_dwarf_ranges_do_not_treat_nested_subprograms_as_inline_frames_like_perf() {
+        // perf util/dwarf-aux.c cu_walk_functions_at() chooses one
+        // DW_TAG_subprogram with die_find_realfunc(), then subsequent
+        // die_find_child() searches only accept DW_TAG_inlined_subroutine.
+        // A nested DW_TAG_subprogram must not become part of the inline chain.
+        let mut names = PerfDwarfNameInterner::default();
+        let segments = perf_dwarf_frame_ranges_from_roots(&[PerfDwarfDieNode {
+            kind: PerfDwarfDieKind::Subprogram,
+            ranges: vec![test_range(0, 100)],
+            name: Some(names.intern("outer".to_string())),
+            children: vec![
+                PerfDwarfDieNode {
+                    kind: PerfDwarfDieKind::Subprogram,
+                    ranges: vec![test_range(10, 90)],
+                    name: Some(names.intern("nested_subprogram".to_string())),
+                    children: vec![PerfDwarfDieNode {
+                        kind: PerfDwarfDieKind::Inline,
+                        ranges: vec![test_range(20, 30)],
+                        name: Some(names.intern("nested_inline".to_string())),
+                        children: Vec::new(),
+                    }],
+                },
+                PerfDwarfDieNode {
+                    kind: PerfDwarfDieKind::Inline,
+                    ranges: vec![test_range(40, 50)],
+                    name: Some(names.intern("real_inline".to_string())),
+                    children: Vec::new(),
+                },
+            ],
+        }]);
+
+        assert_eq!(
+            perf_dwarf_frame_names_from_index(&segments, &names.names, 25, Some("outer")),
+            None
+        );
+        assert_eq!(
+            perf_dwarf_frame_names_from_index(&segments, &names.names, 45, Some("outer")),
+            Some(vec!["real_inline".to_string(), "outer".to_string()])
         );
     }
 
