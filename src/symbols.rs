@@ -247,6 +247,7 @@ struct PerfDwarfFrameRange {
     range: PerfAddressRange,
     frames: Arc<[PerfDwarfNameId]>,
     base_symbol_sensitive: bool,
+    order: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2552,8 +2553,9 @@ fn perf_dwarf_ranges_contain(ranges: &[PerfAddressRange], address: u64) -> bool 
 fn perf_dwarf_frame_ranges_from_roots(roots: &[PerfDwarfDieNode]) -> Vec<PerfDwarfFrameRange> {
     let mut segments = Vec::new();
     let root_frames: Arc<[PerfDwarfNameId]> = Arc::from([]);
+    let mut next_order = 0;
     for root in roots {
-        perf_dwarf_collect_frame_ranges(root, &root_frames, &mut segments);
+        perf_dwarf_collect_frame_ranges(root, &root_frames, &mut segments, &mut next_order);
     }
     segments.sort_by_key(|segment| segment.range.begin);
     segments
@@ -2563,21 +2565,27 @@ fn perf_dwarf_collect_frame_ranges(
     node: &PerfDwarfDieNode,
     parent_frames: &Arc<[PerfDwarfNameId]>,
     out: &mut Vec<PerfDwarfFrameRange>,
+    next_order: &mut usize,
 ) -> Vec<PerfAddressRange> {
     let frames = perf_dwarf_node_frames(parent_frames, node.name);
 
     let mut child_coverage = Vec::new();
     for child in &node.children {
-        child_coverage.extend(perf_dwarf_collect_frame_ranges(child, &frames, out));
+        child_coverage.extend(perf_dwarf_collect_frame_ranges(
+            child, &frames, out, next_order,
+        ));
     }
 
     if !frames.is_empty() {
         let base_symbol_sensitive = node.kind == PerfDwarfDieKind::Subprogram && frames.len() == 1;
         for range in perf_dwarf_subtract_ranges(&node.ranges, &child_coverage) {
+            let order = *next_order;
+            *next_order += 1;
             out.push(PerfDwarfFrameRange {
                 range,
                 frames: frames.clone(),
                 base_symbol_sensitive,
+                order,
             });
         }
     }
@@ -2667,10 +2675,10 @@ fn perf_dwarf_frame_names_from_index(
     if upper_bound == 0 {
         return None;
     }
-    let segment = &segments[upper_bound - 1];
-    if !(segment.range.begin <= address && address < segment.range.end) {
-        return None;
-    }
+    let segment = segments[..upper_bound]
+        .iter()
+        .filter(|segment| segment.range.begin <= address && address < segment.range.end)
+        .min_by_key(|segment| segment.order)?;
     if segment.base_symbol_sensitive
         && !segment
             .frames
@@ -3414,6 +3422,39 @@ mod tests {
         assert_eq!(
             perf_dwarf_frame_names_from_index(&segments, &names.names, 35, Some("outer")),
             Some(vec!["inner".to_string(), "outer".to_string()])
+        );
+    }
+
+    #[test]
+    fn flattened_dwarf_lookup_prefers_first_overlapping_inline_sibling_like_perf_die_find_child() {
+        // perf util/dwarf-aux.c die_find_child walks siblings in DIE order and
+        // stops at the first DW_TAG_inlined_subroutine whose range contains
+        // the address. A later overlapping sibling must not win just because
+        // its flattened range has the same start address.
+        let mut names = PerfDwarfNameInterner::default();
+        let segments = perf_dwarf_frame_ranges_from_roots(&[PerfDwarfDieNode {
+            kind: PerfDwarfDieKind::Subprogram,
+            ranges: vec![test_range(0, 100)],
+            name: Some(names.intern("outer".to_string())),
+            children: vec![
+                PerfDwarfDieNode {
+                    kind: PerfDwarfDieKind::Inline,
+                    ranges: vec![test_range(10, 30)],
+                    name: Some(names.intern("first".to_string())),
+                    children: Vec::new(),
+                },
+                PerfDwarfDieNode {
+                    kind: PerfDwarfDieKind::Inline,
+                    ranges: vec![test_range(10, 30)],
+                    name: Some(names.intern("second".to_string())),
+                    children: Vec::new(),
+                },
+            ],
+        }]);
+
+        assert_eq!(
+            perf_dwarf_frame_names_from_index(&segments, &names.names, 20, Some("outer")),
+            Some(vec!["first".to_string(), "outer".to_string()])
         );
     }
 
