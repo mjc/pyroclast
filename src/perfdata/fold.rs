@@ -29,7 +29,8 @@ use crate::perfdata::samples::{
     is_perf_user_deferred_context_marker, parse_sample_record_callchain,
 };
 use crate::perfdata::unwind::{
-    FramehopUnwinder, PerfX86_64Regs, UserStackUnwindResult, UserStackUnwinder, unwind_x86_64_stack,
+    FramehopUnwinder, PerfX86_64Regs, UserStackUnwindResult, UserStackUnwinder,
+    unwind_x86_64_frame_pointer_stack_like_elfutils, unwind_x86_64_stack,
 };
 use crate::symbols::{SymbolFrameCache, SymbolRequest, SymbolResolver, perf_build_id_elf_path};
 
@@ -2893,6 +2894,21 @@ fn unwind_object_frame_addresses_like_perf(
     let object_unwind =
         unwind_user_stack_with_diagnostics(&mut state.object_unwinder, *regs, stack_bytes, 256);
     let raw_frames = object_unwind.accepted_frames;
+    let use_libdw_arch_fallback = should_use_libdw_arch_fallback_after_empty_object_unwind(
+        context,
+        initial_ip_mapping_has_reported_unwind_module(
+            pid,
+            regs.ip,
+            mmap_table,
+            &state.object_unwinder,
+        ),
+    );
+    let raw_frames = libdw_arch_fallback_after_empty_object_unwind(
+        raw_frames,
+        regs,
+        stack_bytes,
+        use_libdw_arch_fallback,
+    );
     let maybe_inline_current_ip = should_salvage_inline_current_ip_after_empty_object_unwind(
         raw_frames.is_empty(),
         object_unwind.framehop_frame_count,
@@ -2906,6 +2922,41 @@ fn unwind_object_frame_addresses_like_perf(
         raw_frames,
     );
     (frames, maybe_inline_current_ip)
+}
+
+fn libdw_arch_fallback_after_empty_object_unwind(
+    raw_frames: Vec<u64>,
+    regs: &PerfX86_64Regs,
+    stack_bytes: &[u8],
+    use_libdw_arch_fallback: bool,
+) -> Vec<u64> {
+    if raw_frames.is_empty() && use_libdw_arch_fallback && regs.bp >= regs.sp {
+        unwind_x86_64_frame_pointer_stack_like_elfutils(*regs, stack_bytes, 256)
+    } else {
+        raw_frames
+    }
+}
+
+fn should_use_libdw_arch_fallback_after_empty_object_unwind(
+    context: UserUnwindContext,
+    initial_ip_mapping_has_reported_module: bool,
+) -> bool {
+    context.initial_ip_mapping == InitialIpMappingState::RecordedMappingLoaded
+        && initial_ip_mapping_has_reported_module
+        && context.initial_ip_is_dso
+        && context.syscall_return_state
+}
+
+fn initial_ip_mapping_has_reported_unwind_module(
+    pid: Option<u32>,
+    ip: u64,
+    mmap_table: &MmapTable,
+    object_unwinder: &FramehopUnwinder,
+) -> bool {
+    let mut mapping_cache = MappingResolveCache::default();
+    pid.and_then(|pid| mmap_table.resolve_ref_cached(pid, ip, &mut mapping_cache))
+        .is_some()
+        && object_unwinder.has_reported_module_for_ip(ip)
 }
 
 fn unwind_user_stack_with_diagnostics(
@@ -4488,6 +4539,97 @@ mod tests {
                 vec![0x7fff_f7f0_277b, 0x5555_556b_ab79],
             ),
             vec![0x7fff_f7f0_277b, 0x5555_556b_ab79]
+        );
+    }
+
+    #[test]
+    fn empty_object_unwind_uses_arch_fallback_like_libdw_ebl_unwind() {
+        // elfutils libdwfl/frame_unwind.c tries EH CFI, then DWARF CFI, then
+        // falls through to ebl_unwind(). The real period 803991 sample in the
+        // octo profile takes this path: framehop returns no object frames, while
+        // perf script prints the frame-pointer spine after the kernel stack.
+        let regs = super::PerfX86_64Regs {
+            ip: 0x7fff_f7e1_c03e,
+            sp: 0x7fff_ffff_9250,
+            bp: 0x7fff_ffff_9260,
+            registers: {
+                let mut registers = [0; 16];
+                registers[framehop::x86_64::Reg::RSP as usize] = 0x7fff_ffff_9250;
+                registers[framehop::x86_64::Reg::RBP as usize] = 0x7fff_ffff_9260;
+                registers
+            },
+        };
+        let mut stack = vec![0; 0x40];
+        stack[0x10..0x18].copy_from_slice(&0x7fff_ffff_9270_u64.to_le_bytes());
+        stack[0x18..0x20].copy_from_slice(&0x7fff_f7e1_c084_u64.to_le_bytes());
+        stack[0x20..0x28].copy_from_slice(&0_u64.to_le_bytes());
+        stack[0x28..0x30].copy_from_slice(&0x7fff_f7e9_9d7e_u64.to_le_bytes());
+
+        assert_eq!(
+            super::libdw_arch_fallback_after_empty_object_unwind(Vec::new(), &regs, &stack, true,),
+            vec![0x7fff_f7e1_c03e, 0x7fff_f7e1_c083, 0x7fff_f7e9_9d7d]
+        );
+    }
+
+    #[test]
+    fn empty_object_unwind_arch_fallback_requires_loaded_reported_mapping_like_libdw_entry() {
+        let regs = super::PerfX86_64Regs {
+            ip: 0x4000,
+            sp: 0x8000,
+            bp: 0x8000,
+            registers: [0; 16],
+        };
+        let stack = 0x5000_u64.to_le_bytes();
+
+        assert_eq!(
+            super::libdw_arch_fallback_after_empty_object_unwind(Vec::new(), &regs, &stack, false,),
+            Vec::<u64>::new()
+        );
+
+        let matching_context = super::UserUnwindContext {
+            callchain: super::SampleCallchainState::KernelWithCallchain,
+            initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
+            initial_ip_is_dso: true,
+            module_count: 1,
+            frame_pointer_at_or_above_stack_pointer: true,
+            syscall_return_state: true,
+        };
+        assert!(
+            super::should_use_libdw_arch_fallback_after_empty_object_unwind(matching_context, true)
+        );
+
+        assert!(
+            !super::should_use_libdw_arch_fallback_after_empty_object_unwind(
+                super::UserUnwindContext {
+                    initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
+                    ..matching_context
+                },
+                true
+            )
+        );
+        assert!(
+            !super::should_use_libdw_arch_fallback_after_empty_object_unwind(
+                super::UserUnwindContext {
+                    initial_ip_is_dso: false,
+                    ..matching_context
+                },
+                true
+            )
+        );
+        assert!(
+            !super::should_use_libdw_arch_fallback_after_empty_object_unwind(
+                super::UserUnwindContext {
+                    syscall_return_state: false,
+                    ..matching_context
+                },
+                true
+            )
+        );
+        assert!(
+            !super::should_use_libdw_arch_fallback_after_empty_object_unwind(
+                matching_context,
+                false
+            )
         );
     }
 

@@ -96,6 +96,40 @@ pub fn unwind_x86_64_stack(regs: PerfX86_64Regs, stack: &[u8], max_frames: usize
     frames
 }
 
+#[must_use]
+pub fn unwind_x86_64_frame_pointer_stack_like_elfutils(
+    regs: PerfX86_64Regs,
+    stack: &[u8],
+    max_frames: usize,
+) -> Vec<u64> {
+    let memory_reader = PerfStackReader::new(regs.sp, stack);
+    let mut frames = Vec::new();
+    if max_frames == 0 || regs.bp == 0 {
+        return frames;
+    }
+
+    frames.push(regs.ip);
+    let mut fp = regs.bp;
+    let mut sp = regs.sp;
+    while frames.len() < max_frames {
+        let prev_fp = memory_reader.read_u64(fp).unwrap_or(0);
+        let Some(ret) = memory_reader.read_u64(fp.saturating_add(8)) else {
+            break;
+        };
+        let next_sp = fp.saturating_add(16);
+        if sp >= next_sp {
+            break;
+        }
+        push_perf_unwind_address(&mut frames, ret);
+        fp = prev_fp;
+        sp = next_sp;
+        if fp == 0 {
+            break;
+        }
+    }
+    frames
+}
+
 impl Default for FramehopUnwinder {
     fn default() -> Self {
         Self::new()
@@ -759,6 +793,53 @@ mod tests {
         super::truncate_at_first_uncovered_unwind_frame(&mut frames, |address| address < 0x3000);
 
         assert_eq!(frames, vec![0x1000, 0x2000, 0x3000]);
+    }
+
+    #[test]
+    fn frame_pointer_arch_fallback_matches_elfutils_x86_64_unwind() {
+        // elfutils backends/x86_64_unwind.c uses rbp as a conventional frame
+        // pointer, reads [rbp] as previous rbp, [rbp + 8] as return address,
+        // and advances sp by 16 before accepting the caller.
+        let mut registers = [0; 16];
+        registers[Reg::RSP as usize] = 0x7fff_ffff_9250;
+        registers[Reg::RBP as usize] = 0x7fff_ffff_9260;
+        let regs = super::PerfX86_64Regs {
+            ip: 0x7fff_f7e1_c03e,
+            sp: 0x7fff_ffff_9250,
+            bp: 0x7fff_ffff_9260,
+            registers,
+        };
+        let mut stack = vec![0; 0x40];
+        stack[0x10..0x18].copy_from_slice(&0x7fff_ffff_9270_u64.to_le_bytes());
+        stack[0x18..0x20].copy_from_slice(&0x7fff_f7e1_c084_u64.to_le_bytes());
+        stack[0x20..0x28].copy_from_slice(&0_u64.to_le_bytes());
+        stack[0x28..0x30].copy_from_slice(&0x7fff_f7e9_9d7e_u64.to_le_bytes());
+
+        assert_eq!(
+            super::unwind_x86_64_frame_pointer_stack_like_elfutils(regs, &stack, 256),
+            vec![0x7fff_f7e1_c03e, 0x7fff_f7e1_c083, 0x7fff_f7e9_9d7d]
+        );
+    }
+
+    #[test]
+    fn frame_pointer_arch_fallback_rejects_non_advancing_stack_like_elfutils() {
+        let mut registers = [0; 16];
+        registers[Reg::RSP as usize] = 0x8000;
+        registers[Reg::RBP as usize] = 0x7ff0;
+        let regs = super::PerfX86_64Regs {
+            ip: 0x4000,
+            sp: 0x8000,
+            bp: 0x7ff0,
+            registers,
+        };
+        let mut stack = vec![0; 0x20];
+        stack[0..8].copy_from_slice(&0_u64.to_le_bytes());
+        stack[8..16].copy_from_slice(&0x5000_u64.to_le_bytes());
+
+        assert_eq!(
+            super::unwind_x86_64_frame_pointer_stack_like_elfutils(regs, &stack, 256),
+            vec![0x4000]
+        );
     }
 
     #[test]
