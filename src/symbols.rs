@@ -276,6 +276,7 @@ struct PerfObjectSymbolNames<'a> {
 #[derive(Default)]
 struct PerfObjectSymbolIndex {
     symbols: Vec<PerfSymbolCandidate>,
+    max_end_by_index: Vec<u64>,
 }
 
 pub struct PerfSymbolResolver<O> {
@@ -2047,6 +2048,14 @@ fn perf_symbol_is_candidate(symbol: &object::Symbol<'_, '_>) -> bool {
         )
 }
 
+fn perf_symbol_candidate_search_end(candidate: &PerfSymbolCandidate) -> u64 {
+    candidate.address.saturating_add(if candidate.size == 0 {
+        1
+    } else {
+        candidate.size
+    })
+}
+
 fn perf_symbol_candidate_contains_address(candidate: &PerfSymbolCandidate, address: u64) -> bool {
     if candidate.size == 0 {
         candidate.address == address
@@ -2132,7 +2141,18 @@ impl PerfObjectSymbolIndex {
             .collect::<Vec<_>>();
         symbols.extend(perf_synthesized_plt_symbols(&object, &symbols));
         symbols.sort_by_key(|symbol| symbol.address);
-        Self { symbols }
+        let mut max_end = 0_u64;
+        let max_end_by_index = symbols
+            .iter()
+            .map(|symbol| {
+                max_end = max_end.max(perf_symbol_candidate_search_end(symbol));
+                max_end
+            })
+            .collect();
+        Self {
+            symbols,
+            max_end_by_index,
+        }
     }
 
     fn symbol_name(&self, address: u64) -> Option<&str> {
@@ -2147,8 +2167,16 @@ impl PerfObjectSymbolIndex {
     }
 
     fn symbol(&self, address: u64) -> Option<&PerfSymbolCandidate> {
+        let mut index = self
+            .symbols
+            .partition_point(|candidate| candidate.address <= address);
         let mut best = None::<&PerfSymbolCandidate>;
-        for candidate in &self.symbols {
+        while index > 0 {
+            index -= 1;
+            if self.max_end_by_index[index] <= address {
+                break;
+            }
+            let candidate = &self.symbols[index];
             if !perf_symbol_candidate_contains_address(candidate, address) {
                 continue;
             }
@@ -3185,8 +3213,8 @@ mod tests {
 
     use super::{
         PerfAddressRange, PerfDwarfDieKind, PerfDwarfDieNode, PerfDwarfNameInterner,
-        PerfSymbolBinding, PerfSymbolCandidate, PerfSymbolScope, ResolvedMappingRef,
-        RustAddr2lineResolver, SymbolFrameCache, SymbolRequest, SymbolResolver,
+        PerfObjectSymbolIndex, PerfSymbolBinding, PerfSymbolCandidate, PerfSymbolScope,
+        ResolvedMappingRef, RustAddr2lineResolver, SymbolFrameCache, SymbolRequest, SymbolResolver,
         clean_object_symbol_request, perf_best_duplicate_symbol, perf_dwarf_frame_names_from_index,
         perf_dwarf_frame_ranges_from_roots, perf_frames_with_object_alias,
     };
@@ -3254,6 +3282,31 @@ mod tests {
             perf_best_duplicate_symbol(&local_alias, &global_alias).name,
             "read"
         );
+    }
+
+    #[test]
+    fn object_symbol_index_keeps_earlier_overlapping_symbol_candidates() {
+        let symbols = PerfObjectSymbolIndex {
+            symbols: vec![
+                PerfSymbolCandidate {
+                    name: "large".to_string(),
+                    address: 0x1000,
+                    size: 0x1000,
+                    scope: PerfSymbolScope::Global,
+                    binding: PerfSymbolBinding::Global,
+                },
+                PerfSymbolCandidate {
+                    name: "small".to_string(),
+                    address: 0x1800,
+                    size: 0x10,
+                    scope: PerfSymbolScope::Global,
+                    binding: PerfSymbolBinding::Global,
+                },
+            ],
+            max_end_by_index: vec![0x2000, 0x2000],
+        };
+
+        assert_eq!(symbols.symbol_name(0x1810), Some("large"));
     }
 
     #[test]
