@@ -1,6 +1,3 @@
-use std::cell::RefCell;
-use std::fmt::Write as _;
-
 use object::{Object as _, ObjectSegment as _, ObjectSymbol as _};
 use proptest::prelude::*;
 use pyroclast::perfdata::fold::{
@@ -18,6 +15,7 @@ use pyroclast::perfdata::samples::{
     PERF_SAMPLE_TIME,
 };
 use pyroclast::symbols::{SymbolRequest, SymbolResolver};
+use std::cell::RefCell;
 
 fn render_unknown_folded_callchain(frames: &[u64], count: u64) -> String {
     if frames.is_empty() {
@@ -25,8 +23,8 @@ fn render_unknown_folded_callchain(frames: &[u64], count: u64) -> String {
     }
 
     let mut rendered = String::from(":12");
-    for frame in frames.iter().rev() {
-        let _ = write!(rendered, ";0x{frame:x}");
+    for _ in frames.iter().rev() {
+        rendered.push_str(";[unknown]");
     }
     rendered.push(' ');
     rendered.push_str(&count.to_string());
@@ -180,7 +178,7 @@ fn keeps_unmapped_dwarf_user_stack_payloads_like_perf_libdw_ebl() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;0x1233;0x4000 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -466,7 +464,7 @@ fn keeps_dwarf_user_stack_when_build_id_mapping_overlaps_before_first_report_lik
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;0x1233;0x4900 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -556,7 +554,7 @@ fn folds_dwarf_user_stack_payloads_before_kernel_callchain_frames() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;0x1233;0x4000;0xa000;0x9000 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown];[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -594,7 +592,7 @@ fn keeps_unmapped_kernel_looking_user_unwind_frame_like_perf_libdw_entry() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;0xffffffff80ffffff;0x4000;0x9000 1\n");
+    assert_eq!(folded, ":12;0xffffffff80ffffff;[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -632,7 +630,7 @@ fn keeps_dwarf_user_stack_payloads_when_kernel_callchain_has_user_context_marker
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;0x1233;0x4000;[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown];[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -671,7 +669,7 @@ fn keeps_dwarf_user_stack_payloads_when_kernel_callchain_has_no_user_context_mar
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;0x1233;0x4000;[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown];[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -711,7 +709,7 @@ fn keeps_dwarf_user_stack_payloads_for_kernel_samples_without_user_context_marke
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;0x1233;0x4000;[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown];[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -751,7 +749,7 @@ fn keeps_recorded_user_frame_without_dwarf_callers_for_kernel_user_context_like_
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;0x4000;[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -786,7 +784,7 @@ fn keeps_recorded_user_frame_without_dwarf_callers_for_kernel_user_frame_like_pe
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;0x4000;[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -821,7 +819,7 @@ fn keeps_recorded_user_frame_without_dwarf_callers_for_mixed_callchain_like_perf
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;0x4000;[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -859,7 +857,7 @@ fn keeps_dwarf_user_stack_for_kernel_sample_without_kernel_callchain_like_perf_l
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;0x1233;0x4000 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -942,7 +940,7 @@ fn limits_dwarf_unwind_to_perf_user_stack_dynamic_size_like_perf_script() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;0x4000;[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -1445,7 +1443,7 @@ fn drops_dwarf_user_stack_frames_from_known_non_executable_mappings() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;0x4000;0x9000 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -1485,7 +1483,7 @@ fn keeps_dwarf_user_stack_frames_from_mapped_non_executable_libraries_like_perf_
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[libc.so.6];0x4000;0x9000 1\n");
+    assert_eq!(folded, ":12;[libc.so.6];[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -1522,7 +1520,7 @@ fn drops_dwarf_user_stack_frames_from_stack_mappings_like_perf_script() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;0x4000;0x9000 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -1559,7 +1557,7 @@ fn drops_dwarf_user_stack_frames_from_perf_data_file_mappings_without_prot() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;0x4000;0x9000 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -1596,7 +1594,7 @@ fn drops_perf_data_file_frames_when_mapping_arrives_after_sample() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;0x4000;0x9000 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -1615,7 +1613,7 @@ fn folds_callchains_in_flamegraph_root_to_leaf_order() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;0x4000;0x3000;0x2000 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -1652,7 +1650,7 @@ fn folds_identical_sample_callchains_as_hex_frames() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;0x3000;0x2000 2\n:12;0x4000 1\n");
+    assert_eq!(folded, ":12;[unknown] 1\n:12;[unknown];[unknown] 2\n");
 }
 
 #[test]
@@ -1671,7 +1669,7 @@ fn drops_perf_context_marker_frames_when_folding() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;0x2000 1\n");
+    assert_eq!(folded, ":12;[unknown] 1\n");
 }
 
 #[test]
@@ -1699,7 +1697,7 @@ fn merges_deferred_user_callchains_like_perf_script() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;0x6000;0x5000;0x3000;0x2000 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown];[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -1795,7 +1793,7 @@ fn missing_sample_thread_comm_uses_perf_thread_placeholder() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;0x2000 1\n");
+    assert_eq!(folded, ":12;[unknown] 1\n");
 }
 
 #[test]
@@ -1818,7 +1816,7 @@ fn prefixes_folded_stacks_with_sample_tid_comm_like_perf_script() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "pyroclast;0x2000 1\n");
+    assert_eq!(folded, "pyroclast;[unknown] 1\n");
 }
 
 #[test]
@@ -1839,7 +1837,7 @@ fn uses_comm_name_from_sample_time_like_perf_script() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;0x2000 1\n:12;0x3000 1\n");
+    assert_eq!(folded, ":12;[unknown] 2\n");
 }
 
 #[test]
@@ -1866,7 +1864,7 @@ fn thread_comm_takes_precedence_over_process_exec_comm_like_perf_script() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "perf-exec;0x2000 1\n");
+    assert_eq!(folded, "perf-exec;[unknown] 1\n");
 }
 
 #[test]
@@ -1889,7 +1887,7 @@ fn process_exec_comm_is_fallback_when_sample_thread_has_no_comm() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;0x2000 1\n");
+    assert_eq!(folded, ":12;[unknown] 1\n");
 }
 
 #[test]
@@ -1915,7 +1913,7 @@ fn applies_comm_records_by_perf_timestamp_like_perf_script() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "perf-exec;0x2000 1\n");
+    assert_eq!(folded, "perf-exec;[unknown] 1\n");
 }
 
 #[test]
@@ -1934,7 +1932,7 @@ fn normalizes_comm_spaces_like_inferno() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "V8_WorkerThread;0x2000 1\n");
+    assert_eq!(folded, "V8_WorkerThread;[unknown] 1\n");
 }
 
 #[test]
@@ -1959,7 +1957,7 @@ fn can_fold_samples_weighted_by_period() {
     )
     .expect("folded");
 
-    assert_eq!(folded, ":12;0x2000 10\n");
+    assert_eq!(folded, ":12;[unknown] 10\n");
 }
 
 #[test]
@@ -1990,7 +1988,7 @@ fn folds_sample_ip_when_callchain_is_absent_like_perf_script() {
     )
     .expect("folded");
 
-    assert_eq!(folded, ":12;0x2000 10\n");
+    assert_eq!(folded, ":12;[unknown] 10\n");
 }
 
 #[test]
@@ -2030,7 +2028,7 @@ fn emits_sample_ip_when_callchain_field_is_absent_even_with_dwarf_payload_like_p
     )
     .expect("folded");
 
-    assert_eq!(folded, ":12;0x4000 7\n");
+    assert_eq!(folded, ":12;[unknown] 7\n");
 }
 
 #[test]
@@ -2066,7 +2064,7 @@ fn selects_sample_layout_by_identifier() {
     )
     .expect("folded");
 
-    assert_eq!(folded, ":12;0x2000 7\n");
+    assert_eq!(folded, ":12;[unknown] 7\n");
 }
 
 #[test]
@@ -2102,7 +2100,7 @@ fn selects_sample_layout_by_id_field() {
     )
     .expect("folded");
 
-    assert_eq!(folded, ":12;0x2000 7\n");
+    assert_eq!(folded, ":12;[unknown] 7\n");
 }
 
 #[test]
@@ -2149,7 +2147,7 @@ fn folds_samples_from_multiple_attrs_when_generated_perf_script_event_name_match
     )
     .expect("folded");
 
-    assert_eq!(folded, ":12;0x1111 1\n:12;0x2222 2\n");
+    assert_eq!(folded, ":12;[unknown] 3\n");
 }
 
 #[test]
@@ -2177,7 +2175,7 @@ fn folds_perfdata_from_file_path() {
     )
     .expect("folded");
 
-    assert_eq!(folded, ":12;0x2000 10\n");
+    assert_eq!(folded, ":12;[unknown] 10\n");
 }
 
 #[test]
@@ -2263,7 +2261,7 @@ fn folds_perfdata_from_multiple_finished_rounds_into_one_total() {
     )
     .expect("folded");
 
-    assert_eq!(folded, ":12;0x2000 10\n");
+    assert_eq!(folded, ":12;[unknown] 10\n");
 }
 
 #[test]
@@ -2289,7 +2287,7 @@ fn folds_later_rounds_with_updated_mappings_after_cacheable_rounds() {
     let folded =
         fold_perfdata_file_with_options(&perfdata, FoldOptions::default()).expect("folded");
 
-    assert_eq!(folded, ":12;0x2000 1\n:12;[app] 1\n");
+    assert_eq!(folded, ":12;[app] 1\n:12;[unknown] 1\n");
 }
 
 #[test]
@@ -2316,7 +2314,7 @@ fn folds_identical_rendered_stacks_across_pids_into_one_line() {
     )
     .expect("folded");
 
-    assert_eq!(folded, "pyroclast;0x2000 10\n");
+    assert_eq!(folded, "pyroclast;[unknown] 10\n");
 }
 
 #[test]
@@ -2372,7 +2370,7 @@ fn synthesized_fork_does_not_clone_parent_mappings_like_perf_script() {
     )
     .expect("folded");
 
-    assert_eq!(folded, ":22;0x2000 7\n");
+    assert_eq!(folded, ":22;[unknown] 7\n");
 }
 
 #[test]
@@ -2403,7 +2401,7 @@ fn applies_comm_records_by_perf_timestamp_from_file_path_like_perf_script() {
     let folded =
         fold_perfdata_file_with_options(&perfdata, FoldOptions::default()).expect("folded");
 
-    assert_eq!(folded, "perf-exec;0x2000 1\n");
+    assert_eq!(folded, "perf-exec;[unknown] 1\n");
 }
 
 #[test]
@@ -2472,7 +2470,7 @@ fn folds_file_samples_from_multiple_attrs_when_generated_perf_script_event_name_
     )
     .expect("folded");
 
-    assert_eq!(folded, ":12;0x1111 1\n:12;0x2222 2\n");
+    assert_eq!(folded, ":12;[unknown] 3\n");
 }
 
 proptest! {
@@ -2699,7 +2697,7 @@ fn symbolized_fold_carries_mmap2_build_ids_to_symbol_requests() {
     let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
         .expect("folded");
 
-    assert_eq!(folded, ":12;[igb]+0x30 1\n");
+    assert_eq!(folded, ":12;[[igb]] 1\n");
     assert_eq!(
         resolver.calls(),
         vec![vec![SymbolRequest {

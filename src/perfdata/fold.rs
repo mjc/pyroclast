@@ -1977,7 +1977,6 @@ impl<'a> FoldFrameResolver<'a> {
         &self,
         pid: Option<u32>,
         address: u64,
-        symbolizing: bool,
         mapping_cache: &mut MappingResolveCache,
     ) -> FrameMappingDecision<'a> {
         if let Some(mapping) = pid.and_then(|pid| {
@@ -1989,10 +1988,8 @@ impl<'a> FoldFrameResolver<'a> {
             } else {
                 FrameMappingDecision::Mapped(mapping)
             }
-        } else if is_kernel_space_frame(address) || symbolizing {
-            FrameMappingDecision::Unknown
         } else {
-            FrameMappingDecision::Address
+            FrameMappingDecision::Unknown
         }
     }
 
@@ -2130,8 +2127,7 @@ impl<'a> FoldFrameResolver<'a> {
         W: IoWrite + ?Sized,
     {
         let address = frame.address();
-        let symbolizing = symbol_cache.is_some();
-        match self.mapping_decision(pid, address, symbolizing, mapping_cache) {
+        match self.mapping_decision(pid, address, mapping_cache) {
             FrameMappingDecision::Mapped(mapping) => {
                 write_perf_script_mapped_decision_frame(
                     writer,
@@ -2219,7 +2215,7 @@ impl<'a> FoldFrameResolver<'a> {
                 append_cached_inferno_perf_raw_function_to_buffers(buffers, label);
             }
         } else {
-            self.append_inline_current_ip_fallback_folded_frame(pid, address, true, buffers);
+            self.append_inline_current_ip_fallback_folded_frame(pid, address, buffers);
         }
         Ok(())
     }
@@ -2250,10 +2246,9 @@ impl<'a> FoldFrameResolver<'a> {
         &self,
         pid: Option<u32>,
         address: u64,
-        symbolizing: bool,
         buffers: &mut FoldedRenderBuffers,
     ) {
-        match self.mapping_decision(pid, address, symbolizing, &mut buffers.mapping_cache) {
+        match self.mapping_decision(pid, address, &mut buffers.mapping_cache) {
             FrameMappingDecision::Mapped(mapping) => {
                 let fallback = symbol_fallback_frame_ref(&mapping);
                 append_cached_inferno_perf_folded_label_to_buffers(buffers, &fallback);
@@ -2316,7 +2311,7 @@ impl<'a> FoldFrameResolver<'a> {
         mapping_cache: &mut MappingResolveCache,
     ) -> FrameMappingDecision<'a> {
         let address = frame.address();
-        let decision = self.mapping_decision(pid, address, symbolizing, mapping_cache);
+        let decision = self.mapping_decision(pid, address, mapping_cache);
         if !symbolizing
             && matches!(
                 frame,

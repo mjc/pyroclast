@@ -3050,8 +3050,6 @@ fn mapping_fallback_frame(mapping: &ResolvedMappingRef<'_>) -> String {
         kernel_module_fallback_frame(mapping.path)
     } else if mapping.path == "[unknown]" {
         mapping.path.to_string()
-    } else if mapping.path.starts_with('[') {
-        format!("{}+0x{:x}", mapping.path, mapping.relative_address)
     } else {
         let name = Path::new(mapping.path)
             .file_name()
@@ -3746,6 +3744,20 @@ mod tests {
 
         assert_eq!(first_ptr, second_ptr);
         assert_eq!(resolver.calls.get(), 1);
+    }
+
+    #[test]
+    fn symbol_frame_cache_resolve_folded_mapping_ref_wraps_bracket_dso_like_inferno_perf() {
+        let resolver = CountingFrameResolver::new(vec![Vec::new()]);
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let mapping = test_mapping_ref("[vdso]", 0x10);
+
+        let folded = cache
+            .resolve_folded_mapping_ref(&mapping)
+            .expect("resolve")
+            .expect("folded fallback render");
+
+        assert_eq!(folded, "[[vdso]]");
     }
 
     #[test]

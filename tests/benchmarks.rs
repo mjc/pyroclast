@@ -37,7 +37,7 @@ fn fold_benchmark_reports_folded_output_size() {
     let report = run_fold_benchmark(&perfdata).expect("benchmark");
 
     assert_eq!(report.input, perfdata);
-    assert_eq!(report.folded_bytes, ":2;0x2000 2\n".len());
+    assert_eq!(report.folded_bytes, ":2;[unknown] 2\n".len());
     assert_eq!(report.folded_lines, 1);
     assert!(report.elapsed.as_nanos() > 0);
 }
@@ -64,7 +64,7 @@ fn fold_benchmark_weights_perf_sample_periods() {
 
     let report = run_fold_benchmark(&perfdata).expect("benchmark");
 
-    assert_eq!(report.folded_bytes, ":2;0x2000 144\n".len());
+    assert_eq!(report.folded_bytes, ":2;[unknown] 144\n".len());
 }
 
 #[test]
@@ -150,8 +150,8 @@ fn compares_pyroclast_folded_stacks_with_inferno_collapse() {
     assert_eq!(report.inferno_folded_lines, 1);
     assert!(report.matches);
     assert!(report.svg_matches);
-    assert_eq!(report.pyroclast_svg_bytes, 21);
-    assert_eq!(report.inferno_svg_bytes, 21);
+    assert_eq!(report.pyroclast_svg_bytes, 24);
+    assert_eq!(report.inferno_svg_bytes, 24);
     assert_eq!(report.only_pyroclast, Vec::<String>::new());
     assert_eq!(report.only_inferno, Vec::<String>::new());
 }
@@ -338,7 +338,7 @@ fn bench_command_exports_perf_script_and_compares_without_perf_runner() {
 
     assert_eq!(
         std::fs::read_to_string(&exported_perf_script).expect("exported perf script"),
-        ":2       2          1 cpu/cycles/P:\n\t2000 0x2000 ([unknown])\n\n"
+        ":2       2          1 cpu/cycles/P:\n\t            2000 [unknown] ([unknown])\n\n"
     );
     assert!(output.contains("inferno_compare.matches=true"));
     assert!(output.contains("pyroclast_fold.input="));
@@ -617,9 +617,10 @@ impl CommandRunner for BenchCommandRunner {
         self.commands.lock().unwrap().push(command.clone());
         let stdout = match command.program.as_str() {
             "perf" => {
-                b":2       2          1 cpu/cycles/P:\n\t2000 0x2000 ([unknown])\n\n".to_vec()
+                b":2       2          1 cpu/cycles/P:\n\t            2000 [unknown] ([unknown])\n\n"
+                    .to_vec()
             }
-            "inferno-collapse-perf" => b":2;0x2000 1\n".to_vec(),
+            "inferno-collapse-perf" => b":2;[unknown] 1\n".to_vec(),
             "inferno-flamegraph" => {
                 let mut svg = b"<svg>".to_vec();
                 svg.extend(command.stdin.as_deref().unwrap_or_default());
@@ -647,13 +648,13 @@ impl CommandRunner for MatchingCollapseRunner {
         if command.program == "inferno-flamegraph" {
             return Ok(CommandOutput {
                 status_code: Some(0),
-                stdout: b"<svg>0x2000 2\n</svg>\n".to_vec(),
+                stdout: b"<svg>[unknown] 2\n</svg>\n".to_vec(),
                 stderr: Vec::new(),
             });
         }
         Ok(CommandOutput {
             status_code: Some(0),
-            stdout: b":2;0x2000 2\n".to_vec(),
+            stdout: b":2;[unknown] 2\n".to_vec(),
             stderr: Vec::new(),
         })
     }
