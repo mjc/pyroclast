@@ -370,7 +370,11 @@ fn drops_dwarf_user_stack_when_current_mapping_replaces_broad_loaded_mapping_lik
 }
 
 #[test]
-fn drops_dwarf_user_stack_when_newer_mapping_module_overlaps_prior_report_like_perf_script() {
+fn keeps_dwarf_user_stack_when_newer_mapping_overlaps_before_first_report_like_perf_script() {
+    // perf's libdw module reporting is lazy: tools/perf/util/unwind-libdw.c
+    // does not call report_module() until a sample enters the unwind path.
+    // Overlapping MMAP records before that first report update the maps, but
+    // there is no prior DWFL module yet for the later mapping to conflict with.
     let current_exe = std::env::current_exe().expect("current exe");
     let current_exe = current_exe.to_string_lossy();
     let bytes = perfdata_with_records_and_attrs(
@@ -411,12 +415,16 @@ fn drops_dwarf_user_stack_when_newer_mapping_module_overlaps_prior_report_like_p
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
+    let expected = format!("[unknown];{}+0x100 1\n", current_exe.as_ref());
 
-    assert_eq!(folded, "");
+    assert_eq!(folded, expected);
 }
 
 #[test]
-fn drops_dwarf_user_stack_when_build_id_mapping_module_overlaps_prior_report_like_perf_script() {
+fn keeps_dwarf_user_stack_when_build_id_mapping_overlaps_before_first_report_like_perf_script() {
+    // Same lazy report_module() rule as plain MMAP: a build-id-backed mapping
+    // can only overlap a prior DWFL module after an earlier unwind report
+    // populated that module.
     let current_exe = std::env::current_exe().expect("current exe");
     let current_exe = current_exe.to_string_lossy();
     let bytes = perfdata_with_records_and_attrs(
@@ -458,12 +466,15 @@ fn drops_dwarf_user_stack_when_build_id_mapping_module_overlaps_prior_report_lik
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "");
+    assert_eq!(folded, "[unknown];0x1233;0x4900 1\n");
 }
 
 #[test]
-fn drops_dwarf_user_stack_when_header_build_id_mmap2_module_overlaps_prior_report_like_perf_script()
+fn keeps_dwarf_user_stack_when_header_build_id_mmap2_overlaps_before_first_report_like_perf_script()
 {
+    // Header FEATURE_BUILD_ID resolution also happens when the mapping is
+    // reported to DWFL. Without a sample before the overlap, there is no prior
+    // reported module to reject this mapping.
     let build_id = [
         0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90,
         0xa0, 0xb0, 0xc0, 0xd0, 0xe0,
@@ -509,8 +520,9 @@ fn drops_dwarf_user_stack_when_header_build_id_mmap2_module_overlaps_prior_repor
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
+    let expected = format!("[unknown];{}+0x1100 1\n", current_exe.as_ref());
 
-    assert_eq!(folded, "");
+    assert_eq!(folded, expected);
 }
 
 #[test]
