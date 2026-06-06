@@ -203,6 +203,12 @@ enum SampleCallchainState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SampleCallchainPresence {
+    Present,
+    Absent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ObjectUnwindInitialFramePolicy {
     DropSyntheticCurrentIp,
     KeepDsoLeaf,
@@ -224,6 +230,7 @@ enum ReportModuleResult {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct UserUnwindContext {
+    sample_callchain: SampleCallchainPresence,
     callchain: SampleCallchainState,
     initial_ip_mapping: InitialIpMappingState,
     initial_ip_is_dso: bool,
@@ -3001,7 +3008,13 @@ fn build_user_unwind_context(
     sample: &crate::perfdata::samples::SampleCallchain<'_>,
     regs: &PerfX86_64Regs,
 ) -> UserUnwindContext {
+    let sample_callchain = if event.layout.sample_type & PERF_SAMPLE_CALLCHAIN != 0 {
+        SampleCallchainPresence::Present
+    } else {
+        SampleCallchainPresence::Absent
+    };
     UserUnwindContext {
+        sample_callchain,
         callchain: sample_callchain_state(
             misc,
             event,
@@ -3321,8 +3334,13 @@ fn choose_user_unwind_source(context: UserUnwindContext) -> UserUnwindSource {
     }
 }
 
-fn has_perf_object_unwind(_context: UserUnwindContext) -> bool {
-    true
+fn has_perf_object_unwind(context: UserUnwindContext) -> bool {
+    // tools/perf/builtin-script.c only calls thread__resolve_callchain()
+    // behind `symbol_conf.use_callchain && sample->callchain`. libdw's
+    // unwind__get_entries() is reached later from that callchain resolver, so
+    // captured regs/stack without a PERF_SAMPLE_CALLCHAIN payload must not
+    // trigger object unwinding.
+    context.sample_callchain == SampleCallchainPresence::Present
 }
 
 fn sample_fold_count(period: Option<u64>, options: FoldOptions) -> u64 {
@@ -4430,6 +4448,7 @@ mod tests {
         // operation.
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
+                sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::Other {
                     has_callchain: true,
                     has_frames: true,
@@ -4452,6 +4471,7 @@ mod tests {
         // backend performs the frame-pointer fallback inside libdw.
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
+                sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::Other {
                     has_callchain: true,
                     has_frames: true,
@@ -4466,6 +4486,7 @@ mod tests {
         );
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
+                sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::Other {
                     has_callchain: true,
                     has_frames: false,
@@ -4480,6 +4501,7 @@ mod tests {
         );
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
+                sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::Other {
                     has_callchain: true,
                     has_frames: true,
@@ -4498,6 +4520,7 @@ mod tests {
     fn user_unwind_source_uses_object_unwinder_with_callchain_field_like_perf_script() {
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
+                sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::Other {
                     has_callchain: true,
                     has_frames: false,
@@ -4516,6 +4539,7 @@ mod tests {
     fn user_unwind_source_uses_object_unwinder_for_nonempty_callchain_after_modules_are_loaded() {
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
+                sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::Other {
                     has_callchain: true,
                     has_frames: true,
@@ -4531,13 +4555,13 @@ mod tests {
     }
 
     #[test]
-    fn user_unwind_source_uses_object_unwinder_for_captured_stack_without_recorded_callchain_like_perf()
-     {
-        // Perf's thread__resolve_callchain_unwind only requires PERF_SAMPLE_REGS_USER
-        // and PERF_SAMPLE_STACK_USER; __thread__resolve_callchain calls it even when
-        // PERF_SAMPLE_CALLCHAIN did not contribute recorded frames.
+    fn user_unwind_source_skips_object_unwinder_without_sample_callchain_like_perf_script() {
+        // tools/perf/builtin-script.c only calls thread__resolve_callchain()
+        // behind `symbol_conf.use_callchain && sample->callchain`; captured
+        // DWARF regs/stack alone do not enter the libdw unwind path.
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
+                sample_callchain: super::SampleCallchainPresence::Absent,
                 callchain: super::SampleCallchainState::Other {
                     has_callchain: false,
                     has_frames: false,
@@ -4548,7 +4572,7 @@ mod tests {
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
             }),
-            super::UserUnwindSource::Object
+            super::UserUnwindSource::None
         );
     }
 
@@ -4556,6 +4580,7 @@ mod tests {
     fn user_unwind_source_uses_object_unwind_for_kernel_callchain_like_perf_libdw() {
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
+                sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::KernelWithCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
                 initial_ip_is_dso: false,
@@ -4571,6 +4596,7 @@ mod tests {
     fn user_unwind_source_uses_object_unwind_for_syscall_return_like_perf_libdw() {
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
+                sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::KernelWithCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
                 initial_ip_is_dso: false,
@@ -4586,6 +4612,7 @@ mod tests {
     fn user_unwind_source_uses_object_unwind_for_valid_kernel_bp_like_perf_script() {
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
+                sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::KernelWithCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
                 initial_ip_is_dso: false,
@@ -4604,6 +4631,7 @@ mod tests {
         // captured user regs/stack and emits the user-space memmove leaf.
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
+                sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::KernelWithoutCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
                 initial_ip_is_dso: true,
@@ -4625,6 +4653,7 @@ mod tests {
         // because the captured user IP belongs to the main executable.
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
+                sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::KernelWithoutCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
                 initial_ip_is_dso: false,
@@ -4645,6 +4674,7 @@ mod tests {
         // already contains a user frame.
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
+                sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::KernelWithUserFrame,
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
                 initial_ip_is_dso: false,
@@ -4714,6 +4744,7 @@ mod tests {
             Some(11),
             &mmap_table,
             super::UserUnwindContext {
+                sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::KernelWithCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
                 initial_ip_is_dso: true,
@@ -4760,6 +4791,7 @@ mod tests {
             Some(11),
             &mmap_table,
             super::UserUnwindContext {
+                sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::KernelWithCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
                 initial_ip_is_dso: true,
@@ -4780,6 +4812,7 @@ mod tests {
         // fallback after report_module(ip).
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
+                sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::KernelWithCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
                 initial_ip_is_dso: false,
@@ -4795,6 +4828,7 @@ mod tests {
     fn user_unwind_source_attempts_libdw_for_syscall_return_without_modules_like_perf_script() {
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
+                sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::KernelWithCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
                 initial_ip_is_dso: false,
@@ -4810,6 +4844,7 @@ mod tests {
     fn user_unwind_source_uses_libdw_ebl_fallback_for_valid_kernel_bp_like_perf_script() {
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
+                sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::KernelWithCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
                 initial_ip_is_dso: false,
@@ -5270,6 +5305,7 @@ mod tests {
         );
 
         let matching_context = super::UserUnwindContext {
+            sample_callchain: super::SampleCallchainPresence::Present,
             callchain: super::SampleCallchainState::KernelWithCallchain,
             initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
             initial_ip_is_dso: true,
