@@ -146,7 +146,11 @@ fn summarizes_dwarf_user_stack_payloads() {
 }
 
 #[test]
-fn drops_unmapped_dwarf_user_stack_payloads_like_perf_script() {
+fn keeps_unmapped_dwarf_user_stack_payloads_like_perf_libdw_ebl() {
+    // perf machine.c attempts thread__resolve_callchain_unwind() whenever the
+    // sample has user regs and a non-empty user stack. libdw
+    // __report_module() succeeds with no DSO, and elfutils frame_unwind.c can
+    // still fall back to x86_64_unwind() using frame pointers.
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -176,7 +180,7 @@ fn drops_unmapped_dwarf_user_stack_payloads_like_perf_script() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "");
+    assert_eq!(folded, "[unknown];0x1233;0x4000 1\n");
 }
 
 #[test]
@@ -544,7 +548,11 @@ fn folds_dwarf_user_stack_payloads_before_kernel_callchain_frames() {
 }
 
 #[test]
-fn drops_kernel_addresses_synthesized_from_dwarf_user_stack_like_perf_script() {
+fn keeps_unmapped_kernel_looking_user_unwind_frame_like_perf_libdw_entry() {
+    // perf's libdw entry path reports unwind frames with
+    // thread__find_symbol(..., PERF_RECORD_MISC_USER, ip). If that lookup finds
+    // no DSO, __report_module() returns success and unwind_entry() later keeps
+    // the unresolved frame unless hide_unresolved is set.
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -574,7 +582,7 @@ fn drops_kernel_addresses_synthesized_from_dwarf_user_stack_like_perf_script() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "[unknown];0x4000;0x9000 1\n");
+    assert_eq!(folded, "[unknown];0xffffffff80ffffff;0x4000;0x9000 1\n");
 }
 
 #[test]
@@ -805,7 +813,10 @@ fn keeps_recorded_user_frame_without_dwarf_callers_for_mixed_callchain_like_perf
 }
 
 #[test]
-fn drops_dwarf_user_stack_for_kernel_sample_without_kernel_callchain_like_perf_script() {
+fn keeps_dwarf_user_stack_for_kernel_sample_without_kernel_callchain_like_perf_libdw_ebl() {
+    // For ORDER_CALLEE, perf resolves the recorded callchain first and then
+    // calls thread__resolve_callchain_unwind(); an empty kernel callchain does
+    // not suppress the captured user-regs/user-stack unwind path.
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -836,7 +847,7 @@ fn drops_dwarf_user_stack_for_kernel_sample_without_kernel_callchain_like_perf_s
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "");
+    assert_eq!(folded, "[unknown];0x1233;0x4000 1\n");
 }
 
 #[test]
@@ -923,7 +934,11 @@ fn limits_dwarf_unwind_to_perf_user_stack_dynamic_size_like_perf_script() {
 }
 
 #[test]
-fn drops_current_ip_only_object_unwind_for_mapped_dwarf_user_stack_like_perf_libdw() {
+fn keeps_current_ip_only_object_unwind_for_mapped_dwarf_user_stack_like_perf_libdw() {
+    // elfutils dwfl_thread_getframes() invokes the callback for the initial
+    // state before attempting to unwind callers. perf's frame_callback() then
+    // calls entry(pc), so a single current-IP callback is a real frame, not
+    // something to drop.
     let current_exe = std::env::current_exe().expect("current exe");
     let current_exe = current_exe.to_string_lossy();
     let bytes = perfdata_with_records_and_attrs(
@@ -960,12 +975,16 @@ fn drops_current_ip_only_object_unwind_for_mapped_dwarf_user_stack_like_perf_lib
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
+    let expected = format!("[unknown];{}+0x4000 1\n", current_exe.as_ref());
 
-    assert_eq!(folded, "");
+    assert_eq!(folded, expected);
 }
 
 #[test]
-fn drops_current_ip_only_object_unwind_after_first_non_text_mapping_like_perf_libdw() {
+fn keeps_current_ip_only_object_unwind_after_first_non_text_mapping_like_perf_libdw() {
+    // perf reports the module selected by thread__find_symbol() for the
+    // callback PC. If that report succeeds, entry() stores the current IP even
+    // when no caller is recovered.
     let current_exe = std::env::current_exe().expect("current exe");
     let current_exe = current_exe.to_string_lossy();
     let bytes = perfdata_with_records_and_attrs(
@@ -1006,12 +1025,13 @@ fn drops_current_ip_only_object_unwind_after_first_non_text_mapping_like_perf_li
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
+    let expected = format!("[unknown];{}+0x1000 1\n", current_exe.as_ref());
 
-    assert_eq!(folded, "");
+    assert_eq!(folded, expected);
 }
 
 #[test]
-fn drops_current_ip_only_object_unwind_from_executable_mmap2_like_perf_libdw() {
+fn keeps_current_ip_only_object_unwind_from_executable_mmap2_like_perf_libdw() {
     let current_exe = std::env::current_exe().expect("current exe");
     let current_exe = current_exe.to_string_lossy();
     let bytes = perfdata_with_records_and_attrs(
@@ -1060,12 +1080,13 @@ fn drops_current_ip_only_object_unwind_from_executable_mmap2_like_perf_libdw() {
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
+    let expected = format!("[unknown];{}+0x4000 1\n", current_exe.as_ref());
 
-    assert_eq!(folded, "");
+    assert_eq!(folded, expected);
 }
 
 #[test]
-fn drops_current_ip_only_object_unwind_from_pid_specific_modules_like_perf_libdw() {
+fn keeps_current_ip_only_object_unwind_from_pid_specific_modules_like_perf_libdw() {
     let current_exe = std::env::current_exe().expect("current exe");
     let current_exe = current_exe.to_string_lossy();
     let bytes = perfdata_with_records_and_attrs(
@@ -1106,8 +1127,9 @@ fn drops_current_ip_only_object_unwind_from_pid_specific_modules_like_perf_libdw
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
+    let expected = format!("[unknown];{}+0x4000 1\n", current_exe.as_ref());
 
-    assert_eq!(folded, "");
+    assert_eq!(folded, expected);
 }
 
 #[cfg(target_os = "linux")]

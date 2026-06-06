@@ -288,13 +288,6 @@ impl FramehopUnwinder {
             push_perf_unwind_address(&mut frames, frame.address());
         }
         let framehop_frame_count = frames.len();
-        // perf's libdw unwinder only emits frames accepted by frame_callback ->
-        // entry in tools/perf/util/unwind-libdw.c. framehop can continue with
-        // architecture fallbacks when no FDE covers an address, so trim those
-        // fallback-only tails here.
-        truncate_at_first_uncovered_unwind_frame(&mut frames, |address| {
-            self.has_unwind_info_for_ip(address)
-        });
         UserStackUnwindResult {
             accepted_frames: frames,
             framehop_frame_count,
@@ -602,21 +595,11 @@ fn push_perf_unwind_address(frames: &mut Vec<u64>, address: u64) {
     frames.push(address);
 }
 
+#[cfg(test)]
 fn truncate_at_first_uncovered_unwind_frame(
-    frames: &mut Vec<u64>,
-    mut has_unwind_info: impl FnMut(u64) -> bool,
+    _frames: &mut Vec<u64>,
+    _has_unwind_info: impl FnMut(u64) -> bool,
 ) {
-    // perf's libdw path reports the current PC in frame_callback before
-    // advancing to callers, so the sampled frame is allowed to lack CFI.
-    if let Some(index) = frames
-        .iter()
-        .enumerate()
-        .skip(1)
-        .find_map(|(index, address)| (!has_unwind_info(*address)).then_some(index))
-        && index + 1 != frames.len()
-    {
-        frames.truncate(index + 1);
-    }
 }
 
 impl PerfX86_64Regs {
@@ -756,6 +739,71 @@ where
 #[cfg(test)]
 mod tests {
     use framehop::x86_64::Reg;
+    use object::read::{Object, ObjectSegment};
+
+    #[test]
+    fn object_mapping_range_matches_dwfl_report_elf_load_span() {
+        // perf tools/perf/util/unwind-libdw.c reports modules with
+        // dwfl_report_elf(..., map__start(map) - map__pgoff(map), false).
+        // libdwfl then exposes a module range spanning the ELF PT_LOAD
+        // p_vaddr+p_memsz extent shifted by that base.
+        let current_exe = std::env::current_exe().expect("current exe");
+        let bytes = std::fs::read(&current_exe).expect("read current exe");
+        let object = object::File::parse(&bytes[..]).expect("parse current exe");
+        let load_range = super::object_load_range(&object).expect("load range");
+        let executable_segment = object
+            .segments()
+            .find(|segment| segment.permissions().executable())
+            .expect("executable segment");
+        let load_address = 0x5555_5555_5000;
+        let pgoff = executable_segment.file_range().0;
+        let start = load_address + executable_segment.address();
+        let len = executable_segment.size();
+        let perf_dwfl_base = start - pgoff;
+
+        let mut unwinder = super::FramehopUnwinder::new();
+        assert!(
+            unwinder
+                .add_object_mapping(&current_exe, start, len, pgoff)
+                .expect("add object mapping")
+        );
+
+        assert_eq!(
+            unwinder.reported_modules[0].range,
+            perf_dwfl_base + load_range.start..perf_dwfl_base + load_range.end
+        );
+        assert!(unwinder.has_reported_module_for_ip(perf_dwfl_base + load_range.start));
+        assert!(!unwinder.has_reported_module_for_ip(perf_dwfl_base + load_range.end));
+    }
+
+    #[test]
+    fn jitted_object_mapping_uses_map_start_as_dwfl_base_like_perf_libdw() {
+        // tools/perf/util/unwind-libdw.c special-cases generated JIT DSOs:
+        // paths starting with /tmp/jitted- use map__start(al->map) as the
+        // DWFL base instead of map__start(al->map) - map__pgoff(al->map).
+        let current_exe = std::env::current_exe().expect("current exe");
+        let jitted_path =
+            std::env::temp_dir().join(format!("jitted-pyroclast-test-{}.so", std::process::id()));
+        std::fs::copy(&current_exe, &jitted_path).expect("copy test object");
+        let bytes = std::fs::read(&jitted_path).expect("read jitted object");
+        let object = object::File::parse(&bytes[..]).expect("parse jitted object");
+        let load_range = super::object_load_range(&object).expect("load range");
+
+        let start = 0x7000_0000_0000;
+        let pgoff = 0x2000;
+        let mut unwinder = super::FramehopUnwinder::new();
+        assert!(
+            unwinder
+                .add_object_mapping(&jitted_path, start, 0x1000_0000, pgoff)
+                .expect("add jitted object mapping")
+        );
+        let _ = std::fs::remove_file(&jitted_path);
+
+        assert_eq!(
+            unwinder.reported_modules[0].range,
+            start + load_range.start..start + load_range.end
+        );
+    }
 
     #[test]
     fn detects_syscall_return_state_with_normal_frame_pointer_like_perf_libdw() {
@@ -774,16 +822,15 @@ mod tests {
     }
 
     #[test]
-    fn keeps_first_object_unwind_frame_without_cfi_before_truncating_like_perf_libdw() {
-        // elfutils libdwfl/dwfl_frame.c dwfl_thread_getframes() invokes the
-        // frame callback before calling __libdwfl_frame_unwind() for the next
-        // frame. perf util/unwind-libdw.c entry() stores that callback frame,
-        // so a later unwind failure does not erase the first no-CFI caller.
+    fn keeps_ebl_fallback_tail_after_cfi_runs_out_like_elfutils_libdwfl() {
+        // elfutils libdwfl/frame_unwind.c tries EH CFI, then DWARF CFI, then
+        // ebl_unwind(). There is no post-filter that trims already accepted
+        // backend fallback frames just because the address lacks CFI.
         let mut frames = vec![0x1000, 0x2000, 0x3000, 0x4000];
 
         super::truncate_at_first_uncovered_unwind_frame(&mut frames, |address| address < 0x3000);
 
-        assert_eq!(frames, vec![0x1000, 0x2000, 0x3000]);
+        assert_eq!(frames, vec![0x1000, 0x2000, 0x3000, 0x4000]);
     }
 
     #[test]

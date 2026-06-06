@@ -357,6 +357,22 @@ impl MmapTable {
     }
 
     #[must_use]
+    pub(crate) fn has_overlapping_user_mapping_for_pid(
+        &self,
+        pid: u32,
+        start: u64,
+        len: u64,
+    ) -> bool {
+        let end = start.saturating_add(len);
+        self.mappings.iter().any(|mapping| {
+            mapping.pid == pid
+                && mapping.is_user_file_mapping()
+                && start < mapping.end()
+                && mapping.start < end
+        })
+    }
+
+    #[must_use]
     #[cfg(test)]
     pub(crate) fn has_mapping_for_pid_cached(
         &self,

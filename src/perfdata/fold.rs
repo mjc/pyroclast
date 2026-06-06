@@ -15,12 +15,13 @@ use crate::perfdata::build_id::{
 };
 use crate::perfdata::endian::{read_u32, read_u64};
 use crate::perfdata::header::{PerfFeatureSection, PerfHeader, parse_header};
-use crate::perfdata::mappings::{FileIdentity, MappingResolveCache, MmapTable, ResolvedMappingRef};
+use crate::perfdata::mappings::{
+    FileIdentity, MappingResolveCache, MmapTable, ResolvedMappingRef, UserMapping,
+};
 use crate::perfdata::raw_stack::{RawStackAccumulator, RawStackEntryRef};
 use crate::perfdata::records::{
-    Mmap2Record, PERF_RECORD_FINISHED_ROUND, PERF_RECORD_MISC_CPUMODE_KERNEL,
-    PERF_RECORD_MISC_CPUMODE_MASK, ParsedRecord, PerfRecord, PerfRecordHeader, iter_records,
-    parse_record, parse_record_header,
+    PERF_RECORD_FINISHED_ROUND, PERF_RECORD_MISC_CPUMODE_KERNEL, PERF_RECORD_MISC_CPUMODE_MASK,
+    ParsedRecord, PerfRecord, PerfRecordHeader, iter_records, parse_record, parse_record_header,
 };
 use crate::perfdata::samples::{
     PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_ID,
@@ -30,7 +31,7 @@ use crate::perfdata::samples::{
 };
 use crate::perfdata::unwind::{
     FramehopUnwinder, PerfX86_64Regs, UserStackUnwindResult, UserStackUnwinder,
-    unwind_x86_64_frame_pointer_stack_like_elfutils, unwind_x86_64_stack,
+    unwind_x86_64_frame_pointer_stack_like_elfutils,
 };
 use crate::symbols::{SymbolFrameCache, SymbolRequest, SymbolResolver, perf_build_id_elf_path};
 
@@ -118,16 +119,7 @@ struct PidUnwindState {
 
 type UnwindMappingKey = (String, u64, u64, u64);
 type UnwindModuleKey = (String, u64);
-
-struct OwnedUnwindMappingRequest {
-    start: u64,
-    len: u64,
-    pgoff: u64,
-    prot: Option<u32>,
-    path: String,
-    build_id: Option<Vec<u8>>,
-    file_identity: Option<FileIdentity>,
-}
+const MAX_LIBDW_CALLBACK_REPORT_PASSES: usize = 8;
 
 struct TimedRecord {
     index: usize,
@@ -187,7 +179,6 @@ enum FoldFrame {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UserUnwindSource {
     None,
-    FramePointer,
     Object,
 }
 
@@ -1295,20 +1286,10 @@ impl FoldAccumulator {
                 Ok(())
             }
             ParsedRecord::Mmap(record) => {
-                let unwind_state = self.unwind_state_mut(record.pid);
-                load_unwind_mapping(
-                    &mut unwind_state.object_unwinder,
-                    &mut unwind_state.attempted_unwind_mappings,
-                    &mut unwind_state.loaded_unwind_modules,
-                    UnwindMappingRequest {
-                        start: record.start,
-                        len: record.len,
-                        pgoff: record.pgoff,
-                        prot: None,
-                        path: &record.path,
-                        file_identity: None,
-                        build_id: None,
-                    },
+                self.invalidate_pid_unwinder_if_mapping_overlaps_like_perf(
+                    record.pid,
+                    record.start,
+                    record.len,
                 );
                 self.mmap_table.insert_mmap(record);
                 Ok(())
@@ -1322,56 +1303,25 @@ impl FoldAccumulator {
                 Ok(())
             }
             ParsedRecord::Mmap2(record) => {
+                self.invalidate_pid_unwinder_if_mapping_overlaps_like_perf(
+                    record.pid,
+                    record.start,
+                    record.len,
+                );
                 let build_id = self.header_build_ids.get(&record.path).cloned();
                 if let Some(build_id) = build_id {
-                    let unwind_debug_dir = self.unwind_debug_dir.clone();
-                    let unwind_state = self.unwind_state_mut(record.pid);
-                    load_build_id_unwind_mapping(
-                        &mut unwind_state.object_unwinder,
-                        &mut unwind_state.attempted_unwind_mappings,
-                        &mut unwind_state.loaded_unwind_modules,
-                        UnwindMappingRequest {
-                            start: record.start,
-                            len: record.len,
-                            pgoff: record.pgoff,
-                            prot: Some(record.prot),
-                            path: &record.path,
-                            file_identity: Some(mmap2_file_identity(&record)),
-                            build_id: Some(&build_id),
-                        },
-                        unwind_debug_dir.as_deref(),
-                    );
                     self.mmap_table
                         .insert_mmap2_with_build_id(record, Some(build_id));
                 } else {
-                    let unwind_state = self.unwind_state_mut(record.pid);
-                    load_mmap2_unwind_mapping(
-                        &mut unwind_state.object_unwinder,
-                        &mut unwind_state.attempted_unwind_mappings,
-                        &mut unwind_state.loaded_unwind_modules,
-                        &record,
-                    );
                     self.mmap_table.insert_mmap2(record);
                 }
                 Ok(())
             }
             ParsedRecord::Mmap2BuildId(record) => {
-                let unwind_debug_dir = self.unwind_debug_dir.clone();
-                let unwind_state = self.unwind_state_mut(record.pid);
-                load_build_id_unwind_mapping(
-                    &mut unwind_state.object_unwinder,
-                    &mut unwind_state.attempted_unwind_mappings,
-                    &mut unwind_state.loaded_unwind_modules,
-                    UnwindMappingRequest {
-                        start: record.start,
-                        len: record.len,
-                        pgoff: record.pgoff,
-                        prot: Some(record.prot),
-                        path: &record.path,
-                        file_identity: None,
-                        build_id: Some(&record.build_id),
-                    },
-                    unwind_debug_dir.as_deref(),
+                self.invalidate_pid_unwinder_if_mapping_overlaps_like_perf(
+                    record.pid,
+                    record.start,
+                    record.len,
                 );
                 self.mmap_table.insert_mmap2_build_id(record);
                 Ok(())
@@ -1391,55 +1341,9 @@ impl FoldAccumulator {
             &mut self.thread_comms,
             record,
         );
+        self.unwind_states.remove(&record.pid);
         if record.clone_maps {
             self.mmap_table.clone_pid_mappings(record.ppid, record.pid);
-            self.prepare_pid_unwind_mappings(record.pid);
-        }
-    }
-
-    fn prepare_pid_unwind_mappings(&mut self, pid: u32) {
-        let mappings = self
-            .mmap_table
-            .user_mappings()
-            .filter(|mapping| mapping.pid == pid)
-            .map(|mapping| OwnedUnwindMappingRequest {
-                start: mapping.start,
-                len: mapping.len,
-                pgoff: mapping.pgoff,
-                prot: mapping.prot,
-                path: mapping.path.to_owned(),
-                build_id: mapping.build_id.map(<[u8]>::to_vec),
-                file_identity: mapping.file_identity,
-            })
-            .collect::<Vec<_>>();
-        let unwind_debug_dir = self.unwind_debug_dir.clone();
-        let unwind_state = self.unwind_state_mut(pid);
-        for mapping in mappings {
-            let request = UnwindMappingRequest {
-                start: mapping.start,
-                len: mapping.len,
-                pgoff: mapping.pgoff,
-                prot: mapping.prot,
-                path: &mapping.path,
-                file_identity: mapping.file_identity,
-                build_id: mapping.build_id.as_deref(),
-            };
-            if request.build_id.is_some() {
-                load_build_id_unwind_mapping(
-                    &mut unwind_state.object_unwinder,
-                    &mut unwind_state.attempted_unwind_mappings,
-                    &mut unwind_state.loaded_unwind_modules,
-                    request,
-                    unwind_debug_dir.as_deref(),
-                );
-            } else {
-                load_unwind_mapping(
-                    &mut unwind_state.object_unwinder,
-                    &mut unwind_state.attempted_unwind_mappings,
-                    &mut unwind_state.loaded_unwind_modules,
-                    request,
-                );
-            }
         }
     }
 
@@ -1452,6 +1356,23 @@ impl FoldAccumulator {
 
     fn unwind_state_mut(&mut self, pid: u32) -> &mut PidUnwindState {
         self.unwind_states.entry(pid).or_default()
+    }
+
+    fn invalidate_pid_unwinder_if_mapping_overlaps_like_perf(
+        &mut self,
+        pid: u32,
+        start: u64,
+        len: u64,
+    ) {
+        if self
+            .mmap_table
+            .has_overlapping_user_mapping_for_pid(pid, start, len)
+        {
+            // perf's map removal path invalidates the per-maps DWFL address
+            // space. Its overlap-fix insert path replaces/removes maps inline,
+            // so stale modules must not survive into later report_module calls.
+            self.unwind_states.remove(&pid);
+        }
     }
 }
 
@@ -1690,34 +1611,23 @@ impl FoldAccumulator {
         };
         let path = mapping.path.to_string();
         let build_id = mapping.build_id.map(<[u8]>::to_vec);
-        let request = UnwindMappingRequest {
+        let mapping = UserMapping {
+            pid: mapping.pid,
             start: mapping.start,
             len: mapping.len,
             pgoff: mapping.pgoff,
             prot: mapping.prot,
             path: &path,
-            file_identity: mapping.file_identity,
             build_id: build_id.as_deref(),
+            file_identity: mapping.file_identity,
         };
-        if build_id.is_some() {
-            let unwind_debug_dir = self.unwind_debug_dir.clone();
-            let unwind_state = self.unwind_state_mut(pid);
-            load_build_id_unwind_mapping(
-                &mut unwind_state.object_unwinder,
-                &mut unwind_state.attempted_unwind_mappings,
-                &mut unwind_state.loaded_unwind_modules,
-                request,
-                unwind_debug_dir.as_deref(),
-            );
-        } else {
-            let unwind_state = self.unwind_state_mut(pid);
-            load_unwind_mapping(
-                &mut unwind_state.object_unwinder,
-                &mut unwind_state.attempted_unwind_mappings,
-                &mut unwind_state.loaded_unwind_modules,
-                request,
-            );
-        }
+        let unwind_debug_dir = self.unwind_debug_dir.clone();
+        let unwind_state = self.unwind_state_mut(pid);
+        load_unwind_mapping_for_user_mapping_like_perf(
+            unwind_state,
+            mapping,
+            unwind_debug_dir.as_deref(),
+        );
     }
 
     fn add_deferred_callchain(&mut self, cookie: u64, tid: Option<u32>, ips: &[u64]) {
@@ -1805,7 +1715,7 @@ fn is_valid_unwound_user_frame(
     let (FoldFrame::UserUnwind(address) | FoldFrame::InlineCurrentIp(address)) = frame else {
         return true;
     };
-    !is_kernel_space_frame(address)
+    address != 0
 }
 
 fn comm_for_ids<'a>(
@@ -2237,6 +2147,16 @@ impl<'a> FoldFrameResolver<'a> {
         R: SymbolResolver,
         W: IoWrite + ?Sized,
     {
+        if symbol_cache.is_none() {
+            self.write_regular_script_frame(
+                pid,
+                FoldFrame::UserUnwind(address),
+                None::<&mut SymbolFrameCache<'_, R>>,
+                mapping_cache,
+                writer,
+            )?;
+            return Ok(());
+        }
         if let Some(frames) =
             self.resolve_inline_current_ip_frames(pid, address, symbol_cache, mapping_cache)?
         {
@@ -2862,12 +2782,6 @@ fn unwind_user_stack_like_perf(
     };
     match choose_user_unwind_source(context) {
         UserUnwindSource::None => Vec::new(),
-        UserUnwindSource::FramePointer => {
-            perf_accepted_unwind_frames(unwind_x86_64_stack(*regs, stack_bytes, 256))
-                .into_iter()
-                .map(FoldFrame::UserUnwind)
-                .collect()
-        }
         UserUnwindSource::Object => {
             unwind_object_stack_like_perf(accumulator, sample.pid, regs, stack_bytes, context)
         }
@@ -2884,48 +2798,73 @@ fn unwind_object_stack_like_perf(
     let Some(pid_value) = pid else {
         return Vec::new();
     };
-    accumulator.prepare_pid_unwind_mappings(pid_value);
-    let Some(state) = accumulator.unwind_states.get_mut(&pid_value) else {
+    let Some(mut state) = accumulator.unwind_states.remove(&pid_value) else {
         return Vec::new();
     };
-    let (frames, maybe_inline_current_ip) = unwind_object_frame_addresses_like_perf(
-        state,
-        pid,
+    let unwind_debug_dir = accumulator.unwind_debug_dir.clone();
+    let frames = unwind_object_frame_addresses_like_perf(
+        &mut state,
+        pid_value,
         &accumulator.mmap_table,
+        unwind_debug_dir.as_deref(),
         regs,
         stack_bytes,
         context,
     );
-    let mut fold_frames = frames
+    accumulator.unwind_states.insert(pid_value, state);
+    frames
         .into_iter()
-        .map(FoldFrame::UserUnwind)
-        .collect::<Vec<_>>();
-    if maybe_inline_current_ip && fold_frames.is_empty() {
-        fold_frames.push(FoldFrame::InlineCurrentIp(regs.ip));
-    }
-    fold_frames
+        .enumerate()
+        .map(|(index, address)| {
+            if index == 0 && address == regs.ip {
+                FoldFrame::InlineCurrentIp(address)
+            } else {
+                FoldFrame::UserUnwind(address)
+            }
+        })
+        .collect::<Vec<_>>()
 }
 
 fn unwind_object_frame_addresses_like_perf(
     state: &mut PidUnwindState,
-    pid: Option<u32>,
+    pid: u32,
     mmap_table: &MmapTable,
+    unwind_debug_dir: Option<&Path>,
     regs: &PerfX86_64Regs,
     stack_bytes: &[u8],
     context: UserUnwindContext,
-) -> (Vec<u64>, bool) {
-    let initial_frame_policy = object_unwind_initial_frame_policy(pid, regs.ip, mmap_table);
-    let object_unwind =
+) -> Vec<u64> {
+    let initial_frame_policy = object_unwind_initial_frame_policy(Some(pid), regs.ip, mmap_table);
+    report_unwind_module_for_ip_like_perf(state, mmap_table, pid, regs.ip, unwind_debug_dir);
+    let mut object_unwind =
         unwind_user_stack_with_diagnostics(&mut state.object_unwinder, *regs, stack_bytes, 256);
+    for _ in 0..MAX_LIBDW_CALLBACK_REPORT_PASSES {
+        if !report_unwind_modules_for_frame_callbacks_like_perf(
+            state,
+            mmap_table,
+            pid,
+            &object_unwind.accepted_frames,
+            unwind_debug_dir,
+        ) {
+            break;
+        }
+        let next_unwind =
+            unwind_user_stack_with_diagnostics(&mut state.object_unwinder, *regs, stack_bytes, 256);
+        if next_unwind == object_unwind {
+            break;
+        }
+        object_unwind = next_unwind;
+    }
     let raw_frames = object_unwind.accepted_frames;
+    let initial_ip_has_reported_module = initial_ip_mapping_has_reported_unwind_module(
+        Some(pid),
+        regs.ip,
+        mmap_table,
+        &state.object_unwinder,
+    );
     let use_libdw_arch_fallback = should_use_libdw_arch_fallback_after_empty_object_unwind(
         context,
-        initial_ip_mapping_has_reported_unwind_module(
-            pid,
-            regs.ip,
-            mmap_table,
-            &state.object_unwinder,
-        ),
+        initial_ip_has_reported_module,
     );
     let raw_frames = libdw_arch_fallback_after_empty_object_unwind(
         raw_frames,
@@ -2934,21 +2873,12 @@ fn unwind_object_frame_addresses_like_perf(
         use_libdw_arch_fallback,
     );
     let raw_frames = truncate_syscall_return_unwind_after_first_executable_frame(
-        raw_frames, pid, mmap_table, context,
-    );
-    let maybe_inline_current_ip = should_salvage_inline_current_ip_after_empty_object_unwind(
-        raw_frames.is_empty(),
-        object_unwind.framehop_frame_count,
-        regs,
+        raw_frames,
+        Some(pid),
+        mmap_table,
         context,
     );
-    let frames = perf_accepted_object_unwind_frames(
-        regs,
-        context.callchain,
-        initial_frame_policy,
-        raw_frames,
-    );
-    (frames, maybe_inline_current_ip)
+    perf_accepted_object_unwind_frames(regs, context.callchain, initial_frame_policy, raw_frames)
 }
 
 fn libdw_arch_fallback_after_empty_object_unwind(
@@ -2965,48 +2895,19 @@ fn libdw_arch_fallback_after_empty_object_unwind(
 }
 
 fn truncate_syscall_return_unwind_after_first_executable_frame(
-    mut raw_frames: Vec<u64>,
-    pid: Option<u32>,
-    mmap_table: &MmapTable,
-    context: UserUnwindContext,
+    raw_frames: Vec<u64>,
+    _pid: Option<u32>,
+    _mmap_table: &MmapTable,
+    _context: UserUnwindContext,
 ) -> Vec<u64> {
-    if context.callchain != SampleCallchainState::KernelWithCallchain
-        || !context.syscall_return_state
-    {
-        return raw_frames;
-    }
-    let Some(pid) = pid else {
-        return raw_frames;
-    };
-
-    let mut saw_shared_object_frame = false;
-    let mut mapping_cache = MappingResolveCache::default();
-    for (index, address) in raw_frames.iter().enumerate() {
-        let Some(mapping) = mmap_table.resolve_ref_cached(pid, *address, &mut mapping_cache) else {
-            continue;
-        };
-        if is_shared_object_mapping_path(mapping.path) {
-            saw_shared_object_frame = true;
-        } else if saw_shared_object_frame {
-            // perf's libdw path accepts this executable callback frame and then
-            // stops when unwinding that frame fails. In the octo trace, perf -v
-            // logs "no map for 3291a" after the executable frame and does not
-            // emit framehop's deeper Rust callers.
-            raw_frames.truncate(index + 1);
-            break;
-        }
-    }
     raw_frames
 }
 
 fn should_use_libdw_arch_fallback_after_empty_object_unwind(
     context: UserUnwindContext,
-    initial_ip_mapping_has_reported_module: bool,
+    _initial_ip_mapping_has_reported_module: bool,
 ) -> bool {
-    context.initial_ip_mapping == InitialIpMappingState::RecordedMappingLoaded
-        && initial_ip_mapping_has_reported_module
-        && context.initial_ip_is_dso
-        && context.syscall_return_state
+    context.initial_ip_mapping != InitialIpMappingState::RecordedMappingMissing
 }
 
 fn initial_ip_mapping_has_reported_unwind_module(
@@ -3021,6 +2922,81 @@ fn initial_ip_mapping_has_reported_unwind_module(
         && object_unwinder.has_reported_module_for_ip(ip)
 }
 
+fn report_unwind_modules_for_frame_callbacks_like_perf(
+    state: &mut PidUnwindState,
+    mmap_table: &MmapTable,
+    pid: u32,
+    frame_addresses: &[u64],
+    unwind_debug_dir: Option<&Path>,
+) -> bool {
+    let mut loaded = false;
+    for address in frame_addresses {
+        loaded |= report_unwind_module_for_ip_like_perf(
+            state,
+            mmap_table,
+            pid,
+            *address,
+            unwind_debug_dir,
+        );
+        loaded |= report_unwind_module_for_ip_like_perf(
+            state,
+            mmap_table,
+            pid,
+            address.saturating_add(1),
+            unwind_debug_dir,
+        );
+    }
+    loaded
+}
+
+fn report_unwind_module_for_ip_like_perf(
+    state: &mut PidUnwindState,
+    mmap_table: &MmapTable,
+    pid: u32,
+    ip: u64,
+    unwind_debug_dir: Option<&Path>,
+) -> bool {
+    mmap_table
+        .user_mapping_for_pid_ip(pid, ip)
+        .is_some_and(|mapping| {
+            load_unwind_mapping_for_user_mapping_like_perf(state, mapping, unwind_debug_dir)
+        })
+}
+
+fn load_unwind_mapping_for_user_mapping_like_perf(
+    state: &mut PidUnwindState,
+    mapping: UserMapping<'_>,
+    unwind_debug_dir: Option<&Path>,
+) -> bool {
+    let path = mapping.path.to_string();
+    let build_id = mapping.build_id.map(<[u8]>::to_vec);
+    let request = UnwindMappingRequest {
+        start: mapping.start,
+        len: mapping.len,
+        pgoff: mapping.pgoff,
+        prot: mapping.prot,
+        path: &path,
+        file_identity: mapping.file_identity,
+        build_id: build_id.as_deref(),
+    };
+    if build_id.is_some() {
+        load_build_id_unwind_mapping(
+            &mut state.object_unwinder,
+            &mut state.attempted_unwind_mappings,
+            &mut state.loaded_unwind_modules,
+            request,
+            unwind_debug_dir,
+        )
+    } else {
+        load_unwind_mapping(
+            &mut state.object_unwinder,
+            &mut state.attempted_unwind_mappings,
+            &mut state.loaded_unwind_modules,
+            request,
+        )
+    }
+}
+
 fn unwind_user_stack_with_diagnostics(
     unwinder: &mut impl UserStackUnwinder,
     regs: PerfX86_64Regs,
@@ -3030,48 +3006,13 @@ fn unwind_user_stack_with_diagnostics(
     unwinder.unwind_user_stack(regs, stack_bytes, max_frames)
 }
 
-fn should_salvage_inline_current_ip_after_empty_object_unwind(
-    raw_object_unwind_is_empty: bool,
-    raw_object_unwind_frame_count: usize,
-    _regs: &PerfX86_64Regs,
-    context: UserUnwindContext,
-) -> bool {
-    raw_object_unwind_is_empty
-        && context.initial_ip_mapping == InitialIpMappingState::RecordedMappingLoaded
-        && context.module_count > 0
-        && raw_object_unwind_frame_count > 1
-}
-
 fn choose_user_unwind_source(context: UserUnwindContext) -> UserUnwindSource {
     if context.initial_ip_mapping == InitialIpMappingState::RecordedMappingMissing {
         UserUnwindSource::None
-    } else if context.module_count == 0 {
-        if has_perf_frame_pointer_fallback(context)
-            && context.initial_ip_mapping == InitialIpMappingState::NoRecordedMapping
-        {
-            UserUnwindSource::FramePointer
-        } else {
-            UserUnwindSource::None
-        }
     } else if has_perf_object_unwind(context) {
         UserUnwindSource::Object
     } else {
         UserUnwindSource::None
-    }
-}
-
-fn has_perf_frame_pointer_fallback(context: UserUnwindContext) -> bool {
-    match context.callchain {
-        SampleCallchainState::KernelWithCallchain => {
-            context.frame_pointer_at_or_above_stack_pointer
-        }
-        SampleCallchainState::Other {
-            has_callchain: true,
-            has_frames: true,
-        } => true,
-        SampleCallchainState::KernelWithoutCallchain
-        | SampleCallchainState::KernelWithUserFrame
-        | SampleCallchainState::Other { .. } => false,
     }
 }
 
@@ -3127,16 +3068,11 @@ fn perf_effective_user_stack_bytes<'a>(
 }
 
 fn truncate_user_unwind_at_first_unmapped_frame(
-    pid: Option<u32>,
-    frames: &mut Vec<FoldFrame>,
-    mmap_table: &MmapTable,
-    mapping_cache: &mut MappingResolveCache,
+    _pid: Option<u32>,
+    _frames: &mut Vec<FoldFrame>,
+    _mmap_table: &MmapTable,
+    _mapping_cache: &mut MappingResolveCache,
 ) {
-    frames.retain(|frame| is_valid_unwound_user_frame(pid, *frame, mmap_table, mapping_cache));
-}
-
-fn perf_accepted_unwind_frames(unwound_frames: Vec<u64>) -> Vec<u64> {
-    unwound_frames
 }
 
 fn perf_accepted_object_unwind_frames(
@@ -3148,28 +3084,8 @@ fn perf_accepted_object_unwind_frames(
     // framehop yields the sampled instruction pointer before trying to advance.
     // perf's libdw path reports the IP to DWFL as initial state, then only
     // prints entries accepted via frame_callback/entry.
-    match unwound_frames.as_slice() {
-        [] => Vec::new(),
-        [ip] if *ip == regs.ip && regs.bp < regs.sp => match initial_frame_policy {
-            ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp
-            | ObjectUnwindInitialFramePolicy::KeepDsoLeaf => vec![*ip],
-        },
-        [ip] if *ip == regs.ip => match initial_frame_policy {
-            ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp => Vec::new(),
-            ObjectUnwindInitialFramePolicy::KeepDsoLeaf => vec![*ip],
-        },
-        [ip, _]
-            if *ip == regs.ip
-                && callchain
-                    == (SampleCallchainState::Other {
-                        has_callchain: false,
-                        has_frames: false,
-                    }) =>
-        {
-            Vec::new()
-        }
-        _ => unwound_frames,
-    }
+    let _ = (regs, callchain, initial_frame_policy);
+    unwound_frames
 }
 
 fn object_unwind_initial_frame_policy(
@@ -3205,16 +3121,16 @@ fn load_unwind_mapping(
     attempted_unwind_mappings: &mut BTreeSet<UnwindMappingKey>,
     loaded_unwind_modules: &mut BTreeSet<UnwindModuleKey>,
     request: UnwindMappingRequest<'_>,
-) {
+) -> bool {
     if !should_load_unwind_object(request.path, request.file_identity) {
-        return;
+        return false;
     }
     if request.prot.is_some_and(|prot| prot & PROT_EXEC == 0) {
-        return;
+        return false;
     }
     let key = unwind_mapping_key(request.path, request.start, request.len, request.pgoff);
     if !attempted_unwind_mappings.insert(key.clone()) {
-        return;
+        return false;
     }
     if object_unwinder
         .add_object_mapping(
@@ -3229,30 +3145,10 @@ fn load_unwind_mapping(
             request.path,
             request.start,
             request.pgoff,
-        ));
+        ))
+    } else {
+        false
     }
-}
-
-fn load_mmap2_unwind_mapping(
-    object_unwinder: &mut FramehopUnwinder,
-    attempted_unwind_mappings: &mut BTreeSet<UnwindMappingKey>,
-    loaded_unwind_modules: &mut BTreeSet<UnwindModuleKey>,
-    record: &Mmap2Record,
-) {
-    load_unwind_mapping(
-        object_unwinder,
-        attempted_unwind_mappings,
-        loaded_unwind_modules,
-        UnwindMappingRequest {
-            start: record.start,
-            len: record.len,
-            pgoff: record.pgoff,
-            prot: Some(record.prot),
-            path: &record.path,
-            file_identity: Some(mmap2_file_identity(record)),
-            build_id: None,
-        },
-    );
 }
 
 fn load_build_id_unwind_mapping(
@@ -3261,13 +3157,13 @@ fn load_build_id_unwind_mapping(
     loaded_unwind_modules: &mut BTreeSet<UnwindModuleKey>,
     request: UnwindMappingRequest<'_>,
     debug_dir: Option<&Path>,
-) {
+) -> bool {
     let Some(build_id) = request.build_id else {
-        return;
+        return false;
     };
     let object_path = unwind_object_path_for_build_id(request.path, build_id, debug_dir);
     if object_path.to_string_lossy().starts_with('[') {
-        return;
+        return false;
     }
     let object_path = object_path.to_string_lossy();
     let key = unwind_mapping_key(
@@ -3277,7 +3173,7 @@ fn load_build_id_unwind_mapping(
         request.pgoff,
     );
     if !attempted_unwind_mappings.insert(key.clone()) {
-        return;
+        return false;
     }
     if object_unwinder
         .add_object_mapping(
@@ -3292,7 +3188,9 @@ fn load_build_id_unwind_mapping(
             object_path.as_ref(),
             request.start,
             request.pgoff,
-        ));
+        ))
+    } else {
+        false
     }
 }
 
@@ -3313,15 +3211,6 @@ fn unwind_object_path_for_build_id(
         .map(|debug_dir| perf_build_id_elf_path(debug_dir, &build_id_hex(build_id)))
         .filter(|cached| cached.exists())
         .unwrap_or_else(|| PathBuf::from(path))
-}
-
-fn mmap2_file_identity(record: &Mmap2Record) -> FileIdentity {
-    FileIdentity {
-        major: record.major,
-        minor: record.minor,
-        inode: record.inode,
-        inode_generation: record.inode_generation,
-    }
 }
 
 fn should_load_unwind_object(path: &str, _file_identity: Option<FileIdentity>) -> bool {
@@ -3608,7 +3497,7 @@ mod tests {
     }
 
     #[test]
-    fn fork_clone_prepares_child_unwind_maps_like_perf_maps_copy_from() {
+    fn fork_clone_copies_maps_without_preloading_unwind_modules_like_perf() {
         let current_exe = std::env::current_exe().expect("current exe");
         let current_exe = current_exe.to_string_lossy().into_owned();
         let mut accumulator = super::FoldAccumulator::new(std::collections::BTreeMap::default());
@@ -3647,25 +3536,42 @@ mod tests {
             )
             .expect("fork");
 
-        assert_eq!(
+        assert!(
             accumulator
-                .unwind_states
-                .get(&22)
-                .map(|state| state.object_unwinder.module_count()),
-            Some(1)
+                .mmap_table
+                .user_mapping_for_pid_ip(22, 0)
+                .is_some(),
+            "perf copies address maps for forked children"
+        );
+        assert!(
+            accumulator.unwind_states.get(&22).is_none(),
+            "perf libdw reports modules lazily from sampled/callback PCs"
         );
     }
 
     #[test]
-    fn empty_unwind_for_loaded_module_does_not_invent_current_ip_like_perf_libdw() {
+    fn object_unwind_keeps_single_current_ip_callback_like_perf_libdw() {
+        // dwfl_thread_getframes() calls perf's frame_callback() for the initial
+        // frame before attempting to unwind callers. If entry() accepted that
+        // current IP, perf keeps it.
         assert_eq!(
-            super::perf_accepted_unwind_frames(Vec::new()),
-            Vec::<u64>::new()
+            super::perf_accepted_object_unwind_frames(
+                &test_regs(0x1000),
+                super::SampleCallchainState::Other {
+                    has_callchain: true,
+                    has_frames: false,
+                },
+                super::ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp,
+                vec![0x1000],
+            ),
+            vec![0x1000]
         );
     }
 
     #[test]
-    fn object_unwind_drops_short_fallback_stack_without_callchain_like_perf_libdw() {
+    fn object_unwind_keeps_short_fallback_stack_without_callchain_like_perf_libdw() {
+        // tools/perf/util/unwind-libdw.c does not filter accepted callbacks
+        // based on whether PERF_SAMPLE_CALLCHAIN contributed recorded frames.
         assert_eq!(
             super::perf_accepted_object_unwind_frames(
                 &test_regs(0x1000),
@@ -3676,7 +3582,7 @@ mod tests {
                 super::ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp,
                 vec![0x1000, 0x1100],
             ),
-            Vec::<u64>::new()
+            vec![0x1000, 0x1100]
         );
     }
 
@@ -3699,102 +3605,6 @@ mod tests {
                 Vec::new(),
             ),
             Vec::<u64>::new()
-        );
-    }
-
-    #[test]
-    fn empty_framehop_unwind_salvages_inline_current_ip_when_perf_libdw_can_emit_initial_frame() {
-        // tools/perf/util/unwind-libdw.c reports the sampled IP module, then
-        // stores frames from frame_callback() -> entry(). tools/perf/util/machine.c
-        // unwind_entry() lets append_inlines() replace a stored current-IP frame
-        // with inline frames. A framehop miss is therefore not proof that libdw
-        // produced no callbacks; rendering still drops this marker unless DWARF
-        // inline lookup finds a base symbol and an inline chain.
-        let mut regs = test_regs(0x5555_5577_096a);
-        regs.sp = 0x7fff_ffff_7830;
-        regs.bp = 0x76c8;
-
-        assert!(
-            super::should_salvage_inline_current_ip_after_empty_object_unwind(
-                true,
-                2,
-                &regs,
-                super::UserUnwindContext {
-                    callchain: super::SampleCallchainState::Other {
-                        has_callchain: true,
-                        has_frames: false,
-                    },
-                    initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
-                    initial_ip_is_dso: false,
-                    module_count: 1,
-                    frame_pointer_at_or_above_stack_pointer: false,
-                    syscall_return_state: false,
-                },
-            )
-        );
-    }
-
-    #[test]
-    fn empty_callchain_sample_without_accepted_frame_does_not_prove_libdw_initial_callback() {
-        // tools/perf/util/machine.c calls thread__resolve_callchain_unwind()
-        // when PERF_SAMPLE_REGS_USER and PERF_SAMPLE_STACK_USER are present,
-        // even if the PERF_SAMPLE_CALLCHAIN payload has no recorded frames.
-        // That is not enough to prove perf's libdw frame_callback accepted
-        // the initial frame; real perf.data files contain blank events with
-        // the same high-level shape.
-        let mut regs = test_regs(0x5555_5567_a0be);
-        regs.sp = 0x7fff_ffff_9030;
-        regs.bp = 0;
-
-        assert!(
-            !super::should_salvage_inline_current_ip_after_empty_object_unwind(
-                true,
-                0,
-                &regs,
-                super::UserUnwindContext {
-                    callchain: super::SampleCallchainState::Other {
-                        has_callchain: true,
-                        has_frames: false,
-                    },
-                    initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
-                    initial_ip_is_dso: false,
-                    module_count: 1,
-                    frame_pointer_at_or_above_stack_pointer: false,
-                    syscall_return_state: false,
-                },
-            )
-        );
-    }
-
-    #[test]
-    fn single_synthetic_framehop_frame_does_not_salvage_inline_current_ip_like_blank_perf_libdw() {
-        // Real period 4703553 from
-        // target/profiling-runs/octo-symbolized-fold-final/profile.raw.perf.data:
-        // perf script -D shows user regs/stack and an inline-capable sampled IP,
-        // but perf -v has no matching unwind:...ip entry, so perf script prints
-        // a blank stack. framehop's synthetic initial frame is not enough to
-        // model a libdw frame_callback() -> entry() emission.
-        let mut regs = test_regs(0x5555_557e_8995);
-        regs.sp = 0x7fff_ffff_87a0;
-        regs.bp = 0x7fff_e91e_77c8;
-
-        assert!(
-            !super::should_salvage_inline_current_ip_after_empty_object_unwind(
-                true,
-                1,
-                &regs,
-                super::UserUnwindContext {
-                    callchain: super::SampleCallchainState::Other {
-                        has_callchain: true,
-                        has_frames: false,
-                    },
-                    initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
-                    initial_ip_is_dso: false,
-                    module_count: 1,
-                    frame_pointer_at_or_above_stack_pointer: false,
-                    syscall_return_state: false,
-                },
-            )
         );
     }
 
@@ -3852,11 +3662,10 @@ mod tests {
     }
 
     #[test]
-    fn inline_current_ip_with_single_symbol_renders_no_folded_stack_like_perf_libdw() {
-        // Real period 4753323 sample from
-        // target/profiling-runs/octo-symbolized-fold-final/profile.raw.perf.data:
-        // perf script -D shows captured user regs/stack and FP chain nr:0, but
-        // perf script emits an empty stack for IP 0x555555676876.
+    fn inline_current_ip_without_base_symbol_renders_module_fallback_like_perf_unwind_entry() {
+        // tools/perf/util/machine.c append_inlines() returns nonzero when
+        // ms.sym is missing. unwind_entry() then appends the unresolved
+        // map_symbol, which Inferno collapses through the module fallback.
         let mut mmap_table = super::MmapTable::default();
         mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
             pid: 11,
@@ -3883,7 +3692,7 @@ mod tests {
             )
             .expect("render folded stack");
 
-        assert_eq!(buffers.rendered, "");
+        assert_eq!(buffers.rendered, "pyroclast;[pyroclast]");
     }
 
     #[test]
@@ -3923,9 +3732,11 @@ mod tests {
     }
 
     #[test]
-    fn inline_current_ip_without_base_symbol_renders_no_folded_stack_like_perf_append_inlines() {
+    fn inline_current_ip_without_base_symbol_skips_inline_chain_but_keeps_module_fallback_like_perf()
+     {
         // tools/perf/util/machine.c append_inlines() returns before expanding
-        // DWARF inline frames when thread__find_symbol() did not populate ms.sym.
+        // DWARF inline frames when thread__find_symbol() did not populate
+        // ms.sym, but unwind_entry() still appends the unresolved map_symbol.
         let mut mmap_table = super::MmapTable::default();
         mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
             pid: 11,
@@ -3956,7 +3767,7 @@ mod tests {
             )
             .expect("render folded stack");
 
-        assert_eq!(buffers.rendered, "");
+        assert_eq!(buffers.rendered, "pyroclast;[pyroclast]");
     }
 
     #[test]
@@ -4174,6 +3985,10 @@ mod tests {
 
     #[test]
     fn keeps_unmapped_middle_user_unwind_frame_like_perf_libdw_entry() {
+        // tools/perf/util/unwind-libdw.c entry() calls __report_module() for
+        // each callback IP, but __report_module() returns success when
+        // thread__find_symbol() finds no DSO. With hide_unresolved disabled,
+        // tools/perf/util/machine.c unwind_entry() appends unresolved entries.
         let mut mmap_table = super::MmapTable::default();
         mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
             pid: 11,
@@ -4209,6 +4024,10 @@ mod tests {
 
     #[test]
     fn keeps_terminal_unmapped_user_unwind_frame_like_perf_libdw_entry() {
+        // tools/perf/util/unwind-libdw.c entry() stores frames even when
+        // __report_module() leaves entry->ms.map NULL. Later
+        // machine.c unwind_entry() only drops unresolved frames when
+        // symbol_conf.hide_unresolved is set.
         let mut mmap_table = super::MmapTable::default();
         mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
             pid: 11,
@@ -4241,7 +4060,11 @@ mod tests {
     }
 
     #[test]
-    fn user_unwind_source_skips_recorded_ip_without_loaded_unwind_module() {
+    fn user_unwind_source_attempts_recorded_ip_without_loaded_unwind_module_like_perf_libdw() {
+        // tools/perf/util/unwind-libdw.c calls report_module(ip) before
+        // dwfl_getthread_frames(). A recorded mapping that is not already
+        // loaded is not a reason to skip libdw; report_module is the loading
+        // operation.
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
                 callchain: super::SampleCallchainState::Other {
@@ -4254,12 +4077,16 @@ mod tests {
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
             }),
-            super::UserUnwindSource::None
+            super::UserUnwindSource::Object
         );
     }
 
     #[test]
-    fn user_unwind_source_uses_frame_pointer_only_for_callchain_without_modules() {
+    fn user_unwind_source_uses_libdw_for_captured_stack_without_modules_like_perf() {
+        // tools/perf/util/machine.c thread__resolve_callchain_unwind() gates on
+        // captured user regs and stack, not on preloaded modules. elfutils
+        // libdwfl/frame_unwind.c falls through to ebl_unwind(), whose x86_64
+        // backend performs the frame-pointer fallback inside libdw.
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
                 callchain: super::SampleCallchainState::Other {
@@ -4272,7 +4099,7 @@ mod tests {
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
             }),
-            super::UserUnwindSource::FramePointer
+            super::UserUnwindSource::Object
         );
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
@@ -4286,7 +4113,7 @@ mod tests {
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
             }),
-            super::UserUnwindSource::None
+            super::UserUnwindSource::Object
         );
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
@@ -4300,7 +4127,7 @@ mod tests {
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
             }),
-            super::UserUnwindSource::None
+            super::UserUnwindSource::Object
         );
     }
 
@@ -4426,10 +4253,13 @@ mod tests {
     }
 
     #[test]
-    fn user_unwind_source_skips_kernel_sample_without_callchain_from_executable_like_perf_libdw() {
-        // Real period 4745894 sample from target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
-        // perf script leaves the sample blank when the captured user IP is in
-        // the Pyro executable and libdw does not produce accepted entries.
+    fn user_unwind_source_attempts_kernel_sample_without_callchain_from_executable_like_perf_libdw()
+    {
+        // tools/perf/util/machine.c thread__resolve_callchain_unwind() only
+        // requires PERF_SAMPLE_REGS_USER, PERF_SAMPLE_STACK_USER, user regs,
+        // and a non-empty user stack. tools/perf/util/unwind-libdw.c then
+        // calls report_module(ip). Perf does not pre-skip object unwinding
+        // because the captured user IP belongs to the main executable.
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
                 callchain: super::SampleCallchainState::KernelWithoutCallchain,
@@ -4439,7 +4269,7 @@ mod tests {
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
             }),
-            super::UserUnwindSource::None
+            super::UserUnwindSource::Object
         );
     }
 
@@ -4489,10 +4319,10 @@ mod tests {
     }
 
     #[test]
-    fn syscall_return_kernel_unwind_stops_after_first_executable_frame_like_perf_libdw() {
-        // perf -v for the octo trace accepts libc syscall frames and the first
-        // executable callback frame. It then logs "no map for 3291a" and does
-        // not emit framehop's deeper executable callers.
+    fn syscall_return_kernel_unwind_keeps_all_accepted_frames_like_perf_libdw() {
+        // perf stops when libdw stops producing callback frames; it does not
+        // apply a path-based "shared object then executable" truncation rule
+        // after frames have already been accepted by frame_callback -> entry().
         let mut mmap_table = super::MmapTable::default();
         insert_test_mapping(
             &mut mmap_table,
@@ -4537,6 +4367,8 @@ mod tests {
                 0x7fff_f7e1_c083,
                 0x7fff_f7e9_9d7d,
                 0x5555_557d_c17e,
+                0x5555_557f_587a,
+                0x5555_5577_6369,
             ]
         );
     }
@@ -4578,11 +4410,11 @@ mod tests {
     }
 
     #[test]
-    fn user_unwind_source_skips_frame_pointer_fallback_for_kernel_callchain_like_perf_script() {
-        // Real period 1593359 sample from target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
-        // perf script prints the recorded kernel callchain only. With no object
-        // module loaded yet, Pyroclast must not invent a frame-pointer fallback
-        // user frame from PERF_SAMPLE_REGS_USER/PERF_SAMPLE_STACK_USER.
+    fn user_unwind_source_attempts_libdw_for_kernel_callchain_without_modules_like_perf_script() {
+        // tools/perf/util/machine.c still calls thread__resolve_callchain_unwind()
+        // after resolving the recorded callchain. A missing preloaded module is
+        // not a skip condition; elfutils may still use its EBL frame-pointer
+        // fallback after report_module(ip).
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
                 callchain: super::SampleCallchainState::KernelWithCallchain,
@@ -4592,12 +4424,12 @@ mod tests {
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
             }),
-            super::UserUnwindSource::None
+            super::UserUnwindSource::Object
         );
     }
 
     #[test]
-    fn user_unwind_source_skips_frame_pointer_fallback_for_syscall_return_like_perf_script() {
+    fn user_unwind_source_attempts_libdw_for_syscall_return_without_modules_like_perf_script() {
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
                 callchain: super::SampleCallchainState::KernelWithCallchain,
@@ -4607,12 +4439,12 @@ mod tests {
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: true,
             }),
-            super::UserUnwindSource::None
+            super::UserUnwindSource::Object
         );
     }
 
     #[test]
-    fn user_unwind_source_uses_frame_pointer_for_valid_kernel_bp_like_perf_script() {
+    fn user_unwind_source_uses_libdw_ebl_fallback_for_valid_kernel_bp_like_perf_script() {
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
                 callchain: super::SampleCallchainState::KernelWithCallchain,
@@ -4622,7 +4454,7 @@ mod tests {
                 frame_pointer_at_or_above_stack_pointer: true,
                 syscall_return_state: false,
             }),
-            super::UserUnwindSource::FramePointer
+            super::UserUnwindSource::Object
         );
     }
 
@@ -4741,10 +4573,172 @@ mod tests {
     }
 
     #[test]
-    fn pid_unwind_preload_loads_executable_mappings_like_libdw_report_module_callbacks() {
-        // perf's libdw unwinder calls report_module for each frame address as
-        // dwfl_getthread_frames walks across DSOs. Framehop has no such callback
-        // path here, so the Rust perf path preloads executable PID mappings.
+    fn fork_exec_removes_existing_child_unwinder_like_perf_thread_replacement() {
+        // tools/perf/util/machine.c machine__process_fork_event() removes an
+        // existing child thread before creating the new one. For synthesized
+        // exec fork events, PERF_RECORD_MISC_FORK_EXEC also disables map
+        // cloning, so stale pre-exec DWFL state must not survive.
+        let current_exe = std::env::current_exe().expect("current exe");
+        let current_exe = current_exe.to_string_lossy().into_owned();
+        let mut accumulator = super::FoldAccumulator::new(std::collections::BTreeMap::new());
+        accumulator
+            .mmap_table
+            .insert_mmap(crate::perfdata::records::MmapRecord {
+                pid: 11,
+                tid: 11,
+                start: 0x1000,
+                len: 0x1000_0000,
+                pgoff: 0,
+                path: current_exe.clone(),
+            });
+        accumulator.ensure_unwind_mapping_for_ip(Some(11), 0x2000);
+        assert!(accumulator.unwind_states.contains_key(&11));
+
+        accumulator
+            .apply_record(
+                crate::perfdata::records::ParsedRecord::Fork(
+                    crate::perfdata::records::ForkRecord {
+                        pid: 11,
+                        tid: 11,
+                        ppid: 10,
+                        ptid: 10,
+                        time: 0,
+                        clone_maps: false,
+                    },
+                ),
+                &super::SampleLayouts::default(),
+                super::FoldOptions::default(),
+            )
+            .expect("fork exec");
+
+        assert!(accumulator.unwind_states.get(&11).is_none());
+    }
+
+    #[test]
+    fn overlapping_mmap_insert_invalidates_stale_unwind_modules_like_perf_dwfl() {
+        // tools/perf/util/maps.c invalidates libdw's per-maps DWFL state when
+        // map removals happen. Its overlap-fix insert path removes/replaces
+        // maps inline, so the broad synthesized MMAP must not leave a stale
+        // module that rejects the later executable MMAP2 split.
+        let current_exe = std::env::current_exe().expect("current exe");
+        let current_exe = current_exe.to_string_lossy().into_owned();
+        let mut accumulator = super::FoldAccumulator::new(std::collections::BTreeMap::new());
+        accumulator
+            .apply_record(
+                crate::perfdata::records::ParsedRecord::Mmap(
+                    crate::perfdata::records::MmapRecord {
+                        pid: 11,
+                        tid: 11,
+                        start: 0x5555_5555_4000,
+                        len: 0x002b_e000,
+                        pgoff: 0,
+                        path: current_exe.clone(),
+                    },
+                ),
+                &super::SampleLayouts::default(),
+                super::FoldOptions::default(),
+            )
+            .expect("broad mmap");
+        accumulator.ensure_unwind_mapping_for_ip(Some(11), 0x5555_5555_5000);
+        assert!(accumulator.unwind_states.contains_key(&11));
+
+        accumulator
+            .apply_record(
+                crate::perfdata::records::ParsedRecord::Mmap2(
+                    crate::perfdata::records::Mmap2Record {
+                        pid: 11,
+                        tid: 11,
+                        start: 0x5555_555d_6000,
+                        len: 0x0022_b000,
+                        pgoff: 0x0008_1000,
+                        major: 0,
+                        minor: 0,
+                        inode: 0,
+                        inode_generation: 0,
+                        prot: super::PROT_EXEC,
+                        flags: 2,
+                        path: current_exe,
+                    },
+                ),
+                &super::SampleLayouts::default(),
+                super::FoldOptions::default(),
+            )
+            .expect("exec mmap2");
+
+        assert!(
+            accumulator.unwind_states.get(&11).is_none(),
+            "overlap fix should invalidate stale DWFL-like module state"
+        );
+        accumulator.ensure_unwind_mapping_for_ip(Some(11), 0x5555_5567_66de);
+        let state = accumulator.unwind_states.get(&11).expect("reloaded state");
+        assert!(
+            state
+                .object_unwinder
+                .has_reported_module_for_ip(0x5555_5567_66de),
+            "later executable split should load after invalidation"
+        );
+        assert!(
+            !state
+                .object_unwinder
+                .has_rejected_mapping_for_ip(0x5555_5567_66de),
+            "later executable split must not inherit the stale broad-module overlap"
+        );
+    }
+
+    #[test]
+    fn object_unwind_reports_callback_frame_modules_like_perf_libdw() {
+        // tools/perf/util/unwind-libdw.c frame_callback() calls report_module(pc)
+        // before entry(). A direct framehop pass can reveal a caller address
+        // before its module is loaded, so the fold path must lazily report
+        // callback-frame modules too.
+        let current_exe = std::env::current_exe().expect("current exe");
+        let current_exe = current_exe.to_string_lossy().into_owned();
+        let mut accumulator = super::FoldAccumulator::new(std::collections::BTreeMap::new());
+        accumulator
+            .mmap_table
+            .insert_mmap(crate::perfdata::records::MmapRecord {
+                pid: 11,
+                tid: 11,
+                start: 0x1000,
+                len: 0x1000_0000,
+                pgoff: 0,
+                path: current_exe.clone(),
+            });
+        accumulator
+            .mmap_table
+            .insert_mmap(crate::perfdata::records::MmapRecord {
+                pid: 11,
+                tid: 11,
+                start: 0x2000_0000,
+                len: 0x1000_0000,
+                pgoff: 0,
+                path: current_exe,
+            });
+
+        let mut state = super::PidUnwindState::default();
+        let loaded = super::report_unwind_modules_for_frame_callbacks_like_perf(
+            &mut state,
+            &accumulator.mmap_table,
+            11,
+            &[0x1000, 0x2000_1000],
+            None,
+        );
+
+        assert!(loaded);
+        assert!(
+            state
+                .object_unwinder
+                .has_reported_module_for_ip(0x2000_1000)
+        );
+    }
+
+    #[test]
+    fn callback_module_reporting_does_not_probe_next_ip_like_perf_libdw_entry() {
+        // tools/perf/util/unwind-libdw.c frame_callback() calls
+        // report_module(pc), then decrements non-activation PCs before calling
+        // entry(pc). entry() calls __report_module() for that decremented IP.
+        // There is no perf/libdw path that turns an unmapped callback IP into a
+        // mapped one by probing ip + 1.
         let current_exe = std::env::current_exe().expect("current exe");
         let current_exe = current_exe.to_string_lossy().into_owned();
         let mut accumulator = super::FoldAccumulator::new(std::collections::BTreeMap::new());
@@ -4759,9 +4753,20 @@ mod tests {
                 path: current_exe,
             });
 
-        accumulator.prepare_pid_unwind_mappings(11);
+        let mut state = super::PidUnwindState::default();
+        let loaded = super::report_unwind_modules_for_frame_callbacks_like_perf(
+            &mut state,
+            &accumulator.mmap_table,
+            11,
+            &[0x0fff],
+            None,
+        );
 
-        assert!(accumulator.has_loaded_unwind_mapping_for_ip(Some(11), 0x2000));
+        assert!(!loaded);
+        assert!(
+            !state.object_unwinder.has_reported_module_for_ip(0x1000),
+            "ip + 1 probing loads a module that perf/libdw entry would reject"
+        );
     }
 
     #[test]
@@ -4887,7 +4892,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_object_unwind_arch_fallback_requires_loaded_reported_mapping_like_libdw_entry() {
+    fn empty_object_unwind_arch_fallback_does_not_require_reported_mapping_like_elfutils() {
         let regs = super::PerfX86_64Regs {
             ip: 0x4000,
             sp: 0x8000,
@@ -4914,34 +4919,34 @@ mod tests {
         );
 
         assert!(
-            !super::should_use_libdw_arch_fallback_after_empty_object_unwind(
+            super::should_use_libdw_arch_fallback_after_empty_object_unwind(
                 super::UserUnwindContext {
                     initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
                     ..matching_context
                 },
-                true
+                false
             )
         );
         assert!(
-            !super::should_use_libdw_arch_fallback_after_empty_object_unwind(
+            super::should_use_libdw_arch_fallback_after_empty_object_unwind(
                 super::UserUnwindContext {
                     initial_ip_is_dso: false,
                     ..matching_context
                 },
-                true
+                false
             )
         );
         assert!(
-            !super::should_use_libdw_arch_fallback_after_empty_object_unwind(
+            super::should_use_libdw_arch_fallback_after_empty_object_unwind(
                 super::UserUnwindContext {
                     syscall_return_state: false,
                     ..matching_context
                 },
-                true
+                false
             )
         );
         assert!(
-            !super::should_use_libdw_arch_fallback_after_empty_object_unwind(
+            super::should_use_libdw_arch_fallback_after_empty_object_unwind(
                 matching_context,
                 false
             )

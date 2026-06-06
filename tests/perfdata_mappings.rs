@@ -159,6 +159,55 @@ fn prefers_most_specific_mapping_for_overlapping_ranges() {
 }
 
 #[test]
+fn resolves_perf_split_executable_mapping_over_initial_read_mapping_like_perf_maps_fixup() {
+    let mut table = MmapTable::default();
+    table.insert_mmap2(Mmap2Record {
+        pid: 2_764_143,
+        tid: 2_764_143,
+        start: 0x5555_5555_4000,
+        len: 0x002b_e000,
+        pgoff: 0,
+        major: 0,
+        minor: 0x61,
+        inode: 716_299,
+        inode_generation: 20_005_098,
+        prot: 1,
+        flags: 2,
+        path: "/home/mjc/projects/pyroclast/target/profiling/pyroclast".to_string(),
+    });
+    table.insert_mmap2(Mmap2Record {
+        pid: 2_764_143,
+        tid: 2_764_143,
+        start: 0x5555_555d_6000,
+        len: 0x0022_b000,
+        pgoff: 0x0008_1000,
+        major: 0,
+        minor: 0x61,
+        inode: 716_299,
+        inode_generation: 20_005_098,
+        prot: 5,
+        flags: 2,
+        path: "/home/mjc/projects/pyroclast/target/profiling/pyroclast".to_string(),
+    });
+
+    assert_eq!(
+        table.resolve(2_764_143, 0x5555_5567_66de),
+        Some(ResolvedMapping {
+            path: "/home/mjc/projects/pyroclast/target/profiling/pyroclast".to_string(),
+            relative_address: 0x0012_16de,
+            build_id: None,
+            file_identity: Some(FileIdentity {
+                major: 0,
+                minor: 0x61,
+                inode: 716_299,
+                inode_generation: 20_005_098,
+            }),
+            kernel_relocation: None,
+        })
+    );
+}
+
+#[test]
 fn prefers_newer_mapping_when_it_broadly_overlaps_older_mapping_like_perf() {
     let mut table = MmapTable::default();
     table.insert_mmap(MmapRecord {
