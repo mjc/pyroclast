@@ -1033,10 +1033,13 @@ where
     }
 
     fn write_sample_header(&mut self, sample: &PreparedFoldSample) -> Result<(), String> {
-        let comm = sample.comm.as_deref().unwrap_or("[unknown]");
-        let tid = sample.tid.or(sample.pid).unwrap_or(0);
-        write!(self.writer, "{comm} {tid:>7} ")
+        let comm = perf_script_comm(sample);
+        write!(self.writer, "{comm} ")
             .map_err(|error| format!("failed to write perf script output: {error}"))?;
+        if let Some(tid) = sample.tid.or(sample.pid) {
+            write!(self.writer, "{tid:>7} ")
+                .map_err(|error| format!("failed to write perf script output: {error}"))?;
+        }
         if let Some(cpu) = sample.cpu {
             write!(self.writer, "[{cpu:03}] ")
                 .map_err(|error| format!("failed to write perf script output: {error}"))?;
@@ -1058,10 +1061,13 @@ where
     }
 
     fn write_sample_inline_header(&mut self, sample: &PreparedFoldSample) -> Result<(), String> {
-        let comm = sample.comm.as_deref().unwrap_or("[unknown]");
-        let tid = sample.tid.or(sample.pid).unwrap_or(0);
-        write!(self.writer, "{comm:>16} {tid:>7} ")
+        let comm = perf_script_comm(sample);
+        write!(self.writer, "{comm:>16} ")
             .map_err(|error| format!("failed to write perf script output: {error}"))?;
+        if let Some(tid) = sample.tid.or(sample.pid) {
+            write!(self.writer, "{tid:>7} ")
+                .map_err(|error| format!("failed to write perf script output: {error}"))?;
+        }
         if let Some(cpu) = sample.cpu {
             write!(self.writer, "[{cpu:03}] ")
                 .map_err(|error| format!("failed to write perf script output: {error}"))?;
@@ -1081,6 +1087,16 @@ where
         )
         .map_err(|error| format!("failed to write perf script output: {error}"))
     }
+}
+
+fn perf_script_comm(sample: &PreparedFoldSample) -> &str {
+    sample.comm.as_deref().unwrap_or_else(|| {
+        if sample.tid.or(sample.pid).is_none() {
+            ":-1"
+        } else {
+            "[unknown]"
+        }
+    })
 }
 
 impl OrderedRecordQueue {

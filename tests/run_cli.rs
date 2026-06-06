@@ -385,6 +385,41 @@ fn perf_script_command_pads_event_names_to_evlist_max_width_like_perf_script() {
 }
 
 #[test]
+fn perf_script_command_omits_tid_column_when_sample_type_lacks_tid_like_perf_script() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    std::fs::write(
+        &perfdata,
+        perfdata_with_records_and_attrs(
+            [file_attr_bytes(
+                PERF_SAMPLE_IP | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN,
+                0,
+                0,
+            )],
+            [record_bytes(
+                9,
+                &sample_payload_with_period_without_tid(0x1000, 5, [0x2000]),
+            )],
+        ),
+    )
+    .expect("write perfdata");
+
+    let output = pyroclast::run_cli([
+        "pyroclast",
+        "plumbing",
+        "perf-script",
+        "--no-symbols",
+        perfdata.to_str().unwrap(),
+    ])
+    .expect("perf script command");
+
+    assert_eq!(
+        output.stdout,
+        ":-1          5 cycles:\n\t            2000 [unknown] ([unknown])\n\n"
+    );
+}
+
+#[test]
 fn perf_script_command_inherits_parent_comm_on_fork_like_perf_script() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
@@ -1457,6 +1492,21 @@ fn sample_payload_with_identifier_and_period<const N: usize>(
     payload.extend(ip.to_le_bytes());
     payload.extend(pid.to_le_bytes());
     payload.extend(tid.to_le_bytes());
+    payload.extend(period.to_le_bytes());
+    payload.extend((callchain.len() as u64).to_le_bytes());
+    for frame in callchain {
+        payload.extend(frame.to_le_bytes());
+    }
+    payload
+}
+
+fn sample_payload_with_period_without_tid<const N: usize>(
+    ip: u64,
+    period: u64,
+    callchain: [u64; N],
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(ip.to_le_bytes());
     payload.extend(period.to_le_bytes());
     payload.extend((callchain.len() as u64).to_le_bytes());
     for frame in callchain {
