@@ -2938,13 +2938,6 @@ fn report_unwind_modules_for_frame_callbacks_like_perf(
             *address,
             unwind_debug_dir,
         );
-        loaded |= report_unwind_module_for_ip_like_perf(
-            state,
-            mmap_table,
-            pid,
-            address.saturating_add(1),
-            unwind_debug_dir,
-        );
     }
     loaded
 }
