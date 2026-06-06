@@ -130,6 +130,57 @@ fn perf_script_command_exports_inferno_compatible_perf_script() {
 }
 
 #[test]
+fn perf_script_command_uses_perf_default_thread_comm_when_comm_is_missing() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    std::fs::write(
+        &perfdata,
+        perfdata_with_records_and_attrs(
+            [file_attr_bytes(
+                PERF_SAMPLE_IP
+                    | PERF_SAMPLE_TID
+                    | PERF_SAMPLE_TIME
+                    | PERF_SAMPLE_CPU
+                    | PERF_SAMPLE_PERIOD
+                    | PERF_SAMPLE_CALLCHAIN,
+                0,
+                0,
+            )],
+            [
+                record_bytes(1, &mmap_payload(1, 2, 0x1000, 0x2000, 0, "/bin/app")),
+                record_bytes(
+                    9,
+                    &sample_payload_with_time_cpu_period(
+                        0x1000,
+                        1,
+                        2,
+                        123_456_000,
+                        3,
+                        144,
+                        [0x2000],
+                    ),
+                ),
+            ],
+        ),
+    )
+    .expect("write perfdata");
+
+    let output = pyroclast::run_cli([
+        "pyroclast",
+        "plumbing",
+        "perf-script",
+        "--no-symbols",
+        perfdata.to_str().unwrap(),
+    ])
+    .expect("perf script command");
+
+    assert_eq!(
+        output.stdout,
+        ":2       2 [003]     0.123456:        144 cpu/cycles/P:\n\t            2000 [unknown] (/bin/app)\n\n"
+    );
+}
+
+#[test]
 fn perf_script_command_preserves_sample_event_records_like_perf_script() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
@@ -179,6 +230,44 @@ fn perf_script_command_preserves_sample_event_records_like_perf_script() {
             "app       2 [005]     0.000020:         11 cpu/cycles/P:\n",
             "\t            2000 [unknown] (/bin/app)\n\n",
         )
+    );
+}
+
+#[test]
+fn perf_script_command_writes_sample_ip_on_event_line_when_callchain_is_absent_like_perf_script() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    std::fs::write(
+        &perfdata,
+        perfdata_with_records_and_attrs(
+            [file_attr_bytes(
+                PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD,
+                0,
+                0,
+            )],
+            [
+                record_bytes(1, &mmap_payload(1, 2, 0x1000, 0x2000, 0, "/bin/app")),
+                record_bytes(
+                    9,
+                    &sample_payload_with_period_no_callchain(0x1000, 1, 2, 144),
+                ),
+            ],
+        ),
+    )
+    .expect("write perfdata");
+
+    let output = pyroclast::run_cli([
+        "pyroclast",
+        "plumbing",
+        "perf-script",
+        "--no-symbols",
+        perfdata.to_str().unwrap(),
+    ])
+    .expect("perf script command");
+
+    assert_eq!(
+        output.stdout,
+        "              :2       2        144 cpu/cycles/P:             1000 [unknown] (/bin/app)\n"
     );
 }
 
@@ -1198,6 +1287,15 @@ fn sample_payload_with_period<const N: usize>(
     for frame in callchain {
         payload.extend(frame.to_le_bytes());
     }
+    payload
+}
+
+fn sample_payload_with_period_no_callchain(ip: u64, pid: u32, tid: u32, period: u64) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(ip.to_le_bytes());
+    payload.extend(pid.to_le_bytes());
+    payload.extend(tid.to_le_bytes());
+    payload.extend(period.to_le_bytes());
     payload
 }
 

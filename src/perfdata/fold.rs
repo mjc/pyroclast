@@ -150,6 +150,7 @@ struct DeferredFoldSample {
     comm: Option<String>,
     count: u64,
     frames: Vec<FoldFrame>,
+    has_callchain: bool,
 }
 
 struct PreparedFoldSample {
@@ -161,6 +162,7 @@ struct PreparedFoldSample {
     count: u64,
     frames: Vec<FoldFrame>,
     deferred_cookie: Option<u64>,
+    has_callchain: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -929,6 +931,7 @@ where
                     comm: sample.comm,
                     count: sample.count,
                     frames: sample.frames,
+                    has_callchain: sample.has_callchain,
                 });
             return Ok(());
         }
@@ -960,6 +963,7 @@ where
                 count: sample.count,
                 frames: sample.frames,
                 deferred_cookie: None,
+                has_callchain: sample.has_callchain,
             };
             self.write_sample_event(&sample)?;
         }
@@ -978,6 +982,7 @@ where
                 count: sample.count,
                 frames: sample.frames,
                 deferred_cookie: None,
+                has_callchain: sample.has_callchain,
             };
             self.write_sample_header(&sample)?;
             self.writer
@@ -988,13 +993,25 @@ where
     }
 
     fn write_sample_event(&mut self, sample: &PreparedFoldSample) -> Result<(), String> {
-        self.write_sample_header(sample)?;
-        FoldFrameResolver::new(&self.accumulator.mmap_table).write_script_frames_for_stack(
-            sample.pid,
-            &sample.frames,
-            self.symbol_cache.as_deref_mut(),
-            self.writer,
-        )?;
+        if sample.has_callchain {
+            self.write_sample_header(sample)?;
+            let frame_resolver = FoldFrameResolver::new(&self.accumulator.mmap_table);
+            frame_resolver.write_script_frames_for_stack(
+                sample.pid,
+                &sample.frames,
+                self.symbol_cache.as_deref_mut(),
+                self.writer,
+            )?;
+        } else {
+            self.write_sample_inline_header(sample)?;
+            let frame_resolver = FoldFrameResolver::new(&self.accumulator.mmap_table);
+            frame_resolver.write_inline_sample_frame_for_stack(
+                sample.pid,
+                &sample.frames,
+                self.symbol_cache.as_deref_mut(),
+                self.writer,
+            )?;
+        }
         self.writer
             .write_all(b"\n")
             .map_err(|error| format!("failed to write perf script output: {error}"))
@@ -1016,6 +1033,25 @@ where
                 .map_err(|error| format!("failed to write perf script output: {error}"))?;
         }
         writeln!(self.writer, "{:>10} cpu/cycles/P:", sample.count)
+            .map_err(|error| format!("failed to write perf script output: {error}"))
+    }
+
+    fn write_sample_inline_header(&mut self, sample: &PreparedFoldSample) -> Result<(), String> {
+        let comm = sample.comm.as_deref().unwrap_or("[unknown]");
+        let tid = sample.tid.or(sample.pid).unwrap_or(0);
+        write!(self.writer, "{comm:>16} {tid:>7} ")
+            .map_err(|error| format!("failed to write perf script output: {error}"))?;
+        if let Some(cpu) = sample.cpu {
+            write!(self.writer, "[{cpu:03}] ")
+                .map_err(|error| format!("failed to write perf script output: {error}"))?;
+        }
+        if let Some(time) = sample.time {
+            let secs = time / 1_000_000_000;
+            let usecs = (time % 1_000_000_000) / 1_000;
+            write!(self.writer, "{secs:>5}.{usecs:06}: ")
+                .map_err(|error| format!("failed to write perf script output: {error}"))?;
+        }
+        write!(self.writer, "{:>10} cpu/cycles/P: ", sample.count)
             .map_err(|error| format!("failed to write perf script output: {error}"))
     }
 }
@@ -2114,6 +2150,41 @@ impl<'a> FoldFrameResolver<'a> {
         Ok(())
     }
 
+    fn write_inline_sample_frame_for_stack<R, W>(
+        &self,
+        pid: Option<u32>,
+        callchain: &[FoldFrame],
+        symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+        writer: &mut W,
+    ) -> Result<(), String>
+    where
+        R: SymbolResolver,
+        W: IoWrite + ?Sized,
+    {
+        let mut mapping_cache = MappingResolveCache::default();
+        let Some(frame) = callchain.first().copied() else {
+            return Ok(());
+        };
+        let address = frame.address();
+        match self.mapping_decision(pid, address, &mut mapping_cache) {
+            FrameMappingDecision::Mapped(mapping) => {
+                write_perf_script_inline_mapped_decision_frame(
+                    writer,
+                    address,
+                    &mapping,
+                    symbol_cache,
+                )?;
+            }
+            FrameMappingDecision::KernelAddress | FrameMappingDecision::Address => {
+                write_perf_script_address_frame_fragment(writer, "", address)?;
+            }
+            FrameMappingDecision::Unknown => {
+                write_perf_script_unknown_frame_fragment(writer, "", address)?;
+            }
+        }
+        Ok(())
+    }
+
     fn write_regular_script_frame<R, W>(
         &self,
         pid: Option<u32>,
@@ -2409,21 +2480,39 @@ fn write_perf_script_frame_for_label<W>(
 where
     W: IoWrite + ?Sized,
 {
+    write_perf_script_frame_for_label_fragment(writer, "\t", address, label)?;
+    writer
+        .write_all(b"\n")
+        .map_err(|error| format!("failed to write perf script output: {error}"))
+}
+
+fn write_perf_script_frame_for_label_fragment<W>(
+    writer: &mut W,
+    prefix: &str,
+    address: u64,
+    label: &str,
+) -> Result<(), String>
+where
+    W: IoWrite + ?Sized,
+{
     if label == UNKNOWN_FRAME {
-        return write_perf_script_unknown_frame(writer, address);
+        return write_perf_script_unknown_frame_fragment(writer, prefix, address);
     }
     if label.starts_with("0x") {
-        return write_perf_script_label_frame(writer, address, label);
+        return write_perf_script_label_frame_fragment(writer, prefix, address, label);
     }
     if let Some(module) = module_fallback_label_module(label) {
-        return writeln!(writer, "\t{address:x} {UNKNOWN_FRAME} ({module})")
+        return write!(writer, "{prefix}{address:16x} {UNKNOWN_FRAME} ({module})")
             .map_err(|error| format!("failed to write perf script output: {error}"));
     }
     if looks_like_mapped_frame_label(label) {
-        return writeln!(writer, "\t{address:x} {label}+0x0 ({UNKNOWN_FRAME})")
-            .map_err(|error| format!("failed to write perf script output: {error}"));
+        return write!(
+            writer,
+            "{prefix}{address:16x} {label}+0x0 ({UNKNOWN_FRAME})"
+        )
+        .map_err(|error| format!("failed to write perf script output: {error}"));
     }
-    write_perf_script_label_frame(writer, address, label)
+    write_perf_script_label_frame_fragment(writer, prefix, address, label)
 }
 
 fn write_perf_script_mapped_decision_frame<R, W>(
@@ -2461,11 +2550,44 @@ where
     Ok(())
 }
 
+fn write_perf_script_inline_mapped_decision_frame<R, W>(
+    writer: &mut W,
+    address: u64,
+    mapping: &ResolvedMappingRef<'_>,
+    symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+) -> Result<(), String>
+where
+    R: SymbolResolver,
+    W: IoWrite + ?Sized,
+{
+    if let Some(cache) = symbol_cache {
+        let frames = cache.resolve_mapping_ref(mapping)?;
+        if let Some(label) = frames.first() {
+            return write_perf_script_mapped_symbol_frame_fragment(
+                writer,
+                "",
+                address,
+                label,
+                mapping.path,
+            );
+        }
+        return write_perf_script_frame_for_label_fragment(
+            writer,
+            "",
+            address,
+            &symbol_fallback_frame_ref(mapping),
+        );
+    }
+    write_perf_script_mapped_unknown_symbol_frame_fragment(writer, "", address, mapping.path)
+}
+
 fn write_perf_script_unknown_frame<W>(writer: &mut W, address: u64) -> Result<(), String>
 where
     W: IoWrite + ?Sized,
 {
-    writeln!(writer, "\t{address:x} {UNKNOWN_FRAME} ({UNKNOWN_FRAME})")
+    write_perf_script_unknown_frame_fragment(writer, "\t", address)?;
+    writer
+        .write_all(b"\n")
         .map_err(|error| format!("failed to write perf script output: {error}"))
 }
 
@@ -2473,15 +2595,52 @@ fn write_perf_script_address_frame<W>(writer: &mut W, address: u64) -> Result<()
 where
     W: IoWrite + ?Sized,
 {
-    writeln!(writer, "\t{address:x} 0x{address:x} ({UNKNOWN_FRAME})")
+    write_perf_script_address_frame_fragment(writer, "\t", address)?;
+    writer
+        .write_all(b"\n")
         .map_err(|error| format!("failed to write perf script output: {error}"))
 }
 
-fn write_perf_script_label_frame<W>(writer: &mut W, address: u64, label: &str) -> Result<(), String>
+fn write_perf_script_unknown_frame_fragment<W>(
+    writer: &mut W,
+    prefix: &str,
+    address: u64,
+) -> Result<(), String>
 where
     W: IoWrite + ?Sized,
 {
-    writeln!(writer, "\t{address:x} {label} ({UNKNOWN_FRAME})")
+    write!(
+        writer,
+        "{prefix}{address:16x} {UNKNOWN_FRAME} ({UNKNOWN_FRAME})"
+    )
+    .map_err(|error| format!("failed to write perf script output: {error}"))
+}
+
+fn write_perf_script_address_frame_fragment<W>(
+    writer: &mut W,
+    prefix: &str,
+    address: u64,
+) -> Result<(), String>
+where
+    W: IoWrite + ?Sized,
+{
+    write!(
+        writer,
+        "{prefix}{address:16x} 0x{address:x} ({UNKNOWN_FRAME})"
+    )
+    .map_err(|error| format!("failed to write perf script output: {error}"))
+}
+
+fn write_perf_script_label_frame_fragment<W>(
+    writer: &mut W,
+    prefix: &str,
+    address: u64,
+    label: &str,
+) -> Result<(), String>
+where
+    W: IoWrite + ?Sized,
+{
+    write!(writer, "{prefix}{address:16x} {label} ({UNKNOWN_FRAME})")
         .map_err(|error| format!("failed to write perf script output: {error}"))
 }
 
@@ -2500,7 +2659,29 @@ where
     {
         return write_perf_script_frame_for_label(writer, address, label);
     }
-    writeln!(writer, "\t{address:x} {label} ({path})")
+    write_perf_script_mapped_symbol_frame_fragment(writer, "\t", address, label, path)?;
+    writer
+        .write_all(b"\n")
+        .map_err(|error| format!("failed to write perf script output: {error}"))
+}
+
+fn write_perf_script_mapped_symbol_frame_fragment<W>(
+    writer: &mut W,
+    prefix: &str,
+    address: u64,
+    label: &str,
+    path: &str,
+) -> Result<(), String>
+where
+    W: IoWrite + ?Sized,
+{
+    if label == UNKNOWN_FRAME
+        || label.starts_with("0x")
+        || module_fallback_label_module(label).is_some()
+    {
+        return write_perf_script_frame_for_label_fragment(writer, prefix, address, label);
+    }
+    write!(writer, "{prefix}{address:16x} {label} ({path})")
         .map_err(|error| format!("failed to write perf script output: {error}"))
 }
 
@@ -2512,7 +2693,22 @@ fn write_perf_script_mapped_unknown_symbol_frame<W>(
 where
     W: IoWrite + ?Sized,
 {
-    writeln!(writer, "\t{address:16x} {UNKNOWN_FRAME} ({path})")
+    write_perf_script_mapped_unknown_symbol_frame_fragment(writer, "\t", address, path)?;
+    writer
+        .write_all(b"\n")
+        .map_err(|error| format!("failed to write perf script output: {error}"))
+}
+
+fn write_perf_script_mapped_unknown_symbol_frame_fragment<W>(
+    writer: &mut W,
+    prefix: &str,
+    address: u64,
+    path: &str,
+) -> Result<(), String>
+where
+    W: IoWrite + ?Sized,
+{
+    write!(writer, "{prefix}{address:16x} {UNKNOWN_FRAME} ({path})")
         .map_err(|error| format!("failed to write perf script output: {error}"))
 }
 
@@ -2661,6 +2857,7 @@ fn parse_sample_for_fold(
                 comm: sample.comm,
                 count: sample.count,
                 frames: sample.frames,
+                has_callchain: sample.has_callchain,
             });
     } else {
         add_fold_stack(
@@ -2707,6 +2904,7 @@ fn prepare_sample_for_fold(
         count,
         frames: std::mem::take(&mut accumulator.sample_frames),
         deferred_cookie,
+        has_callchain: event.layout.sample_type & PERF_SAMPLE_CALLCHAIN != 0,
     }))
 }
 
@@ -3892,7 +4090,7 @@ mod tests {
 
         assert_eq!(
             String::from_utf8(written).expect("utf-8"),
-            "\t1048 _Fork+0x48 (/nix/store/glibc/lib/libc.so.6)\n"
+            "\t            1048 _Fork+0x48 (/nix/store/glibc/lib/libc.so.6)\n"
         );
     }
 
