@@ -2295,18 +2295,8 @@ impl<'a> FoldFrameResolver<'a> {
                     }
                     return Ok(());
                 }
-                if is_kernel_space_frame(address) && matches!(frame, FoldFrame::Callchain(_)) {
-                    append_cached_inferno_perf_folded_label_to_buffers(buffers, UNKNOWN_FRAME);
-                } else {
-                    buffers.label_scratch.clear();
-                    write!(
-                        buffers.label_scratch,
-                        "{}+0x{:x}",
-                        mapping.path, mapping.relative_address
-                    )
-                    .expect("writing to a string cannot fail");
-                    append_inferno_perf_folded_label(&mut buffers.rendered, &buffers.label_scratch);
-                }
+                let fallback = symbol_fallback_frame_ref(&mapping);
+                append_cached_inferno_perf_folded_label_to_buffers(buffers, &fallback);
             }
             FrameMappingDecision::KernelAddress | FrameMappingDecision::Address => {
                 append_folded_address_label(buffers, address);
@@ -2472,11 +2462,7 @@ where
         }
         return Ok(());
     }
-    if is_kernel_space_frame(address) {
-        write_perf_script_unknown_frame(writer, address)?;
-    } else {
-        write_perf_script_mapped_frame(writer, address, mapping.path, mapping.relative_address)?;
-    }
+    write_perf_script_mapped_unknown_symbol_frame(writer, address, mapping.path)?;
     Ok(())
 }
 
@@ -2523,20 +2509,16 @@ where
         .map_err(|error| format!("failed to write perf script output: {error}"))
 }
 
-fn write_perf_script_mapped_frame<W>(
+fn write_perf_script_mapped_unknown_symbol_frame<W>(
     writer: &mut W,
     address: u64,
     path: &str,
-    relative_address: u64,
 ) -> Result<(), String>
 where
     W: IoWrite + ?Sized,
 {
-    writeln!(
-        writer,
-        "\t{address:x} {path}+0x{relative_address:x}+0x0 ({UNKNOWN_FRAME})"
-    )
-    .map_err(|error| format!("failed to write perf script output: {error}"))
+    writeln!(writer, "\t{address:16x} {UNKNOWN_FRAME} ({path})")
+        .map_err(|error| format!("failed to write perf script output: {error}"))
 }
 
 fn module_fallback_label_module(label: &str) -> Option<&str> {
@@ -2581,8 +2563,6 @@ fn symbol_fallback_frame_ref(mapping: &ResolvedMappingRef<'_>) -> String {
         kernel_module_fallback_frame(mapping.path)
     } else if mapping.path == UNKNOWN_FRAME {
         mapping.path.to_string()
-    } else if mapping.path.starts_with('[') {
-        mapped_frame_label_ref(mapping)
     } else {
         module_fallback_frame(mapping.path)
     }
@@ -2594,10 +2574,6 @@ fn build_id_hex(bytes: &[u8]) -> String {
         write!(&mut hex, "{byte:02x}").expect("writing to a string cannot fail");
     }
     hex
-}
-
-fn mapped_frame_label_ref(mapping: &ResolvedMappingRef<'_>) -> String {
-    format!("{}+0x{:x}", mapping.path, mapping.relative_address)
 }
 
 fn module_fallback_frame(path: &str) -> String {

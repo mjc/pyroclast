@@ -162,7 +162,7 @@ fn offcpu_backend_perf_cpu_clock_method_writes_folded_stack_artifacts() {
     assert!(result.layout.raw_profile("perf.data").is_file());
     assert_eq!(
         std::fs::read_to_string(result.layout.stacks_folded()).expect("folded"),
-        "app;/bin/app+0x1000 1\n"
+        "app;[app] 1\n"
     );
     let summary_json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(result.layout.summary_json()).unwrap())

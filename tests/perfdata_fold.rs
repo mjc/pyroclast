@@ -415,7 +415,7 @@ fn keeps_dwarf_user_stack_when_newer_mapping_overlaps_before_first_report_like_p
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
-    let expected = format!(":12;{}+0x100 1\n", current_exe.as_ref());
+    let expected = format!(":12;[{}] 1\n", current_exe_file_name());
 
     assert_eq!(folded, expected);
 }
@@ -520,7 +520,7 @@ fn keeps_dwarf_user_stack_when_header_build_id_mmap2_overlaps_before_first_repor
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
-    let expected = format!(":12;{}+0x1100 1\n", current_exe.as_ref());
+    let expected = format!(":12;[{}] 1\n", current_exe_file_name());
 
     assert_eq!(folded, expected);
 }
@@ -987,7 +987,7 @@ fn keeps_current_ip_only_object_unwind_for_mapped_dwarf_user_stack_like_perf_lib
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
-    let expected = format!(":12;{}+0x4000 1\n", current_exe.as_ref());
+    let expected = format!(":12;[{}] 1\n", current_exe_file_name());
 
     assert_eq!(folded, expected);
 }
@@ -1037,7 +1037,7 @@ fn keeps_current_ip_only_object_unwind_after_first_non_text_mapping_like_perf_li
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
-    let expected = format!(":12;{}+0x1000 1\n", current_exe.as_ref());
+    let expected = format!(":12;[{}] 1\n", current_exe_file_name());
 
     assert_eq!(folded, expected);
 }
@@ -1092,7 +1092,7 @@ fn keeps_current_ip_only_object_unwind_from_executable_mmap2_like_perf_libdw() {
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
-    let expected = format!(":12;{}+0x4000 1\n", current_exe.as_ref());
+    let expected = format!(":12;[{}] 1\n", current_exe_file_name());
 
     assert_eq!(folded, expected);
 }
@@ -1139,7 +1139,7 @@ fn keeps_current_ip_only_object_unwind_from_pid_specific_modules_like_perf_libdw
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
-    let expected = format!(":12;{}+0x4000 1\n", current_exe.as_ref());
+    let expected = format!(":12;[{}] 1\n", current_exe_file_name());
 
     assert_eq!(folded, expected);
 }
@@ -1213,7 +1213,7 @@ fn keeps_object_unwind_dso_leaf_when_framehop_only_returns_current_ip_like_perf_
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
-    let expected = format!(":12;{}+0x{ip_offset:x} 1\n", libc.as_ref());
+    let expected = ":12;[libc.so.6] 1\n".to_string();
 
     assert_eq!(folded, expected);
 }
@@ -1485,7 +1485,7 @@ fn keeps_dwarf_user_stack_frames_from_mapped_non_executable_libraries_like_perf_
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;/lib/libc.so.6+0x33;0x4000;0x9000 1\n");
+    assert_eq!(folded, ":12;[libc.so.6];0x4000;0x9000 1\n");
 }
 
 #[test]
@@ -2208,7 +2208,7 @@ fn file_path_folding_applies_late_untimed_mmaps_before_timed_samples_like_global
     let folded =
         fold_perfdata_file_with_options(&perfdata, FoldOptions::default()).expect("folded");
 
-    assert_eq!(folded, ":12;/bin/app+0x0 10000\n");
+    assert_eq!(folded, ":12;[app] 10000\n");
 }
 
 #[test]
@@ -2233,7 +2233,7 @@ fn file_path_folding_uses_finished_round_as_perf_ordered_event_watermark() {
     let folded =
         fold_perfdata_file_with_options(&perfdata, FoldOptions::default()).expect("folded");
 
-    assert_eq!(folded, ":12;/bin/app+0x0 1\n");
+    assert_eq!(folded, ":12;[app] 1\n");
 }
 
 #[test]
@@ -2289,7 +2289,7 @@ fn folds_later_rounds_with_updated_mappings_after_cacheable_rounds() {
     let folded =
         fold_perfdata_file_with_options(&perfdata, FoldOptions::default()).expect("folded");
 
-    assert_eq!(folded, ":12;/bin/app+0x0 1\n:12;0x2000 1\n");
+    assert_eq!(folded, ":12;0x2000 1\n:12;[app] 1\n");
 }
 
 #[test]
@@ -2342,7 +2342,7 @@ fn forked_process_inherits_parent_mappings_like_perf_script() {
     )
     .expect("folded");
 
-    assert_eq!(folded, ":22;/bin/app+0x0 7\n");
+    assert_eq!(folded, ":22;[app] 7\n");
 }
 
 #[test]
@@ -2617,7 +2617,7 @@ proptest! {
 }
 
 #[test]
-fn folds_mapped_user_frames_as_file_relative_addresses() {
+fn folds_unsymbolized_mapped_user_frames_like_inferno_module_fallback() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
             PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
@@ -2632,7 +2632,26 @@ fn folds_mapped_user_frames_as_file_relative_addresses() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;/bin/app+0x10 1\n");
+    assert_eq!(folded, ":12;[app] 1\n");
+}
+
+#[test]
+fn folds_unsymbolized_bracket_mappings_like_inferno_module_fallback() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(1, &mmap_payload(11, 11, 0x7000, 0x100, 0, "[vdso]")),
+            record_bytes(9, &sample_payload(0x1000, 11, 12, [0x7010])),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, ":12;[[vdso]] 1\n");
 }
 
 #[test]
@@ -2655,7 +2674,7 @@ fn folds_mmap2_build_id_records_as_mappings() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;/bin/build-id-app+0x30 1\n");
+    assert_eq!(folded, ":12;[build-id-app] 1\n");
 }
 
 #[test]
@@ -3020,7 +3039,7 @@ fn keeps_kernel_frames_from_mmap2_records_without_exec_prot() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown] 1\n");
+    assert_eq!(folded, ":12;[[kernel.kallsyms]] 1\n");
 }
 
 #[test]
@@ -3798,6 +3817,15 @@ impl SymbolResolver for InlineSymbolResolver {
 }
 
 struct ArrowInlineSymbolResolver;
+
+fn current_exe_file_name() -> String {
+    std::env::current_exe()
+        .expect("current exe")
+        .file_name()
+        .expect("current exe file name")
+        .to_string_lossy()
+        .into_owned()
+}
 
 impl SymbolResolver for ArrowInlineSymbolResolver {
     fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {

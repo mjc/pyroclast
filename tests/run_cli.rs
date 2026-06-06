@@ -74,7 +74,7 @@ fn fold_command_reads_perfdata_directly() {
     ])
     .expect("fold command");
 
-    assert_eq!(output.stdout, "app;/bin/app+0x1000 1\n");
+    assert_eq!(output.stdout, "app;[app] 1\n");
 }
 
 #[test]
@@ -125,7 +125,7 @@ fn perf_script_command_exports_inferno_compatible_perf_script() {
 
     assert_eq!(
         output.stdout,
-        "app       2 [003]     0.123456:        144 cpu/cycles/P:\n\t2000 /bin/app+0x1000+0x0 ([unknown])\n\n"
+        "app       2 [003]     0.123456:        144 cpu/cycles/P:\n\t            2000 [unknown] (/bin/app)\n\n"
     );
 }
 
@@ -175,9 +175,9 @@ fn perf_script_command_preserves_sample_event_records_like_perf_script() {
         output.stdout,
         concat!(
             "app       2 [004]     0.000010:          7 cpu/cycles/P:\n",
-            "\t2000 /bin/app+0x1000+0x0 ([unknown])\n\n",
+            "\t            2000 [unknown] (/bin/app)\n\n",
             "app       2 [005]     0.000020:         11 cpu/cycles/P:\n",
-            "\t2000 /bin/app+0x1000+0x0 ([unknown])\n\n",
+            "\t            2000 [unknown] (/bin/app)\n\n",
         )
     );
 }
@@ -223,7 +223,7 @@ fn perf_script_command_inherits_parent_comm_on_fork_like_perf_script() {
 
     assert_eq!(
         output.stdout,
-        "sh      22 [006]     0.000030:          5 cpu/cycles/P:\n\t2000 /bin/sh+0x1000+0x0 ([unknown])\n\n"
+        "sh      22 [006]     0.000030:          5 cpu/cycles/P:\n\t            2000 [unknown] (/bin/sh)\n\n"
     );
 }
 
@@ -277,8 +277,8 @@ fn perf_script_command_keeps_perf_stack_order_and_skips_context_markers() {
         output.stdout,
         concat!(
             "app       2 [000]     0.000000:         13 cpu/cycles/P:\n",
-            "\t2000 /bin/app+0x1000+0x0 ([unknown])\n",
-            "\t2100 /bin/app+0x1100+0x0 ([unknown])\n\n",
+            "\t            2000 [unknown] (/bin/app)\n",
+            "\t            2100 [unknown] (/bin/app)\n\n",
         )
     );
 }

@@ -61,7 +61,7 @@ fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
     );
     assert_eq!(
         std::fs::read_to_string(result.layout.stacks_folded()).expect("stacks folded"),
-        "app;/bin/app+0x1000 1\n"
+        "app;[app] 1\n"
     );
     assert_eq!(
         std::fs::read_to_string(result.layout.flamegraph_svg()).expect("flamegraph svg"),
@@ -72,11 +72,11 @@ fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
     )
     .expect("parse summary json");
     assert_eq!(summary_json["folded_lines"], 1);
-    assert_eq!(summary_json["folded_bytes"], 22);
+    assert_eq!(summary_json["folded_bytes"], 12);
     assert_eq!(summary_json["total_count"], 1);
     assert_eq!(
         std::fs::read_to_string(result.layout.summary_txt()).expect("summary txt"),
-        "folded lines: 1\nfolded bytes: 22\ntotal count: 1\n"
+        "folded lines: 1\nfolded bytes: 12\ntotal count: 1\n"
     );
     assert!(result.layout.run_json().is_file());
     assert!(result.layout.stderr_log().is_file());
@@ -143,7 +143,7 @@ fn linux_perf_backend_accepts_pluggable_flamegraph_renderer() {
 
     let result = backend.profile(&request).expect("profile");
 
-    assert_eq!(renderer.folded_stacks(), "app;/bin/app+0x1000 1\n");
+    assert_eq!(renderer.folded_stacks(), "app;[app] 1\n");
     assert_eq!(renderer.title(), "Flame Graph");
     assert_eq!(
         std::fs::read_to_string(result.layout.flamegraph_svg()).expect("flamegraph svg"),
@@ -194,7 +194,7 @@ fn linux_perf_backend_writes_tool_errors_when_renderer_fails() {
     );
     assert_eq!(
         std::fs::read_to_string(root.path().join("cpu/stacks.folded")).expect("folded stacks"),
-        "app;/bin/app+0x1000 1\n"
+        "app;[app] 1\n"
     );
 }
 
