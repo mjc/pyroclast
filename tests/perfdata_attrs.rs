@@ -20,6 +20,8 @@ fn parses_sample_type_from_file_attr_section() {
     assert_eq!(
         attrs,
         vec![PerfFileAttr {
+            event_type: 0,
+            config: 0,
             sample_type,
             read_format: 0,
             branch_sample_type: 0,
@@ -97,6 +99,8 @@ fn parses_file_attr_id_lists() {
     bytes[200..208].copy_from_slice(&11u64.to_le_bytes());
     bytes[208..216].copy_from_slice(&22u64.to_le_bytes());
     let attr = PerfFileAttr {
+        event_type: 0,
+        config: 0,
         sample_type: PERF_SAMPLE_IP,
         read_format: 0,
         branch_sample_type: 0,
@@ -215,6 +219,8 @@ proptest! {
         prop_assert_eq!(
             parse_file_attrs(&bytes, header).expect("attrs"),
             vec![PerfFileAttr {
+                event_type: 0,
+                config: 0,
                 sample_type,
                 read_format,
                 branch_sample_type,
@@ -234,6 +240,8 @@ proptest! {
             bytes[32 + index * 8..32 + (index + 1) * 8].copy_from_slice(&id.to_le_bytes());
         }
         let attr = PerfFileAttr {
+            event_type: 0,
+            config: 0,
             sample_type: PERF_SAMPLE_IP,
             read_format: 0,
             branch_sample_type: 0,

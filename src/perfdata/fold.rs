@@ -148,6 +148,7 @@ struct DeferredFoldSample {
     time: Option<u64>,
     cpu: Option<u32>,
     comm: Option<String>,
+    event_name: String,
     count: u64,
     frames: Vec<FoldFrame>,
     has_callchain: bool,
@@ -159,6 +160,7 @@ struct PreparedFoldSample {
     time: Option<u64>,
     cpu: Option<u32>,
     comm: Option<String>,
+    event_name: String,
     count: u64,
     frames: Vec<FoldFrame>,
     deferred_cookie: Option<u64>,
@@ -252,9 +254,10 @@ struct SampleLayouts {
     by_identifier: BTreeMap<u64, SampleEventLayout>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct SampleEventLayout {
     layout: SampleLayout,
+    event_name: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -929,6 +932,7 @@ where
                     time: sample.time,
                     cpu: sample.cpu,
                     comm: sample.comm,
+                    event_name: sample.event_name,
                     count: sample.count,
                     frames: sample.frames,
                     has_callchain: sample.has_callchain,
@@ -960,6 +964,7 @@ where
                 time: sample.time,
                 cpu: sample.cpu,
                 comm: sample.comm,
+                event_name: sample.event_name,
                 count: sample.count,
                 frames: sample.frames,
                 deferred_cookie: None,
@@ -979,6 +984,7 @@ where
                 time: sample.time,
                 cpu: sample.cpu,
                 comm: sample.comm,
+                event_name: sample.event_name,
                 count: sample.count,
                 frames: sample.frames,
                 deferred_cookie: None,
@@ -1032,7 +1038,7 @@ where
             write!(self.writer, "{secs:>5}.{usecs:06}: ")
                 .map_err(|error| format!("failed to write perf script output: {error}"))?;
         }
-        writeln!(self.writer, "{:>10} cpu/cycles/P:", sample.count)
+        writeln!(self.writer, "{:>10} {}:", sample.count, sample.event_name)
             .map_err(|error| format!("failed to write perf script output: {error}"))
     }
 
@@ -1051,7 +1057,7 @@ where
             write!(self.writer, "{secs:>5}.{usecs:06}: ")
                 .map_err(|error| format!("failed to write perf script output: {error}"))?;
         }
-        write!(self.writer, "{:>10} cpu/cycles/P: ", sample.count)
+        write!(self.writer, "{:>10} {}: ", sample.count, sample.event_name)
             .map_err(|error| format!("failed to write perf script output: {error}"))
     }
 }
@@ -1184,15 +1190,17 @@ fn sample_layouts_from_file(file: &File, header: PerfHeader) -> Result<SampleLay
     let mut layouts = SampleLayouts {
         fallback: attrs.first().map(|attr| SampleEventLayout {
             layout: layout_from_attr(attr),
+            event_name: perf_event_name(attr),
         }),
         by_identifier: BTreeMap::new(),
     };
     for attr in &attrs {
         let event = SampleEventLayout {
             layout: layout_from_attr(attr),
+            event_name: perf_event_name(attr),
         };
         for id in file_attr_ids_from_file(file, attr)? {
-            layouts.by_identifier.insert(id, event);
+            layouts.by_identifier.insert(id, event.clone());
         }
     }
     Ok(layouts)
@@ -1528,6 +1536,7 @@ fn record_time(
 
     sample_layouts
         .fallback
+        .clone()
         .filter(|event| event.layout.sample_id_all)
         .map_or(Ok(None), |event| {
             sample_id_payload_time(record.payload, event.layout)
@@ -1595,6 +1604,7 @@ fn sample_id_size(layout: SampleLayout) -> usize {
 fn deferred_callchain_tid(sample_id: &[u8], sample_layouts: &SampleLayouts) -> Option<u32> {
     sample_layouts
         .fallback
+        .clone()
         .filter(|event| event.layout.sample_id_all)
         .and_then(|event| sample_id_payload_tid(sample_id, event.layout))
 }
@@ -2855,6 +2865,7 @@ fn parse_sample_for_fold(
                 time: sample.time,
                 cpu: sample.cpu,
                 comm: sample.comm,
+                event_name: sample.event_name,
                 count: sample.count,
                 frames: sample.frames,
                 has_callchain: sample.has_callchain,
@@ -2893,7 +2904,7 @@ fn prepare_sample_for_fold(
         .sample_frames
         .extend(sample.frames.clone().map(FoldFrame::Callchain));
     let deferred_cookie = take_deferred_cookie(&mut accumulator.sample_frames);
-    append_perf_user_unwind_frames(accumulator, misc, event, &sample);
+    append_perf_user_unwind_frames(accumulator, misc, &event, &sample);
     let comm = comm_for_ids(&accumulator.thread_comms, sample.tid);
     Ok(Some(PreparedFoldSample {
         pid: sample.pid,
@@ -2901,6 +2912,7 @@ fn prepare_sample_for_fold(
         time: sample.time,
         cpu: sample.cpu,
         comm: comm.map(Cow::into_owned),
+        event_name: event.event_name,
         count,
         frames: std::mem::take(&mut accumulator.sample_frames),
         deferred_cookie,
@@ -2911,7 +2923,7 @@ fn prepare_sample_for_fold(
 fn append_perf_user_unwind_frames(
     accumulator: &mut FoldAccumulator,
     misc: u16,
-    event: SampleEventLayout,
+    event: &SampleEventLayout,
     sample: &crate::perfdata::samples::SampleCallchain<'_>,
 ) {
     let (Some(regs), Some(stack)) = (&sample.user_regs, &sample.user_stack) else {
@@ -2941,7 +2953,7 @@ fn append_perf_user_unwind_frames(
 fn build_user_unwind_context(
     accumulator: &FoldAccumulator,
     misc: u16,
-    event: SampleEventLayout,
+    event: &SampleEventLayout,
     sample: &crate::perfdata::samples::SampleCallchain<'_>,
     regs: &PerfX86_64Regs,
 ) -> UserUnwindContext {
@@ -2986,7 +2998,7 @@ fn loaded_unwind_module_count(accumulator: &FoldAccumulator, pid: Option<u32>) -
 
 fn sample_callchain_state(
     misc: u16,
-    event: SampleEventLayout,
+    event: &SampleEventLayout,
     sample: &crate::perfdata::samples::SampleCallchain<'_>,
     has_sample_frames: bool,
 ) -> SampleCallchainState {
@@ -3476,15 +3488,17 @@ fn sample_layouts(
     let mut layouts = SampleLayouts {
         fallback: attrs.first().map(|attr| SampleEventLayout {
             layout: layout_from_attr(attr),
+            event_name: perf_event_name(attr),
         }),
         by_identifier: BTreeMap::new(),
     };
     for attr in &attrs {
         let event = SampleEventLayout {
             layout: layout_from_attr(attr),
+            event_name: perf_event_name(attr),
         };
         for id in parse_file_attr_ids(bytes, attr)? {
-            layouts.by_identifier.insert(id, event);
+            layouts.by_identifier.insert(id, event.clone());
         }
     }
     Ok(layouts)
@@ -3501,19 +3515,70 @@ fn layout_from_attr(attr: &PerfFileAttr) -> SampleLayout {
     }
 }
 
+fn perf_event_name(attr: &PerfFileAttr) -> String {
+    const PERF_TYPE_HARDWARE: u32 = 0;
+    const PERF_TYPE_SOFTWARE: u32 = 1;
+    const PERF_TYPE_TRACEPOINT: u32 = 2;
+    const PERF_TYPE_HW_CACHE: u32 = 3;
+    const PERF_TYPE_RAW: u32 = 4;
+    const PERF_TYPE_BREAKPOINT: u32 = 5;
+
+    match attr.event_type {
+        PERF_TYPE_HARDWARE => hardware_event_name(attr.config).to_string(),
+        PERF_TYPE_SOFTWARE => software_event_name(attr.config).to_string(),
+        PERF_TYPE_TRACEPOINT => "unknown tracepoint".to_string(),
+        PERF_TYPE_HW_CACHE => "invalid-cache".to_string(),
+        PERF_TYPE_RAW => format!("raw 0x{:x}", attr.config),
+        PERF_TYPE_BREAKPOINT => "breakpoint".to_string(),
+        _ => format!("unknown attr type: {}", attr.event_type),
+    }
+}
+
+fn hardware_event_name(config: u64) -> &'static str {
+    match config & 0xffff_ffff {
+        0 => "cycles",
+        1 => "instructions",
+        2 => "cache-references",
+        3 => "cache-misses",
+        4 => "branches",
+        5 => "branch-misses",
+        6 => "bus-cycles",
+        7 => "stalled-cycles-frontend",
+        8 => "stalled-cycles-backend",
+        9 => "ref-cycles",
+        _ => "unknown-hardware",
+    }
+}
+
+fn software_event_name(config: u64) -> &'static str {
+    match config {
+        0 => "cpu-clock",
+        1 => "task-clock",
+        2 => "page-faults",
+        3 => "context-switches",
+        4 => "cpu-migrations",
+        5 => "minor-faults",
+        6 => "major-faults",
+        7 => "alignment-faults",
+        8 => "emulation-faults",
+        9 => "dummy",
+        _ => "unknown-software",
+    }
+}
+
 impl SampleLayouts {
     fn layout_for_payload(&self, payload: &[u8]) -> Result<Option<SampleEventLayout>, String> {
         if self.by_identifier.is_empty() {
-            return Ok(self.fallback);
+            return Ok(self.fallback.clone());
         }
-        let Some(fallback) = self.fallback else {
+        let Some(fallback) = self.fallback.clone() else {
             return Ok(None);
         };
         if let Some(identifier) = sample_event_id(payload, fallback.layout)? {
             return Ok(self
                 .by_identifier
                 .get(&identifier)
-                .copied()
+                .cloned()
                 .or(Some(fallback)));
         }
         Ok(Some(fallback))

@@ -125,7 +125,7 @@ fn perf_script_command_exports_inferno_compatible_perf_script() {
 
     assert_eq!(
         output.stdout,
-        "app       2 [003]     0.123456:        144 cpu/cycles/P:\n\t            2000 [unknown] (/bin/app)\n\n"
+        "app       2 [003]     0.123456:        144 cycles:\n\t            2000 [unknown] (/bin/app)\n\n"
     );
 }
 
@@ -176,7 +176,7 @@ fn perf_script_command_uses_perf_default_thread_comm_when_comm_is_missing() {
 
     assert_eq!(
         output.stdout,
-        ":2       2 [003]     0.123456:        144 cpu/cycles/P:\n\t            2000 [unknown] (/bin/app)\n\n"
+        ":2       2 [003]     0.123456:        144 cycles:\n\t            2000 [unknown] (/bin/app)\n\n"
     );
 }
 
@@ -225,9 +225,9 @@ fn perf_script_command_preserves_sample_event_records_like_perf_script() {
     assert_eq!(
         output.stdout,
         concat!(
-            "app       2 [004]     0.000010:          7 cpu/cycles/P:\n",
+            "app       2 [004]     0.000010:          7 cycles:\n",
             "\t            2000 [unknown] (/bin/app)\n\n",
-            "app       2 [005]     0.000020:         11 cpu/cycles/P:\n",
+            "app       2 [005]     0.000020:         11 cycles:\n",
             "\t            2000 [unknown] (/bin/app)\n\n",
         )
     );
@@ -267,7 +267,48 @@ fn perf_script_command_writes_sample_ip_on_event_line_when_callchain_is_absent_l
 
     assert_eq!(
         output.stdout,
-        "              :2       2        144 cpu/cycles/P:             1000 [unknown] (/bin/app)\n"
+        "              :2       2        144 cycles:             1000 [unknown] (/bin/app)\n"
+    );
+}
+
+#[test]
+fn perf_script_command_uses_perf_event_name_from_software_attr_like_perf_script() {
+    const PERF_TYPE_SOFTWARE: u32 = 1;
+    const PERF_COUNT_SW_CPU_CLOCK: u64 = 0;
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    std::fs::write(
+        &perfdata,
+        perfdata_with_records_and_attrs(
+            [file_attr_bytes_with_type_config(
+                PERF_TYPE_SOFTWARE,
+                PERF_COUNT_SW_CPU_CLOCK,
+                PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN,
+                0,
+                0,
+            )],
+            [
+                record_bytes(3, &comm_payload(1, 2, "app")),
+                record_bytes(1, &mmap_payload(1, 2, 0x1000, 0x2000, 0, "/bin/app")),
+                record_bytes(9, &sample_payload_with_period(0x1000, 1, 2, 144, [0x2000])),
+            ],
+        ),
+    )
+    .expect("write perfdata");
+
+    let output = pyroclast::run_cli([
+        "pyroclast",
+        "plumbing",
+        "perf-script",
+        "--no-symbols",
+        perfdata.to_str().unwrap(),
+    ])
+    .expect("perf script command");
+
+    assert_eq!(
+        output.stdout,
+        "app       2        144 cpu-clock:\n\t            2000 [unknown] (/bin/app)\n\n"
     );
 }
 
@@ -312,7 +353,7 @@ fn perf_script_command_inherits_parent_comm_on_fork_like_perf_script() {
 
     assert_eq!(
         output.stdout,
-        "sh      22 [006]     0.000030:          5 cpu/cycles/P:\n\t            2000 [unknown] (/bin/sh)\n\n"
+        "sh      22 [006]     0.000030:          5 cycles:\n\t            2000 [unknown] (/bin/sh)\n\n"
     );
 }
 
@@ -365,7 +406,7 @@ fn perf_script_command_keeps_perf_stack_order_and_skips_context_markers() {
     assert_eq!(
         output.stdout,
         concat!(
-            "app       2 [000]     0.000000:         13 cpu/cycles/P:\n",
+            "app       2 [000]     0.000000:         13 cycles:\n",
             "\t            2000 [unknown] (/bin/app)\n",
             "\t            2100 [unknown] (/bin/app)\n\n",
         )
@@ -1242,6 +1283,19 @@ fn file_attr_bytes(sample_type: u64, ids_offset: u64, ids_size: u64) -> [u8; 144
     put_u64(&mut bytes, 24, sample_type);
     put_u64(&mut bytes, 128, ids_offset);
     put_u64(&mut bytes, 136, ids_size);
+    bytes
+}
+
+fn file_attr_bytes_with_type_config(
+    event_type: u32,
+    config: u64,
+    sample_type: u64,
+    ids_offset: u64,
+    ids_size: u64,
+) -> [u8; 144] {
+    let mut bytes = file_attr_bytes(sample_type, ids_offset, ids_size);
+    put_u32(&mut bytes, 0, event_type);
+    put_u64(&mut bytes, 8, config);
     bytes
 }
 
