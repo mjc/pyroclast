@@ -172,7 +172,14 @@ impl FramehopUnwinder {
         let object = object::File::parse(&mapped[..]).map_err(|error| {
             format!("failed to parse unwind object {}: {error}", path.display())
         })?;
-        let base = start.saturating_sub(pgoff);
+        let base = if path
+            .to_str()
+            .is_some_and(|path| path.starts_with("/tmp/jitted-"))
+        {
+            start
+        } else {
+            start.saturating_sub(pgoff)
+        };
         let Some(module_range) = object_load_range(&object)
             .map(|range| base.saturating_add(range.start)..base.saturating_add(range.end))
         else {
@@ -782,8 +789,10 @@ mod tests {
         // paths starting with /tmp/jitted- use map__start(al->map) as the
         // DWFL base instead of map__start(al->map) - map__pgoff(al->map).
         let current_exe = std::env::current_exe().expect("current exe");
-        let jitted_path =
-            std::env::temp_dir().join(format!("jitted-pyroclast-test-{}.so", std::process::id()));
+        let jitted_path = std::path::PathBuf::from(format!(
+            "/tmp/jitted-pyroclast-test-{}.so",
+            std::process::id()
+        ));
         std::fs::copy(&current_exe, &jitted_path).expect("copy test object");
         let bytes = std::fs::read(&jitted_path).expect("read jitted object");
         let object = object::File::parse(&bytes[..]).expect("parse jitted object");
