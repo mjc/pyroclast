@@ -252,6 +252,7 @@ struct PrefetchMappingKey {
 struct SampleLayouts {
     fallback: Option<SampleEventLayout>,
     by_identifier: BTreeMap<u64, SampleEventLayout>,
+    event_name_width: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -800,7 +801,12 @@ where
         .seek(SeekFrom::Start(header.data_offset))
         .map_err(|error| format!("failed to seek perf data section: {error}"))?;
 
-    let mut sink = PerfScriptSink::new(header_build_ids, symbol_cache, writer);
+    let mut sink = PerfScriptSink::new(
+        header_build_ids,
+        symbol_cache,
+        writer,
+        sample_layouts.event_name_width,
+    );
     let mut ordered_records = OrderedRecordQueue::default();
     let mut header_bytes = [0_u8; 8];
     let mut payload = Vec::new();
@@ -865,6 +871,7 @@ struct PerfScriptSink<'io, 'cache, R, W: ?Sized> {
     accumulator: FoldAccumulator,
     symbol_cache: Option<&'io mut SymbolFrameCache<'cache, R>>,
     writer: &'io mut W,
+    event_name_width: usize,
 }
 
 impl<'io, 'cache, R, W> PerfScriptSink<'io, 'cache, R, W>
@@ -876,11 +883,13 @@ where
         header_build_ids: BTreeMap<String, Vec<u8>>,
         symbol_cache: Option<&'io mut SymbolFrameCache<'cache, R>>,
         writer: &'io mut W,
+        event_name_width: usize,
     ) -> Self {
         Self {
             accumulator: FoldAccumulator::new(header_build_ids),
             symbol_cache,
             writer,
+            event_name_width,
         }
     }
 
@@ -1038,8 +1047,14 @@ where
             write!(self.writer, "{secs:>5}.{usecs:06}: ")
                 .map_err(|error| format!("failed to write perf script output: {error}"))?;
         }
-        writeln!(self.writer, "{:>10} {}:", sample.count, sample.event_name)
-            .map_err(|error| format!("failed to write perf script output: {error}"))
+        writeln!(
+            self.writer,
+            "{:>10} {:>width$}:",
+            sample.count,
+            sample.event_name,
+            width = self.event_name_width,
+        )
+        .map_err(|error| format!("failed to write perf script output: {error}"))
     }
 
     fn write_sample_inline_header(&mut self, sample: &PreparedFoldSample) -> Result<(), String> {
@@ -1057,8 +1072,14 @@ where
             write!(self.writer, "{secs:>5}.{usecs:06}: ")
                 .map_err(|error| format!("failed to write perf script output: {error}"))?;
         }
-        write!(self.writer, "{:>10} {}: ", sample.count, sample.event_name)
-            .map_err(|error| format!("failed to write perf script output: {error}"))
+        write!(
+            self.writer,
+            "{:>10} {:>width$}: ",
+            sample.count,
+            sample.event_name,
+            width = self.event_name_width,
+        )
+        .map_err(|error| format!("failed to write perf script output: {error}"))
     }
 }
 
@@ -1187,17 +1208,24 @@ fn sample_layouts_from_file(file: &File, header: PerfHeader) -> Result<SampleLay
         },
     )?;
 
+    let event_names = attrs.iter().map(perf_event_name).collect::<Vec<_>>();
+    let event_name_width = event_names
+        .iter()
+        .map(String::len)
+        .max()
+        .unwrap_or_default();
     let mut layouts = SampleLayouts {
         fallback: attrs.first().map(|attr| SampleEventLayout {
             layout: layout_from_attr(attr),
-            event_name: perf_event_name(attr),
+            event_name: event_names.first().cloned().unwrap_or_default(),
         }),
         by_identifier: BTreeMap::new(),
+        event_name_width,
     };
-    for attr in &attrs {
+    for (attr, event_name) in attrs.iter().zip(event_names) {
         let event = SampleEventLayout {
             layout: layout_from_attr(attr),
-            event_name: perf_event_name(attr),
+            event_name,
         };
         for id in file_attr_ids_from_file(file, attr)? {
             layouts.by_identifier.insert(id, event.clone());
@@ -3485,17 +3513,24 @@ fn sample_layouts(
     header: crate::perfdata::header::PerfHeader,
 ) -> Result<SampleLayouts, String> {
     let attrs = parse_file_attrs(bytes, header)?;
+    let event_names = attrs.iter().map(perf_event_name).collect::<Vec<_>>();
+    let event_name_width = event_names
+        .iter()
+        .map(String::len)
+        .max()
+        .unwrap_or_default();
     let mut layouts = SampleLayouts {
         fallback: attrs.first().map(|attr| SampleEventLayout {
             layout: layout_from_attr(attr),
-            event_name: perf_event_name(attr),
+            event_name: event_names.first().cloned().unwrap_or_default(),
         }),
         by_identifier: BTreeMap::new(),
+        event_name_width,
     };
-    for attr in &attrs {
+    for (attr, event_name) in attrs.iter().zip(event_names) {
         let event = SampleEventLayout {
             layout: layout_from_attr(attr),
-            event_name: perf_event_name(attr),
+            event_name,
         };
         for id in parse_file_attr_ids(bytes, attr)? {
             layouts.by_identifier.insert(id, event.clone());

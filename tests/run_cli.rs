@@ -1,8 +1,8 @@
 use object::{Object, ObjectSegment, ObjectSymbol};
 use pyroclast::perfdata::records::PERF_RECORD_FORK;
 use pyroclast::perfdata::samples::{
-    PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_TID,
-    PERF_SAMPLE_TIME,
+    PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP,
+    PERF_SAMPLE_PERIOD, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
 };
 use std::sync::Mutex;
 
@@ -309,6 +309,78 @@ fn perf_script_command_uses_perf_event_name_from_software_attr_like_perf_script(
     assert_eq!(
         output.stdout,
         "app       2        144 cpu-clock:\n\t            2000 [unknown] (/bin/app)\n\n"
+    );
+}
+
+#[test]
+fn perf_script_command_pads_event_names_to_evlist_max_width_like_perf_script() {
+    const PERF_TYPE_HARDWARE: u32 = 0;
+    const PERF_COUNT_HW_CPU_CYCLES: u64 = 0;
+    const PERF_TYPE_SOFTWARE: u32 = 1;
+    const PERF_COUNT_SW_CPU_CLOCK: u64 = 0;
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    std::fs::write(
+        &perfdata,
+        perfdata_with_attrs_ids_and_records(
+            [
+                file_attr_bytes_with_type_config(
+                    PERF_TYPE_HARDWARE,
+                    PERF_COUNT_HW_CPU_CYCLES,
+                    PERF_SAMPLE_IDENTIFIER
+                        | PERF_SAMPLE_IP
+                        | PERF_SAMPLE_TID
+                        | PERF_SAMPLE_PERIOD
+                        | PERF_SAMPLE_CALLCHAIN,
+                    392,
+                    8,
+                ),
+                file_attr_bytes_with_type_config(
+                    PERF_TYPE_SOFTWARE,
+                    PERF_COUNT_SW_CPU_CLOCK,
+                    PERF_SAMPLE_IDENTIFIER
+                        | PERF_SAMPLE_IP
+                        | PERF_SAMPLE_TID
+                        | PERF_SAMPLE_PERIOD
+                        | PERF_SAMPLE_CALLCHAIN,
+                    400,
+                    8,
+                ),
+            ],
+            [111, 222],
+            [
+                record_bytes(3, &comm_payload(1, 2, "app")),
+                record_bytes(
+                    9,
+                    &sample_payload_with_identifier_and_period(111, 0x1000, 1, 2, 5, [0x2000]),
+                ),
+                record_bytes(
+                    9,
+                    &sample_payload_with_identifier_and_period(222, 0x1000, 1, 2, 7, [0x2000]),
+                ),
+            ],
+        ),
+    )
+    .expect("write perfdata");
+
+    let output = pyroclast::run_cli([
+        "pyroclast",
+        "plumbing",
+        "perf-script",
+        "--no-symbols",
+        perfdata.to_str().unwrap(),
+    ])
+    .expect("perf script command");
+
+    assert_eq!(
+        output.stdout,
+        concat!(
+            "app       2          5    cycles:\n",
+            "\t            2000 [unknown] ([unknown])\n\n",
+            "app       2          7 cpu-clock:\n",
+            "\t            2000 [unknown] ([unknown])\n\n",
+        )
     );
 }
 
@@ -1277,6 +1349,34 @@ fn perfdata_with_records_and_attrs<const A: usize, const R: usize>(
     bytes
 }
 
+fn perfdata_with_attrs_ids_and_records<const A: usize, const I: usize, const R: usize>(
+    attrs: [[u8; 144]; A],
+    ids: [u64; I],
+    records: [Vec<u8>; R],
+) -> Vec<u8> {
+    let attr_size = attrs.len() * 144;
+    let ids_size = ids.len() * 8;
+    let data_size = records.iter().map(Vec::len).sum::<usize>();
+    let data_offset = 104 + attr_size + ids_size;
+    let mut bytes = vec![0; 104];
+    bytes[..8].copy_from_slice(b"PERFILE2");
+    put_u64(&mut bytes, 8, 104);
+    put_u64(&mut bytes, 24, 104);
+    put_u64(&mut bytes, 32, attr_size as u64);
+    put_u64(&mut bytes, 40, data_offset as u64);
+    put_u64(&mut bytes, 48, data_size as u64);
+    for attr in attrs {
+        bytes.extend(attr);
+    }
+    for id in ids {
+        bytes.extend(id.to_le_bytes());
+    }
+    for record in records {
+        bytes.extend(record);
+    }
+    bytes
+}
+
 fn file_attr_bytes(sample_type: u64, ids_offset: u64, ids_size: u64) -> [u8; 144] {
     let mut bytes = [0; 144];
     put_u32(&mut bytes, 4, 128);
@@ -1333,6 +1433,27 @@ fn sample_payload_with_period<const N: usize>(
     callchain: [u64; N],
 ) -> Vec<u8> {
     let mut payload = Vec::new();
+    payload.extend(ip.to_le_bytes());
+    payload.extend(pid.to_le_bytes());
+    payload.extend(tid.to_le_bytes());
+    payload.extend(period.to_le_bytes());
+    payload.extend((callchain.len() as u64).to_le_bytes());
+    for frame in callchain {
+        payload.extend(frame.to_le_bytes());
+    }
+    payload
+}
+
+fn sample_payload_with_identifier_and_period<const N: usize>(
+    identifier: u64,
+    ip: u64,
+    pid: u32,
+    tid: u32,
+    period: u64,
+    callchain: [u64; N],
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(identifier.to_le_bytes());
     payload.extend(ip.to_le_bytes());
     payload.extend(pid.to_le_bytes());
     payload.extend(tid.to_le_bytes());
