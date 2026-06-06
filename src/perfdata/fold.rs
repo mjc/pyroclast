@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::fs::File;
@@ -144,6 +145,8 @@ struct OrderedRecordQueue {
 struct DeferredFoldSample {
     pid: Option<u32>,
     tid: Option<u32>,
+    time: Option<u64>,
+    cpu: Option<u32>,
     comm: Option<String>,
     count: u64,
     frames: Vec<FoldFrame>,
@@ -152,6 +155,8 @@ struct DeferredFoldSample {
 struct PreparedFoldSample {
     pid: Option<u32>,
     tid: Option<u32>,
+    time: Option<u64>,
+    cpu: Option<u32>,
     comm: Option<String>,
     count: u64,
     frames: Vec<FoldFrame>,
@@ -420,7 +425,10 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
                 Ok(())
             }
             ParsedRecord::Fork(record) => {
-                inherit_fork_comm(&mut summary.comms_by_pid, &mut summary.comms_by_tid, record);
+                if let Some(comm) = summary.comms_by_tid.get(&record.ptid).cloned() {
+                    summary.comms_by_pid.insert(record.pid, comm.clone());
+                    summary.comms_by_tid.insert(record.tid, comm);
+                }
                 if record.clone_maps {
                     summary
                         .mmap_table
@@ -916,6 +924,8 @@ where
                 .push(DeferredFoldSample {
                     pid: sample.pid,
                     tid: sample.tid,
+                    time: sample.time,
+                    cpu: sample.cpu,
                     comm: sample.comm,
                     count: sample.count,
                     frames: sample.frames,
@@ -944,6 +954,8 @@ where
             let sample = PreparedFoldSample {
                 pid: sample.pid,
                 tid: sample.tid,
+                time: sample.time,
+                cpu: sample.cpu,
                 comm: sample.comm,
                 count: sample.count,
                 frames: sample.frames,
@@ -960,6 +972,8 @@ where
             let sample = PreparedFoldSample {
                 pid: sample.pid,
                 tid: sample.tid,
+                time: sample.time,
+                cpu: sample.cpu,
                 comm: sample.comm,
                 count: sample.count,
                 frames: sample.frames,
@@ -988,13 +1002,21 @@ where
 
     fn write_sample_header(&mut self, sample: &PreparedFoldSample) -> Result<(), String> {
         let comm = sample.comm.as_deref().unwrap_or("[unknown]");
-        let pid = sample.pid.unwrap_or(0);
-        writeln!(
-            self.writer,
-            "{comm} {pid} 0: {} cpu/cycles/P:",
-            sample.count
-        )
-        .map_err(|error| format!("failed to write perf script output: {error}"))
+        let tid = sample.tid.or(sample.pid).unwrap_or(0);
+        write!(self.writer, "{comm} {tid:>7} ")
+            .map_err(|error| format!("failed to write perf script output: {error}"))?;
+        if let Some(cpu) = sample.cpu {
+            write!(self.writer, "[{cpu:03}] ")
+                .map_err(|error| format!("failed to write perf script output: {error}"))?;
+        }
+        if let Some(time) = sample.time {
+            let secs = time / 1_000_000_000;
+            let usecs = (time % 1_000_000_000) / 1_000;
+            write!(self.writer, "{secs:>5}.{usecs:06}: ")
+                .map_err(|error| format!("failed to write perf script output: {error}"))?;
+        }
+        writeln!(self.writer, "{:>10} cpu/cycles/P:", sample.count)
+            .map_err(|error| format!("failed to write perf script output: {error}"))
     }
 }
 
@@ -1555,16 +1577,10 @@ fn update_comm_tables(
 }
 
 fn inherit_fork_comm(
-    process_comms: &mut BTreeMap<u32, String>,
     thread_comms: &mut BTreeMap<u32, String>,
     record: crate::perfdata::records::ForkRecord,
 ) {
-    let inherited = thread_comms
-        .get(&record.ptid)
-        .or_else(|| process_comms.get(&record.ppid))
-        .cloned();
-    if let Some(comm) = inherited {
-        process_comms.insert(record.pid, comm.clone());
+    if let Some(comm) = thread_comms.get(&record.ptid).cloned() {
         thread_comms.insert(record.tid, comm);
     }
 }
@@ -1575,7 +1591,10 @@ fn inherit_fork_comm_tables(
     thread_comms: &mut BTreeMap<u32, String>,
     record: crate::perfdata::records::ForkRecord,
 ) {
-    inherit_fork_comm(process_comms, thread_comms, record);
+    inherit_fork_comm(thread_comms, record);
+    if let Some(comm) = thread_comms.get(&record.tid).cloned() {
+        process_comms.insert(record.pid, comm);
+    }
     if let Some(comm) = exec_process_comms.get(&record.ppid).cloned() {
         exec_process_comms.insert(record.pid, comm);
     }
@@ -1725,17 +1744,12 @@ fn is_valid_unwound_user_frame(
     address != 0
 }
 
-fn comm_for_ids<'a>(
-    process_comms: &'a BTreeMap<u32, String>,
-    exec_process_comms: &'a BTreeMap<u32, String>,
-    thread_comms: &'a BTreeMap<u32, String>,
-    pid: Option<u32>,
-    tid: Option<u32>,
-) -> Option<&'a str> {
-    tid.and_then(|tid| thread_comms.get(&tid))
-        .or_else(|| pid.and_then(|pid| exec_process_comms.get(&pid)))
-        .or_else(|| pid.and_then(|pid| process_comms.get(&pid)))
-        .map(String::as_str)
+fn comm_for_ids(thread_comms: &BTreeMap<u32, String>, tid: Option<u32>) -> Option<Cow<'_, str>> {
+    let tid = tid?;
+    Some(thread_comms.get(&tid).map_or_else(
+        || Cow::Owned(format!(":{tid}")),
+        |comm| Cow::Borrowed(comm.as_str()),
+    ))
 }
 
 fn render_fold_data<R>(
@@ -2671,6 +2685,8 @@ fn parse_sample_for_fold(
             .push(DeferredFoldSample {
                 pid: sample.pid,
                 tid: sample.tid,
+                time: sample.time,
+                cpu: sample.cpu,
                 comm: sample.comm,
                 count: sample.count,
                 frames: sample.frames,
@@ -2710,17 +2726,13 @@ fn prepare_sample_for_fold(
         .extend(sample.frames.clone().map(FoldFrame::Callchain));
     let deferred_cookie = take_deferred_cookie(&mut accumulator.sample_frames);
     append_perf_user_unwind_frames(accumulator, misc, event, &sample);
-    let comm = comm_for_ids(
-        &accumulator.process_comms,
-        &accumulator.exec_process_comms,
-        &accumulator.thread_comms,
-        sample.pid,
-        sample.tid,
-    );
+    let comm = comm_for_ids(&accumulator.thread_comms, sample.tid);
     Ok(Some(PreparedFoldSample {
         pid: sample.pid,
         tid: sample.tid,
-        comm: comm.map(str::to_owned),
+        time: sample.time,
+        cpu: sample.cpu,
+        comm: comm.map(Cow::into_owned),
         count,
         frames: std::mem::take(&mut accumulator.sample_frames),
         deferred_cookie,

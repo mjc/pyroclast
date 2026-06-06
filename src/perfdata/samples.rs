@@ -85,6 +85,7 @@ pub struct SampleCallchain<'a> {
     pub pid: Option<u32>,
     pub tid: Option<u32>,
     pub time: Option<u64>,
+    pub cpu: Option<u32>,
     pub period: Option<u64>,
     pub frames: SampleCallchainFrames<'a>,
     pub user_regs: Option<SampleUserRegs>,
@@ -233,6 +234,7 @@ pub fn parse_sample_record_callchain(
     let mut pid = None;
     let mut tid = None;
     let mut time = None;
+    let mut cpu = None;
     let mut period = None;
     let mut sample_ip = None;
 
@@ -259,7 +261,7 @@ pub fn parse_sample_record_callchain(
         cursor.skip_u64()?;
     }
     if layout.has(PERF_SAMPLE_CPU) {
-        cursor.skip_u32()?;
+        cpu = Some(cursor.read_u32()?);
         cursor.skip_u32()?;
     }
     if layout.has(PERF_SAMPLE_PERIOD) {
@@ -285,6 +287,7 @@ pub fn parse_sample_record_callchain(
             pid,
             tid,
             time,
+            cpu,
             period,
             frames: SampleCallchainFrames {
                 payload: &[],
@@ -321,6 +324,7 @@ pub fn parse_sample_record_callchain(
         pid,
         tid,
         time,
+        cpu,
         period,
         frames: SampleCallchainFrames {
             payload: frames,

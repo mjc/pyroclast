@@ -1,7 +1,8 @@
 use object::{Object, ObjectSegment, ObjectSymbol};
 use pyroclast::perfdata::records::PERF_RECORD_FORK;
 use pyroclast::perfdata::samples::{
-    PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_TID,
+    PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_TID,
+    PERF_SAMPLE_TIME,
 };
 use std::sync::Mutex;
 
@@ -84,14 +85,30 @@ fn perf_script_command_exports_inferno_compatible_perf_script() {
         &perfdata,
         perfdata_with_records_and_attrs(
             [file_attr_bytes(
-                PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_PERIOD,
+                PERF_SAMPLE_IP
+                    | PERF_SAMPLE_TID
+                    | PERF_SAMPLE_TIME
+                    | PERF_SAMPLE_CPU
+                    | PERF_SAMPLE_PERIOD
+                    | PERF_SAMPLE_CALLCHAIN,
                 0,
                 0,
             )],
             [
                 record_bytes(3, &comm_payload(1, 2, "app")),
                 record_bytes(1, &mmap_payload(1, 2, 0x1000, 0x2000, 0, "/bin/app")),
-                record_bytes(9, &sample_payload_with_period(0x1000, 1, 2, 144, [0x2000])),
+                record_bytes(
+                    9,
+                    &sample_payload_with_time_cpu_period(
+                        0x1000,
+                        1,
+                        2,
+                        123_456_000,
+                        3,
+                        144,
+                        [0x2000],
+                    ),
+                ),
             ],
         ),
     )
@@ -108,7 +125,7 @@ fn perf_script_command_exports_inferno_compatible_perf_script() {
 
     assert_eq!(
         output.stdout,
-        "app 1 0: 144 cpu/cycles/P:\n\t2000 /bin/app+0x1000+0x0 ([unknown])\n\n"
+        "app       2 [003]     0.123456:        144 cpu/cycles/P:\n\t2000 /bin/app+0x1000+0x0 ([unknown])\n\n"
     );
 }
 
@@ -120,15 +137,26 @@ fn perf_script_command_preserves_sample_event_records_like_perf_script() {
         &perfdata,
         perfdata_with_records_and_attrs(
             [file_attr_bytes(
-                PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_PERIOD,
+                PERF_SAMPLE_IP
+                    | PERF_SAMPLE_TID
+                    | PERF_SAMPLE_TIME
+                    | PERF_SAMPLE_CPU
+                    | PERF_SAMPLE_PERIOD
+                    | PERF_SAMPLE_CALLCHAIN,
                 0,
                 0,
             )],
             [
                 record_bytes(3, &comm_payload(1, 2, "app")),
                 record_bytes(1, &mmap_payload(1, 2, 0x1000, 0x2000, 0, "/bin/app")),
-                record_bytes(9, &sample_payload_with_period(0x1000, 1, 2, 7, [0x2000])),
-                record_bytes(9, &sample_payload_with_period(0x1000, 1, 2, 11, [0x2000])),
+                record_bytes(
+                    9,
+                    &sample_payload_with_time_cpu_period(0x1000, 1, 2, 10_000, 4, 7, [0x2000]),
+                ),
+                record_bytes(
+                    9,
+                    &sample_payload_with_time_cpu_period(0x1000, 1, 2, 20_000, 5, 11, [0x2000]),
+                ),
             ],
         ),
     )
@@ -146,9 +174,9 @@ fn perf_script_command_preserves_sample_event_records_like_perf_script() {
     assert_eq!(
         output.stdout,
         concat!(
-            "app 1 0: 7 cpu/cycles/P:\n",
+            "app       2 [004]     0.000010:          7 cpu/cycles/P:\n",
             "\t2000 /bin/app+0x1000+0x0 ([unknown])\n\n",
-            "app 1 0: 11 cpu/cycles/P:\n",
+            "app       2 [005]     0.000020:         11 cpu/cycles/P:\n",
             "\t2000 /bin/app+0x1000+0x0 ([unknown])\n\n",
         )
     );
@@ -162,7 +190,12 @@ fn perf_script_command_inherits_parent_comm_on_fork_like_perf_script() {
         &perfdata,
         perfdata_with_records_and_attrs(
             [file_attr_bytes(
-                PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_PERIOD,
+                PERF_SAMPLE_IP
+                    | PERF_SAMPLE_TID
+                    | PERF_SAMPLE_TIME
+                    | PERF_SAMPLE_CPU
+                    | PERF_SAMPLE_PERIOD
+                    | PERF_SAMPLE_CALLCHAIN,
                 0,
                 0,
             )],
@@ -170,7 +203,10 @@ fn perf_script_command_inherits_parent_comm_on_fork_like_perf_script() {
                 record_bytes(3, &comm_payload(11, 11, "sh")),
                 record_bytes(1, &mmap_payload(11, 11, 0x1000, 0x2000, 0, "/bin/sh")),
                 record_bytes(PERF_RECORD_FORK, &fork_payload([22, 11, 22, 11], 99)),
-                record_bytes(9, &sample_payload_with_period(0x1000, 22, 22, 5, [0x2000])),
+                record_bytes(
+                    9,
+                    &sample_payload_with_time_cpu_period(0x1000, 22, 22, 30_000, 6, 5, [0x2000]),
+                ),
             ],
         ),
     )
@@ -187,7 +223,7 @@ fn perf_script_command_inherits_parent_comm_on_fork_like_perf_script() {
 
     assert_eq!(
         output.stdout,
-        "sh 22 0: 5 cpu/cycles/P:\n\t2000 /bin/sh+0x1000+0x0 ([unknown])\n\n"
+        "sh      22 [006]     0.000030:          5 cpu/cycles/P:\n\t2000 /bin/sh+0x1000+0x0 ([unknown])\n\n"
     );
 }
 
@@ -199,7 +235,12 @@ fn perf_script_command_keeps_perf_stack_order_and_skips_context_markers() {
         &perfdata,
         perfdata_with_records_and_attrs(
             [file_attr_bytes(
-                PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_PERIOD,
+                PERF_SAMPLE_IP
+                    | PERF_SAMPLE_TID
+                    | PERF_SAMPLE_TIME
+                    | PERF_SAMPLE_CPU
+                    | PERF_SAMPLE_PERIOD
+                    | PERF_SAMPLE_CALLCHAIN,
                 0,
                 0,
             )],
@@ -208,10 +249,12 @@ fn perf_script_command_keeps_perf_stack_order_and_skips_context_markers() {
                 record_bytes(1, &mmap_payload(1, 2, 0x1000, 0x3000, 0, "/bin/app")),
                 record_bytes(
                     9,
-                    &sample_payload_with_period(
+                    &sample_payload_with_time_cpu_period(
                         0x1000,
                         1,
                         2,
+                        0,
+                        0,
                         13,
                         [0x2000, 0x2100, 0xffff_ffff_ffff_ff80],
                     ),
@@ -233,7 +276,7 @@ fn perf_script_command_keeps_perf_stack_order_and_skips_context_markers() {
     assert_eq!(
         output.stdout,
         concat!(
-            "app 1 0: 13 cpu/cycles/P:\n",
+            "app       2 [000]     0.000000:         13 cpu/cycles/P:\n",
             "\t2000 /bin/app+0x1000+0x0 ([unknown])\n",
             "\t2100 /bin/app+0x1100+0x0 ([unknown])\n\n",
         )
@@ -383,10 +426,7 @@ fn flamegraph_command_folds_perfdata_without_perf_script() {
             "-".to_string()
         ])
     );
-    assert_eq!(
-        runner.stdins(),
-        vec![Some(b"[unknown];0x2000 1\n".to_vec())]
-    );
+    assert_eq!(runner.stdins(), vec![Some(b":2;0x2000 1\n".to_vec())]);
     assert_eq!(
         std::fs::read_to_string(output_svg).expect("svg"),
         "<svg></svg>\n"
@@ -412,10 +452,7 @@ fn flamegraph_command_weights_perf_sample_periods() {
 
     pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("flamegraph command");
 
-    assert_eq!(
-        runner.stdins(),
-        vec![Some(b"[unknown];0x2000 144\n".to_vec())]
-    );
+    assert_eq!(runner.stdins(), vec![Some(b":2;0x2000 144\n".to_vec())]);
 }
 
 #[test]
@@ -440,7 +477,7 @@ fn flamegraph_command_accepts_injected_renderer() {
         .expect("flamegraph command");
 
     assert_eq!(runner.programs(), Vec::<String>::new());
-    assert_eq!(renderer.folded_stacks(), "[unknown];0x2000 1\n");
+    assert_eq!(renderer.folded_stacks(), ":2;0x2000 1\n");
     assert_eq!(
         std::fs::read_to_string(output_svg).expect("svg"),
         "<svg>cli plugin</svg>\n"
@@ -681,7 +718,7 @@ fn summarize_command_computes_text_from_raw_perfdata_when_summaries_are_missing(
 
     assert_eq!(
         output.stdout,
-        "folded lines: 1\nfolded bytes: 19\ntotal count: 1\n"
+        "folded lines: 1\nfolded bytes: 12\ntotal count: 1\n"
     );
 }
 
@@ -703,7 +740,7 @@ fn summarize_command_computes_json_from_raw_perfdata_when_summaries_are_missing(
     let summary: serde_json::Value = serde_json::from_str(&output.stdout).expect("summary json");
 
     assert_eq!(summary["folded_lines"], 1);
-    assert_eq!(summary["folded_bytes"], 19);
+    assert_eq!(summary["folded_bytes"], 12);
     assert_eq!(summary["total_count"], 1);
 }
 
@@ -1156,6 +1193,30 @@ fn sample_payload_with_period<const N: usize>(
     payload.extend(ip.to_le_bytes());
     payload.extend(pid.to_le_bytes());
     payload.extend(tid.to_le_bytes());
+    payload.extend(period.to_le_bytes());
+    payload.extend((callchain.len() as u64).to_le_bytes());
+    for frame in callchain {
+        payload.extend(frame.to_le_bytes());
+    }
+    payload
+}
+
+fn sample_payload_with_time_cpu_period<const N: usize>(
+    ip: u64,
+    pid: u32,
+    tid: u32,
+    time: u64,
+    cpu: u32,
+    period: u64,
+    callchain: [u64; N],
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(ip.to_le_bytes());
+    payload.extend(pid.to_le_bytes());
+    payload.extend(tid.to_le_bytes());
+    payload.extend(time.to_le_bytes());
+    payload.extend(cpu.to_le_bytes());
+    payload.extend(0u32.to_le_bytes());
     payload.extend(period.to_le_bytes());
     payload.extend((callchain.len() as u64).to_le_bytes());
     for frame in callchain {
