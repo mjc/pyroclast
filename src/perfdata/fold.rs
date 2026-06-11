@@ -120,6 +120,17 @@ struct PidUnwindState {
     object_unwinder: FramehopUnwinder,
     attempted_unwind_mappings: BTreeSet<UnwindMappingKey>,
     loaded_unwind_modules: BTreeSet<UnwindModuleKey>,
+    /// Memo of the ip-intrinsic leaf-only eligibility per sampled IP (gap-pkh
+    /// skip-gate cache). Only the `(pid, ip)`-STABLE facts are cached here —
+    /// whether the module covering `ip` is reported and whether any CFI covers
+    /// `ip`. The per-sample register condition (`bp < sp` / `lr == 0`) and the
+    /// sample's callchain state are combined fresh at query time, since both
+    /// vary across samples at the same IP. The whole `PidUnwindState` (and thus
+    /// this memo) is dropped when the pid's mappings change or the pid forks
+    /// (see `invalidate_pid_unwinder_if_mapping_overlaps_like_perf` /
+    /// `apply_fork_record`), which is exactly when reported-module / CFI facts
+    /// could change.
+    leaf_only_eligibility: HashMap<u64, LeafOnlyEligibility, FxBuildHasher>,
 }
 
 impl PidUnwindState {
@@ -128,8 +139,42 @@ impl PidUnwindState {
             object_unwinder: FramehopUnwinder::with_arch(arch),
             attempted_unwind_mappings: BTreeSet::new(),
             loaded_unwind_modules: BTreeSet::new(),
+            leaf_only_eligibility: HashMap::with_hasher(FxBuildHasher),
         }
     }
+}
+
+/// The `(pid, ip)`-stable half of the gap-5gr / gap-pkh leaf-only decision.
+///
+/// `Eligible` means: the module covering the sampled IP is reported into the
+/// unwinder AND no CFI (.eh_frame/.debug_frame FDE) covers the IP. Per
+/// elfutils `libdwfl/frame_unwind.c`, with no FDE row `handle_cfi` cannot
+/// allocate an unwound frame, so `__libdwfl_frame_unwind` falls through to the
+/// `ebl_unwind` arch fallback; if that fallback also cannot advance (the
+/// per-sample register condition) libdwfl fires the initial-frame callback
+/// exactly once and stops — the scenario-D single leaf. `Ineligible` means CFI
+/// covers the IP (so we cannot tell a priori whether `handle_cfi` yields
+/// PC_UNDEFINED end-of-stack or a real PC_SET caller — see
+/// `backends/.../handle_cfi`'s return-register branch — and MUST run framehop)
+/// or the IP's module is not reported (scenario B, handled upstream).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LeafOnlyEligibility {
+    Eligible,
+    Ineligible,
+}
+
+/// Outcome of classifying a sample's object unwind before running framehop.
+///
+/// Gap-pkh skip gate: `SkipUnwind` and `LeafOnly` both avoid invoking framehop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObjectUnwindClass {
+    /// perf/libdw would emit zero unwound frames (research §3 skip classes).
+    SkipUnwind,
+    /// perf/libdw fires the initial-frame callback exactly once and stops
+    /// (scenario D): emit the single sampled-IP leaf, skip framehop.
+    LeafOnly,
+    /// Could be 1-or-N frames; framehop must run.
+    MustUnwind,
 }
 
 type UnwindMappingKey = (String, u64, u64, u64);
@@ -223,12 +268,6 @@ enum SampleCallchainPresence {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ObjectUnwindInitialFramePolicy {
-    DropSyntheticCurrentIp,
-    KeepDsoLeaf,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InitialIpMappingState {
     NoRecordedMapping,
     RecordedMappingLoaded,
@@ -238,7 +277,12 @@ enum InitialIpMappingState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReportModuleResult {
     NoDso,
-    Reported,
+    /// A module covering this IP was loaded into the unwinder by this call.
+    NewlyReported,
+    /// A module covering this IP was already present (no new work, no new
+    /// unwind information for framehop — used to suppress the PERF-4 redundant
+    /// re-unwind in the module-report retry loop).
+    AlreadyReported,
     Failed,
 }
 
@@ -247,7 +291,6 @@ struct UserUnwindContext {
     sample_callchain: SampleCallchainPresence,
     callchain: SampleCallchainState,
     initial_ip_mapping: InitialIpMappingState,
-    initial_ip_is_dso: bool,
     module_count: usize,
     frame_pointer_at_or_above_stack_pointer: bool,
     syscall_return_state: bool,
@@ -3310,11 +3353,6 @@ fn build_user_unwind_context(
             !accumulator.sample_frames.is_empty(),
         ),
         initial_ip_mapping: initial_ip_mapping_state(accumulator, sample.pid, regs.ip()),
-        initial_ip_is_dso: object_unwind_initial_frame_policy(
-            sample.pid,
-            regs.ip(),
-            &accumulator.mmap_table,
-        ) == ObjectUnwindInitialFramePolicy::KeepDsoLeaf,
         module_count: loaded_unwind_module_count(accumulator, sample.pid),
         // x86_64-specific `ebl_unwind` precondition (false on aarch64, whose
         // backend has its own internal accept condition).
@@ -3441,15 +3479,37 @@ fn unwind_object_frame_addresses_like_perf(
     stack_bytes: &[u8],
     context: UserUnwindContext,
 ) -> Vec<u64> {
-    let initial_frame_policy = object_unwind_initial_frame_policy(Some(pid), regs.ip(), mmap_table);
+    // perf's unwind__get_entries reports the module for the initial IP up front
+    // (tools/perf/util/unwind-libdw.c): a hard report failure (scenario B)
+    // abandons the whole unwind with zero entries.
     if report_unwind_module_for_ip_like_perf(state, mmap_table, pid, regs.ip(), unwind_debug_dir)
         == ReportModuleResult::Failed
     {
         return Vec::new();
     }
+
+    // gap-pkh skip gate: evaluate the same leaf-only predicate BEFORE framehop.
+    // `LeafOnly`/`SkipUnwind` never invoke the (expensive) framehop unwind, and
+    // the result is byte-identical to running it, because the shared
+    // acceptance tail emits the same leaf when framehop would have produced
+    // nothing.
+    let leaf_only = sample_is_leaf_only(state, pid, mmap_table, regs, context);
+    match classify_object_unwind(context, leaf_only) {
+        ObjectUnwindClass::SkipUnwind => return Vec::new(),
+        ObjectUnwindClass::LeafOnly => {
+            return perf_accepted_object_unwind_frames(regs, context.callchain, true, Vec::new());
+        }
+        ObjectUnwindClass::MustUnwind => {}
+    }
+
     let mut object_unwind =
         unwind_user_stack_with_diagnostics(&mut state.object_unwinder, *regs, stack_bytes, 256);
     for _ in 0..MAX_LIBDW_CALLBACK_REPORT_PASSES {
+        // PERF-4: only re-unwind when this pass actually loaded a new module.
+        // report_unwind_modules_for_frame_callbacks_like_perf returns whether
+        // anything was newly reported; when it returns false there is nothing
+        // new for framehop to traverse, so the previous unwind is final and the
+        // redundant re-unwind (and its Vec/diagnostics comparison) is skipped.
         if !report_unwind_modules_for_frame_callbacks_like_perf(
             state,
             mmap_table,
@@ -3489,7 +3549,90 @@ fn unwind_object_frame_addresses_like_perf(
         mmap_table,
         context,
     );
-    perf_accepted_object_unwind_frames(regs, context.callchain, initial_frame_policy, raw_frames)
+    perf_accepted_object_unwind_frames(regs, context.callchain, leaf_only, raw_frames)
+}
+
+/// Whether perf/libdw would fire the initial-frame callback exactly once and
+/// stop (research §2 scenario D / §3.6): the sampled IP reported into a module,
+/// no CFI covers it, and the arch-specific `ebl_unwind` fallback provably
+/// cannot advance. This is the EXACT narrow predicate from
+/// `.ace-research-perf-unwind.md` §3.6/§4 — broader rules (e.g. "emit on any
+/// empty framehop") reintroduced the measured 10.1B/41.2B overcounts.
+///
+/// The `(pid, ip)`-stable half (module reported + no CFI) is memoized in
+/// `state.leaf_only_eligibility`; the per-sample register condition
+/// (`bp < sp` on x86_64, `lr == 0` on aarch64) is combined here fresh.
+fn sample_is_leaf_only(
+    state: &mut PidUnwindState,
+    pid: u32,
+    mmap_table: &MmapTable,
+    regs: &PerfUserRegs,
+    context: UserUnwindContext,
+) -> bool {
+    // KernelWithUserFrame never appends extra user frames (research §3.5), so a
+    // leaf is never emitted there; leave that to the SkipUnwind class.
+    if context.callchain == SampleCallchainState::KernelWithUserFrame {
+        return false;
+    }
+    let ip = regs.ip();
+    let eligibility = *state
+        .leaf_only_eligibility
+        .entry(ip)
+        .or_insert_with(|| leaf_only_eligibility(pid, ip, mmap_table, &state.object_unwinder));
+    if eligibility != LeafOnlyEligibility::Eligible {
+        return false;
+    }
+    arch_fallback_provably_cannot_advance(regs)
+}
+
+/// The `(pid, ip)`-stable half of the leaf-only predicate, suitable for
+/// memoizing: the module covering `ip` is reported into the unwinder AND no CFI
+/// (.eh_frame/.debug_frame FDE) covers `ip`.
+fn leaf_only_eligibility(
+    pid: u32,
+    ip: u64,
+    mmap_table: &MmapTable,
+    object_unwinder: &FramehopUnwinder,
+) -> LeafOnlyEligibility {
+    let reported =
+        initial_ip_mapping_has_reported_unwind_module(Some(pid), ip, mmap_table, object_unwinder);
+    if reported && !object_unwinder.has_unwind_info_for_ip(ip) {
+        LeafOnlyEligibility::Eligible
+    } else {
+        LeafOnlyEligibility::Ineligible
+    }
+}
+
+/// The per-sample half of the leaf-only predicate: whether the arch-specific
+/// `ebl_unwind` fallback can never produce a caller from these registers.
+///
+/// x86_64 (`backends/x86_64_unwind.c`): the rbp fallback is only attempted by
+/// pyroclast when `bp >= sp` (the elfutils final guard `if (sp >= fp) return
+/// false;` rejects a frame pointer that does not sit above the stack pointer).
+/// So `bp < sp` means the fallback contributes nothing.
+///
+/// aarch64 (`backends/aarch64_unwind.c`): the caller pc comes from `lr`; the
+/// fallback returns false immediately when `lr == 0`. So `lr == 0` means no
+/// caller.
+fn arch_fallback_provably_cannot_advance(regs: &PerfUserRegs) -> bool {
+    match *regs {
+        PerfUserRegs::X86_64(regs) => regs.bp < regs.sp,
+        PerfUserRegs::Aarch64(regs) => regs.lr == 0,
+    }
+}
+
+/// Classifies a sample's object unwind before framehop runs (gap-pkh).
+fn classify_object_unwind(context: UserUnwindContext, leaf_only: bool) -> ObjectUnwindClass {
+    // Research §3.5: a recorded kernel->user callchain is not extended with
+    // extra user DWARF callers — perf emits zero unwound frames here.
+    if context.callchain == SampleCallchainState::KernelWithUserFrame {
+        return ObjectUnwindClass::SkipUnwind;
+    }
+    if leaf_only {
+        ObjectUnwindClass::LeafOnly
+    } else {
+        ObjectUnwindClass::MustUnwind
+    }
 }
 
 fn libdw_arch_fallback_after_empty_object_unwind(
@@ -3566,13 +3709,16 @@ fn report_unwind_modules_for_frame_callbacks_like_perf(
 ) -> bool {
     let mut loaded = false;
     for address in frame_addresses {
+        // PERF-4: only treat a NEWLY loaded module as progress. An
+        // already-present module adds no unwind information, so re-unwinding
+        // after it would reproduce the same frames.
         loaded |= report_unwind_module_for_ip_like_perf(
             state,
             mmap_table,
             pid,
             *address,
             unwind_debug_dir,
-        ) == ReportModuleResult::Reported;
+        ) == ReportModuleResult::NewlyReported;
     }
     loaded
 }
@@ -3588,10 +3734,10 @@ fn report_unwind_module_for_ip_like_perf(
         return ReportModuleResult::NoDso;
     };
     if state.object_unwinder.has_reported_module_for_ip(ip) {
-        return ReportModuleResult::Reported;
+        return ReportModuleResult::AlreadyReported;
     }
     if load_unwind_mapping_for_user_mapping_like_perf(state, mapping, unwind_debug_dir) {
-        ReportModuleResult::Reported
+        ReportModuleResult::NewlyReported
     } else {
         ReportModuleResult::Failed
     }
@@ -3707,48 +3853,42 @@ fn truncate_user_unwind_at_first_unmapped_frame(
 ) {
 }
 
+/// Maps framehop's unwound frame addresses onto perf's accepted-entry list.
+///
+/// `leaf_only` is the fully-evaluated scenario-D predicate (see
+/// `sample_is_leaf_only`): when framehop produced no frames at all but
+/// perf/libdw would still fire the initial-frame callback exactly once, emit
+/// the single sampled-IP leaf. perf has no `.so`-vs-executable distinction in
+/// this path — `frame_callback` fires for the initial frame regardless of
+/// whether the covering module is a shared object or the main binary
+/// (`tools/perf/util/unwind-libdw.c` / `libdwfl/dwfl_frame.c`), so the prior
+/// `KeepDsoLeaf`/`DropSyntheticCurrentIp` split (which had no perf-source
+/// basis) is gone.
 fn perf_accepted_object_unwind_frames(
     regs: &PerfUserRegs,
     callchain: SampleCallchainState,
-    initial_frame_policy: ObjectUnwindInitialFramePolicy,
+    leaf_only: bool,
     unwound_frames: Vec<u64>,
 ) -> Vec<u64> {
     if callchain == SampleCallchainState::KernelWithUserFrame {
         return Vec::new();
     }
-    // framehop yields the sampled instruction pointer before trying to advance.
-    // perf's libdw path reports the IP to DWFL as initial state, then only
-    // prints entries accepted via frame_callback/entry.
-    let _ = (regs, callchain, initial_frame_policy);
-    unwound_frames
-}
-
-fn object_unwind_initial_frame_policy(
-    pid: Option<u32>,
-    ip: u64,
-    mmap_table: &MmapTable,
-) -> ObjectUnwindInitialFramePolicy {
-    let mut mapping_cache = MappingResolveCache::default();
-    if pid
-        .and_then(|pid| mmap_table.resolve_ref_cached(pid, ip, &mut mapping_cache))
-        .is_some_and(|mapping| is_shared_object_mapping_path(mapping.path))
-    {
-        ObjectUnwindInitialFramePolicy::KeepDsoLeaf
-    } else {
-        ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp
+    // gap-5gr: when the leaf-only predicate holds, perf/libdwfl fires
+    // frame_callback exactly once for the seeded IP and stops (scenario D).
+    // No FDE row covers the IP (`!has_unwind_info_for_ip`), so handle_cfi
+    // cannot advance, and the `ebl_unwind` rbp/lr fallback is guarded off
+    // (`bp < sp` on x86_64 / `lr == 0` on aarch64). perf therefore prints
+    // exactly the single sampled-IP leaf. framehop always yields the seed and
+    // its instruction-analysis heuristics can recover a *spurious* caller here
+    // that libdwfl would never emit, so the accepted list is the leaf alone
+    // regardless of what framehop produced. Because this truncation is the
+    // shared tail for both the gated (framehop-skipped) and ungated
+    // (framehop-run) paths, the gap-pkh skip gate is a pure optimization: both
+    // yield exactly `[ip]`.
+    if leaf_only {
+        return vec![regs.ip()];
     }
-}
-
-fn is_shared_object_mapping_path(path: &str) -> bool {
-    path.rsplit('/')
-        .next()
-        .is_some_and(|file_name| file_name.contains(".so") || has_dylib_extension(file_name))
-}
-
-fn has_dylib_extension(file_name: &str) -> bool {
-    Path::new(file_name)
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("dylib"))
+    unwound_frames
 }
 
 fn load_unwind_mapping(
@@ -4443,7 +4583,7 @@ mod tests {
                     has_callchain: true,
                     has_frames: false,
                 },
-                super::ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp,
+                false,
                 vec![0x1000],
             ),
             vec![0x1000]
@@ -4461,7 +4601,7 @@ mod tests {
                     has_callchain: false,
                     has_frames: false,
                 },
-                super::ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp,
+                false,
                 vec![0x1000, 0x1100],
             ),
             vec![0x1000, 0x1100]
@@ -4472,7 +4612,9 @@ mod tests {
     fn object_unwind_acceptance_does_not_invent_sample_ip_for_empty_libdw_callbacks() {
         // tools/perf/util/unwind-libdw.c only appends frames accepted by
         // frame_callback -> entry after dwfl_getthread_frames runs. A captured
-        // stack with no accepted callbacks stays empty.
+        // stack with no accepted callbacks and a sample that is NOT leaf-only
+        // (`leaf_only == false`: e.g. CFI covers the IP) stays empty — the
+        // sampled IP is never invented absent the scenario-D predicate.
         let mut regs = test_x86_regs(0x5555_556f_bbbb);
         regs.sp = 0x7fff_ffff_7790;
         regs.bp = 0x76c8;
@@ -4483,7 +4625,7 @@ mod tests {
                     has_callchain: true,
                     has_frames: false,
                 },
-                super::ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp,
+                false,
                 Vec::new(),
             ),
             Vec::<u64>::new()
@@ -5053,7 +5195,6 @@ mod tests {
                     has_frames: true,
                 },
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingMissing,
-                initial_ip_is_dso: false,
                 module_count: 1,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
@@ -5076,7 +5217,6 @@ mod tests {
                     has_frames: true,
                 },
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
-                initial_ip_is_dso: false,
                 module_count: 0,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
@@ -5091,7 +5231,6 @@ mod tests {
                     has_frames: false,
                 },
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
-                initial_ip_is_dso: false,
                 module_count: 0,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
@@ -5106,7 +5245,6 @@ mod tests {
                     has_frames: true,
                 },
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
-                initial_ip_is_dso: false,
                 module_count: 0,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
@@ -5125,7 +5263,6 @@ mod tests {
                     has_frames: false,
                 },
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
-                initial_ip_is_dso: false,
                 module_count: 1,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
@@ -5144,7 +5281,6 @@ mod tests {
                     has_frames: true,
                 },
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
-                initial_ip_is_dso: false,
                 module_count: 1,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
@@ -5166,7 +5302,6 @@ mod tests {
                     has_frames: false,
                 },
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
-                initial_ip_is_dso: true,
                 module_count: 1,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
@@ -5182,7 +5317,6 @@ mod tests {
                 sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::KernelWithCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
-                initial_ip_is_dso: false,
                 module_count: 1,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
@@ -5198,7 +5332,6 @@ mod tests {
                 sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::KernelWithCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
-                initial_ip_is_dso: false,
                 module_count: 1,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: true,
@@ -5214,7 +5347,6 @@ mod tests {
                 sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::KernelWithCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
-                initial_ip_is_dso: false,
                 module_count: 1,
                 frame_pointer_at_or_above_stack_pointer: true,
                 syscall_return_state: false,
@@ -5233,7 +5365,6 @@ mod tests {
                 sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::KernelWithoutCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
-                initial_ip_is_dso: true,
                 module_count: 1,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
@@ -5255,7 +5386,6 @@ mod tests {
                 sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::KernelWithoutCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
-                initial_ip_is_dso: false,
                 module_count: 1,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
@@ -5276,7 +5406,6 @@ mod tests {
                 sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::KernelWithUserFrame,
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
-                initial_ip_is_dso: false,
                 module_count: 1,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
@@ -5303,7 +5432,7 @@ mod tests {
             super::perf_accepted_object_unwind_frames(
                 &PerfUserRegs::X86_64(regs),
                 super::SampleCallchainState::KernelWithCallchain,
-                super::ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp,
+                false,
                 vec![0x7fff_f7ea_3f4b, 0x5555_5578_8ba4, 0x5555_5578_8ba5],
             ),
             vec![0x7fff_f7ea_3f4b, 0x5555_5578_8ba4, 0x5555_5578_8ba5]
@@ -5346,7 +5475,6 @@ mod tests {
                 sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::KernelWithCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
-                initial_ip_is_dso: true,
                 module_count: 2,
                 frame_pointer_at_or_above_stack_pointer: true,
                 syscall_return_state: true,
@@ -5393,7 +5521,6 @@ mod tests {
                 sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::KernelWithCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
-                initial_ip_is_dso: true,
                 module_count: 2,
                 frame_pointer_at_or_above_stack_pointer: true,
                 syscall_return_state: false,
@@ -5414,7 +5541,6 @@ mod tests {
                 sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::KernelWithCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
-                initial_ip_is_dso: false,
                 module_count: 0,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: false,
@@ -5430,7 +5556,6 @@ mod tests {
                 sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::KernelWithCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
-                initial_ip_is_dso: false,
                 module_count: 0,
                 frame_pointer_at_or_above_stack_pointer: false,
                 syscall_return_state: true,
@@ -5446,7 +5571,6 @@ mod tests {
                 sample_callchain: super::SampleCallchainPresence::Present,
                 callchain: super::SampleCallchainState::KernelWithCallchain,
                 initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
-                initial_ip_is_dso: false,
                 module_count: 0,
                 frame_pointer_at_or_above_stack_pointer: true,
                 syscall_return_state: false,
@@ -5476,7 +5600,7 @@ mod tests {
                     has_callchain: true,
                     has_frames: false,
                 },
-                super::ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp,
+                false,
                 vec![0x5555_5578_c601, 0x5555_5579_6e23],
             ),
             vec![0x5555_5578_c601, 0x5555_5579_6e23]
@@ -5502,7 +5626,7 @@ mod tests {
                     has_callchain: true,
                     has_frames: false,
                 },
-                super::ObjectUnwindInitialFramePolicy::KeepDsoLeaf,
+                false,
                 vec![0x7fff_f7e2_ecb7],
             ),
             vec![0x7fff_f7e2_ecb7]
@@ -5787,7 +5911,7 @@ mod tests {
                     has_callchain: true,
                     has_frames: false,
                 },
-                super::ObjectUnwindInitialFramePolicy::KeepDsoLeaf,
+                false,
                 vec![0x7fff_f7f0_277b, 0x5555_5579_6e23, 0x5555_5579_6e23],
             ),
             vec![0x7fff_f7f0_277b, 0x5555_5579_6e23, 0x5555_5579_6e23]
@@ -5815,7 +5939,7 @@ mod tests {
                     has_callchain: true,
                     has_frames: false,
                 },
-                super::ObjectUnwindInitialFramePolicy::KeepDsoLeaf,
+                false,
                 vec![
                     0x7fff_f7e5_7982,
                     0x5555_555a_019e,
@@ -5852,7 +5976,7 @@ mod tests {
                     has_callchain: true,
                     has_frames: false,
                 },
-                super::ObjectUnwindInitialFramePolicy::KeepDsoLeaf,
+                false,
                 vec![0x7fff_f7f0_277b, 0x5555_556b_ab79],
             ),
             vec![0x7fff_f7f0_277b, 0x5555_556b_ab79]
@@ -5917,7 +6041,6 @@ mod tests {
             sample_callchain: super::SampleCallchainPresence::Present,
             callchain: super::SampleCallchainState::KernelWithCallchain,
             initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
-            initial_ip_is_dso: true,
             module_count: 1,
             frame_pointer_at_or_above_stack_pointer: true,
             syscall_return_state: true,
@@ -5937,10 +6060,7 @@ mod tests {
         );
         assert!(
             super::should_use_libdw_arch_fallback_after_empty_object_unwind(
-                super::UserUnwindContext {
-                    initial_ip_is_dso: false,
-                    ..matching_context
-                },
+                super::UserUnwindContext { ..matching_context },
                 false
             )
         );
@@ -6025,7 +6145,7 @@ mod tests {
             super::perf_accepted_object_unwind_frames(
                 &PerfUserRegs::X86_64(regs),
                 super::SampleCallchainState::KernelWithoutCallchain,
-                super::ObjectUnwindInitialFramePolicy::KeepDsoLeaf,
+                false,
                 vec![
                     0x7fff_f7f2_d344,
                     0x5555_5559_a556,
@@ -6096,6 +6216,139 @@ mod tests {
         assert_eq!(
             String::from_utf8(written).expect("utf-8"),
             "alpha;leaf 7\nbeta;leaf 3\n"
+        );
+    }
+
+    fn other_callchain() -> super::SampleCallchainState {
+        super::SampleCallchainState::Other {
+            has_callchain: true,
+            has_frames: false,
+        }
+    }
+
+    #[test]
+    fn arch_fallback_cannot_advance_only_when_x86_bp_below_sp() {
+        // backends/x86_64_unwind.c: the rbp fallback writes new_sp = fp + 16
+        // and rejects the frame with `if (sp >= fp) return false;` — i.e. it
+        // advances only when the frame pointer sits above the stack pointer.
+        // pyroclast attempts the fallback only when `bp >= sp`, so `bp < sp`
+        // means the fallback can never produce a caller.
+        let mut below = test_x86_regs(0x4000);
+        below.sp = 0x7fff_0000;
+        below.bp = 0x7ffe_ff00; // bp < sp
+        assert!(super::arch_fallback_provably_cannot_advance(
+            &PerfUserRegs::X86_64(below)
+        ));
+
+        let mut at_or_above = test_x86_regs(0x4000);
+        at_or_above.sp = 0x7fff_0000;
+        at_or_above.bp = 0x7fff_0008; // bp > sp
+        assert!(!super::arch_fallback_provably_cannot_advance(
+            &PerfUserRegs::X86_64(at_or_above)
+        ));
+    }
+
+    #[test]
+    fn arch_fallback_cannot_advance_only_when_aarch64_lr_is_zero() {
+        // backends/aarch64_unwind.c: the caller pc comes from lr and the walk
+        // returns false immediately when `lr == 0`. fp/sp are irrelevant to
+        // whether the FIRST caller can be produced.
+        let zero_lr = crate::perfdata::unwind::PerfAarch64Regs {
+            pc: 0x4000,
+            sp: 0x1000,
+            fp: 0x1010,
+            lr: 0,
+        };
+        assert!(super::arch_fallback_provably_cannot_advance(
+            &PerfUserRegs::Aarch64(zero_lr)
+        ));
+
+        let live_lr = crate::perfdata::unwind::PerfAarch64Regs {
+            lr: 0x5000,
+            ..zero_lr
+        };
+        assert!(!super::arch_fallback_provably_cannot_advance(
+            &PerfUserRegs::Aarch64(live_lr)
+        ));
+    }
+
+    #[test]
+    fn classify_object_unwind_routes_leaf_skip_and_unwind() {
+        let leaf_only_ctx = super::UserUnwindContext {
+            sample_callchain: super::SampleCallchainPresence::Present,
+            callchain: other_callchain(),
+            initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
+            module_count: 1,
+            frame_pointer_at_or_above_stack_pointer: false,
+            syscall_return_state: false,
+        };
+        assert_eq!(
+            super::classify_object_unwind(leaf_only_ctx, true),
+            super::ObjectUnwindClass::LeafOnly
+        );
+        assert_eq!(
+            super::classify_object_unwind(leaf_only_ctx, false),
+            super::ObjectUnwindClass::MustUnwind
+        );
+
+        // Research §3.5: a recorded kernel->user callchain is never extended
+        // with user DWARF callers, so it skips unwinding entirely regardless of
+        // the leaf-only predicate.
+        let kernel_user = super::UserUnwindContext {
+            callchain: super::SampleCallchainState::KernelWithUserFrame,
+            ..leaf_only_ctx
+        };
+        assert_eq!(
+            super::classify_object_unwind(kernel_user, true),
+            super::ObjectUnwindClass::SkipUnwind
+        );
+        assert_eq!(
+            super::classify_object_unwind(kernel_user, false),
+            super::ObjectUnwindClass::SkipUnwind
+        );
+    }
+
+    #[test]
+    fn accepted_frames_emit_leaf_only_when_predicate_holds() {
+        // gap-5gr: when the leaf-only predicate holds the accepted list is the
+        // single sampled-IP leaf, even if framehop produced a (spurious)
+        // caller — libdwfl would have stopped after the initial-frame callback.
+        let regs = test_regs(0x4000);
+        assert_eq!(
+            super::perf_accepted_object_unwind_frames(&regs, other_callchain(), true, Vec::new()),
+            vec![0x4000]
+        );
+        assert_eq!(
+            super::perf_accepted_object_unwind_frames(
+                &regs,
+                other_callchain(),
+                true,
+                vec![0x4000, 0x9999],
+            ),
+            vec![0x4000],
+            "a framehop heuristic caller is dropped when perf/libdwfl emits only the leaf"
+        );
+    }
+
+    #[test]
+    fn accepted_frames_keep_full_unwind_when_not_leaf_only() {
+        // When the predicate does not hold (e.g. CFI covers the IP), framehop
+        // is authoritative and every accepted frame is kept.
+        let regs = test_regs(0x4000);
+        assert_eq!(
+            super::perf_accepted_object_unwind_frames(
+                &regs,
+                other_callchain(),
+                false,
+                vec![0x4000, 0x9999],
+            ),
+            vec![0x4000, 0x9999]
+        );
+        // A non-leaf-only sample with no accepted frames stays empty: the
+        // sampled IP is never invented absent the scenario-D predicate.
+        assert!(
+            super::perf_accepted_object_unwind_frames(&regs, other_callchain(), false, Vec::new())
+                .is_empty()
         );
     }
 }

@@ -205,6 +205,48 @@ fn object_unwind_attempts_initial_plt_frame_without_cfi_like_perf_libdw() {
 }
 
 #[test]
+fn has_unwind_info_memo_is_consistent_and_invalidated_on_module_add() {
+    // The gap-2 skip gate queries has_unwind_info_for_ip per sample; it is
+    // memoized by exact ip. A repeated query must return the same answer, and
+    // adding a module (which can extend coverage) must invalidate the memo so a
+    // later query at a now-covered ip sees the new CFI.
+    let current_exe = std::env::current_exe().expect("current exe");
+    let base = 0x6666_0000_0000;
+
+    // Ground truth from a fresh, never-memoized unwinder with the module loaded.
+    let mut ground_truth = FramehopUnwinder::new();
+    ground_truth
+        .add_object_mapping(&current_exe, base, 0x1000_0000, 0)
+        .expect("load ground-truth module");
+    // Pick an ip the host binary's CFI actually covers; if the host toolchain
+    // emitted no unwind info at all, skip (nothing to prove about coverage).
+    let covered_ip = (base..base + 0x0010_0000)
+        .step_by(0x40)
+        .find(|&ip| ground_truth.has_unwind_info_for_ip(ip));
+    let Some(covered_ip) = covered_ip else {
+        return;
+    };
+
+    let mut unwinder = FramehopUnwinder::new();
+    // Query before the covering module exists: memoizes `false`, and the
+    // repeat must be consistent with the first answer.
+    assert!(!unwinder.has_unwind_info_for_ip(covered_ip));
+    assert!(!unwinder.has_unwind_info_for_ip(covered_ip));
+
+    assert!(
+        unwinder
+            .add_object_mapping(&current_exe, base, 0x1000_0000, 0)
+            .expect("load module")
+    );
+
+    // The memo was cleared on module add, so the previously-cached `false`
+    // is recomputed to the now-correct `true`, matching the un-memoized
+    // ground truth.
+    assert!(unwinder.has_unwind_info_for_ip(covered_ip));
+    assert!(unwinder.has_unwind_info_for_ip(covered_ip));
+}
+
+#[test]
 fn framehop_unwinder_implements_pluggable_user_stack_unwinder_boundary() {
     let mut unwinder: Box<dyn UserStackUnwinder> = Box::new(FramehopUnwinder::new());
     let regs = PerfX86_64Regs {

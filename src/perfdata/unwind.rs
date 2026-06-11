@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs::File;
 use std::ops::{Deref, Range};
 use std::path::Path;
@@ -9,6 +11,17 @@ use framehop::{ExplicitModuleSectionInfo, Module, Unwinder};
 use gimli::{BaseAddresses, CieOrFde, DebugFrame, EhFrame, LittleEndian, UnwindSection};
 use memmap2::Mmap;
 use object::read::{Object, ObjectSection, ObjectSegment};
+use rustc_hash::FxBuildHasher;
+
+// The gap-2 skip gate queries `has_unwind_info_for_ip` once per sampled IP,
+// and the same hot leaves (libc `malloc`/`memmove`/`memcmp`) recur across
+// millions of samples. Memoizing collapses the otherwise-linear FDE-range scan
+// (`.ace-review-findings.md` PERF-6) into an O(1) lookup. The memo is keyed by
+// the EXACT ip, not `ip >> 12`: FDE pc-ranges are function-granular and two
+// functions (one covered, one not) can share a 4 KiB page, so a page-granular
+// memo could return a stale answer for a second IP in the page and perturb the
+// skip-gate decision. Exact-ip keying keeps the answer byte-identical to the
+// linear scan while still collapsing the dominant repeated-leaf query pattern.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PerfX86_64Regs {
@@ -149,6 +162,10 @@ pub struct FramehopUnwinder {
     module_count: usize,
     reported_modules: Vec<ReportedModule>,
     rejected_mapping_ranges: Vec<Range<u64>>,
+    /// Exact-ip memo for `has_unwind_info_for_ip`. Interior-mutable so the
+    /// predicate stays `&self`; cleared whenever a new module is added, since
+    /// that can extend coverage over a previously-uncovered ip.
+    unwind_info_memo: RefCell<HashMap<u64, bool, FxBuildHasher>>,
 }
 
 /// Per-architecture framehop unwinder and cache. Module registration is shared
@@ -289,6 +306,7 @@ impl FramehopUnwinder {
             module_count: 0,
             reported_modules: Vec::new(),
             rejected_mapping_ranges: Vec::new(),
+            unwind_info_memo: RefCell::new(HashMap::with_hasher(FxBuildHasher)),
         }
     }
 
@@ -362,6 +380,10 @@ impl FramehopUnwinder {
             unwind_ranges,
         });
         self.module_count += 1;
+        // A newly reported module can add CFI coverage over an ip that was
+        // previously memoized as uncovered; drop the memo so the next query
+        // re-scans against the full module set.
+        self.unwind_info_memo.borrow_mut().clear();
         Ok(true)
     }
 
@@ -386,9 +408,15 @@ impl FramehopUnwinder {
 
     #[must_use]
     pub fn has_unwind_info_for_ip(&self, ip: u64) -> bool {
-        self.reported_modules
+        if let Some(&cached) = self.unwind_info_memo.borrow().get(&ip) {
+            return cached;
+        }
+        let covered = self
+            .reported_modules
             .iter()
-            .any(|module| module.unwind_ranges.iter().any(|range| range.contains(&ip)))
+            .any(|module| module.unwind_ranges.iter().any(|range| range.contains(&ip)));
+        self.unwind_info_memo.borrow_mut().insert(ip, covered);
+        covered
     }
 
     #[must_use]
