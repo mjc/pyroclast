@@ -88,7 +88,22 @@ address. Remaining dwarf divergence is inline-NAME parity, not unwinding:
 - perf prints trailing `[unknown]` frames for PAC-tagged return addresses that
   framehop strips.
 
-### Inline-name parity: perf srcline backend variance (next milestone)
+### Inline-name parity — RESOLVED (later 2026-06-11)
+
+All four inline gaps closed: names come from DW_AT_linkage_name demangled the way
+perf itself demangles (its external addr2line runs without -C), sampled-IP leaves
+expand through the full inline chain (perf runs append_inlines on every accepted
+entry — the earlier "over-expansion" read was actually under-expansion elsewhere),
+inline script lines render `sym+0xoff (inlined)` sharing the base frame's offset,
+and `[kernel.kallsyms]` frames resolve from live /proc/kallsyms when
+/sys/kernel/notes matches the recorded kernel build-id. The dwarf oracle script and
+folded outputs now match perf byte-for-byte EXCEPT perf's PAC-tagged `[unknown]`
+frames (perf prints aarch64 lr values without stripping pointer-auth bits;
+pyroclast/framehop strips them — intentional divergence, arguably a perf bug).
+A `.debug_str`-based generic specialization was removed from the inline path: it
+rewrote qualified names into spellings perf never prints.
+
+### Historical note (pre-fix analysis)
 
 perf's inline-frame names depend on which srcline backend its build uses: libbfd,
 libllvm, libdw, or an external `addr2line` subprocess. The Ubuntu oracle perf uses
