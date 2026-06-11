@@ -71,7 +71,40 @@ These six are being fixed against the oracle byte-diff (in progress). The base s
 naming itself (candidate selection, interval lookup, offset formatting) already matches
 perf — prior commits got that right.
 
-## Architecture gap: aarch64 DWARF unwind unsupported
+## Architecture gap: aarch64 DWARF unwind — RESOLVED
+
+aarch64 DWARF user unwinding is now wired through the fold path (PerfUserRegs
+per-arch decoding via HEADER_ARCH, per-arch framehop unwinders, arch-gated no-CFI
+fallbacks; the aarch64 fallback fires when framehop yields only the seed pc, since
+elfutils' aarch64 ebl_unwind recovers a caller from lr with no fp>=sp
+precondition). The dwarf oracle's call spine now matches perf frame-for-frame by
+address. Remaining dwarf divergence is inline-NAME parity, not unwinding:
+
+- perf expands more leaf inline frames at some IPs than pyroclast, and marks them
+  `(inlined)`;
+- inline name spelling: pyroclast emits DWARF DIE names (`sort<u64, fn(&u64,
+  &u64) -> bool>`), perf's srcline backend emits qualified names
+  (`core::slice::sort::unstable::sort`);
+- perf prints trailing `[unknown]` frames for PAC-tagged return addresses that
+  framehop strips.
+
+### Inline-name parity: perf srcline backend variance (next milestone)
+
+perf's inline-frame names depend on which srcline backend its build uses: libbfd,
+libllvm, libdw, or an external `addr2line` subprocess. The Ubuntu oracle perf uses
+the external addr2line backend and prints fully-qualified, v0-demangled names
+(`std::panicking::catch_unwind::<isize, std::rt::lang_start_internal::{closure#0}>`)
+with `(inlined)` in the DSO column and symbol offsets on base frames. pyroclast's
+DIE-walking resolver (built to match a libdw-backed perf in earlier commits
+decabb1/bfb75c4) emits bare `DW_AT_name` spellings (`catch_unwind<isize, ...>`)
+without qualification. Decision: align with the qualified-name behavior (it is the
+modern, measurable oracle here and the more useful output) and treat the libdw
+spelling as documented variance. Also observed: pyroclast expands inline frames at
+one return address where perf does not (suspect a missing pc-1 adjustment on
+non-leaf inline lookups), and kernel frames currently fold as `[[kernel.kallsyms]]`
+because kallsyms symbolization isn't wired into the direct fold.
+
+## Original note (pre-fix)
 
 The user-stack unwind model is x86_64-only (`PerfX86_64Regs`, rbp/rsp heuristics,
 x86_64 elfutils arch fallback). On arm64 perf.data with `--call-graph dwarf`, pyroclast
