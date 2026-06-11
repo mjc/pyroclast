@@ -3270,7 +3270,9 @@ fn perfdata_with_records_attrs_and_build_id_feature<const A: usize, const R: usi
     put_u64(&mut bytes, 32, attr_size as u64);
     put_u64(&mut bytes, 40, data_offset as u64);
     put_u64(&mut bytes, 48, data_size as u64);
-    put_u64(&mut bytes, 56, 1 << 2);
+    // HEADER_BUILD_ID feature bit (2) in the adds_features bitmap, which struct
+    // perf_file_header (tools/perf/util/header.h) places at byte offset 72.
+    put_u64(&mut bytes, 72, 1 << 2);
     for attr in attrs {
         bytes.extend(attr);
     }

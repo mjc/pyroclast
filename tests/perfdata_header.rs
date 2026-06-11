@@ -32,9 +32,13 @@ fn rejects_non_perfdata_magic() {
 
 #[test]
 fn parses_feature_sections_from_set_header_bits() {
+    // tools/perf/util/header.h struct perf_file_header places the
+    // adds_features DECLARE_BITMAP at byte offset 72 (after magic[8], size[8],
+    // attr_size[8], and the three 16-byte perf_file_section structs attrs,
+    // data, event_types). The feature section table follows the data section.
     let mut bytes = vec![0; 520];
     bytes[..104].copy_from_slice(&header_bytes("PERFILE2", 104, 128, 64, 256, 128));
-    put_u64(&mut bytes, 56, 1 << 2);
+    put_u64(&mut bytes, 72, 1 << 2);
     put_u64(&mut bytes, 384, 448);
     put_u64(&mut bytes, 392, 72);
 
@@ -91,7 +95,9 @@ proptest! {
         let mut expected = Vec::new();
 
         for (index, feature) in features.iter().copied().enumerate() {
-            let word_offset = 56 + usize::from(feature / 64) * 8;
+            // adds_features bitmap starts at offset 72 (struct perf_file_header,
+            // tools/perf/util/header.h).
+            let word_offset = 72 + usize::from(feature / 64) * 8;
             let bit = 1_u64 << u32::from(feature % 64);
             let word = u64::from_le_bytes(
                 bytes[word_offset..word_offset + 8]

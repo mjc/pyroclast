@@ -257,7 +257,9 @@ fn perfdata_with_build_id_feature(payload: &[u8]) -> Vec<u8> {
     put_u64(&mut bytes, 8, 104);
     put_u64(&mut bytes, 40, 128);
     put_u64(&mut bytes, 48, 0);
-    put_u64(&mut bytes, 56, 1 << 2);
+    // HEADER_BUILD_ID feature bit (2) in the adds_features bitmap at byte
+    // offset 72 (struct perf_file_header, tools/perf/util/header.h).
+    put_u64(&mut bytes, 72, 1 << 2);
     put_u64(&mut bytes, feature_table_offset, payload_offset as u64);
     put_u64(
         &mut bytes,

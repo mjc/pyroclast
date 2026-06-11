@@ -81,9 +81,13 @@ fn feature_table_offset(header: &PerfHeader) -> Result<usize, String> {
 }
 
 fn set_feature_bits(bytes: &[u8]) -> Result<Vec<u16>, String> {
+    // tools/perf/util/header.h struct perf_file_header lays out the
+    // adds_features DECLARE_BITMAP at byte offset 72: magic(8) + size(8) +
+    // attr_size(8) + attrs(16) + data(16) + event_types(16) = 72. The bitmap
+    // spans HEADER_FEAT_BITS=256 bits (four u64 words).
     let mut features = Vec::new();
     for word_index in 0..4 {
-        let word = read_u64(bytes, 56 + word_index * 8)?;
+        let word = read_u64(bytes, 72 + word_index * 8)?;
         for bit_index in 0..64 {
             if word & (1_u64 << bit_index) != 0 {
                 let feature = u16::try_from(word_index * 64 + bit_index)

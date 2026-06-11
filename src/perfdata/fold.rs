@@ -1330,9 +1330,11 @@ fn feature_sections_from_file(
 }
 
 fn perf_feature_bits(header_bytes: &[u8; 104]) -> Result<Vec<u16>, String> {
+    // adds_features bitmap begins at byte offset 72 in struct perf_file_header
+    // (tools/perf/util/header.h); see set_feature_bits in header.rs.
     let mut features = Vec::new();
     for word_index in 0..4 {
-        let word = read_u64(header_bytes, 56 + word_index * 8)?;
+        let word = read_u64(header_bytes, 72 + word_index * 8)?;
         for bit_index in 0..64 {
             if word & (1_u64 << bit_index) != 0 {
                 let feature = u16::try_from(word_index * 64 + bit_index)
