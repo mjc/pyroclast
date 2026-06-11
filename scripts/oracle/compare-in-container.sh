@@ -52,7 +52,9 @@ for name in ${ORACLE_NAMES:-fp dwarf}; do
         --symbols \
         | tee "$ORACLE_OUT/$name.bench.txt" \
         || echo "pyroclast-bench failed for $name (continuing)" >&2
-    timeout 600 "$CARGO_TARGET_DIR/release/pyroclast" plumbing fold \
+    # --count-periods matches the scoreboard (benchmark_fold_options) so the
+    # printed folded diff lines up with inferno's period-weighted counts.
+    timeout 600 "$CARGO_TARGET_DIR/release/pyroclast" plumbing fold --count-periods \
         "$ORACLE_OUT/$name.perf.data" > "$ORACLE_OUT/$name.pyroclast.folded" \
         || echo "plumbing fold failed for $name (continuing)" >&2
     timeout 600 "$CARGO_TARGET_DIR/release/pyroclast" plumbing perf-script \
