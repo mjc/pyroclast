@@ -1386,7 +1386,9 @@ fn nixos_system_map_path_sits_next_to_kernel_image_symlink_target() {
 
     assert_eq!(
         pyroclast::symbols::nixos_system_map_path(&kernel),
-        Some(system_map)
+        // nixos_system_map_path canonicalizes the kernel image, so resolve the
+        // expectation through tempdir symlinks (macOS /var -> /private/var).
+        Some(std::fs::canonicalize(&system_map).expect("canonicalize system map"))
     );
 }
 

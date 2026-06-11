@@ -21,7 +21,7 @@ fn top_level_memory_command_uses_injected_heaptrack_runner() {
         "check",
     ]);
 
-    pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("run cli");
+    pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux").expect("run cli");
 
     assert!(out.join("run.json").is_file());
     assert!(out.join("command.txt").is_file());
@@ -995,7 +995,7 @@ fn top_level_cpu_command_uses_injected_perf_runner() {
         "true",
     ]);
 
-    pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("run cli");
+    pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux").expect("run cli");
 
     assert_eq!(runner.programs(), vec!["perf", "inferno-flamegraph"]);
     let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
@@ -1030,7 +1030,7 @@ fn profile_cpu_command_uses_injected_perf_runner() {
         "true",
     ]);
 
-    pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("run cli");
+    pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux").expect("run cli");
 
     assert_eq!(runner.programs(), vec!["perf", "inferno-flamegraph"]);
     let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
@@ -1083,7 +1083,7 @@ fn profile_memory_command_keeps_symbols_off_by_default() {
         "true",
     ]);
 
-    pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("run cli");
+    pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux").expect("run cli");
 
     assert_eq!(runner.programs(), vec!["heaptrack", "heaptrack_print"]);
     let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
@@ -1105,7 +1105,7 @@ fn top_level_latency_command_uses_injected_strace_runner() {
         "true",
     ]);
 
-    pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("run cli");
+    pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux").expect("run cli");
 
     assert_eq!(runner.programs(), vec!["strace"]);
     let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
@@ -1131,7 +1131,7 @@ fn top_level_offcpu_command_uses_injected_perf_sched_runner() {
         "true",
     ]);
 
-    pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("run cli");
+    pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux").expect("run cli");
 
     assert_eq!(runner.programs(), vec!["perf", "perf"]);
     let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
@@ -1158,7 +1158,7 @@ fn top_level_offcpu_command_rejects_attach_workflows() {
     ]);
 
     let error =
-        pyroclast::run_parsed_cli_with_runner(cli, &runner).expect_err("attach should fail");
+        pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux").expect_err("attach should fail");
 
     assert_eq!(
         error.to_string(),

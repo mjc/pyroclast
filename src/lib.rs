@@ -18,7 +18,6 @@ pub mod symbols;
 pub mod tools;
 
 use artifacts::ArtifactLayout;
-use backends::fake::FakeBackend;
 use backends::heaptrack::HeaptrackBackend;
 use backends::linux_perf::LinuxPerfBackend;
 use backends::macos_xctrace::MacosXctraceBackend;
@@ -109,6 +108,52 @@ where
     R: CommandRunner,
 {
     run_parsed_cli_with_runner_and_renderer(cli, runner, InfernoFlamegraphRenderer::new(runner))
+}
+
+/// Runs a parsed CLI command with an injected process runner and explicit
+/// platform routing.
+///
+/// # Errors
+///
+/// Returns an error when command execution, artifact I/O, or input parsing
+/// fails.
+pub fn run_parsed_cli_with_runner_on_platform<R>(
+    cli: Cli,
+    runner: &R,
+    platform: &str,
+) -> backends::BackendResult<CliOutput>
+where
+    R: CommandRunner,
+{
+    run_parsed_cli_with_runner_and_renderer_on_platform(
+        cli,
+        runner,
+        InfernoFlamegraphRenderer::new(runner),
+        platform,
+    )
+}
+
+/// Runs a parsed cargo-subcommand command with an injected process runner and
+/// explicit platform routing.
+///
+/// # Errors
+///
+/// Returns an error when cargo target resolution, command execution, artifact
+/// I/O, or input parsing fails.
+pub fn run_parsed_cargo_cli_with_runner_on_platform<R>(
+    cli: cargo_cli::CargoCli,
+    runner: &R,
+    platform: &str,
+) -> backends::BackendResult<CliOutput>
+where
+    R: CommandRunner,
+{
+    run_parsed_cargo_cli_with_runner_and_renderer_on_platform(
+        cli,
+        runner,
+        InfernoFlamegraphRenderer::new(runner),
+        platform,
+    )
 }
 
 /// Runs a parsed cargo-subcommand command with an injected process runner.
@@ -274,11 +319,32 @@ where
         cli::ProfileKind::Offcpu if platform == "linux" => {
             OffcpuBackend::new(runner).profile(&request)?;
         }
-        _ => {
-            FakeBackend.profile(&request)?;
+        cli::ProfileKind::Async => {
+            return Err(format!(
+                "{} profiling is not implemented yet",
+                profile_kind_name(request.kind)
+            )
+            .into());
+        }
+        kind => {
+            return Err(format!(
+                "{} profiling is not supported on {platform}",
+                profile_kind_name(kind)
+            )
+            .into());
         }
     }
     Ok(())
+}
+
+fn profile_kind_name(kind: cli::ProfileKind) -> &'static str {
+    match kind {
+        cli::ProfileKind::Cpu => "cpu",
+        cli::ProfileKind::Memory => "memory",
+        cli::ProfileKind::Offcpu => "off-cpu",
+        cli::ProfileKind::Latency => "latency",
+        cli::ProfileKind::Async => "async",
+    }
 }
 
 fn run_non_profile_command<R, F>(
