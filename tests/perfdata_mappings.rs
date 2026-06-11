@@ -371,6 +371,17 @@ fn resolves_file_identity_from_mmap2_mapping() {
     );
 }
 
+// Mirrors the glibc MAJOR()/MINOR() decomposition perf uses when recording
+// device numbers in PERF_RECORD_MMAP2 (tools/perf/util/dso.c __dso_id__cmp
+// compares maj/min/ino together, never the inode alone).
+fn device_major(device: u64) -> u32 {
+    (((device >> 8) & 0xfff) | ((device >> 32) & !0xfff)) as u32
+}
+
+fn device_minor(device: u64) -> u32 {
+    ((device & 0xff) | ((device >> 12) & !0xff)) as u32
+}
+
 #[test]
 fn compares_recorded_file_identity_with_current_path() {
     let root = tempfile::tempdir().expect("tempdir");
@@ -381,8 +392,8 @@ fn compares_recorded_file_identity_with_current_path() {
     assert!(file_matches_recorded_identity(
         &path,
         FileIdentity {
-            major: 0,
-            minor: 0,
+            major: device_major(metadata.dev()),
+            minor: device_minor(metadata.dev()),
             inode: metadata.ino(),
             inode_generation: 0,
         }
@@ -390,9 +401,39 @@ fn compares_recorded_file_identity_with_current_path() {
     assert!(!file_matches_recorded_identity(
         &path,
         FileIdentity {
-            major: 0,
-            minor: 0,
+            major: device_major(metadata.dev()),
+            minor: device_minor(metadata.dev()),
             inode: metadata.ino() + 1,
+            inode_generation: 0,
+        }
+    ));
+}
+
+#[test]
+fn rejects_recorded_file_identity_on_a_different_device() {
+    // perf's __dso_id__cmp compares maj/min/ino together; an inode number is
+    // unique only within a filesystem, so a matching inode on a different
+    // device must NOT be accepted as the same backing store.
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("app");
+    std::fs::write(&path, b"binary").expect("write app");
+    let metadata = std::fs::metadata(&path).expect("metadata");
+
+    assert!(!file_matches_recorded_identity(
+        &path,
+        FileIdentity {
+            major: device_major(metadata.dev()).wrapping_add(1),
+            minor: device_minor(metadata.dev()),
+            inode: metadata.ino(),
+            inode_generation: 0,
+        }
+    ));
+    assert!(!file_matches_recorded_identity(
+        &path,
+        FileIdentity {
+            major: device_major(metadata.dev()),
+            minor: device_minor(metadata.dev()).wrapping_add(1),
+            inode: metadata.ino(),
             inode_generation: 0,
         }
     ));

@@ -54,15 +54,53 @@ pub struct FileIdentity {
     pub inode_generation: u64,
 }
 
+/// Reports whether the on-disk file at `path` carries the same backing-storage
+/// identity (device major/minor + inode, and inode generation when recorded)
+/// that perf captured in the `PERF_RECORD_MMAP2` event.
+///
+/// This mirrors perf's `__dso_id__cmp` (tools/perf/util/dso.c), which compares
+/// `maj`/`min`/`ino` together — never the inode alone — so two files sharing an
+/// inode number on different filesystems are not treated as the same backing
+/// store. Inode numbers are unique only within a single device, so comparing
+/// `ino` without the device would admit cross-filesystem false matches.
+///
+/// Note: perf does not use this device/inode identity to *reject* an on-disk
+/// file before symbolizing or unwinding from it (`dso__load` and
+/// `do_open`/`__open_dso` trust the path and only validate build-ids when both
+/// the recorded and on-disk build-ids are defined). This helper exists for the
+/// dso-instance identity comparison perf performs in `__dso_id__cmp`, and must
+/// match that semantics: device-aware, with absent generation skipped.
 #[must_use]
 #[cfg(unix)]
 pub fn file_matches_recorded_identity(path: &Path, identity: FileIdentity) -> bool {
-    std::fs::metadata(path).is_ok_and(|metadata| metadata.ino() == identity.inode)
+    std::fs::metadata(path).is_ok_and(|metadata| {
+        let device = metadata.dev();
+        // PERF_RECORD_MMAP2 records maj/min as MAJOR(dev)/MINOR(dev); decompose
+        // the on-disk st_dev with the matching macros before comparing.
+        major(device) == identity.major
+            && minor(device) == identity.minor
+            && metadata.ino() == identity.inode
+    })
 }
 
 #[cfg(not(unix))]
 pub fn file_matches_recorded_identity(_path: &Path, _identity: FileIdentity) -> bool {
     false
+}
+
+/// Extracts the device major number from a `st_dev` value using the glibc
+/// encoding userspace `stat` reports, matching the kernel `MAJOR()` macro perf
+/// records in `PERF_RECORD_MMAP2`.
+#[cfg(unix)]
+fn major(device: u64) -> u32 {
+    (((device >> 8) & 0xfff) | ((device >> 32) & !0xfff)) as u32
+}
+
+/// Extracts the device minor number from a `st_dev` value, matching the kernel
+/// `MINOR()` macro perf records in `PERF_RECORD_MMAP2`.
+#[cfg(unix)]
+fn minor(device: u64) -> u32 {
+    ((device & 0xff) | ((device >> 12) & !0xff)) as u32
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
