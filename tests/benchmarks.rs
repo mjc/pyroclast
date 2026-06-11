@@ -114,7 +114,9 @@ fn symbolized_fold_benchmark_uses_runner_addr2line() {
     .expect("write perfdata");
     let runner = Addr2lineRunner::default();
 
-    let report = run_fold_benchmark_with_runner(&perfdata, &runner, true).expect("benchmark");
+    // The external addr2line resolver only runs on the --inline path; the
+    // default base path resolves from the in-process ELF symtab.
+    let report = run_fold_benchmark_with_runner(&perfdata, &runner, true, true).expect("benchmark");
 
     assert_eq!(report.folded_bytes, ":12;app::main 1\n".len());
     assert_eq!(runner.programs(), vec!["addr2line"]);
@@ -179,8 +181,11 @@ fn compares_symbolized_pyroclast_folded_stacks_with_inferno_collapse() {
     std::fs::write(&perf_script, "sample script\n").expect("write perf script");
     let runner = SymbolizedCompareRunner::default();
 
-    let report = compare_with_inferno_collapse_with_symbols(&perfdata, &perf_script, &runner, true)
-        .expect("comparison");
+    // Exercising the external addr2line resolver (and its inline frames)
+    // requires --inline; the default base path reads the in-process symtab.
+    let report =
+        compare_with_inferno_collapse_with_symbols(&perfdata, &perf_script, &runner, true, true)
+            .expect("comparison");
 
     assert!(report.matches);
     assert!(report.svg_matches);

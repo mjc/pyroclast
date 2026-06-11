@@ -351,7 +351,7 @@ where
                 &command.input,
                 FoldOptions {
                     count_periods: true,
-                    inline: false,
+                    inline: command.inline,
                 },
                 command.symbols,
                 command.symbolizer,
