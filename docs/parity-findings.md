@@ -155,16 +155,22 @@ the sampled IP before unwinding, and perf keeps partial stacks. So:
 - **Silent FakeBackend fallback:** on macOS, `pyroclast memory|latency|offcpu` quietly
   run the fake backend and write fake artifacts instead of erroring out as unsupported.
 
-## Test-suite portability (macOS/aarch64 host)
+## Test-suite portability (macOS/aarch64 host) — RESOLVED
 
-22 of 621 tests fail on a fresh macOS machine (the suite was developed on x86_64
-Linux): 7 `cargo_cli` (fixed by the canonicalization fix above, except one that exposes
-the FakeBackend fallback), 8 `run_cli` (assume Linux backend selection), 2 `platform`
-(procfs impl is cfg-gated to Linux even though it takes an injectable root — a plain
-`read_dir` would be testable everywhere), 1 `symbols` NixOS-path test, and 5
-`perfdata_fold` tests whose fixtures map `std::env::current_exe()` (host Mach-O/arm64)
-with x86_64 reg masks — host-dependent fixtures that should build a synthetic ELF
-instead.
+22 of 621 tests originally failed on a fresh macOS machine (the suite was developed
+on x86_64 Linux). All fixed: cargo metadata path canonicalization (7 `cargo_cli`),
+explicit platform injection through the existing `_on_platform` entry points
+(8 `run_cli` + the FakeBackend-exposing e2e test), a portable `read_dir` procfs walk
+(2 `platform`, and the `procfs` dependency is gone), a canonicalized expectation in
+the NixOS System.map test, and a synthetic x86_64 ELF fixture replacing
+`std::env::current_exe()` in the 5 current-IP-only unwind tests (the host test
+binary's Mach-O `__unwind_info` recovered callers a Linux ELF would not). The suite
+is now fully green on macOS: 641/641, clippy clean.
+
+Note for fixture authors: framehop applies a frame-pointer fallback for addresses
+OUTSIDE any known module, but stops at uncovered addresses INSIDE a module that has
+CFI — synthetic unwind fixtures must include an eh_frame (even one whose only FDE
+covers an unrelated range) to pin the no-coverage behavior.
 
 ## Environment notes
 
