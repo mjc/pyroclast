@@ -3399,23 +3399,35 @@ fn libdw_arch_fallback_after_empty_object_unwind(
     stack_bytes: &[u8],
     use_libdw_arch_fallback: bool,
 ) -> Vec<u64> {
-    if !raw_frames.is_empty() || !use_libdw_arch_fallback {
+    if !use_libdw_arch_fallback {
         return raw_frames;
     }
     match *regs {
         // elfutils' x86_64 backend only walks the rbp chain when the frame
-        // pointer is at or above the stack pointer.
-        PerfUserRegs::X86_64(regs) if regs.bp >= regs.sp => {
+        // pointer is at or above the stack pointer. framehop's own x86_64
+        // frame-pointer recovery already advances most stacks, so the elfutils
+        // fallback only fills in stacks where framehop produced nothing.
+        PerfUserRegs::X86_64(regs) if raw_frames.is_empty() && regs.bp >= regs.sp => {
             unwind_x86_64_frame_pointer_stack_like_elfutils(regs, stack_bytes, 256)
         }
         PerfUserRegs::X86_64(_) => raw_frames,
         // aarch64's backend has no bp/sp precondition: it accepts the lr-based
         // caller unless lr == 0, with its own internal `fp == 0 || fp+16 > sp`
-        // accept condition (backends/aarch64_unwind.c).
-        PerfUserRegs::Aarch64(regs) => {
+        // accept condition (backends/aarch64_unwind.c). framehop's aarch64
+        // unwinder yields only the seed pc when no CFI covers it, which is
+        // exactly when libdwfl invokes ebl_unwind on the leaf, so the fallback
+        // fires when framehop produced no caller beyond the sampled pc.
+        PerfUserRegs::Aarch64(regs) if frames_are_seed_only(&raw_frames, regs.pc) => {
             unwind_aarch64_frame_pointer_stack_like_elfutils(regs, stack_bytes, 256)
         }
+        PerfUserRegs::Aarch64(_) => raw_frames,
     }
+}
+
+/// Whether framehop produced no caller beyond the sampled pc: either nothing at
+/// all, or just the seed instruction pointer.
+fn frames_are_seed_only(raw_frames: &[u64], pc: u64) -> bool {
+    raw_frames.is_empty() || raw_frames == [pc]
 }
 
 fn truncate_syscall_return_unwind_after_first_executable_frame(
@@ -5751,6 +5763,50 @@ mod tests {
                 matching_context,
                 false
             )
+        );
+    }
+
+    #[test]
+    fn aarch64_arch_fallback_fires_on_seed_only_object_unwind_like_libdw_ebl() {
+        // framehop's aarch64 unwinder yields only the seed pc when no CFI
+        // covers it; that is exactly when libdwfl invokes ebl_unwind on the
+        // leaf (backends/aarch64_unwind.c), so the fp-chain fallback must run
+        // even though framehop returned one frame.
+        let regs = PerfUserRegs::Aarch64(crate::perfdata::unwind::PerfAarch64Regs {
+            pc: 0x4000,
+            sp: 0x1000,
+            fp: 0x1010,
+            lr: 0x5000,
+        });
+        let stack = vec![0_u8; 0x40];
+
+        assert_eq!(
+            super::libdw_arch_fallback_after_empty_object_unwind(vec![0x4000], &regs, &stack, true,),
+            // pc, then the lr caller (perf pc-1 adjustment), then stop on the
+            // zeroed next lr.
+            vec![0x4000, 0x4fff]
+        );
+    }
+
+    #[test]
+    fn aarch64_arch_fallback_keeps_multi_frame_object_unwind() {
+        // When framehop already produced callers past the seed (CFI worked),
+        // the ebl fallback must not clobber them.
+        let regs = PerfUserRegs::Aarch64(crate::perfdata::unwind::PerfAarch64Regs {
+            pc: 0x4000,
+            sp: 0x1000,
+            fp: 0x1010,
+            lr: 0x5000,
+        });
+
+        assert_eq!(
+            super::libdw_arch_fallback_after_empty_object_unwind(
+                vec![0x4000, 0x9000],
+                &regs,
+                &[0_u8; 0x40],
+                true,
+            ),
+            vec![0x4000, 0x9000]
         );
     }
 

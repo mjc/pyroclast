@@ -182,6 +182,48 @@ fn keeps_unmapped_dwarf_user_stack_payloads_like_perf_libdw_ebl() {
 }
 
 #[test]
+fn folds_aarch64_dwarf_user_stack_with_frame_pointer_fallback_like_perf_libdw_ebl() {
+    // perf record --call-graph dwarf on arm64 captures x0-x30, sp, pc. The
+    // recording machine's HEADER_ARCH ("aarch64") tells the fold path to decode
+    // PerfAarch64Regs (fp=29, lr=30, sp=31, pc=32) and use elfutils'
+    // backends/aarch64_unwind.c frame-pointer fallback when no DSO/CFI covers
+    // the sampled pc: the caller pc comes from lr (taking the perf pc-1
+    // adjustment), and the walk ends on the zeroed next lr.
+    let mask = (1_u64 << 29) | (1_u64 << 30) | (1_u64 << 31) | (1_u64 << 32);
+    let bytes = perfdata_with_records_attrs_and_arch_feature(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            mask,
+        )],
+        [record_bytes(
+            9,
+            // Registers are in ascending perf-register order: fp, lr, sp, pc.
+            // sp = 0x1000, fp = 0x1010: the fp chain record at fp+0 (next fp)
+            // and fp+8 (next lr) are both zero, so the lr-derived caller is the
+            // only unwound frame.
+            &sample_payload_with_user_stack(
+                0x4000,
+                11,
+                12,
+                [],
+                1,
+                [0x1010, 0x5000, 0x1000, 0x4000],
+                [0_u8; 0x40],
+            ),
+        )],
+        "aarch64",
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
+}
+
+#[test]
 fn drops_dwarf_user_stack_when_mapped_object_cannot_be_loaded_like_perf_script() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
@@ -3303,6 +3345,56 @@ fn perfdata_with_records_attrs_and_build_id_feature<const A: usize, const R: usi
         u64::try_from(build_id_payload.len()).expect("payload size"),
     );
     bytes.extend(build_id_payload);
+    bytes
+}
+
+/// Builds a perf.data carrying a single HEADER_ARCH feature string (the
+/// recording machine's `uname -m`). perf stores it as a `perf_header_string`:
+/// a u32 length followed by that many NUL-terminated bytes (util/header.c
+/// write_arch/do_write_string).
+fn perfdata_with_records_attrs_and_arch_feature<const A: usize, const R: usize>(
+    attrs: [[u8; 144]; A],
+    records: [Vec<u8>; R],
+    arch: &str,
+) -> Vec<u8> {
+    let attr_size = attrs.len() * 144;
+    let data_size = records.iter().map(Vec::len).sum::<usize>();
+    let data_offset = 104 + attr_size;
+    let feature_table_offset = data_offset + data_size;
+    let arch_payload_offset = feature_table_offset + 16;
+    // do_write_string aligns the length to NAME_ALIGN (64) and writes the
+    // NUL-terminated name plus zero padding.
+    let aligned = (arch.len() + 1).next_multiple_of(64);
+    let mut arch_payload = Vec::new();
+    arch_payload.extend(u32::try_from(aligned).expect("arch len").to_le_bytes());
+    let mut name_bytes = arch.as_bytes().to_vec();
+    name_bytes.resize(aligned, 0);
+    arch_payload.extend(name_bytes);
+
+    let mut bytes = vec![0; 104];
+    bytes[..8].copy_from_slice(b"PERFILE2");
+    put_u64(&mut bytes, 8, 104);
+    put_u64(&mut bytes, 24, 104);
+    put_u64(&mut bytes, 32, attr_size as u64);
+    put_u64(&mut bytes, 40, data_offset as u64);
+    put_u64(&mut bytes, 48, data_size as u64);
+    // HEADER_ARCH feature bit (6) in the adds_features bitmap, which struct
+    // perf_file_header (tools/perf/util/header.h) places at byte offset 72.
+    put_u64(&mut bytes, 72, 1 << 6);
+    for attr in attrs {
+        bytes.extend(attr);
+    }
+    for record in records {
+        bytes.extend(record);
+    }
+    bytes.resize(arch_payload_offset, 0);
+    put_u64(&mut bytes, feature_table_offset, arch_payload_offset as u64);
+    put_u64(
+        &mut bytes,
+        feature_table_offset + 8,
+        u64::try_from(arch_payload.len()).expect("payload size"),
+    );
+    bytes.extend(arch_payload);
     bytes
 }
 
