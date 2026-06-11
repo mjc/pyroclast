@@ -15,7 +15,7 @@ use crate::perfdata::build_id::{
     BuildIdEvent, build_id_events_from_perfdata, parse_build_id_events,
 };
 use crate::perfdata::endian::{read_u32, read_u64};
-use crate::perfdata::header::{PerfFeatureSection, PerfHeader, parse_header};
+use crate::perfdata::header::{PerfFeatureSection, PerfHeader, parse_header, parse_header_arch};
 use crate::perfdata::mappings::{
     FileIdentity, MappingResolveCache, MmapTable, ResolvedMappingRef, UserMapping,
 };
@@ -31,7 +31,8 @@ use crate::perfdata::samples::{
     is_perf_user_deferred_context_marker, parse_sample_record_callchain,
 };
 use crate::perfdata::unwind::{
-    FramehopUnwinder, PerfX86_64Regs, UserStackUnwindResult, UserStackUnwinder,
+    FramehopUnwinder, PerfArch, PerfUserRegs, UserStackUnwindResult, UserStackUnwinder,
+    unwind_aarch64_frame_pointer_stack_like_elfutils,
     unwind_x86_64_frame_pointer_stack_like_elfutils,
 };
 use crate::symbols::{SymbolFrameCache, SymbolRequest, SymbolResolver, perf_build_id_elf_path};
@@ -109,13 +110,26 @@ struct FoldAccumulator {
     sample_frames: Vec<FoldFrame>,
     callchain: Vec<FoldFrame>,
     unwind_debug_dir: Option<PathBuf>,
+    /// Architecture of the recording machine (HEADER_ARCH), used to decode
+    /// REGS_USER samples and construct per-pid unwinders. Defaults to x86_64
+    /// when the feature is absent.
+    arch: PerfArch,
 }
 
-#[derive(Default)]
 struct PidUnwindState {
     object_unwinder: FramehopUnwinder,
     attempted_unwind_mappings: BTreeSet<UnwindMappingKey>,
     loaded_unwind_modules: BTreeSet<UnwindModuleKey>,
+}
+
+impl PidUnwindState {
+    fn with_arch(arch: PerfArch) -> Self {
+        Self {
+            object_unwinder: FramehopUnwinder::with_arch(arch),
+            attempted_unwind_mappings: BTreeSet::new(),
+            loaded_unwind_modules: BTreeSet::new(),
+        }
+    }
 }
 
 type UnwindMappingKey = (String, u64, u64, u64);
@@ -634,7 +648,8 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
     let header = parse_header(bytes)?;
     let sample_layouts = sample_layouts(bytes, header)?;
     let header_build_ids = header_build_ids_by_filename(bytes)?;
-    let mut accumulator = FoldAccumulator::new(header_build_ids);
+    let arch = perf_arch_from_header(parse_header_arch(bytes, &header)?.as_deref());
+    let mut accumulator = FoldAccumulator::new(header_build_ids).with_arch(arch);
     let records = timed_records(bytes, header, &sample_layouts)?;
     let mut ordered_records = OrderedRecordQueue::default();
 
@@ -686,7 +701,9 @@ where
     let (header, header_bytes) = perfdata_header_from_file(file)?;
     let sample_layouts = sample_layouts_from_file(file, header, &header_bytes)?;
     let header_build_ids = header_build_ids_by_filename_from_file(file, header, &header_bytes)?;
-    let mut accumulator = FoldAccumulator::new(header_build_ids);
+    let arch =
+        perf_arch_from_header(header_arch_from_file(file, header, &header_bytes)?.as_deref());
+    let mut accumulator = FoldAccumulator::new(header_build_ids).with_arch(arch);
     let data_end = header
         .data_offset
         .checked_add(header.data_size)
@@ -794,6 +811,8 @@ where
     let (header, header_bytes) = perfdata_header_from_file(file)?;
     let sample_layouts = sample_layouts_from_file(file, header, &header_bytes)?;
     let header_build_ids = header_build_ids_by_filename_from_file(file, header, &header_bytes)?;
+    let arch =
+        perf_arch_from_header(header_arch_from_file(file, header, &header_bytes)?.as_deref());
     let data_end = header
         .data_offset
         .checked_add(header.data_size)
@@ -822,6 +841,7 @@ where
         writer,
         sample_layouts.event_name_width,
         options.inline,
+        arch,
     );
     let mut ordered_records = OrderedRecordQueue::default();
     let mut header_bytes = [0_u8; 8];
@@ -902,9 +922,10 @@ where
         writer: &'io mut W,
         event_name_width: usize,
         inline: bool,
+        arch: PerfArch,
     ) -> Self {
         Self {
-            accumulator: FoldAccumulator::new(header_build_ids),
+            accumulator: FoldAccumulator::new(header_build_ids).with_arch(arch),
             symbol_cache,
             writer,
             event_name_width,
@@ -1323,6 +1344,51 @@ fn build_id_events_from_file(
     parse_build_id_events(&payload)
 }
 
+// HEADER_ARCH feature bit (tools/perf/util/header.h enum HEADER_*).
+const HEADER_ARCH_FEATURE: u16 = 6;
+
+/// Maps a HEADER_ARCH string to the unwinder architecture, defaulting to
+/// x86_64 when the feature is absent or unrecognized. perf records the
+/// recording machine's `uname -m`, so an unknown value (an arch pyroclast does
+/// not unwind) falls back to the x86_64 path rather than failing the fold.
+fn perf_arch_from_header(arch: Option<&str>) -> PerfArch {
+    arch.and_then(PerfArch::from_header_arch)
+        .unwrap_or_default()
+}
+
+/// Reads the HEADER_ARCH feature string from a perf.data `File`.
+///
+/// The feature table and payload live after the data section, so this reads
+/// them from the file the way `build_id_events_from_file` does, then parses the
+/// `perf_header_string` (u32 length + NUL-terminated bytes).
+fn header_arch_from_file(
+    file: &File,
+    header: PerfHeader,
+    header_bytes: &[u8; 104],
+) -> Result<Option<String>, String> {
+    let Some(section) = feature_sections_from_file(file, header, header_bytes)?
+        .into_iter()
+        .find(|section| section.feature == HEADER_ARCH_FEATURE)
+    else {
+        return Ok(None);
+    };
+    let size =
+        usize::try_from(section.size).map_err(|_| "arch feature size exceeds usize".to_string())?;
+    let payload = read_file_range(file, section.offset, size, "arch feature payload")?;
+    let length = usize::try_from(read_u32(&payload, 0)?)
+        .map_err(|_| "arch feature string length exceeds usize".to_string())?;
+    let string = payload
+        .get(4..4 + length)
+        .ok_or_else(|| "arch feature string is truncated".to_string())?;
+    let end = string
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(string.len());
+    std::str::from_utf8(&string[..end])
+        .map(|arch| Some(arch.to_string()))
+        .map_err(|error| format!("arch feature string is not UTF-8: {error}"))
+}
+
 // HEADER_EVENT_DESC feature bit (tools/perf/util/header.h enum HEADER_*).
 const HEADER_EVENT_DESC_FEATURE: u16 = 12;
 
@@ -1462,7 +1528,13 @@ impl FoldAccumulator {
             sample_frames: Vec::new(),
             callchain: Vec::new(),
             unwind_debug_dir: current_perf_debug_dir(),
+            arch: PerfArch::default(),
         }
+    }
+
+    fn with_arch(mut self, arch: PerfArch) -> Self {
+        self.arch = arch;
+        self
     }
 
     fn apply_record(
@@ -1551,7 +1623,10 @@ impl FoldAccumulator {
     }
 
     fn unwind_state_mut(&mut self, pid: u32) -> &mut PidUnwindState {
-        self.unwind_states.entry(pid).or_default()
+        let arch = self.arch;
+        self.unwind_states
+            .entry(pid)
+            .or_insert_with(|| PidUnwindState::with_arch(arch))
     }
 
     fn invalidate_pid_unwinder_if_mapping_overlaps_like_perf(
@@ -3095,12 +3170,14 @@ fn append_perf_user_unwind_frames(
     if !has_perf_captured_user_stack(stack) {
         return;
     }
-    let Ok(regs) =
-        PerfX86_64Regs::from_perf_masked_values(event.layout.sample_regs_user, &regs.values)
-    else {
+    let Ok(regs) = PerfUserRegs::from_perf_masked_values(
+        accumulator.arch,
+        event.layout.sample_regs_user,
+        &regs.values,
+    ) else {
         return;
     };
-    accumulator.ensure_unwind_mapping_for_ip(sample.pid, regs.ip);
+    accumulator.ensure_unwind_mapping_for_ip(sample.pid, regs.ip());
     let context = build_user_unwind_context(accumulator, misc, event, sample, &regs);
     let mut unwound_frames = unwind_user_stack_like_perf(accumulator, sample, &regs, context);
     let mut mapping_cache = MappingResolveCache::default();
@@ -3118,7 +3195,7 @@ fn build_user_unwind_context(
     misc: u16,
     event: &SampleEventLayout,
     sample: &crate::perfdata::samples::SampleCallchain<'_>,
-    regs: &PerfX86_64Regs,
+    regs: &PerfUserRegs,
 ) -> UserUnwindContext {
     let sample_callchain = if event.layout.sample_type & PERF_SAMPLE_CALLCHAIN != 0 {
         SampleCallchainPresence::Present
@@ -3133,14 +3210,16 @@ fn build_user_unwind_context(
             sample,
             !accumulator.sample_frames.is_empty(),
         ),
-        initial_ip_mapping: initial_ip_mapping_state(accumulator, sample.pid, regs.ip),
+        initial_ip_mapping: initial_ip_mapping_state(accumulator, sample.pid, regs.ip()),
         initial_ip_is_dso: object_unwind_initial_frame_policy(
             sample.pid,
-            regs.ip,
+            regs.ip(),
             &accumulator.mmap_table,
         ) == ObjectUnwindInitialFramePolicy::KeepDsoLeaf,
         module_count: loaded_unwind_module_count(accumulator, sample.pid),
-        frame_pointer_at_or_above_stack_pointer: regs.bp >= regs.sp,
+        // x86_64-specific `ebl_unwind` precondition (false on aarch64, whose
+        // backend has its own internal accept condition).
+        frame_pointer_at_or_above_stack_pointer: regs.frame_pointer_at_or_above_stack_pointer(),
         syscall_return_state: regs.is_syscall_return_state(),
     }
 }
@@ -3199,7 +3278,7 @@ fn sample_callchain_state(
 fn unwind_user_stack_like_perf(
     accumulator: &mut FoldAccumulator,
     sample: &crate::perfdata::samples::SampleCallchain<'_>,
-    regs: &PerfX86_64Regs,
+    regs: &PerfUserRegs,
     context: UserUnwindContext,
 ) -> Vec<FoldFrame> {
     let Some(stack) = &sample.user_stack else {
@@ -3219,7 +3298,7 @@ fn unwind_user_stack_like_perf(
 fn unwind_object_stack_like_perf(
     accumulator: &mut FoldAccumulator,
     pid: Option<u32>,
-    regs: &PerfX86_64Regs,
+    regs: &PerfUserRegs,
     stack_bytes: &[u8],
     context: UserUnwindContext,
 ) -> Vec<FoldFrame> {
@@ -3229,7 +3308,7 @@ fn unwind_object_stack_like_perf(
     let mut state = accumulator
         .unwind_states
         .remove(&pid_value)
-        .unwrap_or_default();
+        .unwrap_or_else(|| PidUnwindState::with_arch(accumulator.arch));
     let unwind_debug_dir = accumulator.unwind_debug_dir.clone();
     let frames = unwind_object_frame_addresses_like_perf(
         &mut state,
@@ -3245,7 +3324,7 @@ fn unwind_object_stack_like_perf(
         .into_iter()
         .enumerate()
         .map(|(index, address)| {
-            if index == 0 && address == regs.ip {
+            if index == 0 && address == regs.ip() {
                 FoldFrame::InlineCurrentIp(address)
             } else {
                 FoldFrame::UserUnwind(address)
@@ -3259,12 +3338,12 @@ fn unwind_object_frame_addresses_like_perf(
     pid: u32,
     mmap_table: &MmapTable,
     unwind_debug_dir: Option<&Path>,
-    regs: &PerfX86_64Regs,
+    regs: &PerfUserRegs,
     stack_bytes: &[u8],
     context: UserUnwindContext,
 ) -> Vec<u64> {
-    let initial_frame_policy = object_unwind_initial_frame_policy(Some(pid), regs.ip, mmap_table);
-    if report_unwind_module_for_ip_like_perf(state, mmap_table, pid, regs.ip, unwind_debug_dir)
+    let initial_frame_policy = object_unwind_initial_frame_policy(Some(pid), regs.ip(), mmap_table);
+    if report_unwind_module_for_ip_like_perf(state, mmap_table, pid, regs.ip(), unwind_debug_dir)
         == ReportModuleResult::Failed
     {
         return Vec::new();
@@ -3291,7 +3370,7 @@ fn unwind_object_frame_addresses_like_perf(
     let raw_frames = object_unwind.accepted_frames;
     let initial_ip_has_reported_module = initial_ip_mapping_has_reported_unwind_module(
         Some(pid),
-        regs.ip,
+        regs.ip(),
         mmap_table,
         &state.object_unwinder,
     );
@@ -3316,15 +3395,39 @@ fn unwind_object_frame_addresses_like_perf(
 
 fn libdw_arch_fallback_after_empty_object_unwind(
     raw_frames: Vec<u64>,
-    regs: &PerfX86_64Regs,
+    regs: &PerfUserRegs,
     stack_bytes: &[u8],
     use_libdw_arch_fallback: bool,
 ) -> Vec<u64> {
-    if raw_frames.is_empty() && use_libdw_arch_fallback && regs.bp >= regs.sp {
-        unwind_x86_64_frame_pointer_stack_like_elfutils(*regs, stack_bytes, 256)
-    } else {
-        raw_frames
+    if !use_libdw_arch_fallback {
+        return raw_frames;
     }
+    match *regs {
+        // elfutils' x86_64 backend only walks the rbp chain when the frame
+        // pointer is at or above the stack pointer. framehop's own x86_64
+        // frame-pointer recovery already advances most stacks, so the elfutils
+        // fallback only fills in stacks where framehop produced nothing.
+        PerfUserRegs::X86_64(regs) if raw_frames.is_empty() && regs.bp >= regs.sp => {
+            unwind_x86_64_frame_pointer_stack_like_elfutils(regs, stack_bytes, 256)
+        }
+        PerfUserRegs::X86_64(_) => raw_frames,
+        // aarch64's backend has no bp/sp precondition: it accepts the lr-based
+        // caller unless lr == 0, with its own internal `fp == 0 || fp+16 > sp`
+        // accept condition (backends/aarch64_unwind.c). framehop's aarch64
+        // unwinder yields only the seed pc when no CFI covers it, which is
+        // exactly when libdwfl invokes ebl_unwind on the leaf, so the fallback
+        // fires when framehop produced no caller beyond the sampled pc.
+        PerfUserRegs::Aarch64(regs) if frames_are_seed_only(&raw_frames, regs.pc) => {
+            unwind_aarch64_frame_pointer_stack_like_elfutils(regs, stack_bytes, 256)
+        }
+        PerfUserRegs::Aarch64(_) => raw_frames,
+    }
+}
+
+/// Whether framehop produced no caller beyond the sampled pc: either nothing at
+/// all, or just the seed instruction pointer.
+fn frames_are_seed_only(raw_frames: &[u64], pc: u64) -> bool {
+    raw_frames.is_empty() || raw_frames == [pc]
 }
 
 fn truncate_syscall_return_unwind_after_first_executable_frame(
@@ -3431,7 +3534,7 @@ fn load_unwind_mapping_for_user_mapping_like_perf(
 
 fn unwind_user_stack_with_diagnostics(
     unwinder: &mut impl UserStackUnwinder,
-    regs: PerfX86_64Regs,
+    regs: PerfUserRegs,
     stack_bytes: &[u8],
     max_frames: usize,
 ) -> UserStackUnwindResult {
@@ -3506,7 +3609,7 @@ fn truncate_user_unwind_at_first_unmapped_frame(
 }
 
 fn perf_accepted_object_unwind_frames(
-    regs: &PerfX86_64Regs,
+    regs: &PerfUserRegs,
     callchain: SampleCallchainState,
     initial_frame_policy: ObjectUnwindInitialFramePolicy,
     unwound_frames: Vec<u64>,
@@ -3916,7 +4019,9 @@ mod tests {
     use std::cell::RefCell;
 
     use crate::perfdata::mappings::FileIdentity;
-    use crate::perfdata::unwind::{UserStackUnwindResult, UserStackUnwinder};
+    use crate::perfdata::unwind::{
+        PerfArch, PerfUserRegs, PerfX86_64Regs, UserStackUnwindResult, UserStackUnwinder,
+    };
     use crate::symbols::{ResolvedSymbolFrames, SymbolFrameCache, SymbolRequest, SymbolResolver};
 
     // tools/perf/util/header.c write_event_desc: nre(u32), attr_sz(u32), then
@@ -3997,7 +4102,7 @@ mod tests {
     impl UserStackUnwinder for FakeUserStackUnwinder {
         fn unwind_user_stack(
             &mut self,
-            _regs: super::PerfX86_64Regs,
+            _regs: PerfUserRegs,
             _stack: &[u8],
             _max_frames: usize,
         ) -> UserStackUnwindResult {
@@ -4098,13 +4203,17 @@ mod tests {
         }
     }
 
-    fn test_regs(ip: u64) -> super::PerfX86_64Regs {
-        super::PerfX86_64Regs {
+    fn test_x86_regs(ip: u64) -> PerfX86_64Regs {
+        PerfX86_64Regs {
             ip,
             sp: 0x2000,
             bp: 0x3000,
             registers: [0; 16],
         }
+    }
+
+    fn test_regs(ip: u64) -> PerfUserRegs {
+        PerfUserRegs::X86_64(test_x86_regs(ip))
     }
 
     #[test]
@@ -4261,12 +4370,12 @@ mod tests {
         // tools/perf/util/unwind-libdw.c only appends frames accepted by
         // frame_callback -> entry after dwfl_getthread_frames runs. A captured
         // stack with no accepted callbacks stays empty.
-        let mut regs = test_regs(0x5555_556f_bbbb);
+        let mut regs = test_x86_regs(0x5555_556f_bbbb);
         regs.sp = 0x7fff_ffff_7790;
         regs.bp = 0x76c8;
         assert_eq!(
             super::perf_accepted_object_unwind_frames(
-                &regs,
+                &PerfUserRegs::X86_64(regs),
                 super::SampleCallchainState::Other {
                     has_callchain: true,
                     has_frames: false,
@@ -4983,7 +5092,7 @@ mod tests {
 
     #[test]
     fn object_unwind_keeps_syscall_return_callers_like_perf_libdw() {
-        let regs = super::PerfX86_64Regs {
+        let regs = PerfX86_64Regs {
             ip: 0x7fff_f7ea_3f4b,
             sp: 0x7fff_ffff_9928,
             bp: 3,
@@ -4997,7 +5106,7 @@ mod tests {
 
         assert_eq!(
             super::perf_accepted_object_unwind_frames(
-                &regs,
+                &PerfUserRegs::X86_64(regs),
                 super::SampleCallchainState::KernelWithCallchain,
                 super::ObjectUnwindInitialFramePolicy::DropSyntheticCurrentIp,
                 vec![0x7fff_f7ea_3f4b, 0x5555_5578_8ba4, 0x5555_5578_8ba5],
@@ -5158,7 +5267,7 @@ mod tests {
         // executable because the full unwind path rejects that synthesized
         // stack before this acceptance step. tools/perf/util/unwind-libdw.c's
         // entry callback does not drop already-accepted executable frames.
-        let regs = super::PerfX86_64Regs {
+        let regs = PerfX86_64Regs {
             ip: 0x5555_5578_c601,
             sp: 0x7fff_ffff_8cf8,
             bp: 0x4002,
@@ -5167,7 +5276,7 @@ mod tests {
 
         assert_eq!(
             super::perf_accepted_object_unwind_frames(
-                &regs,
+                &PerfUserRegs::X86_64(regs),
                 super::SampleCallchainState::Other {
                     has_callchain: true,
                     has_frames: false,
@@ -5184,7 +5293,7 @@ mod tests {
         // Real period 4754368 sample from target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
         // perf script prints the _int_free_chunk glibc leaf even though the
         // recorded FP callchain itself is empty.
-        let regs = super::PerfX86_64Regs {
+        let regs = PerfX86_64Regs {
             ip: 0x7fff_f7e2_ecb7,
             sp: 0x7fff_ffff_8cf8,
             bp: 0x4002,
@@ -5193,7 +5302,7 @@ mod tests {
 
         assert_eq!(
             super::perf_accepted_object_unwind_frames(
-                &regs,
+                &PerfUserRegs::X86_64(regs),
                 super::SampleCallchainState::Other {
                     has_callchain: true,
                     has_frames: false,
@@ -5408,7 +5517,7 @@ mod tests {
                 path: current_exe,
             });
 
-        let mut state = super::PidUnwindState::default();
+        let mut state = super::PidUnwindState::with_arch(PerfArch::X86_64);
         let loaded = super::report_unwind_modules_for_frame_callbacks_like_perf(
             &mut state,
             &accumulator.mmap_table,
@@ -5446,7 +5555,7 @@ mod tests {
                 path: current_exe,
             });
 
-        let mut state = super::PidUnwindState::default();
+        let mut state = super::PidUnwindState::with_arch(PerfArch::X86_64);
         let loaded = super::report_unwind_modules_for_frame_callbacks_like_perf(
             &mut state,
             &accumulator.mmap_table,
@@ -5469,7 +5578,7 @@ mod tests {
         // but that decision belongs to the full unwind/truncation path. Once
         // libdw entry has accepted frames, there is no user-mode empty-callchain
         // filter here.
-        let regs = super::PerfX86_64Regs {
+        let regs = PerfX86_64Regs {
             ip: 0x7fff_f7f0_277b,
             sp: 0x7fff_ffff_8cf8,
             bp: 0x4002,
@@ -5478,7 +5587,7 @@ mod tests {
 
         assert_eq!(
             super::perf_accepted_object_unwind_frames(
-                &regs,
+                &PerfUserRegs::X86_64(regs),
                 super::SampleCallchainState::Other {
                     has_callchain: true,
                     has_frames: false,
@@ -5497,7 +5606,7 @@ mod tests {
         // recorded FP callchain has nr:0. tools/perf/util/unwind-libdw.c has no
         // blanket filter for user-mode samples with an empty callchain; it emits
         // each frame accepted by frame_callback -> entry.
-        let regs = super::PerfX86_64Regs {
+        let regs = PerfX86_64Regs {
             ip: 0x7fff_f7e5_7982,
             sp: 0x7fff_ffff_a1e0,
             bp: 0x7fff_ffff_a220,
@@ -5506,7 +5615,7 @@ mod tests {
 
         assert_eq!(
             super::perf_accepted_object_unwind_frames(
-                &regs,
+                &PerfUserRegs::X86_64(regs),
                 super::SampleCallchainState::Other {
                     has_callchain: true,
                     has_frames: false,
@@ -5534,7 +5643,7 @@ mod tests {
         // perf script prints only __memmove_avx_unaligned_erms even though the
         // sampled BP points above SP; the full unwind path is responsible for
         // rejecting framehop-only tails that libdw did not accept.
-        let regs = super::PerfX86_64Regs {
+        let regs = PerfX86_64Regs {
             ip: 0x7fff_f7f0_277b,
             sp: 0x7fff_ffff_8938,
             bp: 0x7fff_ffff_9650,
@@ -5543,7 +5652,7 @@ mod tests {
 
         assert_eq!(
             super::perf_accepted_object_unwind_frames(
-                &regs,
+                &PerfUserRegs::X86_64(regs),
                 super::SampleCallchainState::Other {
                     has_callchain: true,
                     has_frames: false,
@@ -5561,7 +5670,7 @@ mod tests {
         // falls through to ebl_unwind(). The real period 803991 sample in the
         // octo profile takes this path: framehop returns no object frames, while
         // perf script prints the frame-pointer spine after the kernel stack.
-        let regs = super::PerfX86_64Regs {
+        let regs = PerfX86_64Regs {
             ip: 0x7fff_f7e1_c03e,
             sp: 0x7fff_ffff_9250,
             bp: 0x7fff_ffff_9260,
@@ -5579,14 +5688,19 @@ mod tests {
         stack[0x28..0x30].copy_from_slice(&0x7fff_f7e9_9d7e_u64.to_le_bytes());
 
         assert_eq!(
-            super::libdw_arch_fallback_after_empty_object_unwind(Vec::new(), &regs, &stack, true,),
+            super::libdw_arch_fallback_after_empty_object_unwind(
+                Vec::new(),
+                &PerfUserRegs::X86_64(regs),
+                &stack,
+                true,
+            ),
             vec![0x7fff_f7e1_c03e, 0x7fff_f7e1_c083, 0x7fff_f7e9_9d7d]
         );
     }
 
     #[test]
     fn empty_object_unwind_arch_fallback_does_not_require_reported_mapping_like_elfutils() {
-        let regs = super::PerfX86_64Regs {
+        let regs = PerfX86_64Regs {
             ip: 0x4000,
             sp: 0x8000,
             bp: 0x8000,
@@ -5595,7 +5709,12 @@ mod tests {
         let stack = 0x5000_u64.to_le_bytes();
 
         assert_eq!(
-            super::libdw_arch_fallback_after_empty_object_unwind(Vec::new(), &regs, &stack, false,),
+            super::libdw_arch_fallback_after_empty_object_unwind(
+                Vec::new(),
+                &PerfUserRegs::X86_64(regs),
+                &stack,
+                false,
+            ),
             Vec::<u64>::new()
         );
 
@@ -5648,6 +5767,50 @@ mod tests {
     }
 
     #[test]
+    fn aarch64_arch_fallback_fires_on_seed_only_object_unwind_like_libdw_ebl() {
+        // framehop's aarch64 unwinder yields only the seed pc when no CFI
+        // covers it; that is exactly when libdwfl invokes ebl_unwind on the
+        // leaf (backends/aarch64_unwind.c), so the fp-chain fallback must run
+        // even though framehop returned one frame.
+        let regs = PerfUserRegs::Aarch64(crate::perfdata::unwind::PerfAarch64Regs {
+            pc: 0x4000,
+            sp: 0x1000,
+            fp: 0x1010,
+            lr: 0x5000,
+        });
+        let stack = vec![0_u8; 0x40];
+
+        assert_eq!(
+            super::libdw_arch_fallback_after_empty_object_unwind(vec![0x4000], &regs, &stack, true,),
+            // pc, then the lr caller (perf pc-1 adjustment), then stop on the
+            // zeroed next lr.
+            vec![0x4000, 0x4fff]
+        );
+    }
+
+    #[test]
+    fn aarch64_arch_fallback_keeps_multi_frame_object_unwind() {
+        // When framehop already produced callers past the seed (CFI worked),
+        // the ebl fallback must not clobber them.
+        let regs = PerfUserRegs::Aarch64(crate::perfdata::unwind::PerfAarch64Regs {
+            pc: 0x4000,
+            sp: 0x1000,
+            fp: 0x1010,
+            lr: 0x5000,
+        });
+
+        assert_eq!(
+            super::libdw_arch_fallback_after_empty_object_unwind(
+                vec![0x4000, 0x9000],
+                &regs,
+                &[0_u8; 0x40],
+                true,
+            ),
+            vec![0x4000, 0x9000]
+        );
+    }
+
+    #[test]
     fn object_unwind_keeps_kernel_without_callchain_dso_tail_like_perf_libdw() {
         // Real period 144 __strlen_avx2 sample from
         // target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
@@ -5656,7 +5819,7 @@ mod tests {
         // callers. In perf util/unwind-libdw.c, frame_callback reports every
         // accepted frame via entry(); there is no kernel-without-callchain
         // post-filter that truncates to the leaf.
-        let regs = super::PerfX86_64Regs {
+        let regs = PerfX86_64Regs {
             ip: 0x7fff_f7f2_d344,
             sp: 0x7fff_ffff_a1d8,
             bp: 0x7fff_ffff_a220,
@@ -5665,7 +5828,7 @@ mod tests {
 
         assert_eq!(
             super::perf_accepted_object_unwind_frames(
-                &regs,
+                &PerfUserRegs::X86_64(regs),
                 super::SampleCallchainState::KernelWithoutCallchain,
                 super::ObjectUnwindInitialFramePolicy::KeepDsoLeaf,
                 vec![

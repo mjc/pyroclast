@@ -2,8 +2,8 @@ use framehop::x86_64::Reg;
 use object::{Object, ObjectSection, ObjectSegment};
 use proptest::prelude::*;
 use pyroclast::perfdata::unwind::{
-    FramehopUnwinder, PerfStackReader, PerfUserMemoryReader, PerfX86_64Regs, UserStackUnwindResult,
-    UserStackUnwinder, unwind_x86_64_stack,
+    FramehopUnwinder, PerfStackReader, PerfUserMemoryReader, PerfUserRegs, PerfX86_64Regs,
+    UserStackUnwindResult, UserStackUnwinder, unwind_x86_64_stack,
 };
 
 #[test]
@@ -191,12 +191,12 @@ fn object_unwind_attempts_initial_plt_frame_without_cfi_like_perf_libdw() {
     assert!(!unwinder.has_unwind_info_for_ip(ip));
 
     let frames = unwinder.unwind_stack(
-        PerfX86_64Regs {
+        PerfUserRegs::X86_64(PerfX86_64Regs {
             ip,
             sp,
             bp: sp,
             registers: registers_with_bp_sp(sp, sp),
-        },
+        }),
         &stack,
         4,
     );
@@ -214,7 +214,8 @@ fn framehop_unwinder_implements_pluggable_user_stack_unwinder_boundary() {
         registers: registers_with_bp_sp(0x7fff_0000, 0x7fff_0000),
     };
 
-    let result: UserStackUnwindResult = unwinder.unwind_user_stack(regs, &[], 4);
+    let result: UserStackUnwindResult =
+        unwinder.unwind_user_stack(PerfUserRegs::X86_64(regs), &[], 4);
 
     assert_eq!(result.accepted_frames, vec![regs.ip]);
 }
@@ -267,7 +268,10 @@ fn rejected_overlapping_module_range_does_not_unwind_through_prior_module() {
             .expect("reject overlapping object mapping")
     );
 
-    assert_eq!(unwinder.unwind_stack(regs, &stack, 4), Vec::<u64>::new());
+    assert_eq!(
+        unwinder.unwind_stack(PerfUserRegs::X86_64(regs), &stack, 4),
+        Vec::<u64>::new()
+    );
 }
 
 #[test]
