@@ -1,6 +1,6 @@
 use proptest::prelude::*;
 use pyroclast::perfdata::header::{
-    PerfFeatureSection, PerfHeader, parse_feature_sections, parse_header,
+    PerfFeatureSection, PerfHeader, parse_feature_sections, parse_header, parse_header_arch,
 };
 
 #[test]
@@ -49,6 +49,35 @@ fn parses_feature_sections_from_set_header_bits() {
             size: 72,
         }]
     );
+}
+
+#[test]
+fn parses_header_arch_feature_string() {
+    // HEADER_ARCH (bit 6) payload is a perf_header_string: u32 length followed
+    // by that many bytes of NUL-terminated text (util/header.c do_read_string).
+    let mut bytes = vec![0; 520];
+    bytes[..104].copy_from_slice(&header_bytes("PERFILE2", 104, 128, 64, 256, 128));
+    put_u64(&mut bytes, 56, 1 << 6);
+    put_u64(&mut bytes, 384, 448);
+    put_u64(&mut bytes, 392, 16);
+    bytes[448..452].copy_from_slice(&12_u32.to_le_bytes());
+    bytes[452..459].copy_from_slice(b"aarch64");
+
+    let header = parse_header(&bytes).expect("header");
+
+    assert_eq!(
+        parse_header_arch(&bytes, &header).expect("arch"),
+        Some("aarch64".to_string())
+    );
+}
+
+#[test]
+fn header_arch_is_none_when_feature_is_absent() {
+    let bytes = header_bytes("PERFILE2", 104, 128, 64, 256, 0);
+
+    let header = parse_header(&bytes).expect("header");
+
+    assert_eq!(parse_header_arch(&bytes, &header).expect("arch"), None);
 }
 
 proptest! {

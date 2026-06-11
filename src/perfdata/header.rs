@@ -72,6 +72,49 @@ pub fn parse_feature_sections(
     Ok(sections)
 }
 
+const HEADER_ARCH: u16 = 6;
+
+/// Reads the HEADER_ARCH feature string (the recording machine's `uname -m`,
+/// e.g. `x86_64` or `aarch64`).
+///
+/// perf stores it as a `perf_header_string`: a u32 length followed by that many
+/// bytes containing a NUL-terminated string (util/header.c `do_read_string`).
+///
+/// # Errors
+///
+/// Returns an error when the header or feature table is malformed. A missing
+/// HEADER_ARCH feature is `Ok(None)`.
+pub fn parse_header_arch(bytes: &[u8], header: &PerfHeader) -> Result<Option<String>, String> {
+    let Some(section) = parse_feature_sections(bytes, header)?
+        .into_iter()
+        .find(|section| section.feature == HEADER_ARCH)
+    else {
+        return Ok(None);
+    };
+    let start = usize::try_from(section.offset)
+        .map_err(|_| "arch feature offset exceeds usize".to_string())?;
+    let size = usize::try_from(section.size)
+        .map_err(|_| "arch feature size exceeds usize".to_string())?;
+    let end = start
+        .checked_add(size)
+        .ok_or_else(|| "arch feature range overflows usize".to_string())?;
+    let payload = bytes
+        .get(start..end)
+        .ok_or_else(|| "arch feature payload is truncated".to_string())?;
+    let length = usize::try_from(crate::perfdata::endian::read_u32(payload, 0)?)
+        .map_err(|_| "arch feature string length exceeds usize".to_string())?;
+    let string = payload
+        .get(4..4 + length)
+        .ok_or_else(|| "arch feature string is truncated".to_string())?;
+    let end = string
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(string.len());
+    std::str::from_utf8(&string[..end])
+        .map(|arch| Some(arch.to_string()))
+        .map_err(|error| format!("arch feature string is not UTF-8: {error}"))
+}
+
 fn feature_table_offset(header: &PerfHeader) -> Result<usize, String> {
     let offset = header
         .data_offset
