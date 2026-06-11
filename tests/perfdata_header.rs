@@ -61,7 +61,8 @@ fn parses_header_arch_feature_string() {
     // by that many bytes of NUL-terminated text (util/header.c do_read_string).
     let mut bytes = vec![0; 520];
     bytes[..104].copy_from_slice(&header_bytes("PERFILE2", 104, 128, 64, 256, 128));
-    put_u64(&mut bytes, 56, 1 << 6);
+    // adds_features bitmap lives at offset 72 (struct perf_file_header).
+    put_u64(&mut bytes, 72, 1 << 6);
     put_u64(&mut bytes, 384, 448);
     put_u64(&mut bytes, 392, 16);
     bytes[448..452].copy_from_slice(&12_u32.to_le_bytes());
