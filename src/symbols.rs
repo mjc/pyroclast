@@ -43,11 +43,32 @@ pub struct SymbolRequest {
     pub kernel_relocation: Option<KernelRelocation>,
 }
 
+impl SymbolRequest {
+    /// Returns the `file_identity` that participates in identity comparison.
+    ///
+    /// perf's `__dso_id__cmp` (tools/perf/util/dso.c) treats a defined build_id
+    /// as the decisive backing-store discriminator and only weighs the mmap2
+    /// maj/min/ino when both dso ids recorded them. The same on-disk object can
+    /// arrive with the build_id but no file_identity (inline MMAP2-build-id) or
+    /// with both (plain MMAP2 + HEADER_BUILD_ID), so once a build_id is present
+    /// we ignore file_identity to keep the request — and thus the symbol cache
+    /// entry — unified. Distinct build_ids at the same path still differ via
+    /// `build_id`; file_identity remains the discriminator only when no
+    /// build_id exists.
+    fn identity_file_identity(&self) -> Option<FileIdentity> {
+        if self.build_id.is_some() {
+            None
+        } else {
+            self.file_identity
+        }
+    }
+}
+
 impl PartialEq for SymbolRequest {
     fn eq(&self, other: &Self) -> bool {
         self.relative_address == other.relative_address
             && self.build_id == other.build_id
-            && self.file_identity == other.file_identity
+            && self.identity_file_identity() == other.identity_file_identity()
             && self.kernel_relocation == other.kernel_relocation
             && self.path.as_os_str() == other.path.as_os_str()
     }
@@ -60,7 +81,7 @@ impl Hash for SymbolRequest {
         self.path.as_os_str().hash(state);
         self.relative_address.hash(state);
         self.build_id.hash(state);
-        self.file_identity.hash(state);
+        self.identity_file_identity().hash(state);
         self.kernel_relocation.hash(state);
     }
 }
@@ -78,7 +99,10 @@ impl Ord for SymbolRequest {
             .cmp(other.path.as_os_str())
             .then_with(|| self.relative_address.cmp(&other.relative_address))
             .then_with(|| self.build_id.cmp(&other.build_id))
-            .then_with(|| self.file_identity.cmp(&other.file_identity))
+            .then_with(|| {
+                self.identity_file_identity()
+                    .cmp(&other.identity_file_identity())
+            })
             .then_with(|| self.kernel_relocation.cmp(&other.kernel_relocation))
     }
 }
@@ -3602,6 +3626,7 @@ fn parse_module_kallsyms_line(line: &str) -> Option<(u64, String, String)> {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     use object::{Object, ObjectSegment, ObjectSymbol, build, elf};
@@ -3693,6 +3718,73 @@ mod tests {
             ),
             "std::panicking::catch_unwind::<isize, std::rt::lang_start_internal::{closure#0}>"
         );
+    }
+
+    #[test]
+    fn symbol_request_ignores_file_identity_when_build_id_present() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        use crate::perfdata::mappings::FileIdentity;
+
+        let hash_of = |request: &SymbolRequest| {
+            let mut hasher = DefaultHasher::new();
+            request.hash(&mut hasher);
+            hasher.finish()
+        };
+
+        // Same object, same build_id: the inline MMAP2-build-id form carries no
+        // file_identity while the plain MMAP2 + HEADER_BUILD_ID form does.
+        // perf's __dso_id__cmp makes build_id decisive, so these are one entry.
+        let inline = SymbolRequest {
+            path: PathBuf::from("/usr/lib/libc.so.6"),
+            relative_address: 0x1234,
+            build_id: Some("aabbccdd".to_string()),
+            file_identity: None,
+            kernel_relocation: None,
+        };
+        let with_identity = SymbolRequest {
+            file_identity: Some(FileIdentity {
+                major: 8,
+                minor: 1,
+                inode: 99,
+                inode_generation: 7,
+            }),
+            ..inline.clone()
+        };
+        assert_eq!(inline, with_identity);
+        assert_eq!(hash_of(&inline), hash_of(&with_identity));
+        assert_eq!(inline.cmp(&with_identity), std::cmp::Ordering::Equal);
+
+        // Different build_ids at the same path are genuinely different objects.
+        let other_build_id = SymbolRequest {
+            build_id: Some("11223344".to_string()),
+            ..inline.clone()
+        };
+        assert_ne!(inline, other_build_id);
+
+        // With no build_id, file_identity is the only backing-store
+        // discriminator and must still separate distinct objects.
+        let no_build_id_a = SymbolRequest {
+            build_id: None,
+            file_identity: Some(FileIdentity {
+                major: 8,
+                minor: 1,
+                inode: 99,
+                inode_generation: 0,
+            }),
+            ..inline.clone()
+        };
+        let no_build_id_b = SymbolRequest {
+            file_identity: Some(FileIdentity {
+                major: 8,
+                minor: 1,
+                inode: 100,
+                inode_generation: 0,
+            }),
+            ..no_build_id_a.clone()
+        };
+        assert_ne!(no_build_id_a, no_build_id_b);
     }
 
     #[test]

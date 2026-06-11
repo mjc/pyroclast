@@ -680,14 +680,31 @@ impl Mapping {
     }
 
     fn symbol_source_key(&self) -> SymbolSourceKey {
+        // perf identifies a dso backing store via __dso_id__cmp
+        // (tools/perf/util/dso.c): once both sides carry a defined build_id it
+        // is the decisive comparison, and the mmap2 maj/min/ino are only
+        // weighed when both sides recorded them. The same on-disk object can
+        // therefore reach us as an inline MMAP2-build-id record (build_id, no
+        // file_identity) or as a plain MMAP2 plus a HEADER_BUILD_ID entry
+        // (build_id and file_identity). Keying on file_identity alongside the
+        // build_id would split those into two symbol sources, so when a
+        // build_id is present we drop file_identity from the key and rely on
+        // (path, build_id) — preserving distinct build_ids at the same path,
+        // and falling back to file_identity only when no build_id exists.
+        let build_id = self.build_id.clone();
+        let file_identity = if build_id.is_some() {
+            None
+        } else {
+            self.file_identity
+        };
         SymbolSourceKey {
             path: if self.is_kernel_symbol_mapping() && self.path.starts_with("[kernel") {
                 "[kernel.kallsyms]".to_string()
             } else {
                 self.path.clone()
             },
-            build_id: self.build_id.clone(),
-            file_identity: self.file_identity,
+            build_id,
+            file_identity,
             kernel_relocation: self.kernel_relocation(),
         }
     }

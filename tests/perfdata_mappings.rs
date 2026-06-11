@@ -343,6 +343,100 @@ fn resolves_build_id_from_mmap2_build_id_mapping() {
 }
 
 #[test]
+fn unifies_symbol_source_for_one_object_across_mmap_record_forms() {
+    // The same on-disk object can arrive as an inline MMAP2-build-id record
+    // (build_id, no file_identity) or as a plain MMAP2 carrying file_identity
+    // plus a HEADER_BUILD_ID that supplies the same build_id. perf's
+    // __dso_id__cmp (tools/perf/util/dso.c) makes the build_id decisive once
+    // both ids define it, so both forms must map to a single symbol source.
+    let build_id = vec![0xaa, 0xbb, 0xcc, 0xdd];
+    let mut table = MmapTable::default();
+    table.insert_mmap2_build_id(Mmap2BuildIdRecord {
+        pid: 1,
+        tid: 1,
+        start: 0x1000,
+        len: 0x200,
+        build_id_size: 4,
+        build_id: build_id.clone(),
+        pgoff: 0,
+        prot: 5,
+        flags: 2,
+        path: "/usr/lib/libc.so.6".to_string(),
+    });
+    table.insert_mmap2_with_build_id(
+        Mmap2Record {
+            pid: 2,
+            tid: 2,
+            start: 0x4000,
+            len: 0x200,
+            pgoff: 0,
+            major: 8,
+            minor: 1,
+            inode: 99,
+            inode_generation: 7,
+            prot: 5,
+            flags: 2,
+            path: "/usr/lib/libc.so.6".to_string(),
+        },
+        Some(build_id.clone()),
+    );
+
+    let inline = table
+        .resolve_ref(1, 0x1010)
+        .expect("inline build-id mapping");
+    let header = table
+        .resolve_ref(2, 0x4010)
+        .expect("header build-id mapping");
+    assert_eq!(
+        inline.symbol_source_id, header.symbol_source_id,
+        "one object must resolve through one symbol source regardless of mmap form"
+    );
+}
+
+#[test]
+fn keeps_distinct_symbol_sources_for_different_build_ids_at_same_path() {
+    // perf's __dso_id__cmp compares the build_id when both are defined, so two
+    // genuinely different objects at the same path (e.g. a replaced binary)
+    // must remain distinct symbol sources.
+    let mut table = MmapTable::default();
+    table.insert_mmap2_build_id(Mmap2BuildIdRecord {
+        pid: 1,
+        tid: 1,
+        start: 0x1000,
+        len: 0x200,
+        build_id_size: 4,
+        build_id: vec![0xaa, 0xbb, 0xcc, 0xdd],
+        pgoff: 0,
+        prot: 5,
+        flags: 2,
+        path: "/usr/lib/libc.so.6".to_string(),
+    });
+    table.insert_mmap2_build_id(Mmap2BuildIdRecord {
+        pid: 2,
+        tid: 2,
+        start: 0x4000,
+        len: 0x200,
+        build_id_size: 4,
+        build_id: vec![0x11, 0x22, 0x33, 0x44],
+        pgoff: 0,
+        prot: 5,
+        flags: 2,
+        path: "/usr/lib/libc.so.6".to_string(),
+    });
+
+    let first = table
+        .resolve_ref(1, 0x1010)
+        .expect("first build-id mapping");
+    let second = table
+        .resolve_ref(2, 0x4010)
+        .expect("second build-id mapping");
+    assert_ne!(
+        first.symbol_source_id, second.symbol_source_id,
+        "different build_ids at the same path must stay distinct symbol sources"
+    );
+}
+
+#[test]
 fn resolves_file_identity_from_mmap2_mapping() {
     let mut table = MmapTable::default();
     table.insert_mmap2(Mmap2Record {
