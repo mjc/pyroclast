@@ -2180,8 +2180,10 @@ fn extend_symbol_mappings_for_stack<'a>(
             };
             // Without --inline (the default), every frame is rendered from its
             // single base ELF symtab symbol, so prefetch only the base symbol.
-            // InlineCurrentIp object-unwind leaves always use base resolution.
-            if !inline || matches!(frame, FoldFrame::InlineCurrentIp(_)) {
+            // With --inline, perf's machine.c unwind_entry() runs
+            // append_inlines() on every accepted entry including the leaf, so
+            // InlineCurrentIp leaves prefetch the full DWARF inline chain too.
+            if !inline {
                 if batches.seen_base.insert(key) {
                     batches.base_mappings.push(mapping);
                 }
@@ -2303,12 +2305,26 @@ impl<'a> FoldFrameResolver<'a> {
                 continue;
             }
             if let FoldFrame::InlineCurrentIp(address) = frame {
-                self.append_inline_current_ip_folded_frame(
-                    pid,
-                    address,
-                    symbol_cache.as_deref_mut(),
-                    buffers,
-                )?;
+                // perf's machine.c unwind_entry() runs append_inlines() on
+                // EVERY accepted entry, including the initial sampled IP, so
+                // with --inline the leaf expands its inline chain just like a
+                // caller frame. Only the no-inline default renders the single
+                // base symtab symbol for the leaf.
+                if self.inline {
+                    self.append_folded_frame_labels(
+                        pid,
+                        FoldFrame::UserUnwind(address),
+                        symbol_cache.as_deref_mut(),
+                        buffers,
+                    )?;
+                } else {
+                    self.append_inline_current_ip_folded_frame(
+                        pid,
+                        address,
+                        symbol_cache.as_deref_mut(),
+                        buffers,
+                    )?;
+                }
                 continue;
             }
             self.append_folded_frame_labels(pid, frame, symbol_cache.as_deref_mut(), buffers)?;
@@ -2349,13 +2365,28 @@ impl<'a> FoldFrameResolver<'a> {
                 continue;
             }
             if let FoldFrame::InlineCurrentIp(address) = frame {
-                self.write_inline_current_ip_script_frames(
-                    pid,
-                    address,
-                    symbol_cache.as_deref_mut(),
-                    &mut mapping_cache,
-                    writer,
-                )?;
+                // perf's machine.c unwind_entry() runs append_inlines() on
+                // EVERY accepted entry, including the initial sampled IP, so
+                // with --inline the leaf expands its inline chain just like a
+                // caller frame. Only the no-inline default renders the single
+                // base symtab symbol for the leaf.
+                if self.inline {
+                    self.write_regular_script_frame(
+                        pid,
+                        FoldFrame::UserUnwind(address),
+                        symbol_cache.as_deref_mut(),
+                        &mut mapping_cache,
+                        writer,
+                    )?;
+                } else {
+                    self.write_inline_current_ip_script_frames(
+                        pid,
+                        address,
+                        symbol_cache.as_deref_mut(),
+                        &mut mapping_cache,
+                        writer,
+                    )?;
+                }
                 continue;
             }
             self.write_regular_script_frame(
@@ -4732,10 +4763,12 @@ mod tests {
     }
 
     #[test]
-    fn prefetch_symbols_batches_inline_current_ip_as_base_symbol_only() {
-        // perf's libdw path emits the initial frame as a map symbol before any
-        // inline expansion. Prefetching InlineCurrentIp through the full DWARF
-        // frame path repeats expensive object work on large perf.data files.
+    fn prefetch_symbols_batches_inline_current_ip_through_full_dwarf_with_inline() {
+        // perf's machine.c unwind_entry() runs append_inlines() on EVERY
+        // accepted entry, including the initial sampled IP (the InlineCurrentIp
+        // leaf), so with --inline the leaf is symbolized through the full DWARF
+        // inline chain exactly like a caller frame. Only the no-inline default
+        // resolves it from the single base symtab symbol.
         let mut mmap_table = super::MmapTable::default();
         mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
             pid: 11,
@@ -4759,13 +4792,13 @@ mod tests {
         let resolver = RecordingFrameResolver::default();
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
 
-        // With --inline, regular frames prefetch the full DWARF inline chain
-        // while InlineCurrentIp object-unwind leaves only need the base symbol.
+        // With --inline, both the caller (UserUnwind 0x1010) and the leaf
+        // (InlineCurrentIp 0x1020) prefetch the full DWARF inline chain.
         super::prefetch_symbols(&entries, &mmap_table, &mut symbol_cache, true)
             .expect("prefetch folded stack symbols");
 
-        assert_eq!(*resolver.full_requests.borrow(), vec![0x10]);
-        assert_eq!(*resolver.base_requests.borrow(), vec![0x20]);
+        assert_eq!(*resolver.full_requests.borrow(), vec![0x10, 0x20]);
+        assert!(resolver.base_requests.borrow().is_empty());
     }
 
     #[test]

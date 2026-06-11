@@ -1941,12 +1941,13 @@ impl SymbolResolver for RustAddr2lineResolver {
                     object_symbol,
                     object_symbols.with_offset.as_deref(),
                 );
-                if let Some(metadata) = &object_metadata {
-                    specialize_frames_from_debug_strings(
-                        &mut frames,
-                        &metadata.object_metadata.debug_names,
-                    );
-                }
+                // No .debug_str generic specialization here: inline-frame names
+                // now come from the DWARF linkage name demangled like perf's
+                // external-addr2line backend (fully qualified, perf-faithful).
+                // Re-specializing from .debug_str would rewrite e.g.
+                // `core::slice::<impl [T]>::sort_unstable` to `sort_unstable<u64>`,
+                // which perf never prints (verified against
+                // target/oracle/dwarf.perf.script).
                 resolved[index] = ResolvedSymbolFrames {
                     frames,
                     has_base_symbol,
