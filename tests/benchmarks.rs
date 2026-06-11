@@ -270,6 +270,7 @@ fn parses_benchmark_inputs() {
     let args = BenchArgs::parse(vec![
         "profile.perf.data".into(),
         "--symbols".into(),
+        "--inline".into(),
         "--export-perf-script".into(),
         "exported-script.txt".into(),
         "--perf-script".into(),
@@ -278,8 +279,16 @@ fn parses_benchmark_inputs() {
 
     assert_eq!(args.perf_data, Some("profile.perf.data".into()));
     assert!(args.symbols);
+    assert!(args.inline);
     assert_eq!(args.export_perf_script, Some("exported-script.txt".into()));
     assert_eq!(args.perf_script, Some("perf-script.txt".into()));
+}
+
+#[test]
+fn benchmark_inline_flag_defaults_off() {
+    let args = BenchArgs::parse(vec!["profile.perf.data".into(), "--symbols".into()]);
+
+    assert!(!args.inline);
 }
 
 #[test]
@@ -300,6 +309,7 @@ fn bench_command_reports_missing_input() {
         perf_script: None,
         export_perf_script: None,
         symbols: false,
+        inline: false,
     };
 
     let error = run_bench_command(&args, &runner).expect_err("missing input should fail");
@@ -318,6 +328,7 @@ fn bench_command_reports_missing_perf_script_input() {
         perf_script: Some(root.path().join("missing.perf-script")),
         export_perf_script: None,
         symbols: false,
+        inline: false,
     };
 
     let error = run_bench_command(&args, &runner).expect_err("missing perf script should fail");
@@ -337,6 +348,7 @@ fn bench_command_exports_perf_script_and_compares_without_perf_runner() {
         perf_script: None,
         export_perf_script: Some(exported_perf_script.clone()),
         symbols: false,
+        inline: false,
     };
 
     let output = run_bench_command(&args, &runner).expect("bench command");
@@ -432,6 +444,7 @@ proptest! {
             perf_script: None,
             export_perf_script: None,
             symbols: false,
+            inline: false,
         };
 
         let expected = perf_data

@@ -30,6 +30,12 @@ pub struct BenchArgs {
     pub export_perf_script: Option<PathBuf>,
 
     pub symbols: bool,
+
+    /// Expand each callchain entry into its DWARF inline frames when folding,
+    /// like `perf script --inline`. The dwarf oracle's perf.script is recorded
+    /// with inline expansion, so the comparison must fold with inline on to
+    /// line up frame counts.
+    pub inline: bool,
 }
 
 impl BenchArgs {
@@ -44,6 +50,8 @@ impl BenchArgs {
                 parsed.export_perf_script = iter.next();
             } else if arg.as_os_str() == "--symbols" {
                 parsed.symbols = true;
+            } else if arg.as_os_str() == "--inline" {
+                parsed.inline = true;
             } else {
                 parsed.perf_data = Some(arg);
             }
@@ -122,9 +130,14 @@ where
         ));
     }
 
-    let report =
-        run_streaming_comparison_with_symbols(&input, perf_script.as_deref(), runner, args.symbols)
-            .map_err(|error| format!("inferno comparison failed: {error}"))?;
+    let report = run_streaming_comparison_with_symbols(
+        &input,
+        perf_script.as_deref(),
+        runner,
+        args.symbols,
+        args.inline,
+    )
+    .map_err(|error| format!("inferno comparison failed: {error}"))?;
     Ok(format_bench_output(&report))
 }
 
@@ -358,6 +371,7 @@ pub fn run_streaming_comparison_with_symbols<R>(
     perf_script: Option<&Path>,
     runner: &R,
     symbols: bool,
+    inline: bool,
 ) -> Result<StreamingComparisonReport, String>
 where
     R: CommandRunner + Sync,
@@ -366,7 +380,7 @@ where
         let (pyro_tx, pyro_rx) = sync_channel(64);
         let (inferno_tx, inferno_rx) = sync_channel(64);
         let pyro_thread =
-            scope.spawn(move || run_pyroclast_stream(perf_data, runner, symbols, pyro_tx));
+            scope.spawn(move || run_pyroclast_stream(perf_data, runner, symbols, inline, pyro_tx));
         let inferno_thread = scope
             .spawn(move || run_inferno_stream(perf_data, perf_script, runner, symbols, inferno_tx));
         let diff = compare_folded_line_receivers(&pyro_rx, &inferno_rx)?;
@@ -630,6 +644,7 @@ fn run_pyroclast_stream<R>(
     perf_data: &Path,
     runner: &R,
     symbols: bool,
+    inline: bool,
     line_sender: SyncSender<String>,
 ) -> Result<ProducerResult, String>
 where
@@ -649,14 +664,14 @@ where
         let resolver = perf_symbol_resolver_for_current_home(runner, &perf_data);
         write_folded_perfdata_file_with_symbols(
             &perf_data,
-            benchmark_fold_options(false),
+            benchmark_fold_options(inline),
             &resolver,
             &mut writer,
         )?;
     } else {
         write_folded_perfdata_file_with_options(
             &perf_data,
-            benchmark_fold_options(false),
+            benchmark_fold_options(inline),
             &mut writer,
         )?;
     }
