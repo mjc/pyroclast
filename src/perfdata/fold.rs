@@ -680,7 +680,7 @@ where
     W: IoWrite + ?Sized,
 {
     let (header, header_bytes) = perfdata_header_from_file(file)?;
-    let sample_layouts = sample_layouts_from_file(file, header)?;
+    let sample_layouts = sample_layouts_from_file(file, header, &header_bytes)?;
     let header_build_ids = header_build_ids_by_filename_from_file(file, header, &header_bytes)?;
     let mut accumulator = FoldAccumulator::new(header_build_ids);
     let data_end = header
@@ -784,7 +784,7 @@ where
     W: IoWrite + ?Sized,
 {
     let (header, header_bytes) = perfdata_header_from_file(file)?;
-    let sample_layouts = sample_layouts_from_file(file, header)?;
+    let sample_layouts = sample_layouts_from_file(file, header, &header_bytes)?;
     let header_build_ids = header_build_ids_by_filename_from_file(file, header, &header_bytes)?;
     let data_end = header
         .data_offset
@@ -1057,9 +1057,13 @@ where
             write!(self.writer, "{secs:>5}.{usecs:06}: ")
                 .map_err(|error| format!("failed to write perf script output: {error}"))?;
         }
+        // builtin-script.c prints `fprintf(fp, "%*s: ", name_width, evname)`
+        // (note the trailing space) and then `fputc(cursor ? '\n' : ' ', fp)`.
+        // For a resolved callchain (the multi-frame path) cursor is set, so the
+        // header line ends with the event-name colon, a space, then a newline.
         writeln!(
             self.writer,
-            "{:>10} {:>width$}:",
+            "{:>10} {:>width$}: ",
             sample.count,
             sample.event_name,
             width = self.event_name_width,
@@ -1216,7 +1220,11 @@ fn perfdata_header_from_file(file: &File) -> Result<(PerfHeader, [u8; 104]), Str
     Ok((header, bytes))
 }
 
-fn sample_layouts_from_file(file: &File, header: PerfHeader) -> Result<SampleLayouts, String> {
+fn sample_layouts_from_file(
+    file: &File,
+    header: PerfHeader,
+    header_bytes: &[u8; 104],
+) -> Result<SampleLayouts, String> {
     let attr_size = usize::try_from(header.attr_size)
         .map_err(|_| "perf attr section size exceeds usize".to_string())?;
     let attr_bytes = read_file_range(file, header.attr_offset, attr_size, "perf attr section")?;
@@ -1231,7 +1239,12 @@ fn sample_layouts_from_file(file: &File, header: PerfHeader) -> Result<SampleLay
         },
     )?;
 
-    let event_names = attrs.iter().map(perf_event_name).collect::<Vec<_>>();
+    let attr_ids = attrs
+        .iter()
+        .map(|attr| file_attr_ids_from_file(file, attr))
+        .collect::<Result<Vec<_>, _>>()?;
+    let event_desc = event_desc_entries_from_file(file, header, header_bytes)?;
+    let event_names = build_event_names(&attrs, &attr_ids, &event_desc);
     let event_name_width = event_names
         .iter()
         .map(String::len)
@@ -1245,12 +1258,12 @@ fn sample_layouts_from_file(file: &File, header: PerfHeader) -> Result<SampleLay
         by_identifier: BTreeMap::new(),
         event_name_width,
     };
-    for (attr, event_name) in attrs.iter().zip(event_names) {
+    for ((attr, event_name), ids) in attrs.iter().zip(event_names).zip(attr_ids) {
         let event = SampleEventLayout {
             layout: layout_from_attr(attr),
             event_name,
         };
-        for id in file_attr_ids_from_file(file, attr)? {
+        for id in ids {
             layouts.by_identifier.insert(id, event.clone());
         }
     }
@@ -1296,6 +1309,51 @@ fn build_id_events_from_file(
         .map_err(|_| "build-id feature size exceeds usize".to_string())?;
     let payload = read_file_range(file, section.offset, size, "build-id feature payload")?;
     parse_build_id_events(&payload)
+}
+
+// HEADER_EVENT_DESC feature bit (tools/perf/util/header.h enum HEADER_*).
+const HEADER_EVENT_DESC_FEATURE: u16 = 12;
+
+fn event_desc_entries_from_file(
+    file: &File,
+    header: PerfHeader,
+    header_bytes: &[u8; 104],
+) -> Result<Vec<EventDescEntry>, String> {
+    let Some(section) = feature_sections_from_file(file, header, header_bytes)?
+        .into_iter()
+        .find(|section| section.feature == HEADER_EVENT_DESC_FEATURE)
+    else {
+        return Ok(Vec::new());
+    };
+    let size = usize::try_from(section.size)
+        .map_err(|_| "event desc feature size exceeds usize".to_string())?;
+    let payload = read_file_range(file, section.offset, size, "event desc feature payload")?;
+    Ok(parse_event_desc_entries(&payload))
+}
+
+fn event_desc_entries_from_bytes(
+    bytes: &[u8],
+    header: crate::perfdata::header::PerfHeader,
+) -> Vec<EventDescEntry> {
+    let Ok(sections) = crate::perfdata::header::parse_feature_sections(bytes, &header) else {
+        return Vec::new();
+    };
+    let Some(section) = sections
+        .into_iter()
+        .find(|section| section.feature == HEADER_EVENT_DESC_FEATURE)
+    else {
+        return Vec::new();
+    };
+    let (Ok(offset), Ok(size)) = (
+        usize::try_from(section.offset),
+        usize::try_from(section.size),
+    ) else {
+        return Vec::new();
+    };
+    bytes
+        .get(offset..offset + size)
+        .map(parse_event_desc_entries)
+        .unwrap_or_default()
 }
 
 fn feature_sections_from_file(
@@ -3549,7 +3607,12 @@ fn sample_layouts(
     header: crate::perfdata::header::PerfHeader,
 ) -> Result<SampleLayouts, String> {
     let attrs = parse_file_attrs(bytes, header)?;
-    let event_names = attrs.iter().map(perf_event_name).collect::<Vec<_>>();
+    let attr_ids = attrs
+        .iter()
+        .map(|attr| parse_file_attr_ids(bytes, attr))
+        .collect::<Result<Vec<_>, _>>()?;
+    let event_desc = event_desc_entries_from_bytes(bytes, header);
+    let event_names = build_event_names(&attrs, &attr_ids, &event_desc);
     let event_name_width = event_names
         .iter()
         .map(String::len)
@@ -3563,12 +3626,12 @@ fn sample_layouts(
         by_identifier: BTreeMap::new(),
         event_name_width,
     };
-    for (attr, event_name) in attrs.iter().zip(event_names) {
+    for ((attr, event_name), ids) in attrs.iter().zip(event_names).zip(attr_ids) {
         let event = SampleEventLayout {
             layout: layout_from_attr(attr),
             event_name,
         };
-        for id in parse_file_attr_ids(bytes, attr)? {
+        for id in ids {
             layouts.by_identifier.insert(id, event.clone());
         }
     }
@@ -3603,6 +3666,106 @@ fn perf_event_name(attr: &PerfFileAttr) -> String {
         PERF_TYPE_BREAKPOINT => "breakpoint".to_string(),
         _ => format!("unknown attr type: {}", attr.event_type),
     }
+}
+
+/// A single event description parsed from the `HEADER_EVENT_DESC` feature.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EventDescEntry {
+    name: String,
+    ids: Vec<u64>,
+}
+
+/// Parses the `HEADER_EVENT_DESC` feature payload.
+///
+/// `perf record` writes evsel names verbatim into this feature (see
+/// `write_event_desc`/`read_event_desc` in `tools/perf/util/header.c`), and
+/// `perf script` prints those names instead of reconstructing them from the
+/// attr type/config. The layout is: `nre` (u32, number of events), `attr_sz`
+/// (u32, sizeof perf_event_attr), then for each event: `attr_sz` attr bytes, a
+/// `nr` (u32) id count, a length-prefixed name string, and `nr` u64 ids.
+///
+/// The name string is written by `do_write_string`: a u32 length
+/// (`PERF_ALIGN(strlen + 1, NAME_ALIGN)`) followed by that many bytes holding
+/// the NUL-terminated name plus zero padding. We read the declared number of
+/// bytes and take the text up to the first NUL.
+fn parse_event_desc_entries(payload: &[u8]) -> Vec<EventDescEntry> {
+    parse_event_desc_entries_checked(payload).unwrap_or_default()
+}
+
+fn parse_event_desc_entries_checked(payload: &[u8]) -> Result<Vec<EventDescEntry>, String> {
+    let event_count = read_u32(payload, 0)?;
+    let attr_size = usize::try_from(read_u32(payload, 4)?)
+        .map_err(|_| "event desc attr size exceeds usize".to_string())?;
+    let mut offset = 8usize;
+    let mut entries = Vec::with_capacity(event_count as usize);
+    for _ in 0..event_count {
+        offset = offset
+            .checked_add(attr_size)
+            .ok_or_else(|| "event desc attr offset overflow".to_string())?;
+        let id_count = usize::try_from(read_u32(payload, offset)?)
+            .map_err(|_| "event desc id count exceeds usize".to_string())?;
+        offset += 4;
+        let name_len = usize::try_from(read_u32(payload, offset)?)
+            .map_err(|_| "event desc name length exceeds usize".to_string())?;
+        offset += 4;
+        let name_bytes = payload
+            .get(offset..offset + name_len)
+            .ok_or_else(|| "event desc name truncated".to_string())?;
+        let name = event_desc_name_from_bytes(name_bytes);
+        offset += name_len;
+        let mut ids = Vec::with_capacity(id_count);
+        for _ in 0..id_count {
+            ids.push(read_u64(payload, offset)?);
+            offset += 8;
+        }
+        entries.push(EventDescEntry { name, ids });
+    }
+    Ok(entries)
+}
+
+fn event_desc_name_from_bytes(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+/// Builds the per-attr event names `perf script` would print.
+///
+/// Prefers the verbatim evsel names from `HEADER_EVENT_DESC`, matched to each
+/// attr by shared sample id (and by event index as a fallback, which is how
+/// `process_event_desc` in `tools/perf/util/header.c` pairs descriptions with
+/// evsels). Falls back to reconstructing the name from the attr type/config
+/// when no description matches.
+fn build_event_names(
+    attrs: &[PerfFileAttr],
+    attr_ids: &[Vec<u64>],
+    event_desc: &[EventDescEntry],
+) -> Vec<String> {
+    attrs
+        .iter()
+        .enumerate()
+        .map(|(index, attr)| {
+            event_desc_name_for_attr(index, attr_ids.get(index), event_desc)
+                .unwrap_or_else(|| perf_event_name(attr))
+        })
+        .collect()
+}
+
+fn event_desc_name_for_attr(
+    index: usize,
+    attr_ids: Option<&Vec<u64>>,
+    event_desc: &[EventDescEntry],
+) -> Option<String> {
+    if event_desc.is_empty() {
+        return None;
+    }
+    if let Some(ids) = attr_ids.filter(|ids| !ids.is_empty())
+        && let Some(entry) = event_desc
+            .iter()
+            .find(|entry| entry.ids.iter().any(|id| ids.contains(id)))
+    {
+        return Some(entry.name.clone());
+    }
+    event_desc.get(index).map(|entry| entry.name.clone())
 }
 
 fn hardware_event_name(config: u64) -> &'static str {
@@ -3700,6 +3863,75 @@ mod tests {
     use crate::perfdata::mappings::FileIdentity;
     use crate::perfdata::unwind::{UserStackUnwindResult, UserStackUnwinder};
     use crate::symbols::{ResolvedSymbolFrames, SymbolFrameCache, SymbolRequest, SymbolResolver};
+
+    // tools/perf/util/header.c write_event_desc: nre(u32), attr_sz(u32), then
+    // per event attr_sz attr bytes, nr(u32), do_write_string(name), nr u64 ids.
+    fn event_desc_payload(events: &[(&str, &[u64])], attr_sz: usize) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend((events.len() as u32).to_le_bytes());
+        payload.extend((attr_sz as u32).to_le_bytes());
+        for (name, ids) in events {
+            payload.extend(std::iter::repeat_n(0_u8, attr_sz));
+            payload.extend((ids.len() as u32).to_le_bytes());
+            // do_write_string: u32 len = PERF_ALIGN(strlen+1, NAME_ALIGN=64),
+            // then len bytes of NUL-terminated name plus zero padding.
+            let aligned = (name.len() + 1).div_ceil(64) * 64;
+            payload.extend((aligned as u32).to_le_bytes());
+            let mut name_bytes = name.as_bytes().to_vec();
+            name_bytes.resize(aligned, 0);
+            payload.extend(name_bytes);
+            for id in *ids {
+                payload.extend(id.to_le_bytes());
+            }
+        }
+        payload
+    }
+
+    #[test]
+    fn parses_event_desc_names_verbatim_like_perf_read_event_desc() {
+        // perf script prints the evsel names recorded in HEADER_EVENT_DESC
+        // (e.g. "task-clock:ppp") rather than reconstructing them; the trailing
+        // colon perf script appends is a separator, not part of the name.
+        let payload = event_desc_payload(&[("task-clock:ppp", &[230, 231, 242])], 136);
+        let entries = super::parse_event_desc_entries(&payload);
+        assert_eq!(
+            entries,
+            vec![super::EventDescEntry {
+                name: "task-clock:ppp".to_string(),
+                ids: vec![230, 231, 242],
+            }]
+        );
+    }
+
+    #[test]
+    fn event_desc_name_matches_attr_by_shared_id() {
+        let entries = vec![
+            super::EventDescEntry {
+                name: "cycles:ppp".to_string(),
+                ids: vec![10, 11],
+            },
+            super::EventDescEntry {
+                name: "task-clock:ppp".to_string(),
+                ids: vec![20, 21],
+            },
+        ];
+        assert_eq!(
+            super::event_desc_name_for_attr(0, Some(&vec![21]), &entries),
+            Some("task-clock:ppp".to_string())
+        );
+    }
+
+    #[test]
+    fn event_desc_name_falls_back_to_event_index_without_ids() {
+        let entries = vec![super::EventDescEntry {
+            name: "task-clock:ppp".to_string(),
+            ids: Vec::new(),
+        }];
+        assert_eq!(
+            super::event_desc_name_for_attr(0, None, &entries),
+            Some("task-clock:ppp".to_string())
+        );
+    }
 
     #[derive(Default)]
     struct FakeUserStackUnwinder {

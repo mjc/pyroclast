@@ -336,9 +336,12 @@ fn bench_command_exports_perf_script_and_compares_without_perf_runner() {
 
     let output = run_bench_command(&args, &runner).expect("bench command");
 
+    // builtin-script.c prints the event name with `"%*s: "` (trailing space)
+    // then `fputc(cursor ? '\n' : ' ')`; a resolved callchain yields the newline
+    // so the header line ends "P: \n".
     assert_eq!(
         std::fs::read_to_string(&exported_perf_script).expect("exported perf script"),
-        ":2       2          1 cpu/cycles/P:\n\t            2000 [unknown] ([unknown])\n\n"
+        ":2       2          1 cpu/cycles/P: \n\t            2000 [unknown] ([unknown])\n\n"
     );
     assert!(output.contains("inferno_compare.matches=true"));
     assert!(output.contains("pyroclast_fold.input="));
@@ -617,7 +620,7 @@ impl CommandRunner for BenchCommandRunner {
         self.commands.lock().unwrap().push(command.clone());
         let stdout = match command.program.as_str() {
             "perf" => {
-                b":2       2          1 cpu/cycles/P:\n\t            2000 [unknown] ([unknown])\n\n"
+                b":2       2          1 cpu/cycles/P: \n\t            2000 [unknown] ([unknown])\n\n"
                     .to_vec()
             }
             "inferno-collapse-perf" => b":2;[unknown] 1\n".to_vec(),
