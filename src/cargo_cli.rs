@@ -622,9 +622,20 @@ fn find_unique_target(
         .exec()?
         .packages
         .into_iter()
-        .filter(|package_metadata| match package {
-            Some(package) => package == package_metadata.name.as_str(),
-            None => package_metadata.manifest_path.starts_with(&crate_root),
+        .filter(|package_metadata| {
+            if let Some(package) = package {
+                package == package_metadata.name.as_str()
+            } else {
+                // cargo metadata reports manifest paths as given, which can
+                // disagree with the canonicalized crate root through symlinks
+                // (macOS /var -> /private/var).
+                let manifest_path = package_metadata.manifest_path.as_std_path();
+                manifest_path
+                    .canonicalize()
+                    .as_deref()
+                    .unwrap_or(manifest_path)
+                    .starts_with(&crate_root)
+            }
         })
         .peekable();
 
@@ -822,6 +833,40 @@ mod tests {
             ]
         );
         assert!(runner.commands()[0].inherit_stderr);
+    }
+
+    #[test]
+    fn resolves_manifest_path_through_symlinked_crate_root() {
+        let root = tempdir().expect("tempdir");
+        let real_root = root.path().join("real");
+        write_basic_package(&real_root, "demo");
+        let linked_root = root.path().join("linked");
+        std::os::unix::fs::symlink(&real_root, &linked_root).expect("symlink crate root");
+        let manifest_path = linked_root.join("Cargo.toml");
+        let executable = real_root.join("target/release/demo");
+        let runner = CargoBuildRunner::successful(cargo_artifact_messages(
+            &manifest_path,
+            "demo",
+            "bin",
+            &executable,
+            2,
+        ));
+
+        let cli = CargoCli::parse_from(normalize_cargo_args([
+            "cargo-pyroclast",
+            "pyroclast",
+            "cpu",
+            "--manifest-path",
+            manifest_path.to_str().expect("utf8 path"),
+        ]));
+
+        let invocation = cli
+            .command
+            .pyroclast_command()
+            .into_profile_invocation(&runner)
+            .expect("profile invocation");
+
+        assert_eq!(invocation.command, vec![executable.display().to_string()]);
     }
 
     #[test]
