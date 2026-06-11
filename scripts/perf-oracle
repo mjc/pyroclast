@@ -1,0 +1,17 @@
+#!/usr/bin/env sh
+# Builds the Linux oracle container and produces perf.data / perf script /
+# folded oracle artifacts under target/oracle, then runs the pyroclast
+# comparison inside the container. Requires Docker.
+set -eu
+
+repo="$(git rev-parse --show-toplevel)"
+out="$repo/target/oracle"
+mkdir -p "$out"
+
+docker build -t pyroclast-oracle -f "$repo/scripts/oracle/Dockerfile" "$repo/scripts/oracle"
+
+exec docker run --rm --privileged \
+    -v "$repo:/work" \
+    -v "$out:/oracle-out" \
+    -v pyroclast-oracle-cargo-registry:/usr/local/cargo/registry \
+    pyroclast-oracle bash /work/scripts/oracle/run-in-container.sh

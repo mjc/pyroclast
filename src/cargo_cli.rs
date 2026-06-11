@@ -624,7 +624,17 @@ fn find_unique_target(
         .into_iter()
         .filter(|package_metadata| match package {
             Some(package) => package == package_metadata.name.as_str(),
-            None => package_metadata.manifest_path.starts_with(&crate_root),
+            None => {
+                // cargo metadata reports manifest paths as given, which can
+                // disagree with the canonicalized crate root through symlinks
+                // (macOS /var -> /private/var).
+                let manifest_path = package_metadata.manifest_path.as_std_path();
+                manifest_path
+                    .canonicalize()
+                    .as_deref()
+                    .unwrap_or(manifest_path)
+                    .starts_with(&crate_root)
+            }
         })
         .peekable();
 
