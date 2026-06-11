@@ -9,6 +9,13 @@ REPO="${REPO:-/work}"
 export CARGO_TARGET_DIR="$ORACLE_OUT/target"
 
 mkdir -p "$ORACLE_OUT"
+# Ubuntu's /usr/bin/perf wrapper insists on a kernel-matched build; call the
+# packaged binary directly since any modern perf works for the oracle.
+if ! perf version >/dev/null 2>&1; then
+    PERF_BIN="$(find /usr/lib/linux-tools* -name perf -type f 2>/dev/null | head -n 1)"
+    [ -n "$PERF_BIN" ] || { echo "no perf binary found" >&2; exit 1; }
+    perf() { "$PERF_BIN" "$@"; }
+fi
 perf version | tee "$ORACLE_OUT/perf.version"
 
 rustc -O -Cdebuginfo=2 -o /tmp/oracle-workload "$REPO/scripts/oracle/workload.rs"
