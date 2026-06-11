@@ -271,6 +271,10 @@ struct SampleEventLayout {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FoldOptions {
     pub count_periods: bool,
+    /// When set, expand each callchain entry into its DWARF inline frames,
+    /// mirroring `perf script --inline`. Off by default: plain `perf script`
+    /// prints exactly one line per callchain entry, named from the ELF symtab.
+    pub inline: bool,
 }
 
 impl PerfSummary {
@@ -496,7 +500,7 @@ pub fn fold_perfdata_callchains_with_options(
     options: FoldOptions,
 ) -> Result<String, String> {
     let fold_data = collect_fold_data(bytes, options)?;
-    render_fold_data::<NoopSymbolResolver>(fold_data, None)
+    render_fold_data::<NoopSymbolResolver>(fold_data, None, options.inline)
 }
 
 /// Collapses perf sample callchains from a `perf.data` file path.
@@ -539,7 +543,7 @@ where
 {
     let fold_data = collect_fold_data(bytes, options)?;
     let mut symbol_cache = SymbolFrameCache::new(symbol_resolver);
-    render_fold_data(fold_data, Some(&mut symbol_cache))
+    render_fold_data(fold_data, Some(&mut symbol_cache), options.inline)
 }
 
 /// Collapses symbolized perf sample callchains from a `perf.data` file path.
@@ -680,7 +684,7 @@ where
     W: IoWrite + ?Sized,
 {
     let (header, header_bytes) = perfdata_header_from_file(file)?;
-    let sample_layouts = sample_layouts_from_file(file, header)?;
+    let sample_layouts = sample_layouts_from_file(file, header, &header_bytes)?;
     let header_build_ids = header_build_ids_by_filename_from_file(file, header, &header_bytes)?;
     let mut accumulator = FoldAccumulator::new(header_build_ids);
     let data_end = header
@@ -742,7 +746,11 @@ where
 
         if record_header.record_type == PERF_RECORD_FINISHED_ROUND {
             ordered_records.flush_round(&mut accumulator, &sample_layouts, options)?;
-            accumulator.drain_fold_counts(&mut counts, symbol_cache.as_deref_mut())?;
+            accumulator.drain_fold_counts(
+                &mut counts,
+                symbol_cache.as_deref_mut(),
+                options.inline,
+            )?;
             offset = next;
             continue;
         }
@@ -769,7 +777,7 @@ where
 
     ordered_records.flush_final(&mut accumulator, &sample_layouts, options)?;
     accumulator.flush_deferred_samples();
-    accumulator.drain_fold_counts(&mut counts, symbol_cache)?;
+    accumulator.drain_fold_counts(&mut counts, symbol_cache, options.inline)?;
     write_fold_counts(counts, writer)
 }
 
@@ -784,7 +792,7 @@ where
     W: IoWrite + ?Sized,
 {
     let (header, header_bytes) = perfdata_header_from_file(file)?;
-    let sample_layouts = sample_layouts_from_file(file, header)?;
+    let sample_layouts = sample_layouts_from_file(file, header, &header_bytes)?;
     let header_build_ids = header_build_ids_by_filename_from_file(file, header, &header_bytes)?;
     let data_end = header
         .data_offset
@@ -813,6 +821,7 @@ where
         symbol_cache,
         writer,
         sample_layouts.event_name_width,
+        options.inline,
     );
     let mut ordered_records = OrderedRecordQueue::default();
     let mut header_bytes = [0_u8; 8];
@@ -879,6 +888,7 @@ struct PerfScriptSink<'io, 'cache, R, W: ?Sized> {
     symbol_cache: Option<&'io mut SymbolFrameCache<'cache, R>>,
     writer: &'io mut W,
     event_name_width: usize,
+    inline: bool,
 }
 
 impl<'io, 'cache, R, W> PerfScriptSink<'io, 'cache, R, W>
@@ -891,12 +901,14 @@ where
         symbol_cache: Option<&'io mut SymbolFrameCache<'cache, R>>,
         writer: &'io mut W,
         event_name_width: usize,
+        inline: bool,
     ) -> Self {
         Self {
             accumulator: FoldAccumulator::new(header_build_ids),
             symbol_cache,
             writer,
             event_name_width,
+            inline,
         }
     }
 
@@ -1017,7 +1029,7 @@ where
     fn write_sample_event(&mut self, sample: &PreparedFoldSample) -> Result<(), String> {
         if sample.has_callchain {
             self.write_sample_header(sample)?;
-            let frame_resolver = FoldFrameResolver::new(&self.accumulator.mmap_table);
+            let frame_resolver = FoldFrameResolver::new(&self.accumulator.mmap_table, self.inline);
             frame_resolver.write_script_frames_for_stack(
                 sample.pid,
                 &sample.frames,
@@ -1026,7 +1038,7 @@ where
             )?;
         } else {
             self.write_sample_inline_header(sample)?;
-            let frame_resolver = FoldFrameResolver::new(&self.accumulator.mmap_table);
+            let frame_resolver = FoldFrameResolver::new(&self.accumulator.mmap_table, self.inline);
             frame_resolver.write_inline_sample_frame_for_stack(
                 sample.pid,
                 &sample.frames,
@@ -1057,9 +1069,13 @@ where
             write!(self.writer, "{secs:>5}.{usecs:06}: ")
                 .map_err(|error| format!("failed to write perf script output: {error}"))?;
         }
+        // builtin-script.c prints `fprintf(fp, "%*s: ", name_width, evname)`
+        // (note the trailing space) and then `fputc(cursor ? '\n' : ' ', fp)`.
+        // For a resolved callchain (the multi-frame path) cursor is set, so the
+        // header line ends with the event-name colon, a space, then a newline.
         writeln!(
             self.writer,
-            "{:>10} {:>width$}:",
+            "{:>10} {:>width$}: ",
             sample.count,
             sample.event_name,
             width = self.event_name_width,
@@ -1216,7 +1232,11 @@ fn perfdata_header_from_file(file: &File) -> Result<(PerfHeader, [u8; 104]), Str
     Ok((header, bytes))
 }
 
-fn sample_layouts_from_file(file: &File, header: PerfHeader) -> Result<SampleLayouts, String> {
+fn sample_layouts_from_file(
+    file: &File,
+    header: PerfHeader,
+    header_bytes: &[u8; 104],
+) -> Result<SampleLayouts, String> {
     let attr_size = usize::try_from(header.attr_size)
         .map_err(|_| "perf attr section size exceeds usize".to_string())?;
     let attr_bytes = read_file_range(file, header.attr_offset, attr_size, "perf attr section")?;
@@ -1231,7 +1251,12 @@ fn sample_layouts_from_file(file: &File, header: PerfHeader) -> Result<SampleLay
         },
     )?;
 
-    let event_names = attrs.iter().map(perf_event_name).collect::<Vec<_>>();
+    let attr_ids = attrs
+        .iter()
+        .map(|attr| file_attr_ids_from_file(file, attr))
+        .collect::<Result<Vec<_>, _>>()?;
+    let event_desc = event_desc_entries_from_file(file, header, header_bytes)?;
+    let event_names = build_event_names(&attrs, &attr_ids, &event_desc);
     let event_name_width = event_names
         .iter()
         .map(String::len)
@@ -1245,12 +1270,12 @@ fn sample_layouts_from_file(file: &File, header: PerfHeader) -> Result<SampleLay
         by_identifier: BTreeMap::new(),
         event_name_width,
     };
-    for (attr, event_name) in attrs.iter().zip(event_names) {
+    for ((attr, event_name), ids) in attrs.iter().zip(event_names).zip(attr_ids) {
         let event = SampleEventLayout {
             layout: layout_from_attr(attr),
             event_name,
         };
-        for id in file_attr_ids_from_file(file, attr)? {
+        for id in ids {
             layouts.by_identifier.insert(id, event.clone());
         }
     }
@@ -1298,6 +1323,51 @@ fn build_id_events_from_file(
     parse_build_id_events(&payload)
 }
 
+// HEADER_EVENT_DESC feature bit (tools/perf/util/header.h enum HEADER_*).
+const HEADER_EVENT_DESC_FEATURE: u16 = 12;
+
+fn event_desc_entries_from_file(
+    file: &File,
+    header: PerfHeader,
+    header_bytes: &[u8; 104],
+) -> Result<Vec<EventDescEntry>, String> {
+    let Some(section) = feature_sections_from_file(file, header, header_bytes)?
+        .into_iter()
+        .find(|section| section.feature == HEADER_EVENT_DESC_FEATURE)
+    else {
+        return Ok(Vec::new());
+    };
+    let size = usize::try_from(section.size)
+        .map_err(|_| "event desc feature size exceeds usize".to_string())?;
+    let payload = read_file_range(file, section.offset, size, "event desc feature payload")?;
+    Ok(parse_event_desc_entries(&payload))
+}
+
+fn event_desc_entries_from_bytes(
+    bytes: &[u8],
+    header: crate::perfdata::header::PerfHeader,
+) -> Vec<EventDescEntry> {
+    let Ok(sections) = crate::perfdata::header::parse_feature_sections(bytes, &header) else {
+        return Vec::new();
+    };
+    let Some(section) = sections
+        .into_iter()
+        .find(|section| section.feature == HEADER_EVENT_DESC_FEATURE)
+    else {
+        return Vec::new();
+    };
+    let (Ok(offset), Ok(size)) = (
+        usize::try_from(section.offset),
+        usize::try_from(section.size),
+    ) else {
+        return Vec::new();
+    };
+    bytes
+        .get(offset..offset + size)
+        .map(parse_event_desc_entries)
+        .unwrap_or_default()
+}
+
 fn feature_sections_from_file(
     file: &File,
     header: PerfHeader,
@@ -1330,9 +1400,11 @@ fn feature_sections_from_file(
 }
 
 fn perf_feature_bits(header_bytes: &[u8; 104]) -> Result<Vec<u16>, String> {
+    // adds_features bitmap begins at byte offset 72 in struct perf_file_header
+    // (tools/perf/util/header.h); see set_feature_bits in header.rs.
     let mut features = Vec::new();
     for word_index in 0..4 {
-        let word = read_u64(header_bytes, 56 + word_index * 8)?;
+        let word = read_u64(header_bytes, 72 + word_index * 8)?;
         for bit_index in 0..64 {
             if word & (1_u64 << bit_index) != 0 {
                 let feature = u16::try_from(word_index * 64 + bit_index)
@@ -1820,12 +1892,13 @@ impl FoldAccumulator {
         &mut self,
         counts: &mut FoldCounts,
         symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+        inline: bool,
     ) -> Result<(), String>
     where
         R: SymbolResolver,
     {
         let raw_stacks = std::mem::take(&mut self.raw_stacks);
-        accumulate_fold_counts(&raw_stacks, &self.mmap_table, counts, symbol_cache)
+        accumulate_fold_counts(&raw_stacks, &self.mmap_table, counts, symbol_cache, inline)
     }
 }
 
@@ -1852,18 +1925,20 @@ fn comm_for_ids(thread_comms: &BTreeMap<u32, String>, tid: Option<u32>) -> Optio
 fn render_fold_data<R>(
     fold_data: PerfFoldData,
     symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+    inline: bool,
 ) -> Result<String, String>
 where
     R: SymbolResolver,
 {
     let mut folded = Vec::new();
-    write_fold_data(fold_data, symbol_cache, &mut folded)?;
+    write_fold_data(fold_data, symbol_cache, inline, &mut folded)?;
     String::from_utf8(folded).map_err(|error| format!("folded output is not utf-8: {error}"))
 }
 
 fn write_fold_data<R, W>(
     fold_data: PerfFoldData,
     symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+    inline: bool,
     writer: &mut W,
 ) -> Result<(), String>
 where
@@ -1875,7 +1950,7 @@ where
         raw_stacks,
     } = fold_data;
     let mut counts = FoldCounts::default();
-    accumulate_fold_counts(&raw_stacks, &mmap_table, &mut counts, symbol_cache)?;
+    accumulate_fold_counts(&raw_stacks, &mmap_table, &mut counts, symbol_cache, inline)?;
     write_fold_counts(counts, writer)
 }
 
@@ -1883,6 +1958,7 @@ fn prefetch_symbols<R>(
     raw_stacks: &[RawStackEntryRef<'_, FoldFrame>],
     mmap_table: &MmapTable,
     symbol_cache: &mut SymbolFrameCache<'_, R>,
+    inline: bool,
 ) -> Result<(), String>
 where
     R: SymbolResolver,
@@ -1897,6 +1973,7 @@ where
             mmap_table,
             &mut mapping_cache,
             &mut batches,
+            inline,
         );
         if batches.full_mappings.len() >= PREFETCH_SYMBOL_REQUEST_BATCH_SIZE {
             symbol_cache.prefetch_mapping_refs(&batches.full_mappings)?;
@@ -1923,6 +2000,7 @@ fn accumulate_fold_counts<R>(
     mmap_table: &MmapTable,
     counts: &mut FoldCounts,
     mut symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+    inline: bool,
 ) -> Result<(), String>
 where
     R: SymbolResolver,
@@ -1930,9 +2008,9 @@ where
     let raw_stacks = raw_stacks.sorted_entries();
     counts.reserve_first_drain(raw_stacks.len());
     if let Some(cache) = symbol_cache.as_deref_mut() {
-        prefetch_symbols(&raw_stacks, mmap_table, cache)?;
+        prefetch_symbols(&raw_stacks, mmap_table, cache, inline)?;
     }
-    let frame_resolver = FoldFrameResolver::new(mmap_table);
+    let frame_resolver = FoldFrameResolver::new(mmap_table, inline);
     let mut callchain = Vec::new();
     let mut buffers = FoldedRenderBuffers::default();
     for stack in raw_stacks {
@@ -2013,6 +2091,7 @@ fn extend_symbol_mappings_for_stack<'a>(
     mmap_table: &'a MmapTable,
     mapping_cache: &mut MappingResolveCache,
     batches: &mut SymbolPrefetchBatches<'a>,
+    inline: bool,
 ) {
     for frame in callchain {
         let address = frame.address();
@@ -2024,7 +2103,10 @@ fn extend_symbol_mappings_for_stack<'a>(
                 symbol_source_id: mapping.symbol_source_id,
                 relative_address: mapping.relative_address,
             };
-            if matches!(frame, FoldFrame::InlineCurrentIp(_)) {
+            // Without --inline (the default), every frame is rendered from its
+            // single base ELF symtab symbol, so prefetch only the base symbol.
+            // InlineCurrentIp object-unwind leaves always use base resolution.
+            if !inline || matches!(frame, FoldFrame::InlineCurrentIp(_)) {
                 if batches.seen_base.insert(key) {
                     batches.base_mappings.push(mapping);
                 }
@@ -2037,6 +2119,7 @@ fn extend_symbol_mappings_for_stack<'a>(
 
 struct FoldFrameResolver<'a> {
     mmap_table: &'a MmapTable,
+    inline: bool,
 }
 
 enum FrameMappingDecision<'a> {
@@ -2066,8 +2149,8 @@ impl SymbolResolver for NoopSymbolResolver {
 }
 
 impl<'a> FoldFrameResolver<'a> {
-    fn new(mmap_table: &'a MmapTable) -> Self {
-        Self { mmap_table }
+    fn new(mmap_table: &'a MmapTable, inline: bool) -> Self {
+        Self { mmap_table, inline }
     }
 
     fn mapping_decision(
@@ -2267,6 +2350,7 @@ impl<'a> FoldFrameResolver<'a> {
                     frame,
                     &mapping,
                     symbol_cache,
+                    self.inline,
                 )?;
             }
             FrameMappingDecision::KernelAddress | FrameMappingDecision::Address => {
@@ -2304,11 +2388,25 @@ impl<'a> FoldFrameResolver<'a> {
         let Some(cache) = symbol_cache else {
             return Ok(());
         };
+        // Resolve the mapping path first so the inline chain can carry the
+        // mapped DSO name like every other script frame (map__fprintf_dsoname),
+        // rather than the hardcoded "([unknown])".
+        let dso_path = pid
+            .and_then(|pid| {
+                self.mmap_table
+                    .resolve_ref_cached(pid, address, mapping_cache)
+            })
+            .map(|mapping| mapping.path.to_string());
         if let Some(frames) =
             self.resolve_inline_current_ip_frames(pid, address, cache, mapping_cache)?
         {
             for label in frames.iter().rev() {
-                write_perf_script_frame_for_label(writer, address, label)?;
+                match dso_path.as_deref() {
+                    Some(path) => {
+                        write_perf_script_mapped_symbol_frame(writer, address, label, path)?;
+                    }
+                    None => write_perf_script_frame_for_label(writer, address, label)?,
+                }
             }
         } else {
             self.write_regular_script_frame(
@@ -2414,7 +2512,12 @@ impl<'a> FoldFrameResolver<'a> {
         ) {
             FrameMappingDecision::Mapped(mapping) => {
                 if let Some(cache) = symbol_cache {
-                    if let Some(rendered) = cache.resolve_folded_mapping_ref(&mapping)? {
+                    let rendered = if self.inline {
+                        cache.resolve_folded_mapping_ref(&mapping)?
+                    } else {
+                        cache.resolve_base_folded_mapping_ref(&mapping)?
+                    };
+                    if let Some(rendered) = rendered {
                         append_cached_rendered_frame(&mut buffers.rendered, rendered);
                     } else {
                         let fallback = symbol_fallback_frame_ref(&mapping);
@@ -2582,32 +2685,41 @@ fn write_perf_script_mapped_decision_frame<R, W>(
     frame: FoldFrame,
     mapping: &ResolvedMappingRef<'_>,
     symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+    inline: bool,
 ) -> Result<(), String>
 where
     R: SymbolResolver,
     W: IoWrite + ?Sized,
 {
-    if let Some(cache) = symbol_cache {
-        let frames = cache.resolve_mapping_ref(mapping)?;
-        if frames.is_empty() {
-            write_perf_script_frame_for_label(
-                writer,
-                address,
-                &symbol_fallback_frame_ref(mapping),
-            )?;
-        } else if matches!(frame, FoldFrame::UserUnwind(_))
-            && frames.len() == 1
-            && !is_kernel_space_frame(address)
-        {
-            write_perf_script_mapped_symbol_frame(writer, address, &frames[0], mapping.path)?;
-        } else {
-            for label in frames.iter().rev() {
-                write_perf_script_frame_for_label(writer, address, label)?;
-            }
-        }
+    let Some(cache) = symbol_cache else {
+        write_perf_script_mapped_unknown_symbol_frame(writer, address, mapping.path)?;
         return Ok(());
+    };
+    // Default `perf script` prints exactly one line per callchain entry, named
+    // from the ELF symtab (builtin-script.c sample__fprintf_sym without
+    // --inline). Resolve only the base object symbol and print it with the
+    // mapping's full DSO name (map__fprintf_dsoname).
+    if !inline {
+        return match cache.resolve_mapping_ref_with_base_symbol(mapping)? {
+            Some([label, ..]) => {
+                write_perf_script_mapped_symbol_frame(writer, address, label, mapping.path)
+            }
+            _ => write_perf_script_mapped_unknown_symbol_frame(writer, address, mapping.path),
+        };
     }
-    write_perf_script_mapped_unknown_symbol_frame(writer, address, mapping.path)?;
+    let frames = cache.resolve_mapping_ref(mapping)?;
+    if frames.is_empty() {
+        write_perf_script_mapped_unknown_symbol_frame(writer, address, mapping.path)?;
+    } else if matches!(frame, FoldFrame::UserUnwind(_))
+        && frames.len() == 1
+        && !is_kernel_space_frame(address)
+    {
+        write_perf_script_mapped_symbol_frame(writer, address, &frames[0], mapping.path)?;
+    } else {
+        for label in frames.iter().rev() {
+            write_perf_script_mapped_symbol_frame(writer, address, label, mapping.path)?;
+        }
+    }
     Ok(())
 }
 
@@ -3547,7 +3659,12 @@ fn sample_layouts(
     header: crate::perfdata::header::PerfHeader,
 ) -> Result<SampleLayouts, String> {
     let attrs = parse_file_attrs(bytes, header)?;
-    let event_names = attrs.iter().map(perf_event_name).collect::<Vec<_>>();
+    let attr_ids = attrs
+        .iter()
+        .map(|attr| parse_file_attr_ids(bytes, attr))
+        .collect::<Result<Vec<_>, _>>()?;
+    let event_desc = event_desc_entries_from_bytes(bytes, header);
+    let event_names = build_event_names(&attrs, &attr_ids, &event_desc);
     let event_name_width = event_names
         .iter()
         .map(String::len)
@@ -3561,12 +3678,12 @@ fn sample_layouts(
         by_identifier: BTreeMap::new(),
         event_name_width,
     };
-    for (attr, event_name) in attrs.iter().zip(event_names) {
+    for ((attr, event_name), ids) in attrs.iter().zip(event_names).zip(attr_ids) {
         let event = SampleEventLayout {
             layout: layout_from_attr(attr),
             event_name,
         };
-        for id in parse_file_attr_ids(bytes, attr)? {
+        for id in ids {
             layouts.by_identifier.insert(id, event.clone());
         }
     }
@@ -3601,6 +3718,109 @@ fn perf_event_name(attr: &PerfFileAttr) -> String {
         PERF_TYPE_BREAKPOINT => "breakpoint".to_string(),
         _ => format!("unknown attr type: {}", attr.event_type),
     }
+}
+
+/// A single event description parsed from the `HEADER_EVENT_DESC` feature.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EventDescEntry {
+    name: String,
+    ids: Vec<u64>,
+}
+
+/// Parses the `HEADER_EVENT_DESC` feature payload.
+///
+/// `perf record` writes evsel names verbatim into this feature (see
+/// `write_event_desc`/`read_event_desc` in `tools/perf/util/header.c`), and
+/// `perf script` prints those names instead of reconstructing them from the
+/// attr type/config. The layout is: `nre` (u32, number of events), `attr_sz`
+/// (u32, sizeof perf_event_attr), then for each event: `attr_sz` attr bytes, a
+/// `nr` (u32) id count, a length-prefixed name string, and `nr` u64 ids.
+///
+/// The name string is written by `do_write_string`: a u32 length
+/// (`PERF_ALIGN(strlen + 1, NAME_ALIGN)`) followed by that many bytes holding
+/// the NUL-terminated name plus zero padding. We read the declared number of
+/// bytes and take the text up to the first NUL.
+fn parse_event_desc_entries(payload: &[u8]) -> Vec<EventDescEntry> {
+    parse_event_desc_entries_checked(payload).unwrap_or_default()
+}
+
+fn parse_event_desc_entries_checked(payload: &[u8]) -> Result<Vec<EventDescEntry>, String> {
+    let event_count = read_u32(payload, 0)?;
+    let attr_size = usize::try_from(read_u32(payload, 4)?)
+        .map_err(|_| "event desc attr size exceeds usize".to_string())?;
+    let mut offset = 8usize;
+    let mut entries = Vec::with_capacity(event_count as usize);
+    for _ in 0..event_count {
+        offset = offset
+            .checked_add(attr_size)
+            .ok_or_else(|| "event desc attr offset overflow".to_string())?;
+        let id_count = usize::try_from(read_u32(payload, offset)?)
+            .map_err(|_| "event desc id count exceeds usize".to_string())?;
+        offset += 4;
+        let name_len = usize::try_from(read_u32(payload, offset)?)
+            .map_err(|_| "event desc name length exceeds usize".to_string())?;
+        offset += 4;
+        let name_bytes = payload
+            .get(offset..offset + name_len)
+            .ok_or_else(|| "event desc name truncated".to_string())?;
+        let name = event_desc_name_from_bytes(name_bytes);
+        offset += name_len;
+        let mut ids = Vec::with_capacity(id_count);
+        for _ in 0..id_count {
+            ids.push(read_u64(payload, offset)?);
+            offset += 8;
+        }
+        entries.push(EventDescEntry { name, ids });
+    }
+    Ok(entries)
+}
+
+fn event_desc_name_from_bytes(bytes: &[u8]) -> String {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+/// Builds the per-attr event names `perf script` would print.
+///
+/// Prefers the verbatim evsel names from `HEADER_EVENT_DESC`, matched to each
+/// attr by shared sample id (and by event index as a fallback, which is how
+/// `process_event_desc` in `tools/perf/util/header.c` pairs descriptions with
+/// evsels). Falls back to reconstructing the name from the attr type/config
+/// when no description matches.
+fn build_event_names(
+    attrs: &[PerfFileAttr],
+    attr_ids: &[Vec<u64>],
+    event_desc: &[EventDescEntry],
+) -> Vec<String> {
+    attrs
+        .iter()
+        .enumerate()
+        .map(|(index, attr)| {
+            event_desc_name_for_attr(index, attr_ids.get(index), event_desc)
+                .unwrap_or_else(|| perf_event_name(attr))
+        })
+        .collect()
+}
+
+fn event_desc_name_for_attr(
+    index: usize,
+    attr_ids: Option<&Vec<u64>>,
+    event_desc: &[EventDescEntry],
+) -> Option<String> {
+    if event_desc.is_empty() {
+        return None;
+    }
+    if let Some(ids) = attr_ids.filter(|ids| !ids.is_empty())
+        && let Some(entry) = event_desc
+            .iter()
+            .find(|entry| entry.ids.iter().any(|id| ids.contains(id)))
+    {
+        return Some(entry.name.clone());
+    }
+    event_desc.get(index).map(|entry| entry.name.clone())
 }
 
 fn hardware_event_name(config: u64) -> &'static str {
@@ -3698,6 +3918,75 @@ mod tests {
     use crate::perfdata::mappings::FileIdentity;
     use crate::perfdata::unwind::{UserStackUnwindResult, UserStackUnwinder};
     use crate::symbols::{ResolvedSymbolFrames, SymbolFrameCache, SymbolRequest, SymbolResolver};
+
+    // tools/perf/util/header.c write_event_desc: nre(u32), attr_sz(u32), then
+    // per event attr_sz attr bytes, nr(u32), do_write_string(name), nr u64 ids.
+    fn event_desc_payload(events: &[(&str, &[u64])], attr_sz: usize) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend((events.len() as u32).to_le_bytes());
+        payload.extend((attr_sz as u32).to_le_bytes());
+        for (name, ids) in events {
+            payload.extend(std::iter::repeat_n(0_u8, attr_sz));
+            payload.extend((ids.len() as u32).to_le_bytes());
+            // do_write_string: u32 len = PERF_ALIGN(strlen+1, NAME_ALIGN=64),
+            // then len bytes of NUL-terminated name plus zero padding.
+            let aligned = (name.len() + 1).div_ceil(64) * 64;
+            payload.extend((aligned as u32).to_le_bytes());
+            let mut name_bytes = name.as_bytes().to_vec();
+            name_bytes.resize(aligned, 0);
+            payload.extend(name_bytes);
+            for id in *ids {
+                payload.extend(id.to_le_bytes());
+            }
+        }
+        payload
+    }
+
+    #[test]
+    fn parses_event_desc_names_verbatim_like_perf_read_event_desc() {
+        // perf script prints the evsel names recorded in HEADER_EVENT_DESC
+        // (e.g. "task-clock:ppp") rather than reconstructing them; the trailing
+        // colon perf script appends is a separator, not part of the name.
+        let payload = event_desc_payload(&[("task-clock:ppp", &[230, 231, 242])], 136);
+        let entries = super::parse_event_desc_entries(&payload);
+        assert_eq!(
+            entries,
+            vec![super::EventDescEntry {
+                name: "task-clock:ppp".to_string(),
+                ids: vec![230, 231, 242],
+            }]
+        );
+    }
+
+    #[test]
+    fn event_desc_name_matches_attr_by_shared_id() {
+        let entries = vec![
+            super::EventDescEntry {
+                name: "cycles:ppp".to_string(),
+                ids: vec![10, 11],
+            },
+            super::EventDescEntry {
+                name: "task-clock:ppp".to_string(),
+                ids: vec![20, 21],
+            },
+        ];
+        assert_eq!(
+            super::event_desc_name_for_attr(0, Some(&vec![21]), &entries),
+            Some("task-clock:ppp".to_string())
+        );
+    }
+
+    #[test]
+    fn event_desc_name_falls_back_to_event_index_without_ids() {
+        let entries = vec![super::EventDescEntry {
+            name: "task-clock:ppp".to_string(),
+            ids: Vec::new(),
+        }];
+        assert_eq!(
+            super::event_desc_name_for_attr(0, None, &entries),
+            Some("task-clock:ppp".to_string())
+        );
+    }
 
     #[derive(Default)]
     struct FakeUserStackUnwinder {
@@ -4063,7 +4352,7 @@ mod tests {
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut buffers = super::FoldedRenderBuffers::default();
 
-        super::FoldFrameResolver::new(&mmap_table)
+        super::FoldFrameResolver::new(&mmap_table, false)
             .render_folded_stack_for_stack(
                 Some(11),
                 Some("pyroclast"),
@@ -4096,7 +4385,7 @@ mod tests {
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut buffers = super::FoldedRenderBuffers::default();
 
-        super::FoldFrameResolver::new(&mmap_table)
+        super::FoldFrameResolver::new(&mmap_table, false)
             .render_folded_stack_for_stack(
                 Some(11),
                 Some("pyroclast"),
@@ -4138,7 +4427,7 @@ mod tests {
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut buffers = super::FoldedRenderBuffers::default();
 
-        super::FoldFrameResolver::new(&mmap_table)
+        super::FoldFrameResolver::new(&mmap_table, false)
             .render_folded_stack_for_stack(
                 Some(11),
                 Some("pyroclast"),
@@ -4176,7 +4465,7 @@ mod tests {
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut buffers = super::FoldedRenderBuffers::default();
 
-        super::FoldFrameResolver::new(&mmap_table)
+        super::FoldFrameResolver::new(&mmap_table, false)
             .render_folded_stack_for_stack(
                 Some(11),
                 Some("pyroclast"),
@@ -4213,7 +4502,7 @@ mod tests {
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut written = Vec::new();
 
-        super::FoldFrameResolver::new(&mmap_table)
+        super::FoldFrameResolver::new(&mmap_table, false)
             .write_script_frames_for_stack(
                 Some(11),
                 &[super::FoldFrame::UserUnwind(0x1048)],
@@ -4308,12 +4597,15 @@ mod tests {
             super::FoldFrame::Callchain(0x1020),
         ];
 
+        // Inline mode routes regular Callchain frames into the full-mapping
+        // batch; this test exercises the cross-stack dedup of those keys.
         super::extend_symbol_mappings_for_stack(
             Some(11),
             &callchain,
             &mmap_table,
             &mut mapping_cache,
             &mut batches,
+            true,
         );
         super::extend_symbol_mappings_for_stack(
             Some(11),
@@ -4321,6 +4613,7 @@ mod tests {
             &mmap_table,
             &mut mapping_cache,
             &mut batches,
+            true,
         );
 
         assert_eq!(batches.full_mappings.len(), 2);
@@ -4357,7 +4650,9 @@ mod tests {
         let resolver = RecordingFrameResolver::default();
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
 
-        super::prefetch_symbols(&entries, &mmap_table, &mut symbol_cache)
+        // With --inline, regular frames prefetch the full DWARF inline chain
+        // while InlineCurrentIp object-unwind leaves only need the base symbol.
+        super::prefetch_symbols(&entries, &mmap_table, &mut symbol_cache, true)
             .expect("prefetch folded stack symbols");
 
         assert_eq!(*resolver.full_requests.borrow(), vec![0x10]);
@@ -5397,7 +5692,8 @@ mod tests {
             super::sample_fold_count(
                 Some(37),
                 super::FoldOptions {
-                    count_periods: true
+                    count_periods: true,
+                    ..super::FoldOptions::default()
                 }
             ),
             37
@@ -5406,7 +5702,8 @@ mod tests {
             super::sample_fold_count(
                 Some(37),
                 super::FoldOptions {
-                    count_periods: false
+                    count_periods: false,
+                    ..super::FoldOptions::default()
                 }
             ),
             1
@@ -5419,7 +5716,8 @@ mod tests {
             super::sample_fold_count(
                 None,
                 super::FoldOptions {
-                    count_periods: true
+                    count_periods: true,
+                    ..super::FoldOptions::default()
                 }
             ),
             1

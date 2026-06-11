@@ -1049,6 +1049,31 @@ where
             .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())
     }
 
+    /// Resolves one borrowed perfdata mapping to the pre-rendered folded
+    /// fragment for its single base object symbol (no DWARF inline expansion).
+    ///
+    /// This is the default `perf script`/folded path: plain `perf` prints one
+    /// frame per callchain entry named from the ELF symtab.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backing resolver fails.
+    pub fn resolve_base_folded_mapping_ref(
+        &mut self,
+        mapping: &ResolvedMappingRef<'_>,
+    ) -> Result<Option<&str>, String> {
+        let key = mapping_frame_key(mapping);
+        if !self.resolved_base_by_mapping.contains_key(&key) {
+            self.prefetch_base_mapping_refs(std::slice::from_ref(mapping))?;
+        }
+        self.resolved_base_by_mapping
+            .get(&key)
+            .map(|cached| {
+                (!cached.folded_rendered.is_empty()).then_some(cached.folded_rendered.as_str())
+            })
+            .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())
+    }
+
     /// Resolves many borrowed perfdata mappings to base symbols only.
     ///
     /// # Errors
