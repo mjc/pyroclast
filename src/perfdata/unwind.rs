@@ -755,10 +755,14 @@ impl PerfAarch64Regs {
         };
 
         Ok(Self {
-            pc: masked(PC).ok_or_else(|| "perf sample is missing aarch64 PC register".to_string())?,
-            sp: masked(SP).ok_or_else(|| "perf sample is missing aarch64 SP register".to_string())?,
-            fp: masked(FP).ok_or_else(|| "perf sample is missing aarch64 FP register".to_string())?,
-            lr: masked(LR).ok_or_else(|| "perf sample is missing aarch64 LR register".to_string())?,
+            pc: masked(PC)
+                .ok_or_else(|| "perf sample is missing aarch64 PC register".to_string())?,
+            sp: masked(SP)
+                .ok_or_else(|| "perf sample is missing aarch64 SP register".to_string())?,
+            fp: masked(FP)
+                .ok_or_else(|| "perf sample is missing aarch64 FP register".to_string())?,
+            lr: masked(LR)
+                .ok_or_else(|| "perf sample is missing aarch64 LR register".to_string())?,
         })
     }
 
@@ -1070,8 +1074,8 @@ mod tests {
         let mask = (1 << 29) | (1 << 30) | (1 << 31);
         let values = [0x2900, 0x3000, 0x3100];
 
-        let error = super::PerfAarch64Regs::from_perf_masked_values(mask, &values)
-            .expect_err("missing pc");
+        let error =
+            super::PerfAarch64Regs::from_perf_masked_values(mask, &values).expect_err("missing pc");
 
         assert!(error.contains("PC"));
     }

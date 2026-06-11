@@ -25,6 +25,24 @@ trixie's perf 6.12 does not demangle Rust v0 (`_RNv...` stays raw) while modern 
 Byte parity is only meaningful against a pinned perf version; record
 `target/oracle/perf.version` with any saved numbers.
 
+## Status update (later on 2026-06-11)
+
+The six gaps below are FIXED and merged: `pyroclast plumbing perf-script` output is
+now byte-identical to `perf script --force` on the fp oracle, and the folded output
+differs only where `inferno-collapse-perf` itself mis-parses the space-containing
+DSO path `/ (deleted)` (it keeps the `+0x9c` offset and a trailing space on
+`__libc_start_main` and emits `[unknown] `); pyroclast's folding of those frames is
+deliberately the more correct one. Two genuine parser bugs fell out of this work:
+the perf feature bitmap was read at byte offset 56 instead of 72 (silently
+disabling HEADER_EVENT_DESC and header build-ids — `struct perf_file_header`
+places `adds_features` after the three file sections), and feature-section
+build-id records (which carry `header.type == 0`) were rejected.
+
+Dwarf note: the dwarf oracle's `perf script` output contains `(inlined)` frames —
+modern perf expands inline frames by default for DWARF-symbolized stacks — so the
+dwarf comparison runs pyroclast with `--inline`. The remaining dwarf divergence is
+the aarch64 unwind support (in progress; spec in `.ace-aarch64-unwind-spec.md`).
+
 ## Parity gaps found via the oracle (fp call-graph path, arch-independent)
 
 Measured by diffing `target/oracle/fp.pyroclast.script` against `fp.perf.script`

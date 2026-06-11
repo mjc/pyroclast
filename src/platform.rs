@@ -65,7 +65,12 @@ pub fn linux_thread_ids_from_proc(proc_root: &Path, pid: u32) -> std::io::Result
     let task_dir = proc_root.join(pid.to_string()).join("task");
     let mut tids = std::fs::read_dir(&task_dir)?
         .filter_map(Result::ok)
-        .filter_map(|entry| entry.file_name().to_str().and_then(|name| name.parse().ok()))
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse().ok())
+        })
         .collect::<Vec<u32>>();
     tids.sort_unstable();
     if tids.is_empty() {

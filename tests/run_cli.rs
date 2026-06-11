@@ -1163,8 +1163,8 @@ fn top_level_offcpu_command_rejects_attach_workflows() {
         "5",
     ]);
 
-    let error =
-        pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux").expect_err("attach should fail");
+    let error = pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux")
+        .expect_err("attach should fail");
 
     assert_eq!(
         error.to_string(),

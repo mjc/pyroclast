@@ -93,8 +93,8 @@ pub fn parse_header_arch(bytes: &[u8], header: &PerfHeader) -> Result<Option<Str
     };
     let start = usize::try_from(section.offset)
         .map_err(|_| "arch feature offset exceeds usize".to_string())?;
-    let size = usize::try_from(section.size)
-        .map_err(|_| "arch feature size exceeds usize".to_string())?;
+    let size =
+        usize::try_from(section.size).map_err(|_| "arch feature size exceeds usize".to_string())?;
     let end = start
         .checked_add(size)
         .ok_or_else(|| "arch feature range overflows usize".to_string())?;

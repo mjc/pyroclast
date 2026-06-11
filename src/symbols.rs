@@ -265,6 +265,26 @@ struct PreparedObjectMetadata {
 struct CachedObjectMetadata {
     object_metadata: PreparedObjectMetadata,
     object_bytes: Arc<[u8]>,
+    dwarf_index: Mutex<PerfDwarfIndexCache>,
+}
+
+/// Per-object memo of DWARF inline-frame indexes.
+///
+/// Folding queries the same hot objects every round; re-parsing their DWARF
+/// and re-walking the DIE trees per batch dominated fold time. Unit ranges are
+/// scanned once, and each unit's frame index is built on the first batch whose
+/// addresses land in it. The name interner is append-only so frame name ids
+/// stay valid across incremental builds.
+#[derive(Default)]
+struct PerfDwarfIndexCache {
+    names: PerfDwarfNameInterner,
+    units: Option<Vec<PerfDwarfCachedUnit>>,
+    failed: bool,
+}
+
+struct PerfDwarfCachedUnit {
+    ranges: Option<Vec<PerfAddressRange>>,
+    segments: Option<Vec<PerfDwarfFrameRange>>,
 }
 
 #[derive(Default)]
@@ -516,6 +536,7 @@ impl RustAddr2lineResolver {
             Arc::new(CachedObjectMetadata {
                 object_metadata: PreparedObjectMetadata::from_object_bytes(&bytes),
                 object_bytes: bytes.into(),
+                dwarf_index: Mutex::new(PerfDwarfIndexCache::default()),
             })
         });
 
@@ -580,6 +601,7 @@ where
             Arc::new(CachedObjectMetadata {
                 object_metadata: PreparedObjectMetadata::from_object_bytes(&bytes),
                 object_bytes: bytes.into(),
+                dwarf_index: Mutex::new(PerfDwarfIndexCache::default()),
             })
         });
 
@@ -1735,17 +1757,13 @@ where
                 .collect::<Vec<_>>();
             let symbols = self.resolve_group_symbols(path, &grouped_requests)?;
             let object_metadata = self.object_metadata(path);
-            let perf_dwarf = object_metadata.as_ref().and_then(|metadata| {
+            if let Some(metadata) = object_metadata.as_ref() {
                 let addresses = grouped_requests
                     .iter()
                     .map(|request| request.relative_address)
                     .collect::<Vec<_>>();
-                PerfDwarfNameResolver::from_object_bytes_for_addresses(
-                    &metadata.object_bytes,
-                    &addresses,
-                )
-                .ok()
-            });
+                metadata.prepare_dwarf_frames_for_addresses(&addresses);
+            }
             for ((index, request), symbol) in indexes.into_iter().zip(grouped_requests).zip(symbols)
             {
                 let object_symbols =
@@ -1753,10 +1771,10 @@ where
                 let object_symbol = object_symbols.bare;
                 let has_base_symbol = object_symbol.is_some();
                 let mut frames = if let Some(object_symbol) = object_symbol {
-                    perf_dwarf
+                    object_metadata
                         .as_ref()
-                        .and_then(|resolver| {
-                            resolver.frame_names_for_base_symbol(
+                        .and_then(|metadata| {
+                            metadata.dwarf_frame_names_for_base_symbol(
                                 request.relative_address,
                                 Some(object_symbol),
                             )
@@ -1881,17 +1899,13 @@ impl SymbolResolver for RustAddr2lineResolver {
         for (path, indexes) in grouped_request_indexes(requests) {
             let path = Path::new(path);
             let object_metadata = self.object_metadata(path);
-            let perf_dwarf = object_metadata.as_ref().and_then(|metadata| {
+            if let Some(metadata) = object_metadata.as_ref() {
                 let addresses = indexes
                     .iter()
                     .map(|index| requests[*index].relative_address)
                     .collect::<Vec<_>>();
-                PerfDwarfNameResolver::from_object_bytes_for_addresses(
-                    &metadata.object_bytes,
-                    &addresses,
-                )
-                .ok()
-            });
+                metadata.prepare_dwarf_frames_for_addresses(&addresses);
+            }
             let mut loader = None;
             let mut loader_attempted = false;
             for index in indexes {
@@ -1901,10 +1915,10 @@ impl SymbolResolver for RustAddr2lineResolver {
                 let object_symbol = object_symbols.bare;
                 let has_base_symbol = object_symbol.is_some();
                 let mut frames = if let Some(object_symbol) = object_symbol {
-                    perf_dwarf
+                    object_metadata
                         .as_ref()
-                        .and_then(|resolver| {
-                            resolver.frame_names_for_base_symbol(
+                        .and_then(|metadata| {
+                            metadata.dwarf_frame_names_for_base_symbol(
                                 request.relative_address,
                                 Some(object_symbol),
                             )
@@ -2500,6 +2514,118 @@ impl PerfDwarfNameResolver {
         }
         None
     }
+}
+
+impl CachedObjectMetadata {
+    /// Builds frame indexes for every DWARF unit covering `addresses` that has
+    /// not been indexed by an earlier batch.
+    fn prepare_dwarf_frames_for_addresses(&self, addresses: &[u64]) {
+        let mut cache = self.dwarf_index.lock().expect("dwarf index cache lock");
+        if cache.failed {
+            return;
+        }
+        if let Some(units) = &cache.units {
+            let needs_build = units.iter().any(|unit| {
+                unit.segments.is_none()
+                    && perf_dwarf_unit_ranges_match_addresses(unit.ranges.as_deref(), addresses)
+            });
+            if !needs_build {
+                return;
+            }
+        }
+        if build_dwarf_index_cache_for_addresses(&mut cache, &self.object_bytes, addresses).is_err()
+        {
+            cache.failed = true;
+        }
+    }
+
+    /// Resolves the perf-style inline frame chain for one address from the
+    /// units prepared by [`Self::prepare_dwarf_frames_for_addresses`].
+    fn dwarf_frame_names_for_base_symbol(
+        &self,
+        address: u64,
+        base_symbol: Option<&str>,
+    ) -> Option<Vec<String>> {
+        let cache = self.dwarf_index.lock().expect("dwarf index cache lock");
+        for unit in cache.units.as_deref()? {
+            let Some(segments) = &unit.segments else {
+                continue;
+            };
+            if !unit
+                .ranges
+                .as_ref()
+                .is_none_or(|ranges| perf_dwarf_ranges_contain(ranges, address))
+            {
+                continue;
+            }
+            if let Some(frames) = perf_dwarf_frame_names_from_index(
+                segments,
+                &cache.names.names,
+                address,
+                base_symbol,
+            ) {
+                return Some(frames);
+            }
+        }
+        None
+    }
+}
+
+fn build_dwarf_index_cache_for_addresses(
+    cache: &mut PerfDwarfIndexCache,
+    bytes: &[u8],
+    addresses: &[u64],
+) -> Result<(), gimli::Error> {
+    let object = object::File::parse(bytes).map_err(|_| gimli::Error::Io)?;
+    let endian = if object.is_little_endian() {
+        gimli::RunTimeEndian::Little
+    } else {
+        gimli::RunTimeEndian::Big
+    };
+    let dwarf_sections = gimli::DwarfSections::load(|id| {
+        Ok::<_, gimli::Error>(
+            object
+                .section_by_name(id.name())
+                .and_then(|section| section.uncompressed_data().ok())
+                .unwrap_or(Cow::Borrowed(&[][..])),
+        )
+    })?;
+    let dwarf = dwarf_sections.borrow(|section| gimli::EndianSlice::new(section.as_ref(), endian));
+
+    let scanning = cache.units.is_none();
+    let mut units = cache.units.take().unwrap_or_default();
+    let mut headers = dwarf.units();
+    let mut ordinal = 0_usize;
+    while let Ok(Some(header)) = headers.next() {
+        let Ok(unit) = dwarf.unit(header) else {
+            if scanning {
+                units.push(PerfDwarfCachedUnit {
+                    ranges: Some(Vec::new()),
+                    segments: Some(Vec::new()),
+                });
+            }
+            ordinal += 1;
+            continue;
+        };
+        if scanning {
+            units.push(PerfDwarfCachedUnit {
+                ranges: perf_dwarf_ranges(dwarf.unit_ranges(&unit).ok()),
+                segments: None,
+            });
+        }
+        let Some(cached_unit) = units.get_mut(ordinal) else {
+            break;
+        };
+        if cached_unit.segments.is_none()
+            && perf_dwarf_unit_ranges_match_addresses(cached_unit.ranges.as_deref(), addresses)
+        {
+            let roots = perf_dwarf_unit_roots(&dwarf, &unit, &mut cache.names);
+            cached_unit.segments = Some(perf_dwarf_frame_ranges_from_roots(&roots));
+        }
+        ordinal += 1;
+    }
+    cache.units = Some(units);
+    Ok(())
 }
 
 fn perf_dwarf_unit_ranges_match_addresses(
