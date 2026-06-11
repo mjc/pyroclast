@@ -2006,6 +2006,15 @@ fn demangle_addr2line_name(name: &str) -> String {
     perf_dwarf_function_name(&addr2line::demangle_auto(Cow::Borrowed(name), None))
 }
 
+/// Demangles a mangled (linkage) symbol the way perf's external-addr2line
+/// srcline backend does: fully qualified, no trailing `::h<hash>`, generic
+/// args preserved (`dso__demangle_sym` ->
+/// `rust_demangle_display_demangle(..., /*alternate=*/true)`). Unlike
+/// [`demangle_addr2line_name`] it does NOT collapse to the unqualified leaf.
+fn demangle_addr2line_name_qualified(name: &str) -> String {
+    addr2line::demangle_auto(Cow::Borrowed(name), None).into_owned()
+}
+
 fn perf_name_with_object_alias(name: Option<String>, object_alias: Option<&str>) -> Option<String> {
     match (name, object_alias) {
         (Some(name), Some(object_alias))
@@ -2685,8 +2694,7 @@ fn perf_dwarf_collect_relevant_nodes<R>(
     let ranges = kind
         .map(|_| perf_dwarf_ranges(dwarf.die_ranges(unit, node.entry()).ok()).unwrap_or_default());
     let name = kind.and_then(|_| {
-        perf_dwarf_die_name(dwarf, unit, node.entry())
-            .map(|name| names.intern(perf_dwarf_function_name(&name)))
+        perf_dwarf_die_frame_name(dwarf, unit, node.entry()).map(|name| names.intern(name))
     });
     if let Some(kind) = kind {
         let mut children = Vec::new();
@@ -2903,6 +2911,82 @@ fn perf_dwarf_frame_names_from_index(
 
 fn perf_realfunc_name_replaces_base_symbol(name: &str, base_symbol: Option<&str>) -> bool {
     base_symbol.is_some_and(|base_symbol| name != base_symbol)
+}
+
+/// Resolves the printed frame name for one subprogram/inlined-subroutine DIE.
+///
+/// perf's external-addr2line srcline backend (the modern oracle build) names
+/// each frame from the ELF symtab / DWARF *linkage* (mangled) name and then
+/// demangles it itself with the Rust v0 demangler in alternate form
+/// (`tools/perf/util/srcline.c` `new_inline_sym` -> `dso__demangle_sym` ->
+/// `rust_demangle_display_demangle(..., /*alternate=*/true)` in
+/// `tools/perf/util/symbol.c`), which yields fully-qualified names without the
+/// trailing `::h<hash>` and with generic arguments preserved.
+/// `addr2line::demangle_auto` produces byte-identical output to perf's alternate
+/// Rust demangle for both legacy `_ZN` and v0 `_R` manglings, so the linkage
+/// name is demangled with it directly (NOT run through
+/// [`perf_dwarf_function_name`], which strips to the unqualified leaf and only
+/// applies to the bare `DW_AT_name` fallback).
+///
+/// Falls back to the bare `DW_AT_name` (perf's libdw backend spelling) when no
+/// linkage name is present, e.g. closures and shim DIEs.
+fn perf_dwarf_die_frame_name<R>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    entry: &gimli::DebuggingInformationEntry<R>,
+) -> Option<String>
+where
+    R: gimli::Reader,
+{
+    if let Some(linkage) = perf_dwarf_die_linkage_name(dwarf, unit, entry, 16) {
+        return Some(demangle_addr2line_name_qualified(&linkage));
+    }
+    perf_dwarf_die_name(dwarf, unit, entry).map(|name| perf_dwarf_function_name(&name))
+}
+
+fn perf_dwarf_die_linkage_name<R>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    entry: &gimli::DebuggingInformationEntry<R>,
+    recursion_limit: usize,
+) -> Option<String>
+where
+    R: gimli::Reader,
+{
+    if recursion_limit == 0 {
+        return None;
+    }
+    entry
+        .attr(gimli::DW_AT_linkage_name)
+        .and_then(|attr| dwarf.attr_string(unit, attr.value()).ok())
+        .and_then(|name| name.to_string_lossy().ok().map(Cow::into_owned))
+        .or_else(|| {
+            entry.attr(gimli::DW_AT_abstract_origin).and_then(|attr| {
+                perf_dwarf_origin_linkage_name(dwarf, unit, &attr.value(), recursion_limit - 1)
+            })
+        })
+        .or_else(|| {
+            entry.attr(gimli::DW_AT_specification).and_then(|attr| {
+                perf_dwarf_origin_linkage_name(dwarf, unit, &attr.value(), recursion_limit - 1)
+            })
+        })
+}
+
+fn perf_dwarf_origin_linkage_name<R>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    value: &gimli::AttributeValue<R>,
+    recursion_limit: usize,
+) -> Option<String>
+where
+    R: gimli::Reader,
+{
+    let gimli::AttributeValue::UnitRef(offset) = value else {
+        return None;
+    };
+    let mut entries = unit.entries_tree(Some(*offset)).ok()?;
+    let root = entries.root().ok()?;
+    perf_dwarf_die_linkage_name(dwarf, unit, root.entry(), recursion_limit)
 }
 
 fn perf_dwarf_die_name<R>(
@@ -3364,9 +3448,47 @@ mod tests {
         PerfAddressRange, PerfDwarfDieKind, PerfDwarfDieNode, PerfDwarfNameInterner,
         PerfObjectSymbolIndex, PerfSymbolBinding, PerfSymbolCandidate, PerfSymbolScope,
         ResolvedMappingRef, RustAddr2lineResolver, SymbolFrameCache, SymbolRequest, SymbolResolver,
-        clean_object_symbol_request, perf_best_duplicate_symbol, perf_dwarf_frame_names_from_index,
-        perf_dwarf_frame_ranges_from_roots, perf_frames_with_object_alias,
+        clean_object_symbol_request, demangle_addr2line_name_qualified, perf_best_duplicate_symbol,
+        perf_dwarf_frame_names_from_index, perf_dwarf_frame_ranges_from_roots,
+        perf_frames_with_object_alias,
     };
+
+    #[test]
+    fn demangle_addr2line_name_qualified_matches_perf_external_addr2line_backend() {
+        // perf's external-addr2line srcline backend names each frame from the
+        // mangled symtab/DWARF linkage name and demangles it itself with the
+        // Rust v0 demangler in alternate form (tools/perf/util/srcline.c
+        // new_inline_sym -> tools/perf/util/symbol.c dso__demangle_sym ->
+        // rust_demangle_display_demangle(..., /*alternate=*/true)), keeping the
+        // fully-qualified path, dropping the trailing ::h<hash>, and preserving
+        // generic arguments. These expectations are copied byte-for-byte from
+        // target/oracle/dwarf.perf.script (perf 6.17.13, addr2line backend).
+        //
+        // Legacy `_ZN` manglings (core/std non-generic functions in symtab):
+        assert_eq!(
+            demangle_addr2line_name_qualified(
+                "_ZN4core5slice4sort8unstable4sort17hf487fc59c5378322E"
+            ),
+            "core::slice::sort::unstable::sort"
+        );
+        assert_eq!(
+            demangle_addr2line_name_qualified(
+                "_ZN91_$LT$T$u20$as$u20$core..slice..sort..shared..smallsort..UnstableSmallSortFreezeTypeImpl$GT$10small_sort17ha5f9b986560cf204E"
+            ),
+            "<T as core::slice::sort::shared::smallsort::UnstableSmallSortFreezeTypeImpl>::small_sort"
+        );
+        // v0 `_R` manglings (the std::rt::lang_start_internal inline group):
+        assert_eq!(
+            demangle_addr2line_name_qualified("_RNvNtCsfQfHhyvAE2O_3std2rt19lang_start_internal"),
+            "std::rt::lang_start_internal"
+        );
+        assert_eq!(
+            demangle_addr2line_name_qualified(
+                "_RINvNtCsfQfHhyvAE2O_3std9panicking12catch_unwindiNCNvNtB4_2rt19lang_start_internal0EB4_"
+            ),
+            "std::panicking::catch_unwind::<isize, std::rt::lang_start_internal::{closure#0}>"
+        );
+    }
 
     #[test]
     fn object_requests_use_elf_virtual_addresses_for_pie_file_offsets() {

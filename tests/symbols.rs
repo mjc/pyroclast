@@ -617,7 +617,16 @@ fn specializes_qualified_generic_placeholder_dwarf_names_from_debug_strings() {
 }
 
 #[test]
-fn perf_dwarf_frame_names_prefer_die_names_like_perf_script() {
+fn perf_dwarf_frame_names_match_external_addr2line_qualified_names_like_perf_script() {
+    // perf's external-addr2line srcline backend (the modern oracle build) names
+    // each frame from the mangled symtab/DWARF linkage name returned by
+    // `addr2line -f -i` and demangles it itself with the Rust v0 demangler in
+    // alternate form (tools/perf/util/srcline.c new_inline_sym ->
+    // tools/perf/util/symbol.c dso__demangle_sym ->
+    // rust_demangle_display_demangle(..., /*alternate=*/true)). The result is
+    // fully qualified with generic arguments preserved -- NOT the bare DWARF
+    // DW_AT_name leaf the older libdw backend printed. This test pins that
+    // pyroclast now matches the external-addr2line spelling frame-for-frame.
     let Some((profiling_binary, object_bytes)) = profiling_binary_fixture() else {
         return;
     };
@@ -629,14 +638,13 @@ fn perf_dwarf_frame_names_prefer_die_names_like_perf_script() {
                 return false;
             };
             let Some(expected) =
-                external_addr2line_frames_leaf_to_root(&profiling_binary, *address)
+                external_addr2line_qualified_frames_leaf_to_root(&profiling_binary, *address)
             else {
                 return false;
             };
-            frames.len() == expected.len()
-                && frames.iter().zip(expected.iter()).any(|(frame, external)| {
-                    frame != external && frame.contains('<') && !external.contains('<')
-                })
+            // Only meaningful where the inline chain carries a qualified
+            // generic name (so the libdw leaf spelling would have differed).
+            frames.len() == expected.len() && frames.iter().any(|frame| frame.contains('<'))
         })
     else {
         return;
@@ -644,13 +652,10 @@ fn perf_dwarf_frame_names_prefer_die_names_like_perf_script() {
 
     let frames =
         perf_dwarf_frame_names_from_object(&profiling_binary, address).expect("perf dwarf frames");
-    let expected = external_addr2line_frames_leaf_to_root(&profiling_binary, address)
+    let expected = external_addr2line_qualified_frames_leaf_to_root(&profiling_binary, address)
         .expect("external addr2line frames");
 
-    assert_eq!(frames.len(), expected.len());
-    assert!(frames.iter().zip(expected.iter()).any(|(frame, external)| {
-        frame != external && frame.contains('<') && !external.contains('<')
-    }));
+    assert_eq!(frames, expected);
 }
 
 #[test]
@@ -948,6 +953,34 @@ fn external_addr2line_frames_leaf_to_root(path: &Path, address: u64) -> Option<V
 
 fn external_addr2line_frames_root_to_leaf(path: &Path, address: u64) -> Option<Vec<String>> {
     external_addr2line_frames_leaf_to_root(path, address).map(perf_inline_frame_order)
+}
+
+/// Runs `addr2line -f -i -e` exactly like perf's external-addr2line backend
+/// (tools/perf/util/addr2line.c addr2line_subprocess_init passes `-a -i -f`
+/// and never `-C`), then demangles each mangled function-name line with the
+/// Rust alternate demangle the way perf's new_inline_sym -> dso__demangle_sym
+/// does. `addr2line::demangle_auto` is byte-identical to perf's alternate Rust
+/// demangle for both legacy `_ZN` and v0 `_R` symbols.
+fn external_addr2line_qualified_frames_leaf_to_root(
+    path: &Path,
+    address: u64,
+) -> Option<Vec<String>> {
+    let output = Command::new("addr2line")
+        .args(["-f", "-i", "-e", path.to_str()?, &format!("0x{address:x}")])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let frames = stdout
+        .lines()
+        .step_by(2)
+        .filter(|name| *name != "??")
+        .map(|name| addr2line::demangle_auto(Cow::Borrowed(name), None).into_owned())
+        .collect::<Vec<_>>();
+    (!frames.is_empty()).then_some(frames)
 }
 
 #[test]
