@@ -1256,10 +1256,13 @@ ffffffff88000080 t asm_exc_page_fault
         ])
         .expect("symbols");
 
+    // perf-script prints kernel frames as `name+0x<off>`
+    // (tools/perf/util/symbol_fprintf.c __symbol__fprintf_symname_offs); the
+    // folded path strips the offset like every other frame.
     assert_eq!(
         symbols,
         vec![
-            Some("asm_exc_page_fault".to_string()),
+            Some("asm_exc_page_fault+0xf".to_string()),
             Some("app::main".to_string())
         ]
     );
@@ -1291,7 +1294,8 @@ fn perf_symbol_resolver_prefers_live_kallsyms_for_kernel_module_paths() {
         }])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![Some("zpl_iter_read".to_string())]);
+    // perf-script kernel frames carry the +0x<off> offset (symbol_fprintf.c).
+    assert_eq!(symbols, vec![Some("zpl_iter_read+0xe9".to_string())]);
     assert!(runner.commands().is_empty());
 }
 
@@ -1321,7 +1325,8 @@ ffffffff82000000 T later_kernel_symbol
         }])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![Some("asm_exc_page_fault".to_string())]);
+    // The relocated address lands on the symbol start, so perf prints +0x0.
+    assert_eq!(symbols, vec![Some("asm_exc_page_fault+0x0".to_string())]);
     assert!(runner.commands().is_empty());
 }
 
@@ -1351,7 +1356,7 @@ fn perf_symbol_resolver_loads_perfdata_kernel_build_id_cache() {
         }])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![Some("asm_exc_page_fault".to_string())]);
+    assert_eq!(symbols, vec![Some("asm_exc_page_fault+0xf".to_string())]);
     assert!(runner.commands().is_empty());
 }
 
@@ -1384,7 +1389,7 @@ fn perf_symbol_resolver_loads_perfdata_kernel_build_id_cache_from_file() {
         }])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![Some("asm_exc_page_fault".to_string())]);
+    assert_eq!(symbols, vec![Some("asm_exc_page_fault+0xf".to_string())]);
     assert!(runner.commands().is_empty());
 }
 
@@ -1495,7 +1500,9 @@ fn perf_symbol_resolver_constructor_uses_perfdata_cache_before_system_kallsyms()
         }])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![Some("cached_kernel_symbol".to_string())]);
+    // perf-script kernel frames carry +0x<off> (symbol_fprintf.c); folded
+    // output strips it.
+    assert_eq!(symbols, vec![Some("cached_kernel_symbol+0xf".to_string())]);
     assert!(runner.commands().is_empty());
 }
 
@@ -1567,7 +1574,8 @@ fn perf_symbol_resolver_prefers_perfdata_kallsyms_over_kernel_elf() {
         }])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![Some("__pi_memcpy".to_string())]);
+    // perf-script kernel frames carry +0x<off> (symbol_fprintf.c).
+    assert_eq!(symbols, vec![Some("__pi_memcpy+0xf".to_string())]);
     assert!(runner.commands().is_empty());
 }
 
@@ -1640,7 +1648,8 @@ ffffffff846997a0 T __pi_memcpy
         }])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![Some("__pi_memcpy".to_string())]);
+    // perf-script kernel frames carry +0x<off> (symbol_fprintf.c).
+    assert_eq!(symbols, vec![Some("__pi_memcpy+0xc".to_string())]);
     assert!(runner.commands().is_empty());
 }
 
@@ -1674,7 +1683,8 @@ ffffffff846997a0 T memcpy
         }])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![Some("__pi_memcpy".to_string())]);
+    // perf-script kernel frames carry +0x<off> (symbol_fprintf.c).
+    assert_eq!(symbols, vec![Some("__pi_memcpy+0xc".to_string())]);
 }
 
 #[test]
@@ -1705,7 +1715,8 @@ ffffffffc0e17dae t zfs_read [zfs]
         }])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![Some("zfs_read".to_string())]);
+    // perf-script kernel/module frames carry +0x<off> (symbol_fprintf.c).
+    assert_eq!(symbols, vec![Some("zfs_read+0x0".to_string())]);
     assert!(runner.commands().is_empty());
 }
 
@@ -1738,7 +1749,8 @@ ffffffffc1e17dae t igb_clean_rx_irq [igb]
     let symbols = resolver
         .resolve_batch(std::slice::from_ref(&zfs))
         .expect("symbols");
-    assert_eq!(symbols, vec![Some("zfs_read".to_string())]);
+    // perf-script kernel/module frames carry +0x<off> (symbol_fprintf.c).
+    assert_eq!(symbols, vec![Some("zfs_read+0x0".to_string())]);
 
     std::fs::write(
         &live_kallsyms,
@@ -1761,8 +1773,8 @@ ffffffffc2e17dae t unrelated_module_symbol [mlx5]
     assert_eq!(
         symbols,
         vec![
-            Some("zfs_read".to_string()),
-            Some("igb_clean_rx_irq".to_string())
+            Some("zfs_read+0x0".to_string()),
+            Some("igb_clean_rx_irq+0x0".to_string())
         ]
     );
     assert!(runner.commands().is_empty());
@@ -1796,7 +1808,8 @@ ffffffff846997a0 T memcpy
         }])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![Some("__pi_memcpy".to_string())]);
+    // perf-script kernel frames carry +0x<off> (symbol_fprintf.c).
+    assert_eq!(symbols, vec![Some("__pi_memcpy+0xc".to_string())]);
     assert!(runner.commands().is_empty());
 }
 
@@ -2016,7 +2029,9 @@ fn perf_symbol_resolver_uses_system_map_candidates_when_cache_is_missing() {
         }])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![Some("asm_exc_page_fault".to_string())]);
+    // perf-script kernel frames carry +0x<off> (symbol_fprintf.c); the
+    // relocated address lands on the symbol start.
+    assert_eq!(symbols, vec![Some("asm_exc_page_fault+0x0".to_string())]);
     assert!(runner.commands().is_empty());
 }
 
@@ -2057,11 +2072,12 @@ fn perf_symbol_resolver_keeps_live_kallsyms_for_modules_when_system_map_exists()
         ])
         .expect("symbols");
 
+    // perf-script kernel/module frames carry +0x<off> (symbol_fprintf.c).
     assert_eq!(
         symbols,
         vec![
-            Some("asm_exc_page_fault".to_string()),
-            Some("zfs_read".to_string())
+            Some("asm_exc_page_fault+0x0".to_string()),
+            Some("zfs_read+0x0".to_string())
         ]
     );
 }

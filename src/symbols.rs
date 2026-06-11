@@ -325,6 +325,12 @@ pub struct PerfSymbolResolver<O> {
     system_map_kallsyms: Option<Kallsyms>,
     system_map_candidates: Vec<PathBuf>,
     system_map_kallsyms_cache: OnceLock<Option<Kallsyms>>,
+    /// `/sys/kernel/notes` (or a test override) — the live kernel's GNU
+    /// build-id note. Used to confirm the running kernel matches the build-id
+    /// recorded in the perf.data before trusting live `/proc/kallsyms` for
+    /// `[kernel.kallsyms]` frames.
+    live_kernel_notes_path: Option<PathBuf>,
+    live_kernel_build_id_cache: OnceLock<Option<String>>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -671,6 +677,8 @@ where
             system_map_kallsyms: None,
             system_map_candidates: Vec::new(),
             system_map_kallsyms_cache: OnceLock::new(),
+            live_kernel_notes_path: None,
+            live_kernel_build_id_cache: OnceLock::new(),
         }
     }
 
@@ -764,8 +772,43 @@ where
         let mut this = self;
         if this.live_kallsyms.is_none() {
             this.live_kallsyms_path = Some(path.to_path_buf());
+            // Pair the live kallsyms with the running kernel's build-id note so
+            // we only trust it for [kernel.kallsyms] frames when it matches the
+            // perf.data's recorded kernel build-id.
+            if this.live_kernel_notes_path.is_none() {
+                this.live_kernel_notes_path = Some(PathBuf::from("/sys/kernel/notes"));
+            }
         }
         this
+    }
+
+    #[must_use]
+    pub fn with_live_kernel_notes_path(mut self, path: PathBuf) -> Self {
+        self.live_kernel_notes_path = Some(path);
+        self
+    }
+
+    fn live_kernel_build_id(&self) -> Option<&str> {
+        self.live_kernel_build_id_cache
+            .get_or_init(|| {
+                let path = self.live_kernel_notes_path.as_ref()?;
+                let bytes = std::fs::read(path).ok()?;
+                gnu_build_id_from_notes(&bytes)
+            })
+            .as_deref()
+    }
+
+    /// True when the running kernel's build-id matches the build-id recorded in
+    /// the perf.data, so live `/proc/kallsyms` describes the same kernel perf
+    /// symbolized against. perf trusts kallsyms for the recorded kernel; this is
+    /// the equivalent guard for the direct-fold path on the recording machine.
+    fn live_kernel_matches_recorded(&self) -> bool {
+        match &self.recorded_kernel_build_id {
+            Some(recorded) => self
+                .live_kernel_build_id()
+                .is_some_and(|live| live == recorded),
+            None => false,
+        }
     }
 }
 
@@ -873,6 +916,17 @@ impl Kallsyms {
             .map(|(_, symbol)| symbol.clone())
     }
 
+    /// Resolves an address to `name+0x<off>`, matching perf-script kernel
+    /// frames (`tools/perf/util/symbol_fprintf.c __symbol__fprintf_symname_offs`
+    /// prints the offset from the containing symbol, including `+0x0`).
+    #[must_use]
+    pub fn resolve_with_offset(&self, address: u64) -> Option<String> {
+        self.symbols
+            .range(..=address)
+            .next_back()
+            .map(|(start, symbol)| format!("{symbol}+0x{:x}", address - start))
+    }
+
     #[must_use]
     pub fn resolve_relocated(
         &self,
@@ -883,6 +937,18 @@ impl Kallsyms {
         let symbol_file_address = self.address_of(reference_symbol)?;
         let delta = symbol_file_address.wrapping_sub(recorded_reference_address);
         self.resolve(address.wrapping_add(delta))
+    }
+
+    #[must_use]
+    pub fn resolve_relocated_with_offset(
+        &self,
+        address: u64,
+        reference_symbol: &str,
+        recorded_reference_address: u64,
+    ) -> Option<String> {
+        let symbol_file_address = self.address_of(reference_symbol)?;
+        let delta = symbol_file_address.wrapping_sub(recorded_reference_address);
+        self.resolve_with_offset(address.wrapping_add(delta))
     }
 
     fn address_of(&self, name: &str) -> Option<u64> {
@@ -1674,7 +1740,13 @@ where
     }
 
     fn can_use_system_kernel_symbols(&self, request: &SymbolRequest) -> bool {
-        self.recorded_kernel_build_id.is_none() || request.path != Path::new("[kernel.kallsyms]")
+        // Safe to use system/live kernel symbols when either the perf.data
+        // recorded no kernel build-id, the request is not for the core kernel,
+        // or the running kernel's build-id matches the recorded one (the
+        // recording machine: live /proc/kallsyms describes the same kernel).
+        self.recorded_kernel_build_id.is_none()
+            || request.path != Path::new("[kernel.kallsyms]")
+            || self.live_kernel_matches_recorded()
     }
 }
 
@@ -3383,15 +3455,57 @@ fn build_id_hex(bytes: &[u8]) -> String {
     hex
 }
 
+/// Extracts the GNU build-id (lowercase hex) from a buffer of ELF notes such as
+/// `/sys/kernel/notes`. Walks the note stream looking for the
+/// `NT_GNU_BUILD_ID` (type 3) note with name "GNU\0" and returns its
+/// descriptor. Notes are little-endian on the supported targets (x86_64,
+/// aarch64), matching how perf stores build-ids in HEADER_BUILD_ID.
+fn gnu_build_id_from_notes(bytes: &[u8]) -> Option<String> {
+    const NT_GNU_BUILD_ID: u32 = 3;
+    let mut offset = 0usize;
+    while offset + 12 <= bytes.len() {
+        let read_u32 = |start: usize| {
+            u32::from_le_bytes([
+                bytes[start],
+                bytes[start + 1],
+                bytes[start + 2],
+                bytes[start + 3],
+            ])
+        };
+        let namesz = read_u32(offset) as usize;
+        let descsz = read_u32(offset + 4) as usize;
+        let note_type = read_u32(offset + 8);
+        let name_start = offset + 12;
+        let name_end = name_start.checked_add(namesz)?;
+        // Notes pad name and descriptor to 4-byte boundaries.
+        let name_padded = name_end.next_multiple_of(4);
+        let desc_start = name_padded;
+        let desc_end = desc_start.checked_add(descsz)?;
+        if desc_end > bytes.len() {
+            break;
+        }
+        if note_type == NT_GNU_BUILD_ID
+            && bytes.get(name_start..name_end) == Some(b"GNU\0")
+            && descsz > 0
+        {
+            return Some(build_id_hex(&bytes[desc_start..desc_end]));
+        }
+        offset = desc_end.next_multiple_of(4);
+    }
+    None
+}
+
 fn resolve_kernel_kallsyms(kallsyms: &Kallsyms, request: &SymbolRequest) -> Option<String> {
+    // perf-script prints kernel frames as `name+0x<off>` (symbol_fprintf.c),
+    // and the folded path strips the offset like every other frame.
     if let Some(relocation) = &request.kernel_relocation {
-        kallsyms.resolve_relocated(
+        kallsyms.resolve_relocated_with_offset(
             request.relative_address,
             &relocation.reference_symbol,
             relocation.recorded_reference_address,
         )
     } else {
-        kallsyms.resolve(request.relative_address)
+        kallsyms.resolve_with_offset(request.relative_address)
     }
 }
 
@@ -3496,10 +3610,53 @@ mod tests {
         PerfAddressRange, PerfDwarfDieKind, PerfDwarfDieNode, PerfDwarfNameInterner,
         PerfObjectSymbolIndex, PerfSymbolBinding, PerfSymbolCandidate, PerfSymbolScope,
         ResolvedMappingRef, RustAddr2lineResolver, SymbolFrameCache, SymbolRequest, SymbolResolver,
-        clean_object_symbol_request, demangle_addr2line_name_qualified, perf_best_duplicate_symbol,
-        perf_dwarf_frame_names_from_index, perf_dwarf_frame_ranges_from_roots,
-        perf_frames_with_object_alias,
+        clean_object_symbol_request, demangle_addr2line_name_qualified, gnu_build_id_from_notes,
+        perf_best_duplicate_symbol, perf_dwarf_frame_names_from_index,
+        perf_dwarf_frame_ranges_from_roots, perf_frames_with_object_alias,
     };
+
+    #[test]
+    fn gnu_build_id_from_notes_reads_kernel_nt_gnu_build_id() {
+        // Real /sys/kernel/notes bytes from the oracle recording container
+        // (aarch64). Layout per note: namesz=4, descsz=20, type=3
+        // (NT_GNU_BUILD_ID), name "GNU\0", then the 20-byte build-id; followed
+        // by unrelated "Linux" notes that must be skipped.
+        let notes = [
+            0x04, 0x00, 0x00, 0x00, // namesz = 4
+            0x14, 0x00, 0x00, 0x00, // descsz = 20
+            0x03, 0x00, 0x00, 0x00, // type = NT_GNU_BUILD_ID
+            0x47, 0x4e, 0x55, 0x00, // "GNU\0"
+            0xcb, 0x97, 0xc0, 0xad, 0xd7, 0x3d, 0xc6, 0x0d, 0x73, 0xbb, 0x9a, 0xd7, 0xdc, 0x27,
+            0x85, 0xd8, 0x8b, 0x36, 0x44, 0xa0, // 20-byte build-id
+            0x06, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x4c, 0x69,
+            0x6e, 0x75, 0x78, 0x00, 0x00, 0x00, // a trailing "Linux" note
+        ];
+
+        assert_eq!(
+            gnu_build_id_from_notes(&notes).as_deref(),
+            Some("cb97c0add73dc60d73bb9ad7dc2785d88b3644a0")
+        );
+    }
+
+    #[test]
+    fn gnu_build_id_from_notes_skips_leading_non_build_id_note() {
+        // A "Linux" version note precedes the build-id note; the walker must
+        // honor 4-byte name/descriptor padding and find the later build-id.
+        let notes = [
+            0x06, 0x00, 0x00, 0x00, // namesz = 6 -> padded to 8
+            0x04, 0x00, 0x00, 0x00, // descsz = 4
+            0x00, 0x01, 0x00, 0x00, // type
+            0x4c, 0x69, 0x6e, 0x75, 0x78, 0x00, 0x00, 0x00, // "Linux\0" padded
+            0xde, 0xad, 0xbe, 0xef, // 4-byte desc
+            0x04, 0x00, 0x00, 0x00, // namesz = 4
+            0x04, 0x00, 0x00, 0x00, // descsz = 4
+            0x03, 0x00, 0x00, 0x00, // NT_GNU_BUILD_ID
+            0x47, 0x4e, 0x55, 0x00, // "GNU\0"
+            0x01, 0x23, 0x45, 0x67, // 4-byte build-id
+        ];
+
+        assert_eq!(gnu_build_id_from_notes(&notes).as_deref(), Some("01234567"));
+    }
 
     #[test]
     fn demangle_addr2line_name_qualified_matches_perf_external_addr2line_backend() {

@@ -2878,6 +2878,7 @@ where
         writeln!(writer, "\t{address:16x} {label}{offset} (inlined)")
             .map_err(|error| format!("failed to write perf script output: {error}"))
     } else {
+        let path = perf_script_dso_name(path);
         writeln!(writer, "\t{address:16x} {label}{offset} ({path})")
             .map_err(|error| format!("failed to write perf script output: {error}"))
     }
@@ -3014,6 +3015,7 @@ where
     {
         return write_perf_script_frame_for_label_fragment(writer, prefix, address, label);
     }
+    let path = perf_script_dso_name(path);
     write!(writer, "{prefix}{address:16x} {label} ({path})")
         .map_err(|error| format!("failed to write perf script output: {error}"))
 }
@@ -3118,6 +3120,18 @@ fn kernel_module_fallback_frame(path: &str) -> String {
 
 fn is_kernel_mapping_ref(mapping: &ResolvedMappingRef<'_>) -> bool {
     is_kernel_space_frame(mapping.relative_address) && mapping.path.starts_with('[')
+}
+
+/// The DSO name perf-script prints for a mapping. The core kernel map is
+/// recorded with a relocation reference suffix (e.g. `[kernel.kallsyms]_stext`),
+/// but perf names its dso `[kernel.kallsyms]` (`machine__create_kernel_maps`
+/// sets the kernel dso short name), so map__fprintf_dsoname prints that.
+fn perf_script_dso_name(path: &str) -> &str {
+    if path.starts_with("[kernel.kallsyms]") {
+        "[kernel.kallsyms]"
+    } else {
+        path
+    }
 }
 
 fn parse_sample_for_summary(
