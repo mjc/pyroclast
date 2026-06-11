@@ -6218,4 +6218,137 @@ mod tests {
             "alpha;leaf 7\nbeta;leaf 3\n"
         );
     }
+
+    fn other_callchain() -> super::SampleCallchainState {
+        super::SampleCallchainState::Other {
+            has_callchain: true,
+            has_frames: false,
+        }
+    }
+
+    #[test]
+    fn arch_fallback_cannot_advance_only_when_x86_bp_below_sp() {
+        // backends/x86_64_unwind.c: the rbp fallback writes new_sp = fp + 16
+        // and rejects the frame with `if (sp >= fp) return false;` — i.e. it
+        // advances only when the frame pointer sits above the stack pointer.
+        // pyroclast attempts the fallback only when `bp >= sp`, so `bp < sp`
+        // means the fallback can never produce a caller.
+        let mut below = test_x86_regs(0x4000);
+        below.sp = 0x7fff_0000;
+        below.bp = 0x7ffe_ff00; // bp < sp
+        assert!(super::arch_fallback_provably_cannot_advance(
+            &PerfUserRegs::X86_64(below)
+        ));
+
+        let mut at_or_above = test_x86_regs(0x4000);
+        at_or_above.sp = 0x7fff_0000;
+        at_or_above.bp = 0x7fff_0008; // bp > sp
+        assert!(!super::arch_fallback_provably_cannot_advance(
+            &PerfUserRegs::X86_64(at_or_above)
+        ));
+    }
+
+    #[test]
+    fn arch_fallback_cannot_advance_only_when_aarch64_lr_is_zero() {
+        // backends/aarch64_unwind.c: the caller pc comes from lr and the walk
+        // returns false immediately when `lr == 0`. fp/sp are irrelevant to
+        // whether the FIRST caller can be produced.
+        let zero_lr = crate::perfdata::unwind::PerfAarch64Regs {
+            pc: 0x4000,
+            sp: 0x1000,
+            fp: 0x1010,
+            lr: 0,
+        };
+        assert!(super::arch_fallback_provably_cannot_advance(
+            &PerfUserRegs::Aarch64(zero_lr)
+        ));
+
+        let live_lr = crate::perfdata::unwind::PerfAarch64Regs {
+            lr: 0x5000,
+            ..zero_lr
+        };
+        assert!(!super::arch_fallback_provably_cannot_advance(
+            &PerfUserRegs::Aarch64(live_lr)
+        ));
+    }
+
+    #[test]
+    fn classify_object_unwind_routes_leaf_skip_and_unwind() {
+        let leaf_only_ctx = super::UserUnwindContext {
+            sample_callchain: super::SampleCallchainPresence::Present,
+            callchain: other_callchain(),
+            initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
+            module_count: 1,
+            frame_pointer_at_or_above_stack_pointer: false,
+            syscall_return_state: false,
+        };
+        assert_eq!(
+            super::classify_object_unwind(leaf_only_ctx, true),
+            super::ObjectUnwindClass::LeafOnly
+        );
+        assert_eq!(
+            super::classify_object_unwind(leaf_only_ctx, false),
+            super::ObjectUnwindClass::MustUnwind
+        );
+
+        // Research §3.5: a recorded kernel->user callchain is never extended
+        // with user DWARF callers, so it skips unwinding entirely regardless of
+        // the leaf-only predicate.
+        let kernel_user = super::UserUnwindContext {
+            callchain: super::SampleCallchainState::KernelWithUserFrame,
+            ..leaf_only_ctx
+        };
+        assert_eq!(
+            super::classify_object_unwind(kernel_user, true),
+            super::ObjectUnwindClass::SkipUnwind
+        );
+        assert_eq!(
+            super::classify_object_unwind(kernel_user, false),
+            super::ObjectUnwindClass::SkipUnwind
+        );
+    }
+
+    #[test]
+    fn accepted_frames_emit_leaf_only_when_predicate_holds() {
+        // gap-5gr: when the leaf-only predicate holds the accepted list is the
+        // single sampled-IP leaf, even if framehop produced a (spurious)
+        // caller — libdwfl would have stopped after the initial-frame callback.
+        let regs = test_regs(0x4000);
+        assert_eq!(
+            super::perf_accepted_object_unwind_frames(&regs, other_callchain(), true, Vec::new()),
+            vec![0x4000]
+        );
+        assert_eq!(
+            super::perf_accepted_object_unwind_frames(
+                &regs,
+                other_callchain(),
+                true,
+                vec![0x4000, 0x9999],
+            ),
+            vec![0x4000],
+            "a framehop heuristic caller is dropped when perf/libdwfl emits only the leaf"
+        );
+    }
+
+    #[test]
+    fn accepted_frames_keep_full_unwind_when_not_leaf_only() {
+        // When the predicate does not hold (e.g. CFI covers the IP), framehop
+        // is authoritative and every accepted frame is kept.
+        let regs = test_regs(0x4000);
+        assert_eq!(
+            super::perf_accepted_object_unwind_frames(
+                &regs,
+                other_callchain(),
+                false,
+                vec![0x4000, 0x9999],
+            ),
+            vec![0x4000, 0x9999]
+        );
+        // A non-leaf-only sample with no accepted frames stays empty: the
+        // sampled IP is never invented absent the scenario-D predicate.
+        assert!(
+            super::perf_accepted_object_unwind_frames(&regs, other_callchain(), false, Vec::new())
+                .is_empty()
+        );
+    }
 }

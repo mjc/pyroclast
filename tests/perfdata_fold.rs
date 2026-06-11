@@ -1186,6 +1186,173 @@ fn keeps_current_ip_only_object_unwind_from_pid_specific_modules_like_perf_libdw
     assert_eq!(folded, expected);
 }
 
+/// Build a `--call-graph dwarf` x86_64 perf.data with a single sample over the
+/// synthetic fixture: one MMAP covering `[0, 0x1000_0000)` and one user-stack
+/// sample. `regs` are `[bp, sp, ip]` in perf's ascending register order
+/// (RBP=6, RSP=7, IP=8).
+fn x86_leaf_only_perfdata(fixture_path: &str, regs: [u64; 3], stack: [u8; 24]) -> Vec<u8> {
+    perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            (1 << 6) | (1 << 7) | (1 << 8),
+        )],
+        [
+            record_bytes(1, &mmap_payload(11, 11, 0, 0x1000_0000, 0, fixture_path)),
+            record_bytes(
+                9,
+                &sample_payload_with_user_stack(regs[2], 11, 12, [], 1, regs, stack),
+            ),
+        ],
+    )
+}
+
+#[test]
+fn emits_scenario_d_leaf_when_no_cfi_and_bp_below_sp_like_perf_libdw() {
+    // gap-5gr scenario D: the sampled IP (0x4000) is reported into a module
+    // but no .eh_frame FDE covers it (the fixture's only FDE is at [0x100,
+    // 0x104)), and bp < sp so elfutils' x86_64 rbp fallback (`if (sp >= fp)
+    // return false;`, backends/x86_64_unwind.c) can never advance. libdwfl
+    // fires the initial-frame callback exactly once, so perf prints the single
+    // leaf. bp=0x7ffe_ff00 < sp=0x7fff_0000.
+    let fixture = SyntheticX86_64Object::create();
+    let bytes = x86_leaf_only_perfdata(
+        &fixture.path_string(),
+        [0x7ffe_ff00, 0x7fff_0000, 0x4000],
+        [
+            0, 0, 0, 0, 0, 0, 0, 0, //
+            0x40, 0, 0, 0, 0, 0, 0, 0, //
+            0x34, 0x12, 0, 0, 0, 0, 0, 0,
+        ],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+    assert_eq!(folded, format!(":12;[{}] 1\n", fixture.file_name()));
+}
+
+#[test]
+fn does_not_take_leaf_only_path_when_bp_at_or_above_sp_is_fallback_territory_like_perf_libdw() {
+    // bp >= sp is exactly when elfutils attempts the rbp fallback
+    // (backends/x86_64_unwind.c only fails on the *final* `if (sp >= fp)`
+    // guard), so the leaf-only predicate's register clause is false and this
+    // sample is MustUnwind, not LeafOnly: framehop is authoritative and the
+    // result is whatever it (and the elfutils fp fallback) recover, never a
+    // truncated synthetic leaf. Here framehop yields the seeded IP and the
+    // elfutils fallback only runs when framehop returned nothing, so the result
+    // is the genuine single seed frame — identical bytes to case 1's output,
+    // but reached through the full unwind path rather than leaf-only
+    // truncation. (The companion unit test
+    // `arch_fallback_cannot_advance_only_when_x86_bp_below_sp` pins the
+    // predicate edge directly.)
+    let fixture = SyntheticX86_64Object::create();
+    let bytes = x86_leaf_only_perfdata(
+        &fixture.path_string(),
+        [0x7fff_0008, 0x7fff_0000, 0x4000],
+        [
+            0, 0, 0, 0, 0, 0, 0, 0, //
+            0x40, 0, 0, 0, 0, 0, 0, 0, //
+            0x34, 0x12, 0, 0, 0, 0, 0, 0,
+        ],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+    assert_eq!(folded, format!(":12;[{}] 1\n", fixture.file_name()));
+}
+
+#[test]
+fn does_not_truncate_to_leaf_when_cfi_covers_ip_like_perf_libdw() {
+    // When an FDE covers the sampled IP, handle_cfi (libdwfl/frame_unwind.c)
+    // may yield either PC_UNDEFINED (clean end-of-stack -> leaf only) or a
+    // PC_SET caller, and the two are indistinguishable a priori — so this case
+    // is MustUnwind and framehop is authoritative. The fixture's FDE covers
+    // [0x100, 0x104); sample at vaddr 0x100 (mapping base 0) with bp < sp. The
+    // leaf-only predicate's `!has_unwind_info_for_ip` clause is false here, so
+    // no leaf-only truncation occurs and framehop's own result (the seed IP,
+    // since the FDE has only nops and recovers no usable caller) stands.
+    let fixture = SyntheticX86_64Object::create();
+    let bytes = x86_leaf_only_perfdata(
+        &fixture.path_string(),
+        [0x7ffe_ff00, 0x7fff_0000, 0x100],
+        [0_u8; 24],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+    // CFI covers the IP, so this is not leaf-only; framehop runs and yields the
+    // seed. The output is the single covered-IP frame produced by the real
+    // unwind, NOT a leaf-only-truncated synthetic.
+    assert_eq!(folded, format!(":12;[{}] 1\n", fixture.file_name()));
+}
+
+#[test]
+fn skip_gate_is_byte_identical_to_running_the_full_unwind_for_leaf_only_samples() {
+    // The gap-pkh skip gate is a pure optimization: classifying a leaf-only
+    // sample and skipping framehop must produce the exact same folded output
+    // as running framehop and letting the shared acceptance tail truncate to
+    // the leaf. The fold path always takes the gated route, so we assert the
+    // gated output equals the independently-known perf-correct single leaf.
+    let fixture = SyntheticX86_64Object::create();
+    let leaf_only = x86_leaf_only_perfdata(
+        &fixture.path_string(),
+        [0x7ffe_ff00, 0x7fff_0000, 0x4000],
+        [
+            0, 0, 0, 0, 0, 0, 0, 0, //
+            0x40, 0, 0, 0, 0, 0, 0, 0, //
+            0x34, 0x12, 0, 0, 0, 0, 0, 0,
+        ],
+    );
+
+    let gated = fold_perfdata_callchains(&leaf_only).expect("folded");
+    assert_eq!(gated, format!(":12;[{}] 1\n", fixture.file_name()));
+}
+
+#[test]
+fn emits_scenario_d_leaf_on_aarch64_when_no_cfi_and_lr_is_zero_like_perf_libdw() {
+    // gap-5gr scenario D on aarch64: pc (0x4000) is reported into a module with
+    // no FDE covering it (the fixture's only FDE is [0x100, 0x104)) and lr == 0,
+    // so elfutils' backends/aarch64_unwind.c fails before producing any caller
+    // (`if (lr == 0 || !setfunc(...)) return false;`). libdwfl fires the
+    // initial-frame callback exactly once, so perf prints the single leaf.
+    // Registers are ascending fp(29), lr(30), sp(31), pc(32) = [fp, lr, sp, pc].
+    let fixture = SyntheticAarch64Object::create();
+    let mask = (1_u64 << 29) | (1_u64 << 30) | (1_u64 << 31) | (1_u64 << 32);
+    let bytes = perfdata_with_records_attrs_and_arch_feature(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            mask,
+        )],
+        [
+            record_bytes(
+                1,
+                &mmap_payload(11, 11, 0, 0x1000_0000, 0, fixture.path_string().as_ref()),
+            ),
+            record_bytes(
+                9,
+                &sample_payload_with_user_stack(
+                    0x4000,
+                    11,
+                    12,
+                    [],
+                    1,
+                    // fp = 0x1010, lr = 0 (ends the walk), sp = 0x1000, pc = 0x4000.
+                    [0x1010, 0, 0x1000, 0x4000],
+                    [0_u8; 0x40],
+                ),
+            ),
+        ],
+        "aarch64",
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+    assert_eq!(folded, format!(":12;[{}] 1\n", fixture.file_name()));
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn keeps_object_unwind_dso_leaf_when_framehop_only_returns_current_ip_like_perf_libdw() {
@@ -4007,6 +4174,86 @@ impl SyntheticX86_64Object {
 
     fn file_name(&self) -> &'static str {
         "fixture-x86-64"
+    }
+}
+
+/// Minimal aarch64 ELF, structurally identical to `SyntheticX86_64Object` but
+/// with `e_machine = EM_AARCH64` (183) and a `.eh_frame` FDE that covers only
+/// `[0x100, 0x104)`. Used to pin the aarch64 scenario-D leaf-only case: a
+/// reported module, no FDE covering the sampled pc, and `lr == 0` so the
+/// elfutils `backends/aarch64_unwind.c` fallback fails before producing any
+/// caller.
+struct SyntheticAarch64Object {
+    _dir: tempfile::TempDir,
+    path: std::path::PathBuf,
+}
+
+impl SyntheticAarch64Object {
+    fn create() -> Self {
+        let mut bytes = vec![0_u8; 0x240];
+        bytes[0..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2; // ELFCLASS64
+        bytes[5] = 1; // ELFDATA2LSB
+        bytes[6] = 1; // EV_CURRENT
+        bytes[16..18].copy_from_slice(&3_u16.to_le_bytes()); // ET_DYN
+        bytes[18..20].copy_from_slice(&183_u16.to_le_bytes()); // EM_AARCH64
+        bytes[20..24].copy_from_slice(&1_u32.to_le_bytes()); // e_version
+        bytes[32..40].copy_from_slice(&64_u64.to_le_bytes()); // e_phoff
+        bytes[40..48].copy_from_slice(&0x180_u64.to_le_bytes()); // e_shoff
+        bytes[52..54].copy_from_slice(&64_u16.to_le_bytes()); // e_ehsize
+        bytes[54..56].copy_from_slice(&56_u16.to_le_bytes()); // e_phentsize
+        bytes[56..58].copy_from_slice(&1_u16.to_le_bytes()); // e_phnum
+        bytes[58..60].copy_from_slice(&64_u16.to_le_bytes()); // e_shentsize
+        bytes[60..62].copy_from_slice(&3_u16.to_le_bytes()); // e_shnum
+        bytes[62..64].copy_from_slice(&2_u16.to_le_bytes()); // e_shstrndx
+        bytes[64..68].copy_from_slice(&1_u32.to_le_bytes()); // PT_LOAD
+        bytes[68..72].copy_from_slice(&5_u32.to_le_bytes()); // PF_R | PF_X
+        bytes[96..104].copy_from_slice(&0x200_u64.to_le_bytes()); // p_filesz
+        bytes[104..112].copy_from_slice(&0x1_0000_u64.to_le_bytes()); // p_memsz
+        bytes[112..120].copy_from_slice(&0x1000_u64.to_le_bytes()); // p_align
+        let eh_frame: [u8; 52] = [
+            0x14, 0, 0, 0, // CIE length
+            0, 0, 0, 0, // CIE id
+            0x01, b'z', b'R', 0, // version, augmentation "zR"
+            0x01, 0x78, 0x1e, // code align 1, data align -8, ra 30 (aarch64 LR)
+            0x01, 0x1b, // augmentation: FDE encoding pcrel|sdata4
+            0, 0, 0, 0, 0, 0, 0, // DW_CFA_nop padding
+            0x14, 0, 0, 0, // FDE length
+            0x1c, 0, 0, 0, // CIE pointer (back 28 bytes)
+            0xe0, 0xff, 0xff, 0xff, // pc_begin: pcrel -0x20 -> vaddr 0x100
+            0x04, 0, 0, 0, // pc_range 4
+            0, // augmentation data length
+            0, 0, 0, 0, 0, 0, 0, // DW_CFA_nop padding
+            0, 0, 0, 0, // terminator
+        ];
+        bytes[0x100..0x100 + eh_frame.len()].copy_from_slice(&eh_frame);
+        let strtab = b"\0.eh_frame\0.shstrtab\0";
+        bytes[0x140..0x140 + strtab.len()].copy_from_slice(strtab);
+        let mut section =
+            |index: usize, name: u32, kind: u32, flags: u64, addr: u64, offset: u64, size: u64| {
+                let base = 0x180 + index * 64;
+                bytes[base..base + 4].copy_from_slice(&name.to_le_bytes());
+                bytes[base + 4..base + 8].copy_from_slice(&kind.to_le_bytes());
+                bytes[base + 8..base + 16].copy_from_slice(&flags.to_le_bytes());
+                bytes[base + 16..base + 24].copy_from_slice(&addr.to_le_bytes());
+                bytes[base + 24..base + 32].copy_from_slice(&offset.to_le_bytes());
+                bytes[base + 32..base + 40].copy_from_slice(&size.to_le_bytes());
+                bytes[base + 48..base + 56].copy_from_slice(&8_u64.to_le_bytes());
+            };
+        section(1, 1, 1, 2, 0x100, 0x100, 52); // .eh_frame PROGBITS ALLOC
+        section(2, 11, 3, 0, 0, 0x140, 21); // .shstrtab STRTAB
+        let dir = tempfile::tempdir().expect("fixture dir");
+        let path = dir.path().join("fixture-aarch64");
+        std::fs::write(&path, &bytes).expect("write fixture elf");
+        Self { _dir: dir, path }
+    }
+
+    fn path_string(&self) -> String {
+        self.path.to_string_lossy().into_owned()
+    }
+
+    fn file_name(&self) -> &'static str {
+        "fixture-aarch64"
     }
 }
 
