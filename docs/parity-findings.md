@@ -129,7 +129,25 @@ work on the dwarf path. Needs: per-arch reg-mask decoding (the regs are already 
 mask), framehop's aarch64 unwinder, and the aarch64 `ebl_unwind` (x29 chain) analogue.
 Tracked as follow-up; the fp path works on any arch.
 
-## The two open .beads parity issues reduce to one model (x86_64 dwarf path)
+## The two .beads parity issues — CLOSED (leaf-only model landed)
+
+pyroclast-5gr and pyroclast-pkh are closed. The leaf-only predicate is implemented
+exactly as sourced: emit (or truncate to) the single seeded-IP leaf when the
+initial IP reported into a module, no FDE covers it, and the arch ebl fallback
+cannot advance (x86_64 `bp < sp` per backends/x86_64_unwind.c's `sp >= fp+16`
+guard; aarch64 `lr == 0`). When CFI covers the ip the sample stays MustUnwind —
+an FDE row with undefined RA (clean leaf) and one with a real caller are
+indistinguishable without unwinding (libdwfl handle_cfi). The same classification
+runs before framehop (SkipUnwind | LeafOnly | MustUnwind, memoized per (pid, ip)),
+CFI presence is memoized per ip, and the module-report retry loop re-unwinds only
+when a module actually loaded (PERF-4). The unsourced .so-vs-exe initial-frame
+policy was removed. Validation caveat: the original 114-vs-144 folded-line gap was
+measured against an x86_64 perf.data we cannot regenerate locally; the model is
+test-pinned to the cited elfutils/perf sources and the arm64 oracle is unchanged,
+but re-running the original x86_64 comparison on a Linux x86 box remains the final
+confirmation.
+
+## Original analysis (historical)
 
 From `.ace-research-perf-unwind.md`: libdwfl always fires the frame callback once for
 the sampled IP before unwinding, and perf keeps partial stacks. So:
