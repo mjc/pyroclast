@@ -15,12 +15,15 @@ set -eu
 # This worktree (the code under test).
 worktree="$(git rev-parse --show-toplevel)"
 # The MAIN checkout that owns the recorded oracle artifacts. Override with
-# ORACLE_MAIN_REPO=/path/to/main if your main checkout is elsewhere.
-main_repo="${ORACLE_MAIN_REPO:-$(git rev-parse --git-common-dir | sed 's#/\.git.*##; s#/\.git$##')}"
-case "$main_repo" in
-    /*) : ;;
-    *) main_repo="$worktree/$main_repo" ;;
-esac
+# ORACLE_MAIN_REPO=/path/to/main if your main checkout is elsewhere. The
+# common dir is "<main>/.git" from any worktree and plain ".git" from the main
+# checkout itself.
+if [ -n "${ORACLE_MAIN_REPO:-}" ]; then
+    main_repo="$ORACLE_MAIN_REPO"
+else
+    common_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
+    main_repo="$(dirname "$common_dir")"
+fi
 out="$main_repo/target/oracle"
 
 if [ ! -d "$out" ]; then
