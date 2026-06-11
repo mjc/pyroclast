@@ -141,6 +141,13 @@ pub trait SymbolResolver {
 pub struct ResolvedSymbolFrames {
     pub frames: Vec<String>,
     pub has_base_symbol: bool,
+    /// The `+0x<off>` suffix (relative to the containing symtab symbol) that
+    /// perf prints on every inline AND base frame for this address.
+    /// `tools/perf/util/symbol_fprintf.c __symbol__fprintf_symname_offs` uses
+    /// `al->addr - sym->start`, and an inline frame's fake symbol reuses
+    /// `base_sym->start` (`tools/perf/util/srcline.c new_inline_sym`), so the
+    /// whole group shares one offset.
+    pub base_offset: Option<String>,
 }
 
 impl ResolvedSymbolFrames {
@@ -150,6 +157,7 @@ impl ResolvedSymbolFrames {
         Self {
             frames,
             has_base_symbol,
+            base_offset: None,
         }
     }
 }
@@ -180,6 +188,7 @@ struct CachedMappingFrames {
     frames: Vec<String>,
     folded_rendered: String,
     has_base_symbol: bool,
+    base_offset: Option<String>,
 }
 
 pub struct Addr2lineResolver<'a, R> {
@@ -291,6 +300,9 @@ struct PerfDwarfCachedUnit {
 struct PerfObjectSymbolNames<'a> {
     bare: Option<&'a str>,
     with_offset: Option<String>,
+    /// Just the `+0x<off>` suffix of `with_offset`, shared by every inline and
+    /// base frame at this address in perf-script output.
+    offset_suffix: Option<String>,
 }
 
 #[derive(Default)]
@@ -313,6 +325,12 @@ pub struct PerfSymbolResolver<O> {
     system_map_kallsyms: Option<Kallsyms>,
     system_map_candidates: Vec<PathBuf>,
     system_map_kallsyms_cache: OnceLock<Option<Kallsyms>>,
+    /// `/sys/kernel/notes` (or a test override) — the live kernel's GNU
+    /// build-id note. Used to confirm the running kernel matches the build-id
+    /// recorded in the perf.data before trusting live `/proc/kallsyms` for
+    /// `[kernel.kallsyms]` frames.
+    live_kernel_notes_path: Option<PathBuf>,
+    live_kernel_build_id_cache: OnceLock<Option<String>>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -659,6 +677,8 @@ where
             system_map_kallsyms: None,
             system_map_candidates: Vec::new(),
             system_map_kallsyms_cache: OnceLock::new(),
+            live_kernel_notes_path: None,
+            live_kernel_build_id_cache: OnceLock::new(),
         }
     }
 
@@ -752,8 +772,43 @@ where
         let mut this = self;
         if this.live_kallsyms.is_none() {
             this.live_kallsyms_path = Some(path.to_path_buf());
+            // Pair the live kallsyms with the running kernel's build-id note so
+            // we only trust it for [kernel.kallsyms] frames when it matches the
+            // perf.data's recorded kernel build-id.
+            if this.live_kernel_notes_path.is_none() {
+                this.live_kernel_notes_path = Some(PathBuf::from("/sys/kernel/notes"));
+            }
         }
         this
+    }
+
+    #[must_use]
+    pub fn with_live_kernel_notes_path(mut self, path: PathBuf) -> Self {
+        self.live_kernel_notes_path = Some(path);
+        self
+    }
+
+    fn live_kernel_build_id(&self) -> Option<&str> {
+        self.live_kernel_build_id_cache
+            .get_or_init(|| {
+                let path = self.live_kernel_notes_path.as_ref()?;
+                let bytes = std::fs::read(path).ok()?;
+                gnu_build_id_from_notes(&bytes)
+            })
+            .as_deref()
+    }
+
+    /// True when the running kernel's build-id matches the build-id recorded in
+    /// the perf.data, so live `/proc/kallsyms` describes the same kernel perf
+    /// symbolized against. perf trusts kallsyms for the recorded kernel; this is
+    /// the equivalent guard for the direct-fold path on the recording machine.
+    fn live_kernel_matches_recorded(&self) -> bool {
+        match &self.recorded_kernel_build_id {
+            Some(recorded) => self
+                .live_kernel_build_id()
+                .is_some_and(|live| live == recorded),
+            None => false,
+        }
     }
 }
 
@@ -861,6 +916,17 @@ impl Kallsyms {
             .map(|(_, symbol)| symbol.clone())
     }
 
+    /// Resolves an address to `name+0x<off>`, matching perf-script kernel
+    /// frames (`tools/perf/util/symbol_fprintf.c __symbol__fprintf_symname_offs`
+    /// prints the offset from the containing symbol, including `+0x0`).
+    #[must_use]
+    pub fn resolve_with_offset(&self, address: u64) -> Option<String> {
+        self.symbols
+            .range(..=address)
+            .next_back()
+            .map(|(start, symbol)| format!("{symbol}+0x{:x}", address - start))
+    }
+
     #[must_use]
     pub fn resolve_relocated(
         &self,
@@ -871,6 +937,18 @@ impl Kallsyms {
         let symbol_file_address = self.address_of(reference_symbol)?;
         let delta = symbol_file_address.wrapping_sub(recorded_reference_address);
         self.resolve(address.wrapping_add(delta))
+    }
+
+    #[must_use]
+    pub fn resolve_relocated_with_offset(
+        &self,
+        address: u64,
+        reference_symbol: &str,
+        recorded_reference_address: u64,
+    ) -> Option<String> {
+        let symbol_file_address = self.address_of(reference_symbol)?;
+        let delta = symbol_file_address.wrapping_sub(recorded_reference_address);
+        self.resolve_with_offset(address.wrapping_add(delta))
     }
 
     fn address_of(&self, name: &str) -> Option<u64> {
@@ -1030,6 +1108,27 @@ where
     }
 
     /// Resolves one borrowed perfdata mapping through the cache and returns the
+    /// inline frame slice together with the shared `+0x<off>` offset suffix
+    /// perf prints on every inline and base frame at this address.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backing resolver fails.
+    pub fn resolve_mapping_ref_with_offset(
+        &mut self,
+        mapping: &ResolvedMappingRef<'_>,
+    ) -> Result<(&[String], Option<&str>), String> {
+        let key = mapping_frame_key(mapping);
+        if !self.resolved_by_mapping.contains_key(&key) {
+            self.prefetch_mapping_refs(std::slice::from_ref(mapping))?;
+        }
+        self.resolved_by_mapping
+            .get(&key)
+            .map(|cached| (cached.frames.as_slice(), cached.base_offset.as_deref()))
+            .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())
+    }
+
+    /// Resolves one borrowed perfdata mapping through the cache and returns the
     /// pre-rendered folded fragment for its symbolized inline frames.
     ///
     /// # Errors
@@ -1160,6 +1259,7 @@ where
                         frames: resolved_frames.frames,
                         folded_rendered,
                         has_base_symbol: resolved_frames.has_base_symbol,
+                        base_offset: resolved_frames.base_offset,
                     },
                 );
             }
@@ -1273,6 +1373,7 @@ where
                         frames: resolved_frames.frames,
                         folded_rendered,
                         has_base_symbol: resolved_frames.has_base_symbol,
+                        base_offset: resolved_frames.base_offset,
                     },
                 );
             }
@@ -1639,7 +1740,13 @@ where
     }
 
     fn can_use_system_kernel_symbols(&self, request: &SymbolRequest) -> bool {
-        self.recorded_kernel_build_id.is_none() || request.path != Path::new("[kernel.kallsyms]")
+        // Safe to use system/live kernel symbols when either the perf.data
+        // recorded no kernel build-id, the request is not for the core kernel,
+        // or the running kernel's build-id matches the recorded one (the
+        // recording machine: live /proc/kallsyms describes the same kernel).
+        self.recorded_kernel_build_id.is_none()
+            || request.path != Path::new("[kernel.kallsyms]")
+            || self.live_kernel_matches_recorded()
     }
 }
 
@@ -1791,6 +1898,7 @@ where
                 resolved[index] = ResolvedSymbolFrames {
                     frames,
                     has_base_symbol,
+                    base_offset: object_symbols.offset_suffix,
                 };
             }
         }
@@ -1941,15 +2049,17 @@ impl SymbolResolver for RustAddr2lineResolver {
                     object_symbol,
                     object_symbols.with_offset.as_deref(),
                 );
-                if let Some(metadata) = &object_metadata {
-                    specialize_frames_from_debug_strings(
-                        &mut frames,
-                        &metadata.object_metadata.debug_names,
-                    );
-                }
+                // No .debug_str generic specialization here: inline-frame names
+                // now come from the DWARF linkage name demangled like perf's
+                // external-addr2line backend (fully qualified, perf-faithful).
+                // Re-specializing from .debug_str would rewrite e.g.
+                // `core::slice::<impl [T]>::sort_unstable` to `sort_unstable<u64>`,
+                // which perf never prints (verified against
+                // target/oracle/dwarf.perf.script).
                 resolved[index] = ResolvedSymbolFrames {
                     frames,
                     has_base_symbol,
+                    base_offset: object_symbols.offset_suffix,
                 };
             }
         }
@@ -1996,6 +2106,9 @@ fn resolve_base_frames_from_object_metadata(
             resolved[index] = ResolvedSymbolFrames {
                 frames,
                 has_base_symbol: true,
+                // The no-inline base path bakes +0x<off> into the single frame
+                // name via with_offset, so no separate per-line offset is used.
+                base_offset: None,
             };
         }
     }
@@ -2004,6 +2117,15 @@ fn resolve_base_frames_from_object_metadata(
 
 fn demangle_addr2line_name(name: &str) -> String {
     perf_dwarf_function_name(&addr2line::demangle_auto(Cow::Borrowed(name), None))
+}
+
+/// Demangles a mangled (linkage) symbol the way perf's external-addr2line
+/// srcline backend does: fully qualified, no trailing `::h<hash>`, generic
+/// args preserved (`dso__demangle_sym` ->
+/// `rust_demangle_display_demangle(..., /*alternate=*/true)`). Unlike
+/// [`demangle_addr2line_name`] it does NOT collapse to the unqualified leaf.
+fn demangle_addr2line_name_qualified(name: &str) -> String {
+    addr2line::demangle_auto(Cow::Borrowed(name), None).into_owned()
 }
 
 fn perf_name_with_object_alias(name: Option<String>, object_alias: Option<&str>) -> Option<String> {
@@ -2164,6 +2286,7 @@ impl PreparedObjectMetadata {
         PerfObjectSymbolNames {
             bare: self.object_symbol(address),
             with_offset: self.object_symbol_with_offset(address),
+            offset_suffix: self.object_symbols.symbol_offset_suffix(address),
         }
     }
 }
@@ -2203,6 +2326,12 @@ impl PerfObjectSymbolIndex {
         let candidate = self.symbol(address)?;
         let offset = address.saturating_sub(candidate.address);
         Some(format!("{}+0x{offset:x}", candidate.name))
+    }
+
+    fn symbol_offset_suffix(&self, address: u64) -> Option<String> {
+        let candidate = self.symbol(address)?;
+        let offset = address.saturating_sub(candidate.address);
+        Some(format!("+0x{offset:x}"))
     }
 
     fn symbol(&self, address: u64) -> Option<&PerfSymbolCandidate> {
@@ -2685,8 +2814,7 @@ fn perf_dwarf_collect_relevant_nodes<R>(
     let ranges = kind
         .map(|_| perf_dwarf_ranges(dwarf.die_ranges(unit, node.entry()).ok()).unwrap_or_default());
     let name = kind.and_then(|_| {
-        perf_dwarf_die_name(dwarf, unit, node.entry())
-            .map(|name| names.intern(perf_dwarf_function_name(&name)))
+        perf_dwarf_die_frame_name(dwarf, unit, node.entry()).map(|name| names.intern(name))
     });
     if let Some(kind) = kind {
         let mut children = Vec::new();
@@ -2903,6 +3031,82 @@ fn perf_dwarf_frame_names_from_index(
 
 fn perf_realfunc_name_replaces_base_symbol(name: &str, base_symbol: Option<&str>) -> bool {
     base_symbol.is_some_and(|base_symbol| name != base_symbol)
+}
+
+/// Resolves the printed frame name for one subprogram/inlined-subroutine DIE.
+///
+/// perf's external-addr2line srcline backend (the modern oracle build) names
+/// each frame from the ELF symtab / DWARF *linkage* (mangled) name and then
+/// demangles it itself with the Rust v0 demangler in alternate form
+/// (`tools/perf/util/srcline.c` `new_inline_sym` -> `dso__demangle_sym` ->
+/// `rust_demangle_display_demangle(..., /*alternate=*/true)` in
+/// `tools/perf/util/symbol.c`), which yields fully-qualified names without the
+/// trailing `::h<hash>` and with generic arguments preserved.
+/// `addr2line::demangle_auto` produces byte-identical output to perf's alternate
+/// Rust demangle for both legacy `_ZN` and v0 `_R` manglings, so the linkage
+/// name is demangled with it directly (NOT run through
+/// [`perf_dwarf_function_name`], which strips to the unqualified leaf and only
+/// applies to the bare `DW_AT_name` fallback).
+///
+/// Falls back to the bare `DW_AT_name` (perf's libdw backend spelling) when no
+/// linkage name is present, e.g. closures and shim DIEs.
+fn perf_dwarf_die_frame_name<R>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    entry: &gimli::DebuggingInformationEntry<R>,
+) -> Option<String>
+where
+    R: gimli::Reader,
+{
+    if let Some(linkage) = perf_dwarf_die_linkage_name(dwarf, unit, entry, 16) {
+        return Some(demangle_addr2line_name_qualified(&linkage));
+    }
+    perf_dwarf_die_name(dwarf, unit, entry).map(|name| perf_dwarf_function_name(&name))
+}
+
+fn perf_dwarf_die_linkage_name<R>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    entry: &gimli::DebuggingInformationEntry<R>,
+    recursion_limit: usize,
+) -> Option<String>
+where
+    R: gimli::Reader,
+{
+    if recursion_limit == 0 {
+        return None;
+    }
+    entry
+        .attr(gimli::DW_AT_linkage_name)
+        .and_then(|attr| dwarf.attr_string(unit, attr.value()).ok())
+        .and_then(|name| name.to_string_lossy().ok().map(Cow::into_owned))
+        .or_else(|| {
+            entry.attr(gimli::DW_AT_abstract_origin).and_then(|attr| {
+                perf_dwarf_origin_linkage_name(dwarf, unit, &attr.value(), recursion_limit - 1)
+            })
+        })
+        .or_else(|| {
+            entry.attr(gimli::DW_AT_specification).and_then(|attr| {
+                perf_dwarf_origin_linkage_name(dwarf, unit, &attr.value(), recursion_limit - 1)
+            })
+        })
+}
+
+fn perf_dwarf_origin_linkage_name<R>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    value: &gimli::AttributeValue<R>,
+    recursion_limit: usize,
+) -> Option<String>
+where
+    R: gimli::Reader,
+{
+    let gimli::AttributeValue::UnitRef(offset) = value else {
+        return None;
+    };
+    let mut entries = unit.entries_tree(Some(*offset)).ok()?;
+    let root = entries.root().ok()?;
+    perf_dwarf_die_linkage_name(dwarf, unit, root.entry(), recursion_limit)
 }
 
 fn perf_dwarf_die_name<R>(
@@ -3251,15 +3455,57 @@ fn build_id_hex(bytes: &[u8]) -> String {
     hex
 }
 
+/// Extracts the GNU build-id (lowercase hex) from a buffer of ELF notes such as
+/// `/sys/kernel/notes`. Walks the note stream looking for the
+/// `NT_GNU_BUILD_ID` (type 3) note with name "GNU\0" and returns its
+/// descriptor. Notes are little-endian on the supported targets (x86_64,
+/// aarch64), matching how perf stores build-ids in HEADER_BUILD_ID.
+fn gnu_build_id_from_notes(bytes: &[u8]) -> Option<String> {
+    const NT_GNU_BUILD_ID: u32 = 3;
+    let mut offset = 0usize;
+    while offset + 12 <= bytes.len() {
+        let read_u32 = |start: usize| {
+            u32::from_le_bytes([
+                bytes[start],
+                bytes[start + 1],
+                bytes[start + 2],
+                bytes[start + 3],
+            ])
+        };
+        let namesz = read_u32(offset) as usize;
+        let descsz = read_u32(offset + 4) as usize;
+        let note_type = read_u32(offset + 8);
+        let name_start = offset + 12;
+        let name_end = name_start.checked_add(namesz)?;
+        // Notes pad name and descriptor to 4-byte boundaries.
+        let name_padded = name_end.next_multiple_of(4);
+        let desc_start = name_padded;
+        let desc_end = desc_start.checked_add(descsz)?;
+        if desc_end > bytes.len() {
+            break;
+        }
+        if note_type == NT_GNU_BUILD_ID
+            && bytes.get(name_start..name_end) == Some(b"GNU\0")
+            && descsz > 0
+        {
+            return Some(build_id_hex(&bytes[desc_start..desc_end]));
+        }
+        offset = desc_end.next_multiple_of(4);
+    }
+    None
+}
+
 fn resolve_kernel_kallsyms(kallsyms: &Kallsyms, request: &SymbolRequest) -> Option<String> {
+    // perf-script prints kernel frames as `name+0x<off>` (symbol_fprintf.c),
+    // and the folded path strips the offset like every other frame.
     if let Some(relocation) = &request.kernel_relocation {
-        kallsyms.resolve_relocated(
+        kallsyms.resolve_relocated_with_offset(
             request.relative_address,
             &relocation.reference_symbol,
             relocation.recorded_reference_address,
         )
     } else {
-        kallsyms.resolve(request.relative_address)
+        kallsyms.resolve_with_offset(request.relative_address)
     }
 }
 
@@ -3364,9 +3610,90 @@ mod tests {
         PerfAddressRange, PerfDwarfDieKind, PerfDwarfDieNode, PerfDwarfNameInterner,
         PerfObjectSymbolIndex, PerfSymbolBinding, PerfSymbolCandidate, PerfSymbolScope,
         ResolvedMappingRef, RustAddr2lineResolver, SymbolFrameCache, SymbolRequest, SymbolResolver,
-        clean_object_symbol_request, perf_best_duplicate_symbol, perf_dwarf_frame_names_from_index,
+        clean_object_symbol_request, demangle_addr2line_name_qualified, gnu_build_id_from_notes,
+        perf_best_duplicate_symbol, perf_dwarf_frame_names_from_index,
         perf_dwarf_frame_ranges_from_roots, perf_frames_with_object_alias,
     };
+
+    #[test]
+    fn gnu_build_id_from_notes_reads_kernel_nt_gnu_build_id() {
+        // Real /sys/kernel/notes bytes from the oracle recording container
+        // (aarch64). Layout per note: namesz=4, descsz=20, type=3
+        // (NT_GNU_BUILD_ID), name "GNU\0", then the 20-byte build-id; followed
+        // by unrelated "Linux" notes that must be skipped.
+        let notes = [
+            0x04, 0x00, 0x00, 0x00, // namesz = 4
+            0x14, 0x00, 0x00, 0x00, // descsz = 20
+            0x03, 0x00, 0x00, 0x00, // type = NT_GNU_BUILD_ID
+            0x47, 0x4e, 0x55, 0x00, // "GNU\0"
+            0xcb, 0x97, 0xc0, 0xad, 0xd7, 0x3d, 0xc6, 0x0d, 0x73, 0xbb, 0x9a, 0xd7, 0xdc, 0x27,
+            0x85, 0xd8, 0x8b, 0x36, 0x44, 0xa0, // 20-byte build-id
+            0x06, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x4c, 0x69,
+            0x6e, 0x75, 0x78, 0x00, 0x00, 0x00, // a trailing "Linux" note
+        ];
+
+        assert_eq!(
+            gnu_build_id_from_notes(&notes).as_deref(),
+            Some("cb97c0add73dc60d73bb9ad7dc2785d88b3644a0")
+        );
+    }
+
+    #[test]
+    fn gnu_build_id_from_notes_skips_leading_non_build_id_note() {
+        // A "Linux" version note precedes the build-id note; the walker must
+        // honor 4-byte name/descriptor padding and find the later build-id.
+        let notes = [
+            0x06, 0x00, 0x00, 0x00, // namesz = 6 -> padded to 8
+            0x04, 0x00, 0x00, 0x00, // descsz = 4
+            0x00, 0x01, 0x00, 0x00, // type
+            0x4c, 0x69, 0x6e, 0x75, 0x78, 0x00, 0x00, 0x00, // "Linux\0" padded
+            0xde, 0xad, 0xbe, 0xef, // 4-byte desc
+            0x04, 0x00, 0x00, 0x00, // namesz = 4
+            0x04, 0x00, 0x00, 0x00, // descsz = 4
+            0x03, 0x00, 0x00, 0x00, // NT_GNU_BUILD_ID
+            0x47, 0x4e, 0x55, 0x00, // "GNU\0"
+            0x01, 0x23, 0x45, 0x67, // 4-byte build-id
+        ];
+
+        assert_eq!(gnu_build_id_from_notes(&notes).as_deref(), Some("01234567"));
+    }
+
+    #[test]
+    fn demangle_addr2line_name_qualified_matches_perf_external_addr2line_backend() {
+        // perf's external-addr2line srcline backend names each frame from the
+        // mangled symtab/DWARF linkage name and demangles it itself with the
+        // Rust v0 demangler in alternate form (tools/perf/util/srcline.c
+        // new_inline_sym -> tools/perf/util/symbol.c dso__demangle_sym ->
+        // rust_demangle_display_demangle(..., /*alternate=*/true)), keeping the
+        // fully-qualified path, dropping the trailing ::h<hash>, and preserving
+        // generic arguments. These expectations are copied byte-for-byte from
+        // target/oracle/dwarf.perf.script (perf 6.17.13, addr2line backend).
+        //
+        // Legacy `_ZN` manglings (core/std non-generic functions in symtab):
+        assert_eq!(
+            demangle_addr2line_name_qualified(
+                "_ZN4core5slice4sort8unstable4sort17hf487fc59c5378322E"
+            ),
+            "core::slice::sort::unstable::sort"
+        );
+        assert_eq!(
+            demangle_addr2line_name_qualified(
+                "_ZN91_$LT$T$u20$as$u20$core..slice..sort..shared..smallsort..UnstableSmallSortFreezeTypeImpl$GT$10small_sort17ha5f9b986560cf204E"
+            ),
+            "<T as core::slice::sort::shared::smallsort::UnstableSmallSortFreezeTypeImpl>::small_sort"
+        );
+        // v0 `_R` manglings (the std::rt::lang_start_internal inline group):
+        assert_eq!(
+            demangle_addr2line_name_qualified("_RNvNtCsfQfHhyvAE2O_3std2rt19lang_start_internal"),
+            "std::rt::lang_start_internal"
+        );
+        assert_eq!(
+            demangle_addr2line_name_qualified(
+                "_RINvNtCsfQfHhyvAE2O_3std9panicking12catch_unwindiNCNvNtB4_2rt19lang_start_internal0EB4_"
+            ),
+            "std::panicking::catch_unwind::<isize, std::rt::lang_start_internal::{closure#0}>"
+        );
+    }
 
     #[test]
     fn object_requests_use_elf_virtual_addresses_for_pie_file_offsets() {

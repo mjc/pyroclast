@@ -617,7 +617,16 @@ fn specializes_qualified_generic_placeholder_dwarf_names_from_debug_strings() {
 }
 
 #[test]
-fn perf_dwarf_frame_names_prefer_die_names_like_perf_script() {
+fn perf_dwarf_frame_names_match_external_addr2line_qualified_names_like_perf_script() {
+    // perf's external-addr2line srcline backend (the modern oracle build) names
+    // each frame from the mangled symtab/DWARF linkage name returned by
+    // `addr2line -f -i` and demangles it itself with the Rust v0 demangler in
+    // alternate form (tools/perf/util/srcline.c new_inline_sym ->
+    // tools/perf/util/symbol.c dso__demangle_sym ->
+    // rust_demangle_display_demangle(..., /*alternate=*/true)). The result is
+    // fully qualified with generic arguments preserved -- NOT the bare DWARF
+    // DW_AT_name leaf the older libdw backend printed. This test pins that
+    // pyroclast now matches the external-addr2line spelling frame-for-frame.
     let Some((profiling_binary, object_bytes)) = profiling_binary_fixture() else {
         return;
     };
@@ -629,14 +638,13 @@ fn perf_dwarf_frame_names_prefer_die_names_like_perf_script() {
                 return false;
             };
             let Some(expected) =
-                external_addr2line_frames_leaf_to_root(&profiling_binary, *address)
+                external_addr2line_qualified_frames_leaf_to_root(&profiling_binary, *address)
             else {
                 return false;
             };
-            frames.len() == expected.len()
-                && frames.iter().zip(expected.iter()).any(|(frame, external)| {
-                    frame != external && frame.contains('<') && !external.contains('<')
-                })
+            // Only meaningful where the inline chain carries a qualified
+            // generic name (so the libdw leaf spelling would have differed).
+            frames.len() == expected.len() && frames.iter().any(|frame| frame.contains('<'))
         })
     else {
         return;
@@ -644,13 +652,10 @@ fn perf_dwarf_frame_names_prefer_die_names_like_perf_script() {
 
     let frames =
         perf_dwarf_frame_names_from_object(&profiling_binary, address).expect("perf dwarf frames");
-    let expected = external_addr2line_frames_leaf_to_root(&profiling_binary, address)
+    let expected = external_addr2line_qualified_frames_leaf_to_root(&profiling_binary, address)
         .expect("external addr2line frames");
 
-    assert_eq!(frames.len(), expected.len());
-    assert!(frames.iter().zip(expected.iter()).any(|(frame, external)| {
-        frame != external && frame.contains('<') && !external.contains('<')
-    }));
+    assert_eq!(frames, expected);
 }
 
 #[test]
@@ -950,6 +955,34 @@ fn external_addr2line_frames_root_to_leaf(path: &Path, address: u64) -> Option<V
     external_addr2line_frames_leaf_to_root(path, address).map(perf_inline_frame_order)
 }
 
+/// Runs `addr2line -f -i -e` exactly like perf's external-addr2line backend
+/// (tools/perf/util/addr2line.c addr2line_subprocess_init passes `-a -i -f`
+/// and never `-C`), then demangles each mangled function-name line with the
+/// Rust alternate demangle the way perf's new_inline_sym -> dso__demangle_sym
+/// does. `addr2line::demangle_auto` is byte-identical to perf's alternate Rust
+/// demangle for both legacy `_ZN` and v0 `_R` symbols.
+fn external_addr2line_qualified_frames_leaf_to_root(
+    path: &Path,
+    address: u64,
+) -> Option<Vec<String>> {
+    let output = Command::new("addr2line")
+        .args(["-f", "-i", "-e", path.to_str()?, &format!("0x{address:x}")])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let frames = stdout
+        .lines()
+        .step_by(2)
+        .filter(|name| *name != "??")
+        .map(|name| addr2line::demangle_auto(Cow::Borrowed(name), None).into_owned())
+        .collect::<Vec<_>>();
+    (!frames.is_empty()).then_some(frames)
+}
+
 #[test]
 fn rejects_ambiguous_generic_dwarf_names_from_debug_strings() {
     let debug_strings =
@@ -1223,10 +1256,13 @@ ffffffff88000080 t asm_exc_page_fault
         ])
         .expect("symbols");
 
+    // perf-script prints kernel frames as `name+0x<off>`
+    // (tools/perf/util/symbol_fprintf.c __symbol__fprintf_symname_offs); the
+    // folded path strips the offset like every other frame.
     assert_eq!(
         symbols,
         vec![
-            Some("asm_exc_page_fault".to_string()),
+            Some("asm_exc_page_fault+0xf".to_string()),
             Some("app::main".to_string())
         ]
     );
@@ -1258,7 +1294,8 @@ fn perf_symbol_resolver_prefers_live_kallsyms_for_kernel_module_paths() {
         }])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![Some("zpl_iter_read".to_string())]);
+    // perf-script kernel frames carry the +0x<off> offset (symbol_fprintf.c).
+    assert_eq!(symbols, vec![Some("zpl_iter_read+0xe9".to_string())]);
     assert!(runner.commands().is_empty());
 }
 
@@ -1288,7 +1325,8 @@ ffffffff82000000 T later_kernel_symbol
         }])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![Some("asm_exc_page_fault".to_string())]);
+    // The relocated address lands on the symbol start, so perf prints +0x0.
+    assert_eq!(symbols, vec![Some("asm_exc_page_fault+0x0".to_string())]);
     assert!(runner.commands().is_empty());
 }
 
@@ -1318,7 +1356,7 @@ fn perf_symbol_resolver_loads_perfdata_kernel_build_id_cache() {
         }])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![Some("asm_exc_page_fault".to_string())]);
+    assert_eq!(symbols, vec![Some("asm_exc_page_fault+0xf".to_string())]);
     assert!(runner.commands().is_empty());
 }
 
@@ -1351,7 +1389,7 @@ fn perf_symbol_resolver_loads_perfdata_kernel_build_id_cache_from_file() {
         }])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![Some("asm_exc_page_fault".to_string())]);
+    assert_eq!(symbols, vec![Some("asm_exc_page_fault+0xf".to_string())]);
     assert!(runner.commands().is_empty());
 }
 
@@ -1462,7 +1500,9 @@ fn perf_symbol_resolver_constructor_uses_perfdata_cache_before_system_kallsyms()
         }])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![Some("cached_kernel_symbol".to_string())]);
+    // perf-script kernel frames carry +0x<off> (symbol_fprintf.c); folded
+    // output strips it.
+    assert_eq!(symbols, vec![Some("cached_kernel_symbol+0xf".to_string())]);
     assert!(runner.commands().is_empty());
 }
 
@@ -1534,7 +1574,8 @@ fn perf_symbol_resolver_prefers_perfdata_kallsyms_over_kernel_elf() {
         }])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![Some("__pi_memcpy".to_string())]);
+    // perf-script kernel frames carry +0x<off> (symbol_fprintf.c).
+    assert_eq!(symbols, vec![Some("__pi_memcpy+0xf".to_string())]);
     assert!(runner.commands().is_empty());
 }
 
@@ -1607,7 +1648,8 @@ ffffffff846997a0 T __pi_memcpy
         }])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![Some("__pi_memcpy".to_string())]);
+    // perf-script kernel frames carry +0x<off> (symbol_fprintf.c).
+    assert_eq!(symbols, vec![Some("__pi_memcpy+0xc".to_string())]);
     assert!(runner.commands().is_empty());
 }
 
@@ -1641,7 +1683,8 @@ ffffffff846997a0 T memcpy
         }])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![Some("__pi_memcpy".to_string())]);
+    // perf-script kernel frames carry +0x<off> (symbol_fprintf.c).
+    assert_eq!(symbols, vec![Some("__pi_memcpy+0xc".to_string())]);
 }
 
 #[test]
@@ -1672,7 +1715,8 @@ ffffffffc0e17dae t zfs_read [zfs]
         }])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![Some("zfs_read".to_string())]);
+    // perf-script kernel/module frames carry +0x<off> (symbol_fprintf.c).
+    assert_eq!(symbols, vec![Some("zfs_read+0x0".to_string())]);
     assert!(runner.commands().is_empty());
 }
 
@@ -1705,7 +1749,8 @@ ffffffffc1e17dae t igb_clean_rx_irq [igb]
     let symbols = resolver
         .resolve_batch(std::slice::from_ref(&zfs))
         .expect("symbols");
-    assert_eq!(symbols, vec![Some("zfs_read".to_string())]);
+    // perf-script kernel/module frames carry +0x<off> (symbol_fprintf.c).
+    assert_eq!(symbols, vec![Some("zfs_read+0x0".to_string())]);
 
     std::fs::write(
         &live_kallsyms,
@@ -1728,8 +1773,8 @@ ffffffffc2e17dae t unrelated_module_symbol [mlx5]
     assert_eq!(
         symbols,
         vec![
-            Some("zfs_read".to_string()),
-            Some("igb_clean_rx_irq".to_string())
+            Some("zfs_read+0x0".to_string()),
+            Some("igb_clean_rx_irq+0x0".to_string())
         ]
     );
     assert!(runner.commands().is_empty());
@@ -1763,7 +1808,8 @@ ffffffff846997a0 T memcpy
         }])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![Some("__pi_memcpy".to_string())]);
+    // perf-script kernel frames carry +0x<off> (symbol_fprintf.c).
+    assert_eq!(symbols, vec![Some("__pi_memcpy+0xc".to_string())]);
     assert!(runner.commands().is_empty());
 }
 
@@ -1983,7 +2029,9 @@ fn perf_symbol_resolver_uses_system_map_candidates_when_cache_is_missing() {
         }])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![Some("asm_exc_page_fault".to_string())]);
+    // perf-script kernel frames carry +0x<off> (symbol_fprintf.c); the
+    // relocated address lands on the symbol start.
+    assert_eq!(symbols, vec![Some("asm_exc_page_fault+0x0".to_string())]);
     assert!(runner.commands().is_empty());
 }
 
@@ -2024,11 +2072,12 @@ fn perf_symbol_resolver_keeps_live_kallsyms_for_modules_when_system_map_exists()
         ])
         .expect("symbols");
 
+    // perf-script kernel/module frames carry +0x<off> (symbol_fprintf.c).
     assert_eq!(
         symbols,
         vec![
-            Some("asm_exc_page_fault".to_string()),
-            Some("zfs_read".to_string())
+            Some("asm_exc_page_fault+0x0".to_string()),
+            Some("zfs_read+0x0".to_string())
         ]
     );
 }
