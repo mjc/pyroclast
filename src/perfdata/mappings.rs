@@ -181,6 +181,16 @@ impl MmapTable {
     }
 
     fn insert_mapping(&mut self, mapping: Mapping) {
+        // Common case: the new mapping does not overlap any existing mapping for
+        // its pid. Detect this in O(log n + matches) using the per-pid interval
+        // index and take a pure incremental insert, skipping the whole-table
+        // `mem::take` and global index rebuild. Only an actual overlap (a split)
+        // falls back to the rebuild-based path, which preserves perf's exact
+        // retained-mapping ordering and split semantics.
+        if !self.has_overlapping_mapping_for_pid(mapping.pid, mapping.start, mapping.end()) {
+            self.insert_mapping_without_overlap_fix(mapping);
+            return;
+        }
         let split_mappings = self.remove_overlapping_mappings_like_perf(&mapping);
         for split in split_mappings {
             self.insert_mapping_without_overlap_fix(split);
@@ -214,6 +224,46 @@ impl MmapTable {
         self.mappings = kept;
         self.rebuild_pid_indexes();
         split_mappings
+    }
+
+    /// Returns whether any existing mapping for `pid` overlaps the half-open
+    /// range `[start, end)`, using the per-pid interval index so the common
+    /// no-overlap case is `O(log n + matches)` rather than a full scan.
+    fn has_overlapping_mapping_for_pid(&self, pid: u32, start: u64, end: u64) -> bool {
+        self.any_indexed_mapping_in_range(pid, start, end, |_mapping| true)
+    }
+
+    /// Walks the per-pid interval index for mappings whose `[start, end)` range
+    /// intersects `[start, end)` and reports whether any matching mapping also
+    /// satisfies `predicate`. Mirrors the `max_end`-augmented descent used by
+    /// `resolve_mapping_index_for_pid`, but tests interval intersection instead
+    /// of point containment.
+    fn any_indexed_mapping_in_range(
+        &self,
+        pid: u32,
+        start: u64,
+        end: u64,
+        mut predicate: impl FnMut(&Mapping) -> bool,
+    ) -> bool {
+        let Some(bucket) = self.mappings_by_pid.get(&pid) else {
+            return false;
+        };
+        // Mappings are sorted by `start`; only those with `start < end` can
+        // overlap, so descend from the last such entry. The augmented `max_end`
+        // lets us stop once no earlier mapping can reach past `start`.
+        let mut upper_bound = bucket.partition_point(|indexed| indexed.start < end);
+        while upper_bound > 0 {
+            upper_bound -= 1;
+            let indexed = &bucket[upper_bound];
+            if indexed.max_end <= start {
+                break;
+            }
+            let mapping = &self.mappings[indexed.index];
+            if start < mapping.end() && mapping.start < end && predicate(mapping) {
+                return true;
+            }
+        }
+        false
     }
 
     fn insert_mapping_without_overlap_fix(&mut self, mut mapping: Mapping) {
@@ -364,12 +414,7 @@ impl MmapTable {
         len: u64,
     ) -> bool {
         let end = start.saturating_add(len);
-        self.mappings.iter().any(|mapping| {
-            mapping.pid == pid
-                && mapping.is_user_file_mapping()
-                && start < mapping.end()
-                && mapping.start < end
-        })
+        self.any_indexed_mapping_in_range(pid, start, end, Mapping::is_user_file_mapping)
     }
 
     #[must_use]
@@ -734,5 +779,138 @@ mod tests {
 
         assert!(!table.has_mapping_for_pid_cached(7, 0x5000, &mut cache));
         assert_eq!(cache.pid_index, None);
+    }
+
+    #[test]
+    fn incremental_insert_splits_multiple_overlapping_mappings_like_perf() {
+        // Two adjacent mappings, then a third that straddles both: the overlap
+        // path must remove both originals, emit before/after fragments in the
+        // perf-source order, and let the newest mapping win the shared interior.
+        let mut table = MmapTable::default();
+        table.insert_mmap(MmapRecord {
+            pid: 7,
+            tid: 7,
+            start: 0x1000,
+            len: 0x1000,
+            pgoff: 0,
+            path: "/first".to_string(),
+        });
+        table.insert_mmap(MmapRecord {
+            pid: 7,
+            tid: 7,
+            start: 0x2000,
+            len: 0x1000,
+            pgoff: 0,
+            path: "/second".to_string(),
+        });
+        table.insert_mmap(MmapRecord {
+            pid: 7,
+            tid: 7,
+            start: 0x1800,
+            len: 0x1000,
+            pgoff: 0x100,
+            path: "/straddle".to_string(),
+        });
+
+        // /first head survives below the straddle, /second tail above it.
+        assert_eq!(table.resolve(7, 0x1400).expect("first head").path, "/first");
+        assert_eq!(
+            table.resolve(7, 0x1900).expect("straddle body").path,
+            "/straddle"
+        );
+        assert_eq!(
+            table.resolve(7, 0x2900).expect("second tail").path,
+            "/second"
+        );
+        let straddle = table.resolve(7, 0x1900).expect("straddle relative");
+        assert_eq!(straddle.relative_address, 0x100 + 0x100);
+    }
+
+    #[test]
+    fn non_overlapping_insert_takes_fast_path_and_indexes_correctly() {
+        // Disjoint mappings (and a different pid) must not be treated as
+        // overlapping, so each insert takes the incremental fast path while
+        // still resolving and pruning correctly.
+        let mut table = MmapTable::default();
+        table.insert_mmap(MmapRecord {
+            pid: 7,
+            tid: 7,
+            start: 0x1000,
+            len: 0x100,
+            pgoff: 0,
+            path: "/a".to_string(),
+        });
+        table.insert_mmap(MmapRecord {
+            pid: 7,
+            tid: 7,
+            start: 0x3000,
+            len: 0x100,
+            pgoff: 0,
+            path: "/b".to_string(),
+        });
+        table.insert_mmap(MmapRecord {
+            pid: 9,
+            tid: 9,
+            start: 0x1000,
+            len: 0x100,
+            pgoff: 0,
+            path: "/other-pid".to_string(),
+        });
+
+        assert!(!table.has_overlapping_user_mapping_for_pid(7, 0x1100, 0x100));
+        assert!(!table.has_overlapping_user_mapping_for_pid(7, 0x2000, 0x800));
+        assert!(table.has_overlapping_user_mapping_for_pid(7, 0x10ff, 0x100));
+        assert!(table.has_overlapping_user_mapping_for_pid(7, 0x3080, 0x100));
+        // Adjacency is not overlap (half-open ranges).
+        assert!(!table.has_overlapping_user_mapping_for_pid(7, 0x1100, 0x10));
+        // Different pid's mapping must not count.
+        assert!(!table.has_overlapping_user_mapping_for_pid(8, 0x1000, 0x100));
+        assert_eq!(table.resolve(7, 0x1050).expect("/a").path, "/a");
+        assert_eq!(table.resolve(7, 0x3050).expect("/b").path, "/b");
+    }
+
+    #[test]
+    fn has_overlapping_user_mapping_matches_linear_scan_oracle() {
+        // The index-based overlap query must agree with an exhaustive linear
+        // scan across a dense, multi-pid set of mappings (including bracket
+        // paths that are not user-file mappings).
+        let segments: &[(u32, u64, u64, &str)] = &[
+            (7, 0x1000, 0x400, "/bin/a"),
+            (7, 0x1400, 0x400, "/bin/b"),
+            (7, 0x2000, 0x100, "/bin/c"),
+            (7, 0x2500, 0x800, "/bin/d"),
+            (7, 0x3000, 0x200, "[anon]"),
+            (9, 0x1200, 0x600, "/bin/e"),
+            (9, 0x4000, 0x100, "/bin/f"),
+        ];
+        let mut table = MmapTable::default();
+        for &(pid, start, len, path) in segments {
+            table.insert_mmap(MmapRecord {
+                pid,
+                tid: pid,
+                start,
+                len,
+                pgoff: 0,
+                path: path.to_string(),
+            });
+        }
+
+        for pid in [7_u32, 8, 9] {
+            for start in (0x0u64..0x5000).step_by(0x80) {
+                for len in [0u64, 0x40, 0x100, 0x900] {
+                    let end = start.saturating_add(len);
+                    let expected = segments.iter().any(|&(seg_pid, seg_start, seg_len, path)| {
+                        let seg_end = seg_start + seg_len;
+                        let is_user = !path.starts_with('[');
+                        seg_pid == pid && is_user && start < seg_end && seg_start < end
+                    });
+                    assert_eq!(
+                        table.has_overlapping_user_mapping_for_pid(pid, start, len),
+                        expected,
+                        "pid={pid} start={start:#x} len={len:#x}"
+                    );
+                }
+            }
+        }
     }
 }
