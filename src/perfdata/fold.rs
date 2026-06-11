@@ -2813,20 +2813,74 @@ where
             _ => write_perf_script_mapped_unknown_symbol_frame(writer, address, mapping.path),
         };
     }
-    let frames = cache.resolve_mapping_ref(mapping)?;
+    let (frames, base_offset) = cache.resolve_mapping_ref_with_offset(mapping)?;
     if frames.is_empty() {
         write_perf_script_mapped_unknown_symbol_frame(writer, address, mapping.path)?;
     } else if matches!(frame, FoldFrame::UserUnwind(_))
         && frames.len() == 1
         && !is_kernel_space_frame(address)
     {
+        // A single non-inline base frame already carries its +0x<off> baked in
+        // by perf_frames_with_object_alias_and_offset (the symtab with_offset
+        // form), so print it verbatim with the DSO path.
         write_perf_script_mapped_symbol_frame(writer, address, &frames[0], mapping.path)?;
     } else {
-        for label in frames.iter().rev() {
-            write_perf_script_mapped_symbol_frame(writer, address, label, mapping.path)?;
+        // perf's evsel_fprintf.c prints `sym+0x<off> (inlined)` for every inline
+        // frame and `sym+0x<off> (dso)` for the trailing non-inline base frame.
+        // Every frame shares one offset (__symbol__fprintf_symname_offs uses the
+        // base symbol start, which new_inline_sym reuses for the fake inline
+        // symbols). Frames are stored root-to-leaf, so .rev() prints leaf-first
+        // and the base (root) last as the non-inlined frame.
+        let last = frames.len() - 1;
+        for (printed_index, label) in frames.iter().rev().enumerate() {
+            let is_inlined = printed_index != last;
+            write_perf_script_inline_chain_frame(
+                writer,
+                address,
+                label,
+                base_offset,
+                mapping.path,
+                is_inlined,
+            )?;
         }
     }
     Ok(())
+}
+
+/// Prints one perf-script callchain frame for an inline-expanded address.
+///
+/// Matches `tools/perf/util/evsel_fprintf.c`: the symbol name carries the
+/// shared `+0x<off>` offset (`__symbol__fprintf_symname_offs`), inline frames
+/// print ` (inlined)` instead of a DSO name (`print_dso && (!sym ||
+/// !sym->inlined)`), and the trailing non-inline base frame prints the mapped
+/// DSO path (`map__fprintf_dsoname_dsoff`).
+fn write_perf_script_inline_chain_frame<W>(
+    writer: &mut W,
+    address: u64,
+    label: &str,
+    base_offset: Option<&str>,
+    path: &str,
+    is_inlined: bool,
+) -> Result<(), String>
+where
+    W: IoWrite + ?Sized,
+{
+    // Fallback labels (raw addresses, [unknown], [module]) keep their existing
+    // rendering and never take an offset or the (inlined) marker.
+    if label == UNKNOWN_FRAME
+        || label.starts_with("0x")
+        || module_fallback_label_module(label).is_some()
+    {
+        return write_perf_script_mapped_symbol_frame(writer, address, label, path);
+    }
+    let offset = base_offset.unwrap_or("");
+    if is_inlined {
+        writeln!(writer, "\t{address:16x} {label}{offset} (inlined)")
+            .map_err(|error| format!("failed to write perf script output: {error}"))
+    } else {
+        writeln!(writer, "\t{address:16x} {label}{offset} ({path})")
+            .map_err(|error| format!("failed to write perf script output: {error}"))
+    }
 }
 
 fn write_perf_script_inline_mapped_decision_frame<R, W>(
@@ -4142,9 +4196,11 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
     struct StaticFrameResolver {
         frames: Vec<String>,
         has_base_symbol: bool,
+        base_offset: Option<String>,
     }
 
     impl SymbolResolver for StaticFrameResolver {
@@ -4167,6 +4223,7 @@ mod tests {
                 ResolvedSymbolFrames {
                     frames: self.frames.clone(),
                     has_base_symbol: self.has_base_symbol,
+                    base_offset: self.base_offset.clone(),
                 };
                 requests.len()
             ])
@@ -4203,6 +4260,7 @@ mod tests {
                 .map(|request| ResolvedSymbolFrames {
                     frames: vec![format!("symbol_{:x}", request.relative_address)],
                     has_base_symbol: true,
+                    base_offset: None,
                 })
                 .collect()
         }
@@ -4488,6 +4546,7 @@ mod tests {
         let resolver = StaticFrameResolver {
             frames: vec!["core::num::flt2dec::strategy::dragon::mul_pow10".to_string()],
             has_base_symbol: false,
+            base_offset: None,
         };
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut buffers = super::FoldedRenderBuffers::default();
@@ -4521,6 +4580,7 @@ mod tests {
         let resolver = StaticFrameResolver {
             frames: vec!["core::num::flt2dec::strategy::dragon::format_shortest".to_string()],
             has_base_symbol: true,
+            base_offset: None,
         };
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut buffers = super::FoldedRenderBuffers::default();
@@ -4563,6 +4623,7 @@ mod tests {
                 "read_file_range".to_string(),
             ],
             has_base_symbol: false,
+            base_offset: None,
         };
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut buffers = super::FoldedRenderBuffers::default();
@@ -4601,6 +4662,7 @@ mod tests {
                 "quicksort<&str>".to_string(),
             ],
             has_base_symbol: true,
+            base_offset: None,
         };
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut buffers = super::FoldedRenderBuffers::default();
@@ -4638,6 +4700,7 @@ mod tests {
         let resolver = StaticFrameResolver {
             frames: vec!["_Fork+0x48".to_string()],
             has_base_symbol: true,
+            base_offset: None,
         };
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut written = Vec::new();
@@ -4654,6 +4717,91 @@ mod tests {
         assert_eq!(
             String::from_utf8(written).expect("utf-8"),
             "\t            1048 _Fork+0x48 (/nix/store/glibc/lib/libc.so.6)\n"
+        );
+    }
+
+    #[test]
+    fn inline_user_unwind_script_frame_marks_inlined_and_shares_offset_like_perf_script() {
+        // tools/perf/util/evsel_fprintf.c prints `sym+0x<off> (inlined)` for
+        // each inline frame and `sym+0x<off> (dso)` for the trailing non-inline
+        // base frame. The offset is shared across the whole group:
+        // __symbol__fprintf_symname_offs uses `al->addr - sym->start`, and an
+        // inline frame's fake symbol reuses base_sym->start (srcline.c
+        // new_inline_sym). Frames are stored root-to-leaf, so the leaf inline
+        // prints first and the base (root) prints last with the DSO path.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x1000,
+            len: 0x1000,
+            pgoff: 0,
+            path: "/tmp/oracle-workload".to_string(),
+        });
+        let resolver = StaticFrameResolver {
+            frames: vec![
+                "workload::main".to_string(),
+                "workload::churn_allocations".to_string(),
+                "core::slice::<impl [T]>::sort_unstable".to_string(),
+                "core::slice::sort::unstable::sort".to_string(),
+            ],
+            has_base_symbol: true,
+            base_offset: Some("+0x1fb".to_string()),
+        };
+        let mut symbol_cache = SymbolFrameCache::new(&resolver);
+        let mut written = Vec::new();
+
+        super::FoldFrameResolver::new(&mmap_table, true)
+            .write_script_frames_for_stack(
+                Some(11),
+                &[super::FoldFrame::UserUnwind(0x1427)],
+                Some(&mut symbol_cache),
+                &mut written,
+            )
+            .expect("write perf script frames");
+
+        assert_eq!(
+            String::from_utf8(written).expect("utf-8"),
+            "\t            1427 core::slice::sort::unstable::sort+0x1fb (inlined)\n\
+             \t            1427 core::slice::<impl [T]>::sort_unstable+0x1fb (inlined)\n\
+             \t            1427 workload::churn_allocations+0x1fb (inlined)\n\
+             \t            1427 workload::main+0x1fb (/tmp/oracle-workload)\n"
+        );
+    }
+
+    #[test]
+    fn single_base_user_unwind_script_frame_keeps_its_baked_offset_once_like_perf_script() {
+        // A non-inline base frame already carries +0x<off> in its label from the
+        // symtab with_offset form; it must not be doubled when --inline is set.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x1000,
+            len: 0x1000,
+            pgoff: 0,
+            path: "/tmp/oracle-workload".to_string(),
+        });
+        let resolver = StaticFrameResolver {
+            frames: vec!["core::slice::sort::unstable::quicksort::quicksort+0x6cb".to_string()],
+            has_base_symbol: true,
+            base_offset: Some("+0x6cb".to_string()),
+        };
+        let mut symbol_cache = SymbolFrameCache::new(&resolver);
+        let mut written = Vec::new();
+
+        super::FoldFrameResolver::new(&mmap_table, true)
+            .write_script_frames_for_stack(
+                Some(11),
+                &[super::FoldFrame::UserUnwind(0x16cb)],
+                Some(&mut symbol_cache),
+                &mut written,
+            )
+            .expect("write perf script frames");
+
+        assert_eq!(
+            String::from_utf8(written).expect("utf-8"),
+            "\t            16cb core::slice::sort::unstable::quicksort::quicksort+0x6cb (/tmp/oracle-workload)\n"
         );
     }
 
