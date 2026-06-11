@@ -1,0 +1,39 @@
+#!/usr/bin/env sh
+# Fast oracle iteration: rebuild pyroclast from THIS worktree inside the oracle
+# container and regenerate only the *.pyroclast.* artifacts + bench reports
+# against the already-recorded oracle inputs in the MAIN repo's target/oracle.
+# Prints the fp script/folded diffs and the inferno_compare scoreboard.
+#
+# Does NOT re-record perf.data (use scripts/perf-oracle for a full re-record).
+# The recorded oracle inputs (*.perf.data, *.perf.script, *.inferno.folded)
+# are never overwritten by this path.
+#
+# CARGO_TARGET_DIR lives under /oracle-out/target so release builds are
+# incremental across runs.
+set -eu
+
+# This worktree (the code under test).
+worktree="$(git rev-parse --show-toplevel)"
+# The MAIN checkout that owns the recorded oracle artifacts. Override with
+# ORACLE_MAIN_REPO=/path/to/main if your main checkout is elsewhere.
+main_repo="${ORACLE_MAIN_REPO:-$(git rev-parse --git-common-dir | sed 's#/\.git.*##; s#/\.git$##')}"
+case "$main_repo" in
+    /*) : ;;
+    *) main_repo="$worktree/$main_repo" ;;
+esac
+out="$main_repo/target/oracle"
+
+if [ ! -d "$out" ]; then
+    echo "oracle inputs not found at $out" >&2
+    echo "run scripts/perf-oracle once to record them, or set ORACLE_MAIN_REPO" >&2
+    exit 1
+fi
+
+docker build -t pyroclast-oracle -f "$worktree/scripts/oracle/Dockerfile" "$worktree/scripts/oracle"
+
+exec docker run --rm \
+    -v "$worktree:/work" \
+    -v "$out:/oracle-out" \
+    -v pyroclast-oracle-cargo-registry:/usr/local/cargo/registry \
+    -e "ORACLE_NAMES=${ORACLE_NAMES:-fp dwarf}" \
+    pyroclast-oracle bash /work/scripts/oracle/compare-in-container.sh
