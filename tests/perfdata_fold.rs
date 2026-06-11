@@ -1,3 +1,5 @@
+// Only the linux-gated libc leaf test parses real objects.
+#[cfg(target_os = "linux")]
 use object::{Object as _, ObjectSegment as _, ObjectSymbol as _};
 use proptest::prelude::*;
 use pyroclast::perfdata::fold::{
@@ -519,8 +521,8 @@ fn keeps_dwarf_user_stack_when_header_build_id_mmap2_overlaps_before_first_repor
         0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90,
         0xa0, 0xb0, 0xc0, 0xd0, 0xe0,
     ];
-    let current_exe = std::env::current_exe().expect("current exe");
-    let current_exe = current_exe.to_string_lossy();
+    let fixture = SyntheticX86_64Object::create();
+    let current_exe = fixture.path_string();
     let bytes = perfdata_with_records_attrs_and_build_id_feature(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -560,7 +562,7 @@ fn keeps_dwarf_user_stack_when_header_build_id_mmap2_overlaps_before_first_repor
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
-    let expected = format!(":12;[{}] 1\n", current_exe_file_name());
+    let expected = format!(":12;[{}] 1\n", fixture.file_name());
 
     assert_eq!(folded, expected);
 }
@@ -991,8 +993,8 @@ fn keeps_current_ip_only_object_unwind_for_mapped_dwarf_user_stack_like_perf_lib
     // state before attempting to unwind callers. perf's frame_callback() then
     // calls entry(pc), so a single current-IP callback is a real frame, not
     // something to drop.
-    let current_exe = std::env::current_exe().expect("current exe");
-    let current_exe = current_exe.to_string_lossy();
+    let fixture = SyntheticX86_64Object::create();
+    let current_exe = fixture.path_string();
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -1027,7 +1029,7 @@ fn keeps_current_ip_only_object_unwind_for_mapped_dwarf_user_stack_like_perf_lib
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
-    let expected = format!(":12;[{}] 1\n", current_exe_file_name());
+    let expected = format!(":12;[{}] 1\n", fixture.file_name());
 
     assert_eq!(folded, expected);
 }
@@ -1037,8 +1039,8 @@ fn keeps_current_ip_only_object_unwind_after_first_non_text_mapping_like_perf_li
     // perf reports the module selected by thread__find_symbol() for the
     // callback PC. If that report succeeds, entry() stores the current IP even
     // when no caller is recovered.
-    let current_exe = std::env::current_exe().expect("current exe");
-    let current_exe = current_exe.to_string_lossy();
+    let fixture = SyntheticX86_64Object::create();
+    let current_exe = fixture.path_string();
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -1077,15 +1079,15 @@ fn keeps_current_ip_only_object_unwind_after_first_non_text_mapping_like_perf_li
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
-    let expected = format!(":12;[{}] 1\n", current_exe_file_name());
+    let expected = format!(":12;[{}] 1\n", fixture.file_name());
 
     assert_eq!(folded, expected);
 }
 
 #[test]
 fn keeps_current_ip_only_object_unwind_from_executable_mmap2_like_perf_libdw() {
-    let current_exe = std::env::current_exe().expect("current exe");
-    let current_exe = current_exe.to_string_lossy();
+    let fixture = SyntheticX86_64Object::create();
+    let current_exe = fixture.path_string();
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -1132,15 +1134,15 @@ fn keeps_current_ip_only_object_unwind_from_executable_mmap2_like_perf_libdw() {
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
-    let expected = format!(":12;[{}] 1\n", current_exe_file_name());
+    let expected = format!(":12;[{}] 1\n", fixture.file_name());
 
     assert_eq!(folded, expected);
 }
 
 #[test]
 fn keeps_current_ip_only_object_unwind_from_pid_specific_modules_like_perf_libdw() {
-    let current_exe = std::env::current_exe().expect("current exe");
-    let current_exe = current_exe.to_string_lossy();
+    let fixture = SyntheticX86_64Object::create();
+    let current_exe = fixture.path_string();
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -1179,7 +1181,7 @@ fn keeps_current_ip_only_object_unwind_from_pid_specific_modules_like_perf_libdw
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
-    let expected = format!(":12;[{}] 1\n", current_exe_file_name());
+    let expected = format!(":12;[{}] 1\n", fixture.file_name());
 
     assert_eq!(folded, expected);
 }
@@ -3921,6 +3923,92 @@ impl SymbolResolver for InlineSymbolResolver {
 }
 
 struct ArrowInlineSymbolResolver;
+
+struct SyntheticX86_64Object {
+    _dir: tempfile::TempDir,
+    path: std::path::PathBuf,
+}
+
+impl SyntheticX86_64Object {
+    /// Minimal x86_64 ELF with one PT_LOAD covering [0, 0x10000) and no unwind
+    /// info. The current-IP-only tests previously mapped the host test binary,
+    /// which made framehop's unwind host-dependent (a Mach-O/arm64 test binary
+    /// recovers callers through __unwind_info that a Linux x86_64 binary does
+    /// not have at these offsets). A synthetic ELF pins the libdw scenario the
+    /// tests encode: module reports, framehop yields only the seeded IP.
+    fn create() -> Self {
+        let mut bytes = vec![0_u8; 0x240];
+        bytes[0..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2; // ELFCLASS64
+        bytes[5] = 1; // ELFDATA2LSB
+        bytes[6] = 1; // EV_CURRENT
+        bytes[16..18].copy_from_slice(&3_u16.to_le_bytes()); // ET_DYN
+        bytes[18..20].copy_from_slice(&62_u16.to_le_bytes()); // EM_X86_64
+        bytes[20..24].copy_from_slice(&1_u32.to_le_bytes()); // e_version
+        bytes[32..40].copy_from_slice(&64_u64.to_le_bytes()); // e_phoff
+        bytes[40..48].copy_from_slice(&0x180_u64.to_le_bytes()); // e_shoff
+        bytes[52..54].copy_from_slice(&64_u16.to_le_bytes()); // e_ehsize
+        bytes[54..56].copy_from_slice(&56_u16.to_le_bytes()); // e_phentsize
+        bytes[56..58].copy_from_slice(&1_u16.to_le_bytes()); // e_phnum
+        bytes[58..60].copy_from_slice(&64_u16.to_le_bytes()); // e_shentsize
+        bytes[60..62].copy_from_slice(&3_u16.to_le_bytes()); // e_shnum
+        bytes[62..64].copy_from_slice(&2_u16.to_le_bytes()); // e_shstrndx
+        bytes[64..68].copy_from_slice(&1_u32.to_le_bytes()); // PT_LOAD
+        bytes[68..72].copy_from_slice(&5_u32.to_le_bytes()); // PF_R | PF_X
+        bytes[96..104].copy_from_slice(&0x200_u64.to_le_bytes()); // p_filesz
+        bytes[104..112].copy_from_slice(&0x1_0000_u64.to_le_bytes()); // p_memsz
+        bytes[112..120].copy_from_slice(&0x1000_u64.to_le_bytes()); // p_align
+        // .eh_frame at vaddr/offset 0x100: one CIE and one FDE covering only
+        // [0x100, 0x104), so the module HAS unwind info but none of the
+        // sampled IPs are covered — the configuration where framehop stops
+        // after the seeded IP instead of taking a frame-pointer fallback,
+        // matching a real Linux binary sampled outside its FDE ranges.
+        let eh_frame: [u8; 52] = [
+            0x14, 0, 0, 0, // CIE length
+            0, 0, 0, 0, // CIE id
+            0x01, b'z', b'R', 0, // version, augmentation "zR"
+            0x01, 0x78, 0x10, // code align 1, data align -8, ra 16
+            0x01, 0x1b, // augmentation: FDE encoding pcrel|sdata4
+            0, 0, 0, 0, 0, 0, 0, // DW_CFA_nop padding
+            0x14, 0, 0, 0, // FDE length
+            0x1c, 0, 0, 0, // CIE pointer (back 28 bytes)
+            0xe0, 0xff, 0xff, 0xff, // pc_begin: pcrel -0x20 -> vaddr 0x100
+            0x04, 0, 0, 0, // pc_range 4
+            0, // augmentation data length
+            0, 0, 0, 0, 0, 0, 0, // DW_CFA_nop padding
+            0, 0, 0, 0, // terminator
+        ];
+        bytes[0x100..0x100 + eh_frame.len()].copy_from_slice(&eh_frame);
+        let strtab = b"\0.eh_frame\0.shstrtab\0";
+        bytes[0x140..0x140 + strtab.len()].copy_from_slice(strtab);
+        // Section headers: [0] SHT_NULL, [1] .eh_frame, [2] .shstrtab.
+        let mut section =
+            |index: usize, name: u32, kind: u32, flags: u64, addr: u64, offset: u64, size: u64| {
+                let base = 0x180 + index * 64;
+                bytes[base..base + 4].copy_from_slice(&name.to_le_bytes());
+                bytes[base + 4..base + 8].copy_from_slice(&kind.to_le_bytes());
+                bytes[base + 8..base + 16].copy_from_slice(&flags.to_le_bytes());
+                bytes[base + 16..base + 24].copy_from_slice(&addr.to_le_bytes());
+                bytes[base + 24..base + 32].copy_from_slice(&offset.to_le_bytes());
+                bytes[base + 32..base + 40].copy_from_slice(&size.to_le_bytes());
+                bytes[base + 48..base + 56].copy_from_slice(&8_u64.to_le_bytes());
+            };
+        section(1, 1, 1, 2, 0x100, 0x100, 52); // .eh_frame PROGBITS ALLOC
+        section(2, 11, 3, 0, 0, 0x140, 21); // .shstrtab STRTAB
+        let dir = tempfile::tempdir().expect("fixture dir");
+        let path = dir.path().join("fixture-x86-64");
+        std::fs::write(&path, &bytes).expect("write fixture elf");
+        Self { _dir: dir, path }
+    }
+
+    fn path_string(&self) -> String {
+        self.path.to_string_lossy().into_owned()
+    }
+
+    fn file_name(&self) -> &'static str {
+        "fixture-x86-64"
+    }
+}
 
 fn current_exe_file_name() -> String {
     std::env::current_exe()
