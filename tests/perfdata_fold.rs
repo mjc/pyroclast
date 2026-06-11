@@ -1912,7 +1912,10 @@ fn merges_deferred_user_callchains_like_perf_script() {
 }
 
 #[test]
-fn does_not_merge_deferred_callchains_from_a_different_tid_like_perf_script() {
+fn flushes_original_deferred_sample_when_deferred_record_tid_differs_like_perf_script() {
+    // perf leaves the original deferred sample queued when a deferred-callchain
+    // record has the right cookie but a different tid. session__flush_deferred_samples()
+    // then delivers the original unmerged callchain at EOF.
     let mut deferred = callchain_deferred_payload(0x4444, [0x5000, 0x6000]);
     deferred.extend(11_u32.to_le_bytes());
     deferred.extend(99_u32.to_le_bytes());
@@ -1938,11 +1941,14 @@ fn does_not_merge_deferred_callchains_from_a_different_tid_like_perf_script() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "");
+    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
 }
 
 #[test]
 fn flushes_unmatched_deferred_user_callchains_like_perf_script() {
+    // A missing matching cookie follows the same perf flush path: the original
+    // sample is eventually delivered with its recorded frames before the
+    // PERF_CONTEXT_USER_DEFERRED marker.
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
             PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
@@ -1966,7 +1972,7 @@ fn flushes_unmatched_deferred_user_callchains_like_perf_script() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, "");
+    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
 }
 
 #[test]

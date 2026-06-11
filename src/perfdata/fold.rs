@@ -1040,16 +1040,10 @@ where
         tid: Option<u32>,
         ips: &[u64],
     ) -> Result<(), String> {
-        let Some(samples) = self.accumulator.deferred_samples.remove(&cookie) else {
-            return Ok(());
-        };
-        for mut sample in samples {
-            if tid.is_some() && tid != sample.tid {
-                continue;
-            }
-            sample
-                .frames
-                .extend(ips.iter().copied().map(FoldFrame::Callchain));
+        for sample in self
+            .accumulator
+            .take_resolved_deferred_samples(cookie, tid, ips)
+        {
             let sample = PreparedFoldSample {
                 pid: sample.pid,
                 tid: sample.tid,
@@ -1082,10 +1076,7 @@ where
                 deferred_cookie: None,
                 has_callchain: sample.has_callchain,
             };
-            self.write_sample_header(&sample)?;
-            self.writer
-                .write_all(b"\n")
-                .map_err(|error| format!("failed to write perf script output: {error}"))?;
+            self.write_sample_event(&sample)?;
         }
         Ok(())
     }
@@ -1944,16 +1935,7 @@ impl FoldAccumulator {
     }
 
     fn add_deferred_callchain(&mut self, cookie: u64, tid: Option<u32>, ips: &[u64]) {
-        let Some(samples) = self.deferred_samples.remove(&cookie) else {
-            return;
-        };
-        for mut sample in samples {
-            if tid.is_some() && tid != sample.tid {
-                continue;
-            }
-            sample
-                .frames
-                .extend(ips.iter().copied().map(FoldFrame::Callchain));
+        for sample in self.take_resolved_deferred_samples(cookie, tid, ips) {
             add_fold_stack(
                 sample.pid,
                 sample.comm.as_deref(),
@@ -1967,13 +1949,49 @@ impl FoldAccumulator {
     }
 
     fn flush_deferred_samples(&mut self) {
-        self.deferred_samples.clear();
+        let samples = self.take_deferred_samples();
+        for sample in samples {
+            add_fold_stack(
+                sample.pid,
+                sample.comm.as_deref(),
+                sample.count,
+                &sample.frames,
+                &self.mmap_table,
+                &mut self.raw_stacks,
+                &mut self.callchain,
+            );
+        }
     }
 
     fn take_deferred_samples(&mut self) -> Vec<DeferredFoldSample> {
         std::mem::take(&mut self.deferred_samples)
             .into_values()
             .flatten()
+            .collect()
+    }
+
+    fn take_resolved_deferred_samples(
+        &mut self,
+        cookie: u64,
+        tid: Option<u32>,
+        ips: &[u64],
+    ) -> Vec<DeferredFoldSample> {
+        let Some(samples) = self.deferred_samples.remove(&cookie) else {
+            return Vec::new();
+        };
+        let (matched, unmatched): (Vec<_>, Vec<_>) = samples
+            .into_iter()
+            .partition(|sample| tid.is_none() || tid == sample.tid);
+        if !unmatched.is_empty() {
+            self.deferred_samples.insert(cookie, unmatched);
+        }
+        let deferred_frames = ips.iter().copied().map(FoldFrame::Callchain);
+        matched
+            .into_iter()
+            .map(|mut sample| {
+                sample.frames.extend(deferred_frames.clone());
+                sample
+            })
             .collect()
     }
 
