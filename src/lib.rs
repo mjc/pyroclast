@@ -316,6 +316,7 @@ where
         PlumbingCommand::Fold(command) => {
             let options = FoldOptions {
                 count_periods: command.count_periods,
+                inline: command.inline,
             };
             let stdout = fold_perfdata_for_cli(
                 &command.input,
@@ -330,8 +331,13 @@ where
             })
         }
         PlumbingCommand::PerfScript(command) => {
-            let stdout =
-                perf_script_for_cli(&command.input, command.symbols, command.symbolizer, runner)?;
+            let stdout = perf_script_for_cli(
+                &command.input,
+                command.symbols,
+                command.inline,
+                command.symbolizer,
+                runner,
+            )?;
             Ok(CliOutput {
                 stdout,
                 stderr: String::new(),
@@ -345,6 +351,7 @@ where
                 &command.input,
                 FoldOptions {
                     count_periods: true,
+                    inline: false,
                 },
                 command.symbols,
                 command.symbolizer,
@@ -625,6 +632,7 @@ where
 fn perf_script_for_cli<R>(
     path: &std::path::Path,
     symbols: bool,
+    inline: bool,
     symbolizer: SymbolizerKind,
     runner: &R,
 ) -> backends::BackendResult<String>
@@ -633,6 +641,7 @@ where
 {
     let options = FoldOptions {
         count_periods: true,
+        inline,
     };
     let mut output = Vec::new();
     if symbols {

@@ -316,6 +316,7 @@ where
 {
     let options = FoldOptions {
         count_periods: true,
+        inline: false,
     };
     if symbols {
         let symbol_resolver =

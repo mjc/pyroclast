@@ -1953,6 +1953,7 @@ fn can_fold_samples_weighted_by_period() {
         &bytes,
         FoldOptions {
             count_periods: true,
+            inline: false,
         },
     )
     .expect("folded");
@@ -1984,6 +1985,7 @@ fn folds_sample_ip_when_callchain_is_absent_like_perf_script() {
         &bytes,
         FoldOptions {
             count_periods: true,
+            inline: false,
         },
     )
     .expect("folded");
@@ -2024,6 +2026,7 @@ fn emits_sample_ip_when_callchain_field_is_absent_even_with_dwarf_payload_like_p
         &bytes,
         FoldOptions {
             count_periods: true,
+            inline: false,
         },
     )
     .expect("folded");
@@ -2060,6 +2063,7 @@ fn selects_sample_layout_by_identifier() {
         &bytes,
         FoldOptions {
             count_periods: true,
+            inline: false,
         },
     )
     .expect("folded");
@@ -2096,6 +2100,7 @@ fn selects_sample_layout_by_id_field() {
         &bytes,
         FoldOptions {
             count_periods: true,
+            inline: false,
         },
     )
     .expect("folded");
@@ -2143,6 +2148,7 @@ fn folds_samples_from_multiple_attrs_when_generated_perf_script_event_name_match
         &bytes,
         FoldOptions {
             count_periods: true,
+            inline: false,
         },
     )
     .expect("folded");
@@ -2171,6 +2177,7 @@ fn folds_perfdata_from_file_path() {
         &perfdata,
         FoldOptions {
             count_periods: true,
+            inline: false,
         },
     )
     .expect("folded");
@@ -2257,6 +2264,7 @@ fn folds_perfdata_from_multiple_finished_rounds_into_one_total() {
         &perfdata,
         FoldOptions {
             count_periods: true,
+            inline: false,
         },
     )
     .expect("folded");
@@ -2310,6 +2318,7 @@ fn folds_identical_rendered_stacks_across_pids_into_one_line() {
         &bytes,
         FoldOptions {
             count_periods: true,
+            inline: false,
         },
     )
     .expect("folded");
@@ -2336,6 +2345,7 @@ fn forked_process_inherits_parent_mappings_like_perf_script() {
         &bytes,
         FoldOptions {
             count_periods: true,
+            inline: false,
         },
     )
     .expect("folded");
@@ -2366,6 +2376,7 @@ fn synthesized_fork_does_not_clone_parent_mappings_like_perf_script() {
         &bytes,
         FoldOptions {
             count_periods: true,
+            inline: false,
         },
     )
     .expect("folded");
@@ -2466,6 +2477,7 @@ fn folds_file_samples_from_multiple_attrs_when_generated_perf_script_event_name_
         &perfdata,
         FoldOptions {
             count_periods: true,
+            inline: false,
         },
     )
     .expect("folded");
@@ -2529,7 +2541,7 @@ proptest! {
 
         let folded = fold_perfdata_callchains_with_options(
             &bytes,
-            FoldOptions { count_periods: true },
+            FoldOptions { count_periods: true, inline: false },
         )
         .expect("folded");
         let expected = render_unknown_folded_callchain(&frames, periods.iter().sum());
@@ -2568,7 +2580,7 @@ proptest! {
 
         let folded = fold_perfdata_callchains_with_options(
             &bytes,
-            FoldOptions { count_periods: true },
+            FoldOptions { count_periods: true, inline: false },
         )
         .expect("folded");
 
@@ -2606,7 +2618,7 @@ proptest! {
 
         let folded = fold_perfdata_callchains_with_options(
             &bytes,
-            FoldOptions { count_periods: true },
+            FoldOptions { count_periods: true, inline: false },
         )
         .expect("folded");
 

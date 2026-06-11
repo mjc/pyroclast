@@ -295,6 +295,11 @@ pub struct FoldArgs {
     #[arg(long = "no-symbols", action = ArgAction::SetFalse, default_value_t = true)]
     pub symbols: bool,
 
+    /// Expand each callchain entry into its DWARF inline frames, like
+    /// `perf script --inline`. Off by default, matching plain `perf script`.
+    #[arg(long)]
+    pub inline: bool,
+
     #[arg(long, value_enum, default_value_t = SymbolizerKind::RustAddr2line)]
     pub symbolizer: SymbolizerKind,
 
@@ -305,6 +310,11 @@ pub struct FoldArgs {
 pub struct PerfScriptArgs {
     #[arg(long = "no-symbols", action = ArgAction::SetFalse, default_value_t = true)]
     pub symbols: bool,
+
+    /// Expand each callchain entry into its DWARF inline frames, like
+    /// `perf script --inline`. Off by default, matching plain `perf script`.
+    #[arg(long)]
+    pub inline: bool,
 
     #[arg(long, value_enum, default_value_t = SymbolizerKind::RustAddr2line)]
     pub symbolizer: SymbolizerKind,

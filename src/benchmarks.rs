@@ -984,8 +984,11 @@ fn join_result_thread<T>(
 }
 
 fn benchmark_fold_options() -> FoldOptions {
+    // The benchmark scoreboard compares against plain `perf | inferno`, which
+    // does not expand DWARF inline frames, so keep inline off here.
     FoldOptions {
         count_periods: true,
+        inline: false,
     }
 }
 

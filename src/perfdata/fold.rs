@@ -271,6 +271,10 @@ struct SampleEventLayout {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FoldOptions {
     pub count_periods: bool,
+    /// When set, expand each callchain entry into its DWARF inline frames,
+    /// mirroring `perf script --inline`. Off by default: plain `perf script`
+    /// prints exactly one line per callchain entry, named from the ELF symtab.
+    pub inline: bool,
 }
 
 impl PerfSummary {
@@ -496,7 +500,7 @@ pub fn fold_perfdata_callchains_with_options(
     options: FoldOptions,
 ) -> Result<String, String> {
     let fold_data = collect_fold_data(bytes, options)?;
-    render_fold_data::<NoopSymbolResolver>(fold_data, None)
+    render_fold_data::<NoopSymbolResolver>(fold_data, None, options.inline)
 }
 
 /// Collapses perf sample callchains from a `perf.data` file path.
@@ -539,7 +543,7 @@ where
 {
     let fold_data = collect_fold_data(bytes, options)?;
     let mut symbol_cache = SymbolFrameCache::new(symbol_resolver);
-    render_fold_data(fold_data, Some(&mut symbol_cache))
+    render_fold_data(fold_data, Some(&mut symbol_cache), options.inline)
 }
 
 /// Collapses symbolized perf sample callchains from a `perf.data` file path.
@@ -742,7 +746,11 @@ where
 
         if record_header.record_type == PERF_RECORD_FINISHED_ROUND {
             ordered_records.flush_round(&mut accumulator, &sample_layouts, options)?;
-            accumulator.drain_fold_counts(&mut counts, symbol_cache.as_deref_mut())?;
+            accumulator.drain_fold_counts(
+                &mut counts,
+                symbol_cache.as_deref_mut(),
+                options.inline,
+            )?;
             offset = next;
             continue;
         }
@@ -769,7 +777,7 @@ where
 
     ordered_records.flush_final(&mut accumulator, &sample_layouts, options)?;
     accumulator.flush_deferred_samples();
-    accumulator.drain_fold_counts(&mut counts, symbol_cache)?;
+    accumulator.drain_fold_counts(&mut counts, symbol_cache, options.inline)?;
     write_fold_counts(counts, writer)
 }
 
@@ -813,6 +821,7 @@ where
         symbol_cache,
         writer,
         sample_layouts.event_name_width,
+        options.inline,
     );
     let mut ordered_records = OrderedRecordQueue::default();
     let mut header_bytes = [0_u8; 8];
@@ -879,6 +888,7 @@ struct PerfScriptSink<'io, 'cache, R, W: ?Sized> {
     symbol_cache: Option<&'io mut SymbolFrameCache<'cache, R>>,
     writer: &'io mut W,
     event_name_width: usize,
+    inline: bool,
 }
 
 impl<'io, 'cache, R, W> PerfScriptSink<'io, 'cache, R, W>
@@ -891,12 +901,14 @@ where
         symbol_cache: Option<&'io mut SymbolFrameCache<'cache, R>>,
         writer: &'io mut W,
         event_name_width: usize,
+        inline: bool,
     ) -> Self {
         Self {
             accumulator: FoldAccumulator::new(header_build_ids),
             symbol_cache,
             writer,
             event_name_width,
+            inline,
         }
     }
 
@@ -1017,7 +1029,7 @@ where
     fn write_sample_event(&mut self, sample: &PreparedFoldSample) -> Result<(), String> {
         if sample.has_callchain {
             self.write_sample_header(sample)?;
-            let frame_resolver = FoldFrameResolver::new(&self.accumulator.mmap_table);
+            let frame_resolver = FoldFrameResolver::new(&self.accumulator.mmap_table, self.inline);
             frame_resolver.write_script_frames_for_stack(
                 sample.pid,
                 &sample.frames,
@@ -1026,7 +1038,7 @@ where
             )?;
         } else {
             self.write_sample_inline_header(sample)?;
-            let frame_resolver = FoldFrameResolver::new(&self.accumulator.mmap_table);
+            let frame_resolver = FoldFrameResolver::new(&self.accumulator.mmap_table, self.inline);
             frame_resolver.write_inline_sample_frame_for_stack(
                 sample.pid,
                 &sample.frames,
@@ -1880,12 +1892,13 @@ impl FoldAccumulator {
         &mut self,
         counts: &mut FoldCounts,
         symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+        inline: bool,
     ) -> Result<(), String>
     where
         R: SymbolResolver,
     {
         let raw_stacks = std::mem::take(&mut self.raw_stacks);
-        accumulate_fold_counts(&raw_stacks, &self.mmap_table, counts, symbol_cache)
+        accumulate_fold_counts(&raw_stacks, &self.mmap_table, counts, symbol_cache, inline)
     }
 }
 
@@ -1912,18 +1925,20 @@ fn comm_for_ids(thread_comms: &BTreeMap<u32, String>, tid: Option<u32>) -> Optio
 fn render_fold_data<R>(
     fold_data: PerfFoldData,
     symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+    inline: bool,
 ) -> Result<String, String>
 where
     R: SymbolResolver,
 {
     let mut folded = Vec::new();
-    write_fold_data(fold_data, symbol_cache, &mut folded)?;
+    write_fold_data(fold_data, symbol_cache, inline, &mut folded)?;
     String::from_utf8(folded).map_err(|error| format!("folded output is not utf-8: {error}"))
 }
 
 fn write_fold_data<R, W>(
     fold_data: PerfFoldData,
     symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+    inline: bool,
     writer: &mut W,
 ) -> Result<(), String>
 where
@@ -1935,7 +1950,7 @@ where
         raw_stacks,
     } = fold_data;
     let mut counts = FoldCounts::default();
-    accumulate_fold_counts(&raw_stacks, &mmap_table, &mut counts, symbol_cache)?;
+    accumulate_fold_counts(&raw_stacks, &mmap_table, &mut counts, symbol_cache, inline)?;
     write_fold_counts(counts, writer)
 }
 
@@ -1943,6 +1958,7 @@ fn prefetch_symbols<R>(
     raw_stacks: &[RawStackEntryRef<'_, FoldFrame>],
     mmap_table: &MmapTable,
     symbol_cache: &mut SymbolFrameCache<'_, R>,
+    inline: bool,
 ) -> Result<(), String>
 where
     R: SymbolResolver,
@@ -1957,6 +1973,7 @@ where
             mmap_table,
             &mut mapping_cache,
             &mut batches,
+            inline,
         );
         if batches.full_mappings.len() >= PREFETCH_SYMBOL_REQUEST_BATCH_SIZE {
             symbol_cache.prefetch_mapping_refs(&batches.full_mappings)?;
@@ -1983,6 +2000,7 @@ fn accumulate_fold_counts<R>(
     mmap_table: &MmapTable,
     counts: &mut FoldCounts,
     mut symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+    inline: bool,
 ) -> Result<(), String>
 where
     R: SymbolResolver,
@@ -1990,9 +2008,9 @@ where
     let raw_stacks = raw_stacks.sorted_entries();
     counts.reserve_first_drain(raw_stacks.len());
     if let Some(cache) = symbol_cache.as_deref_mut() {
-        prefetch_symbols(&raw_stacks, mmap_table, cache)?;
+        prefetch_symbols(&raw_stacks, mmap_table, cache, inline)?;
     }
-    let frame_resolver = FoldFrameResolver::new(mmap_table);
+    let frame_resolver = FoldFrameResolver::new(mmap_table, inline);
     let mut callchain = Vec::new();
     let mut buffers = FoldedRenderBuffers::default();
     for stack in raw_stacks {
@@ -2073,6 +2091,7 @@ fn extend_symbol_mappings_for_stack<'a>(
     mmap_table: &'a MmapTable,
     mapping_cache: &mut MappingResolveCache,
     batches: &mut SymbolPrefetchBatches<'a>,
+    inline: bool,
 ) {
     for frame in callchain {
         let address = frame.address();
@@ -2084,7 +2103,10 @@ fn extend_symbol_mappings_for_stack<'a>(
                 symbol_source_id: mapping.symbol_source_id,
                 relative_address: mapping.relative_address,
             };
-            if matches!(frame, FoldFrame::InlineCurrentIp(_)) {
+            // Without --inline (the default), every frame is rendered from its
+            // single base ELF symtab symbol, so prefetch only the base symbol.
+            // InlineCurrentIp object-unwind leaves always use base resolution.
+            if !inline || matches!(frame, FoldFrame::InlineCurrentIp(_)) {
                 if batches.seen_base.insert(key) {
                     batches.base_mappings.push(mapping);
                 }
@@ -2097,6 +2119,7 @@ fn extend_symbol_mappings_for_stack<'a>(
 
 struct FoldFrameResolver<'a> {
     mmap_table: &'a MmapTable,
+    inline: bool,
 }
 
 enum FrameMappingDecision<'a> {
@@ -2126,8 +2149,8 @@ impl SymbolResolver for NoopSymbolResolver {
 }
 
 impl<'a> FoldFrameResolver<'a> {
-    fn new(mmap_table: &'a MmapTable) -> Self {
-        Self { mmap_table }
+    fn new(mmap_table: &'a MmapTable, inline: bool) -> Self {
+        Self { mmap_table, inline }
     }
 
     fn mapping_decision(
@@ -2327,6 +2350,7 @@ impl<'a> FoldFrameResolver<'a> {
                     frame,
                     &mapping,
                     symbol_cache,
+                    self.inline,
                 )?;
             }
             FrameMappingDecision::KernelAddress | FrameMappingDecision::Address => {
@@ -2364,11 +2388,25 @@ impl<'a> FoldFrameResolver<'a> {
         let Some(cache) = symbol_cache else {
             return Ok(());
         };
+        // Resolve the mapping path first so the inline chain can carry the
+        // mapped DSO name like every other script frame (map__fprintf_dsoname),
+        // rather than the hardcoded "([unknown])".
+        let dso_path = pid
+            .and_then(|pid| {
+                self.mmap_table
+                    .resolve_ref_cached(pid, address, mapping_cache)
+            })
+            .map(|mapping| mapping.path.to_string());
         if let Some(frames) =
             self.resolve_inline_current_ip_frames(pid, address, cache, mapping_cache)?
         {
             for label in frames.iter().rev() {
-                write_perf_script_frame_for_label(writer, address, label)?;
+                match dso_path.as_deref() {
+                    Some(path) => {
+                        write_perf_script_mapped_symbol_frame(writer, address, label, path)?;
+                    }
+                    None => write_perf_script_frame_for_label(writer, address, label)?,
+                }
             }
         } else {
             self.write_regular_script_frame(
@@ -2474,7 +2512,12 @@ impl<'a> FoldFrameResolver<'a> {
         ) {
             FrameMappingDecision::Mapped(mapping) => {
                 if let Some(cache) = symbol_cache {
-                    if let Some(rendered) = cache.resolve_folded_mapping_ref(&mapping)? {
+                    let rendered = if self.inline {
+                        cache.resolve_folded_mapping_ref(&mapping)?
+                    } else {
+                        cache.resolve_base_folded_mapping_ref(&mapping)?
+                    };
+                    if let Some(rendered) = rendered {
                         append_cached_rendered_frame(&mut buffers.rendered, rendered);
                     } else {
                         let fallback = symbol_fallback_frame_ref(&mapping);
@@ -2642,32 +2685,41 @@ fn write_perf_script_mapped_decision_frame<R, W>(
     frame: FoldFrame,
     mapping: &ResolvedMappingRef<'_>,
     symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+    inline: bool,
 ) -> Result<(), String>
 where
     R: SymbolResolver,
     W: IoWrite + ?Sized,
 {
-    if let Some(cache) = symbol_cache {
-        let frames = cache.resolve_mapping_ref(mapping)?;
-        if frames.is_empty() {
-            write_perf_script_frame_for_label(
-                writer,
-                address,
-                &symbol_fallback_frame_ref(mapping),
-            )?;
-        } else if matches!(frame, FoldFrame::UserUnwind(_))
-            && frames.len() == 1
-            && !is_kernel_space_frame(address)
-        {
-            write_perf_script_mapped_symbol_frame(writer, address, &frames[0], mapping.path)?;
-        } else {
-            for label in frames.iter().rev() {
-                write_perf_script_frame_for_label(writer, address, label)?;
-            }
-        }
+    let Some(cache) = symbol_cache else {
+        write_perf_script_mapped_unknown_symbol_frame(writer, address, mapping.path)?;
         return Ok(());
+    };
+    // Default `perf script` prints exactly one line per callchain entry, named
+    // from the ELF symtab (builtin-script.c sample__fprintf_sym without
+    // --inline). Resolve only the base object symbol and print it with the
+    // mapping's full DSO name (map__fprintf_dsoname).
+    if !inline {
+        return match cache.resolve_mapping_ref_with_base_symbol(mapping)? {
+            Some([label, ..]) => {
+                write_perf_script_mapped_symbol_frame(writer, address, label, mapping.path)
+            }
+            _ => write_perf_script_mapped_unknown_symbol_frame(writer, address, mapping.path),
+        };
     }
-    write_perf_script_mapped_unknown_symbol_frame(writer, address, mapping.path)?;
+    let frames = cache.resolve_mapping_ref(mapping)?;
+    if frames.is_empty() {
+        write_perf_script_mapped_unknown_symbol_frame(writer, address, mapping.path)?;
+    } else if matches!(frame, FoldFrame::UserUnwind(_))
+        && frames.len() == 1
+        && !is_kernel_space_frame(address)
+    {
+        write_perf_script_mapped_symbol_frame(writer, address, &frames[0], mapping.path)?;
+    } else {
+        for label in frames.iter().rev() {
+            write_perf_script_mapped_symbol_frame(writer, address, label, mapping.path)?;
+        }
+    }
     Ok(())
 }
 
@@ -3724,7 +3776,10 @@ fn parse_event_desc_entries_checked(payload: &[u8]) -> Result<Vec<EventDescEntry
 }
 
 fn event_desc_name_from_bytes(bytes: &[u8]) -> String {
-    let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
@@ -4297,7 +4352,7 @@ mod tests {
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut buffers = super::FoldedRenderBuffers::default();
 
-        super::FoldFrameResolver::new(&mmap_table)
+        super::FoldFrameResolver::new(&mmap_table, false)
             .render_folded_stack_for_stack(
                 Some(11),
                 Some("pyroclast"),
@@ -4330,7 +4385,7 @@ mod tests {
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut buffers = super::FoldedRenderBuffers::default();
 
-        super::FoldFrameResolver::new(&mmap_table)
+        super::FoldFrameResolver::new(&mmap_table, false)
             .render_folded_stack_for_stack(
                 Some(11),
                 Some("pyroclast"),
@@ -4372,7 +4427,7 @@ mod tests {
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut buffers = super::FoldedRenderBuffers::default();
 
-        super::FoldFrameResolver::new(&mmap_table)
+        super::FoldFrameResolver::new(&mmap_table, false)
             .render_folded_stack_for_stack(
                 Some(11),
                 Some("pyroclast"),
@@ -4410,7 +4465,7 @@ mod tests {
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut buffers = super::FoldedRenderBuffers::default();
 
-        super::FoldFrameResolver::new(&mmap_table)
+        super::FoldFrameResolver::new(&mmap_table, false)
             .render_folded_stack_for_stack(
                 Some(11),
                 Some("pyroclast"),
@@ -4447,7 +4502,7 @@ mod tests {
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut written = Vec::new();
 
-        super::FoldFrameResolver::new(&mmap_table)
+        super::FoldFrameResolver::new(&mmap_table, false)
             .write_script_frames_for_stack(
                 Some(11),
                 &[super::FoldFrame::UserUnwind(0x1048)],
@@ -4542,12 +4597,15 @@ mod tests {
             super::FoldFrame::Callchain(0x1020),
         ];
 
+        // Inline mode routes regular Callchain frames into the full-mapping
+        // batch; this test exercises the cross-stack dedup of those keys.
         super::extend_symbol_mappings_for_stack(
             Some(11),
             &callchain,
             &mmap_table,
             &mut mapping_cache,
             &mut batches,
+            true,
         );
         super::extend_symbol_mappings_for_stack(
             Some(11),
@@ -4555,6 +4613,7 @@ mod tests {
             &mmap_table,
             &mut mapping_cache,
             &mut batches,
+            true,
         );
 
         assert_eq!(batches.full_mappings.len(), 2);
@@ -4591,7 +4650,9 @@ mod tests {
         let resolver = RecordingFrameResolver::default();
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
 
-        super::prefetch_symbols(&entries, &mmap_table, &mut symbol_cache)
+        // With --inline, regular frames prefetch the full DWARF inline chain
+        // while InlineCurrentIp object-unwind leaves only need the base symbol.
+        super::prefetch_symbols(&entries, &mmap_table, &mut symbol_cache, true)
             .expect("prefetch folded stack symbols");
 
         assert_eq!(*resolver.full_requests.borrow(), vec![0x10]);
@@ -5631,7 +5692,8 @@ mod tests {
             super::sample_fold_count(
                 Some(37),
                 super::FoldOptions {
-                    count_periods: true
+                    count_periods: true,
+                    ..super::FoldOptions::default()
                 }
             ),
             37
@@ -5640,7 +5702,8 @@ mod tests {
             super::sample_fold_count(
                 Some(37),
                 super::FoldOptions {
-                    count_periods: false
+                    count_periods: false,
+                    ..super::FoldOptions::default()
                 }
             ),
             1
@@ -5653,7 +5716,8 @@ mod tests {
             super::sample_fold_count(
                 None,
                 super::FoldOptions {
-                    count_periods: true
+                    count_periods: true,
+                    ..super::FoldOptions::default()
                 }
             ),
             1
