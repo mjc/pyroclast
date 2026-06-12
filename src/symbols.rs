@@ -164,13 +164,13 @@ pub trait SymbolResolver {
 pub struct ResolvedSymbolFrames {
     pub frames: Vec<String>,
     pub has_base_symbol: bool,
-    /// The `+0x<off>` suffix (relative to the containing symtab symbol) that
-    /// perf prints on every inline AND base frame for this address.
+    /// The `+0x<off>` suffix value (relative to the containing symtab symbol)
+    /// that perf prints on every inline AND base frame for this address.
     /// `tools/perf/util/symbol_fprintf.c __symbol__fprintf_symname_offs` uses
     /// `al->addr - sym->start`, and an inline frame's fake symbol reuses
     /// `base_sym->start` (`tools/perf/util/srcline.c new_inline_sym`), so the
     /// whole group shares one offset.
-    pub base_offset: Option<String>,
+    pub base_offset: Option<u64>,
 }
 
 impl ResolvedSymbolFrames {
@@ -211,7 +211,7 @@ struct CachedMappingFrames {
     frames: Vec<String>,
     folded_rendered: String,
     has_base_symbol: bool,
-    base_offset: Option<String>,
+    base_offset: Option<u64>,
 }
 
 pub struct Addr2lineResolver<'a, R> {
@@ -322,10 +322,7 @@ struct PerfDwarfCachedUnit {
 #[derive(Default)]
 struct PerfObjectSymbolNames<'a> {
     bare: Option<&'a str>,
-    with_offset: Option<String>,
-    /// Just the `+0x<off>` suffix of `with_offset`, shared by every inline and
-    /// base frame at this address in perf-script output.
-    offset_suffix: Option<String>,
+    offset: Option<u64>,
 }
 
 #[derive(Default)]
@@ -1133,14 +1130,14 @@ where
     pub fn resolve_mapping_ref_with_offset(
         &mut self,
         mapping: &ResolvedMappingRef<'_>,
-    ) -> Result<(&[String], Option<&str>), String> {
+    ) -> Result<(&[String], Option<u64>), String> {
         let key = mapping_frame_key(mapping);
         if !self.resolved_by_mapping.contains_key(&key) {
             self.prefetch_mapping_refs(std::slice::from_ref(mapping))?;
         }
         self.resolved_by_mapping
             .get(&key)
-            .map(|cached| (cached.frames.as_slice(), cached.base_offset.as_deref()))
+            .map(|cached| (cached.frames.as_slice(), cached.base_offset))
             .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())
     }
 
@@ -1937,12 +1934,12 @@ where
                 frames = perf_frames_with_object_alias_and_offset(
                     frames,
                     object_symbol,
-                    object_symbols.with_offset.as_deref(),
+                    object_symbols.offset,
                 );
                 resolved[index] = ResolvedSymbolFrames {
                     frames,
                     has_base_symbol,
-                    base_offset: object_symbols.offset_suffix,
+                    base_offset: object_symbols.offset,
                 };
             }
         }
@@ -2091,7 +2088,7 @@ impl SymbolResolver for RustAddr2lineResolver {
                 frames = perf_frames_with_object_alias_and_offset(
                     frames,
                     object_symbol,
-                    object_symbols.with_offset.as_deref(),
+                    object_symbols.offset,
                 );
                 // No .debug_str generic specialization here: inline-frame names
                 // now come from the DWARF linkage name demangled like perf's
@@ -2103,7 +2100,7 @@ impl SymbolResolver for RustAddr2lineResolver {
                 resolved[index] = ResolvedSymbolFrames {
                     frames,
                     has_base_symbol,
-                    base_offset: object_symbols.offset_suffix,
+                    base_offset: object_symbols.offset,
                 };
             }
         }
@@ -2130,8 +2127,7 @@ fn resolve_base_frames_from_object_metadata(
         let metadata = object_metadata(path);
         for index in indexes {
             let request = &requests[index];
-            let object_symbols =
-                object_symbols_for_frame(metadata.as_ref(), request.relative_address);
+            let object_symbols = object_symbols_for_frame(metadata.as_ref(), request.relative_address);
             let Some(object_symbol) = object_symbols.bare else {
                 continue;
             };
@@ -2139,7 +2135,7 @@ fn resolve_base_frames_from_object_metadata(
             frames = perf_frames_with_object_alias_and_offset(
                 frames,
                 Some(object_symbol),
-                object_symbols.with_offset.as_deref(),
+                object_symbols.offset,
             );
             if let Some(metadata) = &metadata {
                 specialize_frames_from_debug_strings(
@@ -2152,7 +2148,7 @@ fn resolve_base_frames_from_object_metadata(
                 has_base_symbol: true,
                 // The no-inline base path bakes +0x<off> into the single frame
                 // name via with_offset, so no separate per-line offset is used.
-                base_offset: None,
+                base_offset: object_symbols.offset,
             };
         }
     }
@@ -2199,13 +2195,14 @@ fn perf_frames_with_object_alias(
 fn perf_frames_with_object_alias_and_offset(
     frames: Vec<String>,
     object_alias: Option<&str>,
-    object_alias_with_offset: Option<&str>,
+    object_alias_offset: Option<u64>,
 ) -> Vec<String> {
     let mut frames = perf_frames_with_object_alias(frames, object_alias);
     if frames.len() == 1
-        && let Some(alias) = object_alias_with_offset
+        && let Some(alias) = object_alias
+        && let Some(offset) = object_alias_offset
     {
-        frames[0] = alias.to_string();
+        frames[0] = format!("{alias}+0x{offset:x}");
     }
     frames
 }
@@ -2322,15 +2319,10 @@ impl PreparedObjectMetadata {
         self.object_symbols.symbol_name(address)
     }
 
-    fn object_symbol_with_offset(&self, address: u64) -> Option<String> {
-        self.object_symbols.symbol_name_with_offset(address)
-    }
-
     fn object_symbol_names(&self, address: u64) -> PerfObjectSymbolNames<'_> {
         PerfObjectSymbolNames {
             bare: self.object_symbol(address),
-            with_offset: self.object_symbol_with_offset(address),
-            offset_suffix: self.object_symbols.symbol_offset_suffix(address),
+            offset: self.object_symbols.symbol_offset(address),
         }
     }
 }
@@ -2366,16 +2358,16 @@ impl PerfObjectSymbolIndex {
             .map(|candidate| candidate.name.as_str())
     }
 
+    fn symbol_offset(&self, address: u64) -> Option<u64> {
+        let candidate = self.symbol(address)?;
+        Some(address.saturating_sub(candidate.address))
+    }
+
+    #[cfg(test)]
     fn symbol_name_with_offset(&self, address: u64) -> Option<String> {
         let candidate = self.symbol(address)?;
         let offset = address.saturating_sub(candidate.address);
         Some(format!("{}+0x{offset:x}", candidate.name))
-    }
-
-    fn symbol_offset_suffix(&self, address: u64) -> Option<String> {
-        let candidate = self.symbol(address)?;
-        let offset = address.saturating_sub(candidate.address);
-        Some(format!("+0x{offset:x}"))
     }
 
     fn symbol(&self, address: u64) -> Option<&PerfSymbolCandidate> {

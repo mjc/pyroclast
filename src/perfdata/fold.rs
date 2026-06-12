@@ -3094,7 +3094,7 @@ fn write_perf_script_inline_chain_frame<W>(
     writer: &mut W,
     address: u64,
     label: &str,
-    base_offset: Option<&str>,
+    base_offset: Option<u64>,
     path: &str,
     is_inlined: bool,
 ) -> Result<(), String>
@@ -3109,14 +3109,21 @@ where
     {
         return write_perf_script_mapped_symbol_frame(writer, address, label, path);
     }
-    let offset = base_offset.unwrap_or("");
     if is_inlined {
-        writeln!(writer, "\t{address:16x} {label}{offset} (inlined)")
-            .map_err(|error| format!("failed to write perf script output: {error}"))
+        match base_offset {
+            Some(offset) => writeln!(writer, "\t{address:16x} {label}+0x{offset:x} (inlined)")
+                .map_err(|error| format!("failed to write perf script output: {error}")),
+            None => writeln!(writer, "\t{address:16x} {label} (inlined)")
+                .map_err(|error| format!("failed to write perf script output: {error}")),
+        }
     } else {
         let path = perf_script_dso_name(path);
-        writeln!(writer, "\t{address:16x} {label}{offset} ({path})")
-            .map_err(|error| format!("failed to write perf script output: {error}"))
+        match base_offset {
+            Some(offset) => writeln!(writer, "\t{address:16x} {label}+0x{offset:x} ({path})")
+                .map_err(|error| format!("failed to write perf script output: {error}")),
+            None => writeln!(writer, "\t{address:16x} {label} ({path})")
+                .map_err(|error| format!("failed to write perf script output: {error}")),
+        }
     }
 }
 
@@ -4548,7 +4555,7 @@ mod tests {
     struct StaticFrameResolver {
         frames: Vec<String>,
         has_base_symbol: bool,
-        base_offset: Option<String>,
+        base_offset: Option<u64>,
     }
 
     impl SymbolResolver for StaticFrameResolver {
@@ -4571,7 +4578,7 @@ mod tests {
                 ResolvedSymbolFrames {
                     frames: self.frames.clone(),
                     has_base_symbol: self.has_base_symbol,
-                    base_offset: self.base_offset.clone(),
+                    base_offset: self.base_offset,
                 };
                 requests.len()
             ])
@@ -5203,7 +5210,7 @@ mod tests {
                 "core::slice::sort::unstable::sort".to_string(),
             ],
             has_base_symbol: true,
-            base_offset: Some("+0x1fb".to_string()),
+            base_offset: Some(0x1fb),
         };
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut written = Vec::new();
@@ -5242,7 +5249,7 @@ mod tests {
         let resolver = StaticFrameResolver {
             frames: vec!["core::slice::sort::unstable::quicksort::quicksort+0x6cb".to_string()],
             has_base_symbol: true,
-            base_offset: Some("+0x6cb".to_string()),
+            base_offset: Some(0x6cb),
         };
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut written = Vec::new();
