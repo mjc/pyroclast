@@ -2332,11 +2332,13 @@ impl PerfObjectSymbolIndex {
         let Ok(object) = object::File::parse(object_bytes) else {
             return Self::default();
         };
-        let mut symbols = object
-            .symbols()
-            .chain(object.dynamic_symbols())
-            .filter_map(|symbol| perf_symbol_candidate_from_object_symbol(&symbol))
-            .collect::<Vec<_>>();
+        let mut symbols = Vec::with_capacity(object.symbols().count() + object.dynamic_symbols().count());
+        symbols.extend(
+            object
+                .symbols()
+                .chain(object.dynamic_symbols())
+                .filter_map(|symbol| perf_symbol_candidate_from_object_symbol(&symbol)),
+        );
         symbols.extend(perf_synthesized_plt_symbols(&object, &symbols));
         symbols.sort_by_key(|symbol| symbol.address);
         let mut max_end = 0_u64;
