@@ -1260,8 +1260,7 @@ where
                 }
                 missing_keys.push(key);
                 missing_requests.push(symbol_request_from_mapping_ref(mapping));
-                let fallback_frame = mapping_fallback_frame(mapping);
-                missing_fallbacks.push(render_inferno_perf_folded_label(fallback_frame.as_str()));
+                missing_fallbacks.push(mapping_fallback_frame(mapping));
             }
             if missing_requests.is_empty() {
                 return Ok(());
@@ -1277,13 +1276,13 @@ where
                 ));
             }
             self.resolved_base_by_mapping.reserve(missing_keys.len());
-            for ((key, fallback_rendered), resolved_frames) in missing_keys
+            for ((key, fallback_frame), resolved_frames) in missing_keys
                 .drain(..)
                 .zip(missing_fallbacks.drain(..))
                 .zip(resolved)
             {
                 let folded_rendered = if resolved_frames.frames.is_empty() {
-                    fallback_rendered
+                    render_inferno_perf_folded_label(fallback_frame.as_str())
                 } else {
                     render_perf_script_inferno_folded_frames(&resolved_frames.frames)
                 };
@@ -1374,8 +1373,7 @@ where
                 }
                 missing_keys.push(key);
                 missing_requests.push(symbol_request_from_mapping_ref(mapping));
-                let fallback_frame = mapping_fallback_frame(mapping);
-                missing_fallbacks.push(render_inferno_perf_folded_label(fallback_frame.as_str()));
+                missing_fallbacks.push(mapping_fallback_frame(mapping));
             }
             if missing_requests.is_empty() {
                 return Ok(());
@@ -1391,13 +1389,13 @@ where
                 ));
             }
             self.resolved_by_mapping.reserve(missing_keys.len());
-            for ((key, fallback_rendered), resolved_frames) in missing_keys
+            for ((key, fallback_frame), resolved_frames) in missing_keys
                 .drain(..)
                 .zip(missing_fallbacks.drain(..))
                 .zip(resolved)
             {
                 let folded_rendered = if resolved_frames.frames.is_empty() {
-                    fallback_rendered
+                    render_inferno_perf_folded_label(fallback_frame.as_str())
                 } else {
                     render_perf_script_inferno_folded_frames(&resolved_frames.frames)
                 };
