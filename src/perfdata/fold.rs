@@ -3,11 +3,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::fs::File;
 use std::hash::Hasher;
-use std::io::{BufReader, Read, Seek, SeekFrom, Write as IoWrite};
+use std::io::{Read, Seek, SeekFrom, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use hashbrown::{HashMap, HashSet};
+use memmap2::{Mmap, MmapOptions};
 use rustc_hash::{FxBuildHasher, FxHasher};
 use smallvec::SmallVec;
 
@@ -41,7 +42,6 @@ use crate::symbols::{SymbolFrameCache, SymbolRequest, SymbolResolver, perf_build
 
 const UNKNOWN_FRAME: &str = "[unknown]";
 const PREFETCH_SYMBOL_REQUEST_BATCH_SIZE: usize = 4096;
-const RECORD_READER_BUFFER_CAPACITY: usize = 4 * 1024 * 1024;
 const FOLD_COUNT_STORAGE_LINEAR_GROWTH_THRESHOLD: usize = 64 * 1024 * 1024;
 const FOLD_COUNT_STORAGE_LINEAR_GROWTH_CHUNK: usize = 8 * 1024 * 1024;
 const PROT_EXEC: u32 = 4;
@@ -752,92 +752,33 @@ where
     let arch =
         perf_arch_from_header(header_arch_from_file(file, header, &header_bytes)?.as_deref());
     let mut accumulator = FoldAccumulator::new(header_build_ids).with_arch(arch);
-    let data_end = header
-        .data_offset
-        .checked_add(header.data_size)
-        .ok_or_else(|| "perf data section size overflows u64".to_string())?;
-    if file
-        .metadata()
-        .map_err(|error| format!("failed to stat perf.data: {error}"))?
-        .len()
-        < data_end
-    {
-        return Err("perf data section extends past end of file".to_string());
-    }
-
-    let mut reader = BufReader::with_capacity(
-        RECORD_READER_BUFFER_CAPACITY,
-        file.try_clone()
-            .map_err(|error| format!("failed to clone perf.data handle: {error}"))?,
-    );
-    reader
-        .seek(SeekFrom::Start(header.data_offset))
-        .map_err(|error| format!("failed to seek perf data section: {error}"))?;
-
     let mut counts = FoldCounts::default();
     let mut ordered_records = OrderedRecordQueue::default();
-    let mut header_bytes = [0_u8; 8];
-    let mut payload = Vec::new();
-    let mut offset = usize::try_from(header.data_offset)
-        .map_err(|_| "perf data section offset exceeds usize".to_string())?;
-    let end =
-        usize::try_from(data_end).map_err(|_| "perf data section end exceeds usize".to_string())?;
-    let mut index = 0usize;
+    let mapped = map_perfdata_file(file)?;
+    let records = timed_records(&mapped, header, &sample_layouts)?;
 
-    while offset < end {
-        reader.read_exact(&mut header_bytes).map_err(|error| {
-            format!("failed to read perf record header at offset {offset}: {error}")
-        })?;
-        let record_header = parse_record_header(&header_bytes)?;
-        let size = usize::from(record_header.size);
-        if size < 8 {
-            return Err(format!(
-                "invalid perf record size {size} at offset {offset}"
-            ));
-        }
-        let next = offset
-            .checked_add(size)
-            .ok_or_else(|| format!("perf record size overflows at offset {offset}"))?;
-        if next > end {
-            return Err(format!(
-                "perf record overruns data section at offset {offset}"
-            ));
-        }
-
-        payload.resize(size - 8, 0);
-        reader.read_exact(&mut payload).map_err(|error| {
-            format!("failed to read perf record payload at offset {offset}: {error}")
-        })?;
-
-        if record_header.record_type == PERF_RECORD_FINISHED_ROUND {
+    for timed_record in records {
+        let record = timed_record.record(&mapped)?;
+        if record.header.record_type == PERF_RECORD_FINISHED_ROUND {
             ordered_records.flush_round(&mut accumulator, &sample_layouts, options)?;
             accumulator.drain_fold_counts(
                 &mut counts,
                 symbol_cache.as_deref_mut(),
                 options.inline,
             )?;
-            offset = next;
             continue;
         }
 
-        let record = PerfRecord {
-            offset,
-            header: record_header,
-            payload: &payload,
-        };
-        let time = record_time(record, &sample_layouts)?;
+        let time = timed_record.time;
         let parsed_record = parse_record_with_context(record)?;
         ordered_records.apply_or_queue(
-            index,
+            timed_record.index,
             time,
             parsed_record,
             &mut accumulator,
             &sample_layouts,
             options,
         )?;
-        index += 1;
-
-        offset = next;
     }
 
     ordered_records.flush_final(&mut accumulator, &sample_layouts, options)?;
@@ -861,28 +802,6 @@ where
     let header_build_ids = header_build_ids_by_filename_from_file(file, header, &header_bytes)?;
     let arch =
         perf_arch_from_header(header_arch_from_file(file, header, &header_bytes)?.as_deref());
-    let data_end = header
-        .data_offset
-        .checked_add(header.data_size)
-        .ok_or_else(|| "perf data section size overflows u64".to_string())?;
-    if file
-        .metadata()
-        .map_err(|error| format!("failed to stat perf.data: {error}"))?
-        .len()
-        < data_end
-    {
-        return Err("perf data section extends past end of file".to_string());
-    }
-
-    let mut reader = BufReader::with_capacity(
-        RECORD_READER_BUFFER_CAPACITY,
-        file.try_clone()
-            .map_err(|error| format!("failed to clone perf.data handle: {error}"))?,
-    );
-    reader
-        .seek(SeekFrom::Start(header.data_offset))
-        .map_err(|error| format!("failed to seek perf data section: {error}"))?;
-
     let mut sink = PerfScriptSink::new(
         header_build_ids,
         symbol_cache,
@@ -892,58 +811,22 @@ where
         arch,
     );
     let mut ordered_records = OrderedRecordQueue::default();
-    let mut header_bytes = [0_u8; 8];
-    let mut payload = Vec::new();
-    let mut offset = usize::try_from(header.data_offset)
-        .map_err(|_| "perf data section offset exceeds usize".to_string())?;
-    let end =
-        usize::try_from(data_end).map_err(|_| "perf data section end exceeds usize".to_string())?;
-    let mut index = 0usize;
+    let mapped = map_perfdata_file(file)?;
+    let records = timed_records(&mapped, header, &sample_layouts)?;
 
-    while offset < end {
-        reader.read_exact(&mut header_bytes).map_err(|error| {
-            format!("failed to read perf record header at offset {offset}: {error}")
-        })?;
-        let record_header = parse_record_header(&header_bytes)?;
-        let size = usize::from(record_header.size);
-        if size < 8 {
-            return Err(format!(
-                "invalid perf record size {size} at offset {offset}"
-            ));
-        }
-        let next = offset
-            .checked_add(size)
-            .ok_or_else(|| format!("perf record size overflows at offset {offset}"))?;
-        if next > end {
-            return Err(format!(
-                "perf record overruns data section at offset {offset}"
-            ));
-        }
-
-        payload.resize(size - 8, 0);
-        reader.read_exact(&mut payload).map_err(|error| {
-            format!("failed to read perf record payload at offset {offset}: {error}")
-        })?;
-
-        if record_header.record_type == PERF_RECORD_FINISHED_ROUND {
+    for timed_record in records {
+        let record = timed_record.record(&mapped)?;
+        if record.header.record_type == PERF_RECORD_FINISHED_ROUND {
             ordered_records
                 .flush_round_with(|record| sink.apply_record(record, &sample_layouts, options))?;
-            offset = next;
             continue;
         }
 
-        let record = PerfRecord {
-            offset,
-            header: record_header,
-            payload: &payload,
-        };
-        let time = record_time(record, &sample_layouts)?;
+        let time = timed_record.time;
         let parsed_record = parse_record_with_context(record)?;
-        ordered_records.apply_or_queue_with(index, time, parsed_record, |record| {
+        ordered_records.apply_or_queue_with(timed_record.index, time, parsed_record, |record| {
             sink.apply_record(record, &sample_layouts, options)
         })?;
-        index += 1;
-        offset = next;
     }
 
     ordered_records
@@ -1293,6 +1176,11 @@ fn perfdata_header_from_file(file: &File) -> Result<(PerfHeader, [u8; 104]), Str
         .map_err(|error| format!("failed to read perf.data header: {error}"))?;
     let header = parse_header(&bytes)?;
     Ok((header, bytes))
+}
+
+fn map_perfdata_file(file: &File) -> Result<Mmap, String> {
+    unsafe { MmapOptions::new().map(file) }
+        .map_err(|error| format!("failed to memory-map perf.data: {error}"))
 }
 
 fn sample_layouts_from_file(
