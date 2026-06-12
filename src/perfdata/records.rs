@@ -1,5 +1,6 @@
 use std::borrow::Cow;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::cell::RefCell;
+use std::sync::Arc;
 
 use crate::perfdata::endian::{read_u16, read_u32, read_u64};
 use crate::perfdata::header::PerfHeader;
@@ -1036,22 +1037,23 @@ fn parse_c_string_lossy(bytes: &[u8]) -> Cow<'_, str> {
 
 fn intern_c_string(bytes: &[u8]) -> Arc<str> {
     type CommInterner = hashbrown::HashMap<Arc<str>, Arc<str>, rustc_hash::FxBuildHasher>;
-    static INTERNER: OnceLock<Mutex<CommInterner>> = OnceLock::new();
+    thread_local! {
+        static INTERNER: RefCell<CommInterner> = RefCell::new(hashbrown::HashMap::with_hasher(
+            rustc_hash::FxBuildHasher::default(),
+        ));
+    }
 
     let text = parse_c_string_lossy(bytes);
     let text = text.as_ref();
-    let interner = INTERNER.get_or_init(|| {
-        Mutex::new(hashbrown::HashMap::with_hasher(
-            rustc_hash::FxBuildHasher::default(),
-        ))
-    });
-    let mut interner = interner.lock().expect("comm interner lock");
-    if let Some(existing) = interner.get(text) {
-        return Arc::clone(existing);
-    }
-    let cached_comm: Arc<str> = Arc::from(text.to_owned());
-    interner.insert(Arc::clone(&cached_comm), Arc::clone(&cached_comm));
-    cached_comm
+    INTERNER.with(|interner| {
+        let mut interner = interner.borrow_mut();
+        if let Some(existing) = interner.get(text) {
+            return Arc::clone(existing);
+        }
+        let cached_comm: Arc<str> = Arc::from(text.to_owned());
+        interner.insert(Arc::clone(&cached_comm), Arc::clone(&cached_comm));
+        cached_comm
+    })
 }
 
 fn parse_c_string_with_remainder(bytes: &[u8]) -> (String, Vec<u8>) {
