@@ -5,9 +5,11 @@ use std::fs::File;
 use std::hash::Hasher;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write as IoWrite};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use hashbrown::{HashMap, HashSet};
 use rustc_hash::{FxBuildHasher, FxHasher};
+use smallvec::SmallVec;
 
 use crate::folded::{append_inferno_perf_folded_label, append_inferno_perf_raw_function};
 use crate::perfdata::attrs::{PerfFileAttr, parse_file_attr_ids, parse_file_attrs};
@@ -44,6 +46,7 @@ const FOLD_COUNT_STORAGE_LINEAR_GROWTH_THRESHOLD: usize = 64 * 1024 * 1024;
 const FOLD_COUNT_STORAGE_LINEAR_GROWTH_CHUNK: usize = 8 * 1024 * 1024;
 const PROT_EXEC: u32 = 4;
 type FoldFrameRenderCache = HashMap<String, String, FxBuildHasher>;
+type FoldFrameStack = SmallVec<[FoldFrame; 16]>;
 
 #[derive(Default)]
 struct FoldCounts {
@@ -108,7 +111,7 @@ struct FoldAccumulator {
     header_build_ids: BTreeMap<String, Vec<u8>>,
     raw_stacks: RawStackAccumulator<FoldFrame>,
     deferred_samples: BTreeMap<u64, Vec<DeferredFoldSample>>,
-    sample_frames: Vec<FoldFrame>,
+    sample_frames: FoldFrameStack,
     unwind_debug_dir: Option<PathBuf>,
     /// Architecture of the recording machine (HEADER_ARCH), used to decode
     /// REGS_USER samples and construct per-pid unwinders. Defaults to x86_64
@@ -206,10 +209,9 @@ struct DeferredFoldSample {
     tid: Option<u32>,
     time: Option<u64>,
     cpu: Option<u32>,
-    comm: Option<String>,
-    event_name: String,
+    event_name: Arc<str>,
     count: u64,
-    frames: Vec<FoldFrame>,
+    frames: FoldFrameStack,
     has_callchain: bool,
 }
 
@@ -218,10 +220,9 @@ struct PreparedFoldSample {
     tid: Option<u32>,
     time: Option<u64>,
     cpu: Option<u32>,
-    comm: Option<String>,
-    event_name: String,
+    event_name: Arc<str>,
     count: u64,
-    frames: Vec<FoldFrame>,
+    frames: FoldFrameStack,
     deferred_cookie: Option<u64>,
     has_callchain: bool,
 }
@@ -314,15 +315,15 @@ struct PrefetchMappingKey {
 
 #[derive(Clone, Debug, Default)]
 struct SampleLayouts {
-    fallback: Option<SampleEventLayout>,
-    by_identifier: BTreeMap<u64, SampleEventLayout>,
+    fallback: Option<Arc<SampleEventLayout>>,
+    by_identifier: BTreeMap<u64, Arc<SampleEventLayout>>,
     event_name_width: usize,
 }
 
 #[derive(Clone, Debug)]
 struct SampleEventLayout {
     layout: SampleLayout,
-    event_name: String,
+    event_name: Arc<str>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1023,7 +1024,6 @@ where
                     tid: sample.tid,
                     time: sample.time,
                     cpu: sample.cpu,
-                    comm: sample.comm,
                     event_name: sample.event_name,
                     count: sample.count,
                     frames: sample.frames,
@@ -1049,7 +1049,6 @@ where
                 tid: sample.tid,
                 time: sample.time,
                 cpu: sample.cpu,
-                comm: sample.comm,
                 event_name: sample.event_name,
                 count: sample.count,
                 frames: sample.frames,
@@ -1069,7 +1068,6 @@ where
                 tid: sample.tid,
                 time: sample.time,
                 cpu: sample.cpu,
-                comm: sample.comm,
                 event_name: sample.event_name,
                 count: sample.count,
                 frames: sample.frames,
@@ -1107,7 +1105,7 @@ where
     }
 
     fn write_sample_header(&mut self, sample: &PreparedFoldSample) -> Result<(), String> {
-        let comm = perf_script_comm(sample);
+        let comm = perf_script_comm(&self.accumulator.thread_comms, sample);
         write!(self.writer, "{comm} ")
             .map_err(|error| format!("failed to write perf script output: {error}"))?;
         if let Some(tid) = sample.tid.or(sample.pid) {
@@ -1132,14 +1130,14 @@ where
             self.writer,
             "{:>10} {:>width$}: ",
             sample.count,
-            sample.event_name,
+            sample.event_name.as_ref(),
             width = self.event_name_width,
         )
         .map_err(|error| format!("failed to write perf script output: {error}"))
     }
 
     fn write_sample_inline_header(&mut self, sample: &PreparedFoldSample) -> Result<(), String> {
-        let comm = perf_script_comm(sample);
+        let comm = perf_script_comm(&self.accumulator.thread_comms, sample);
         write!(self.writer, "{comm:>16} ")
             .map_err(|error| format!("failed to write perf script output: {error}"))?;
         if let Some(tid) = sample.tid.or(sample.pid) {
@@ -1160,21 +1158,27 @@ where
             self.writer,
             "{:>10} {:>width$}: ",
             sample.count,
-            sample.event_name,
+            sample.event_name.as_ref(),
             width = self.event_name_width,
         )
         .map_err(|error| format!("failed to write perf script output: {error}"))
     }
 }
 
-fn perf_script_comm(sample: &PreparedFoldSample) -> &str {
-    sample.comm.as_deref().unwrap_or_else(|| {
-        if sample.tid.or(sample.pid).is_none() {
-            ":-1"
-        } else {
-            "[unknown]"
-        }
-    })
+fn perf_script_comm<'a>(
+    thread_comms: &'a BTreeMap<u32, String>,
+    sample: &PreparedFoldSample,
+) -> Cow<'a, str> {
+    if let Some(tid) = sample.tid {
+        return thread_comms.get(&tid).map_or_else(
+            || Cow::Owned(format!(":{tid}")),
+            |comm| Cow::Borrowed(comm.as_str()),
+        );
+    }
+    if sample.pid.is_some() {
+        return Cow::Borrowed("[unknown]");
+    }
+    Cow::Borrowed(":-1")
 }
 
 impl OrderedRecordQueue {
@@ -1318,20 +1322,22 @@ fn sample_layouts_from_file(
         .max()
         .unwrap_or_default();
     let mut layouts = SampleLayouts {
-        fallback: attrs.first().map(|attr| SampleEventLayout {
-            layout: layout_from_attr(attr),
-            event_name: event_names.first().cloned().unwrap_or_default(),
+        fallback: attrs.first().map(|attr| {
+            Arc::new(SampleEventLayout {
+                layout: layout_from_attr(attr),
+                event_name: event_names.first().cloned().unwrap_or_default().into(),
+            })
         }),
         by_identifier: BTreeMap::new(),
         event_name_width,
     };
     for ((attr, event_name), ids) in attrs.iter().zip(event_names).zip(attr_ids) {
-        let event = SampleEventLayout {
+        let event = Arc::new(SampleEventLayout {
             layout: layout_from_attr(attr),
-            event_name,
-        };
+            event_name: event_name.into(),
+        });
         for id in ids {
-            layouts.by_identifier.insert(id, event.clone());
+            layouts.by_identifier.insert(id, Arc::clone(&event));
         }
     }
     Ok(layouts)
@@ -1560,7 +1566,7 @@ impl FoldAccumulator {
             header_build_ids,
             raw_stacks: RawStackAccumulator::<FoldFrame>::new(),
             deferred_samples: BTreeMap::new(),
-            sample_frames: Vec::new(),
+            sample_frames: FoldFrameStack::new(),
             unwind_debug_dir: current_perf_debug_dir(),
             arch: PerfArch::default(),
         }
@@ -1939,9 +1945,10 @@ impl FoldAccumulator {
 
     fn add_deferred_callchain(&mut self, cookie: u64, tid: Option<u32>, ips: &[u64]) {
         for sample in self.take_resolved_deferred_samples(cookie, tid, ips) {
+            let comm = comm_for_ids(&self.thread_comms, sample.tid);
             add_fold_stack(
                 sample.pid,
-                sample.comm.as_deref(),
+                comm.as_deref(),
                 sample.count,
                 &sample.frames,
                 &self.mmap_table,
@@ -1954,9 +1961,10 @@ impl FoldAccumulator {
     fn flush_deferred_samples(&mut self) {
         let samples = self.take_deferred_samples();
         for sample in samples {
+            let comm = comm_for_ids(&self.thread_comms, sample.tid);
             add_fold_stack(
                 sample.pid,
-                sample.comm.as_deref(),
+                comm.as_deref(),
                 sample.count,
                 &sample.frames,
                 &self.mmap_table,
@@ -2205,12 +2213,7 @@ where
     writer
         .write_all(b" ")
         .map_err(|error| format!("failed to write folded output: {error}"))?;
-    writer
-        .write_all(count.to_string().as_bytes())
-        .map_err(|error| format!("failed to write folded output: {error}"))?;
-    writer
-        .write_all(b"\n")
-        .map_err(|error| format!("failed to write folded output: {error}"))
+    write!(writer, "{count}\n").map_err(|error| format!("failed to write folded output: {error}"))
 }
 
 struct SymbolPrefetchBatches<'a> {
@@ -3318,22 +3321,23 @@ fn parse_sample_for_fold(
                 tid: sample.tid,
                 time: sample.time,
                 cpu: sample.cpu,
-                comm: sample.comm,
                 event_name: sample.event_name,
                 count: sample.count,
                 frames: sample.frames,
                 has_callchain: sample.has_callchain,
             });
     } else {
+        let comm = comm_for_ids(&accumulator.thread_comms, sample.tid);
         add_fold_stack(
             sample.pid,
-            sample.comm.as_deref(),
+            comm.as_deref(),
             sample.count,
             &sample.frames,
             &accumulator.mmap_table,
             &mut accumulator.mapping_cache,
             &mut accumulator.raw_stacks,
         );
+        accumulator.sample_frames = sample.frames;
     }
     Ok(())
 }
@@ -3353,20 +3357,17 @@ fn prepare_sample_for_fold(
     };
     let count = sample_fold_count(sample.period, options);
     accumulator.sample_frames.clear();
-    accumulator.sample_frames.reserve(sample.frames.len());
-    accumulator
-        .sample_frames
-        .extend(sample.frames.clone().map(FoldFrame::Callchain));
+    for frame in sample.frames.clone() {
+        accumulator.sample_frames.push(FoldFrame::Callchain(frame));
+    }
     let deferred_cookie = take_deferred_cookie(&mut accumulator.sample_frames);
     append_perf_user_unwind_frames(accumulator, misc, &event, &sample);
-    let comm = comm_for_ids(&accumulator.thread_comms, sample.tid);
     Ok(Some(PreparedFoldSample {
         pid: sample.pid,
         tid: sample.tid,
         time: sample.time,
         cpu: sample.cpu,
-        comm: comm.map(Cow::into_owned),
-        event_name: event.event_name,
+        event_name: Arc::clone(&event.event_name),
         count,
         frames: std::mem::take(&mut accumulator.sample_frames),
         deferred_cookie,
@@ -3893,7 +3894,7 @@ fn is_recorded_kernel_callchain_frame(frame: u64) -> bool {
     !is_perf_context_marker(frame) && is_kernel_space_frame(frame)
 }
 
-fn take_deferred_cookie(frames: &mut Vec<FoldFrame>) -> Option<u64> {
+fn take_deferred_cookie(frames: &mut FoldFrameStack) -> Option<u64> {
     match frames.as_slice() {
         [
             ..,
@@ -4087,20 +4088,22 @@ fn sample_layouts(
         .max()
         .unwrap_or_default();
     let mut layouts = SampleLayouts {
-        fallback: attrs.first().map(|attr| SampleEventLayout {
-            layout: layout_from_attr(attr),
-            event_name: event_names.first().cloned().unwrap_or_default(),
+        fallback: attrs.first().map(|attr| {
+            Arc::new(SampleEventLayout {
+                layout: layout_from_attr(attr),
+                event_name: event_names.first().cloned().unwrap_or_default().into(),
+            })
         }),
         by_identifier: BTreeMap::new(),
         event_name_width,
     };
     for ((attr, event_name), ids) in attrs.iter().zip(event_names).zip(attr_ids) {
-        let event = SampleEventLayout {
+        let event = Arc::new(SampleEventLayout {
             layout: layout_from_attr(attr),
-            event_name,
-        };
+            event_name: event_name.into(),
+        });
         for id in ids {
-            layouts.by_identifier.insert(id, event.clone());
+            layouts.by_identifier.insert(id, Arc::clone(&event));
         }
     }
     Ok(layouts)
@@ -4272,9 +4275,9 @@ fn software_event_name(config: u64) -> &'static str {
 }
 
 impl SampleLayouts {
-    fn layout_for_payload(&self, payload: &[u8]) -> Result<Option<SampleEventLayout>, String> {
+    fn layout_for_payload(&self, payload: &[u8]) -> Result<Option<Arc<SampleEventLayout>>, String> {
         if self.by_identifier.is_empty() {
-            return Ok(self.fallback.clone());
+            return Ok(self.fallback.as_ref().map(Arc::clone));
         }
         let Some(fallback) = self.fallback.clone() else {
             return Ok(None);
@@ -4283,7 +4286,7 @@ impl SampleLayouts {
             return Ok(self
                 .by_identifier
                 .get(&identifier)
-                .cloned()
+                .map(Arc::clone)
                 .or(Some(fallback)));
         }
         Ok(Some(fallback))

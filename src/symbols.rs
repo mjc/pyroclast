@@ -657,16 +657,26 @@ where
     fn resolve_group_symbols(
         &self,
         path: &Path,
-        grouped_requests: &[SymbolRequest],
+        requests: &[SymbolRequest],
+        indexes: &[usize],
     ) -> Result<Vec<Option<String>>, String> {
+        let mut stdin = String::new();
+        for index in indexes {
+            writeln!(stdin, "0x{:x}", requests[*index].relative_address)
+                .expect("writing to a string cannot fail");
+        }
         let output = self
             .runner
-            .run(&build_addr2line_command(path, grouped_requests))
+            .run(
+                &CommandSpec::new("addr2line")
+                    .args(["-f", "-C", "-e", path.to_string_lossy().as_ref()])
+                    .stdin(stdin.into_bytes()),
+            )
             .map_err(|error| format!("failed to run addr2line: {error}"))?;
         if output.status_code == Some(0) {
-            parse_addr2line_stdout(&output.stdout, grouped_requests.len())
+            parse_addr2line_stdout(&output.stdout, indexes.len())
         } else {
-            Ok(vec![None; grouped_requests.len()])
+            Ok(vec![None; indexes.len()])
         }
     }
 }
@@ -1851,35 +1861,23 @@ where
     R: CommandRunner,
 {
     fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
-        let mut resolved_by_request = BTreeMap::<SymbolRequest, Option<String>>::new();
+        let mut resolved = vec![None; requests.len()];
         for (path, indexes) in grouped_request_indexes(requests) {
             let path = Path::new(path);
-            let grouped_requests = indexes
-                .iter()
-                .map(|index| requests[*index].clone())
-                .collect::<Vec<_>>();
-            let symbols = self.resolve_group_symbols(path, &grouped_requests)?;
+            let symbols = self.resolve_group_symbols(path, requests, &indexes)?;
             let object_metadata = self.object_metadata(path);
-            for (request, symbol) in grouped_requests.into_iter().zip(symbols) {
+            for (index, symbol) in indexes.into_iter().zip(symbols) {
+                let request = &requests[index];
                 let object_symbol = object_metadata.as_ref().and_then(|metadata| {
                     metadata
                         .object_metadata
                         .object_symbol(request.relative_address)
                 });
                 let symbol = perf_name_with_object_alias(symbol, object_symbol);
-                resolved_by_request.insert(request, symbol);
+                resolved[index] = symbol;
             }
         }
-
-        requests
-            .iter()
-            .map(|request| {
-                resolved_by_request
-                    .get(request)
-                    .cloned()
-                    .ok_or_else(|| "missing addr2line result for request".to_string())
-            })
-            .collect()
+        Ok(resolved)
     }
 
     fn resolve_frame_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Vec<String>>, String> {
@@ -1899,21 +1897,17 @@ where
         let mut resolved = vec![ResolvedSymbolFrames::default(); requests.len()];
         for (path, indexes) in grouped_request_indexes(requests) {
             let path = Path::new(path);
-            let grouped_requests = indexes
-                .iter()
-                .map(|index| requests[*index].clone())
-                .collect::<Vec<_>>();
-            let symbols = self.resolve_group_symbols(path, &grouped_requests)?;
+            let symbols = self.resolve_group_symbols(path, requests, &indexes)?;
             let object_metadata = self.object_metadata(path);
             if let Some(metadata) = object_metadata.as_ref() {
-                let addresses = grouped_requests
+                let addresses = indexes
                     .iter()
-                    .map(|request| request.relative_address)
+                    .map(|index| requests[*index].relative_address)
                     .collect::<Vec<_>>();
                 metadata.prepare_dwarf_frames_for_addresses(&addresses);
             }
-            for ((index, request), symbol) in indexes.into_iter().zip(grouped_requests).zip(symbols)
-            {
+            for (index, symbol) in indexes.into_iter().zip(symbols) {
+                let request = &requests[index];
                 let object_symbols =
                     object_symbols_for_frame(object_metadata.as_ref(), request.relative_address);
                 let object_symbol = object_symbols.bare;
