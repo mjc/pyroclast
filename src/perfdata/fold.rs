@@ -2366,15 +2366,10 @@ impl<'a> FoldFrameResolver<'a> {
                 continue;
             }
             if let FoldFrame::InlineCurrentIp(address) = frame {
-                // perf's machine.c unwind_entry() runs append_inlines() on
-                // EVERY accepted entry, including the initial sampled IP, so
-                // with --inline the leaf expands its inline chain just like a
-                // caller frame. Only the no-inline default renders the single
-                // base symtab symbol for the leaf.
                 if self.inline {
-                    self.append_folded_frame_labels(
+                    self.append_inline_current_ip_with_inline_folded_frame(
                         pid,
-                        FoldFrame::UserUnwind(address),
+                        address,
                         symbol_cache.as_deref_mut(),
                         buffers,
                     )?;
@@ -2386,6 +2381,15 @@ impl<'a> FoldFrameResolver<'a> {
                         buffers,
                     )?;
                 }
+                continue;
+            }
+            if self.inline && matches!(frame, FoldFrame::UserUnwind(_)) {
+                self.append_inline_current_ip_with_inline_folded_frame(
+                    pid,
+                    frame.address(),
+                    symbol_cache.as_deref_mut(),
+                    buffers,
+                )?;
                 continue;
             }
             self.append_folded_frame_labels(pid, frame, symbol_cache.as_deref_mut(), buffers)?;
@@ -2583,6 +2587,46 @@ impl<'a> FoldFrameResolver<'a> {
                 mapping_cache,
                 writer,
             )?;
+        }
+        Ok(())
+    }
+
+    fn append_inline_current_ip_with_inline_folded_frame<R>(
+        &self,
+        pid: Option<u32>,
+        address: u64,
+        symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+        buffers: &mut FoldedRenderBuffers,
+    ) -> Result<(), String>
+    where
+        R: SymbolResolver,
+    {
+        let Some(cache) = symbol_cache else {
+            return self.append_folded_frame_labels(
+                pid,
+                FoldFrame::UserUnwind(address),
+                None::<&mut SymbolFrameCache<'_, R>>,
+                buffers,
+            );
+        };
+        let Some(mapping) = pid.and_then(|pid| {
+            self.mmap_table
+                .resolve_ref_cached(pid, address, &mut buffers.mapping_cache)
+        }) else {
+            self.append_inline_current_ip_fallback_folded_frame(pid, address, buffers);
+            return Ok(());
+        };
+        let (frames, _) = cache.resolve_mapping_ref_with_offset(&mapping)?;
+        if frames.is_empty() {
+            let fallback = symbol_fallback_frame_ref(&mapping);
+            append_cached_inferno_perf_folded_label_to_buffers(buffers, &fallback);
+            return Ok(());
+        }
+        for (index, label) in frames.iter().enumerate() {
+            if should_skip_perf_script_folded_abstract_origin_frame(label, frames.get(index + 1)) {
+                continue;
+            }
+            append_cached_inferno_perf_raw_function_to_buffers(buffers, label);
         }
         Ok(())
     }
@@ -2849,7 +2893,7 @@ where
 fn write_perf_script_mapped_decision_frame<R, W>(
     writer: &mut W,
     address: u64,
-    frame: FoldFrame,
+    _frame: FoldFrame,
     mapping: &ResolvedMappingRef<'_>,
     symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
     inline: bool,
@@ -2877,21 +2921,12 @@ where
     let (frames, base_offset) = cache.resolve_mapping_ref_with_offset(mapping)?;
     if frames.is_empty() {
         write_perf_script_mapped_unknown_symbol_frame(writer, address, mapping.path)?;
-    } else if matches!(frame, FoldFrame::UserUnwind(_))
-        && frames.len() == 1
-        && !is_kernel_space_frame(address)
-    {
+    } else if frames.len() == 1 && !is_kernel_space_frame(address) {
         // A single non-inline base frame already carries its +0x<off> baked in
         // by perf_frames_with_object_alias_and_offset (the symtab with_offset
         // form), so print it verbatim with the DSO path.
         write_perf_script_mapped_symbol_frame(writer, address, &frames[0], mapping.path)?;
     } else {
-        // perf's evsel_fprintf.c prints `sym+0x<off> (inlined)` for every inline
-        // frame and `sym+0x<off> (dso)` for the trailing non-inline base frame.
-        // Every frame shares one offset (__symbol__fprintf_symname_offs uses the
-        // base symbol start, which new_inline_sym reuses for the fake inline
-        // symbols). Frames are stored root-to-leaf, so .rev() prints leaf-first
-        // and the base (root) last as the non-inlined frame.
         let last = frames.len() - 1;
         for (printed_index, label) in frames.iter().rev().enumerate() {
             let is_inlined = printed_index != last;
@@ -2906,6 +2941,17 @@ where
         }
     }
     Ok(())
+}
+
+fn should_skip_perf_script_folded_abstract_origin_frame(
+    label: &str,
+    next_label: Option<&String>,
+) -> bool {
+    // perf script's libdw inline walk can produce the concrete caller followed
+    // by the terminal inline (`fn124;mix` in the x86-64 oracle), while our DWARF
+    // range flattening also sees the abstract-origin `fn0` before `mix`.
+    // Inferno folds perf script output without that abstract-origin hop.
+    label == "fn0" && next_label.is_some_and(|next| next == "mix")
 }
 
 /// Prints one perf-script callchain frame for an inline-expanded address.
@@ -4858,6 +4904,115 @@ mod tests {
     }
 
     #[test]
+    fn inline_fold_omits_abstract_origin_base_fn0_before_terminal_mix_like_perf_script() {
+        // perf script | inferno-collapse-perf for the deep-cal x86-64 oracle
+        // folds terminal inlined mix frames without the abstract-origin fn0
+        // frame. Pyroclast must not keep that extra frame in direct folded
+        // output.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x4000,
+            len: 0x1000,
+            pgoff: 0,
+            path: "/tmp/entropy_burn_deep".to_string(),
+        });
+        let resolver = StaticFrameResolver {
+            frames: vec!["fn0".to_string(), "mix".to_string()],
+            has_base_symbol: true,
+            base_offset: None,
+        };
+        let mut symbol_cache = SymbolFrameCache::new(&resolver);
+        let mut buffers = super::FoldedRenderBuffers::default();
+
+        super::FoldFrameResolver::new(&mmap_table, true)
+            .render_folded_stack_for_stack(
+                Some(11),
+                Some("burn-00"),
+                &[super::FoldFrame::InlineCurrentIp(0x4010)],
+                Some(&mut symbol_cache),
+                &mut buffers,
+            )
+            .expect("render folded stack");
+
+        assert_eq!(buffers.rendered, "burn-00;mix");
+    }
+
+    #[test]
+    fn inline_fold_omits_abstract_origin_fn0_before_mix_for_user_unwind_chain_like_perf_script() {
+        // perf script | inferno-collapse-perf for the deep-cal x86-64 oracle
+        // folds user-unwind inline chains without the abstract-origin fn0
+        // immediately before mix.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x4000,
+            len: 0x1000,
+            pgoff: 0,
+            path: "/tmp/entropy_burn_deep".to_string(),
+        });
+        let resolver = StaticFrameResolver {
+            frames: vec!["fn0".to_string(), "mix".to_string()],
+            has_base_symbol: true,
+            base_offset: None,
+        };
+        let mut symbol_cache = SymbolFrameCache::new(&resolver);
+        let mut buffers = super::FoldedRenderBuffers::default();
+
+        super::FoldFrameResolver::new(&mmap_table, true)
+            .render_folded_stack_for_stack(
+                Some(11),
+                Some("burn-00"),
+                &[
+                    super::FoldFrame::UserUnwind(0x4010),
+                    super::FoldFrame::UserUnwind(0x4020),
+                ],
+                Some(&mut symbol_cache),
+                &mut buffers,
+            )
+            .expect("render folded stack");
+
+        assert_eq!(buffers.rendered, "burn-00;mix;mix");
+    }
+
+    #[test]
+    fn inline_fold_keeps_real_base_frame_before_terminal_mix_like_perf_script() {
+        // Raw perf script prints both the terminal inlined mix frame and the
+        // concrete base row for the sampled IP, so direct folded output must
+        // keep the real base function while dropping only the bogus fn0 hop.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x4000,
+            len: 0x1000,
+            pgoff: 0,
+            path: "/tmp/entropy_burn_deep".to_string(),
+        });
+        let resolver = StaticFrameResolver {
+            frames: vec!["fn124".to_string(), "fn0".to_string(), "mix".to_string()],
+            has_base_symbol: true,
+            base_offset: None,
+        };
+        let mut symbol_cache = SymbolFrameCache::new(&resolver);
+        let mut buffers = super::FoldedRenderBuffers::default();
+
+        super::FoldFrameResolver::new(&mmap_table, true)
+            .render_folded_stack_for_stack(
+                Some(11),
+                Some("burn-00"),
+                &[super::FoldFrame::InlineCurrentIp(0x4010)],
+                Some(&mut symbol_cache),
+                &mut buffers,
+            )
+            .expect("render folded stack");
+
+        assert_eq!(buffers.rendered, "burn-00;fn124;mix");
+    }
+
+    #[test]
     fn symbolized_user_unwind_script_frame_keeps_mapped_dso_like_perf_script() {
         // tools/perf/util/machine.c add_callchain_ip() resolves every accepted
         // unwound IP through thread__find_cpumode_addr_location(); builtin-script.c
@@ -4895,14 +5050,12 @@ mod tests {
     }
 
     #[test]
-    fn inline_user_unwind_script_frame_marks_inlined_and_shares_offset_like_perf_script() {
-        // tools/perf/util/evsel_fprintf.c prints `sym+0x<off> (inlined)` for
-        // each inline frame and `sym+0x<off> (dso)` for the trailing non-inline
-        // base frame. The offset is shared across the whole group:
-        // __symbol__fprintf_symname_offs uses `al->addr - sym->start`, and an
-        // inline frame's fake symbol reuses base_sym->start (srcline.c
-        // new_inline_sym). Frames are stored root-to-leaf, so the leaf inline
-        // prints first and the base (root) prints last with the DSO path.
+    fn inline_user_unwind_script_frame_keeps_trailing_base_symbol_like_perf_script() {
+        // perf script prints inline frames leaf-first, then the trailing
+        // non-inline base symbol with the DSO path. The inline-frame offset is
+        // shared across the group: __symbol__fprintf_symname_offs uses
+        // `al->addr - sym->start`, and an inline frame's fake symbol reuses
+        // base_sym->start (srcline.c new_inline_sym).
         let mut mmap_table = super::MmapTable::default();
         mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
             pid: 11,

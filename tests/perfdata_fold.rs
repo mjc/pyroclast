@@ -3044,7 +3044,7 @@ fn folds_mapped_user_frames_with_symbol_names() {
 }
 
 #[test]
-fn symbolized_fold_expands_inline_symbol_frames() {
+fn symbolized_fold_expands_inline_symbol_frames_with_inline_option() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
             PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
@@ -3058,14 +3058,21 @@ fn symbolized_fold_expands_inline_symbol_frames() {
     );
     let resolver = InlineSymbolResolver;
 
-    let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
-        .expect("folded");
+    let folded = fold_perfdata_callchains_with_symbols(
+        &bytes,
+        FoldOptions {
+            inline: true,
+            ..FoldOptions::default()
+        },
+        &resolver,
+    )
+    .expect("folded");
 
     assert_eq!(folded, ":12;app::outer;app::inner 1\n");
 }
 
 #[test]
-fn symbolized_fold_renders_inline_arrows_like_inferno_collapse_perf() {
+fn symbolized_fold_renders_inline_arrows_with_inline_option_like_inferno_collapse_perf() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
             PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
@@ -3079,14 +3086,21 @@ fn symbolized_fold_renders_inline_arrows_like_inferno_collapse_perf() {
     );
     let resolver = ArrowInlineSymbolResolver;
 
-    let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
-        .expect("folded");
+    let folded = fold_perfdata_callchains_with_symbols(
+        &bytes,
+        FoldOptions {
+            inline: true,
+            ..FoldOptions::default()
+        },
+        &resolver,
+    )
+    .expect("folded");
 
     assert_eq!(folded, ":12;app::outer;app::middle;app::inner_[i] 1\n");
 }
 
 #[test]
-fn symbolized_fold_keeps_unknown_caller_before_inline_frames_like_perf_script() {
+fn symbolized_fold_keeps_unknown_caller_before_inline_frames_with_inline_option_like_perf_script() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
             PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
@@ -3101,14 +3115,22 @@ fn symbolized_fold_keeps_unknown_caller_before_inline_frames_like_perf_script() 
     );
     let resolver = InlineSymbolResolver;
 
-    let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
-        .expect("folded");
+    let folded = fold_perfdata_callchains_with_symbols(
+        &bytes,
+        FoldOptions {
+            inline: true,
+            ..FoldOptions::default()
+        },
+        &resolver,
+    )
+    .expect("folded");
 
     assert_eq!(folded, ":12;[unknown];app::outer;app::inner 1\n");
 }
 
 #[test]
-fn symbolized_fold_keeps_module_fallback_caller_before_inline_frames_like_perf_script() {
+fn symbolized_fold_keeps_module_fallback_caller_before_inline_frames_with_inline_option_like_perf_script()
+ {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
             PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
@@ -3126,14 +3148,22 @@ fn symbolized_fold_keeps_module_fallback_caller_before_inline_frames_like_perf_s
     );
     let resolver = InlineSymbolResolver;
 
-    let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
-        .expect("folded");
+    let folded = fold_perfdata_callchains_with_symbols(
+        &bytes,
+        FoldOptions {
+            inline: true,
+            ..FoldOptions::default()
+        },
+        &resolver,
+    )
+    .expect("folded");
 
     assert_eq!(folded, ":12;[libc.so.6];app::outer;app::inner 1\n");
 }
 
 #[test]
-fn symbolized_fold_renders_unmapped_user_caller_as_unknown_like_perf_script() {
+fn symbolized_fold_renders_unmapped_user_caller_before_inline_frames_with_inline_option_like_perf_script()
+ {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
             PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
@@ -3147,8 +3177,15 @@ fn symbolized_fold_renders_unmapped_user_caller_as_unknown_like_perf_script() {
     );
     let resolver = InlineSymbolResolver;
 
-    let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
-        .expect("folded");
+    let folded = fold_perfdata_callchains_with_symbols(
+        &bytes,
+        FoldOptions {
+            inline: true,
+            ..FoldOptions::default()
+        },
+        &resolver,
+    )
+    .expect("folded");
 
     assert_eq!(folded, ":12;[unknown];app::outer;app::inner 1\n");
 }

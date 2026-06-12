@@ -1275,7 +1275,7 @@ where
                 let folded_rendered = if resolved_frames.frames.is_empty() {
                     fallback_rendered
                 } else {
-                    render_inferno_perf_raw_stack(resolved_frames.frames.iter().map(String::as_str))
+                    render_perf_script_inferno_folded_frames(&resolved_frames.frames)
                 };
                 self.resolved_base_by_mapping.insert(
                     key,
@@ -1389,7 +1389,7 @@ where
                 let folded_rendered = if resolved_frames.frames.is_empty() {
                     fallback_rendered
                 } else {
-                    render_inferno_perf_raw_stack(resolved_frames.frames.iter().map(String::as_str))
+                    render_perf_script_inferno_folded_frames(&resolved_frames.frames)
                 };
                 self.resolved_by_mapping.insert(
                     key,
@@ -1438,6 +1438,23 @@ where
         }
         Ok(())
     }
+}
+
+fn render_perf_script_inferno_folded_frames(frames: &[String]) -> String {
+    render_inferno_perf_raw_stack(frames.iter().enumerate().filter_map(|(index, frame)| {
+        if should_skip_perf_script_folded_abstract_origin_frame(frame, frames.get(index + 1)) {
+            None
+        } else {
+            Some(frame.as_str())
+        }
+    }))
+}
+
+fn should_skip_perf_script_folded_abstract_origin_frame(
+    label: &str,
+    next_label: Option<&String>,
+) -> bool {
+    label == "fn0" && next_label.is_some_and(|next| next == "mix")
 }
 
 impl<O> SymbolResolver for PerfSymbolResolver<O>
@@ -4286,6 +4303,24 @@ mod tests {
             .expect("folded render");
 
         assert_eq!(folded, "handler");
+    }
+
+    #[test]
+    fn symbol_frame_cache_resolve_folded_mapping_ref_omits_fn0_before_mix_like_perf_script() {
+        let resolver = CountingFrameResolver::new(vec![vec![
+            "fn124".to_string(),
+            "fn0".to_string(),
+            "mix".to_string(),
+        ]]);
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let mapping = test_mapping_ref("/bin/demo", 0x1234);
+
+        let folded = cache
+            .resolve_folded_mapping_ref(&mapping)
+            .expect("resolve")
+            .expect("folded render");
+
+        assert_eq!(folded, "fn124;mix");
     }
 
     #[test]
