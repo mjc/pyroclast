@@ -24,8 +24,15 @@ use crate::perfdata::mappings::{
 };
 use crate::perfdata::raw_stack::{RawStackAccumulator, RawStackEntryRef};
 use crate::perfdata::records::{
-    PERF_RECORD_FINISHED_ROUND, PERF_RECORD_MISC_CPUMODE_KERNEL, PERF_RECORD_MISC_CPUMODE_MASK,
-    ParsedRecord, PerfRecord, PerfRecordHeader, iter_records, parse_record, parse_record_header,
+    PERF_RECORD_FINISHED_ROUND, PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_CPUMODE_KERNEL,
+    PERF_RECORD_MISC_CPUMODE_MASK, PERF_RECORD_MISC_FORK_EXEC, PERF_RECORD_MISC_MMAP_BUILD_ID,
+    ParsedRecord, PerfRecord, PerfRecordHeader, iter_records, parse_aux_output_hw_id_record,
+    parse_aux_record, parse_bpf_event_record, parse_callchain_deferred_record, parse_cgroup_record,
+    parse_comm_record, parse_exit_record, parse_fork_record, parse_itrace_start_record,
+    parse_ksymbol_record, parse_lost_record, parse_lost_samples_record, parse_mmap_record,
+    parse_mmap2_build_id_record, parse_mmap2_record, parse_namespaces_record, parse_read_record,
+    parse_record, parse_record_header, parse_switch_cpu_wide_record, parse_switch_record,
+    parse_text_poke_record, parse_throttle_record, parse_unthrottle_record,
 };
 use crate::perfdata::samples::{
     PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_ID,
@@ -191,15 +198,42 @@ struct TimedRecord {
     header: PerfRecordHeader,
 }
 
-struct PendingParsedRecord {
+enum FoldRecord<'a> {
+    Comm(crate::perfdata::records::CommRecord),
+    Mmap(crate::perfdata::records::MmapRecord),
+    Mmap2(crate::perfdata::records::Mmap2Record),
+    Mmap2BuildId(crate::perfdata::records::Mmap2BuildIdRecord),
+    Fork(crate::perfdata::records::ForkRecord),
+    Exit(crate::perfdata::records::ExitRecord),
+    Lost(crate::perfdata::records::LostRecord),
+    LostSamples(crate::perfdata::records::LostSamplesRecord),
+    Throttle(crate::perfdata::records::ThrottleRecord),
+    Unthrottle(crate::perfdata::records::UnthrottleRecord),
+    Read(crate::perfdata::records::ReadRecord),
+    Sample { misc: u16, payload: &'a [u8] },
+    Aux(crate::perfdata::records::AuxRecord),
+    ItraceStart(crate::perfdata::records::ItraceStartRecord),
+    Switch(crate::perfdata::records::SwitchRecord),
+    SwitchCpuWide(crate::perfdata::records::SwitchCpuWideRecord),
+    Namespaces(crate::perfdata::records::NamespacesRecord),
+    Ksymbol(crate::perfdata::records::KsymbolRecord),
+    BpfEvent(crate::perfdata::records::BpfEventRecord),
+    Cgroup(crate::perfdata::records::CgroupRecord),
+    TextPoke(crate::perfdata::records::TextPokeRecord),
+    AuxOutputHwId(crate::perfdata::records::AuxOutputHwIdRecord),
+    CallchainDeferred(crate::perfdata::records::CallchainDeferredRecord),
+    Unsupported { record_type: u32 },
+}
+
+struct PendingFoldRecord<'a> {
     index: usize,
     time: u64,
-    record: ParsedRecord,
+    record: FoldRecord<'a>,
 }
 
 #[derive(Default)]
-struct OrderedRecordQueue {
-    pending_records: Vec<PendingParsedRecord>,
+struct OrderedRecordQueue<'a> {
+    pending_records: Vec<PendingFoldRecord<'a>>,
     next_flush_time: Option<u64>,
     max_timestamp: Option<u64>,
 }
@@ -692,6 +726,89 @@ fn parse_record_with_context(record: PerfRecord<'_>) -> Result<ParsedRecord, Str
     })
 }
 
+fn parse_fold_record(record: PerfRecord<'_>) -> Result<FoldRecord<'_>, String> {
+    let parsed = match record.header.record_type {
+        crate::perfdata::records::PERF_RECORD_MMAP => {
+            FoldRecord::Mmap(parse_mmap_record(record.payload)?)
+        }
+        crate::perfdata::records::PERF_RECORD_LOST => {
+            FoldRecord::Lost(parse_lost_record(record.payload)?)
+        }
+        crate::perfdata::records::PERF_RECORD_COMM => {
+            let mut comm = parse_comm_record(record.payload)?;
+            comm.is_exec = record.header.misc & PERF_RECORD_MISC_COMM_EXEC != 0;
+            FoldRecord::Comm(comm)
+        }
+        crate::perfdata::records::PERF_RECORD_THROTTLE => {
+            FoldRecord::Throttle(parse_throttle_record(record.payload)?)
+        }
+        crate::perfdata::records::PERF_RECORD_UNTHROTTLE => {
+            FoldRecord::Unthrottle(parse_unthrottle_record(record.payload)?)
+        }
+        crate::perfdata::records::PERF_RECORD_MMAP2
+            if record.header.misc & PERF_RECORD_MISC_MMAP_BUILD_ID != 0 =>
+        {
+            FoldRecord::Mmap2BuildId(parse_mmap2_build_id_record(record.payload)?)
+        }
+        crate::perfdata::records::PERF_RECORD_MMAP2 => {
+            FoldRecord::Mmap2(parse_mmap2_record(record.payload)?)
+        }
+        crate::perfdata::records::PERF_RECORD_LOST_SAMPLES => {
+            FoldRecord::LostSamples(parse_lost_samples_record(record.payload)?)
+        }
+        crate::perfdata::records::PERF_RECORD_EXIT => {
+            FoldRecord::Exit(parse_exit_record(record.payload)?)
+        }
+        crate::perfdata::records::PERF_RECORD_FORK => FoldRecord::Fork({
+            let mut fork = parse_fork_record(record.payload)?;
+            fork.clone_maps = record.header.misc & PERF_RECORD_MISC_FORK_EXEC == 0;
+            fork
+        }),
+        crate::perfdata::records::PERF_RECORD_READ => {
+            FoldRecord::Read(parse_read_record(record.payload)?)
+        }
+        crate::perfdata::records::PERF_RECORD_SAMPLE => FoldRecord::Sample {
+            misc: record.header.misc,
+            payload: record.payload,
+        },
+        crate::perfdata::records::PERF_RECORD_AUX => {
+            FoldRecord::Aux(parse_aux_record(record.payload)?)
+        }
+        crate::perfdata::records::PERF_RECORD_ITRACE_START => {
+            FoldRecord::ItraceStart(parse_itrace_start_record(record.payload)?)
+        }
+        crate::perfdata::records::PERF_RECORD_SWITCH => {
+            FoldRecord::Switch(parse_switch_record(record.payload)?)
+        }
+        crate::perfdata::records::PERF_RECORD_SWITCH_CPU_WIDE => {
+            FoldRecord::SwitchCpuWide(parse_switch_cpu_wide_record(record.payload)?)
+        }
+        crate::perfdata::records::PERF_RECORD_NAMESPACES => {
+            FoldRecord::Namespaces(parse_namespaces_record(record.payload)?)
+        }
+        crate::perfdata::records::PERF_RECORD_KSYMBOL => {
+            FoldRecord::Ksymbol(parse_ksymbol_record(record.payload)?)
+        }
+        crate::perfdata::records::PERF_RECORD_BPF_EVENT => {
+            FoldRecord::BpfEvent(parse_bpf_event_record(record.payload)?)
+        }
+        crate::perfdata::records::PERF_RECORD_CGROUP => {
+            FoldRecord::Cgroup(parse_cgroup_record(record.payload)?)
+        }
+        crate::perfdata::records::PERF_RECORD_TEXT_POKE => {
+            FoldRecord::TextPoke(parse_text_poke_record(record.payload)?)
+        }
+        crate::perfdata::records::PERF_RECORD_AUX_OUTPUT_HW_ID => {
+            FoldRecord::AuxOutputHwId(parse_aux_output_hw_id_record(record.payload)?)
+        }
+        crate::perfdata::records::PERF_RECORD_CALLCHAIN_DEFERRED => {
+            FoldRecord::CallchainDeferred(parse_callchain_deferred_record(record.payload)?)
+        }
+        record_type => FoldRecord::Unsupported { record_type },
+    };
+    Ok(parsed)
+}
+
 fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData, String> {
     let header = parse_header(bytes)?;
     let sample_layouts = sample_layouts(bytes, header)?;
@@ -707,7 +824,7 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
             ordered_records.flush_round(&mut accumulator, &sample_layouts, options)?;
             continue;
         }
-        let parsed_record = parse_record_with_context(record)?;
+        let parsed_record = parse_fold_record(record)?;
         let record_result = ordered_records.apply_or_queue(
             timed_record.index,
             timed_record.time,
@@ -770,7 +887,7 @@ where
         }
 
         let time = timed_record.time;
-        let parsed_record = parse_record_with_context(record)?;
+        let parsed_record = parse_fold_record(record)?;
         ordered_records.apply_or_queue(
             timed_record.index,
             time,
@@ -817,20 +934,21 @@ where
     for timed_record in records {
         let record = timed_record.record(&mapped)?;
         if record.header.record_type == PERF_RECORD_FINISHED_ROUND {
-            ordered_records
-                .flush_round_with(|record| sink.apply_record(record, &sample_layouts, options))?;
+            ordered_records.flush_round_with(|record| {
+                sink.apply_fold_record(record, &sample_layouts, options)
+            })?;
             continue;
         }
 
         let time = timed_record.time;
-        let parsed_record = parse_record_with_context(record)?;
+        let parsed_record = parse_fold_record(record)?;
         ordered_records.apply_or_queue_with(timed_record.index, time, parsed_record, |record| {
-            sink.apply_record(record, &sample_layouts, options)
+            sink.apply_fold_record(record, &sample_layouts, options)
         })?;
     }
 
     ordered_records
-        .flush_final_with(|record| sink.apply_record(record, &sample_layouts, options))?;
+        .flush_final_with(|record| sink.apply_fold_record(record, &sample_layouts, options))?;
     sink.flush_deferred_samples()
 }
 
@@ -864,23 +982,23 @@ where
         }
     }
 
-    fn apply_record(
+    fn apply_fold_record(
         &mut self,
-        record: ParsedRecord,
+        record: FoldRecord<'_>,
         sample_layouts: &SampleLayouts,
         options: FoldOptions,
     ) -> Result<(), String> {
         match record {
-            ParsedRecord::Sample(record) => {
-                self.write_sample(record.misc, &record.payload, sample_layouts, options)
+            FoldRecord::Sample { misc, payload } => {
+                self.write_sample(misc, payload, sample_layouts, options)
             }
-            ParsedRecord::CallchainDeferred(record) => {
+            FoldRecord::CallchainDeferred(record) => {
                 let tid = deferred_callchain_tid(&record.sample_id, sample_layouts);
                 self.write_deferred_callchain(record.cookie, tid, &record.ips)
             }
             record => self
                 .accumulator
-                .apply_record(record, sample_layouts, options),
+                .apply_fold_record(record, sample_layouts, options),
         }
     }
 
@@ -1068,16 +1186,16 @@ fn perf_script_comm<'a>(
     Cow::Borrowed(":-1")
 }
 
-impl OrderedRecordQueue {
+impl<'a> OrderedRecordQueue<'a> {
     fn apply_or_queue_with<F>(
         &mut self,
         index: usize,
         time: Option<u64>,
-        record: ParsedRecord,
+        record: FoldRecord<'a>,
         mut apply: F,
     ) -> Result<(), String>
     where
-        F: FnMut(ParsedRecord) -> Result<(), String>,
+        F: FnMut(FoldRecord<'a>) -> Result<(), String>,
     {
         if let Some(time) = time {
             self.queue(index, time, record);
@@ -1091,19 +1209,19 @@ impl OrderedRecordQueue {
         &mut self,
         index: usize,
         time: Option<u64>,
-        record: ParsedRecord,
+        record: FoldRecord<'a>,
         accumulator: &mut FoldAccumulator,
         sample_layouts: &SampleLayouts,
         options: FoldOptions,
     ) -> Result<(), String> {
         self.apply_or_queue_with(index, time, record, |record| {
-            accumulator.apply_record(record, sample_layouts, options)
+            accumulator.apply_fold_record(record, sample_layouts, options)
         })
     }
 
-    fn queue(&mut self, index: usize, time: u64, record: ParsedRecord) {
+    fn queue(&mut self, index: usize, time: u64, record: FoldRecord<'a>) {
         self.max_timestamp = Some(self.max_timestamp.map_or(time, |max| max.max(time)));
-        self.pending_records.push(PendingParsedRecord {
+        self.pending_records.push(PendingFoldRecord {
             index,
             time,
             record,
@@ -1116,12 +1234,14 @@ impl OrderedRecordQueue {
         sample_layouts: &SampleLayouts,
         options: FoldOptions,
     ) -> Result<(), String> {
-        self.flush_round_with(|record| accumulator.apply_record(record, sample_layouts, options))
+        self.flush_round_with(|record| {
+            accumulator.apply_fold_record(record, sample_layouts, options)
+        })
     }
 
     fn flush_round_with<F>(&mut self, apply: F) -> Result<(), String>
     where
-        F: FnMut(ParsedRecord) -> Result<(), String>,
+        F: FnMut(FoldRecord<'a>) -> Result<(), String>,
     {
         if let Some(limit) = self.next_flush_time {
             self.flush_through_with(Some(limit), apply)?;
@@ -1136,19 +1256,21 @@ impl OrderedRecordQueue {
         sample_layouts: &SampleLayouts,
         options: FoldOptions,
     ) -> Result<(), String> {
-        self.flush_final_with(|record| accumulator.apply_record(record, sample_layouts, options))
+        self.flush_final_with(|record| {
+            accumulator.apply_fold_record(record, sample_layouts, options)
+        })
     }
 
     fn flush_final_with<F>(&mut self, apply: F) -> Result<(), String>
     where
-        F: FnMut(ParsedRecord) -> Result<(), String>,
+        F: FnMut(FoldRecord<'a>) -> Result<(), String>,
     {
         self.flush_through_with(None, apply)
     }
 
     fn flush_through_with<F>(&mut self, limit: Option<u64>, mut apply: F) -> Result<(), String>
     where
-        F: FnMut(ParsedRecord) -> Result<(), String>,
+        F: FnMut(FoldRecord<'a>) -> Result<(), String>,
     {
         self.pending_records
             .sort_by_key(|record| (record.time, record.index));
@@ -1768,6 +1890,92 @@ fn upsert_comm(map: &mut BTreeMap<u32, String>, id: u32, comm: &str) {
             if entry.get() != comm {
                 entry.insert(comm.to_owned());
             }
+        }
+    }
+}
+
+impl FoldAccumulator {
+    fn apply_fold_record(
+        &mut self,
+        record: FoldRecord<'_>,
+        sample_layouts: &SampleLayouts,
+        options: FoldOptions,
+    ) -> Result<(), String> {
+        match record {
+            FoldRecord::Comm(record) => {
+                update_comm_tables(
+                    &mut self.process_comms,
+                    &mut self.exec_process_comms,
+                    &mut self.thread_comms,
+                    record,
+                );
+                Ok(())
+            }
+            FoldRecord::Mmap(record) => {
+                self.invalidate_pid_unwinder_if_mapping_overlaps_like_perf(
+                    record.pid,
+                    record.start,
+                    record.len,
+                );
+                self.mmap_table.insert_mmap(record);
+                self.mapping_cache = MappingResolveCache::default();
+                Ok(())
+            }
+            FoldRecord::Sample { misc, payload } => {
+                parse_sample_for_fold(self, misc, payload, sample_layouts, options)
+            }
+            FoldRecord::CallchainDeferred(record) => {
+                let tid = deferred_callchain_tid(&record.sample_id, sample_layouts);
+                self.add_deferred_callchain(record.cookie, tid, &record.ips);
+                Ok(())
+            }
+            FoldRecord::Mmap2(record) => {
+                self.invalidate_pid_unwinder_if_mapping_overlaps_like_perf(
+                    record.pid,
+                    record.start,
+                    record.len,
+                );
+                let build_id = self.header_build_ids.get(&record.path).cloned();
+                if let Some(build_id) = build_id {
+                    self.mmap_table
+                        .insert_mmap2_with_build_id(record, Some(build_id));
+                } else {
+                    self.mmap_table.insert_mmap2(record);
+                }
+                self.mapping_cache = MappingResolveCache::default();
+                Ok(())
+            }
+            FoldRecord::Mmap2BuildId(record) => {
+                self.invalidate_pid_unwinder_if_mapping_overlaps_like_perf(
+                    record.pid,
+                    record.start,
+                    record.len,
+                );
+                self.mmap_table.insert_mmap2_build_id(record);
+                self.mapping_cache = MappingResolveCache::default();
+                Ok(())
+            }
+            FoldRecord::Fork(record) => {
+                self.apply_fork_record(record);
+                Ok(())
+            }
+            FoldRecord::Exit(_)
+            | FoldRecord::Lost(_)
+            | FoldRecord::LostSamples(_)
+            | FoldRecord::Throttle(_)
+            | FoldRecord::Unthrottle(_)
+            | FoldRecord::Read(_)
+            | FoldRecord::Aux(_)
+            | FoldRecord::ItraceStart(_)
+            | FoldRecord::Switch(_)
+            | FoldRecord::SwitchCpuWide(_)
+            | FoldRecord::Namespaces(_)
+            | FoldRecord::Ksymbol(_)
+            | FoldRecord::BpfEvent(_)
+            | FoldRecord::Cgroup(_)
+            | FoldRecord::TextPoke(_)
+            | FoldRecord::AuxOutputHwId(_)
+            | FoldRecord::Unsupported { .. } => Ok(()),
         }
     }
 }
@@ -3265,9 +3473,10 @@ fn prepare_sample_for_fold(
     };
     let count = sample_fold_count(sample.period, options);
     accumulator.sample_frames.clear();
-    for frame in sample.frames.clone() {
-        accumulator.sample_frames.push(FoldFrame::Callchain(frame));
-    }
+    accumulator.sample_frames.reserve(sample.frames.len());
+    accumulator
+        .sample_frames
+        .extend(sample.frames.clone().map(FoldFrame::Callchain));
     let deferred_cookie = take_deferred_cookie(&mut accumulator.sample_frames);
     append_perf_user_unwind_frames(accumulator, misc, &event, &sample);
     Ok(Some(PreparedFoldSample {
