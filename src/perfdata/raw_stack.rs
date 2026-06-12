@@ -275,6 +275,12 @@ where
         }
     }
 
+    pub(crate) fn clear_preserving_capacity(&mut self) {
+        self.counts.clear();
+        self.nodes.clear();
+        self.node_ids.clear();
+    }
+
     #[cfg(test)]
     fn interned_node_count(&self) -> usize {
         self.nodes.len()
@@ -283,6 +289,21 @@ where
     #[cfg(test)]
     fn interned_comm_count(&self) -> usize {
         self.comms.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn counts_capacity(&self) -> usize {
+        self.counts.capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn node_capacity(&self) -> usize {
+        self.nodes.capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn node_id_capacity(&self) -> usize {
+        self.node_ids.capacity()
     }
 }
 
@@ -583,5 +604,42 @@ mod tests {
         accumulator.add_slice_with_borrowed_comm(Some(8), Some("pyroclast"), &[1, 2, 4], 1);
 
         assert_eq!(accumulator.interned_comm_count(), 1);
+    }
+
+    #[test]
+    fn clear_preserving_capacity_empties_entries_and_keeps_allocations() {
+        let mut accumulator = RawStackAccumulator::new();
+
+        for stack in 0_u64..128 {
+            accumulator.add_slice_with_borrowed_comm(
+                Some(7),
+                Some("pyroclast"),
+                &[stack, stack + 1, stack + 2],
+                1,
+            );
+        }
+        let counts_capacity = accumulator.counts_capacity();
+        let node_capacity = accumulator.node_capacity();
+        let node_id_capacity = accumulator.node_id_capacity();
+
+        accumulator.clear_preserving_capacity();
+
+        assert!(accumulator.entries().is_empty());
+        assert_eq!(accumulator.interned_node_count(), 0);
+        assert_eq!(accumulator.counts_capacity(), counts_capacity);
+        assert_eq!(accumulator.node_capacity(), node_capacity);
+        assert_eq!(accumulator.node_id_capacity(), node_id_capacity);
+    }
+
+    #[test]
+    fn clear_preserving_capacity_keeps_comm_interning_warm() {
+        let mut accumulator = RawStackAccumulator::new();
+
+        accumulator.add_slice_with_borrowed_comm(Some(7), Some("pyroclast"), &[1, 2, 3], 1);
+        accumulator.clear_preserving_capacity();
+        accumulator.add_slice_with_borrowed_comm(Some(8), Some("pyroclast"), &[4, 5, 6], 1);
+
+        assert_eq!(accumulator.interned_comm_count(), 1);
+        assert_eq!(accumulator.entries().len(), 1);
     }
 }
