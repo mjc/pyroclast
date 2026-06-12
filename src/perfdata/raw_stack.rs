@@ -91,8 +91,22 @@ where
         callchain: Vec<T>,
         count: u64,
     ) {
+        let reserve_hint = callchain.len();
+        self.add_iter_with_comm(pid, comm, callchain, count, reserve_hint);
+    }
+
+    pub fn add_iter_with_comm<I>(
+        &mut self,
+        pid: Option<u32>,
+        comm: Option<String>,
+        callchain: I,
+        count: u64,
+        reserve_hint: usize,
+    ) where
+        I: IntoIterator<Item = T>,
+    {
         let comm = self.intern_comm(comm);
-        let tail = self.intern_callchain(callchain);
+        let tail = self.intern_callchain_with_hint(callchain, reserve_hint);
         self.reserve_counts_growth(1);
         *self
             .counts
@@ -111,13 +125,7 @@ where
         callchain: &[T],
         count: u64,
     ) {
-        let comm = self.intern_comm(comm);
-        let tail = self.intern_callchain(callchain.iter().cloned());
-        self.reserve_counts_growth(1);
-        *self
-            .counts
-            .entry(RawStackKey { pid, comm, tail })
-            .or_insert(0) += count;
+        self.add_iter_with_comm(pid, comm, callchain.iter().cloned(), count, callchain.len());
     }
 
     pub fn add_slice_with_borrowed_comm(
@@ -127,8 +135,27 @@ where
         callchain: &[T],
         count: u64,
     ) {
+        self.add_iter_with_borrowed_comm(
+            pid,
+            comm,
+            callchain.iter().cloned(),
+            count,
+            callchain.len(),
+        );
+    }
+
+    pub fn add_iter_with_borrowed_comm<I>(
+        &mut self,
+        pid: Option<u32>,
+        comm: Option<&str>,
+        callchain: I,
+        count: u64,
+        reserve_hint: usize,
+    ) where
+        I: IntoIterator<Item = T>,
+    {
         let comm = self.intern_comm_ref(comm);
-        let tail = self.intern_callchain(callchain.iter().cloned());
+        let tail = self.intern_callchain_with_hint(callchain, reserve_hint);
         self.reserve_counts_growth(1);
         *self
             .counts
@@ -216,13 +243,12 @@ where
         Some(id)
     }
 
-    fn intern_callchain<I>(&mut self, callchain: I) -> Option<NodeId>
+    fn intern_callchain_with_hint<I>(&mut self, callchain: I, reserve_hint: usize) -> Option<NodeId>
     where
         I: IntoIterator<Item = T>,
     {
+        self.reserve_node_growth(reserve_hint);
         let callchain = callchain.into_iter();
-        let (lower_bound, upper_bound) = callchain.size_hint();
-        self.reserve_node_growth(upper_bound.unwrap_or(lower_bound));
         let mut tail = None;
         for frame in callchain {
             let hash = node_key_hash(tail, &frame);

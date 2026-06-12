@@ -109,7 +109,6 @@ struct FoldAccumulator {
     raw_stacks: RawStackAccumulator<FoldFrame>,
     deferred_samples: BTreeMap<u64, Vec<DeferredFoldSample>>,
     sample_frames: Vec<FoldFrame>,
-    callchain: Vec<FoldFrame>,
     unwind_debug_dir: Option<PathBuf>,
     /// Architecture of the recording machine (HEADER_ARCH), used to decode
     /// REGS_USER samples and construct per-pid unwinders. Defaults to x86_64
@@ -1562,7 +1561,6 @@ impl FoldAccumulator {
             raw_stacks: RawStackAccumulator::<FoldFrame>::new(),
             deferred_samples: BTreeMap::new(),
             sample_frames: Vec::new(),
-            callchain: Vec::new(),
             unwind_debug_dir: current_perf_debug_dir(),
             arch: PerfArch::default(),
         }
@@ -1892,23 +1890,22 @@ fn add_fold_stack(
     mmap_table: &MmapTable,
     mapping_cache: &mut MappingResolveCache,
     raw_stacks: &mut RawStackAccumulator<FoldFrame>,
-    callchain: &mut Vec<FoldFrame>,
 ) {
-    callchain.clear();
-    callchain.reserve(frames.len());
-    for frame in frames.iter().rev().copied() {
+    let mut filtered_frames = frames.iter().rev().copied().filter(|frame| {
         let address = frame.address();
-        if is_perf_context_marker(address) {
-            continue;
-        }
-        if should_drop_perf_data_user_unwind_frame(pid, frame, mmap_table, mapping_cache) {
-            continue;
-        }
-        callchain.push(frame);
-    }
-    if !callchain.is_empty() {
-        raw_stacks.add_slice_with_borrowed_comm(pid, comm, callchain, count);
-    }
+        !is_perf_context_marker(address)
+            && !should_drop_perf_data_user_unwind_frame(pid, *frame, mmap_table, mapping_cache)
+    });
+    let Some(first_frame) = filtered_frames.next() else {
+        return;
+    };
+    raw_stacks.add_iter_with_borrowed_comm(
+        pid,
+        comm,
+        std::iter::once(first_frame).chain(filtered_frames),
+        count,
+        frames.len(),
+    );
 }
 
 impl FoldAccumulator {
@@ -1950,7 +1947,6 @@ impl FoldAccumulator {
                 &self.mmap_table,
                 &mut self.mapping_cache,
                 &mut self.raw_stacks,
-                &mut self.callchain,
             );
         }
     }
@@ -1966,7 +1962,6 @@ impl FoldAccumulator {
                 &self.mmap_table,
                 &mut self.mapping_cache,
                 &mut self.raw_stacks,
-                &mut self.callchain,
             );
         }
     }
@@ -3338,7 +3333,6 @@ fn parse_sample_for_fold(
             &accumulator.mmap_table,
             &mut accumulator.mapping_cache,
             &mut accumulator.raw_stacks,
-            &mut accumulator.callchain,
         );
     }
     Ok(())
@@ -5227,7 +5221,6 @@ mod tests {
                 &accumulator.mmap_table,
                 &mut accumulator.mapping_cache,
                 &mut accumulator.raw_stacks,
-                &mut accumulator.callchain,
             );
         }
         let counts_capacity = accumulator.raw_stacks.counts_capacity();
@@ -5277,7 +5270,6 @@ mod tests {
             &accumulator.mmap_table,
             &mut accumulator.mapping_cache,
             &mut accumulator.raw_stacks,
-            &mut accumulator.callchain,
         );
         assert!(accumulator.raw_stacks.entries().is_empty());
 
@@ -5304,7 +5296,6 @@ mod tests {
             &accumulator.mmap_table,
             &mut accumulator.mapping_cache,
             &mut accumulator.raw_stacks,
-            &mut accumulator.callchain,
         );
 
         let entries = accumulator.raw_stacks.sorted_entries();
