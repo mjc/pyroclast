@@ -90,7 +90,7 @@ fn parses_comm_record_payload() {
 
     assert_eq!(comm.pid, 123);
     assert_eq!(comm.tid, 456);
-    assert_eq!(comm.comm, "sftp-s3");
+    assert_eq!(comm.comm.as_ref(), "sftp-s3");
 }
 
 #[test]
@@ -119,7 +119,7 @@ fn dispatches_comm_record_by_perf_record_type() {
         ParsedRecord::Comm(pyroclast::perfdata::records::CommRecord {
             pid: 123,
             tid: 456,
-            comm: "sftp-s3".to_string(),
+            comm: "sftp-s3".into(),
             is_exec: false,
         })
     );
@@ -536,7 +536,7 @@ proptest! {
 
         prop_assert_eq!(record.pid, pid);
         prop_assert_eq!(record.tid, tid);
-        prop_assert_eq!(record.comm, comm);
+        prop_assert_eq!(record.comm.as_ref(), comm);
     }
 
     #[test]
@@ -1086,7 +1086,7 @@ proptest! {
             ParsedRecord::Comm(pyroclast::perfdata::records::CommRecord {
                 pid,
                 tid,
-                comm,
+                comm: comm.into(),
                 is_exec,
             })
         );

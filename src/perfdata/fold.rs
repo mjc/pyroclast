@@ -462,9 +462,13 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
         let parsed_record = parse_record_with_context(record)?;
         let record_result: Result<(), String> = match parsed_record {
             ParsedRecord::Comm(record) => {
-                summary.comms_by_pid.insert(record.pid, record.comm.clone());
-                summary.comms_by_tid.insert(record.tid, record.comm.clone());
-                summary.comms.push(record.comm);
+                summary
+                    .comms_by_pid
+                    .insert(record.pid, record.comm.to_string());
+                summary
+                    .comms_by_tid
+                    .insert(record.tid, record.comm.to_string());
+                summary.comms.push(record.comm.to_string());
                 Ok(())
             }
             ParsedRecord::Lost(record) => {
@@ -1857,11 +1861,27 @@ fn update_comm_tables(
     thread_comms: &mut BTreeMap<u32, String>,
     record: crate::perfdata::records::CommRecord,
 ) {
+    let comm = record.comm.as_ref();
     if record.is_exec {
-        exec_process_comms.insert(record.pid, record.comm.clone());
+        upsert_comm(exec_process_comms, record.pid, comm);
     }
-    process_comms.insert(record.pid, record.comm.clone());
-    thread_comms.insert(record.tid, record.comm);
+    upsert_comm(process_comms, record.pid, comm);
+    upsert_comm(thread_comms, record.tid, comm);
+}
+
+fn upsert_comm(map: &mut BTreeMap<u32, String>, id: u32, comm: &str) {
+    use std::collections::btree_map::Entry;
+
+    match map.entry(id) {
+        Entry::Vacant(entry) => {
+            entry.insert(comm.to_owned());
+        }
+        Entry::Occupied(mut entry) => {
+            if entry.get() != comm {
+                entry.insert(comm.to_owned());
+            }
+        }
+    }
 }
 
 fn inherit_fork_comm(

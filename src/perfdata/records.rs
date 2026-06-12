@@ -1,3 +1,6 @@
+use std::borrow::Cow;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use crate::perfdata::endian::{read_u16, read_u32, read_u64};
 use crate::perfdata::header::PerfHeader;
 
@@ -108,7 +111,7 @@ pub const fn supported_perf_record_types() -> &'static [u32] {
 pub struct CommRecord {
     pub pid: u32,
     pub tid: u32,
-    pub comm: String,
+    pub comm: Arc<str>,
     pub is_exec: bool,
 }
 
@@ -462,7 +465,7 @@ fn parse_comm_record_with_misc(payload: &[u8], misc: u16) -> Result<CommRecord, 
     }
     let pid = read_u32(payload, 0)?;
     let tid = read_u32(payload, 4)?;
-    let comm = parse_c_string(&payload[8..]);
+    let comm = intern_c_string(&payload[8..]);
     let is_exec = has_misc_flag(misc, PERF_RECORD_MISC_COMM_EXEC);
 
     Ok(CommRecord {
@@ -1021,6 +1024,34 @@ fn parse_c_string(bytes: &[u8]) -> String {
         .position(|byte| *byte == 0)
         .unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+fn parse_c_string_lossy(bytes: &[u8]) -> Cow<'_, str> {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end])
+}
+
+fn intern_c_string(bytes: &[u8]) -> Arc<str> {
+    type CommInterner = hashbrown::HashMap<Arc<str>, Arc<str>, rustc_hash::FxBuildHasher>;
+    static INTERNER: OnceLock<Mutex<CommInterner>> = OnceLock::new();
+
+    let text = parse_c_string_lossy(bytes);
+    let text = text.as_ref();
+    let interner = INTERNER.get_or_init(|| {
+        Mutex::new(hashbrown::HashMap::with_hasher(
+            rustc_hash::FxBuildHasher::default(),
+        ))
+    });
+    let mut interner = interner.lock().expect("comm interner lock");
+    if let Some(existing) = interner.get(text) {
+        return Arc::clone(existing);
+    }
+    let cached_comm: Arc<str> = Arc::from(text.to_owned());
+    interner.insert(Arc::clone(&cached_comm), Arc::clone(&cached_comm));
+    cached_comm
 }
 
 fn parse_c_string_with_remainder(bytes: &[u8]) -> (String, Vec<u8>) {
