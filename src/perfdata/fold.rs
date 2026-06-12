@@ -103,6 +103,7 @@ struct FoldAccumulator {
     exec_process_comms: BTreeMap<u32, String>,
     thread_comms: BTreeMap<u32, String>,
     mmap_table: MmapTable,
+    mapping_cache: MappingResolveCache,
     unwind_states: HashMap<u32, PidUnwindState, FxBuildHasher>,
     header_build_ids: BTreeMap<String, Vec<u8>>,
     raw_stacks: RawStackAccumulator<FoldFrame>,
@@ -1555,6 +1556,7 @@ impl FoldAccumulator {
             exec_process_comms: BTreeMap::new(),
             thread_comms: BTreeMap::new(),
             mmap_table: MmapTable::default(),
+            mapping_cache: MappingResolveCache::default(),
             unwind_states: HashMap::with_hasher(FxBuildHasher),
             header_build_ids,
             raw_stacks: RawStackAccumulator::<FoldFrame>::new(),
@@ -1594,6 +1596,7 @@ impl FoldAccumulator {
                     record.len,
                 );
                 self.mmap_table.insert_mmap(record);
+                self.mapping_cache = MappingResolveCache::default();
                 Ok(())
             }
             ParsedRecord::Sample(record) => {
@@ -1617,6 +1620,7 @@ impl FoldAccumulator {
                 } else {
                     self.mmap_table.insert_mmap2(record);
                 }
+                self.mapping_cache = MappingResolveCache::default();
                 Ok(())
             }
             ParsedRecord::Mmap2BuildId(record) => {
@@ -1626,6 +1630,7 @@ impl FoldAccumulator {
                     record.len,
                 );
                 self.mmap_table.insert_mmap2_build_id(record);
+                self.mapping_cache = MappingResolveCache::default();
                 Ok(())
             }
             ParsedRecord::Fork(record) => {
@@ -1646,6 +1651,7 @@ impl FoldAccumulator {
         self.unwind_states.remove(&record.pid);
         if record.clone_maps {
             self.mmap_table.clone_pid_mappings(record.ppid, record.pid);
+            self.mapping_cache = MappingResolveCache::default();
         }
     }
 
@@ -1884,18 +1890,18 @@ fn add_fold_stack(
     count: u64,
     frames: &[FoldFrame],
     mmap_table: &MmapTable,
+    mapping_cache: &mut MappingResolveCache,
     raw_stacks: &mut RawStackAccumulator<FoldFrame>,
     callchain: &mut Vec<FoldFrame>,
 ) {
     callchain.clear();
     callchain.reserve(frames.len());
-    let mut mapping_cache = MappingResolveCache::default();
     for frame in frames.iter().rev().copied() {
         let address = frame.address();
         if is_perf_context_marker(address) {
             continue;
         }
-        if should_drop_perf_data_user_unwind_frame(pid, frame, mmap_table, &mut mapping_cache) {
+        if should_drop_perf_data_user_unwind_frame(pid, frame, mmap_table, mapping_cache) {
             continue;
         }
         callchain.push(frame);
@@ -1942,6 +1948,7 @@ impl FoldAccumulator {
                 sample.count,
                 &sample.frames,
                 &self.mmap_table,
+                &mut self.mapping_cache,
                 &mut self.raw_stacks,
                 &mut self.callchain,
             );
@@ -1957,6 +1964,7 @@ impl FoldAccumulator {
                 sample.count,
                 &sample.frames,
                 &self.mmap_table,
+                &mut self.mapping_cache,
                 &mut self.raw_stacks,
                 &mut self.callchain,
             );
@@ -2033,8 +2041,15 @@ impl FoldAccumulator {
     where
         R: SymbolResolver,
     {
-        let raw_stacks = std::mem::take(&mut self.raw_stacks);
-        accumulate_fold_counts(&raw_stacks, &self.mmap_table, counts, symbol_cache, inline)
+        accumulate_fold_counts(
+            &self.raw_stacks,
+            &self.mmap_table,
+            counts,
+            symbol_cache,
+            inline,
+        )?;
+        self.raw_stacks.clear_preserving_capacity();
+        Ok(())
     }
 }
 
@@ -3321,6 +3336,7 @@ fn parse_sample_for_fold(
             sample.count,
             &sample.frames,
             &accumulator.mmap_table,
+            &mut accumulator.mapping_cache,
             &mut accumulator.raw_stacks,
             &mut accumulator.callchain,
         );
@@ -5191,6 +5207,113 @@ mod tests {
 
         assert_eq!(counts.entries.capacity(), previous_entry_capacity);
         assert_eq!(counts.by_hash.capacity(), previous_hash_capacity);
+    }
+
+    #[test]
+    fn fold_accumulator_drain_reuses_raw_stack_capacity_across_rounds() {
+        let mut accumulator = super::FoldAccumulator::new(std::collections::BTreeMap::new());
+        let mut counts = super::FoldCounts::default();
+
+        for address in 0_u64..128 {
+            super::add_fold_stack(
+                Some(7),
+                Some("pyroclast"),
+                1,
+                &[
+                    super::FoldFrame::Callchain(address),
+                    super::FoldFrame::Callchain(address + 1),
+                    super::FoldFrame::Callchain(address + 2),
+                ],
+                &accumulator.mmap_table,
+                &mut accumulator.mapping_cache,
+                &mut accumulator.raw_stacks,
+                &mut accumulator.callchain,
+            );
+        }
+        let counts_capacity = accumulator.raw_stacks.counts_capacity();
+        let node_capacity = accumulator.raw_stacks.node_capacity();
+        let node_id_capacity = accumulator.raw_stacks.node_id_capacity();
+
+        accumulator
+            .drain_fold_counts(
+                &mut counts,
+                None::<&mut SymbolFrameCache<'_, super::NoopSymbolResolver>>,
+                false,
+            )
+            .expect("drain fold counts");
+
+        assert!(accumulator.raw_stacks.entries().is_empty());
+        assert_eq!(accumulator.raw_stacks.counts_capacity(), counts_capacity);
+        assert_eq!(accumulator.raw_stacks.node_capacity(), node_capacity);
+        assert_eq!(accumulator.raw_stacks.node_id_capacity(), node_id_capacity);
+    }
+
+    #[test]
+    fn fold_accumulator_clears_mapping_cache_after_mapping_update() {
+        let mut accumulator = super::FoldAccumulator::new(std::collections::BTreeMap::new());
+        let sample_layouts = super::SampleLayouts::default();
+        let options = super::FoldOptions::default();
+
+        accumulator
+            .apply_record(
+                super::ParsedRecord::Mmap(crate::perfdata::records::MmapRecord {
+                    pid: 7,
+                    tid: 7,
+                    start: 0x1000,
+                    len: 0x100,
+                    pgoff: 0,
+                    path: "/tmp/perf.data".to_string(),
+                }),
+                &sample_layouts,
+                options,
+            )
+            .expect("insert perf.data mapping");
+
+        super::add_fold_stack(
+            Some(7),
+            Some("pyroclast"),
+            1,
+            &[super::FoldFrame::UserUnwind(0x1010)],
+            &accumulator.mmap_table,
+            &mut accumulator.mapping_cache,
+            &mut accumulator.raw_stacks,
+            &mut accumulator.callchain,
+        );
+        assert!(accumulator.raw_stacks.entries().is_empty());
+
+        accumulator
+            .apply_record(
+                super::ParsedRecord::Mmap(crate::perfdata::records::MmapRecord {
+                    pid: 7,
+                    tid: 7,
+                    start: 0x1000,
+                    len: 0x100,
+                    pgoff: 0,
+                    path: "/bin/demo".to_string(),
+                }),
+                &sample_layouts,
+                options,
+            )
+            .expect("insert executable mapping");
+
+        super::add_fold_stack(
+            Some(7),
+            Some("pyroclast"),
+            1,
+            &[super::FoldFrame::UserUnwind(0x1010)],
+            &accumulator.mmap_table,
+            &mut accumulator.mapping_cache,
+            &mut accumulator.raw_stacks,
+            &mut accumulator.callchain,
+        );
+
+        let entries = accumulator.raw_stacks.sorted_entries();
+        assert_eq!(entries.len(), 1);
+        let mut scratch = Vec::new();
+        assert_eq!(
+            entries[0].callchain(&mut scratch),
+            [super::FoldFrame::UserUnwind(0x1010)]
+        );
     }
 
     #[test]
