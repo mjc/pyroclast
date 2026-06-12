@@ -8,14 +8,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use clap::ValueEnum;
-use hashbrown::{HashMap, HashSet};
+use hashbrown::{HashMap, HashSet, hash_map::RawEntryMut};
 use object::{
     Object, ObjectSection, ObjectSegment, ObjectSymbol, ObjectSymbolTable, SymbolIndex, SymbolKind,
 };
 use rustc_hash::FxBuildHasher;
 use serde::Serialize;
 
-use crate::folded::{render_inferno_perf_folded_label, render_inferno_perf_raw_stack};
 use crate::perfdata::build_id::{
     kernel_build_id_from_perfdata, kernel_build_id_from_perfdata_file,
 };
@@ -198,8 +197,8 @@ pub struct SymbolFrameCache<'a, R> {
     resolved_base_by_mapping: FxHashMap<MappingFrameKey, CachedMappingFrames>,
     scratch_seen_mapping: FxHashSet<MappingFrameKey>,
     scratch_missing_keys: Vec<MappingFrameKey>,
+    scratch_missing_indexes: Vec<usize>,
     scratch_missing_requests: Vec<SymbolRequest>,
-    scratch_missing_fallbacks: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -564,29 +563,20 @@ impl RustAddr2lineResolver {
         let cache = self
             .metadata_cache
             .get_or_init(|| Mutex::new(FxHashMap::default()));
-        let path_key = path.as_os_str().to_owned();
-        if let Some(cached) = cache
-            .lock()
-            .expect("rust addr2line metadata cache lock")
-            .get(&path_key)
-            .cloned()
-        {
-            return cached;
-        }
-
-        let loaded = std::fs::read(path).ok().map(|bytes| {
-            Arc::new(CachedObjectMetadata {
-                object_metadata: PreparedObjectMetadata::from_object_bytes(&bytes),
-                object_bytes: bytes.into(),
-                dwarf_index: Mutex::new(PerfDwarfIndexCache::default()),
-            })
-        });
-
         let mut cache = cache.lock().expect("rust addr2line metadata cache lock");
-        cache
-            .entry(path_key)
-            .or_insert_with(|| loaded.clone())
-            .clone()
+        match cache.raw_entry_mut().from_key(path.as_os_str()) {
+            RawEntryMut::Occupied(entry) => entry.get().clone(),
+            RawEntryMut::Vacant(entry) => {
+                let loaded = std::fs::read(path).ok().map(|bytes| {
+                    Arc::new(CachedObjectMetadata {
+                        object_metadata: PreparedObjectMetadata::from_object_bytes(&bytes),
+                        object_bytes: bytes.into(),
+                        dwarf_index: Mutex::new(PerfDwarfIndexCache::default()),
+                    })
+                });
+                entry.insert(path.as_os_str().to_owned(), loaded).1.clone()
+            }
+        }
     }
 
     #[cfg(test)]
@@ -629,29 +619,20 @@ where
         let cache = self
             .metadata_cache
             .get_or_init(|| Mutex::new(FxHashMap::default()));
-        let path_key = path.as_os_str().to_owned();
-        if let Some(cached) = cache
-            .lock()
-            .expect("addr2line metadata cache lock")
-            .get(&path_key)
-            .cloned()
-        {
-            return cached;
-        }
-
-        let loaded = std::fs::read(path).ok().map(|bytes| {
-            Arc::new(CachedObjectMetadata {
-                object_metadata: PreparedObjectMetadata::from_object_bytes(&bytes),
-                object_bytes: bytes.into(),
-                dwarf_index: Mutex::new(PerfDwarfIndexCache::default()),
-            })
-        });
-
         let mut cache = cache.lock().expect("addr2line metadata cache lock");
-        cache
-            .entry(path_key)
-            .or_insert_with(|| loaded.clone())
-            .clone()
+        match cache.raw_entry_mut().from_key(path.as_os_str()) {
+            RawEntryMut::Occupied(entry) => entry.get().clone(),
+            RawEntryMut::Vacant(entry) => {
+                let loaded = std::fs::read(path).ok().map(|bytes| {
+                    Arc::new(CachedObjectMetadata {
+                        object_metadata: PreparedObjectMetadata::from_object_bytes(&bytes),
+                        object_bytes: bytes.into(),
+                        dwarf_index: Mutex::new(PerfDwarfIndexCache::default()),
+                    })
+                });
+                entry.insert(path.as_os_str().to_owned(), loaded).1.clone()
+            }
+        }
     }
 
     fn resolve_group_symbols(
@@ -1092,8 +1073,8 @@ where
             resolved_base_by_mapping: FxHashMap::default(),
             scratch_seen_mapping: FxHashSet::default(),
             scratch_missing_keys: Vec::new(),
+            scratch_missing_indexes: Vec::new(),
             scratch_missing_requests: Vec::new(),
-            scratch_missing_fallbacks: Vec::new(),
         }
     }
 
@@ -1135,10 +1116,11 @@ where
         if !self.resolved_by_mapping.contains_key(&key) {
             self.prefetch_mapping_refs(std::slice::from_ref(mapping))?;
         }
-        self.resolved_by_mapping
+        let cached = self
+            .resolved_by_mapping
             .get(&key)
-            .map(|cached| cached.frames.as_slice())
-            .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())
+            .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())?;
+        Ok(cached.frames.as_slice())
     }
 
     /// Resolves one borrowed perfdata mapping through the cache and returns the
@@ -1163,7 +1145,7 @@ where
     }
 
     /// Resolves one borrowed perfdata mapping through the cache and returns the
-    /// pre-rendered folded fragment for its symbolized inline frames.
+    /// resolved frame list for its symbolized inline frames.
     ///
     /// # Errors
     ///
@@ -1171,16 +1153,14 @@ where
     pub fn resolve_folded_mapping_ref(
         &mut self,
         mapping: &ResolvedMappingRef<'_>,
-    ) -> Result<Option<&str>, String> {
+    ) -> Result<&str, String> {
         let key = mapping_frame_key(mapping);
         if !self.resolved_by_mapping.contains_key(&key) {
             self.prefetch_mapping_refs(std::slice::from_ref(mapping))?;
         }
         self.resolved_by_mapping
             .get(&key)
-            .map(|cached| {
-                (!cached.folded_rendered.is_empty()).then_some(cached.folded_rendered.as_str())
-            })
+            .map(|cached| cached.folded_rendered.as_str())
             .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())
     }
 
@@ -1204,8 +1184,8 @@ where
             .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())
     }
 
-    /// Resolves one borrowed perfdata mapping to the pre-rendered folded
-    /// fragment for its single base object symbol (no DWARF inline expansion).
+    /// Resolves one borrowed perfdata mapping to its single base object symbol
+    /// frames (no DWARF inline expansion).
     ///
     /// This is the default `perf script`/folded path: plain `perf` prints one
     /// frame per callchain entry named from the ELF symtab.
@@ -1216,16 +1196,14 @@ where
     pub fn resolve_base_folded_mapping_ref(
         &mut self,
         mapping: &ResolvedMappingRef<'_>,
-    ) -> Result<Option<&str>, String> {
+    ) -> Result<&str, String> {
         let key = mapping_frame_key(mapping);
         if !self.resolved_base_by_mapping.contains_key(&key) {
             self.prefetch_base_mapping_refs(std::slice::from_ref(mapping))?;
         }
         self.resolved_base_by_mapping
             .get(&key)
-            .map(|cached| {
-                (!cached.folded_rendered.is_empty()).then_some(cached.folded_rendered.as_str())
-            })
+            .map(|cached| cached.folded_rendered.as_str())
             .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())
     }
 
@@ -1241,26 +1219,26 @@ where
     ) -> Result<(), String> {
         let mut seen = std::mem::take(&mut self.scratch_seen_mapping);
         let mut missing_keys = std::mem::take(&mut self.scratch_missing_keys);
+        let mut missing_indexes = std::mem::take(&mut self.scratch_missing_indexes);
         let mut missing_requests = std::mem::take(&mut self.scratch_missing_requests);
-        let mut missing_fallbacks = std::mem::take(&mut self.scratch_missing_fallbacks);
         seen.clear();
         missing_keys.clear();
+        missing_indexes.clear();
         missing_requests.clear();
-        missing_fallbacks.clear();
 
         let result = (|| {
             seen.reserve(mappings.len());
             missing_keys.reserve(mappings.len());
+            missing_indexes.reserve(mappings.len());
             missing_requests.reserve(mappings.len());
-            missing_fallbacks.reserve(mappings.len());
-            for mapping in mappings {
+            for (index, mapping) in mappings.iter().enumerate() {
                 let key = mapping_frame_key(mapping);
                 if self.resolved_base_by_mapping.contains_key(&key) || !seen.insert(key) {
                     continue;
                 }
                 missing_keys.push(key);
+                missing_indexes.push(index);
                 missing_requests.push(symbol_request_from_mapping_ref(mapping));
-                missing_fallbacks.push(mapping_fallback_frame(mapping));
             }
             if missing_requests.is_empty() {
                 return Ok(());
@@ -1276,13 +1254,15 @@ where
                 ));
             }
             self.resolved_base_by_mapping.reserve(missing_keys.len());
-            for ((key, fallback_frame), resolved_frames) in missing_keys
+            for ((key, index), resolved_frames) in missing_keys
                 .drain(..)
-                .zip(missing_fallbacks.drain(..))
+                .zip(missing_indexes.drain(..))
                 .zip(resolved)
             {
                 let folded_rendered = if resolved_frames.frames.is_empty() {
-                    render_inferno_perf_folded_label(fallback_frame.as_str())
+                    crate::folded::render_inferno_perf_folded_label(
+                        mapping_fallback_frame(&mappings[index]).as_str(),
+                    )
                 } else {
                     render_perf_script_inferno_folded_frames(&resolved_frames.frames)
                 };
@@ -1301,8 +1281,8 @@ where
 
         self.scratch_seen_mapping = seen;
         self.scratch_missing_keys = missing_keys;
+        self.scratch_missing_indexes = missing_indexes;
         self.scratch_missing_requests = missing_requests;
-        self.scratch_missing_fallbacks = missing_fallbacks;
         result
     }
 
@@ -1354,26 +1334,26 @@ where
     ) -> Result<(), String> {
         let mut seen = std::mem::take(&mut self.scratch_seen_mapping);
         let mut missing_keys = std::mem::take(&mut self.scratch_missing_keys);
+        let mut missing_indexes = std::mem::take(&mut self.scratch_missing_indexes);
         let mut missing_requests = std::mem::take(&mut self.scratch_missing_requests);
-        let mut missing_fallbacks = std::mem::take(&mut self.scratch_missing_fallbacks);
         seen.clear();
         missing_keys.clear();
+        missing_indexes.clear();
         missing_requests.clear();
-        missing_fallbacks.clear();
 
         let result = (|| {
             seen.reserve(mappings.len());
             missing_keys.reserve(mappings.len());
+            missing_indexes.reserve(mappings.len());
             missing_requests.reserve(mappings.len());
-            missing_fallbacks.reserve(mappings.len());
-            for mapping in mappings {
+            for (index, mapping) in mappings.iter().enumerate() {
                 let key = mapping_frame_key(mapping);
                 if self.resolved_by_mapping.contains_key(&key) || !seen.insert(key) {
                     continue;
                 }
                 missing_keys.push(key);
+                missing_indexes.push(index);
                 missing_requests.push(symbol_request_from_mapping_ref(mapping));
-                missing_fallbacks.push(mapping_fallback_frame(mapping));
             }
             if missing_requests.is_empty() {
                 return Ok(());
@@ -1389,13 +1369,15 @@ where
                 ));
             }
             self.resolved_by_mapping.reserve(missing_keys.len());
-            for ((key, fallback_frame), resolved_frames) in missing_keys
+            for ((key, index), resolved_frames) in missing_keys
                 .drain(..)
-                .zip(missing_fallbacks.drain(..))
+                .zip(missing_indexes.drain(..))
                 .zip(resolved)
             {
                 let folded_rendered = if resolved_frames.frames.is_empty() {
-                    render_inferno_perf_folded_label(fallback_frame.as_str())
+                    crate::folded::render_inferno_perf_folded_label(
+                        mapping_fallback_frame(&mappings[index]).as_str(),
+                    )
                 } else {
                     render_perf_script_inferno_folded_frames(&resolved_frames.frames)
                 };
@@ -1414,8 +1396,8 @@ where
 
         self.scratch_seen_mapping = seen;
         self.scratch_missing_keys = missing_keys;
+        self.scratch_missing_indexes = missing_indexes;
         self.scratch_missing_requests = missing_requests;
-        self.scratch_missing_fallbacks = missing_fallbacks;
         result
     }
 
@@ -1449,13 +1431,35 @@ where
 }
 
 fn render_perf_script_inferno_folded_frames(frames: &[String]) -> String {
-    render_inferno_perf_raw_stack(frames.iter().enumerate().filter_map(|(index, frame)| {
-        if should_skip_perf_script_folded_abstract_origin_frame(frame, frames.get(index + 1)) {
-            None
-        } else {
-            Some(frame.as_str())
-        }
-    }))
+    let mut rendered = String::with_capacity(
+        frames
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| {
+                if should_skip_perf_script_folded_abstract_origin_frame(
+                    frame,
+                    frames.get(index + 1),
+                ) {
+                    0
+                } else {
+                    frame.len() + 1
+                }
+            })
+            .sum(),
+    );
+    let mut scratch = String::new();
+    crate::folded::render_inferno_perf_raw_stack_into(
+        &mut rendered,
+        frames.iter().enumerate().filter_map(|(index, frame)| {
+            if should_skip_perf_script_folded_abstract_origin_frame(frame, frames.get(index + 1)) {
+                None
+            } else {
+                Some(frame.as_str())
+            }
+        }),
+        &mut scratch,
+    );
+    rendered
 }
 
 fn should_skip_perf_script_folded_abstract_origin_frame(
@@ -1827,10 +1831,17 @@ fn object_virtual_address_for_file_offset_cached(
     file_offset: u64,
     address_cache: &mut ObjectAddressCache,
 ) -> Option<u64> {
-    let segments = address_cache
+    let segments = match address_cache
         .segments_by_path
-        .entry(path.as_os_str().to_owned())
-        .or_insert_with(|| object_load_segment_ranges(path));
+        .raw_entry_mut()
+        .from_key(path.as_os_str())
+    {
+        RawEntryMut::Occupied(entry) => entry.into_mut(),
+        RawEntryMut::Vacant(entry) => {
+            let segments = object_load_segment_ranges(path);
+            entry.insert(path.as_os_str().to_owned(), segments).1
+        }
+    };
     segments.as_ref()?.iter().find_map(|segment| {
         (file_offset >= segment.file_offset && file_offset < segment.file_end)
             .then(|| segment.virtual_address + (file_offset - segment.file_offset))
@@ -4256,7 +4267,7 @@ mod tests {
     }
 
     #[test]
-    fn symbol_frame_cache_resolve_folded_mapping_ref_reuses_cached_rendered_stack() {
+    fn symbol_frame_cache_resolve_folded_mapping_ref_reuses_cached_frame_slice() {
         let resolver = CountingFrameResolver::new(vec![vec!["one".to_string(), "two".to_string()]]);
         let mut cache = SymbolFrameCache::new(&resolver);
         let mapping = test_mapping_ref("/bin/demo", 0x1234);
@@ -4264,8 +4275,7 @@ mod tests {
         let first_ptr = {
             let first = cache
                 .resolve_folded_mapping_ref(&mapping)
-                .expect("first resolve")
-                .expect("folded render");
+                .expect("first resolve");
             assert_eq!(first, "one;two");
             first.as_ptr()
         };
@@ -4273,8 +4283,7 @@ mod tests {
         let second_ptr = {
             let second = cache
                 .resolve_folded_mapping_ref(&mapping)
-                .expect("second resolve")
-                .expect("folded render");
+                .expect("second resolve");
             assert_eq!(second, "one;two");
             second.as_ptr()
         };
@@ -4289,12 +4298,9 @@ mod tests {
         let mut cache = SymbolFrameCache::new(&resolver);
         let mapping = test_mapping_ref("/bin/demo", 0x1234);
 
-        let folded = cache
-            .resolve_folded_mapping_ref(&mapping)
-            .expect("resolve")
-            .expect("folded render");
+        let frames = cache.resolve_folded_mapping_ref(&mapping).expect("resolve");
 
-        assert_eq!(folded, "handler");
+        assert_eq!(frames, "handler");
     }
 
     #[test]
@@ -4307,54 +4313,48 @@ mod tests {
         let mut cache = SymbolFrameCache::new(&resolver);
         let mapping = test_mapping_ref("/bin/demo", 0x1234);
 
-        let folded = cache
-            .resolve_folded_mapping_ref(&mapping)
-            .expect("resolve")
-            .expect("folded render");
+        let frames = cache.resolve_folded_mapping_ref(&mapping).expect("resolve");
 
-        assert_eq!(folded, "fn124;mix");
+        assert_eq!(frames, "fn124;mix");
     }
 
     #[test]
-    fn symbol_frame_cache_resolve_folded_mapping_ref_caches_fallback_rendering() {
+    fn symbol_frame_cache_resolve_folded_mapping_ref_renders_multiframe_stacks_like_perf_script() {
+        let resolver = CountingFrameResolver::new(vec![vec![
+            "entry::call".to_string(),
+            "fn0".to_string(),
+            "mix".to_string(),
+            "handler+0x2a".to_string(),
+        ]]);
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let mapping = test_mapping_ref("/bin/demo", 0x1234);
+
+        let frames = cache.resolve_folded_mapping_ref(&mapping).expect("resolve");
+
+        assert_eq!(frames, "entry::call;mix;handler");
+    }
+
+    #[test]
+    fn symbol_frame_cache_resolve_folded_mapping_ref_returns_empty_slice_for_empty_frames() {
         let resolver = CountingFrameResolver::new(vec![Vec::new()]);
         let mut cache = SymbolFrameCache::new(&resolver);
         let mapping = test_mapping_ref("/usr/lib/libdemo.so", 0x1234);
 
-        let first_ptr = {
-            let first = cache
-                .resolve_folded_mapping_ref(&mapping)
-                .expect("first resolve")
-                .expect("folded fallback render");
-            assert_eq!(first, "[libdemo.so]");
-            first.as_ptr()
-        };
+        let frames = cache.resolve_folded_mapping_ref(&mapping).expect("resolve");
 
-        let second_ptr = {
-            let second = cache
-                .resolve_folded_mapping_ref(&mapping)
-                .expect("second resolve")
-                .expect("folded fallback render");
-            assert_eq!(second, "[libdemo.so]");
-            second.as_ptr()
-        };
-
-        assert_eq!(first_ptr, second_ptr);
+        assert_eq!(frames, "[libdemo.so]");
         assert_eq!(resolver.calls.get(), 1);
     }
 
     #[test]
-    fn symbol_frame_cache_resolve_folded_mapping_ref_wraps_bracket_dso_like_inferno_perf() {
+    fn symbol_frame_cache_resolve_folded_mapping_ref_returns_empty_slice_for_bracket_dso() {
         let resolver = CountingFrameResolver::new(vec![Vec::new()]);
         let mut cache = SymbolFrameCache::new(&resolver);
         let mapping = test_mapping_ref("[vdso]", 0x10);
 
-        let folded = cache
-            .resolve_folded_mapping_ref(&mapping)
-            .expect("resolve")
-            .expect("folded fallback render");
+        let frames = cache.resolve_folded_mapping_ref(&mapping).expect("resolve");
 
-        assert_eq!(folded, "[[vdso]]");
+        assert_eq!(frames, "[[vdso]]");
     }
 
     #[test]

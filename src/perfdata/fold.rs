@@ -2857,11 +2857,11 @@ impl<'a> FoldFrameResolver<'a> {
                     } else {
                         cache.resolve_base_folded_mapping_ref(&mapping)?
                     };
-                    if let Some(rendered) = rendered {
-                        append_cached_rendered_frame(&mut buffers.rendered, rendered);
-                    } else {
+                    if rendered.is_empty() {
                         let fallback = symbol_fallback_frame_ref(&mapping);
                         append_cached_inferno_perf_folded_label_to_buffers(buffers, &fallback);
+                    } else {
+                        append_cached_rendered_frame(&mut buffers.rendered, rendered);
                     }
                     return Ok(());
                 }
