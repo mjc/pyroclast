@@ -2459,6 +2459,33 @@ fn file_path_folding_uses_finished_round_as_perf_ordered_event_watermark() {
 }
 
 #[test]
+fn file_backed_folding_matches_in_memory_folding_across_finished_rounds() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(9, &sample_payload_with_time(0x1000, 11, 12, 30, [0x2000])),
+            record_bytes(PERF_RECORD_FINISHED_ROUND, b""),
+            record_bytes(9, &sample_payload_with_time(0x1000, 11, 12, 40, [0x2000])),
+            record_bytes(PERF_RECORD_FINISHED_ROUND, b""),
+        ],
+    );
+    std::fs::write(&perfdata, &bytes).expect("write perfdata");
+
+    let in_memory =
+        fold_perfdata_callchains_with_options(&bytes, FoldOptions::default()).expect("in memory");
+    let file_backed =
+        fold_perfdata_file_with_options(&perfdata, FoldOptions::default()).expect("file backed");
+
+    assert_eq!(file_backed, in_memory);
+}
+
+#[test]
 fn folds_perfdata_from_multiple_finished_rounds_into_one_total() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
