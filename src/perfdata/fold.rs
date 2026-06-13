@@ -2752,10 +2752,7 @@ impl<'a> FoldFrameResolver<'a> {
             append_cached_inferno_perf_folded_label_to_buffers(buffers, &fallback);
             return Ok(());
         }
-        for (index, label) in frames.iter().enumerate() {
-            if should_skip_perf_script_folded_abstract_origin_frame(label, frames.get(index + 1)) {
-                continue;
-            }
+        for label in frames {
             append_cached_inferno_perf_raw_function_to_buffers(buffers, label);
         }
         Ok(())
@@ -3070,17 +3067,6 @@ where
         }
     }
     Ok(())
-}
-
-fn should_skip_perf_script_folded_abstract_origin_frame(
-    label: &str,
-    next_label: Option<&String>,
-) -> bool {
-    // perf script's libdw inline walk can produce the concrete caller followed
-    // by the terminal inline (`fn124;mix` in the x86-64 oracle), while our DWARF
-    // range flattening also sees the abstract-origin `fn0` before `mix`.
-    // Inferno folds perf script output without that abstract-origin hop.
-    label == "fn0" && next_label.is_some_and(|next| next == "mix")
 }
 
 /// Prints one perf-script callchain frame for an inline-expanded address.
