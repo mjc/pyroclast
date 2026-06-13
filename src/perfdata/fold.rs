@@ -363,9 +363,10 @@ struct SampleEventLayout {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FoldOptions {
     pub count_periods: bool,
-    /// When set, expand each callchain entry into its DWARF inline frames,
-    /// mirroring `perf script --inline`. Off by default: plain `perf script`
-    /// prints exactly one line per callchain entry, named from the ELF symtab.
+    /// Internal renderer switch for tests and specialized callers. The CLI
+    /// parity paths keep this on: real `perf script` emits DWARF inline frames
+    /// when the recorded stack and debuginfo make them printable, while fp data
+    /// with no inline DIEs naturally renders as one frame per callchain entry.
     pub inline: bool,
 }
 
@@ -2368,11 +2369,11 @@ fn extend_symbol_mappings_for_stack<'a>(
                 symbol_source_id: mapping.symbol_source_id,
                 relative_address: mapping.relative_address,
             };
-            // Without --inline (the default), every frame is rendered from its
-            // single base ELF symtab symbol, so prefetch only the base symbol.
-            // With --inline, perf's machine.c unwind_entry() runs
-            // append_inlines() on every accepted entry including the leaf, so
-            // InlineCurrentIp leaves prefetch the full DWARF inline chain too.
+            // The base-only mode is retained for low-level renderer tests and
+            // specialized callers. The CLI parity path keeps inline on because
+            // perf's machine.c unwind_entry() runs append_inlines() on every
+            // accepted entry including the leaf, so InlineCurrentIp leaves
+            // prefetch the full DWARF inline chain too.
             if !inline {
                 if batches.seen_base.insert(key) {
                     batches.base_mappings.push(mapping);
@@ -2561,8 +2562,8 @@ impl<'a> FoldFrameResolver<'a> {
             if let FoldFrame::InlineCurrentIp(address) = frame {
                 // perf's machine.c unwind_entry() runs append_inlines() on
                 // EVERY accepted entry, including the initial sampled IP, so
-                // with --inline the leaf expands its inline chain just like a
-                // caller frame. Only the no-inline default renders the single
+                // in inline-capable mode the leaf expands its inline chain just
+                // like a caller frame. Only base-only mode renders the single
                 // base symtab symbol for the leaf.
                 if self.inline {
                     self.write_regular_script_frame(
@@ -3035,10 +3036,9 @@ where
         write_perf_script_mapped_unknown_symbol_frame(writer, address, mapping.path)?;
         return Ok(());
     };
-    // Default `perf script` prints exactly one line per callchain entry, named
-    // from the ELF symtab (builtin-script.c sample__fprintf_sym without
-    // --inline). Resolve only the base object symbol and print it with the
-    // mapping's full DSO name (map__fprintf_dsoname).
+    // Base-only mode resolves one object symbol and prints it with the mapping's
+    // full DSO name (map__fprintf_dsoname). The CLI parity path keeps inline on
+    // so DWARF data can emit the inline rows that real perf prints.
     if !inline {
         return match cache.resolve_mapping_ref_with_base_symbol(mapping)? {
             Some([label, ..]) => {
@@ -5041,11 +5041,9 @@ mod tests {
     }
 
     #[test]
-    fn inline_fold_omits_abstract_origin_base_fn0_before_terminal_mix_like_perf_script() {
-        // perf script | inferno-collapse-perf for the deep-cal x86-64 oracle
-        // folds terminal inlined mix frames without the abstract-origin fn0
-        // frame. Pyroclast must not keep that extra frame in direct folded
-        // output.
+    fn inline_fold_keeps_abstract_origin_fn0_before_terminal_mix_like_perf_script() {
+        // perf/libdw do not special-case the abstract-origin label here; the
+        // inline chain should stay intact instead of dropping the fn0 hop.
         let mut mmap_table = super::MmapTable::default();
         mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
             pid: 11,
@@ -5073,14 +5071,13 @@ mod tests {
             )
             .expect("render folded stack");
 
-        assert_eq!(buffers.rendered, "burn-00;mix");
+        assert_eq!(buffers.rendered, "burn-00;fn0;mix");
     }
 
     #[test]
-    fn inline_fold_omits_abstract_origin_fn0_before_mix_for_user_unwind_chain_like_perf_script() {
-        // perf script | inferno-collapse-perf for the deep-cal x86-64 oracle
-        // folds user-unwind inline chains without the abstract-origin fn0
-        // immediately before mix.
+    fn inline_fold_keeps_abstract_origin_fn0_before_mix_for_user_unwind_chain_like_perf_script() {
+        // perf/libdw keep the inline chain intact for each user-unwind frame;
+        // there is no source-backed special case that drops fn0 before mix.
         let mut mmap_table = super::MmapTable::default();
         mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
             pid: 11,
@@ -5111,14 +5108,14 @@ mod tests {
             )
             .expect("render folded stack");
 
-        assert_eq!(buffers.rendered, "burn-00;mix;mix");
+        assert_eq!(buffers.rendered, "burn-00;fn0;mix;fn0;mix");
     }
 
     #[test]
-    fn inline_fold_keeps_real_base_frame_before_terminal_mix_like_perf_script() {
-        // Raw perf script prints both the terminal inlined mix frame and the
-        // concrete base row for the sampled IP, so direct folded output must
-        // keep the real base function while dropping only the bogus fn0 hop.
+    fn inline_fold_keeps_real_base_frame_and_abstract_origin_before_terminal_mix_like_perf_script()
+    {
+        // perf/libdw source does not justify dropping the abstract-origin hop;
+        // the concrete base row and the inline chain should both be present.
         let mut mmap_table = super::MmapTable::default();
         mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
             pid: 11,
@@ -5146,7 +5143,7 @@ mod tests {
             )
             .expect("render folded stack");
 
-        assert_eq!(buffers.rendered, "burn-00;fn124;mix");
+        assert_eq!(buffers.rendered, "burn-00;fn124;fn0;mix");
     }
 
     #[test]
@@ -5236,7 +5233,7 @@ mod tests {
     #[test]
     fn single_base_user_unwind_script_frame_keeps_its_baked_offset_once_like_perf_script() {
         // A non-inline base frame already carries +0x<off> in its label from the
-        // symtab with_offset form; it must not be doubled when --inline is set.
+        // symtab with_offset form; it must not be doubled in inline-capable mode.
         let mut mmap_table = super::MmapTable::default();
         mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
             pid: 11,
@@ -5482,8 +5479,8 @@ mod tests {
     fn prefetch_symbols_batches_inline_current_ip_through_full_dwarf_with_inline() {
         // perf's machine.c unwind_entry() runs append_inlines() on EVERY
         // accepted entry, including the initial sampled IP (the InlineCurrentIp
-        // leaf), so with --inline the leaf is symbolized through the full DWARF
-        // inline chain exactly like a caller frame. Only the no-inline default
+        // leaf), so inline-capable mode symbolizes the leaf through the full
+        // DWARF inline chain exactly like a caller frame. Only base-only mode
         // resolves it from the single base symtab symbol.
         let mut mmap_table = super::MmapTable::default();
         mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
@@ -5508,8 +5505,8 @@ mod tests {
         let resolver = RecordingFrameResolver::default();
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
 
-        // With --inline, both the caller (UserUnwind 0x1010) and the leaf
-        // (InlineCurrentIp 0x1020) prefetch the full DWARF inline chain.
+        // In inline-capable mode, both the caller (UserUnwind 0x1010) and the
+        // leaf (InlineCurrentIp 0x1020) prefetch the full DWARF inline chain.
         super::prefetch_symbols(&entries, &mmap_table, &mut symbol_cache, true)
             .expect("prefetch folded stack symbols");
 
