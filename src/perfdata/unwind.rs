@@ -32,7 +32,7 @@ pub struct PerfX86_64Regs {
 }
 
 /// The architecture a perf.data file's user register samples were recorded on,
-/// from the HEADER_ARCH feature string.
+/// from the `HEADER_ARCH` feature string.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PerfArch {
     #[default]
@@ -59,10 +59,10 @@ pub struct PerfAarch64Regs {
     pub lr: u64,
 }
 
-/// Architecture-neutral user register sample, decoded from a perf REGS_USER
+/// Architecture-neutral user register sample, decoded from a perf `REGS_USER`
 /// payload according to the recording machine's arch.
 ///
-/// The fold path threads this through every unwind site so the x86_64 and
+/// The fold path threads this through every unwind site so the `x86_64` and
 /// aarch64 register layouts and frame-pointer fallbacks stay byte-faithful to
 /// perf/elfutils without forcing a fake bp/sp onto aarch64.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,7 +102,7 @@ impl PerfUserRegs {
         }
     }
 
-    /// The sampled instruction pointer (x86_64 IP / aarch64 PC).
+    /// The sampled instruction pointer (`x86_64` IP / aarch64 PC).
     #[must_use]
     pub fn ip(self) -> u64 {
         match self {
@@ -120,7 +120,7 @@ impl PerfUserRegs {
         }
     }
 
-    /// Whether the sample looks like an x86_64 syscall-return state, which perf
+    /// Whether the sample looks like an `x86_64` syscall-return state, which perf
     /// truncates after the first executable frame. aarch64 has no analogue, so
     /// this is always `false` there.
     #[must_use]
@@ -131,9 +131,9 @@ impl PerfUserRegs {
         }
     }
 
-    /// The x86_64 `ebl_unwind` frame-pointer precondition `bp >= sp`.
+    /// The `x86_64` `ebl_unwind` frame-pointer precondition `bp >= sp`.
     ///
-    /// elfutils' x86_64 backend only walks the rbp chain when the frame pointer
+    /// elfutils' `x86_64` backend only walks the rbp chain when the frame pointer
     /// sits at or above the stack pointer. aarch64's backend has no such
     /// precondition (its accept condition is internal to the walk), so this
     /// returns `false` there and the fallback is gated differently.
@@ -954,11 +954,11 @@ impl PerfAarch64Regs {
 /// Walks an aarch64 frame-pointer chain the way elfutils' `ebl_unwind` backend
 /// does when no CFI covers the program counter.
 ///
-/// Faithful to elfutils backends/aarch64_unwind.c: the caller's pc is the
+/// Faithful to elfutils `backends/aarch64_unwind.c`: the caller's pc is the
 /// current lr (zero lr ends the walk before any caller is accepted), the next
 /// lr/fp load from `fp+8`/`fp+0` (zero on failed reads), the next sp is
 /// `fp+16`, and a step is accepted iff `fp == 0 || new_sp > sp`. Unlike the
-/// x86_64 backend there is no `fp >= sp` precondition, so a zero frame pointer
+/// `x86_64` backend there is no `fp >= sp` precondition, so a zero frame pointer
 /// still yields one lr-based caller.
 #[must_use]
 pub fn unwind_aarch64_frame_pointer_stack_like_elfutils(
@@ -982,14 +982,14 @@ pub fn unwind_aarch64_frame_pointer_stack_like_elfutils(
         }
         let new_lr = memory_reader.read_u64(fp.saturating_add(8)).unwrap_or(0);
         let new_fp = memory_reader.read_u64(fp).unwrap_or(0);
-        let new_sp = fp.saturating_add(16);
-        if fp != 0 && new_sp <= sp {
+        let caller_sp = fp.saturating_add(16);
+        if fp != 0 && caller_sp <= sp {
             break;
         }
         push_perf_unwind_address(&mut frames, lr);
         lr = new_lr;
         fp = new_fp;
-        sp = new_sp;
+        sp = caller_sp;
     }
     frames
 }

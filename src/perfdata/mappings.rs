@@ -1,4 +1,7 @@
-use crate::perfdata::records::{Mmap2BuildIdRecord, Mmap2Record, MmapRecord};
+use crate::perfdata::records::{
+    Mmap2BuildIdRecord, Mmap2Record, MmapRecord, PERF_RECORD_MISC_CPUMODE_MASK,
+    PERF_RECORD_MISC_CPUMODE_USER,
+};
 use crate::symbols::KernelRelocation;
 use hashbrown::{HashMap, HashSet};
 use rustc_hash::FxBuildHasher;
@@ -24,6 +27,8 @@ pub struct MmapTable {
 pub struct ResolvedMapping {
     pub path: String,
     pub relative_address: u64,
+    pub start: u64,
+    pub end: u64,
     pub build_id: Option<Vec<u8>>,
     pub file_identity: Option<FileIdentity>,
     pub kernel_relocation: Option<KernelRelocation>,
@@ -34,6 +39,8 @@ pub struct ResolvedMappingRef<'a> {
     pub symbol_source_id: usize,
     pub path: &'a str,
     pub relative_address: u64,
+    pub start: u64,
+    pub end: u64,
     pub build_id: Option<&'a [u8]>,
     pub file_identity: Option<FileIdentity>,
     pub kernel_relocation: Option<KernelRelocation>,
@@ -93,14 +100,16 @@ pub fn file_matches_recorded_identity(_path: &Path, _identity: FileIdentity) -> 
 /// records in `PERF_RECORD_MMAP2`.
 #[cfg(unix)]
 fn major(device: u64) -> u32 {
-    (((device >> 8) & 0xfff) | ((device >> 32) & !0xfff)) as u32
+    u32::try_from(((device >> 8) & 0xfff) | ((device >> 32) & 0xffff_f000))
+        .expect("masked device major fits u32")
 }
 
 /// Extracts the device minor number from a `st_dev` value, matching the kernel
 /// `MINOR()` macro perf records in `PERF_RECORD_MMAP2`.
 #[cfg(unix)]
 fn minor(device: u64) -> u32 {
-    ((device & 0xff) | ((device >> 12) & !0xff)) as u32
+    u32::try_from((device & 0xff) | ((device >> 12) & 0xffff_ff00))
+        .expect("masked device minor fits u32")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,6 +135,7 @@ struct Mapping {
     build_id: Option<Vec<u8>>,
     file_identity: Option<FileIdentity>,
     prot: Option<u32>,
+    cpumode: u16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,6 +165,22 @@ impl MmapTable {
             build_id: None,
             file_identity: None,
             prot: None,
+            cpumode: PERF_RECORD_MISC_CPUMODE_USER,
+        });
+    }
+
+    pub(crate) fn insert_mmap_with_misc(&mut self, record: MmapRecord, misc: u16) {
+        self.insert_mapping(Mapping {
+            pid: record.pid,
+            start: record.start,
+            len: record.len,
+            pgoff: record.pgoff,
+            symbol_source_id: 0,
+            path: record.path,
+            build_id: None,
+            file_identity: None,
+            prot: None,
+            cpumode: mapping_cpumode_from_misc(misc),
         });
     }
 
@@ -163,6 +189,19 @@ impl MmapTable {
     }
 
     pub fn insert_mmap2_with_build_id(&mut self, record: Mmap2Record, build_id: Option<Vec<u8>>) {
+        self.insert_mmap2_with_build_id_and_misc(record, build_id, PERF_RECORD_MISC_CPUMODE_USER);
+    }
+
+    pub(crate) fn insert_mmap2_with_misc(&mut self, record: Mmap2Record, misc: u16) {
+        self.insert_mmap2_with_build_id_and_misc(record, None, mapping_cpumode_from_misc(misc));
+    }
+
+    pub(crate) fn insert_mmap2_with_build_id_and_misc(
+        &mut self,
+        record: Mmap2Record,
+        build_id: Option<Vec<u8>>,
+        misc: u16,
+    ) {
         self.insert_mapping(Mapping {
             pid: record.pid,
             start: record.start,
@@ -178,10 +217,19 @@ impl MmapTable {
                 inode_generation: record.inode_generation,
             }),
             prot: Some(record.prot),
+            cpumode: mapping_cpumode_from_misc(misc),
         });
     }
 
     pub fn insert_mmap2_build_id(&mut self, record: Mmap2BuildIdRecord) {
+        self.insert_mmap2_build_id_with_misc(record, PERF_RECORD_MISC_CPUMODE_USER);
+    }
+
+    pub(crate) fn insert_mmap2_build_id_with_misc(
+        &mut self,
+        record: Mmap2BuildIdRecord,
+        misc: u16,
+    ) {
         self.insert_mapping(Mapping {
             pid: record.pid,
             start: record.start,
@@ -192,6 +240,7 @@ impl MmapTable {
             build_id: Some(record.build_id),
             file_identity: None,
             prot: Some(record.prot),
+            cpumode: mapping_cpumode_from_misc(misc),
         });
     }
 
@@ -402,6 +451,8 @@ impl MmapTable {
         self.resolve_ref(pid, ip).map(|mapping| ResolvedMapping {
             path: mapping.path.to_string(),
             relative_address: mapping.relative_address,
+            start: mapping.start,
+            end: mapping.end,
             build_id: mapping.build_id.map(<[u8]>::to_vec),
             file_identity: mapping.file_identity,
             kernel_relocation: mapping.kernel_relocation,
@@ -415,6 +466,8 @@ impl MmapTable {
                 symbol_source_id: mapping.symbol_source_id,
                 path: mapping.path.as_str(),
                 relative_address: mapping.relative_address(ip),
+                start: mapping.start,
+                end: mapping.end(),
                 build_id: mapping.build_id.as_deref(),
                 file_identity: mapping.file_identity,
                 kernel_relocation: mapping.kernel_relocation(),
@@ -433,10 +486,44 @@ impl MmapTable {
                 symbol_source_id: mapping.symbol_source_id,
                 path: mapping.path.as_str(),
                 relative_address: mapping.relative_address(ip),
+                start: mapping.start,
+                end: mapping.end(),
                 build_id: mapping.build_id.as_deref(),
                 file_identity: mapping.file_identity,
                 kernel_relocation: mapping.kernel_relocation(),
             })
+    }
+
+    #[must_use]
+    pub(crate) fn resolve_user_pid_ref_cached(
+        &self,
+        pid: u32,
+        ip: u64,
+        cache: &mut MappingResolveCache,
+    ) -> Option<ResolvedMappingRef<'_>> {
+        if cache.pid != Some(pid) {
+            cache.pid = Some(pid);
+            cache.pid_index = None;
+        }
+        self.resolve_mapping_index_for_pid_with_cache_and_predicate(
+            pid,
+            ip,
+            &mut cache.pid_index,
+            Mapping::is_user_cpumode,
+        )
+        .map(|index| {
+            let mapping = &self.mappings[index];
+            ResolvedMappingRef {
+                symbol_source_id: mapping.symbol_source_id,
+                path: mapping.path.as_str(),
+                relative_address: mapping.relative_address(ip),
+                start: mapping.start,
+                end: mapping.end(),
+                build_id: mapping.build_id.as_deref(),
+                file_identity: mapping.file_identity,
+                kernel_relocation: mapping.kernel_relocation(),
+            }
+        })
     }
 
     #[must_use]
@@ -463,23 +550,13 @@ impl MmapTable {
         ip: u64,
         cache: &mut MappingResolveCache,
     ) -> bool {
-        self.resolve_mapping_cached(pid, ip, cache).is_some()
+        self.resolve_mapping_with_index_cached(pid, ip, cache)
+            .is_some()
     }
 
     #[must_use]
     pub fn mapping_path(&self, pid: u32, ip: u64) -> Option<&str> {
         self.resolve_mapping(pid, ip)
-            .map(|mapping| mapping.path.as_str())
-    }
-
-    #[must_use]
-    pub(crate) fn mapping_path_cached(
-        &self,
-        pid: u32,
-        ip: u64,
-        cache: &mut MappingResolveCache,
-    ) -> Option<&str> {
-        self.resolve_mapping_cached(pid, ip, cache)
             .map(|mapping| mapping.path.as_str())
     }
 
@@ -530,16 +607,6 @@ impl MmapTable {
 
     fn resolve_mapping(&self, pid: u32, ip: u64) -> Option<&Mapping> {
         self.resolve_mapping_with_index(pid, ip)
-            .map(|(_, mapping)| mapping)
-    }
-
-    fn resolve_mapping_cached(
-        &self,
-        pid: u32,
-        ip: u64,
-        cache: &mut MappingResolveCache,
-    ) -> Option<&Mapping> {
-        self.resolve_mapping_with_index_cached(pid, ip, cache)
             .map(|(_, mapping)| mapping)
     }
 
@@ -629,10 +696,55 @@ impl MmapTable {
         resolved
     }
 
+    fn resolve_mapping_index_for_pid_with_cache_and_predicate(
+        &self,
+        pid: u32,
+        ip: u64,
+        cached_index: &mut Option<usize>,
+        predicate: impl Fn(&Mapping) -> bool,
+    ) -> Option<usize> {
+        let resolved = self.resolve_mapping_index_for_pid_with_predicate(pid, ip, predicate);
+        *cached_index = resolved;
+        resolved
+    }
+
+    fn resolve_mapping_index_for_pid_with_predicate(
+        &self,
+        pid: u32,
+        ip: u64,
+        predicate: impl Fn(&Mapping) -> bool,
+    ) -> Option<usize> {
+        let bucket = self.mappings_by_pid.get(&pid)?;
+        let mut upper_bound = bucket.partition_point(|indexed| indexed.start <= ip);
+        let mut latest_matching_index = None;
+        while upper_bound > 0 {
+            upper_bound -= 1;
+            let indexed = &bucket[upper_bound];
+            if indexed.max_end <= ip {
+                break;
+            }
+            let index = indexed.index;
+            let mapping = &self.mappings[index];
+            if ip < mapping.end() && predicate(mapping) {
+                latest_matching_index = latest_matching_index.max(Some(index));
+            }
+        }
+        latest_matching_index
+    }
+
     fn intern_symbol_source(&mut self, mapping: &Mapping) -> usize {
         let key = mapping.symbol_source_key();
         let next_id = self.symbol_source_ids.len();
         *self.symbol_source_ids.entry(key).or_insert(next_id)
+    }
+}
+
+fn mapping_cpumode_from_misc(misc: u16) -> u16 {
+    match misc & PERF_RECORD_MISC_CPUMODE_MASK {
+        crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_KERNEL => {
+            crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_KERNEL
+        }
+        _ => PERF_RECORD_MISC_CPUMODE_USER,
     }
 }
 
@@ -665,6 +777,10 @@ impl Mapping {
 
     fn is_user_file_mapping(&self) -> bool {
         !self.path.starts_with('[') && self.pid != u32::MAX
+    }
+
+    fn is_user_cpumode(&self) -> bool {
+        self.cpumode == PERF_RECORD_MISC_CPUMODE_USER
     }
 
     fn is_known_non_executable(&self) -> bool {

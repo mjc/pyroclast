@@ -74,7 +74,7 @@ pub fn parse_feature_sections(
 
 const HEADER_ARCH: u16 = 6;
 
-/// Reads the HEADER_ARCH feature string (the recording machine's `uname -m`,
+/// Reads the `HEADER_ARCH` feature string (the recording machine's `uname -m`,
 /// e.g. `x86_64` or `aarch64`).
 ///
 /// perf stores it as a `perf_header_string`: a u32 length followed by that many
@@ -83,7 +83,7 @@ const HEADER_ARCH: u16 = 6;
 /// # Errors
 ///
 /// Returns an error when the header or feature table is malformed. A missing
-/// HEADER_ARCH feature is `Ok(None)`.
+/// `HEADER_ARCH` feature is `Ok(None)`.
 pub fn parse_header_arch(bytes: &[u8], header: &PerfHeader) -> Result<Option<String>, String> {
     let Some(section) = parse_feature_sections(bytes, header)?
         .into_iter()

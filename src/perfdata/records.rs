@@ -27,6 +27,8 @@ pub const PERF_RECORD_CGROUP: u32 = 19;
 pub const PERF_RECORD_TEXT_POKE: u32 = 20;
 pub const PERF_RECORD_AUX_OUTPUT_HW_ID: u32 = 21;
 pub const PERF_RECORD_CALLCHAIN_DEFERRED: u32 = 22;
+pub const PERF_RECORD_USER_TYPE_START: u32 = 64;
+pub const PERF_RECORD_HEADER_ATTR: u32 = 64;
 pub const PERF_RECORD_HEADER_BUILD_ID: u32 = 67;
 pub const PERF_RECORD_FINISHED_ROUND: u32 = 68;
 pub const PERF_RECORD_MISC_COMM_EXEC: u16 = 1 << 13;
@@ -80,7 +82,10 @@ pub enum ParsedRecord {
     Comm(CommRecord),
     Mmap(MmapRecord),
     Mmap2(Mmap2Record),
-    Mmap2BuildId(Mmap2BuildIdRecord),
+    Mmap2BuildId {
+        misc: u16,
+        record: Mmap2BuildIdRecord,
+    },
     Fork(ForkRecord),
     Exit(ExitRecord),
     Lost(LostRecord),
@@ -100,7 +105,9 @@ pub enum ParsedRecord {
     TextPoke(TextPokeRecord),
     AuxOutputHwId(AuxOutputHwIdRecord),
     CallchainDeferred(CallchainDeferredRecord),
-    Unsupported { record_type: u32 },
+    Unsupported {
+        record_type: u32,
+    },
 }
 
 #[must_use]
@@ -410,7 +417,10 @@ pub fn parse_record(record: PerfRecord<'_>) -> Result<ParsedRecord, String> {
             parse_unthrottle_record(record.payload).map(ParsedRecord::Unthrottle)
         }
         PERF_RECORD_MMAP2 if has_misc_flag(record.header.misc, PERF_RECORD_MISC_MMAP_BUILD_ID) => {
-            parse_mmap2_build_id_record(record.payload).map(ParsedRecord::Mmap2BuildId)
+            parse_mmap2_build_id_record(record.payload).map(|parsed| ParsedRecord::Mmap2BuildId {
+                misc: record.header.misc,
+                record: parsed,
+            })
         }
         PERF_RECORD_MMAP2 => parse_mmap2_record(record.payload).map(ParsedRecord::Mmap2),
         PERF_RECORD_LOST_SAMPLES => {
@@ -1038,9 +1048,9 @@ fn parse_c_string_lossy(bytes: &[u8]) -> Cow<'_, str> {
 fn intern_c_string(bytes: &[u8]) -> Arc<str> {
     type CommInterner = hashbrown::HashMap<Arc<str>, Arc<str>, rustc_hash::FxBuildHasher>;
     thread_local! {
-        static INTERNER: RefCell<CommInterner> = RefCell::new(hashbrown::HashMap::with_hasher(
-            rustc_hash::FxBuildHasher::default(),
-        ));
+        static INTERNER: RefCell<CommInterner> = const { RefCell::new(hashbrown::HashMap::with_hasher(
+            rustc_hash::FxBuildHasher,
+        )) };
     }
 
     let text = parse_c_string_lossy(bytes);

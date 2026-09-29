@@ -622,9 +622,10 @@ fn find_unique_target(
         .exec()?
         .packages
         .into_iter()
-        .filter(|package_metadata| match package {
-            Some(package) => package == package_metadata.name.as_str(),
-            None => {
+        .filter(|package_metadata| {
+            if let Some(package) = package {
+                package == package_metadata.name.as_str()
+            } else {
                 // cargo metadata reports manifest paths as given, which can
                 // disagree with the canonicalized crate root through symlinks
                 // (macOS /var -> /private/var).

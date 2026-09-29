@@ -314,10 +314,9 @@ pub(crate) fn fold_linux_perfdata<R>(
 where
     R: CommandRunner,
 {
-    // The profile command produces human-facing flamegraphs and keeps the
-    // DWARF inline-frame expansion it has always emitted (like
-    // `perf script --inline`). The byte-for-byte `plumbing perf-script`/fold
-    // parity paths default inline off; this convenience command does not.
+    // Keep the inline-capable renderer on, matching the plumbing parity paths:
+    // fp data naturally stays one frame per callchain entry, while DWARF data
+    // can emit the inline rows that real `perf script` prints.
     let options = FoldOptions {
         count_periods: true,
         inline: true,

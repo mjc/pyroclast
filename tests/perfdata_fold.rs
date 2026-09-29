@@ -9,14 +9,18 @@ use pyroclast::perfdata::fold::{
 use pyroclast::perfdata::mappings::FileIdentity;
 use pyroclast::perfdata::records::{
     PERF_RECORD_FINISHED_ROUND, PERF_RECORD_FORK, PERF_RECORD_MISC_COMM_EXEC,
-    PERF_RECORD_MISC_CPUMODE_KERNEL, PERF_RECORD_MISC_CPUMODE_USER,
+    PERF_RECORD_MISC_CPUMODE_KERNEL, PERF_RECORD_MISC_CPUMODE_USER, PERF_RECORD_MISC_MMAP_BUILD_ID,
+    PERF_RECORD_SAMPLE,
 };
 use pyroclast::perfdata::samples::{
     PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP,
     PERF_SAMPLE_PERIOD, PERF_SAMPLE_REGS_USER, PERF_SAMPLE_STACK_USER, PERF_SAMPLE_TID,
     PERF_SAMPLE_TIME,
 };
-use pyroclast::symbols::{SymbolRequest, SymbolResolver};
+use pyroclast::symbols::{
+    ResolvedSymbolFrames, SymbolRequest, SymbolResolver,
+    perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources,
+};
 use std::cell::RefCell;
 
 fn render_unknown_folded_callchain(frames: &[u64], count: u64) -> String {
@@ -184,13 +188,16 @@ fn keeps_unmapped_dwarf_user_stack_payloads_like_perf_libdw_ebl() {
 }
 
 #[test]
-fn folds_aarch64_dwarf_user_stack_with_frame_pointer_fallback_like_perf_libdw_ebl() {
+fn folds_aarch64_dwarf_user_stack_with_single_lr_frame_pointer_fallback_like_perf_libdw_ebl() {
     // perf record --call-graph dwarf on arm64 captures x0-x30, sp, pc. The
     // recording machine's HEADER_ARCH ("aarch64") tells the fold path to decode
     // PerfAarch64Regs (fp=29, lr=30, sp=31, pc=32) and use elfutils'
-    // backends/aarch64_unwind.c frame-pointer fallback when no DSO/CFI covers
-    // the sampled pc: the caller pc comes from lr (taking the perf pc-1
-    // adjustment), and the walk ends on the zeroed next lr.
+    // backends/aarch64_unwind.c frame-pointer fallback when no DSO/CFI covers the
+    // sampled pc: the caller pc comes from lr (taking the perf pc-1 adjustment),
+    // the next lr/fp are loaded from fp+8/fp+0, and the walk ends on the zeroed
+    // next lr. perf's tools/perf/util/machine.c unwind_entry() appends one cursor
+    // entry for each Dwfl_Frame callback, so this fixture has exactly one user
+    // unwind frame after the event-line leaf.
     let mask = (1_u64 << 29) | (1_u64 << 30) | (1_u64 << 31) | (1_u64 << 32);
     let bytes = perfdata_with_records_attrs_and_arch_feature(
         [file_attr_bytes_with_regs(
@@ -222,7 +229,7 @@ fn folds_aarch64_dwarf_user_stack_with_frame_pointer_fallback_like_perf_libdw_eb
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown] 1\n");
 }
 
 #[test]
@@ -867,10 +874,11 @@ fn keeps_recorded_user_frame_without_dwarf_callers_for_mixed_callchain_like_perf
 }
 
 #[test]
-fn keeps_dwarf_user_stack_for_kernel_sample_without_kernel_callchain_like_perf_libdw_ebl() {
+fn keeps_dwarf_user_stack_for_kernel_sample_with_empty_kernel_callchain_like_perf_libdw_ebl() {
     // For ORDER_CALLEE, perf resolves the recorded callchain first and then
-    // calls thread__resolve_callchain_unwind(); an empty kernel callchain does
-    // not suppress the captured user-regs/user-stack unwind path.
+    // calls thread__resolve_callchain_unwind(); a present-but-empty kernel
+    // callchain payload does not suppress the captured user-regs/user-stack
+    // unwind path.
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -1186,7 +1194,7 @@ fn keeps_current_ip_only_object_unwind_from_pid_specific_modules_like_perf_libdw
     assert_eq!(folded, expected);
 }
 
-/// Build a `--call-graph dwarf` x86_64 perf.data with a single sample over the
+/// Build a `--call-graph dwarf` `x86_64` perf.data with a single sample over the
 /// synthetic fixture: one MMAP covering `[0, 0x1000_0000)` and one user-stack
 /// sample. `regs` are `[bp, sp, ip]` in perf's ascending register order
 /// (RBP=6, RSP=7, IP=8).
@@ -1884,7 +1892,11 @@ fn drops_perf_context_marker_frames_when_folding() {
 }
 
 #[test]
-fn merges_deferred_user_callchains_like_perf_script() {
+fn does_not_merge_deferred_user_callchain_without_tid_sample_id_like_perf_script() {
+    // evsel.c initializes PERF_RECORD_CALLCHAIN_DEFERRED sample tids to -1.
+    // Without sample_id_all TID data, session.c evlist__deliver_deferred_callchain()
+    // does not match a normal original sample tid, so EOF flush emits the
+    // original callchain before the deferred marker.
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
             PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
@@ -1903,6 +1915,36 @@ fn merges_deferred_user_callchains_like_perf_script() {
                 ),
             ),
             record_bytes(22, &callchain_deferred_payload(0x4444, [0x5000, 0x6000])),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
+}
+
+#[test]
+fn merges_deferred_user_callchains_with_matching_tid_sample_id_like_perf_script() {
+    let mut deferred = callchain_deferred_payload(0x4444, [0x5000, 0x6000]);
+    deferred.extend(11_u32.to_le_bytes());
+    deferred.extend(12_u32.to_le_bytes());
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_flags(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            1 << 18,
+        )],
+        [
+            record_bytes(3, &comm_payload(11, 11, "pyroclast")),
+            record_bytes(
+                9,
+                &sample_payload(
+                    0x1000,
+                    11,
+                    12,
+                    [0x2000, 0x3000, 0xffff_ffff_ffff_fd80, 0x4444],
+                ),
+            ),
+            record_bytes(22, &deferred),
         ],
     );
 
@@ -2211,6 +2253,54 @@ fn folds_sample_ip_when_callchain_is_absent_like_perf_script() {
 }
 
 #[test]
+fn folds_kernel_sample_ip_without_callchain_using_record_cpumode_like_perf_script() {
+    // perf builtin-script.c process_sample_event() resolves the event-line IP
+    // with machine__resolve(), and util/event.c machine__resolve() passes
+    // sample->cpumode into thread__find_map(). This is not the recorded
+    // callchain path, whose util/machine.c thread__resolve_callchain_sample()
+    // starts in PERF_RECORD_MISC_USER and switches only on PERF_CONTEXT_*.
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD,
+            0,
+            0,
+        )],
+        [
+            record_bytes_with_misc(
+                1,
+                PERF_RECORD_MISC_CPUMODE_KERNEL,
+                &mmap_payload(
+                    u32::MAX,
+                    u32::MAX,
+                    0xffff_ffff_8800_0000,
+                    0x2000,
+                    0,
+                    "[kernel.kallsyms]",
+                ),
+            ),
+            record_bytes_with_misc(
+                9,
+                PERF_RECORD_MISC_CPUMODE_KERNEL,
+                &sample_payload_with_period_no_callchain(0xffff_ffff_8800_0010, 11, 12, 7),
+            ),
+        ],
+    );
+    let resolver = StaticSymbolResolver;
+
+    let folded = fold_perfdata_callchains_with_symbols(
+        &bytes,
+        FoldOptions {
+            count_periods: true,
+            inline: false,
+        },
+        &resolver,
+    )
+    .expect("folded");
+
+    assert_eq!(folded, ":12;asm_exc_page_fault 7\n");
+}
+
+#[test]
 fn emits_sample_ip_when_callchain_field_is_absent_even_with_dwarf_payload_like_perf_script() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
@@ -2249,6 +2339,41 @@ fn emits_sample_ip_when_callchain_field_is_absent_even_with_dwarf_payload_like_p
     .expect("folded");
 
     assert_eq!(folded, ":12;[unknown] 7\n");
+}
+
+#[test]
+fn folded_no_callchain_sample_ip_uses_base_symbol_even_when_inline_is_enabled_like_perf_script() {
+    // builtin-script.c process_event() only resolves a callchain cursor when
+    // sample->callchain exists. Without PERF_SAMPLE_CALLCHAIN, the event-line
+    // IP is printed through machine__resolve()/map__find_symbol(), even if
+    // inline output is otherwise enabled.
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD,
+            0,
+            0,
+        )],
+        [
+            record_bytes(1, &mmap_payload(11, 12, 0x1000, 0x100, 0, "/bin/app")),
+            record_bytes(
+                9,
+                &sample_payload_with_period_no_callchain(0x1010, 11, 12, 7),
+            ),
+        ],
+    );
+    let resolver = SampleIpInlineSymbolResolver;
+
+    let folded = fold_perfdata_callchains_with_symbols(
+        &bytes,
+        FoldOptions {
+            count_periods: true,
+            inline: true,
+        },
+        &resolver,
+    )
+    .expect("folded");
+
+    assert_eq!(folded, ":12;app::main 7\n");
 }
 
 #[test]
@@ -2959,11 +3084,69 @@ fn symbolized_fold_carries_mmap2_build_ids_to_symbol_requests() {
         vec![vec![SymbolRequest {
             path: std::path::PathBuf::from("[igb]"),
             relative_address: 0x30,
+            kernel_mapping_range: None,
             build_id: Some("aabbccdd".to_string()),
             file_identity: None,
             kernel_relocation: None,
         }]]
     );
+}
+
+#[test]
+fn symbolized_fold_resolves_build_id_kernel_module_from_live_kallsyms_like_perf_script() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes_with_misc(
+                10,
+                PERF_RECORD_MISC_CPUMODE_KERNEL | PERF_RECORD_MISC_MMAP_BUILD_ID,
+                &mmap2_build_id_payload(
+                    u32::MAX,
+                    u32::MAX,
+                    0xffff_ffff_c0ed_5900,
+                    0x1000,
+                    0,
+                    "[zfs]",
+                ),
+            ),
+            record_bytes(
+                PERF_RECORD_SAMPLE,
+                &sample_payload(
+                    0xffff_ffff_c0ed_5ffa,
+                    11,
+                    12,
+                    [0xffff_ffff_ffff_ff80, 0xffff_ffff_c0ed_5ffa],
+                ),
+            ),
+        ],
+    );
+    let root = tempfile::tempdir().expect("root");
+    let perfdata = root.path().join("perf.data");
+    std::fs::write(&perfdata, &bytes).expect("perfdata");
+    let live_kallsyms = root.path().join("kallsyms");
+    std::fs::write(
+        &live_kallsyms,
+        "ffffffffc0ed5900 t arc_read [zfs]\nffffffffc0ed6100 t arc_read_next [zfs]\n",
+    )
+    .expect("kallsyms");
+    let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+        RecordingSymbolResolver::default(),
+        &perfdata,
+        root.path(),
+        [],
+        &live_kallsyms,
+    );
+
+    let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
+        .expect("folded");
+
+    // perf's tools/perf/util/symbol.c dso__find_kallsyms() falls through to
+    // /proc/kallsyms for kernel/module maps even when the DSO has a build-id.
+    assert_eq!(folded, ":12;arc_read 1\n");
 }
 
 #[test]
@@ -2993,6 +3176,7 @@ fn symbolized_fold_carries_mmap2_file_identity_to_symbol_requests() {
         vec![vec![SymbolRequest {
             path: std::path::PathBuf::from("/bin/app"),
             relative_address: 0x30,
+            kernel_mapping_range: None,
             build_id: None,
             file_identity: Some(FileIdentity {
                 major: 8,
@@ -3037,6 +3221,7 @@ fn symbolized_fold_carries_header_build_ids_to_mmap2_symbol_requests() {
         vec![vec![SymbolRequest {
             path: std::path::PathBuf::from("/tmp/stale-app"),
             relative_address: 0x30,
+            kernel_mapping_range: None,
             build_id: Some("aabbccddeeff102030405060708090a0b0c0d0e0".to_string()),
             file_identity: Some(FileIdentity {
                 major: 8,
@@ -3304,7 +3489,7 @@ fn folds_unmapped_kernel_frames_as_unknown_like_inferno() {
 }
 
 #[test]
-fn keeps_kernel_frames_from_mmap2_records_without_exec_prot() {
+fn kernel_looking_user_callchain_without_kernel_context_stays_unknown_like_perf_script() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
             PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
@@ -3313,7 +3498,37 @@ fn keeps_kernel_frames_from_mmap2_records_without_exec_prot() {
         )],
         [
             record_bytes(
+                1,
+                &mmap_payload(
+                    u32::MAX,
+                    u32::MAX,
+                    0xffff_ffff_8800_0000,
+                    0x2000,
+                    0,
+                    "[kernel.kallsyms]",
+                ),
+            ),
+            record_bytes(9, &sample_payload(0x1000, 11, 12, [0xffff_ffff_8800_0010])),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, ":12;[unknown] 1\n");
+}
+
+#[test]
+fn keeps_kernel_frames_from_mmap2_records_without_exec_prot() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes_with_misc(
                 10,
+                PERF_RECORD_MISC_CPUMODE_KERNEL,
                 &mmap2_payload(
                     u32::MAX,
                     u32::MAX,
@@ -3324,7 +3539,15 @@ fn keeps_kernel_frames_from_mmap2_records_without_exec_prot() {
                     "[kernel.kallsyms]",
                 ),
             ),
-            record_bytes(9, &sample_payload(0x1000, 11, 12, [0xffff_ffff_8800_0010])),
+            record_bytes(
+                9,
+                &sample_payload(
+                    0x1000,
+                    11,
+                    12,
+                    [0xffff_ffff_ffff_ff80, 0xffff_ffff_8800_0010],
+                ),
+            ),
         ],
     );
 
@@ -3342,8 +3565,9 @@ fn symbolized_fold_uses_module_fallback_for_unresolved_kernel_frames_like_infern
             0,
         )],
         [
-            record_bytes(
+            record_bytes_with_misc(
                 1,
+                PERF_RECORD_MISC_CPUMODE_KERNEL,
                 &mmap_payload(
                     u32::MAX,
                     u32::MAX,
@@ -3353,7 +3577,15 @@ fn symbolized_fold_uses_module_fallback_for_unresolved_kernel_frames_like_infern
                     "[kernel.kallsyms]_text",
                 ),
             ),
-            record_bytes(9, &sample_payload(0x1000, 11, 12, [0xffff_ffff_8800_0010])),
+            record_bytes(
+                9,
+                &sample_payload(
+                    0x1000,
+                    11,
+                    12,
+                    [0xffff_ffff_ffff_ff80, 0xffff_ffff_8800_0010],
+                ),
+            ),
         ],
     );
     let resolver = RecordingSymbolResolver::default();
@@ -3373,8 +3605,9 @@ fn symbolized_fold_resolves_mapped_kernel_frames() {
             0,
         )],
         [
-            record_bytes(
+            record_bytes_with_misc(
                 1,
+                PERF_RECORD_MISC_CPUMODE_KERNEL,
                 &mmap_payload(
                     u32::MAX,
                     u32::MAX,
@@ -3384,7 +3617,15 @@ fn symbolized_fold_resolves_mapped_kernel_frames() {
                     "[kernel.kallsyms]",
                 ),
             ),
-            record_bytes(9, &sample_payload(0x1000, 11, 12, [0xffff_ffff_8800_0010])),
+            record_bytes(
+                9,
+                &sample_payload(
+                    0x1000,
+                    11,
+                    12,
+                    [0xffff_ffff_ffff_ff80, 0xffff_ffff_8800_0010],
+                ),
+            ),
         ],
     );
     let resolver = StaticSymbolResolver;
@@ -3404,8 +3645,9 @@ fn symbolized_fold_resolves_kernel_module_frames() {
             0,
         )],
         [
-            record_bytes(
+            record_bytes_with_misc(
                 1,
+                PERF_RECORD_MISC_CPUMODE_KERNEL,
                 &mmap_payload(
                     u32::MAX,
                     u32::MAX,
@@ -3415,7 +3657,15 @@ fn symbolized_fold_resolves_kernel_module_frames() {
                     "[zfs]",
                 ),
             ),
-            record_bytes(9, &sample_payload(0x1000, 11, 12, [0xffff_ffff_c000_0123])),
+            record_bytes(
+                9,
+                &sample_payload(
+                    0x1000,
+                    11,
+                    12,
+                    [0xffff_ffff_ffff_ff80, 0xffff_ffff_c000_0123],
+                ),
+            ),
         ],
     );
     let resolver = StaticSymbolResolver;
@@ -3456,6 +3706,7 @@ fn prefetches_unique_symbol_requests_before_folding() {
             SymbolRequest {
                 path: std::path::PathBuf::from("/bin/app"),
                 relative_address: 0x10,
+                kernel_mapping_range: None,
                 build_id: None,
                 file_identity: None,
                 kernel_relocation: None,
@@ -3463,6 +3714,7 @@ fn prefetches_unique_symbol_requests_before_folding() {
             SymbolRequest {
                 path: std::path::PathBuf::from("/bin/app"),
                 relative_address: 0x20,
+                kernel_mapping_range: None,
                 build_id: None,
                 file_identity: None,
                 kernel_relocation: None,
@@ -3587,10 +3839,10 @@ fn perfdata_with_records_attrs_and_build_id_feature<const A: usize, const R: usi
     bytes
 }
 
-/// Builds a perf.data carrying a single HEADER_ARCH feature string (the
+/// Builds a perf.data carrying a single `HEADER_ARCH` feature string (the
 /// recording machine's `uname -m`). perf stores it as a `perf_header_string`:
 /// a u32 length followed by that many NUL-terminated bytes (util/header.c
-/// write_arch/do_write_string).
+/// `write_arch/do_write_string`).
 fn perfdata_with_records_attrs_and_arch_feature<const A: usize, const R: usize>(
     attrs: [[u8; 144]; A],
     records: [Vec<u8>; R],
@@ -4159,6 +4411,53 @@ impl SymbolResolver for InlineSymbolResolver {
     }
 }
 
+struct SampleIpInlineSymbolResolver;
+
+impl SymbolResolver for SampleIpInlineSymbolResolver {
+    fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
+        Ok(vec![None; requests.len()])
+    }
+
+    fn resolve_frame_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Vec<String>>, String> {
+        Ok(requests
+            .iter()
+            .map(|request| {
+                if request.path == std::path::Path::new("/bin/app")
+                    && request.relative_address == 0x10
+                {
+                    vec!["app::outer".to_string(), "app::inner".to_string()]
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect())
+    }
+
+    fn resolve_base_frame_batch_with_metadata(
+        &self,
+        requests: &[SymbolRequest],
+    ) -> Result<Vec<ResolvedSymbolFrames>, String> {
+        Ok(requests
+            .iter()
+            .map(|request| {
+                if request.path == std::path::Path::new("/bin/app")
+                    && request.relative_address == 0x10
+                {
+                    ResolvedSymbolFrames {
+                        frames: vec!["app::main".to_string()],
+                        has_base_symbol: true,
+                        has_inline_frames: false,
+                        has_non_inline_base_frame: true,
+                        base_offset: None,
+                    }
+                } else {
+                    ResolvedSymbolFrames::default()
+                }
+            })
+            .collect())
+    }
+}
+
 struct ArrowInlineSymbolResolver;
 
 struct SyntheticX86_64Object {
@@ -4167,10 +4466,10 @@ struct SyntheticX86_64Object {
 }
 
 impl SyntheticX86_64Object {
-    /// Minimal x86_64 ELF with one PT_LOAD covering [0, 0x10000) and no unwind
+    /// Minimal `x86_64` ELF with one `PT_LOAD` covering [0, 0x10000) and no unwind
     /// info. The current-IP-only tests previously mapped the host test binary,
     /// which made framehop's unwind host-dependent (a Mach-O/arm64 test binary
-    /// recovers callers through __unwind_info that a Linux x86_64 binary does
+    /// recovers callers through `__unwind_info` that a Linux `x86_64` binary does
     /// not have at these offsets). A synthetic ELF pins the libdw scenario the
     /// tests encode: module reports, framehop yields only the seeded IP.
     fn create() -> Self {
@@ -4242,8 +4541,11 @@ impl SyntheticX86_64Object {
         self.path.to_string_lossy().into_owned()
     }
 
-    fn file_name(&self) -> &'static str {
-        "fixture-x86-64"
+    fn file_name(&self) -> &str {
+        self.path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("fixture file name")
     }
 }
 
@@ -4322,8 +4624,11 @@ impl SyntheticAarch64Object {
         self.path.to_string_lossy().into_owned()
     }
 
-    fn file_name(&self) -> &'static str {
-        "fixture-aarch64"
+    fn file_name(&self) -> &str {
+        self.path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("fixture file name")
     }
 }
 

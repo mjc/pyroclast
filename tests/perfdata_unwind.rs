@@ -161,9 +161,42 @@ fn loaded_object_does_not_imply_unwind_info_for_every_address_like_perf_libdw() 
 }
 
 #[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn object_unwind_attempts_initial_plt_frame_without_cfi_like_perf_libdw() {
-    let current_exe = std::env::current_exe().expect("current exe");
-    let bytes = std::fs::read(&current_exe).expect("read object");
+    let root = tempfile::tempdir().expect("fixture directory");
+    let source = root.path().join("plt.c");
+    let binary = root.path().join("libplt.so");
+    std::fs::write(
+        &source,
+        "#include <stdio.h>\nint call_puts(void) { return puts(\"x\"); }\n",
+    )
+    .expect("write fixture source");
+    let output = std::process::Command::new("cc")
+        .args(["-g", "-O0", "-fPIC", "-shared"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .expect("compile PLT fixture");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = std::process::Command::new("objcopy")
+        .args([
+            "--remove-section=.eh_frame",
+            "--remove-section=.eh_frame_hdr",
+        ])
+        .arg(&binary)
+        .output()
+        .expect("remove fixture CFI");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bytes = std::fs::read(&binary).expect("read object");
     let object = object::File::parse(&bytes[..]).expect("parse object");
     let stub_section = object
         .sections()
@@ -184,7 +217,7 @@ fn object_unwind_attempts_initial_plt_frame_without_cfi_like_perf_libdw() {
 
     assert!(
         unwinder
-            .add_object_mapping(&current_exe, base, 0x1000_0000, 0)
+            .add_object_mapping(&binary, base, 0x1000_0000, 0)
             .expect("load object mapping")
     );
     assert!(unwinder.has_reported_module_for_ip(ip));

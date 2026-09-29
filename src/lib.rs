@@ -382,7 +382,7 @@ where
         PlumbingCommand::Fold(command) => {
             let options = FoldOptions {
                 count_periods: command.count_periods,
-                inline: command.inline,
+                inline: command.inline_frames.enabled(),
             };
             let stdout = fold_perfdata_for_cli(
                 &command.input,
@@ -400,7 +400,7 @@ where
             let stdout = perf_script_for_cli(
                 &command.input,
                 command.symbols,
-                command.inline,
+                command.inline_frames.enabled(),
                 command.symbolizer,
                 runner,
             )?;
@@ -410,6 +410,7 @@ where
             })
         }
         PlumbingCommand::Flamegraph(command) => {
+            let inline = command.inline_frames.enabled();
             let output = command
                 .output
                 .unwrap_or_else(|| std::path::PathBuf::from("flamegraph.svg"));
@@ -417,7 +418,7 @@ where
                 &command.input,
                 FoldOptions {
                     count_periods: true,
-                    inline: command.inline,
+                    inline,
                 },
                 command.symbols,
                 command.symbolizer,

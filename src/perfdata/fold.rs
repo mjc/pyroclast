@@ -25,14 +25,15 @@ use crate::perfdata::mappings::{
 use crate::perfdata::raw_stack::{RawStackAccumulator, RawStackEntryRef};
 use crate::perfdata::records::{
     PERF_RECORD_FINISHED_ROUND, PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_CPUMODE_KERNEL,
-    PERF_RECORD_MISC_CPUMODE_MASK, PERF_RECORD_MISC_FORK_EXEC, PERF_RECORD_MISC_MMAP_BUILD_ID,
-    ParsedRecord, PerfRecord, PerfRecordHeader, iter_records, parse_aux_output_hw_id_record,
-    parse_aux_record, parse_bpf_event_record, parse_callchain_deferred_record, parse_cgroup_record,
-    parse_comm_record, parse_exit_record, parse_fork_record, parse_itrace_start_record,
-    parse_ksymbol_record, parse_lost_record, parse_lost_samples_record, parse_mmap_record,
-    parse_mmap2_build_id_record, parse_mmap2_record, parse_namespaces_record, parse_read_record,
-    parse_record, parse_record_header, parse_switch_cpu_wide_record, parse_switch_record,
-    parse_text_poke_record, parse_throttle_record, parse_unthrottle_record,
+    PERF_RECORD_MISC_CPUMODE_MASK, PERF_RECORD_MISC_CPUMODE_USER, PERF_RECORD_MISC_FORK_EXEC,
+    PERF_RECORD_MISC_MMAP_BUILD_ID, ParsedRecord, PerfRecord, PerfRecordHeader, iter_records,
+    parse_aux_output_hw_id_record, parse_aux_record, parse_bpf_event_record,
+    parse_callchain_deferred_record, parse_cgroup_record, parse_comm_record, parse_exit_record,
+    parse_fork_record, parse_itrace_start_record, parse_ksymbol_record, parse_lost_record,
+    parse_lost_samples_record, parse_mmap_record, parse_mmap2_build_id_record, parse_mmap2_record,
+    parse_namespaces_record, parse_read_record, parse_record, parse_record_header,
+    parse_switch_cpu_wide_record, parse_switch_record, parse_text_poke_record,
+    parse_throttle_record, parse_unthrottle_record,
 };
 use crate::perfdata::samples::{
     PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_ID,
@@ -45,13 +46,18 @@ use crate::perfdata::unwind::{
     unwind_aarch64_frame_pointer_stack_like_elfutils,
     unwind_x86_64_frame_pointer_stack_like_elfutils,
 };
-use crate::symbols::{SymbolFrameCache, SymbolRequest, SymbolResolver, perf_build_id_elf_path};
+use crate::symbols::{
+    SymbolFrameCache, SymbolRequest, SymbolResolver, perf_build_id_elf_path_for_dso,
+};
 
 const UNKNOWN_FRAME: &str = "[unknown]";
 const PREFETCH_SYMBOL_REQUEST_BATCH_SIZE: usize = 4096;
 const FOLD_COUNT_STORAGE_LINEAR_GROWTH_THRESHOLD: usize = 64 * 1024 * 1024;
 const FOLD_COUNT_STORAGE_LINEAR_GROWTH_CHUNK: usize = 8 * 1024 * 1024;
 const PROT_EXEC: u32 = 4;
+const PERF_CONTEXT_KERNEL: u64 = 0xffff_ffff_ffff_ff80;
+const PERF_CONTEXT_USER: u64 = 0xffff_ffff_ffff_fe00;
+const PERF_CONTEXT_USER_DEFERRED: u64 = 0xffff_ffff_ffff_fd80;
 type FoldFrameRenderCache = HashMap<String, String, FxBuildHasher>;
 type FoldFrameStack = SmallVec<[FoldFrame; 16]>;
 
@@ -75,7 +81,7 @@ enum FoldHashBucket {
     Many(Vec<usize>),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PerfSummary {
     pub total_records: usize,
     pub record_counts: BTreeMap<u32, usize>,
@@ -117,11 +123,11 @@ struct FoldAccumulator {
     unwind_states: HashMap<u32, PidUnwindState, FxBuildHasher>,
     header_build_ids: BTreeMap<String, Vec<u8>>,
     raw_stacks: RawStackAccumulator<FoldFrame>,
-    deferred_samples: BTreeMap<u64, Vec<DeferredFoldSample>>,
+    deferred_samples: Vec<DeferredFoldSample>,
     sample_frames: FoldFrameStack,
     unwind_debug_dir: Option<PathBuf>,
-    /// Architecture of the recording machine (HEADER_ARCH), used to decode
-    /// REGS_USER samples and construct per-pid unwinders. Defaults to x86_64
+    /// Architecture of the recording machine (`HEADER_ARCH`), used to decode
+    /// `REGS_USER` samples and construct per-pid unwinders. Defaults to `x86_64`
     /// when the feature is absent.
     arch: PerfArch,
 }
@@ -130,14 +136,14 @@ struct PidUnwindState {
     object_unwinder: FramehopUnwinder,
     attempted_unwind_mappings: BTreeSet<UnwindMappingKey>,
     loaded_unwind_modules: BTreeSet<UnwindModuleKey>,
-    /// Memo of the ip-intrinsic leaf-only eligibility per sampled IP (gap-pkh
-    /// skip-gate cache). Only the `(pid, ip)`-STABLE facts are cached here —
-    /// whether the module covering `ip` is reported and whether any CFI covers
-    /// `ip`. The per-sample register condition (`bp < sp` / `lr == 0`) and the
-    /// sample's callchain state are combined fresh at query time, since both
-    /// vary across samples at the same IP. The whole `PidUnwindState` (and thus
-    /// this memo) is dropped when the pid's mappings change or the pid forks
-    /// (see `invalidate_pid_unwinder_if_mapping_overlaps_like_perf` /
+    /// Memo of the ip-intrinsic leaf-only eligibility per sampled IP. Only the
+    /// `(pid, ip)`-stable facts are cached here: whether the module covering
+    /// `ip` is reported and whether any CFI covers `ip`. The per-sample register
+    /// condition (`bp < sp` on `x86_64` / `lr == 0` on aarch64) and the sample's
+    /// callchain state are combined fresh at query time, since both vary across
+    /// samples at the same IP. The whole `PidUnwindState` (and thus this memo) is
+    /// dropped when the pid's mappings change or the pid forks (see
+    /// `invalidate_pid_unwinder_if_mapping_overlaps_like_perf` /
     /// `apply_fork_record`), which is exactly when reported-module / CFI facts
     /// could change.
     leaf_only_eligibility: HashMap<u64, LeafOnlyEligibility, FxBuildHasher>,
@@ -154,19 +160,17 @@ impl PidUnwindState {
     }
 }
 
-/// The `(pid, ip)`-stable half of the gap-5gr / gap-pkh leaf-only decision.
+/// The `(pid, ip)`-stable half of the libdw leaf-only decision.
 ///
 /// `Eligible` means: the module covering the sampled IP is reported into the
-/// unwinder AND no CFI (.eh_frame/.debug_frame FDE) covers the IP. Per
-/// elfutils `libdwfl/frame_unwind.c`, with no FDE row `handle_cfi` cannot
-/// allocate an unwound frame, so `__libdwfl_frame_unwind` falls through to the
-/// `ebl_unwind` arch fallback; if that fallback also cannot advance (the
-/// per-sample register condition) libdwfl fires the initial-frame callback
-/// exactly once and stops — the scenario-D single leaf. `Ineligible` means CFI
-/// covers the IP (so we cannot tell a priori whether `handle_cfi` yields
-/// PC_UNDEFINED end-of-stack or a real PC_SET caller — see
-/// `backends/.../handle_cfi`'s return-register branch — and MUST run framehop)
-/// or the IP's module is not reported (scenario B, handled upstream).
+/// unwinder AND no CFI (`.eh_frame`/`.debug_frame` FDE) covers the IP. In elfutils
+/// `libdwfl/dwfl_frame.c`, `dwfl_thread_getframes()` invokes the frame callback
+/// once for the seeded IP before `__libdwfl_frame_unwind()` tries to advance.
+/// With no FDE row, advancement depends on the arch `ebl_unwind` fallback; if
+/// that fallback also cannot advance, libdwfl stops after the seeded leaf.
+/// `Ineligible` means CFI covers the IP, so framehop must run to determine
+/// whether there is a caller, or the IP's module is not reported, which perf
+/// handles before calling `dwfl_getthread_frames()`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LeafOnlyEligibility {
     Eligible,
@@ -174,14 +178,12 @@ enum LeafOnlyEligibility {
 }
 
 /// Outcome of classifying a sample's object unwind before running framehop.
-///
-/// Gap-pkh skip gate: `SkipUnwind` and `LeafOnly` both avoid invoking framehop.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ObjectUnwindClass {
-    /// perf/libdw would emit zero unwound frames (research §3 skip classes).
+    /// perf/libdw would emit zero unwound frames.
     SkipUnwind,
     /// perf/libdw fires the initial-frame callback exactly once and stops
-    /// (scenario D): emit the single sampled-IP leaf, skip framehop.
+    /// after the arch fallback cannot advance: emit the sampled-IP leaf.
     LeafOnly,
     /// Could be 1-or-N frames; framehop must run.
     MustUnwind,
@@ -200,29 +202,25 @@ struct TimedRecord {
 
 enum FoldRecord<'a> {
     Comm(crate::perfdata::records::CommRecord),
-    Mmap(crate::perfdata::records::MmapRecord),
-    Mmap2(crate::perfdata::records::Mmap2Record),
-    Mmap2BuildId(crate::perfdata::records::Mmap2BuildIdRecord),
+    Mmap {
+        misc: u16,
+        record: crate::perfdata::records::MmapRecord,
+    },
+    Mmap2 {
+        misc: u16,
+        record: crate::perfdata::records::Mmap2Record,
+    },
+    Mmap2BuildId {
+        misc: u16,
+        record: crate::perfdata::records::Mmap2BuildIdRecord,
+    },
     Fork(crate::perfdata::records::ForkRecord),
-    Exit(crate::perfdata::records::ExitRecord),
-    Lost(crate::perfdata::records::LostRecord),
-    LostSamples(crate::perfdata::records::LostSamplesRecord),
-    Throttle(crate::perfdata::records::ThrottleRecord),
-    Unthrottle(crate::perfdata::records::UnthrottleRecord),
-    Read(crate::perfdata::records::ReadRecord),
-    Sample { misc: u16, payload: &'a [u8] },
-    Aux(crate::perfdata::records::AuxRecord),
-    ItraceStart(crate::perfdata::records::ItraceStartRecord),
-    Switch(crate::perfdata::records::SwitchRecord),
-    SwitchCpuWide(crate::perfdata::records::SwitchCpuWideRecord),
-    Namespaces(crate::perfdata::records::NamespacesRecord),
-    Ksymbol(crate::perfdata::records::KsymbolRecord),
-    BpfEvent(crate::perfdata::records::BpfEventRecord),
-    Cgroup(crate::perfdata::records::CgroupRecord),
-    TextPoke(crate::perfdata::records::TextPokeRecord),
-    AuxOutputHwId(crate::perfdata::records::AuxOutputHwIdRecord),
+    Sample {
+        misc: u16,
+        payload: &'a [u8],
+    },
     CallchainDeferred(crate::perfdata::records::CallchainDeferredRecord),
-    Unsupported { record_type: u32 },
+    Ignored,
 }
 
 struct PendingFoldRecord<'a> {
@@ -239,6 +237,7 @@ struct OrderedRecordQueue<'a> {
 }
 
 struct DeferredFoldSample {
+    cookie: u64,
     pid: Option<u32>,
     tid: Option<u32>,
     time: Option<u64>,
@@ -275,6 +274,8 @@ struct UnwindMappingRequest<'a> {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum FoldFrame {
     Callchain(u64),
+    UserCallchain(u64),
+    SampleIp { address: u64, cpumode: u16 },
     UserUnwind(u64),
     InlineCurrentIp(u64),
 }
@@ -335,6 +336,8 @@ impl FoldFrame {
     fn address(self) -> u64 {
         match self {
             Self::Callchain(address)
+            | Self::UserCallchain(address)
+            | Self::SampleIp { address, .. }
             | Self::UserUnwind(address)
             | Self::InlineCurrentIp(address) => address,
         }
@@ -476,17 +479,7 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
     let header = parse_header(bytes)?;
     let sample_layouts = sample_layouts(bytes, header)?;
     let records = iter_records(bytes, header)?;
-    let mut summary = PerfSummary {
-        total_records: 0,
-        record_counts: BTreeMap::new(),
-        comms: Vec::new(),
-        comms_by_pid: BTreeMap::new(),
-        comms_by_tid: BTreeMap::new(),
-        mmaps: Vec::new(),
-        lost_records: 0,
-        mmap_table: MmapTable::default(),
-        sample_stacks: Vec::new(),
-    };
+    let mut summary = PerfSummary::default();
 
     for record in records {
         summary.total_records += 1;
@@ -533,9 +526,11 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
                 summary.mmap_table.insert_mmap2(record);
                 Ok(())
             }
-            ParsedRecord::Mmap2BuildId(record) => {
+            ParsedRecord::Mmap2BuildId { misc, record } => {
                 summary.mmaps.push(record.path.clone());
-                summary.mmap_table.insert_mmap2_build_id(record);
+                summary
+                    .mmap_table
+                    .insert_mmap2_build_id_with_misc(record, misc);
                 Ok(())
             }
             ParsedRecord::Fork(record) => {
@@ -729,11 +724,12 @@ fn parse_record_with_context(record: PerfRecord<'_>) -> Result<ParsedRecord, Str
 
 fn parse_fold_record(record: PerfRecord<'_>) -> Result<FoldRecord<'_>, String> {
     let parsed = match record.header.record_type {
-        crate::perfdata::records::PERF_RECORD_MMAP => {
-            FoldRecord::Mmap(parse_mmap_record(record.payload)?)
-        }
+        crate::perfdata::records::PERF_RECORD_MMAP => FoldRecord::Mmap {
+            misc: record.header.misc,
+            record: parse_mmap_record(record.payload)?,
+        },
         crate::perfdata::records::PERF_RECORD_LOST => {
-            FoldRecord::Lost(parse_lost_record(record.payload)?)
+            parse_lost_record(record.payload).map(|_| FoldRecord::Ignored)?
         }
         crate::perfdata::records::PERF_RECORD_COMM => {
             let mut comm = parse_comm_record(record.payload)?;
@@ -741,24 +737,32 @@ fn parse_fold_record(record: PerfRecord<'_>) -> Result<FoldRecord<'_>, String> {
             FoldRecord::Comm(comm)
         }
         crate::perfdata::records::PERF_RECORD_THROTTLE => {
-            FoldRecord::Throttle(parse_throttle_record(record.payload)?)
+            parse_throttle_record(record.payload)?;
+            FoldRecord::Ignored
         }
         crate::perfdata::records::PERF_RECORD_UNTHROTTLE => {
-            FoldRecord::Unthrottle(parse_unthrottle_record(record.payload)?)
+            parse_unthrottle_record(record.payload)?;
+            FoldRecord::Ignored
         }
         crate::perfdata::records::PERF_RECORD_MMAP2
             if record.header.misc & PERF_RECORD_MISC_MMAP_BUILD_ID != 0 =>
         {
-            FoldRecord::Mmap2BuildId(parse_mmap2_build_id_record(record.payload)?)
+            FoldRecord::Mmap2BuildId {
+                misc: record.header.misc,
+                record: parse_mmap2_build_id_record(record.payload)?,
+            }
         }
-        crate::perfdata::records::PERF_RECORD_MMAP2 => {
-            FoldRecord::Mmap2(parse_mmap2_record(record.payload)?)
-        }
+        crate::perfdata::records::PERF_RECORD_MMAP2 => FoldRecord::Mmap2 {
+            misc: record.header.misc,
+            record: parse_mmap2_record(record.payload)?,
+        },
         crate::perfdata::records::PERF_RECORD_LOST_SAMPLES => {
-            FoldRecord::LostSamples(parse_lost_samples_record(record.payload)?)
+            parse_lost_samples_record(record.payload)?;
+            FoldRecord::Ignored
         }
         crate::perfdata::records::PERF_RECORD_EXIT => {
-            FoldRecord::Exit(parse_exit_record(record.payload)?)
+            parse_exit_record(record.payload)?;
+            FoldRecord::Ignored
         }
         crate::perfdata::records::PERF_RECORD_FORK => FoldRecord::Fork({
             let mut fork = parse_fork_record(record.payload)?;
@@ -766,52 +770,64 @@ fn parse_fold_record(record: PerfRecord<'_>) -> Result<FoldRecord<'_>, String> {
             fork
         }),
         crate::perfdata::records::PERF_RECORD_READ => {
-            FoldRecord::Read(parse_read_record(record.payload)?)
+            parse_read_record(record.payload)?;
+            FoldRecord::Ignored
         }
         crate::perfdata::records::PERF_RECORD_SAMPLE => FoldRecord::Sample {
             misc: record.header.misc,
             payload: record.payload,
         },
         crate::perfdata::records::PERF_RECORD_AUX => {
-            FoldRecord::Aux(parse_aux_record(record.payload)?)
+            parse_aux_record(record.payload)?;
+            FoldRecord::Ignored
         }
         crate::perfdata::records::PERF_RECORD_ITRACE_START => {
-            FoldRecord::ItraceStart(parse_itrace_start_record(record.payload)?)
+            parse_itrace_start_record(record.payload)?;
+            FoldRecord::Ignored
         }
         crate::perfdata::records::PERF_RECORD_SWITCH => {
-            FoldRecord::Switch(parse_switch_record(record.payload)?)
+            parse_switch_record(record.payload)?;
+            FoldRecord::Ignored
         }
         crate::perfdata::records::PERF_RECORD_SWITCH_CPU_WIDE => {
-            FoldRecord::SwitchCpuWide(parse_switch_cpu_wide_record(record.payload)?)
+            parse_switch_cpu_wide_record(record.payload)?;
+            FoldRecord::Ignored
         }
         crate::perfdata::records::PERF_RECORD_NAMESPACES => {
-            FoldRecord::Namespaces(parse_namespaces_record(record.payload)?)
+            parse_namespaces_record(record.payload)?;
+            FoldRecord::Ignored
         }
         crate::perfdata::records::PERF_RECORD_KSYMBOL => {
-            FoldRecord::Ksymbol(parse_ksymbol_record(record.payload)?)
+            parse_ksymbol_record(record.payload)?;
+            FoldRecord::Ignored
         }
         crate::perfdata::records::PERF_RECORD_BPF_EVENT => {
-            FoldRecord::BpfEvent(parse_bpf_event_record(record.payload)?)
+            parse_bpf_event_record(record.payload)?;
+            FoldRecord::Ignored
         }
         crate::perfdata::records::PERF_RECORD_CGROUP => {
-            FoldRecord::Cgroup(parse_cgroup_record(record.payload)?)
+            parse_cgroup_record(record.payload)?;
+            FoldRecord::Ignored
         }
         crate::perfdata::records::PERF_RECORD_TEXT_POKE => {
-            FoldRecord::TextPoke(parse_text_poke_record(record.payload)?)
+            parse_text_poke_record(record.payload)?;
+            FoldRecord::Ignored
         }
         crate::perfdata::records::PERF_RECORD_AUX_OUTPUT_HW_ID => {
-            FoldRecord::AuxOutputHwId(parse_aux_output_hw_id_record(record.payload)?)
+            parse_aux_output_hw_id_record(record.payload)?;
+            FoldRecord::Ignored
         }
         crate::perfdata::records::PERF_RECORD_CALLCHAIN_DEFERRED => {
             FoldRecord::CallchainDeferred(parse_callchain_deferred_record(record.payload)?)
         }
-        record_type => FoldRecord::Unsupported { record_type },
+        _ => FoldRecord::Ignored,
     };
     Ok(parsed)
 }
 
 fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData, String> {
     let header = parse_header(bytes)?;
+    ensure_perfdata_has_event_data(header)?;
     let sample_layouts = sample_layouts(bytes, header)?;
     let header_build_ids = header_build_ids_by_filename(bytes)?;
     let arch = perf_arch_from_header(parse_header_arch(bytes, &header)?.as_deref());
@@ -865,6 +881,7 @@ where
     W: IoWrite + ?Sized,
 {
     let (header, header_bytes) = perfdata_header_from_file(file)?;
+    ensure_perfdata_has_event_data(header)?;
     let sample_layouts = sample_layouts_from_file(file, header, &header_bytes)?;
     let header_build_ids = header_build_ids_by_filename_from_file(file, header, &header_bytes)?;
     let arch =
@@ -916,6 +933,7 @@ where
     W: IoWrite + ?Sized,
 {
     let (header, header_bytes) = perfdata_header_from_file(file)?;
+    ensure_perfdata_has_event_data(header)?;
     let sample_layouts = sample_layouts_from_file(file, header, &header_bytes)?;
     let header_build_ids = header_build_ids_by_filename_from_file(file, header, &header_bytes)?;
     let arch =
@@ -1021,20 +1039,17 @@ where
             return Ok(());
         };
         if let Some(cookie) = sample.deferred_cookie {
-            self.accumulator
-                .deferred_samples
-                .entry(cookie)
-                .or_default()
-                .push(DeferredFoldSample {
-                    pid: sample.pid,
-                    tid: sample.tid,
-                    time: sample.time,
-                    cpu: sample.cpu,
-                    event_name: sample.event_name,
-                    count: sample.count,
-                    frames: sample.frames,
-                    has_callchain: sample.has_callchain,
-                });
+            self.accumulator.deferred_samples.push(DeferredFoldSample {
+                cookie,
+                pid: sample.pid,
+                tid: sample.tid,
+                time: sample.time,
+                cpu: sample.cpu,
+                event_name: sample.event_name,
+                count: sample.count,
+                frames: sample.frames,
+                has_callchain: sample.has_callchain,
+            });
             return Ok(());
         }
         self.write_sample_event(&sample)
@@ -1160,9 +1175,12 @@ where
             write!(self.writer, "{secs:>5}.{usecs:06}: ")
                 .map_err(|error| format!("failed to write perf script output: {error}"))?;
         }
+        // builtin-script.c writes the event-name colon/trailing space, then
+        // fputc(' ', fp) before sample__fprintf_sym() when no callchain cursor
+        // is present, so the inline event-line IP starts after two spaces.
         write!(
             self.writer,
-            "{:>10} {:>width$}: ",
+            "{:>10} {:>width$}:  ",
             sample.count,
             sample.event_name.as_ref(),
             width = self.event_name_width,
@@ -1301,6 +1319,18 @@ fn perfdata_header_from_file(file: &File) -> Result<(PerfHeader, [u8; 104]), Str
     Ok((header, bytes))
 }
 
+fn ensure_perfdata_has_event_data(header: PerfHeader) -> Result<(), String> {
+    if header.data_size == 0 {
+        // tools/perf/util/header.c warns that data.size==0 means perf record
+        // likely did not terminate cleanly, and tools/perf/util/session.c
+        // reader__process_events() returns before processing events.
+        return Err(
+            "perf.data data size field is 0; was perf record properly terminated?".to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn map_perfdata_file(file: &File) -> Result<Mmap, String> {
     unsafe { MmapOptions::new().map(file) }
         .map_err(|error| format!("failed to memory-map perf.data: {error}"))
@@ -1402,16 +1432,16 @@ fn build_id_events_from_file(
 // HEADER_ARCH feature bit (tools/perf/util/header.h enum HEADER_*).
 const HEADER_ARCH_FEATURE: u16 = 6;
 
-/// Maps a HEADER_ARCH string to the unwinder architecture, defaulting to
-/// x86_64 when the feature is absent or unrecognized. perf records the
+/// Maps a `HEADER_ARCH` string to the unwinder architecture, defaulting to
+/// `x86_64` when the feature is absent or unrecognized. perf records the
 /// recording machine's `uname -m`, so an unknown value (an arch pyroclast does
-/// not unwind) falls back to the x86_64 path rather than failing the fold.
+/// not unwind) falls back to the `x86_64` path rather than failing the fold.
 fn perf_arch_from_header(arch: Option<&str>) -> PerfArch {
     arch.and_then(PerfArch::from_header_arch)
         .unwrap_or_default()
 }
 
-/// Reads the HEADER_ARCH feature string from a perf.data `File`.
+/// Reads the `HEADER_ARCH` feature string from a perf.data `File`.
 ///
 /// The feature table and payload live after the data section, so this reads
 /// them from the file the way `build_id_events_from_file` does, then parses the
@@ -1580,7 +1610,7 @@ impl FoldAccumulator {
             unwind_states: HashMap::with_hasher(FxBuildHasher),
             header_build_ids,
             raw_stacks: RawStackAccumulator::<FoldFrame>::new(),
-            deferred_samples: BTreeMap::new(),
+            deferred_samples: Vec::new(),
             sample_frames: FoldFrameStack::new(),
             unwind_debug_dir: current_perf_debug_dir(),
             arch: PerfArch::default(),
@@ -1592,6 +1622,7 @@ impl FoldAccumulator {
         self
     }
 
+    #[cfg(test)]
     fn apply_record(
         &mut self,
         record: ParsedRecord,
@@ -1604,7 +1635,7 @@ impl FoldAccumulator {
                     &mut self.process_comms,
                     &mut self.exec_process_comms,
                     &mut self.thread_comms,
-                    record,
+                    &record,
                 );
                 Ok(())
             }
@@ -1642,13 +1673,14 @@ impl FoldAccumulator {
                 self.mapping_cache = MappingResolveCache::default();
                 Ok(())
             }
-            ParsedRecord::Mmap2BuildId(record) => {
+            ParsedRecord::Mmap2BuildId { misc, record } => {
                 self.invalidate_pid_unwinder_if_mapping_overlaps_like_perf(
                     record.pid,
                     record.start,
                     record.len,
                 );
-                self.mmap_table.insert_mmap2_build_id(record);
+                self.mmap_table
+                    .insert_mmap2_build_id_with_misc(record, misc);
                 self.mapping_cache = MappingResolveCache::default();
                 Ok(())
             }
@@ -1783,6 +1815,12 @@ fn record_time(
     record: PerfRecord<'_>,
     sample_layouts: &SampleLayouts,
 ) -> Result<Option<u64>, String> {
+    if record.header.record_type >= crate::perfdata::records::PERF_RECORD_USER_TYPE_START {
+        // tools/perf/util/session.c perf_session__process_event() dispatches
+        // PERF_RECORD_USER_TYPE_START records before ordered-events, so their
+        // payload tails must not be interpreted as sample_id timestamps.
+        return Ok(None);
+    }
     if record.header.record_type == crate::perfdata::records::PERF_RECORD_SAMPLE {
         return sample_layouts
             .layout_for_payload(record.payload)?
@@ -1870,7 +1908,7 @@ fn update_comm_tables(
     process_comms: &mut BTreeMap<u32, String>,
     exec_process_comms: &mut BTreeMap<u32, String>,
     thread_comms: &mut BTreeMap<u32, String>,
-    record: crate::perfdata::records::CommRecord,
+    record: &crate::perfdata::records::CommRecord,
 ) {
     let comm = record.comm.as_ref();
     if record.is_exec {
@@ -1908,17 +1946,17 @@ impl FoldAccumulator {
                     &mut self.process_comms,
                     &mut self.exec_process_comms,
                     &mut self.thread_comms,
-                    record,
+                    &record,
                 );
                 Ok(())
             }
-            FoldRecord::Mmap(record) => {
+            FoldRecord::Mmap { misc, record } => {
                 self.invalidate_pid_unwinder_if_mapping_overlaps_like_perf(
                     record.pid,
                     record.start,
                     record.len,
                 );
-                self.mmap_table.insert_mmap(record);
+                self.mmap_table.insert_mmap_with_misc(record, misc);
                 self.mapping_cache = MappingResolveCache::default();
                 Ok(())
             }
@@ -1930,7 +1968,7 @@ impl FoldAccumulator {
                 self.add_deferred_callchain(record.cookie, tid, &record.ips);
                 Ok(())
             }
-            FoldRecord::Mmap2(record) => {
+            FoldRecord::Mmap2 { misc, record } => {
                 self.invalidate_pid_unwinder_if_mapping_overlaps_like_perf(
                     record.pid,
                     record.start,
@@ -1938,21 +1976,25 @@ impl FoldAccumulator {
                 );
                 let build_id = self.header_build_ids.get(&record.path).cloned();
                 if let Some(build_id) = build_id {
-                    self.mmap_table
-                        .insert_mmap2_with_build_id(record, Some(build_id));
+                    self.mmap_table.insert_mmap2_with_build_id_and_misc(
+                        record,
+                        Some(build_id),
+                        misc,
+                    );
                 } else {
-                    self.mmap_table.insert_mmap2(record);
+                    self.mmap_table.insert_mmap2_with_misc(record, misc);
                 }
                 self.mapping_cache = MappingResolveCache::default();
                 Ok(())
             }
-            FoldRecord::Mmap2BuildId(record) => {
+            FoldRecord::Mmap2BuildId { misc, record } => {
                 self.invalidate_pid_unwinder_if_mapping_overlaps_like_perf(
                     record.pid,
                     record.start,
                     record.len,
                 );
-                self.mmap_table.insert_mmap2_build_id(record);
+                self.mmap_table
+                    .insert_mmap2_build_id_with_misc(record, misc);
                 self.mapping_cache = MappingResolveCache::default();
                 Ok(())
             }
@@ -1960,23 +2002,7 @@ impl FoldAccumulator {
                 self.apply_fork_record(record);
                 Ok(())
             }
-            FoldRecord::Exit(_)
-            | FoldRecord::Lost(_)
-            | FoldRecord::LostSamples(_)
-            | FoldRecord::Throttle(_)
-            | FoldRecord::Unthrottle(_)
-            | FoldRecord::Read(_)
-            | FoldRecord::Aux(_)
-            | FoldRecord::ItraceStart(_)
-            | FoldRecord::Switch(_)
-            | FoldRecord::SwitchCpuWide(_)
-            | FoldRecord::Namespaces(_)
-            | FoldRecord::Ksymbol(_)
-            | FoldRecord::BpfEvent(_)
-            | FoldRecord::Cgroup(_)
-            | FoldRecord::TextPoke(_)
-            | FoldRecord::AuxOutputHwId(_)
-            | FoldRecord::Unsupported { .. } => Ok(()),
+            FoldRecord::Ignored => Ok(()),
         }
     }
 }
@@ -2093,9 +2119,6 @@ impl FoldAccumulator {
 
     fn take_deferred_samples(&mut self) -> Vec<DeferredFoldSample> {
         std::mem::take(&mut self.deferred_samples)
-            .into_values()
-            .flatten()
-            .collect()
     }
 
     fn take_resolved_deferred_samples(
@@ -2104,23 +2127,22 @@ impl FoldAccumulator {
         tid: Option<u32>,
         ips: &[u64],
     ) -> Vec<DeferredFoldSample> {
-        let Some(samples) = self.deferred_samples.remove(&cookie) else {
-            return Vec::new();
-        };
-        let (matched, unmatched): (Vec<_>, Vec<_>) = samples
-            .into_iter()
-            .partition(|sample| tid.is_none() || tid == sample.tid);
-        if !unmatched.is_empty() {
-            self.deferred_samples.insert(cookie, unmatched);
-        }
-        let deferred_frames = ips.iter().copied().map(FoldFrame::Callchain);
-        matched
-            .into_iter()
-            .map(|mut sample| {
+        let samples = std::mem::take(&mut self.deferred_samples);
+        let deferred_frames = ips.iter().copied().map(FoldFrame::UserCallchain);
+        let mut matched = Vec::new();
+        let mut unmatched = Vec::new();
+        for mut sample in samples {
+            if tid != sample.tid {
+                unmatched.push(sample);
+                continue;
+            }
+            if sample.cookie == cookie {
                 sample.frames.extend(deferred_frames.clone());
-                sample
-            })
-            .collect()
+            }
+            matched.push(sample);
+        }
+        self.deferred_samples = unmatched;
+        matched
     }
 
     fn has_loaded_unwind_mapping_for_ip(&self, pid: Option<u32>, ip: u64) -> bool {
@@ -2330,7 +2352,7 @@ where
     writer
         .write_all(b" ")
         .map_err(|error| format!("failed to write folded output: {error}"))?;
-    write!(writer, "{count}\n").map_err(|error| format!("failed to write folded output: {error}"))
+    writeln!(writer, "{count}").map_err(|error| format!("failed to write folded output: {error}"))
 }
 
 struct SymbolPrefetchBatches<'a> {
@@ -2361,8 +2383,7 @@ fn extend_symbol_mappings_for_stack<'a>(
 ) {
     for frame in callchain {
         let address = frame.address();
-        if let Some(mapping) = pid
-            .and_then(|pid| mmap_table.resolve_ref_cached(pid, address, mapping_cache))
+        if let Some(mapping) = resolve_frame_mapping_ref(mmap_table, pid, *frame, mapping_cache)
             .filter(|mapping| !is_kernel_space_frame(address) || is_kernel_mapping_ref(mapping))
         {
             let key = PrefetchMappingKey {
@@ -2370,11 +2391,12 @@ fn extend_symbol_mappings_for_stack<'a>(
                 relative_address: mapping.relative_address,
             };
             // The base-only mode is retained for low-level renderer tests and
-            // specialized callers. The CLI parity path keeps inline on because
-            // perf's machine.c unwind_entry() runs append_inlines() on every
-            // accepted entry including the leaf, so InlineCurrentIp leaves
-            // prefetch the full DWARF inline chain too.
-            if !inline {
+            // specialized callers. The CLI parity path keeps inline on for
+            // recorded callchain entries because perf's machine.c unwind_entry()
+            // runs append_inlines() on accepted entries. No-callchain SampleIp
+            // frames are different: builtin-script.c process_event() prints the
+            // event-line IP with machine__resolve()/map__find_symbol().
+            if !inline || matches!(frame, FoldFrame::SampleIp { .. }) {
                 if batches.seen_base.insert(key) {
                     batches.base_mappings.push(mapping);
                 }
@@ -2395,6 +2417,30 @@ enum FrameMappingDecision<'a> {
     KernelAddress,
     Unknown,
     Address,
+}
+
+fn resolve_frame_mapping_ref<'a>(
+    mmap_table: &'a MmapTable,
+    pid: Option<u32>,
+    frame: FoldFrame,
+    mapping_cache: &mut MappingResolveCache,
+) -> Option<ResolvedMappingRef<'a>> {
+    let pid = pid?;
+    let address = frame.address();
+    match frame {
+        FoldFrame::Callchain(_) => mmap_table.resolve_ref_cached(pid, address, mapping_cache),
+        FoldFrame::SampleIp { cpumode, .. }
+            if cpumode & PERF_RECORD_MISC_CPUMODE_MASK == PERF_RECORD_MISC_CPUMODE_KERNEL =>
+        {
+            mmap_table.resolve_ref_cached(pid, address, mapping_cache)
+        }
+        FoldFrame::SampleIp { .. }
+        | FoldFrame::UserCallchain(_)
+        | FoldFrame::UserUnwind(_)
+        | FoldFrame::InlineCurrentIp(_) => {
+            mmap_table.resolve_user_pid_ref_cached(pid, address, mapping_cache)
+        }
+    }
 }
 
 #[derive(Default)]
@@ -2424,13 +2470,12 @@ impl<'a> FoldFrameResolver<'a> {
     fn mapping_decision(
         &self,
         pid: Option<u32>,
-        address: u64,
+        frame: FoldFrame,
         mapping_cache: &mut MappingResolveCache,
     ) -> FrameMappingDecision<'a> {
-        if let Some(mapping) = pid.and_then(|pid| {
-            self.mmap_table
-                .resolve_ref_cached(pid, address, mapping_cache)
-        }) {
+        let address = frame.address();
+        if let Some(mapping) = resolve_frame_mapping_ref(self.mmap_table, pid, frame, mapping_cache)
+        {
             if is_kernel_space_frame(address) && !is_kernel_mapping_ref(&mapping) {
                 FrameMappingDecision::KernelAddress
             } else {
@@ -2511,15 +2556,6 @@ impl<'a> FoldFrameResolver<'a> {
                         buffers,
                     )?;
                 }
-                continue;
-            }
-            if self.inline && matches!(frame, FoldFrame::UserUnwind(_)) {
-                self.append_inline_current_ip_with_inline_folded_frame(
-                    pid,
-                    frame.address(),
-                    symbol_cache.as_deref_mut(),
-                    buffers,
-                )?;
                 continue;
             }
             self.append_folded_frame_labels(pid, frame, symbol_cache.as_deref_mut(), buffers)?;
@@ -2611,7 +2647,7 @@ impl<'a> FoldFrameResolver<'a> {
             return Ok(());
         };
         let address = frame.address();
-        match self.mapping_decision(pid, address, &mut mapping_cache) {
+        match self.mapping_decision(pid, frame, &mut mapping_cache) {
             FrameMappingDecision::Mapped(mapping) => {
                 write_perf_script_inline_mapped_decision_frame(
                     writer,
@@ -2643,7 +2679,7 @@ impl<'a> FoldFrameResolver<'a> {
         W: IoWrite + ?Sized,
     {
         let address = frame.address();
-        match self.mapping_decision(pid, address, mapping_cache) {
+        match self.mapping_decision(pid, frame, mapping_cache) {
             FrameMappingDecision::Mapped(mapping) => {
                 write_perf_script_mapped_decision_frame(
                     writer,
@@ -2695,7 +2731,7 @@ impl<'a> FoldFrameResolver<'a> {
         let dso_path = pid
             .and_then(|pid| {
                 self.mmap_table
-                    .resolve_ref_cached(pid, address, mapping_cache)
+                    .resolve_user_pid_ref_cached(pid, address, mapping_cache)
             })
             .map(|mapping| mapping.path.to_string());
         if let Some(frames) =
@@ -2741,12 +2777,12 @@ impl<'a> FoldFrameResolver<'a> {
         };
         let Some(mapping) = pid.and_then(|pid| {
             self.mmap_table
-                .resolve_ref_cached(pid, address, &mut buffers.mapping_cache)
+                .resolve_user_pid_ref_cached(pid, address, &mut buffers.mapping_cache)
         }) else {
             self.append_inline_current_ip_fallback_folded_frame(pid, address, buffers);
             return Ok(());
         };
-        let (frames, _) = cache.resolve_mapping_ref_with_offset(&mapping)?;
+        let (frames, _, _, _) = cache.resolve_mapping_ref_with_offset(&mapping)?;
         if frames.is_empty() {
             let fallback = symbol_fallback_frame_ref(&mapping);
             append_cached_inferno_perf_folded_label_to_buffers(buffers, &fallback);
@@ -2800,7 +2836,7 @@ impl<'a> FoldFrameResolver<'a> {
     {
         let Some(mapping) = pid.and_then(|pid| {
             self.mmap_table
-                .resolve_ref_cached(pid, address, mapping_cache)
+                .resolve_user_pid_ref_cached(pid, address, mapping_cache)
         }) else {
             return Ok(None);
         };
@@ -2816,7 +2852,11 @@ impl<'a> FoldFrameResolver<'a> {
         address: u64,
         buffers: &mut FoldedRenderBuffers,
     ) {
-        match self.mapping_decision(pid, address, &mut buffers.mapping_cache) {
+        match self.mapping_decision(
+            pid,
+            FoldFrame::InlineCurrentIp(address),
+            &mut buffers.mapping_cache,
+        ) {
             FrameMappingDecision::Mapped(mapping) => {
                 let fallback = symbol_fallback_frame_ref(&mapping);
                 append_cached_inferno_perf_folded_label_to_buffers(buffers, &fallback);
@@ -2850,7 +2890,10 @@ impl<'a> FoldFrameResolver<'a> {
         ) {
             FrameMappingDecision::Mapped(mapping) => {
                 if let Some(cache) = symbol_cache {
-                    let rendered = if self.inline {
+                    // SampleIp is the no-callchain event-line IP. Even with
+                    // --inline, perf prints it through machine__resolve(), not
+                    // the callchain cursor's append_inlines() path.
+                    let rendered = if self.inline && !matches!(frame, FoldFrame::SampleIp { .. }) {
                         cache.resolve_folded_mapping_ref(&mapping)?
                     } else {
                         cache.resolve_base_folded_mapping_ref(&mapping)?
@@ -2884,7 +2927,7 @@ impl<'a> FoldFrameResolver<'a> {
         mapping_cache: &mut MappingResolveCache,
     ) -> FrameMappingDecision<'a> {
         let address = frame.address();
-        let decision = self.mapping_decision(pid, address, mapping_cache);
+        let decision = self.mapping_decision(pid, frame, mapping_cache);
         if !symbolizing
             && matches!(
                 frame,
@@ -3044,10 +3087,11 @@ where
             _ => write_perf_script_mapped_unknown_symbol_frame(writer, address, mapping.path),
         };
     }
-    let (frames, base_offset) = cache.resolve_mapping_ref_with_offset(mapping)?;
+    let (frames, base_offset, has_inline_frames, has_non_inline_base_frame) =
+        cache.resolve_mapping_ref_with_offset(mapping)?;
     if frames.is_empty() {
         write_perf_script_mapped_unknown_symbol_frame(writer, address, mapping.path)?;
-    } else if frames.len() == 1 && !is_kernel_space_frame(address) {
+    } else if frames.len() == 1 && !has_inline_frames && !is_kernel_space_frame(address) {
         // A single non-inline base frame already carries its +0x<off> baked in
         // by perf_frames_with_object_alias_and_offset (the symtab with_offset
         // form), so print it verbatim with the DSO path.
@@ -3055,7 +3099,8 @@ where
     } else {
         let last = frames.len() - 1;
         for (printed_index, label) in frames.iter().rev().enumerate() {
-            let is_inlined = printed_index != last;
+            let is_inlined = has_inline_frames
+                && (frames.len() == 1 || printed_index != last || !has_non_inline_base_frame);
             write_perf_script_inline_chain_frame(
                 writer,
                 address,
@@ -3074,8 +3119,10 @@ where
 /// Matches `tools/perf/util/evsel_fprintf.c`: the symbol name carries the
 /// shared `+0x<off>` offset (`__symbol__fprintf_symname_offs`), inline frames
 /// print ` (inlined)` instead of a DSO name (`print_dso && (!sym ||
-/// !sym->inlined)`), and the trailing non-inline base frame prints the mapped
-/// DSO path (`map__fprintf_dsoname_dsoff`).
+/// !sym->inlined)`). A trailing frame prints the mapped DSO path only when
+/// perf's `new_inline_sym()` reused the real base symbol; if libdw's
+/// `dwarf_diename()` differs from that base symbol, perf creates another fake
+/// inline symbol and prints ` (inlined)` for that row too.
 fn write_perf_script_inline_chain_frame<W>(
     writer: &mut W,
     address: u64,
@@ -3124,8 +3171,8 @@ where
     W: IoWrite + ?Sized,
 {
     if let Some(cache) = symbol_cache {
-        let frames = cache.resolve_mapping_ref(mapping)?;
-        if let Some(label) = frames.first() {
+        let frames = cache.resolve_mapping_ref_with_base_symbol(mapping)?;
+        if let Some([label, ..]) = frames {
             return write_perf_script_mapped_symbol_frame_fragment(
                 writer,
                 "",
@@ -3134,11 +3181,11 @@ where
                 mapping.path,
             );
         }
-        return write_perf_script_frame_for_label_fragment(
+        return write_perf_script_mapped_unknown_symbol_frame_fragment(
             writer,
             "",
             address,
-            &symbol_fallback_frame_ref(mapping),
+            mapping.path,
         );
     }
     write_perf_script_mapped_unknown_symbol_frame_fragment(writer, "", address, mapping.path)
@@ -3298,8 +3345,8 @@ fn should_drop_perf_data_user_unwind_frame(
     };
     pid.is_some_and(|pid| {
         mmap_table
-            .mapping_path_cached(pid, address, mapping_cache)
-            .is_some_and(should_drop_user_unwind_mapping_path)
+            .resolve_user_pid_ref_cached(pid, address, mapping_cache)
+            .is_some_and(|mapping| should_drop_user_unwind_mapping_path(mapping.path))
     })
 }
 
@@ -3354,7 +3401,7 @@ fn is_kernel_mapping_ref(mapping: &ResolvedMappingRef<'_>) -> bool {
 /// The DSO name perf-script prints for a mapping. The core kernel map is
 /// recorded with a relocation reference suffix (e.g. `[kernel.kallsyms]_stext`),
 /// but perf names its dso `[kernel.kallsyms]` (`machine__create_kernel_maps`
-/// sets the kernel dso short name), so map__fprintf_dsoname prints that.
+/// sets the kernel dso short name), so `map__fprintf_dsoname` prints that.
 fn perf_script_dso_name(path: &str) -> &str {
     if path.starts_with("[kernel.kallsyms]") {
         "[kernel.kallsyms]"
@@ -3421,20 +3468,17 @@ fn parse_sample_for_fold(
         return Ok(());
     };
     if let Some(cookie) = sample.deferred_cookie {
-        accumulator
-            .deferred_samples
-            .entry(cookie)
-            .or_default()
-            .push(DeferredFoldSample {
-                pid: sample.pid,
-                tid: sample.tid,
-                time: sample.time,
-                cpu: sample.cpu,
-                event_name: sample.event_name,
-                count: sample.count,
-                frames: sample.frames,
-                has_callchain: sample.has_callchain,
-            });
+        accumulator.deferred_samples.push(DeferredFoldSample {
+            cookie,
+            pid: sample.pid,
+            tid: sample.tid,
+            time: sample.time,
+            cpu: sample.cpu,
+            event_name: sample.event_name,
+            count: sample.count,
+            frames: sample.frames,
+            has_callchain: sample.has_callchain,
+        });
     } else {
         let comm = comm_for_ids(&accumulator.thread_comms, sample.tid);
         add_fold_stack(
@@ -3467,9 +3511,19 @@ fn prepare_sample_for_fold(
     let count = sample_fold_count(sample.period, options);
     accumulator.sample_frames.clear();
     accumulator.sample_frames.reserve(sample.frames.len());
-    accumulator
-        .sample_frames
-        .extend(sample.frames.clone().map(FoldFrame::Callchain));
+    let has_callchain = event.layout.sample_type & PERF_SAMPLE_CALLCHAIN != 0;
+    if has_callchain {
+        extend_recorded_callchain_frames_like_perf(
+            &mut accumulator.sample_frames,
+            sample.frames.clone(),
+        );
+    } else {
+        extend_sample_ip_frame_like_perf_machine_resolve(
+            &mut accumulator.sample_frames,
+            misc,
+            sample.frames.clone(),
+        );
+    }
     let deferred_cookie = take_deferred_cookie(&mut accumulator.sample_frames);
     append_perf_user_unwind_frames(accumulator, misc, &event, &sample);
     Ok(Some(PreparedFoldSample {
@@ -3481,8 +3535,52 @@ fn prepare_sample_for_fold(
         count,
         frames: std::mem::take(&mut accumulator.sample_frames),
         deferred_cookie,
-        has_callchain: event.layout.sample_type & PERF_SAMPLE_CALLCHAIN != 0,
+        has_callchain,
     }))
+}
+
+fn extend_sample_ip_frame_like_perf_machine_resolve(
+    frames: &mut FoldFrameStack,
+    misc: u16,
+    callchain: impl IntoIterator<Item = u64>,
+) {
+    // tools/perf/builtin-script.c process_sample_event() calls
+    // machine__resolve() for the event-line IP, and tools/perf/util/event.c
+    // machine__resolve() looks up sample->ip with sample->cpumode.
+    let cpumode = misc & PERF_RECORD_MISC_CPUMODE_MASK;
+    frames.extend(
+        callchain
+            .into_iter()
+            .map(|address| FoldFrame::SampleIp { address, cpumode }),
+    );
+}
+
+fn extend_recorded_callchain_frames_like_perf(
+    frames: &mut FoldFrameStack,
+    callchain: impl IntoIterator<Item = u64>,
+) {
+    // tools/perf/util/machine.c add_callchain_ip() switches cpumode only when
+    // it encounters PERF_CONTEXT_* markers. A kernel-looking address that is
+    // still under PERF_RECORD_MISC_USER must therefore resolve against user
+    // maps and normally prints as [unknown], not fall into kernel maps by
+    // address alone.
+    let mut cpumode = PERF_RECORD_MISC_CPUMODE_USER;
+    for ip in callchain {
+        match ip {
+            PERF_CONTEXT_KERNEL => {
+                cpumode = PERF_RECORD_MISC_CPUMODE_KERNEL;
+                frames.push(FoldFrame::Callchain(ip));
+            }
+            PERF_CONTEXT_USER | PERF_CONTEXT_USER_DEFERRED => {
+                cpumode = PERF_RECORD_MISC_CPUMODE_USER;
+                frames.push(FoldFrame::Callchain(ip));
+            }
+            _ if cpumode == PERF_RECORD_MISC_CPUMODE_USER => {
+                frames.push(FoldFrame::UserCallchain(ip));
+            }
+            _ => frames.push(FoldFrame::Callchain(ip)),
+        }
+    }
 }
 
 fn append_perf_user_unwind_frames(
@@ -3673,11 +3771,9 @@ fn unwind_object_frame_addresses_like_perf(
         return Vec::new();
     }
 
-    // gap-pkh skip gate: evaluate the same leaf-only predicate BEFORE framehop.
-    // `LeafOnly`/`SkipUnwind` never invoke the (expensive) framehop unwind, and
-    // the result is byte-identical to running it, because the shared
-    // acceptance tail emits the same leaf when framehop would have produced
-    // nothing.
+    // Evaluate perf/libdw's skip and leaf-only cases before framehop. The result
+    // is byte-identical to running framehop because the shared acceptance tail
+    // applies the same libdw callback rules to the sampled IP.
     let leaf_only = sample_is_leaf_only(state, pid, mmap_table, regs, context);
     match classify_object_unwind(context, leaf_only) {
         ObjectUnwindClass::SkipUnwind => return Vec::new(),
@@ -3738,15 +3834,12 @@ fn unwind_object_frame_addresses_like_perf(
 }
 
 /// Whether perf/libdw would fire the initial-frame callback exactly once and
-/// stop (research §2 scenario D / §3.6): the sampled IP reported into a module,
-/// no CFI covers it, and the arch-specific `ebl_unwind` fallback provably
-/// cannot advance. This is the EXACT narrow predicate from
-/// `.ace-research-perf-unwind.md` §3.6/§4 — broader rules (e.g. "emit on any
-/// empty framehop") reintroduced the measured 10.1B/41.2B overcounts.
+/// stop: the sampled IP reported into a module, no CFI covers it, and the
+/// arch-specific `ebl_unwind` fallback provably cannot advance.
 ///
 /// The `(pid, ip)`-stable half (module reported + no CFI) is memoized in
 /// `state.leaf_only_eligibility`; the per-sample register condition
-/// (`bp < sp` on x86_64, `lr == 0` on aarch64) is combined here fresh.
+/// (`bp < sp` on `x86_64`, `lr == 0` on aarch64) is combined here fresh.
 fn sample_is_leaf_only(
     state: &mut PidUnwindState,
     pid: u32,
@@ -3754,8 +3847,8 @@ fn sample_is_leaf_only(
     regs: &PerfUserRegs,
     context: UserUnwindContext,
 ) -> bool {
-    // KernelWithUserFrame never appends extra user frames (research §3.5), so a
-    // leaf is never emitted there; leave that to the SkipUnwind class.
+    // KernelWithUserFrame never appends extra user frames, so a leaf is never
+    // emitted there; leave that to the SkipUnwind class.
     if context.callchain == SampleCallchainState::KernelWithUserFrame {
         return false;
     }
@@ -3772,7 +3865,7 @@ fn sample_is_leaf_only(
 
 /// The `(pid, ip)`-stable half of the leaf-only predicate, suitable for
 /// memoizing: the module covering `ip` is reported into the unwinder AND no CFI
-/// (.eh_frame/.debug_frame FDE) covers `ip`.
+/// (`.eh_frame`/`.debug_frame` FDE) covers `ip`.
 fn leaf_only_eligibility(
     pid: u32,
     ip: u64,
@@ -3791,7 +3884,7 @@ fn leaf_only_eligibility(
 /// The per-sample half of the leaf-only predicate: whether the arch-specific
 /// `ebl_unwind` fallback can never produce a caller from these registers.
 ///
-/// x86_64 (`backends/x86_64_unwind.c`): the rbp fallback is only attempted by
+/// `x86_64` (`backends/x86_64_unwind.c`): the rbp fallback is only attempted by
 /// pyroclast when `bp >= sp` (the elfutils final guard `if (sp >= fp) return
 /// false;` rejects a frame pointer that does not sit above the stack pointer).
 /// So `bp < sp` means the fallback contributes nothing.
@@ -3806,7 +3899,7 @@ fn arch_fallback_provably_cannot_advance(regs: &PerfUserRegs) -> bool {
     }
 }
 
-/// Classifies a sample's object unwind before framehop runs (gap-pkh).
+/// Classifies a sample's object unwind before framehop runs.
 fn classify_object_unwind(context: UserUnwindContext, leaf_only: bool) -> ObjectUnwindClass {
     // Research §3.5: a recorded kernel->user callchain is not extended with
     // extra user DWARF callers — perf emits zero unwound frames here.
@@ -3837,7 +3930,6 @@ fn libdw_arch_fallback_after_empty_object_unwind(
         PerfUserRegs::X86_64(regs) if raw_frames.is_empty() && regs.bp >= regs.sp => {
             unwind_x86_64_frame_pointer_stack_like_elfutils(regs, stack_bytes, 256)
         }
-        PerfUserRegs::X86_64(_) => raw_frames,
         // aarch64's backend has no bp/sp precondition: it accepts the lr-based
         // caller unless lr == 0, with its own internal `fp == 0 || fp+16 > sp`
         // accept condition (backends/aarch64_unwind.c). framehop's aarch64
@@ -3847,7 +3939,7 @@ fn libdw_arch_fallback_after_empty_object_unwind(
         PerfUserRegs::Aarch64(regs) if frames_are_seed_only(&raw_frames, regs.pc) => {
             unwind_aarch64_frame_pointer_stack_like_elfutils(regs, stack_bytes, 256)
         }
-        PerfUserRegs::Aarch64(_) => raw_frames,
+        PerfUserRegs::X86_64(_) | PerfUserRegs::Aarch64(_) => raw_frames,
     }
 }
 
@@ -3868,9 +3960,10 @@ fn truncate_syscall_return_unwind_after_first_executable_frame(
 
 fn should_use_libdw_arch_fallback_after_empty_object_unwind(
     context: UserUnwindContext,
-    _initial_ip_mapping_has_reported_module: bool,
+    initial_ip_mapping_has_reported_module: bool,
 ) -> bool {
     context.initial_ip_mapping != InitialIpMappingState::RecordedMappingMissing
+        && initial_ip_mapping_has_reported_module
 }
 
 fn initial_ip_mapping_has_reported_unwind_module(
@@ -4009,7 +4102,7 @@ fn take_deferred_cookie(frames: &mut FoldFrameStack) -> Option<u64> {
         [
             ..,
             FoldFrame::Callchain(marker),
-            FoldFrame::Callchain(cookie),
+            FoldFrame::Callchain(cookie) | FoldFrame::UserCallchain(cookie),
         ] if is_perf_user_deferred_context_marker(*marker) => {
             let cookie = *cookie;
             frames.pop();
@@ -4058,18 +4151,11 @@ fn perf_accepted_object_unwind_frames(
     if callchain == SampleCallchainState::KernelWithUserFrame {
         return Vec::new();
     }
-    // gap-5gr: when the leaf-only predicate holds, perf/libdwfl fires
-    // frame_callback exactly once for the seeded IP and stops (scenario D).
-    // No FDE row covers the IP (`!has_unwind_info_for_ip`), so handle_cfi
-    // cannot advance, and the `ebl_unwind` rbp/lr fallback is guarded off
-    // (`bp < sp` on x86_64 / `lr == 0` on aarch64). perf therefore prints
-    // exactly the single sampled-IP leaf. framehop always yields the seed and
-    // its instruction-analysis heuristics can recover a *spurious* caller here
-    // that libdwfl would never emit, so the accepted list is the leaf alone
-    // regardless of what framehop produced. Because this truncation is the
-    // shared tail for both the gated (framehop-skipped) and ungated
-    // (framehop-run) paths, the gap-pkh skip gate is a pure optimization: both
-    // yield exactly `[ip]`.
+    // When the leaf-only predicate holds, perf/libdwfl fires frame_callback for
+    // the seeded IP and then stops. No FDE row covers the IP, so advancement
+    // depends on `ebl_unwind`; the x86_64 backend returns false when `bp < sp`,
+    // and the aarch64 backend returns false when `lr == 0`. In that state perf
+    // prints exactly the sampled-IP leaf, so a framehop-only caller is discarded.
     if leaf_only {
         return vec![regs.ip()];
     }
@@ -4168,7 +4254,9 @@ fn unwind_object_path_for_build_id(
     debug_dir: Option<&Path>,
 ) -> PathBuf {
     debug_dir
-        .map(|debug_dir| perf_build_id_elf_path(debug_dir, &build_id_hex(build_id)))
+        .map(|debug_dir| {
+            perf_build_id_elf_path_for_dso(debug_dir, Path::new(path), &build_id_hex(build_id))
+        })
         .filter(|cached| cached.exists())
         .unwrap_or_else(|| PathBuf::from(path))
 }
@@ -4262,7 +4350,7 @@ struct EventDescEntry {
 /// `write_event_desc`/`read_event_desc` in `tools/perf/util/header.c`), and
 /// `perf script` prints those names instead of reconstructing them from the
 /// attr type/config. The layout is: `nre` (u32, number of events), `attr_sz`
-/// (u32, sizeof perf_event_attr), then for each event: `attr_sz` attr bytes, a
+/// (u32, sizeof `perf_event_attr`), then for each event: `attr_sz` attr bytes, a
 /// `nr` (u32) id count, a length-prefixed name string, and `nr` u64 ids.
 ///
 /// The name string is written by `do_write_string`: a u32 length
@@ -4454,15 +4542,31 @@ mod tests {
     // per event attr_sz attr bytes, nr(u32), do_write_string(name), nr u64 ids.
     fn event_desc_payload(events: &[(&str, &[u64])], attr_sz: usize) -> Vec<u8> {
         let mut payload = Vec::new();
-        payload.extend((events.len() as u32).to_le_bytes());
-        payload.extend((attr_sz as u32).to_le_bytes());
+        payload.extend(
+            u32::try_from(events.len())
+                .expect("event count fits u32")
+                .to_le_bytes(),
+        );
+        payload.extend(
+            u32::try_from(attr_sz)
+                .expect("attr size fits u32")
+                .to_le_bytes(),
+        );
         for (name, ids) in events {
             payload.extend(std::iter::repeat_n(0_u8, attr_sz));
-            payload.extend((ids.len() as u32).to_le_bytes());
+            payload.extend(
+                u32::try_from(ids.len())
+                    .expect("id count fits u32")
+                    .to_le_bytes(),
+            );
             // do_write_string: u32 len = PERF_ALIGN(strlen+1, NAME_ALIGN=64),
             // then len bytes of NUL-terminated name plus zero padding.
             let aligned = (name.len() + 1).div_ceil(64) * 64;
-            payload.extend((aligned as u32).to_le_bytes());
+            payload.extend(
+                u32::try_from(aligned)
+                    .expect("name length fits u32")
+                    .to_le_bytes(),
+            );
             let mut name_bytes = name.as_bytes().to_vec();
             name_bytes.resize(aligned, 0);
             payload.extend(name_bytes);
@@ -4541,6 +4645,8 @@ mod tests {
     struct StaticFrameResolver {
         frames: Vec<String>,
         has_base_symbol: bool,
+        has_inline_frames: bool,
+        has_non_inline_base_frame: bool,
         base_offset: Option<u64>,
     }
 
@@ -4564,7 +4670,51 @@ mod tests {
                 ResolvedSymbolFrames {
                     frames: self.frames.clone(),
                     has_base_symbol: self.has_base_symbol,
+                    has_inline_frames: self.has_inline_frames,
+                    has_non_inline_base_frame: self.has_non_inline_base_frame,
                     base_offset: self.base_offset,
+                };
+                requests.len()
+            ])
+        }
+    }
+
+    struct SplitFrameResolver;
+
+    impl SymbolResolver for SplitFrameResolver {
+        fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
+            Ok(vec![None; requests.len()])
+        }
+
+        fn resolve_frame_batch_with_metadata(
+            &self,
+            requests: &[SymbolRequest],
+        ) -> Result<Vec<ResolvedSymbolFrames>, String> {
+            Ok(vec![
+                ResolvedSymbolFrames {
+                    frames: vec!["wrong_dwarf_leaf".to_string()],
+                    has_base_symbol: true,
+                    has_inline_frames: false,
+                    has_non_inline_base_frame: true,
+                    base_offset: None,
+                };
+                requests.len()
+            ])
+        }
+
+        fn resolve_base_frame_batch_with_metadata(
+            &self,
+            requests: &[SymbolRequest],
+        ) -> Result<Vec<ResolvedSymbolFrames>, String> {
+            Ok(vec![
+                ResolvedSymbolFrames {
+                    frames: vec![
+                        "pyroclast::parsers::strace::parse_strace_summary+0xaa0".to_string(),
+                    ],
+                    has_base_symbol: true,
+                    has_inline_frames: false,
+                    has_non_inline_base_frame: true,
+                    base_offset: Some(0xaa0),
                 };
                 requests.len()
             ])
@@ -4601,6 +4751,8 @@ mod tests {
                 .map(|request| ResolvedSymbolFrames {
                     frames: vec![format!("symbol_{:x}", request.relative_address)],
                     has_base_symbol: true,
+                    has_inline_frames: false,
+                    has_non_inline_base_frame: true,
                     base_offset: None,
                 })
                 .collect()
@@ -4778,7 +4930,7 @@ mod tests {
     }
 
     #[test]
-    fn object_unwind_keeps_short_fallback_stack_without_callchain_like_perf_libdw() {
+    fn object_unwind_keeps_short_fallback_stack_with_empty_callchain_like_perf_libdw() {
         // tools/perf/util/unwind-libdw.c does not filter accepted callbacks
         // based on whether PERF_SAMPLE_CALLCHAIN contributed recorded frames.
         assert_eq!(
@@ -4889,6 +5041,8 @@ mod tests {
         let resolver = StaticFrameResolver {
             frames: vec!["core::num::flt2dec::strategy::dragon::mul_pow10".to_string()],
             has_base_symbol: false,
+            has_inline_frames: false,
+            has_non_inline_base_frame: false,
             base_offset: None,
         };
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
@@ -4908,6 +5062,89 @@ mod tests {
     }
 
     #[test]
+    fn sample_ip_event_line_uses_base_symbol_with_offset_like_perf_machine_resolve() {
+        // builtin-script.c process_sample_event() resolves the event-line IP
+        // through machine__resolve(); util/event.c machine__resolve() sets
+        // al->sym with map__find_symbol(), and evsel_fprintf.c
+        // sample__fprintf_sym(cursor == NULL) prints
+        // __symbol__fprintf_symname_offs(). It does not use the DWARF inline
+        // expansion path used for callchain cursor rows.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x5555_5578_0000,
+            len: 0x10_0000,
+            pgoff: 0,
+            path: "/bin/pyroclast".to_string(),
+        });
+        let resolver = SplitFrameResolver;
+        let mut symbol_cache = SymbolFrameCache::new(&resolver);
+        let mut written = Vec::new();
+
+        super::FoldFrameResolver::new(&mmap_table, true)
+            .write_inline_sample_frame_for_stack(
+                Some(11),
+                &[super::FoldFrame::SampleIp {
+                    address: 0x5555_5578_a940,
+                    cpumode: crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_USER,
+                }],
+                Some(&mut symbol_cache),
+                &mut written,
+            )
+            .expect("write sample ip frame");
+
+        assert_eq!(
+            String::from_utf8(written).expect("utf-8"),
+            "    55555578a940 pyroclast::parsers::strace::parse_strace_summary+0xaa0 (/bin/pyroclast)"
+        );
+    }
+
+    #[test]
+    fn sample_ip_event_line_without_base_symbol_keeps_mapped_dso_like_perf_machine_resolve() {
+        // evsel_fprintf.c sample__fprintf_sym(cursor == NULL) prints
+        // __symbol__fprintf_symname_offs(al->sym, al, ...) and then
+        // map__fprintf_dsoname_dsoff(al->map, ...). A mapped IP without a
+        // symbol is therefore `[unknown] (full-dso-path)`, not Inferno's
+        // basename fallback.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x5555_5578_0000,
+            len: 0x10_0000,
+            pgoff: 0,
+            path: "/home/mjc/projects/pyroclast/target/profiling/pyroclast".to_string(),
+        });
+        let resolver = StaticFrameResolver {
+            frames: vec!["wrong_dwarf_leaf".to_string()],
+            has_base_symbol: false,
+            has_inline_frames: false,
+            has_non_inline_base_frame: false,
+            base_offset: None,
+        };
+        let mut symbol_cache = SymbolFrameCache::new(&resolver);
+        let mut written = Vec::new();
+
+        super::FoldFrameResolver::new(&mmap_table, true)
+            .write_inline_sample_frame_for_stack(
+                Some(11),
+                &[super::FoldFrame::SampleIp {
+                    address: 0x5555_5578_b9b9,
+                    cpumode: crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_USER,
+                }],
+                Some(&mut symbol_cache),
+                &mut written,
+            )
+            .expect("write sample ip frame");
+
+        assert_eq!(
+            String::from_utf8(written).expect("utf-8"),
+            "    55555578b9b9 [unknown] (/home/mjc/projects/pyroclast/target/profiling/pyroclast)"
+        );
+    }
+
+    #[test]
     fn inline_current_ip_with_base_symbol_renders_single_frame_like_perf_unwind_entry() {
         // tools/perf/util/machine.c unwind_entry() calls append_inlines(); when
         // no inline chain is appended it still appends the current map_symbol.
@@ -4923,6 +5160,8 @@ mod tests {
         let resolver = StaticFrameResolver {
             frames: vec!["core::num::flt2dec::strategy::dragon::format_shortest".to_string()],
             has_base_symbol: true,
+            has_inline_frames: false,
+            has_non_inline_base_frame: true,
             base_offset: None,
         };
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
@@ -4966,6 +5205,8 @@ mod tests {
                 "read_file_range".to_string(),
             ],
             has_base_symbol: false,
+            has_inline_frames: false,
+            has_non_inline_base_frame: false,
             base_offset: None,
         };
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
@@ -5005,6 +5246,8 @@ mod tests {
                 "quicksort<&str>".to_string(),
             ],
             has_base_symbol: true,
+            has_inline_frames: true,
+            has_non_inline_base_frame: false,
             base_offset: None,
         };
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
@@ -5028,8 +5271,9 @@ mod tests {
 
     #[test]
     fn inline_fold_keeps_abstract_origin_fn0_before_terminal_mix_like_perf_script() {
-        // perf/libdw do not special-case the abstract-origin label here; the
-        // inline chain should stay intact instead of dropping the fn0 hop.
+        // Renderer helpers fold the frame list supplied by symbol resolution.
+        // The fn0-vs-mix parity question belongs to resolver construction, not
+        // to a name-specific renderer filter.
         let mut mmap_table = super::MmapTable::default();
         mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
             pid: 11,
@@ -5042,6 +5286,8 @@ mod tests {
         let resolver = StaticFrameResolver {
             frames: vec!["fn0".to_string(), "mix".to_string()],
             has_base_symbol: true,
+            has_inline_frames: true,
+            has_non_inline_base_frame: false,
             base_offset: None,
         };
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
@@ -5062,8 +5308,8 @@ mod tests {
 
     #[test]
     fn inline_fold_keeps_abstract_origin_fn0_before_mix_for_user_unwind_chain_like_perf_script() {
-        // perf/libdw keep the inline chain intact for each user-unwind frame;
-        // there is no source-backed special case that drops fn0 before mix.
+        // Renderer helpers fold the resolved inline chain for every supplied
+        // user-unwind entry; resolver parity decides which labels are present.
         let mut mmap_table = super::MmapTable::default();
         mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
             pid: 11,
@@ -5076,6 +5322,8 @@ mod tests {
         let resolver = StaticFrameResolver {
             frames: vec!["fn0".to_string(), "mix".to_string()],
             has_base_symbol: true,
+            has_inline_frames: true,
+            has_non_inline_base_frame: false,
             base_offset: None,
         };
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
@@ -5100,8 +5348,9 @@ mod tests {
     #[test]
     fn inline_fold_keeps_real_base_frame_and_abstract_origin_before_terminal_mix_like_perf_script()
     {
-        // perf/libdw source does not justify dropping the abstract-origin hop;
-        // the concrete base row and the inline chain should both be present.
+        // Renderer helpers preserve every frame returned by symbol resolution;
+        // dropping a concrete or abstract-origin frame here would be a renderer
+        // hack rather than a perf/libdw model.
         let mut mmap_table = super::MmapTable::default();
         mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
             pid: 11,
@@ -5114,6 +5363,8 @@ mod tests {
         let resolver = StaticFrameResolver {
             frames: vec!["fn124".to_string(), "fn0".to_string(), "mix".to_string()],
             has_base_symbol: true,
+            has_inline_frames: true,
+            has_non_inline_base_frame: false,
             base_offset: None,
         };
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
@@ -5149,6 +5400,8 @@ mod tests {
         let resolver = StaticFrameResolver {
             frames: vec!["_Fork+0x48".to_string()],
             has_base_symbol: true,
+            has_inline_frames: false,
+            has_non_inline_base_frame: true,
             base_offset: None,
         };
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
@@ -5193,6 +5446,8 @@ mod tests {
                 "core::slice::sort::unstable::sort".to_string(),
             ],
             has_base_symbol: true,
+            has_inline_frames: true,
+            has_non_inline_base_frame: true,
             base_offset: Some(0x1fb),
         };
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
@@ -5217,6 +5472,91 @@ mod tests {
     }
 
     #[test]
+    fn inline_user_unwind_script_frame_marks_trailing_fake_inline_symbol_like_perf_script() {
+        // tools/perf/util/libdw.c libdw_a2l_cb() passes dwarf_diename() to
+        // srcline.c new_inline_sym(). If that name differs from base_sym->name,
+        // perf creates a fake symbol with sym->inlined = 1. evsel_fprintf.c
+        // then suppresses the DSO and prints "(inlined)" even for the final row.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x1000,
+            len: 0x1000,
+            pgoff: 0,
+            path: "/tmp/sftp-s3".to_string(),
+        });
+        let resolver = StaticFrameResolver {
+            frames: vec![
+                "new_lookup<Reader>".to_string(),
+                "{closure#0}<Reader>".to_string(),
+            ],
+            has_base_symbol: true,
+            has_inline_frames: true,
+            has_non_inline_base_frame: false,
+            base_offset: Some(0x531),
+        };
+        let mut symbol_cache = SymbolFrameCache::new(&resolver);
+        let mut written = Vec::new();
+
+        super::FoldFrameResolver::new(&mmap_table, true)
+            .write_script_frames_for_stack(
+                Some(11),
+                &[super::FoldFrame::UserUnwind(0x1427)],
+                Some(&mut symbol_cache),
+                &mut written,
+            )
+            .expect("write perf script frames");
+
+        assert_eq!(
+            String::from_utf8(written).expect("utf-8"),
+            "\t            1427 {closure#0}<Reader>+0x531 (inlined)\n\
+             \t            1427 new_lookup<Reader>+0x531 (inlined)\n"
+        );
+    }
+
+    #[test]
+    fn single_surviving_inline_user_unwind_script_frame_prints_inlined_like_perf_script() {
+        // perf util/machine.c append_inlines() suppresses the ordinary base
+        // append when inline symbols were appended. If perf util/addr2line.c
+        // then drops the concrete `fn0` record as a non-first GNU sentinel,
+        // builtin-script still prints the one remaining inline symbol with
+        // `(inlined)` and no DSO path.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x4000,
+            len: 0x1000,
+            pgoff: 0,
+            path: "/tmp/fake-perfdata-work/entropy_burn".to_string(),
+        });
+        let resolver = StaticFrameResolver {
+            frames: vec!["mix".to_string()],
+            has_base_symbol: true,
+            has_inline_frames: true,
+            has_non_inline_base_frame: false,
+            base_offset: Some(0x4b),
+        };
+        let mut symbol_cache = SymbolFrameCache::new(&resolver);
+        let mut written = Vec::new();
+
+        super::FoldFrameResolver::new(&mmap_table, true)
+            .write_script_frames_for_stack(
+                Some(11),
+                &[super::FoldFrame::UserUnwind(0x449b)],
+                Some(&mut symbol_cache),
+                &mut written,
+            )
+            .expect("write perf script frames");
+
+        assert_eq!(
+            String::from_utf8(written).expect("utf-8"),
+            "\t            449b mix+0x4b (inlined)\n"
+        );
+    }
+
+    #[test]
     fn single_base_user_unwind_script_frame_keeps_its_baked_offset_once_like_perf_script() {
         // A non-inline base frame already carries +0x<off> in its label from the
         // symtab with_offset form; it must not be doubled in inline-capable mode.
@@ -5232,6 +5572,8 @@ mod tests {
         let resolver = StaticFrameResolver {
             frames: vec!["core::slice::sort::unstable::quicksort::quicksort+0x6cb".to_string()],
             has_base_symbol: true,
+            has_inline_frames: false,
+            has_non_inline_base_frame: true,
             base_offset: Some(0x6cb),
         };
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
@@ -5414,6 +5756,77 @@ mod tests {
         assert_eq!(
             entries[0].callchain(&mut scratch),
             [super::FoldFrame::UserUnwind(0x1010)]
+        );
+    }
+
+    #[test]
+    fn user_unwind_drop_filter_ignores_global_mappings_like_perf_libdw_user_lookup() {
+        // tools/perf/util/unwind-libdw.c __report_module() and access_dso_mem()
+        // use PERF_RECORD_MISC_USER, so an unwound user frame must not inherit
+        // global/kernel mapping fallback behavior from recorded callchain frames.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: u32::MAX,
+            tid: u32::MAX,
+            start: 0x1000,
+            len: 0x100,
+            pgoff: 0,
+            path: "/tmp/perf.data".to_string(),
+        });
+
+        let mut mapping_cache = super::MappingResolveCache::default();
+        let mut raw_stacks = crate::perfdata::raw_stack::RawStackAccumulator::new();
+        super::add_fold_stack(
+            Some(7),
+            Some("pyroclast"),
+            1,
+            &[super::FoldFrame::UserUnwind(0x1010)],
+            &mmap_table,
+            &mut mapping_cache,
+            &mut raw_stacks,
+        );
+
+        let entries = raw_stacks.sorted_entries();
+        assert_eq!(entries.len(), 1);
+        let mut scratch = Vec::new();
+        assert_eq!(
+            entries[0].callchain(&mut scratch),
+            [super::FoldFrame::UserUnwind(0x1010)]
+        );
+    }
+
+    #[test]
+    fn user_unwind_resolution_ignores_same_pid_kernel_mappings_like_perf_libdw_user_lookup() {
+        // perf's thread__find_map(... PERF_RECORD_MISC_USER ...) searches the
+        // thread's user maps. Kernel-cpumode maps live in machine__kernel_maps()
+        // and must not symbolize libdw user-unwind entries, even when the raw
+        // mmap record carries the same pid.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap_with_misc(
+            crate::perfdata::records::MmapRecord {
+                pid: 7,
+                tid: 7,
+                start: 0xffff_ffff_8100_0000,
+                len: 0x1000,
+                pgoff: 0,
+                path: "[kernel.kallsyms]".to_string(),
+            },
+            crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_KERNEL,
+        );
+
+        let mut written = Vec::new();
+        super::FoldFrameResolver::new(&mmap_table, false)
+            .write_script_frames_for_stack(
+                Some(7),
+                &[super::FoldFrame::UserUnwind(0xffff_ffff_8100_0010)],
+                None::<&mut SymbolFrameCache<'_, super::NoopSymbolResolver>>,
+                &mut written,
+            )
+            .expect("write perf script frames");
+
+        assert_eq!(
+            String::from_utf8(written).expect("utf-8"),
+            "\tffffffff81000010 [unknown] ([unknown])\n"
         );
     }
 
@@ -5751,10 +6164,12 @@ mod tests {
     }
 
     #[test]
-    fn user_unwind_source_uses_object_unwind_for_kernel_sample_without_callchain_like_perf_libdw() {
+    fn user_unwind_source_uses_object_unwind_for_kernel_sample_with_empty_callchain_like_perf_libdw()
+     {
         // Real period 4745147 sample from target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
-        // perf script records a kernel-mode IP but still calls libdw with the
-        // captured user regs/stack and emits the user-space memmove leaf.
+        // perf script records a kernel-mode IP and an empty PERF_SAMPLE_CALLCHAIN
+        // payload, but still calls libdw with the captured user regs/stack and
+        // emits the user-space memmove leaf.
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
                 sample_callchain: super::SampleCallchainPresence::Present,
@@ -5769,13 +6184,14 @@ mod tests {
     }
 
     #[test]
-    fn user_unwind_source_attempts_kernel_sample_without_callchain_from_executable_like_perf_libdw()
-    {
+    fn user_unwind_source_attempts_kernel_sample_with_empty_callchain_from_executable_like_perf_libdw()
+     {
+        // builtin-script.c has already passed the `sample->callchain` gate
+        // because the PERF_SAMPLE_CALLCHAIN payload is present. From there,
         // tools/perf/util/machine.c thread__resolve_callchain_unwind() only
         // requires PERF_SAMPLE_REGS_USER, PERF_SAMPLE_STACK_USER, user regs,
-        // and a non-empty user stack. tools/perf/util/unwind-libdw.c then
-        // calls report_module(ip). Perf does not pre-skip object unwinding
-        // because the captured user IP belongs to the main executable.
+        // and a non-empty user stack. tools/perf/util/unwind-libdw.c then calls
+        // report_module(ip).
         assert_eq!(
             super::choose_user_unwind_source(super::UserUnwindContext {
                 sample_callchain: super::SampleCallchainPresence::Present,
@@ -6413,7 +6829,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_object_unwind_arch_fallback_does_not_require_reported_mapping_like_elfutils() {
+    fn empty_object_unwind_arch_fallback_requires_initial_reported_module_like_perf_libdw() {
         let regs = PerfX86_64Regs {
             ip: 0x4000,
             sp: 0x8000,
@@ -6445,34 +6861,31 @@ mod tests {
         );
 
         assert!(
-            super::should_use_libdw_arch_fallback_after_empty_object_unwind(
+            !super::should_use_libdw_arch_fallback_after_empty_object_unwind(
                 super::UserUnwindContext {
                     initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
                     ..matching_context
                 },
                 false
-            )
+            ),
+            "perf unwind__get_entries exits before dwfl_getthread_frames when report_module(ip) fails"
         );
         assert!(
-            super::should_use_libdw_arch_fallback_after_empty_object_unwind(
+            !super::should_use_libdw_arch_fallback_after_empty_object_unwind(
                 super::UserUnwindContext { ..matching_context },
                 false
-            )
+            ),
+            "perf frame_callback reaches ebl_unwind only after the initial IP module is reported"
         );
         assert!(
-            super::should_use_libdw_arch_fallback_after_empty_object_unwind(
+            !super::should_use_libdw_arch_fallback_after_empty_object_unwind(
                 super::UserUnwindContext {
                     syscall_return_state: false,
                     ..matching_context
                 },
                 false
-            )
-        );
-        assert!(
-            super::should_use_libdw_arch_fallback_after_empty_object_unwind(
-                matching_context,
-                false
-            )
+            ),
+            "non-syscall samples still need perf's initial report_module(ip) success"
         );
     }
 
@@ -6521,13 +6934,13 @@ mod tests {
     }
 
     #[test]
-    fn object_unwind_keeps_kernel_without_callchain_dso_tail_like_perf_libdw() {
+    fn object_unwind_keeps_kernel_empty_callchain_dso_tail_like_perf_libdw() {
         // Real period 144 __strlen_avx2 sample from
         // target/profiling-runs/octo-latest-fold/profile.raw.perf.data:
-        // perf script records a kernel-mode sampled IP with no recorded
-        // callchain, then libdw emits the captured user-space leaf and bash
-        // callers. In perf util/unwind-libdw.c, frame_callback reports every
-        // accepted frame via entry(); there is no kernel-without-callchain
+        // perf script records a kernel-mode sampled IP with a present-but-empty
+        // callchain payload, then libdw emits the captured user-space leaf and
+        // bash callers. In perf util/unwind-libdw.c, frame_callback reports
+        // every accepted frame via entry(); there is no kernel-empty-callchain
         // post-filter that truncates to the leaf.
         let regs = PerfX86_64Regs {
             ip: 0x7fff_f7f2_d344,
@@ -6686,9 +7099,9 @@ mod tests {
             super::ObjectUnwindClass::MustUnwind
         );
 
-        // Research §3.5: a recorded kernel->user callchain is never extended
-        // with user DWARF callers, so it skips unwinding entirely regardless of
-        // the leaf-only predicate.
+        // A recorded kernel->user callchain is never extended with user DWARF
+        // callers, so it skips unwinding entirely regardless of the leaf-only
+        // predicate.
         let kernel_user = super::UserUnwindContext {
             callchain: super::SampleCallchainState::KernelWithUserFrame,
             ..leaf_only_ctx
@@ -6705,9 +7118,9 @@ mod tests {
 
     #[test]
     fn accepted_frames_emit_leaf_only_when_predicate_holds() {
-        // gap-5gr: when the leaf-only predicate holds the accepted list is the
-        // single sampled-IP leaf, even if framehop produced a (spurious)
-        // caller — libdwfl would have stopped after the initial-frame callback.
+        // When the leaf-only predicate holds the accepted list is the single
+        // sampled-IP leaf, even if framehop produced a caller; libdwfl would
+        // have stopped after the initial-frame callback.
         let regs = test_regs(0x4000);
         assert_eq!(
             super::perf_accepted_object_unwind_frames(&regs, other_callchain(), true, Vec::new()),
@@ -6740,10 +7153,178 @@ mod tests {
             vec![0x4000, 0x9999]
         );
         // A non-leaf-only sample with no accepted frames stays empty: the
-        // sampled IP is never invented absent the scenario-D predicate.
+        // sampled IP is never invented absent the leaf-only predicate.
         assert!(
             super::perf_accepted_object_unwind_frames(&regs, other_callchain(), false, Vec::new())
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn accepted_frames_preserve_duplicate_seed_ip_like_perf_libdw_frame_callback() {
+        // tools/perf/util/unwind-libdw.c frame_callback() calls entry() for
+        // each Dwfl_Frame, including repeated PCs. No deduplication occurs.
+        let regs = test_regs(0x4000);
+        assert_eq!(
+            super::perf_accepted_object_unwind_frames(
+                &regs,
+                other_callchain(),
+                false,
+                vec![0x4000, 0x4000, 0x5000],
+            ),
+            vec![0x4000, 0x4000, 0x5000]
+        );
+    }
+
+    #[test]
+    fn deferred_sample_final_flush_preserves_insertion_order_like_perf_ordered_events() {
+        // tools/perf/util/ordered-events.c queue_event() inserts events by
+        // timestamp while preserving input order for equal timestamps. Final
+        // deferred-callchain flush must therefore not drain by cookie key.
+        let mut accumulator = super::FoldAccumulator::new(std::collections::BTreeMap::new());
+        accumulator
+            .deferred_samples
+            .push(super::DeferredFoldSample {
+                cookie: 2,
+                pid: Some(11),
+                tid: Some(21),
+                time: Some(100),
+                cpu: None,
+                event_name: std::sync::Arc::from("cpu-clock"),
+                count: 1,
+                frames: smallvec::smallvec![super::FoldFrame::Callchain(0x2000)],
+                has_callchain: true,
+            });
+        accumulator
+            .deferred_samples
+            .push(super::DeferredFoldSample {
+                cookie: 1,
+                pid: Some(11),
+                tid: Some(22),
+                time: Some(100),
+                cpu: None,
+                event_name: std::sync::Arc::from("cpu-clock"),
+                count: 1,
+                frames: smallvec::smallvec![super::FoldFrame::Callchain(0x1000)],
+                has_callchain: true,
+            });
+
+        let tids = accumulator
+            .take_deferred_samples()
+            .into_iter()
+            .map(|sample| sample.tid)
+            .collect::<Vec<_>>();
+
+        assert_eq!(tids, vec![Some(21), Some(22)]);
+    }
+
+    #[test]
+    fn perf_user_records_do_not_contribute_ordered_event_timestamps_like_perf_session() {
+        // tools/perf/util/session.c perf_session__process_event() dispatches
+        // PERF_RECORD_USER_TYPE_START records before evlist__parse_sample_timestamp().
+        // A user-record payload tail that looks like sample_id_all data must not
+        // advance ordered-events next_flush and flush later samples early.
+        let layouts = super::SampleLayouts {
+            fallback: Some(std::sync::Arc::new(super::SampleEventLayout {
+                layout: crate::perfdata::samples::SampleLayout {
+                    sample_type: crate::perfdata::samples::PERF_SAMPLE_TID
+                        | crate::perfdata::samples::PERF_SAMPLE_TIME,
+                    read_format: 0,
+                    branch_sample_type: 0,
+                    sample_regs_user: 0,
+                    sample_regs_intr: 0,
+                    sample_id_all: true,
+                },
+                event_name: std::sync::Arc::from("cpu-clock"),
+            })),
+            by_identifier: std::collections::BTreeMap::new(),
+            event_name_width: 9,
+        };
+        let mut payload = Vec::new();
+        payload.extend([0xaa; 24]);
+        payload.extend(11_u32.to_le_bytes());
+        payload.extend(22_u32.to_le_bytes());
+        payload.extend(8_725_724_278_030_338_u64.to_le_bytes());
+        let record = super::PerfRecord {
+            offset: 0,
+            header: crate::perfdata::records::PerfRecordHeader {
+                record_type: crate::perfdata::records::PERF_RECORD_HEADER_ATTR,
+                misc: 0,
+                size: u16::try_from(payload.len() + 8).unwrap(),
+            },
+            payload: &payload,
+        };
+
+        assert_eq!(super::record_time(record, &layouts).unwrap(), None);
+    }
+
+    #[test]
+    fn resolved_deferred_samples_emit_by_sample_time_like_perf_ordered_events() {
+        // evlist__deliver_deferred_callchain() scans evlist->deferred_samples
+        // in the order perf's ordered-events delivery queued those samples.
+        // Same-tid entries are delivered in list order even when only one entry
+        // matches the deferred-callchain cookie; different tids remain queued.
+        let mut accumulator = super::FoldAccumulator::new(std::collections::BTreeMap::new());
+        accumulator
+            .deferred_samples
+            .push(super::DeferredFoldSample {
+                cookie: 2,
+                pid: Some(11),
+                tid: Some(20),
+                time: Some(100),
+                cpu: None,
+                event_name: std::sync::Arc::from("cpu-clock"),
+                count: 1,
+                frames: smallvec::smallvec![super::FoldFrame::Callchain(0x2000)],
+                has_callchain: true,
+            });
+        accumulator
+            .deferred_samples
+            .push(super::DeferredFoldSample {
+                cookie: 7,
+                pid: Some(11),
+                tid: Some(30),
+                time: Some(150),
+                cpu: None,
+                event_name: std::sync::Arc::from("cpu-clock"),
+                count: 1,
+                frames: smallvec::smallvec![super::FoldFrame::Callchain(0x3000)],
+                has_callchain: true,
+            });
+        accumulator
+            .deferred_samples
+            .push(super::DeferredFoldSample {
+                cookie: 7,
+                pid: Some(11),
+                tid: Some(20),
+                time: Some(200),
+                cpu: None,
+                event_name: std::sync::Arc::from("cpu-clock"),
+                count: 1,
+                frames: smallvec::smallvec![super::FoldFrame::Callchain(0x7000)],
+                has_callchain: true,
+            });
+
+        let samples = accumulator.take_resolved_deferred_samples(7, Some(20), &[0x4000]);
+
+        assert_eq!(
+            samples.iter().map(|sample| sample.tid).collect::<Vec<_>>(),
+            vec![Some(20), Some(20)]
+        );
+        assert_eq!(
+            samples
+                .iter()
+                .map(|sample| sample.frames.as_slice())
+                .collect::<Vec<_>>(),
+            vec![
+                &[super::FoldFrame::Callchain(0x2000)][..],
+                &[
+                    super::FoldFrame::Callchain(0x7000),
+                    super::FoldFrame::UserCallchain(0x4000)
+                ][..],
+            ]
+        );
+        assert_eq!(accumulator.deferred_samples.len(), 1);
+        assert_eq!(accumulator.deferred_samples[0].tid, Some(30));
     }
 }

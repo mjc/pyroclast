@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write;
 use std::hash::{Hash, Hasher};
+use std::io::{Read, Seek, SeekFrom, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -37,6 +38,7 @@ pub struct KernelRelocation {
 pub struct SymbolRequest {
     pub path: PathBuf,
     pub relative_address: u64,
+    pub kernel_mapping_range: Option<(u64, u64)>,
     pub build_id: Option<String>,
     pub file_identity: Option<FileIdentity>,
     pub kernel_relocation: Option<KernelRelocation>,
@@ -45,15 +47,15 @@ pub struct SymbolRequest {
 impl SymbolRequest {
     /// Returns the `file_identity` that participates in identity comparison.
     ///
-    /// perf's `__dso_id__cmp` (tools/perf/util/dso.c) treats a defined build_id
+    /// perf's `__dso_id__cmp` (tools/perf/util/dso.c) treats a defined `build_id`
     /// as the decisive backing-store discriminator and only weighs the mmap2
     /// maj/min/ino when both dso ids recorded them. The same on-disk object can
-    /// arrive with the build_id but no file_identity (inline MMAP2-build-id) or
-    /// with both (plain MMAP2 + HEADER_BUILD_ID), so once a build_id is present
-    /// we ignore file_identity to keep the request — and thus the symbol cache
-    /// entry — unified. Distinct build_ids at the same path still differ via
-    /// `build_id`; file_identity remains the discriminator only when no
-    /// build_id exists.
+    /// arrive with the `build_id` but no `file_identity` (inline MMAP2-build-id) or
+    /// with both (plain MMAP2 + `HEADER_BUILD_ID`), so once a `build_id` is present
+    /// we ignore `file_identity` to keep the request — and thus the symbol cache
+    /// entry — unified. Distinct `build_ids` at the same path still differ via
+    /// `build_id`; `file_identity` remains the discriminator only when no
+    /// `build_id` exists.
     fn identity_file_identity(&self) -> Option<FileIdentity> {
         if self.build_id.is_some() {
             None
@@ -66,6 +68,7 @@ impl SymbolRequest {
 impl PartialEq for SymbolRequest {
     fn eq(&self, other: &Self) -> bool {
         self.relative_address == other.relative_address
+            && self.kernel_mapping_range == other.kernel_mapping_range
             && self.build_id == other.build_id
             && self.identity_file_identity() == other.identity_file_identity()
             && self.kernel_relocation == other.kernel_relocation
@@ -79,6 +82,7 @@ impl Hash for SymbolRequest {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.path.as_os_str().hash(state);
         self.relative_address.hash(state);
+        self.kernel_mapping_range.hash(state);
         self.build_id.hash(state);
         self.identity_file_identity().hash(state);
         self.kernel_relocation.hash(state);
@@ -97,6 +101,7 @@ impl Ord for SymbolRequest {
             .as_os_str()
             .cmp(other.path.as_os_str())
             .then_with(|| self.relative_address.cmp(&other.relative_address))
+            .then_with(|| self.kernel_mapping_range.cmp(&other.kernel_mapping_range))
             .then_with(|| self.build_id.cmp(&other.build_id))
             .then_with(|| {
                 self.identity_file_identity()
@@ -164,6 +169,8 @@ pub trait SymbolResolver {
 pub struct ResolvedSymbolFrames {
     pub frames: Vec<String>,
     pub has_base_symbol: bool,
+    pub has_inline_frames: bool,
+    pub has_non_inline_base_frame: bool,
     /// The `+0x<off>` suffix value (relative to the containing symtab symbol)
     /// that perf prints on every inline AND base frame for this address.
     /// `tools/perf/util/symbol_fprintf.c __symbol__fprintf_symname_offs` uses
@@ -177,9 +184,13 @@ impl ResolvedSymbolFrames {
     #[must_use]
     pub fn from_frames(frames: Vec<String>) -> Self {
         let has_base_symbol = !frames.is_empty();
+        let has_inline_frames = frames.len() > 1;
+        let has_non_inline_base_frame = has_base_symbol && !has_inline_frames;
         Self {
             frames,
             has_base_symbol,
+            has_inline_frames,
+            has_non_inline_base_frame,
             base_offset: None,
         }
     }
@@ -201,16 +212,21 @@ pub struct SymbolFrameCache<'a, R> {
     scratch_missing_requests: Vec<SymbolRequest>,
 }
 
+type ResolvedFrameSlice<'a> = (&'a [String], Option<u64>, bool, bool);
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct MappingFrameKey {
     symbol_source_id: usize,
     relative_address: u64,
+    kernel_mapping_range: Option<(u64, u64)>,
 }
 
 struct CachedMappingFrames {
     frames: Vec<String>,
     folded_rendered: String,
     has_base_symbol: bool,
+    has_inline_frames: bool,
+    has_non_inline_base_frame: bool,
     base_offset: Option<u64>,
 }
 
@@ -278,7 +294,9 @@ struct PerfDwarfDieNode {
 struct PerfDwarfFrameRange {
     range: PerfAddressRange,
     frames: Arc<[PerfDwarfNameId]>,
-    base_symbol_sensitive: bool,
+    has_inline_frames: bool,
+    has_source_line: bool,
+    has_inline_children: bool,
     order: usize,
 }
 
@@ -291,7 +309,6 @@ enum PerfDwarfDieKind {
 #[derive(Default)]
 struct PreparedObjectMetadata {
     object_symbols: PerfObjectSymbolIndex,
-    debug_names: DebugStringNameIndex,
 }
 
 struct CachedObjectMetadata {
@@ -316,7 +333,18 @@ struct PerfDwarfIndexCache {
 
 struct PerfDwarfCachedUnit {
     ranges: Option<Vec<PerfAddressRange>>,
+    source_line_ranges: Option<Vec<PerfAddressRange>>,
     segments: Option<Vec<PerfDwarfFrameRange>>,
+}
+
+struct LiveVdsoElf {
+    path: PathBuf,
+}
+
+impl Drop for LiveVdsoElf {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 #[derive(Default)]
@@ -345,18 +373,44 @@ pub struct PerfSymbolResolver<O> {
     system_map_kallsyms: Option<Kallsyms>,
     system_map_candidates: Vec<PathBuf>,
     system_map_kallsyms_cache: OnceLock<Option<Kallsyms>>,
+    live_vdso_elf_cache: OnceLock<Option<LiveVdsoElf>>,
     /// `/sys/kernel/notes` (or a test override) — the live kernel's GNU
-    /// build-id note. Used to confirm the running kernel matches the build-id
-    /// recorded in the perf.data before trusting live `/proc/kallsyms` for
-    /// `[kernel.kallsyms]` frames.
+    /// build-id note. Used only for System.map-style fallbacks; perf's
+    /// `dso__find_kallsyms()` may still use kallsyms and `kallsyms__delta()`
+    /// relocates it through the recorded reference symbol.
     live_kernel_notes_path: Option<PathBuf>,
     live_kernel_build_id_cache: OnceLock<Option<String>>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Kallsyms {
-    symbols: BTreeMap<u64, String>,
+    symbols: BTreeMap<u64, KallsymsSymbol>,
     addresses_by_name: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct KallsymsSymbol {
+    name: String,
+    end: Option<u64>,
+    module: Option<String>,
+}
+
+impl KallsymsSymbol {
+    fn kernel(name: String) -> Self {
+        Self {
+            name,
+            end: None,
+            module: None,
+        }
+    }
+
+    fn module(name: String, _symbol_type: char, module: String) -> Self {
+        Self {
+            name,
+            end: None,
+            module: Some(module),
+        }
+    }
 }
 
 #[must_use]
@@ -372,6 +426,80 @@ pub fn perf_build_id_elf_path(debug_dir: &Path, build_id: &str) -> PathBuf {
         .join(prefix)
         .join(suffix)
         .join("elf")
+}
+
+#[must_use]
+pub fn perf_build_id_elf_path_for_dso(
+    debug_dir: &Path,
+    dso_path: &Path,
+    build_id: &str,
+) -> PathBuf {
+    if is_perf_vdso_dso_path(dso_path) {
+        // perf's build-id cache uses [vdso]/<build-id>/vdso for VDSO DSOs
+        // (tools/perf/util/build-id.c: build_id_cache__basename with is_vdso).
+        return debug_dir.join("[vdso]").join(build_id).join("vdso");
+    }
+
+    perf_build_id_elf_path(debug_dir, build_id)
+}
+
+fn is_perf_vdso_dso_path(path: &Path) -> bool {
+    matches!(path.to_str(), Some("[vdso]" | "[vdso32]" | "[vdsox32]"))
+}
+
+fn copy_live_vdso_elf_like_perf() -> Option<LiveVdsoElf> {
+    // perf special-cases VDSO maps in tools/perf/util/map.c: map__new()
+    // clears namespace handling, forces pgoff = 0, and calls
+    // machine__findnew_vdso(). tools/perf/util/vdso.c get_file() then copies
+    // the host [vdso] mapping bytes into a temporary ELF and uses that DSO for
+    // symbolization. Do the same for recordings with no VDSO build-id cache.
+    #[cfg(target_os = "linux")]
+    {
+        copy_live_vdso_elf_linux()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn copy_live_vdso_elf_linux() -> Option<LiveVdsoElf> {
+    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+    let vdso_range = maps.lines().find_map(|line| {
+        if !line.split_whitespace().any(|field| field == "[vdso]") {
+            return None;
+        }
+        let range = line.split_whitespace().next()?;
+        let (start, end) = range.split_once('-')?;
+        let start = u64::from_str_radix(start, 16).ok()?;
+        let end = u64::from_str_radix(end, 16).ok()?;
+        (end > start).then_some((start, end))
+    })?;
+    let len = usize::try_from(vdso_range.1.checked_sub(vdso_range.0)?).ok()?;
+    let mut bytes = vec![0; len];
+    let mut mem = std::fs::File::open("/proc/self/mem").ok()?;
+    mem.seek(SeekFrom::Start(vdso_range.0)).ok()?;
+    mem.read_exact(&mut bytes).ok()?;
+
+    let path = std::env::temp_dir().join(format!(
+        "pyroclast-vdso-{}-{}.so",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .ok()?;
+    if file.write_all(&bytes).is_err() {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    Some(LiveVdsoElf { path })
 }
 
 #[must_use]
@@ -689,6 +817,7 @@ where
             system_map_kallsyms: None,
             system_map_candidates: Vec::new(),
             system_map_kallsyms_cache: OnceLock::new(),
+            live_vdso_elf_cache: OnceLock::new(),
             live_kernel_notes_path: None,
             live_kernel_build_id_cache: OnceLock::new(),
         }
@@ -838,7 +967,12 @@ impl Kallsyms {
             .filter_map(parse_kallsyms_line)
             .filter(|(address, _)| *address != 0)
         {
-            insert_kallsyms_symbol(&mut symbols, &mut addresses_by_name, address, symbol);
+            insert_kallsyms_symbol(
+                &mut symbols,
+                &mut addresses_by_name,
+                address,
+                KallsymsSymbol::kernel(symbol),
+            );
         }
         if symbols.is_empty() {
             return Err("kallsyms did not contain any parseable symbols".to_string());
@@ -857,18 +991,22 @@ impl Kallsyms {
     pub fn parse_modules(text: &str) -> Result<Self, String> {
         let mut symbols = BTreeMap::new();
         let mut addresses_by_name = BTreeMap::new();
-        for (address, symbol) in text
+        for (address, symbol, symbol_type, module) in text
             .lines()
-            .filter_map(|line| {
-                parse_module_kallsyms_line(line).map(|(address, symbol, _)| (address, symbol))
-            })
-            .filter(|(address, _)| *address != 0)
+            .filter_map(parse_module_kallsyms_line)
+            .filter(|(address, _, _, _)| *address != 0)
         {
-            insert_kallsyms_symbol(&mut symbols, &mut addresses_by_name, address, symbol);
+            insert_kallsyms_symbol(
+                &mut symbols,
+                &mut addresses_by_name,
+                address,
+                KallsymsSymbol::module(symbol, symbol_type, module),
+            );
         }
         if symbols.is_empty() {
             return Err("kallsyms did not contain any parseable module symbols".to_string());
         }
+        fixup_kallsyms_symbol_ends_like_perf(&mut symbols);
         Ok(Self {
             symbols,
             addresses_by_name,
@@ -883,19 +1021,38 @@ impl Kallsyms {
     pub fn parse_modules_for_path(text: &str, module_path: &str) -> Result<Self, String> {
         let mut symbols = BTreeMap::new();
         let mut addresses_by_name = BTreeMap::new();
-        for (address, symbol) in text
+        for (address, symbol, symbol_type, module) in text
             .lines()
             .filter_map(parse_module_kallsyms_line)
-            .filter(|(_, _, module)| *module == module_path)
-            .map(|(address, symbol, _)| (address, symbol))
-            .filter(|(address, _)| *address != 0)
+            .filter(|(address, _, _, _)| *address != 0)
         {
-            insert_kallsyms_symbol(&mut symbols, &mut addresses_by_name, address, symbol);
+            insert_kallsyms_symbol(
+                &mut symbols,
+                &mut addresses_by_name,
+                address,
+                KallsymsSymbol::module(symbol, symbol_type, module),
+            );
         }
         if symbols.is_empty() {
             return Err(format!(
                 "kallsyms did not contain any parseable module symbols for {module_path}"
             ));
+        }
+        // perf runs symbols__fixup_end() on the full kallsyms tree before
+        // maps__split_kallsyms() moves symbols into per-module DSOs, so symbols
+        // can be capped by the next global kallsyms entry from another module.
+        fixup_kallsyms_symbol_ends_like_perf(&mut symbols);
+        symbols.retain(|_, symbol| symbol.module.as_deref() == Some(module_path));
+        if symbols.is_empty() {
+            return Err(format!(
+                "kallsyms did not contain any parseable module symbols for {module_path}"
+            ));
+        }
+        addresses_by_name.clear();
+        for (address, symbol) in &symbols {
+            addresses_by_name
+                .entry(symbol.name.clone())
+                .or_insert(*address);
         }
         Ok(Self {
             symbols,
@@ -925,7 +1082,7 @@ impl Kallsyms {
         self.symbols
             .range(..=address)
             .next_back()
-            .map(|(_, symbol)| symbol.clone())
+            .map(|(_, symbol)| symbol.name.clone())
     }
 
     /// Resolves an address to `name+0x<off>`, matching perf-script kernel
@@ -936,7 +1093,37 @@ impl Kallsyms {
         self.symbols
             .range(..=address)
             .next_back()
-            .map(|(start, symbol)| format!("{symbol}+0x{:x}", address - start))
+            .map(|(start, symbol)| format!("{}+0x{:x}", symbol.name, address - start))
+    }
+
+    #[must_use]
+    pub fn resolve_module_with_offset(&self, address: u64) -> Option<String> {
+        self.resolve_module_with_offset_in_range(address, None)
+    }
+
+    #[must_use]
+    pub fn resolve_module_with_offset_in_range(
+        &self,
+        address: u64,
+        range: Option<(u64, u64)>,
+    ) -> Option<String> {
+        self.symbols
+            .range(..=address)
+            .next_back()
+            .and_then(|(start, symbol)| {
+                let mut end = symbol.end?;
+                if let Some((range_start, range_end)) = range {
+                    if *start < range_start || range_end <= address {
+                        return None;
+                    }
+                    end = end.min(range_end);
+                }
+                // perf's map__find_symbol() calls symbols__find(), which
+                // requires start <= ip < end. kallsyms keeps T/W/D/B symbols
+                // before maps__split_kallsyms(), so data/BSS module symbols
+                // are valid anchors too.
+                (address < end).then(|| format!("{}+0x{:x}", symbol.name, address - start))
+            })
     }
 
     #[must_use]
@@ -1130,14 +1317,21 @@ where
     pub fn resolve_mapping_ref_with_offset(
         &mut self,
         mapping: &ResolvedMappingRef<'_>,
-    ) -> Result<(&[String], Option<u64>), String> {
+    ) -> Result<ResolvedFrameSlice<'_>, String> {
         let key = mapping_frame_key(mapping);
         if !self.resolved_by_mapping.contains_key(&key) {
             self.prefetch_mapping_refs(std::slice::from_ref(mapping))?;
         }
         self.resolved_by_mapping
             .get(&key)
-            .map(|cached| (cached.frames.as_slice(), cached.base_offset))
+            .map(|cached| {
+                (
+                    cached.frames.as_slice(),
+                    cached.base_offset,
+                    cached.has_inline_frames,
+                    cached.has_non_inline_base_frame,
+                )
+            })
             .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())
     }
 
@@ -1269,6 +1463,8 @@ where
                         frames: resolved_frames.frames,
                         folded_rendered,
                         has_base_symbol: resolved_frames.has_base_symbol,
+                        has_inline_frames: resolved_frames.has_inline_frames,
+                        has_non_inline_base_frame: resolved_frames.has_non_inline_base_frame,
                         base_offset: resolved_frames.base_offset,
                     },
                 );
@@ -1384,6 +1580,8 @@ where
                         frames: resolved_frames.frames,
                         folded_rendered,
                         has_base_symbol: resolved_frames.has_base_symbol,
+                        has_inline_frames: resolved_frames.has_inline_frames,
+                        has_non_inline_base_frame: resolved_frames.has_non_inline_base_frame,
                         base_offset: resolved_frames.base_offset,
                     },
                 );
@@ -1428,42 +1626,14 @@ where
 }
 
 fn render_perf_script_inferno_folded_frames(frames: &[String]) -> String {
-    let mut rendered = String::with_capacity(
-        frames
-            .iter()
-            .enumerate()
-            .map(|(index, frame)| {
-                if should_skip_perf_script_folded_abstract_origin_frame(
-                    frame,
-                    frames.get(index + 1),
-                ) {
-                    0
-                } else {
-                    frame.len() + 1
-                }
-            })
-            .sum(),
-    );
+    let mut rendered = String::with_capacity(frames.iter().map(|frame| frame.len() + 1).sum());
     let mut scratch = String::new();
     crate::folded::render_inferno_perf_raw_stack_into(
         &mut rendered,
-        frames.iter().enumerate().filter_map(|(index, frame)| {
-            if should_skip_perf_script_folded_abstract_origin_frame(frame, frames.get(index + 1)) {
-                None
-            } else {
-                Some(frame.as_str())
-            }
-        }),
+        frames.iter().map(String::as_str),
         &mut scratch,
     );
     rendered
-}
-
-fn should_skip_perf_script_folded_abstract_origin_frame(
-    label: &str,
-    next_label: Option<&String>,
-) -> bool {
-    label == "fn0" && next_label.is_some_and(|next| next == "mix")
 }
 
 impl<O> SymbolResolver for PerfSymbolResolver<O>
@@ -1516,7 +1686,11 @@ where
         if !user_requests.is_empty() {
             let user_symbols = self.object_resolver.resolve_batch(&user_requests)?;
             for (index, symbol) in user_indexes.into_iter().zip(user_symbols) {
-                resolved[index] = symbol;
+                resolved[index] = symbol.or_else(|| {
+                    is_kernel_module_symbol_path(&requests[index].path)
+                        .then(|| self.resolve_kernel_symbol(&requests[index]))
+                        .flatten()
+                });
             }
         }
         Ok(resolved)
@@ -1585,7 +1759,15 @@ where
                 .object_resolver
                 .resolve_frame_batch_with_metadata(&user_requests)?;
             for (index, frames) in user_indexes.into_iter().zip(user_frames) {
-                resolved[index] = frames;
+                resolved[index] = if frames.frames.is_empty()
+                    && is_kernel_module_symbol_path(&requests[index].path)
+                {
+                    self.resolve_kernel_symbol(&requests[index])
+                        .map(|symbol| ResolvedSymbolFrames::from_frames(vec![symbol]))
+                        .unwrap_or(frames)
+                } else {
+                    frames
+                };
             }
         }
         Ok(resolved)
@@ -1644,7 +1826,15 @@ where
                 .object_resolver
                 .resolve_base_frame_batch_with_metadata(&user_requests)?;
             for (index, frames) in user_indexes.into_iter().zip(user_frames) {
-                resolved[index] = frames;
+                resolved[index] = if frames.frames.is_empty()
+                    && is_kernel_module_symbol_path(&requests[index].path)
+                {
+                    self.resolve_kernel_symbol(&requests[index])
+                        .map(|symbol| ResolvedSymbolFrames::from_frames(vec![symbol]))
+                        .unwrap_or(frames)
+                } else {
+                    frames
+                };
             }
         }
         Ok(resolved)
@@ -1661,6 +1851,7 @@ where
         address_cache: &mut ObjectAddressCache,
     ) -> SymbolRequest {
         self.cached_object_symbol_request(request, address_cache)
+            .or_else(|| self.live_vdso_symbol_request(request, address_cache))
             .unwrap_or_else(|| Self::live_object_symbol_request(request, address_cache))
     }
 
@@ -1671,7 +1862,7 @@ where
     ) -> Option<SymbolRequest> {
         let debug_dir = self.debug_dir.as_ref()?;
         let build_id = request.build_id.as_ref()?;
-        let elf = perf_build_id_elf_path(debug_dir, build_id);
+        let elf = perf_build_id_elf_path_for_dso(debug_dir, &request.path, build_id);
         elf.exists().then(|| {
             clean_object_symbol_request_with_cache(elf, request.relative_address, address_cache)
         })
@@ -1688,6 +1879,25 @@ where
             request.relative_address,
             address_cache,
         )
+    }
+
+    fn live_vdso_symbol_request(
+        &self,
+        request: &SymbolRequest,
+        address_cache: &mut ObjectAddressCache,
+    ) -> Option<SymbolRequest> {
+        if !is_perf_vdso_dso_path(&request.path) {
+            return None;
+        }
+        let live_vdso = self
+            .live_vdso_elf_cache
+            .get_or_init(copy_live_vdso_elf_like_perf)
+            .as_ref()?;
+        Some(clean_object_symbol_request_with_cache(
+            live_vdso.path.clone(),
+            request.relative_address,
+            address_cache,
+        ))
     }
 
     fn live_kallsyms_ref(&self) -> Option<&Kallsyms> {
@@ -1753,37 +1963,41 @@ where
 
     fn resolve_kernel_symbol(&self, request: &SymbolRequest) -> Option<String> {
         if is_kernel_module_symbol_path(&request.path) {
-            self.live_kallsyms
+            self.kallsyms
                 .as_ref()
-                .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
+                .and_then(|kallsyms| resolve_module_kallsyms(kallsyms, request))
+                .or_else(|| {
+                    // tools/perf/util/symbol.c dso__find_kallsyms() does not
+                    // reject /proc/kallsyms for kernel/module maps merely
+                    // because the DSO has a build-id; after build-id/kcore
+                    // attempts it falls through to machine->root_dir/proc/kallsyms.
+                    self.live_kallsyms
+                        .as_ref()
+                        .and_then(|kallsyms| resolve_module_kallsyms(kallsyms, request))
+                })
                 .or_else(|| {
                     request
                         .path
                         .to_str()
                         .and_then(|module_path| self.live_module_kallsyms_for_path(module_path))
-                        .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms.as_ref(), request))
-                })
-                .or_else(|| {
-                    self.kallsyms
-                        .as_ref()
-                        .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
+                        .and_then(|kallsyms| resolve_module_kallsyms(kallsyms.as_ref(), request))
                 })
         } else {
             self.kallsyms
                 .as_ref()
                 .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
                 .or_else(|| {
-                    if !self.can_use_system_kernel_symbols(request) {
-                        return None;
-                    }
-                    self.system_map_kallsyms_ref()
+                    // tools/perf/util/symbol.c dso__find_kallsyms() tries the
+                    // host/root /proc/kallsyms path before the final cached
+                    // kallsyms fallback for host kernel maps.
+                    self.live_kallsyms_ref()
                         .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
                 })
                 .or_else(|| {
                     if !self.can_use_system_kernel_symbols(request) {
                         return None;
                     }
-                    self.live_kallsyms_ref()
+                    self.system_map_kallsyms_ref()
                         .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
                 })
         }
@@ -1817,6 +2031,7 @@ fn clean_object_symbol_request_with_cache(
     SymbolRequest {
         path,
         relative_address,
+        kernel_mapping_range: None,
         build_id: None,
         file_identity: None,
         kernel_relocation: None,
@@ -1908,7 +2123,7 @@ where
             if let Some(metadata) = object_metadata.as_ref() {
                 let addresses = indexes
                     .iter()
-                    .map(|index| requests[*index].relative_address)
+                    .map(|&i| requests[i].relative_address)
                     .collect::<Vec<_>>();
                 metadata.prepare_dwarf_frames_for_addresses(&addresses);
             }
@@ -1918,27 +2133,48 @@ where
                     object_symbols_for_frame(object_metadata.as_ref(), request.relative_address);
                 let object_symbol = object_symbols.bare;
                 let has_base_symbol = object_symbol.is_some();
-                let mut frames = if let Some(object_symbol) = object_symbol {
-                    object_metadata
-                        .as_ref()
-                        .and_then(|metadata| {
-                            metadata.dwarf_frame_names_for_base_symbol(
-                                request.relative_address,
-                                Some(object_symbol),
+                let (mut frames, has_inline_frames, has_non_inline_base_frame) =
+                    if let Some(object_symbol) = object_symbol {
+                        object_metadata
+                            .as_ref()
+                            .and_then(|metadata| {
+                                metadata.dwarf_frame_names_for_base_symbol(
+                                    request.relative_address,
+                                    Some(object_symbol),
+                                )
+                            })
+                            .map_or_else(
+                                || (vec![object_symbol.to_string()], false, true),
+                                |dwarf_frames| {
+                                    let has_non_inline_base_frame = dwarf_frames
+                                        .frames
+                                        .iter()
+                                        .any(|frame| frame == object_symbol);
+                                    (
+                                        perf_inline_frame_order(dwarf_frames.frames),
+                                        dwarf_frames.has_inline_frames,
+                                        has_non_inline_base_frame,
+                                    )
+                                },
                             )
-                        })
-                        .map_or_else(|| vec![object_symbol.to_string()], perf_inline_frame_order)
-                } else {
-                    symbol.map_or_else(Vec::new, |name| vec![name])
-                };
+                    } else {
+                        (
+                            symbol.map_or_else(Vec::new, |name| vec![name]),
+                            false,
+                            false,
+                        )
+                    };
                 frames = perf_frames_with_object_alias_and_offset(
                     frames,
                     object_symbol,
                     object_symbols.offset,
+                    has_inline_frames,
                 );
                 resolved[index] = ResolvedSymbolFrames {
                     frames,
                     has_base_symbol,
+                    has_inline_frames,
+                    has_non_inline_base_frame,
                     base_offset: object_symbols.offset,
                 };
             }
@@ -2015,16 +2251,9 @@ impl SymbolResolver for RustAddr2lineResolver {
                 });
                 let symbol = loader
                     .find_symbol(request.relative_address)
-                    .map(demangle_addr2line_name)
+                    .map(demangle_addr2line_name_qualified)
                     .or_else(|| rust_addr2line_frame_name(&loader, request.relative_address));
-                let mut symbol = perf_name_with_object_alias(symbol, object_symbol);
-                if let Some(metadata) = &object_metadata {
-                    specialize_symbol_from_debug_strings(
-                        &mut symbol,
-                        &metadata.object_metadata.debug_names,
-                    );
-                }
-                resolved[index] = symbol;
+                resolved[index] = perf_name_with_object_alias(symbol, object_symbol);
             }
         }
         Ok(resolved)
@@ -2049,57 +2278,92 @@ impl SymbolResolver for RustAddr2lineResolver {
             let path = Path::new(path);
             let object_metadata = self.object_metadata(path);
             if let Some(metadata) = object_metadata.as_ref() {
-                let addresses = indexes
+                let addresses: Vec<_> = indexes
                     .iter()
-                    .map(|index| requests[*index].relative_address)
-                    .collect::<Vec<_>>();
+                    .map(|&i| requests[i].relative_address)
+                    .collect();
                 metadata.prepare_dwarf_frames_for_addresses(&addresses);
             }
-            let mut loader = None;
-            let mut loader_attempted = false;
+            let (mut loader, mut loader_attempted) = (None, false);
             for index in indexes {
                 let request = &requests[index];
-                let object_symbols =
-                    object_symbols_for_frame(object_metadata.as_ref(), request.relative_address);
+                let address = request.relative_address;
+                let object_symbols = object_symbols_for_frame(object_metadata.as_ref(), address);
                 let object_symbol = object_symbols.bare;
                 let has_base_symbol = object_symbol.is_some();
-                let mut frames = if let Some(object_symbol) = object_symbol {
-                    object_metadata
-                        .as_ref()
-                        .and_then(|metadata| {
-                            metadata.dwarf_frame_names_for_base_symbol(
-                                request.relative_address,
-                                Some(object_symbol),
+                let (mut frames, has_inline_frames, has_non_inline_base_frame) =
+                    if let Some(object_symbol) = object_symbol {
+                        object_metadata
+                            .as_ref()
+                            .and_then(|metadata| {
+                                metadata
+                                    .dwarf_frame_names_for_base_symbol(address, Some(object_symbol))
+                            })
+                            .map_or_else(
+                                || {
+                                    let libdw_source_line_hit =
+                                        object_metadata.as_ref().is_some_and(|metadata| {
+                                            metadata.dwarf_has_source_line_for_address(address)
+                                        });
+                                    if libdw_source_line_hit {
+                                        (vec![object_symbol.to_string()], false, true)
+                                    } else {
+                                        object_metadata
+                                            .as_ref()
+                                            .and_then(|metadata| {
+                                                metadata
+                                                    .object_metadata
+                                                    .bfd_function_record_name(address)
+                                            })
+                                            .filter(|record_name| *record_name != object_symbol)
+                                            .map_or_else(
+                                                || (vec![object_symbol.to_string()], false, true),
+                                                |record_name| {
+                                                    (vec![record_name.to_string()], true, false)
+                                                },
+                                            )
+                                    }
+                                },
+                                |dwarf_frames| {
+                                    let has_non_inline_base_frame = dwarf_frames
+                                        .frames
+                                        .iter()
+                                        .any(|frame| frame == object_symbol);
+                                    (
+                                        perf_inline_frame_order(dwarf_frames.frames),
+                                        dwarf_frames.has_inline_frames,
+                                        has_non_inline_base_frame,
+                                    )
+                                },
                             )
-                        })
-                        .map_or_else(|| vec![object_symbol.to_string()], perf_inline_frame_order)
-                } else {
-                    rust_addr2line_loader(path, &mut loader, &mut loader_attempted)
-                        .and_then(|loader| {
-                            loader
-                                .find_symbol(request.relative_address)
-                                .map(|name| vec![demangle_addr2line_name(name)])
-                                .or_else(|| {
-                                    rust_addr2line_frame_names(loader, request.relative_address)
+                    } else {
+                        (
+                            rust_addr2line_loader(path, &mut loader, &mut loader_attempted)
+                                .and_then(|loader| {
+                                    loader
+                                        .find_symbol(address)
+                                        .map(|name| vec![demangle_addr2line_name_qualified(name)])
+                                        .or_else(|| rust_addr2line_frame_names(loader, address))
                                 })
-                        })
-                        .unwrap_or_default()
-                };
+                                .unwrap_or_default(),
+                            false,
+                            false,
+                        )
+                    };
                 frames = perf_frames_with_object_alias_and_offset(
                     frames,
                     object_symbol,
                     object_symbols.offset,
+                    has_inline_frames,
                 );
                 // No .debug_str generic specialization here: inline-frame names
-                // now come from the DWARF linkage name demangled like perf's
-                // external-addr2line backend (fully qualified, perf-faithful).
-                // Re-specializing from .debug_str would rewrite e.g.
-                // `core::slice::<impl [T]>::sort_unstable` to `sort_unstable<u64>`,
-                // which perf never prints (verified against
-                // target/oracle/dwarf.perf.script).
+                // already follow perf's libdw `dwarf_diename` path. Rewriting
+                // them again can invent spellings perf never printed.
                 resolved[index] = ResolvedSymbolFrames {
                     frames,
                     has_base_symbol,
+                    has_inline_frames,
+                    has_non_inline_base_frame,
                     base_offset: object_symbols.offset,
                 };
             }
@@ -2127,7 +2391,8 @@ fn resolve_base_frames_from_object_metadata(
         let metadata = object_metadata(path);
         for index in indexes {
             let request = &requests[index];
-            let object_symbols = object_symbols_for_frame(metadata.as_ref(), request.relative_address);
+            let object_symbols =
+                object_symbols_for_frame(metadata.as_ref(), request.relative_address);
             let Some(object_symbol) = object_symbols.bare else {
                 continue;
             };
@@ -2136,16 +2401,17 @@ fn resolve_base_frames_from_object_metadata(
                 frames,
                 Some(object_symbol),
                 object_symbols.offset,
+                false,
             );
-            if let Some(metadata) = &metadata {
-                specialize_frames_from_debug_strings(
-                    &mut frames,
-                    &metadata.object_metadata.debug_names,
-                );
-            }
+            // perf's event-line IP path is machine__resolve() -> map__find_symbol()
+            // -> __symbol__fprintf_symname_offs(); it uses the demangled ELF
+            // symtab name and does not replace it with a DWARF debug-string
+            // leaf name.
             resolved[index] = ResolvedSymbolFrames {
                 frames,
                 has_base_symbol: true,
+                has_inline_frames: false,
+                has_non_inline_base_frame: true,
                 // The no-inline base path bakes +0x<off> into the single frame
                 // name via with_offset, so no separate per-line offset is used.
                 base_offset: object_symbols.offset,
@@ -2155,15 +2421,10 @@ fn resolve_base_frames_from_object_metadata(
     resolved
 }
 
-fn demangle_addr2line_name(name: &str) -> String {
-    perf_dwarf_function_name(&addr2line::demangle_auto(Cow::Borrowed(name), None))
-}
-
 /// Demangles a mangled (linkage) symbol the way perf's external-addr2line
 /// srcline backend does: fully qualified, no trailing `::h<hash>`, generic
 /// args preserved (`dso__demangle_sym` ->
-/// `rust_demangle_display_demangle(..., /*alternate=*/true)`). Unlike
-/// [`demangle_addr2line_name`] it does NOT collapse to the unqualified leaf.
+/// `rust_demangle_display_demangle(..., /*alternate=*/true)`).
 fn demangle_addr2line_name_qualified(name: &str) -> String {
     addr2line::demangle_auto(Cow::Borrowed(name), None).into_owned()
 }
@@ -2196,7 +2457,11 @@ fn perf_frames_with_object_alias_and_offset(
     frames: Vec<String>,
     object_alias: Option<&str>,
     object_alias_offset: Option<u64>,
+    has_inline_frames: bool,
 ) -> Vec<String> {
+    if has_inline_frames {
+        return frames;
+    }
     let mut frames = perf_frames_with_object_alias(frames, object_alias);
     if frames.len() == 1
         && let Some(alias) = object_alias
@@ -2227,6 +2492,8 @@ struct PerfSymbolCandidate {
     size: u64,
     scope: PerfSymbolScope,
     binding: PerfSymbolBinding,
+    bfd_function_like: bool,
+    bfd_function: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2246,7 +2513,7 @@ fn perf_symbol_is_candidate(symbol: &object::Symbol<'_, '_>) -> bool {
         && !symbol.name().unwrap_or_default().is_empty()
         && matches!(
             symbol.kind(),
-            SymbolKind::Text | SymbolKind::Data | SymbolKind::Label
+            SymbolKind::Text | SymbolKind::Data | SymbolKind::Label | SymbolKind::Unknown
         )
 }
 
@@ -2270,22 +2537,24 @@ fn perf_best_duplicate_symbol<'a>(
     current: &'a PerfSymbolCandidate,
     candidate: &'a PerfSymbolCandidate,
 ) -> &'a PerfSymbolCandidate {
+    // tools/perf/util/symbol.c choose_best_symbol(): size, non-weak, global,
+    // fewer leading underscores, then longest name.
     if current.size == 0 && candidate.size > 0 {
         return candidate;
     }
     if candidate.size == 0 && current.size > 0 {
         return current;
     }
-    if current.scope == PerfSymbolScope::Global && candidate.scope != PerfSymbolScope::Global {
-        return current;
-    }
-    if candidate.scope == PerfSymbolScope::Global && current.scope != PerfSymbolScope::Global {
-        return candidate;
-    }
     if candidate.binding == PerfSymbolBinding::Weak && current.binding != PerfSymbolBinding::Weak {
         return current;
     }
     if current.binding == PerfSymbolBinding::Weak && candidate.binding != PerfSymbolBinding::Weak {
+        return candidate;
+    }
+    if current.scope == PerfSymbolScope::Global && candidate.scope != PerfSymbolScope::Global {
+        return current;
+    }
+    if candidate.scope == PerfSymbolScope::Global && current.scope != PerfSymbolScope::Global {
         return candidate;
     }
     let current_underscores = leading_underscore_count(&current.name);
@@ -2311,7 +2580,6 @@ impl PreparedObjectMetadata {
     fn from_object_bytes(object_bytes: &[u8]) -> Self {
         Self {
             object_symbols: PerfObjectSymbolIndex::from_object_bytes(object_bytes),
-            debug_names: DebugStringNameIndex::from_object_bytes(object_bytes),
         }
     }
 
@@ -2325,6 +2593,10 @@ impl PreparedObjectMetadata {
             offset: self.object_symbols.symbol_offset(address),
         }
     }
+
+    fn bfd_function_record_name(&self, address: u64) -> Option<&str> {
+        self.object_symbols.bfd_function_record_name(address)
+    }
 }
 
 impl PerfObjectSymbolIndex {
@@ -2332,7 +2604,8 @@ impl PerfObjectSymbolIndex {
         let Ok(object) = object::File::parse(object_bytes) else {
             return Self::default();
         };
-        let mut symbols = Vec::with_capacity(object.symbols().count() + object.dynamic_symbols().count());
+        let mut symbols =
+            Vec::with_capacity(object.symbols().count() + object.dynamic_symbols().count());
         symbols.extend(
             object
                 .symbols()
@@ -2341,6 +2614,7 @@ impl PerfObjectSymbolIndex {
         );
         symbols.extend(perf_synthesized_plt_symbols(&object, &symbols));
         symbols.sort_by_key(|symbol| symbol.address);
+        fixup_object_symbol_ends_like_perf(&mut symbols);
         let mut max_end = 0_u64;
         let max_end_by_index = symbols
             .iter()
@@ -2363,6 +2637,11 @@ impl PerfObjectSymbolIndex {
     fn symbol_offset(&self, address: u64) -> Option<u64> {
         let candidate = self.symbol(address)?;
         Some(address.saturating_sub(candidate.address))
+    }
+
+    fn bfd_function_record_name(&self, address: u64) -> Option<&str> {
+        self.bfd_function_record_symbol(address)
+            .map(|candidate| candidate.name.as_str())
     }
 
     #[cfg(test)]
@@ -2389,12 +2668,105 @@ impl PerfObjectSymbolIndex {
             best = Some(match best {
                 Some(current) if current.address > candidate.address => current,
                 Some(current) if current.address == candidate.address => {
-                    perf_best_duplicate_symbol(current, candidate)
+                    // perf inserts equal-start symbols to the right side of the
+                    // rb-tree and symbols__fixup_duplicate() walks in-order, so
+                    // the earlier inserted symbol is syma. This reverse scan
+                    // sees the later symbol first; pass the earlier candidate as
+                    // the first argument to preserve perf's final arch fallback.
+                    perf_best_duplicate_symbol(candidate, current)
                 }
                 _ => candidate,
             });
         }
         best
+    }
+
+    fn bfd_function_record_symbol(&self, address: u64) -> Option<&PerfSymbolCandidate> {
+        // binutils-gdb bfd/dwarf2.c _bfd_elf_find_function() walks BFD's
+        // canonical symbol array and applies better_fit(). bfd/elf.c sorts
+        // that array with local symbols before globals, so equal-start/equal-
+        // size aliases keep the earlier local entry rather than perf's normal
+        // choose_best_symbol() global preference.
+        let end = self
+            .symbols
+            .partition_point(|candidate| candidate.address <= address);
+        let mut best = None::<&PerfSymbolCandidate>;
+        for candidate in &self.symbols[..end] {
+            if !candidate.bfd_function_like {
+                continue;
+            }
+            best = Some(match best {
+                Some(current) if !bfd_function_record_better_fit(current, candidate, address) => {
+                    current
+                }
+                _ => candidate,
+            });
+        }
+        best
+    }
+}
+
+fn bfd_function_record_size(candidate: &PerfSymbolCandidate) -> u64 {
+    if candidate.size == 0 {
+        1
+    } else {
+        candidate.size
+    }
+}
+
+fn bfd_function_record_better_fit(
+    current: &PerfSymbolCandidate,
+    candidate: &PerfSymbolCandidate,
+    address: u64,
+) -> bool {
+    // Mirrors binutils-gdb bfd/dwarf2.c better_fit() for the tie-breakers we
+    // can represent from object::Symbol data: closest start, covering range,
+    // function over non-function, then smaller range. BFD's final equal case
+    // returns false, preserving the earlier canonical symbol.
+    if candidate.address > address {
+        return false;
+    }
+    if candidate.address < current.address {
+        return false;
+    }
+    if candidate.address > current.address {
+        return true;
+    }
+
+    let current_size = bfd_function_record_size(current);
+    let candidate_size = bfd_function_record_size(candidate);
+    if current.address.saturating_add(current_size) <= address {
+        return candidate_size > current_size;
+    }
+    if candidate.address.saturating_add(candidate_size) <= address {
+        return false;
+    }
+    if current.bfd_function && !candidate.bfd_function {
+        return false;
+    }
+    if candidate.bfd_function && !current.bfd_function {
+        return true;
+    }
+    candidate_size < current_size
+}
+
+fn fixup_object_symbol_ends_like_perf(symbols: &mut [PerfSymbolCandidate]) {
+    // tools/perf/util/symbol-elf.c dso__load_sym_internal() and libbfd.c
+    // bfd2elf__load_symbols() call symbols__fixup_end(..., false) before
+    // duplicate cleanup, extending zero-sized ASM labels to the next symbol.
+    for index in 1..symbols.len() {
+        let current_address = symbols[index].address;
+        let previous = &mut symbols[index - 1];
+        if previous.size == 0 {
+            previous.size = current_address.saturating_sub(previous.address);
+        }
+    }
+    if let Some(last) = symbols.last_mut()
+        && last.size == 0
+    {
+        last.size = round_up_to_page(last.address)
+            .saturating_add(4096)
+            .saturating_sub(last.address);
     }
 }
 
@@ -2437,6 +2809,8 @@ fn perf_synthesized_plt_symbols(
             size: X86_64_PLT_ENTRY_SIZE,
             scope: PerfSymbolScope::Global,
             binding: PerfSymbolBinding::Global,
+            bfd_function_like: true,
+            bfd_function: true,
         });
     }
     for relocation in relocations {
@@ -2457,6 +2831,8 @@ fn perf_synthesized_plt_symbols(
             size: X86_64_PLT_ENTRY_SIZE,
             scope: PerfSymbolScope::Global,
             binding: PerfSymbolBinding::Global,
+            bfd_function_like: true,
+            bfd_function: true,
         });
         plt_offset += X86_64_PLT_ENTRY_SIZE;
     }
@@ -2473,7 +2849,9 @@ fn perf_x86_64_plt_relocations(object: &object::File<'_>) -> Option<Vec<PerfPltR
     let dynamic_symbols = object.dynamic_symbol_table()?;
     let rela_plt = object.section_by_name(".rela.plt")?.data().ok()?;
     let relocations = rela_plt
-        .chunks_exact(ELF64_RELA_ENTRY_SIZE)
+        .as_chunks::<ELF64_RELA_ENTRY_SIZE>()
+        .0
+        .iter()
         .filter_map(parse_elf64_rela_entry)
         .filter_map(|rela| perf_x86_64_plt_relocation_from_rela(&dynamic_symbols, rela))
         .collect::<Vec<_>>();
@@ -2488,7 +2866,7 @@ struct Elf64RelaEntry {
     addend: i64,
 }
 
-fn parse_elf64_rela_entry(entry: &[u8]) -> Option<Elf64RelaEntry> {
+fn parse_elf64_rela_entry(entry: &[u8; ELF64_RELA_ENTRY_SIZE]) -> Option<Elf64RelaEntry> {
     let offset = u64::from_le_bytes(entry[0..8].try_into().ok()?);
     let info = u64::from_le_bytes(entry[8..16].try_into().ok()?);
     let addend = i64::from_le_bytes(entry[16..24].try_into().ok()?);
@@ -2543,6 +2921,7 @@ fn perf_best_symbol_at(
 fn perf_symbol_candidate_from_object_symbol(
     symbol: &object::Symbol<'_, '_>,
 ) -> Option<PerfSymbolCandidate> {
+    let kind = symbol.kind();
     perf_symbol_is_candidate(symbol).then(|| PerfSymbolCandidate {
         name: perf_symbol_name(&addr2line::demangle_auto(
             Cow::Borrowed(symbol.name().unwrap_or_default()),
@@ -2560,6 +2939,8 @@ fn perf_symbol_candidate_from_object_symbol(
         } else {
             PerfSymbolBinding::Global
         },
+        bfd_function_like: !matches!(kind, SymbolKind::Data),
+        bfd_function: matches!(kind, SymbolKind::Text),
     })
 }
 
@@ -2595,16 +2976,19 @@ fn rust_addr2line_frame_names(loader: &addr2line::Loader, address: u64) -> Optio
 #[must_use]
 pub fn perf_dwarf_frame_names_from_object(path: &Path, address: u64) -> Option<Vec<String>> {
     let bytes = std::fs::read(path).ok()?;
-    PerfDwarfNameResolver::from_object_bytes_for_addresses(&bytes, &[address])
-        .ok()?
-        .frame_names(address)
+    perf_dwarf_frame_names_from_object_bytes(&bytes, address)
 }
 
 #[must_use]
 pub fn perf_dwarf_frame_names_from_object_bytes(bytes: &[u8], address: u64) -> Option<Vec<String>> {
+    let base_symbol = PerfObjectSymbolIndex::from_object_bytes(bytes)
+        .symbol_name(address)
+        .map(str::to_string);
     PerfDwarfNameResolver::from_object_bytes_for_addresses(bytes, &[address])
         .ok()?
-        .frame_names(address)
+        .frame_names_for_base_symbol(address, base_symbol.as_deref())
+        .map(|frames| frames.frames)
+        .or(base_symbol.map(|symbol| vec![symbol]))
 }
 
 impl PerfDwarfNameResolver {
@@ -2648,10 +3032,11 @@ impl PerfDwarfNameResolver {
             {
                 continue;
             }
+            let source_line_ranges = perf_dwarf_source_line_ranges(&unit);
             let roots = perf_dwarf_unit_roots(&dwarf, &unit, &mut names);
             units.push(PerfDwarfUnitIndex {
                 ranges,
-                segments: perf_dwarf_frame_ranges_from_roots(&roots),
+                segments: perf_dwarf_frame_ranges_from_roots(&roots, &source_line_ranges),
             });
         }
         Ok(Self {
@@ -2660,15 +3045,11 @@ impl PerfDwarfNameResolver {
         })
     }
 
-    fn frame_names(&self, address: u64) -> Option<Vec<String>> {
-        self.frame_names_for_base_symbol(address, None)
-    }
-
     fn frame_names_for_base_symbol(
         &self,
         address: u64,
         base_symbol: Option<&str>,
-    ) -> Option<Vec<String>> {
+    ) -> Option<PerfDwarfFrameNames> {
         for unit in &self.units {
             if !perf_dwarf_unit_contains_address(unit, address) {
                 continue;
@@ -2712,7 +3093,7 @@ impl CachedObjectMetadata {
         &self,
         address: u64,
         base_symbol: Option<&str>,
-    ) -> Option<Vec<String>> {
+    ) -> Option<PerfDwarfFrameNames> {
         let cache = self.dwarf_index.lock().expect("dwarf index cache lock");
         for unit in cache.units.as_deref()? {
             let Some(segments) = &unit.segments else {
@@ -2735,6 +3116,21 @@ impl CachedObjectMetadata {
             }
         }
         None
+    }
+
+    fn dwarf_has_source_line_for_address(&self, address: u64) -> bool {
+        let cache = self.dwarf_index.lock().expect("dwarf index cache lock");
+        cache.units.as_deref().is_some_and(|units| {
+            units.iter().any(|unit| {
+                unit.ranges
+                    .as_ref()
+                    .is_none_or(|ranges| perf_dwarf_ranges_contain(ranges, address))
+                    && unit
+                        .source_line_ranges
+                        .as_deref()
+                        .is_some_and(|ranges| perf_dwarf_ranges_contain(ranges, address))
+            })
+        })
     }
 }
 
@@ -2768,6 +3164,7 @@ fn build_dwarf_index_cache_for_addresses(
             if scanning {
                 units.push(PerfDwarfCachedUnit {
                     ranges: Some(Vec::new()),
+                    source_line_ranges: Some(Vec::new()),
                     segments: Some(Vec::new()),
                 });
             }
@@ -2777,6 +3174,7 @@ fn build_dwarf_index_cache_for_addresses(
         if scanning {
             units.push(PerfDwarfCachedUnit {
                 ranges: perf_dwarf_ranges(dwarf.unit_ranges(&unit).ok()),
+                source_line_ranges: Some(perf_dwarf_source_line_ranges(&unit)),
                 segments: None,
             });
         }
@@ -2786,8 +3184,14 @@ fn build_dwarf_index_cache_for_addresses(
         if cached_unit.segments.is_none()
             && perf_dwarf_unit_ranges_match_addresses(cached_unit.ranges.as_deref(), addresses)
         {
+            let source_line_ranges = cached_unit
+                .source_line_ranges
+                .get_or_insert_with(|| perf_dwarf_source_line_ranges(&unit));
             let roots = perf_dwarf_unit_roots(&dwarf, &unit, &mut cache.names);
-            cached_unit.segments = Some(perf_dwarf_frame_ranges_from_roots(&roots));
+            cached_unit.segments = Some(perf_dwarf_frame_ranges_from_roots(
+                &roots,
+                source_line_ranges.as_slice(),
+            ));
         }
         ordinal += 1;
     }
@@ -2804,6 +3208,41 @@ fn perf_dwarf_unit_ranges_match_addresses(
             .iter()
             .any(|address| perf_dwarf_ranges_contain(ranges, *address))
     })
+}
+
+fn perf_dwarf_source_line_ranges<R>(unit: &gimli::Unit<R>) -> Vec<PerfAddressRange>
+where
+    R: gimli::Reader,
+{
+    let Some(program) = unit.line_program.clone() else {
+        return Vec::new();
+    };
+    let mut rows = program.rows();
+    let mut ranges = Vec::new();
+    let mut previous_address = None;
+    while let Ok(Some((_, row))) = rows.next_row() {
+        let address = row.address();
+        if row.end_sequence() {
+            if let Some(begin) = previous_address.take()
+                && begin < address
+            {
+                ranges.push(PerfAddressRange {
+                    begin,
+                    end: address,
+                });
+            }
+            continue;
+        }
+        if let Some(begin) = previous_address.replace(address)
+            && begin < address
+        {
+            ranges.push(PerfAddressRange {
+                begin,
+                end: address,
+            });
+        }
+    }
+    perf_dwarf_merge_ranges(ranges)
 }
 
 fn perf_dwarf_unit_roots<R>(
@@ -2916,12 +3355,28 @@ fn perf_dwarf_ranges_contain(ranges: &[PerfAddressRange], address: u64) -> bool 
         .any(|range| range.begin <= address && address < range.end)
 }
 
-fn perf_dwarf_frame_ranges_from_roots(roots: &[PerfDwarfDieNode]) -> Vec<PerfDwarfFrameRange> {
+fn perf_dwarf_ranges_overlap(ranges: &[PerfAddressRange], range: &PerfAddressRange) -> bool {
+    ranges
+        .iter()
+        .any(|other| other.begin < range.end && range.begin < other.end)
+}
+
+fn perf_dwarf_frame_ranges_from_roots(
+    roots: &[PerfDwarfDieNode],
+    source_line_ranges: &[PerfAddressRange],
+) -> Vec<PerfDwarfFrameRange> {
     let mut segments = Vec::new();
     let root_frames: Arc<[PerfDwarfNameId]> = Arc::from([]);
     let mut next_order = 0;
     for root in roots {
-        perf_dwarf_collect_frame_ranges(root, &root_frames, &mut segments, &mut next_order);
+        perf_dwarf_collect_frame_ranges(
+            root,
+            &root_frames,
+            false,
+            source_line_ranges,
+            &mut segments,
+            &mut next_order,
+        );
     }
     segments.sort_by_key(|segment| segment.range.begin);
     segments
@@ -2930,30 +3385,42 @@ fn perf_dwarf_frame_ranges_from_roots(roots: &[PerfDwarfDieNode]) -> Vec<PerfDwa
 fn perf_dwarf_collect_frame_ranges(
     node: &PerfDwarfDieNode,
     parent_frames: &Arc<[PerfDwarfNameId]>,
+    parent_has_inline_frames: bool,
+    source_line_ranges: &[PerfAddressRange],
     out: &mut Vec<PerfDwarfFrameRange>,
     next_order: &mut usize,
 ) -> Vec<PerfAddressRange> {
     let frames = perf_dwarf_node_frames(parent_frames, node.name);
-
+    let has_inline_frames = parent_has_inline_frames || node.kind == PerfDwarfDieKind::Inline;
+    let has_inline_children = node
+        .children
+        .iter()
+        .any(|child| child.kind == PerfDwarfDieKind::Inline);
     let mut child_coverage = Vec::new();
     for child in &node.children {
         if child.kind == PerfDwarfDieKind::Subprogram {
             continue;
         }
         child_coverage.extend(perf_dwarf_collect_frame_ranges(
-            child, &frames, out, next_order,
+            child,
+            &frames,
+            has_inline_frames,
+            source_line_ranges,
+            out,
+            next_order,
         ));
     }
 
     if !frames.is_empty() {
-        let base_symbol_sensitive = node.kind == PerfDwarfDieKind::Subprogram && frames.len() == 1;
         for range in perf_dwarf_subtract_ranges(&node.ranges, &child_coverage) {
             let order = *next_order;
             *next_order += 1;
             out.push(PerfDwarfFrameRange {
                 range,
                 frames: frames.clone(),
-                base_symbol_sensitive,
+                has_inline_frames,
+                has_source_line: perf_dwarf_ranges_overlap(source_line_ranges, &range),
+                has_inline_children,
                 order,
             });
         }
@@ -3034,12 +3501,18 @@ fn perf_dwarf_subtract_ranges(
     uncovered
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PerfDwarfFrameNames {
+    frames: Vec<String>,
+    has_inline_frames: bool,
+}
+
 fn perf_dwarf_frame_names_from_index(
     segments: &[PerfDwarfFrameRange],
     names: &[String],
     address: u64,
     base_symbol: Option<&str>,
-) -> Option<Vec<String>> {
+) -> Option<PerfDwarfFrameNames> {
     let upper_bound = segments.partition_point(|segment| segment.range.begin <= address);
     if upper_bound == 0 {
         return None;
@@ -3048,15 +3521,6 @@ fn perf_dwarf_frame_names_from_index(
         .iter()
         .filter(|segment| segment.range.begin <= address && address < segment.range.end)
         .min_by_key(|segment| segment.order)?;
-    if segment.base_symbol_sensitive
-        && !segment
-            .frames
-            .first()
-            .and_then(|name| names.get(usize::try_from(*name).ok()?))
-            .is_some_and(|name| perf_realfunc_name_replaces_base_symbol(name, base_symbol))
-    {
-        return None;
-    }
     let mut frames = segment
         .frames
         .iter()
@@ -3064,30 +3528,38 @@ fn perf_dwarf_frame_names_from_index(
         .cloned()
         .collect::<Vec<_>>();
     frames.reverse();
-    Some(frames)
-}
-
-fn perf_realfunc_name_replaces_base_symbol(name: &str, base_symbol: Option<&str>) -> bool {
-    base_symbol.is_some_and(|base_symbol| name != base_symbol)
+    let mut has_inline_frames = segment.has_inline_frames;
+    if !has_inline_frames {
+        let replaces_base_symbol = segment.has_source_line
+            && segment.has_inline_children
+            && base_symbol.is_some_and(|base_symbol| {
+                frames
+                    .last()
+                    .is_some_and(|frame| frame.as_str() != base_symbol)
+            });
+        if !replaces_base_symbol {
+            return None;
+        }
+        has_inline_frames = true;
+    }
+    Some(PerfDwarfFrameNames {
+        frames,
+        has_inline_frames,
+    })
 }
 
 /// Resolves the printed frame name for one subprogram/inlined-subroutine DIE.
 ///
-/// perf's external-addr2line srcline backend (the modern oracle build) names
-/// each frame from the ELF symtab / DWARF *linkage* (mangled) name and then
-/// demangles it itself with the Rust v0 demangler in alternate form
-/// (`tools/perf/util/srcline.c` `new_inline_sym` -> `dso__demangle_sym` ->
-/// `rust_demangle_display_demangle(..., /*alternate=*/true)` in
-/// `tools/perf/util/symbol.c`), which yields fully-qualified names without the
-/// trailing `::h<hash>` and with generic arguments preserved.
-/// `addr2line::demangle_auto` produces byte-identical output to perf's alternate
-/// Rust demangle for both legacy `_ZN` and v0 `_R` manglings, so the linkage
-/// name is demangled with it directly (NOT run through
-/// [`perf_dwarf_function_name`], which strips to the unqualified leaf and only
-/// applies to the bare `DW_AT_name` fallback).
+/// perf's default libdw inline path names each frame from `dwarf_diename(die)`
+/// (`tools/perf/util/libdw.c` `libdw_a2l_cb`) and then passes that name through
+/// `new_inline_sym` (`tools/perf/util/srcline.c`). That means Rust DIE names
+/// from `DW_AT_name` / abstract origins retain their supplied spelling
+/// unless the name itself is mangled and `dso__demangle_sym` can demangle it.
 ///
-/// Falls back to the bare `DW_AT_name` (perf's libdw backend spelling) when no
-/// linkage name is present, e.g. closures and shim DIEs.
+/// The installed perf-script oracle for this branch uses libdw first; tests
+/// that assert perf-script output must be checked against that runtime path.
+/// This helper still keeps command-backend spellings for cases where the
+/// linkage name is the only perf-compatible spelling available.
 fn perf_dwarf_die_frame_name<R>(
     dwarf: &gimli::Dwarf<R>,
     unit: &gimli::Unit<R>,
@@ -3096,10 +3568,12 @@ fn perf_dwarf_die_frame_name<R>(
 where
     R: gimli::Reader,
 {
-    if let Some(linkage) = perf_dwarf_die_linkage_name(dwarf, unit, entry, 16) {
-        return Some(demangle_addr2line_name_qualified(&linkage));
-    }
-    perf_dwarf_die_name(dwarf, unit, entry).map(|name| perf_dwarf_function_name(&name))
+    perf_dwarf_die_name(dwarf, unit, entry)
+        .map(|name| perf_dwarf_function_name(&name))
+        .or_else(|| {
+            perf_dwarf_die_linkage_name(dwarf, unit, entry, 16)
+                .map(|linkage| demangle_addr2line_name_qualified(&linkage))
+        })
 }
 
 fn perf_dwarf_die_linkage_name<R>(
@@ -3205,33 +3679,6 @@ where
         })
 }
 
-fn specialize_symbol_from_debug_strings(
-    symbol: &mut Option<String>,
-    debug_names: &DebugStringNameIndex,
-) {
-    if let Some(symbol) = symbol
-        && let Some(specialized) = debug_names.get(symbol)
-        && specialized != symbol
-    {
-        *symbol = specialized.to_string();
-    }
-}
-
-fn specialize_frames_from_debug_strings(frames: &mut [String], debug_names: &DebugStringNameIndex) {
-    for frame in frames {
-        if let Some(specialized) = debug_names.get(frame)
-            && specialized != frame
-        {
-            *frame = specialized.to_string();
-        }
-    }
-}
-
-#[derive(Default)]
-struct DebugStringNameIndex {
-    names_by_leaf: BTreeMap<String, Option<String>>,
-}
-
 #[derive(Default)]
 struct PerfDwarfNameInterner {
     names: Vec<String>,
@@ -3254,164 +3701,14 @@ impl PerfDwarfNameInterner {
     }
 }
 
-impl DebugStringNameIndex {
-    fn from_object_bytes(object_bytes: &[u8]) -> Self {
-        let mut index = Self::default();
-        for raw in object_bytes.split(|byte| *byte == 0) {
-            if raw.len() < 4 || raw.len() > 4096 {
-                continue;
-            }
-            let Ok(candidate) = std::str::from_utf8(raw) else {
-                continue;
-            };
-            if !candidate.contains('<') {
-                continue;
-            }
-            let normalized = perf_dwarf_function_name(candidate);
-            let Some(leaf) = generic_function_leaf(&normalized) else {
-                continue;
-            };
-            if let Some(existing) = index.names_by_leaf.get_mut(leaf) {
-                if existing
-                    .as_ref()
-                    .is_some_and(|current| current != &normalized)
-                {
-                    *existing = None;
-                }
-            } else {
-                index
-                    .names_by_leaf
-                    .insert(leaf.to_string(), Some(normalized));
-            }
-        }
-        index
-    }
-
-    fn get(&self, function_leaf: &str) -> Option<&str> {
-        if function_leaf.is_empty() {
-            return None;
-        }
-        let normalized = perf_dwarf_function_name(function_leaf);
-        let lookup_leaf = generic_function_leaf(&normalized).unwrap_or(&normalized);
-        self.names_by_leaf
-            .get(lookup_leaf)
-            .and_then(Option::as_deref)
-    }
-}
-
-#[must_use]
-pub fn more_specific_dwarf_name_from_debug_strings(
-    function_leaf: &str,
-    object_bytes: &[u8],
-) -> Option<String> {
-    DebugStringNameIndex::from_object_bytes(object_bytes)
-        .get(function_leaf)
-        .map(str::to_string)
-}
-
-fn generic_function_leaf(name: &str) -> Option<&str> {
-    let generic_start = name.find('<')?;
-    let leaf = &name[..generic_start];
-    (!leaf.is_empty() && !leaf.contains(' ') && !leaf.contains('(')).then_some(leaf)
-}
-
 #[must_use]
 pub fn perf_symbol_name(name: &str) -> String {
-    if !looks_like_cpp_qualified_name(name)
-        && let Some(name) = rust_receiver_generic_leaf(name)
-    {
-        return name;
-    }
     name.to_owned()
 }
 
 #[must_use]
 pub fn perf_dwarf_function_name(name: &str) -> String {
-    if looks_like_cpp_qualified_name(name) || perf_script_keeps_rust_qualified_name(name) {
-        return name.to_owned();
-    }
-    rust_leaf_with_receiver_generics(name).unwrap_or_else(|| name.to_owned())
-}
-
-fn looks_like_cpp_qualified_name(name: &str) -> bool {
-    name.starts_with("std::vector")
-        || name.starts_with("std::allocator")
-        || (name.contains("std::vector") && name.contains("::"))
-}
-
-fn perf_script_keeps_rust_qualified_name(name: &str) -> bool {
-    name.starts_with("std::fs::") || name.starts_with("std::io::") || name.starts_with("std::sys::")
-}
-
-fn rust_leaf_with_receiver_generics(name: &str) -> Option<String> {
-    let separator = last_namespace_separator(name)?;
-    let leaf = name.get(separator + 2..)?;
-    if leaf.contains('<') {
-        return Some(leaf.to_owned());
-    }
-
-    let receiver = name.get(..separator)?;
-    if receiver.starts_with('<') {
-        return Some(leaf.to_owned());
-    }
-    if let Some(generic_arguments) = trailing_generic_arguments(receiver)
-        && perf_script_receiver_generics_are_specific(generic_arguments)
-    {
-        Some(format!("{leaf}{generic_arguments}"))
-    } else {
-        Some(leaf.to_owned())
-    }
-}
-
-fn rust_receiver_generic_leaf(name: &str) -> Option<String> {
-    let separator = last_namespace_separator(name)?;
-    let leaf = name.get(separator + 2..)?;
-    let receiver = name.get(..separator)?;
-    if receiver.starts_with('<') {
-        return None;
-    }
-    let generic_arguments = trailing_generic_arguments(receiver)?;
-    perf_script_receiver_generics_are_specific(generic_arguments)
-        .then(|| format!("{leaf}{generic_arguments}"))
-}
-
-fn perf_script_receiver_generics_are_specific(generic_arguments: &str) -> bool {
-    generic_arguments.contains(',') || generic_arguments.contains("::")
-}
-
-fn last_namespace_separator(name: &str) -> Option<usize> {
-    let mut angle_depth = 0_u32;
-    let mut last_namespace_separator = None;
-    for (index, character) in name.char_indices() {
-        match character {
-            '<' => angle_depth = angle_depth.saturating_add(1),
-            '>' => angle_depth = angle_depth.saturating_sub(1),
-            ':' if angle_depth == 0 && name[index..].starts_with("::") => {
-                last_namespace_separator = Some(index);
-            }
-            _ => {}
-        }
-    }
-    last_namespace_separator
-}
-
-fn trailing_generic_arguments(name: &str) -> Option<&str> {
-    let mut angle_depth = 0_u32;
-    let mut generic_start = None;
-    for (index, character) in name.char_indices().rev() {
-        match character {
-            '>' => angle_depth = angle_depth.saturating_add(1),
-            '<' => {
-                angle_depth = angle_depth.checked_sub(1)?;
-                if angle_depth == 0 {
-                    generic_start = Some(index);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    name.get(generic_start?..)
+    name.to_owned()
 }
 
 #[must_use]
@@ -3435,6 +3732,7 @@ fn mapping_frame_key(mapping: &ResolvedMappingRef<'_>) -> MappingFrameKey {
     MappingFrameKey {
         symbol_source_id: mapping.symbol_source_id,
         relative_address: mapping.relative_address,
+        kernel_mapping_range: kernel_mapping_range_from_ref(mapping),
     }
 }
 
@@ -3479,6 +3777,7 @@ fn symbol_request_from_mapping_ref(mapping: &ResolvedMappingRef<'_>) -> SymbolRe
             PathBuf::from(mapping.path)
         },
         relative_address: mapping.relative_address,
+        kernel_mapping_range: kernel_mapping_range_from_ref(mapping),
         build_id: mapping.build_id.map(build_id_hex),
         file_identity: mapping.file_identity,
         kernel_relocation: mapping.kernel_relocation.clone(),
@@ -3496,8 +3795,8 @@ fn build_id_hex(bytes: &[u8]) -> String {
 /// Extracts the GNU build-id (lowercase hex) from a buffer of ELF notes such as
 /// `/sys/kernel/notes`. Walks the note stream looking for the
 /// `NT_GNU_BUILD_ID` (type 3) note with name "GNU\0" and returns its
-/// descriptor. Notes are little-endian on the supported targets (x86_64,
-/// aarch64), matching how perf stores build-ids in HEADER_BUILD_ID.
+/// descriptor. Notes are little-endian on the supported targets (`x86_64`,
+/// aarch64), matching how perf stores build-ids in `HEADER_BUILD_ID`.
 fn gnu_build_id_from_notes(bytes: &[u8]) -> Option<String> {
     const NT_GNU_BUILD_ID: u32 = 3;
     let mut offset = 0usize;
@@ -3547,6 +3846,15 @@ fn resolve_kernel_kallsyms(kallsyms: &Kallsyms, request: &SymbolRequest) -> Opti
     }
 }
 
+fn resolve_module_kallsyms(kallsyms: &Kallsyms, request: &SymbolRequest) -> Option<String> {
+    kallsyms
+        .resolve_module_with_offset_in_range(request.relative_address, request.kernel_mapping_range)
+}
+
+fn kernel_mapping_range_from_ref(mapping: &ResolvedMappingRef<'_>) -> Option<(u64, u64)> {
+    is_kernel_mapping_ref(mapping).then_some((mapping.start, mapping.end))
+}
+
 fn parse_addr2line_stdout(
     stdout: &[u8],
     expected_symbols: usize,
@@ -3588,30 +3896,66 @@ fn is_kernel_module_symbol_path(path: &Path) -> bool {
 }
 
 fn is_kernel_module_symbol_path_str(path: &str) -> bool {
-    path.starts_with('[') && !path.starts_with("[kernel") && !path.starts_with("[guest.kernel]")
-}
-
-fn prefer_kernel_alias(candidate: &str, current: &str) -> bool {
-    candidate.starts_with("__pi_") && !current.starts_with("__pi_")
+    // perf handles VDSO maps before kernel-module DSO lookup:
+    // tools/perf/util/map.c: map__new() checks is_vdso_map() and calls
+    // machine__findnew_vdso() instead of machine__findnew_dso_id().
+    path.starts_with('[')
+        && !matches!(path, "[vdso]" | "[vdso32]" | "[vdsox32]")
+        && !path.starts_with("[kernel")
+        && !path.starts_with("[guest.kernel]")
 }
 
 fn insert_kallsyms_symbol(
-    symbols: &mut BTreeMap<u64, String>,
+    symbols: &mut BTreeMap<u64, KallsymsSymbol>,
     addresses_by_name: &mut BTreeMap<String, u64>,
     address: u64,
-    symbol: String,
+    symbol: KallsymsSymbol,
 ) {
     match symbols.entry(address) {
         std::collections::btree_map::Entry::Vacant(entry) => {
             entry.insert(symbol.clone());
         }
         std::collections::btree_map::Entry::Occupied(mut entry) => {
-            if prefer_kernel_alias(&symbol, entry.get()) {
-                entry.insert(symbol.clone());
-            }
+            // tools/perf/util/symbol.c __symbols__insert() inserts equal-start
+            // symbols to the rb-tree's right side. After symbols__fixup_end(),
+            // the last symbol at an address is the one with nonzero length to
+            // the next address, so symbols__fixup_duplicate() keeps it.
+            entry.insert(symbol.clone());
         }
     }
-    addresses_by_name.entry(symbol).or_insert(address);
+    addresses_by_name.entry(symbol.name).or_insert(address);
+}
+
+fn fixup_kallsyms_symbol_ends_like_perf(symbols: &mut BTreeMap<u64, KallsymsSymbol>) {
+    let addresses = symbols.keys().copied().collect::<Vec<_>>();
+    for pair in addresses.windows(2) {
+        let [prev_addr, curr_addr] = pair else {
+            continue;
+        };
+        let curr_module = symbols
+            .get(curr_addr)
+            .and_then(|symbol| symbol.module.clone());
+        let Some(prev) = symbols.get_mut(prev_addr) else {
+            continue;
+        };
+        if prev.end.is_some() {
+            continue;
+        }
+        prev.end = if prev.module == curr_module {
+            Some(*curr_addr)
+        } else {
+            Some(round_up_to_page(prev_addr.saturating_add(4096)))
+        };
+    }
+    if let Some((addr, symbol)) = symbols.iter_mut().next_back()
+        && symbol.end.is_none()
+    {
+        symbol.end = Some(round_up_to_page(addr.saturating_add(4096)));
+    }
+}
+
+fn round_up_to_page(address: u64) -> u64 {
+    address.saturating_add(4095) & !4095
 }
 
 fn perf_build_id_kallsyms_paths(debug_dir: &Path, build_id: &str) -> [PathBuf; 2] {
@@ -3627,31 +3971,41 @@ fn parse_kallsyms_line(line: &str) -> Option<(u64, String)> {
     Some((address, symbol.to_string()))
 }
 
-fn parse_module_kallsyms_line(line: &str) -> Option<(u64, String, String)> {
+fn parse_module_kallsyms_line(line: &str) -> Option<(u64, String, char, String)> {
     let mut fields = line.split_whitespace();
     let address = u64::from_str_radix(fields.next()?, 16).ok()?;
-    let _symbol_type = fields.next()?;
+    let symbol_type = fields.next()?.chars().next()?;
+    if !perf_kallsyms_type_is_kept(symbol_type) {
+        return None;
+    }
     let symbol = fields.next()?;
     let module = fields.next()?;
     (module.starts_with('[') && module.ends_with(']'))
-        .then(|| (address, symbol.to_string(), module.to_string()))
+        .then(|| (address, symbol.to_string(), symbol_type, module.to_string()))
+}
+
+fn perf_kallsyms_type_is_kept(symbol_type: char) -> bool {
+    matches!(symbol_type.to_ascii_uppercase(), 'T' | 'W' | 'D' | 'B')
 }
 
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use object::{Object, ObjectSegment, ObjectSymbol, build, elf};
 
     use super::{
-        PerfAddressRange, PerfDwarfDieKind, PerfDwarfDieNode, PerfDwarfNameInterner,
-        PerfObjectSymbolIndex, PerfSymbolBinding, PerfSymbolCandidate, PerfSymbolScope,
-        ResolvedMappingRef, RustAddr2lineResolver, SymbolFrameCache, SymbolRequest, SymbolResolver,
-        clean_object_symbol_request, demangle_addr2line_name_qualified, gnu_build_id_from_notes,
-        perf_best_duplicate_symbol, perf_dwarf_frame_names_from_index,
+        CachedObjectMetadata, Kallsyms, PerfAddressRange, PerfDwarfDieKind, PerfDwarfDieNode,
+        PerfDwarfFrameNames, PerfDwarfIndexCache, PerfDwarfNameInterner, PerfObjectSymbolIndex,
+        PerfSymbolBinding, PerfSymbolCandidate, PerfSymbolScope, PreparedObjectMetadata,
+        ResolvedMappingRef, ResolvedSymbolFrames, RustAddr2lineResolver, SymbolFrameCache,
+        SymbolRequest, SymbolResolver, clean_object_symbol_request,
+        demangle_addr2line_name_qualified, fixup_object_symbol_ends_like_perf,
+        gnu_build_id_from_notes, perf_best_duplicate_symbol, perf_dwarf_frame_names_from_index,
         perf_dwarf_frame_ranges_from_roots, perf_frames_with_object_alias,
+        perf_symbol_candidate_search_end, resolve_base_frames_from_object_metadata,
     };
 
     #[test]
@@ -3753,6 +4107,7 @@ mod tests {
         let inline = SymbolRequest {
             path: PathBuf::from("/usr/lib/libc.so.6"),
             relative_address: 0x1234,
+            kernel_mapping_range: None,
             build_id: Some("aabbccdd".to_string()),
             file_identity: None,
             kernel_relocation: None,
@@ -3828,6 +4183,8 @@ mod tests {
             size: 128,
             scope: PerfSymbolScope::Global,
             binding: PerfSymbolBinding::Global,
+            bfd_function_like: true,
+            bfd_function: true,
         };
         let public_alias = PerfSymbolCandidate {
             name: "read".to_string(),
@@ -3835,6 +4192,8 @@ mod tests {
             size: 128,
             scope: PerfSymbolScope::Global,
             binding: PerfSymbolBinding::Global,
+            bfd_function_like: true,
+            bfd_function: true,
         };
 
         assert_eq!(
@@ -3851,6 +4210,8 @@ mod tests {
             size: 128,
             scope: PerfSymbolScope::Local,
             binding: PerfSymbolBinding::Global,
+            bfd_function_like: true,
+            bfd_function: true,
         };
         let global_alias = PerfSymbolCandidate {
             name: "read".to_string(),
@@ -3858,11 +4219,43 @@ mod tests {
             size: 128,
             scope: PerfSymbolScope::Global,
             binding: PerfSymbolBinding::Global,
+            bfd_function_like: true,
+            bfd_function: true,
         };
 
         assert_eq!(
             perf_best_duplicate_symbol(&local_alias, &global_alias).name,
             "read"
+        );
+    }
+
+    #[test]
+    fn perf_alias_tie_breaker_prefers_non_weak_local_symbol_over_weak_global_like_perf() {
+        // tools/perf/util/symbol.c choose_best_symbol() checks STB_WEAK
+        // before STB_GLOBAL, so glibc's local symtab aliases win over weak
+        // public aliases such as recv@@GLIBC_2.2.5.
+        let local_non_weak_alias = PerfSymbolCandidate {
+            name: "__libc_recv".to_string(),
+            address: 0x1000,
+            size: 47,
+            scope: PerfSymbolScope::Local,
+            binding: PerfSymbolBinding::Global,
+            bfd_function_like: true,
+            bfd_function: true,
+        };
+        let weak_global_alias = PerfSymbolCandidate {
+            name: "recv".to_string(),
+            address: 0x1000,
+            size: 47,
+            scope: PerfSymbolScope::Global,
+            binding: PerfSymbolBinding::Weak,
+            bfd_function_like: true,
+            bfd_function: true,
+        };
+
+        assert_eq!(
+            perf_best_duplicate_symbol(&local_non_weak_alias, &weak_global_alias).name,
+            "__libc_recv"
         );
     }
 
@@ -3876,6 +4269,8 @@ mod tests {
                     size: 0x1000,
                     scope: PerfSymbolScope::Global,
                     binding: PerfSymbolBinding::Global,
+                    bfd_function_like: true,
+                    bfd_function: true,
                 },
                 PerfSymbolCandidate {
                     name: "small".to_string(),
@@ -3883,12 +4278,107 @@ mod tests {
                     size: 0x10,
                     scope: PerfSymbolScope::Global,
                     binding: PerfSymbolBinding::Global,
+                    bfd_function_like: true,
+                    bfd_function: true,
                 },
             ],
             max_end_by_index: vec![0x2000, 0x2000],
         };
 
         assert_eq!(symbols.symbol_name(0x1810), Some("large"));
+    }
+
+    #[test]
+    fn object_symbol_index_preserves_perf_duplicate_order_for_versioned_glibc_aliases() {
+        let candidate = |name: &str, address| PerfSymbolCandidate {
+            name: name.to_string(),
+            address,
+            size: 0x100,
+            scope: PerfSymbolScope::Global,
+            binding: PerfSymbolBinding::Global,
+            bfd_function_like: true,
+            bfd_function: true,
+        };
+        let symbols = PerfObjectSymbolIndex {
+            symbols: vec![
+                candidate("pthread_create@GLIBC_2.2.5", 0x1000),
+                candidate("pthread_create@@GLIBC_2.34", 0x1000),
+                candidate("__libc_start_main@@GLIBC_2.34", 0x2000),
+                candidate("__libc_start_main@GLIBC_2.2.5", 0x2000),
+                candidate("clock_gettime@@GLIBC_2.17", 0x3000),
+                candidate("clock_gettime@GLIBC_2.2.5", 0x3000),
+            ],
+            max_end_by_index: vec![0x1100, 0x1100, 0x2100, 0x2100, 0x3100, 0x3100],
+        };
+
+        assert_eq!(
+            symbols.symbol_name_with_offset(0x1098),
+            Some("pthread_create@GLIBC_2.2.5+0x98".to_string())
+        );
+        assert_eq!(
+            symbols.symbol_name_with_offset(0x2088),
+            Some("__libc_start_main@@GLIBC_2.34+0x88".to_string())
+        );
+        assert_eq!(
+            symbols.symbol_name_with_offset(0x3004),
+            Some("clock_gettime@@GLIBC_2.17+0x4".to_string())
+        );
+    }
+
+    #[test]
+    fn object_symbol_index_prefers_non_weak_glibc_symtab_aliases_over_weak_exports_like_perf() {
+        // tools/perf/util/symbol.c symbols__fixup_duplicate() uses
+        // choose_best_symbol(), whose weak check precedes the global check.
+        let symbols = PerfObjectSymbolIndex {
+            symbols: vec![
+                PerfSymbolCandidate {
+                    name: "recv".to_string(),
+                    address: 0x1000,
+                    size: 47,
+                    scope: PerfSymbolScope::Global,
+                    binding: PerfSymbolBinding::Weak,
+                    bfd_function_like: true,
+                    bfd_function: true,
+                },
+                PerfSymbolCandidate {
+                    name: "__libc_recv".to_string(),
+                    address: 0x1000,
+                    size: 47,
+                    scope: PerfSymbolScope::Local,
+                    binding: PerfSymbolBinding::Global,
+                    bfd_function_like: true,
+                    bfd_function: true,
+                },
+                PerfSymbolCandidate {
+                    name: "write".to_string(),
+                    address: 0x2000,
+                    size: 46,
+                    scope: PerfSymbolScope::Global,
+                    binding: PerfSymbolBinding::Weak,
+                    bfd_function_like: true,
+                    bfd_function: true,
+                },
+                PerfSymbolCandidate {
+                    name: "__GI___libc_write".to_string(),
+                    address: 0x2000,
+                    size: 46,
+                    scope: PerfSymbolScope::Local,
+                    binding: PerfSymbolBinding::Global,
+                    bfd_function_like: true,
+                    bfd_function: true,
+                },
+            ],
+            max_end_by_index: vec![0x102f, 0x102f, 0x202e, 0x202e],
+        };
+
+        assert_eq!(
+            symbols.symbol_name_with_offset(0x101f),
+            Some("__libc_recv+0x1f".to_string())
+        );
+        assert_eq!(
+            symbols.symbol_name_with_offset(0x201e),
+            Some("__GI___libc_write+0x1e".to_string())
+        );
     }
 
     #[test]
@@ -3913,6 +4403,165 @@ mod tests {
         assert_eq!(
             symbols.symbol_name_with_offset(0x1008),
             Some("read+0x8".to_string())
+        );
+    }
+
+    #[test]
+    fn base_object_metadata_resolution_keeps_symtab_name_despite_debug_string_generics_like_perf() {
+        // perf script's no-callchain event-line IP uses
+        // machine__resolve() -> map__find_symbol() and
+        // sample__fprintf_sym(cursor == NULL), so it prints the demangled ELF
+        // symtab symbol. BFD/addr2line debug-string names are only relevant to
+        // DWARF line/inline lookup, not this base symbol path.
+        let mut object_bytes = elf_with_dynamic_text_symbol(
+            b"alloc::collections::btree::map::IntoIter<K,V,A>::dying_next",
+            0x1000,
+            0x200,
+        );
+        object_bytes.extend_from_slice(
+            b"\0alloc::collections::btree::map::IntoIter<u64, alloc::string::String, alloc::alloc::Global>::dying_next\0",
+        );
+        let metadata = Arc::new(CachedObjectMetadata {
+            object_metadata: PreparedObjectMetadata::from_object_bytes(&object_bytes),
+            object_bytes: object_bytes.into(),
+            dwarf_index: Mutex::new(PerfDwarfIndexCache::default()),
+        });
+
+        let frames = resolve_base_frames_from_object_metadata(
+            &[SymbolRequest {
+                path: PathBuf::from("/tmp/pyroclast-generic-symbol"),
+                relative_address: 0x1180,
+                kernel_mapping_range: None,
+                build_id: None,
+                file_identity: None,
+                kernel_relocation: None,
+            }],
+            |_| Some(Arc::clone(&metadata)),
+        );
+
+        assert_eq!(
+            frames,
+            vec![ResolvedSymbolFrames {
+                frames: vec![
+                    "alloc::collections::btree::map::IntoIter<K,V,A>::dying_next+0x180".to_string()
+                ],
+                has_base_symbol: true,
+                has_inline_frames: false,
+                has_non_inline_base_frame: true,
+                base_offset: Some(0x180),
+            }]
+        );
+    }
+
+    #[test]
+    fn object_symbol_index_extends_zero_sized_labels_to_next_symbol_like_perf() {
+        // tools/perf/util/symbol-elf.c dso__load_sym_internal() calls
+        // symbols__fixup_end(..., false), so a zero-sized label like glibc's
+        // __syscall_cancel_arch_start covers IPs until the next symbol.
+        let mut symbols = vec![
+            PerfSymbolCandidate {
+                name: "__syscall_cancel_arch".to_string(),
+                address: 0xa68f0,
+                size: 51,
+                scope: PerfSymbolScope::Local,
+                binding: PerfSymbolBinding::Global,
+                bfd_function_like: true,
+                bfd_function: true,
+            },
+            PerfSymbolCandidate {
+                name: "__syscall_cancel_arch_start".to_string(),
+                address: 0xa68f4,
+                size: 0,
+                scope: PerfSymbolScope::Local,
+                binding: PerfSymbolBinding::Global,
+                bfd_function_like: true,
+                bfd_function: true,
+            },
+            PerfSymbolCandidate {
+                name: "__syscall_cancel_arch_end".to_string(),
+                address: 0xa6922,
+                size: 0,
+                scope: PerfSymbolScope::Local,
+                binding: PerfSymbolBinding::Global,
+                bfd_function_like: true,
+                bfd_function: true,
+            },
+        ];
+        fixup_object_symbol_ends_like_perf(&mut symbols);
+        let mut max_end = 0_u64;
+        let max_end_by_index = symbols
+            .iter()
+            .map(|symbol| {
+                max_end = max_end.max(perf_symbol_candidate_search_end(symbol));
+                max_end
+            })
+            .collect();
+        let symbols = PerfObjectSymbolIndex {
+            symbols,
+            max_end_by_index,
+        };
+
+        assert_eq!(
+            symbols.symbol_name_with_offset(0xa691b),
+            Some("__syscall_cancel_arch_start+0x27".to_string())
+        );
+    }
+
+    #[test]
+    fn kallsyms_keeps_last_equal_address_alias_like_perf_fixup_duplicate() {
+        // tools/perf/util/symbol.c __symbols__insert() inserts equal-start
+        // symbols to the right, symbols__fixup_end(true) gives the last one at
+        // that address the extent to the next address, then
+        // symbols__fixup_duplicate() keeps that nonzero-length symbol.
+        let kallsyms = Kallsyms::parse(
+            "ffffffff91201850 t common_interrupt_return\n\
+             ffffffff91201850 T swapgs_restore_regs_and_return_to_usermode\n\
+             ffffffff91201850 T __irqentry_text_end\n\
+             ffffffff91201921 T restore_regs_and_return_to_kernel\n",
+        )
+        .expect("parse kallsyms");
+
+        assert_eq!(
+            kallsyms.resolve_with_offset(0xffff_ffff_9120_186f),
+            Some("__irqentry_text_end+0x1f".to_string())
+        );
+    }
+
+    #[test]
+    fn kallsyms_keeps_last_equal_address_rust_alias_like_perf_fixup_duplicate() {
+        let kallsyms = Kallsyms::parse(
+            "ffffffff91b8a950 T __pfx__RNvXs8_NtCs1L1xvvvYXuH_6kernel12module_paramxNtB5_11ModuleParam18try_from_param_arg\n\
+             ffffffff91b8a950 T __pfx__RNvXsa_NtCs1L1xvvvYXuH_6kernel12module_paramiNtB5_11ModuleParam18try_from_param_arg\n\
+             ffffffff91b8a960 T _RNvXs8_NtCs1L1xvvvYXuH_6kernel12module_paramxNtB5_11ModuleParam18try_from_param_arg\n\
+             ffffffff91b8a960 T _RNvXsa_NtCs1L1xvvvYXuH_6kernel12module_paramiNtB5_11ModuleParam18try_from_param_arg\n\
+             ffffffff91b8ab60 T __pfx__RNvXs8_NtCs1L1xvvvYXuH_6kernel3fmtbNtB5_7Display3fmt\n",
+        )
+        .expect("parse kallsyms");
+
+        assert_eq!(
+            kallsyms.resolve_with_offset(0xffff_ffff_91b8_aaa4),
+            Some("_RNvXsa_NtCs1L1xvvvYXuH_6kernel12module_paramiNtB5_11ModuleParam18try_from_param_arg+0x144".to_string())
+        );
+    }
+
+    #[test]
+    fn object_symbol_index_keeps_notype_text_labels_like_perf() {
+        // perf util/symbol-elf.c elf_sym__is_label() admits STT_NOTYPE
+        // symbols with a real section, and dso__load_sym_internal() includes
+        // labels alongside FUNC/OBJECT symbols. glibc's _dl_start_user is one
+        // such zero-sized NOTYPE label; perf script prints `_dl_start_user+0x0`.
+        let ld_linux = std::path::Path::new(
+            "/nix/store/57iz36553175g3178pvxjij8z5rcsd4n-glibc-2.42-61/lib/ld-linux-x86-64.so.2",
+        );
+        if !ld_linux.exists() {
+            return;
+        }
+        let object_bytes = std::fs::read(ld_linux).expect("ld-linux fixture");
+        let symbols = super::PerfObjectSymbolIndex::from_object_bytes(&object_bytes);
+
+        assert_eq!(
+            symbols.symbol_name_with_offset(0x1fd48),
+            Some("_dl_start_user+0x0".to_string())
         );
     }
 
@@ -3996,17 +4645,20 @@ mod tests {
     #[test]
     fn flattened_dwarf_ranges_share_frame_slices_for_the_same_node() {
         let mut names = PerfDwarfNameInterner::default();
-        let segments = perf_dwarf_frame_ranges_from_roots(&[PerfDwarfDieNode {
-            kind: PerfDwarfDieKind::Subprogram,
-            ranges: vec![test_range(0, 100)],
-            name: Some(names.intern("outer".to_string())),
-            children: vec![PerfDwarfDieNode {
-                kind: PerfDwarfDieKind::Inline,
-                ranges: vec![test_range(10, 20)],
-                name: Some(names.intern("inner".to_string())),
-                children: Vec::new(),
+        let segments = perf_dwarf_frame_ranges_from_roots(
+            &[PerfDwarfDieNode {
+                kind: PerfDwarfDieKind::Subprogram,
+                ranges: vec![test_range(0, 100)],
+                name: Some(names.intern("outer".to_string())),
+                children: vec![PerfDwarfDieNode {
+                    kind: PerfDwarfDieKind::Inline,
+                    ranges: vec![test_range(10, 20)],
+                    name: Some(names.intern("inner".to_string())),
+                    children: Vec::new(),
+                }],
             }],
-        }]);
+            &[],
+        );
 
         assert_eq!(segments.len(), 3);
         assert_eq!(
@@ -4028,20 +4680,24 @@ mod tests {
     #[test]
     fn flattened_dwarf_lookup_keeps_inline_and_base_symbol_rules() {
         let mut names = PerfDwarfNameInterner::default();
-        let segments = perf_dwarf_frame_ranges_from_roots(&[PerfDwarfDieNode {
-            kind: PerfDwarfDieKind::Subprogram,
-            ranges: vec![test_range(0, 100)],
-            name: Some(names.intern("outer".to_string())),
-            children: vec![PerfDwarfDieNode {
-                kind: PerfDwarfDieKind::Inline,
-                ranges: vec![test_range(10, 20)],
-                name: Some(names.intern("inner".to_string())),
-                children: Vec::new(),
+        let segments = perf_dwarf_frame_ranges_from_roots(
+            &[PerfDwarfDieNode {
+                kind: PerfDwarfDieKind::Subprogram,
+                ranges: vec![test_range(0, 100)],
+                name: Some(names.intern("outer".to_string())),
+                children: vec![PerfDwarfDieNode {
+                    kind: PerfDwarfDieKind::Inline,
+                    ranges: vec![test_range(10, 20)],
+                    name: Some(names.intern("inner".to_string())),
+                    children: Vec::new(),
+                }],
             }],
-        }]);
+            &[],
+        );
 
         assert_eq!(
-            perf_dwarf_frame_names_from_index(&segments, &names.names, 15, Some("outer")),
+            perf_dwarf_frame_names_from_index(&segments, &names.names, 15, Some("outer"))
+                .map(|frames| frames.frames),
             Some(vec!["inner".to_string(), "outer".to_string()])
         );
         assert_eq!(
@@ -4050,7 +4706,7 @@ mod tests {
         );
         assert_eq!(
             perf_dwarf_frame_names_from_index(&segments, &names.names, 5, Some("different_base")),
-            Some(vec!["outer".to_string()])
+            None
         );
         assert_eq!(
             perf_dwarf_frame_names_from_index(&segments, &names.names, 150, None),
@@ -4059,27 +4715,219 @@ mod tests {
     }
 
     #[test]
-    fn flattened_dwarf_lookup_ignores_unnamed_intermediate_nodes() {
+    fn flattened_dwarf_lookup_marks_single_inline_die_as_inline_like_perf_libdw() {
+        // tools/perf/util/libdw.c cu_walk_functions_at() invokes
+        // libdw_a2l_cb() for each matching DW_TAG_inlined_subroutine, even
+        // when there is only one printable inline DIE. srcline.c
+        // new_inline_sym() then marks that symbol as inlined, so script output
+        // suppresses the DSO and appends "(inlined)".
         let mut names = PerfDwarfNameInterner::default();
-        let segments = perf_dwarf_frame_ranges_from_roots(&[PerfDwarfDieNode {
-            kind: PerfDwarfDieKind::Subprogram,
-            ranges: vec![test_range(0, 100)],
-            name: Some(names.intern("outer".to_string())),
-            children: vec![PerfDwarfDieNode {
-                kind: PerfDwarfDieKind::Inline,
-                ranges: vec![test_range(20, 80)],
+        let segments = perf_dwarf_frame_ranges_from_roots(
+            &[PerfDwarfDieNode {
+                kind: PerfDwarfDieKind::Subprogram,
+                ranges: vec![test_range(0, 100)],
                 name: None,
                 children: vec![PerfDwarfDieNode {
                     kind: PerfDwarfDieKind::Inline,
-                    ranges: vec![test_range(30, 40)],
-                    name: Some(names.intern("inner".to_string())),
+                    ranges: vec![test_range(10, 20)],
+                    name: Some(names.intern("next_remote_task".to_string())),
                     children: Vec::new(),
                 }],
             }],
-        }]);
+            &[],
+        );
 
         assert_eq!(
-            perf_dwarf_frame_names_from_index(&segments, &names.names, 35, Some("outer")),
+            perf_dwarf_frame_names_from_index(&segments, &names.names, 15, Some("base_symbol")),
+            Some(PerfDwarfFrameNames {
+                frames: vec!["next_remote_task".to_string()],
+                has_inline_frames: true,
+            })
+        );
+    }
+
+    #[test]
+    fn flattened_dwarf_lookup_keeps_symtab_base_when_only_realfunc_name_differs_like_perf() {
+        // tools/perf/util/libdw.c libdw__addr2line() returns before
+        // cu_walk_functions_at() when dwfl_module_getsrc() cannot find source
+        // line information. That leaves perf script printing the original
+        // symtab symbol, as in the verified `float`/`f` fixture.
+        let mut names = PerfDwarfNameInterner::default();
+        let segments = perf_dwarf_frame_ranges_from_roots(
+            &[PerfDwarfDieNode {
+                kind: PerfDwarfDieKind::Subprogram,
+                ranges: vec![test_range(0, 100)],
+                name: Some(names.intern("next_remote_task".to_string())),
+                children: Vec::new(),
+            }],
+            &[],
+        );
+
+        assert_eq!(
+            perf_dwarf_frame_names_from_index(
+                &segments,
+                &names.names,
+                15,
+                Some(
+                    "next_remote_task<impl tokio::runtime::scheduler::multi_thread::handle::Handle>"
+                ),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn flattened_dwarf_lookup_replaces_realfunc_name_when_source_line_exists_like_perf_libdw() {
+        // When libdw has a source line, tools/perf/util/libdw.c calls
+        // cu_walk_functions_at(). The first callback is the real function from
+        // die_find_realfunc(), and srcline.c new_inline_sym() marks it inlined
+        // when dwarf_diename(die) differs from the symtab base symbol.
+        let mut names = PerfDwarfNameInterner::default();
+        let segments = perf_dwarf_frame_ranges_from_roots(
+            &[PerfDwarfDieNode {
+                kind: PerfDwarfDieKind::Subprogram,
+                ranges: vec![test_range(0, 100)],
+                name: Some(names.intern("default_read_to_end<std::fs::File>".to_string())),
+                children: vec![PerfDwarfDieNode {
+                    kind: PerfDwarfDieKind::Inline,
+                    ranges: vec![test_range(40, 50)],
+                    name: Some(names.intern("read".to_string())),
+                    children: Vec::new(),
+                }],
+            }],
+            &[test_range(0, 100)],
+        );
+
+        assert_eq!(
+            perf_dwarf_frame_names_from_index(
+                &segments,
+                &names.names,
+                15,
+                Some("std::io::default_read_to_end::<std::fs::File>"),
+            ),
+            Some(PerfDwarfFrameNames {
+                frames: vec!["default_read_to_end<std::fs::File>".to_string()],
+                has_inline_frames: true,
+            })
+        );
+    }
+
+    #[test]
+    fn flattened_dwarf_lookup_keeps_fn0_die_name_because_sentinel_is_cmd_addr2line_protocol() {
+        // tools/perf/util/addr2line.c read_addr2line_record() checks the
+        // address/sentinel line returned by the external GNU addr2line child.
+        // A DW_AT_name value of `fn0` is not itself a sentinel, so the flattened
+        // DWARF/libdw-style path must keep it. Perf parity for the
+        // entropy_burn fixture requires modeling the external protocol at a
+        // higher layer, not special-casing this DIE name here.
+        let mut names = PerfDwarfNameInterner::default();
+        let segments = perf_dwarf_frame_ranges_from_roots(
+            &[PerfDwarfDieNode {
+                kind: PerfDwarfDieKind::Subprogram,
+                ranges: vec![test_range(0, 100)],
+                name: Some(names.intern("fn0".to_string())),
+                children: vec![PerfDwarfDieNode {
+                    kind: PerfDwarfDieKind::Inline,
+                    ranges: vec![test_range(10, 20)],
+                    name: Some(names.intern("mix".to_string())),
+                    children: Vec::new(),
+                }],
+            }],
+            &[],
+        );
+
+        assert_eq!(
+            perf_dwarf_frame_names_from_index(&segments, &names.names, 15, Some("fn0"))
+                .map(|frames| frames.frames),
+            Some(vec!["mix".to_string(), "fn0".to_string()])
+        );
+    }
+
+    #[test]
+    fn flattened_dwarf_lookup_keeps_nonfirst_short_rust_names_like_perf_libdw() {
+        // tools/perf/util/libdw.c libdw_a2l_cb() passes dwarf_diename(die) to
+        // srcline.c new_inline_sym(); the GNU zero-address sentinel check in
+        // tools/perf/util/addr2line.c read_addr2line_record() applies only to
+        // the external addr2line child protocol's address/sentinel line, not
+        // to libdw DIE names. Real Rust functions named `eq` therefore remain
+        // inline frames instead of terminating the chain.
+        let mut names = PerfDwarfNameInterner::default();
+        let segments = perf_dwarf_frame_ranges_from_roots(
+            &[PerfDwarfDieNode {
+                kind: PerfDwarfDieKind::Subprogram,
+                ranges: vec![test_range(0, 100)],
+                name: Some(names.intern("fmt".to_string())),
+                children: vec![PerfDwarfDieNode {
+                    kind: PerfDwarfDieKind::Inline,
+                    ranges: vec![test_range(10, 90)],
+                    name: Some(names.intern("eq".to_string())),
+                    children: vec![PerfDwarfDieNode {
+                        kind: PerfDwarfDieKind::Inline,
+                        ranges: vec![test_range(20, 80)],
+                        name: Some(names.intern("eq<anstyle::color::Color>".to_string())),
+                        children: Vec::new(),
+                    }],
+                }],
+            }],
+            &[],
+        );
+
+        assert_eq!(
+            perf_dwarf_frame_names_from_index(&segments, &names.names, 30, Some("outer_base"))
+                .map(|frames| frames.frames),
+            Some(vec![
+                "eq<anstyle::color::Color>".to_string(),
+                "eq".to_string(),
+                "fmt".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn flattened_dwarf_lookup_keeps_symtab_base_for_standalone_fn0_like_perf() {
+        let mut names = PerfDwarfNameInterner::default();
+        let segments = perf_dwarf_frame_ranges_from_roots(
+            &[PerfDwarfDieNode {
+                kind: PerfDwarfDieKind::Subprogram,
+                ranges: vec![test_range(0, 100)],
+                name: Some(names.intern("fn0".to_string())),
+                children: Vec::new(),
+            }],
+            &[],
+        );
+
+        assert_eq!(
+            perf_dwarf_frame_names_from_index(&segments, &names.names, 5, Some("different_base")),
+            None
+        );
+    }
+
+    #[test]
+    fn flattened_dwarf_lookup_ignores_unnamed_intermediate_nodes() {
+        let mut names = PerfDwarfNameInterner::default();
+        let segments = perf_dwarf_frame_ranges_from_roots(
+            &[PerfDwarfDieNode {
+                kind: PerfDwarfDieKind::Subprogram,
+                ranges: vec![test_range(0, 100)],
+                name: Some(names.intern("outer".to_string())),
+                children: vec![PerfDwarfDieNode {
+                    kind: PerfDwarfDieKind::Inline,
+                    ranges: vec![test_range(20, 80)],
+                    name: None,
+                    children: vec![PerfDwarfDieNode {
+                        kind: PerfDwarfDieKind::Inline,
+                        ranges: vec![test_range(30, 40)],
+                        name: Some(names.intern("inner".to_string())),
+                        children: Vec::new(),
+                    }],
+                }],
+            }],
+            &[],
+        );
+
+        assert_eq!(
+            perf_dwarf_frame_names_from_index(&segments, &names.names, 35, Some("outer"))
+                .map(|frames| frames.frames),
             Some(vec!["inner".to_string(), "outer".to_string()])
         );
     }
@@ -4091,28 +4939,32 @@ mod tests {
         // the address. A later overlapping sibling must not win just because
         // its flattened range has the same start address.
         let mut names = PerfDwarfNameInterner::default();
-        let segments = perf_dwarf_frame_ranges_from_roots(&[PerfDwarfDieNode {
-            kind: PerfDwarfDieKind::Subprogram,
-            ranges: vec![test_range(0, 100)],
-            name: Some(names.intern("outer".to_string())),
-            children: vec![
-                PerfDwarfDieNode {
-                    kind: PerfDwarfDieKind::Inline,
-                    ranges: vec![test_range(10, 30)],
-                    name: Some(names.intern("first".to_string())),
-                    children: Vec::new(),
-                },
-                PerfDwarfDieNode {
-                    kind: PerfDwarfDieKind::Inline,
-                    ranges: vec![test_range(10, 30)],
-                    name: Some(names.intern("second".to_string())),
-                    children: Vec::new(),
-                },
-            ],
-        }]);
+        let segments = perf_dwarf_frame_ranges_from_roots(
+            &[PerfDwarfDieNode {
+                kind: PerfDwarfDieKind::Subprogram,
+                ranges: vec![test_range(0, 100)],
+                name: Some(names.intern("outer".to_string())),
+                children: vec![
+                    PerfDwarfDieNode {
+                        kind: PerfDwarfDieKind::Inline,
+                        ranges: vec![test_range(10, 30)],
+                        name: Some(names.intern("first".to_string())),
+                        children: Vec::new(),
+                    },
+                    PerfDwarfDieNode {
+                        kind: PerfDwarfDieKind::Inline,
+                        ranges: vec![test_range(10, 30)],
+                        name: Some(names.intern("second".to_string())),
+                        children: Vec::new(),
+                    },
+                ],
+            }],
+            &[],
+        );
 
         assert_eq!(
-            perf_dwarf_frame_names_from_index(&segments, &names.names, 20, Some("outer")),
+            perf_dwarf_frame_names_from_index(&segments, &names.names, 20, Some("outer"))
+                .map(|frames| frames.frames),
             Some(vec!["first".to_string(), "outer".to_string()])
         );
     }
@@ -4124,37 +4976,41 @@ mod tests {
         // die_find_child() searches only accept DW_TAG_inlined_subroutine.
         // A nested DW_TAG_subprogram must not become part of the inline chain.
         let mut names = PerfDwarfNameInterner::default();
-        let segments = perf_dwarf_frame_ranges_from_roots(&[PerfDwarfDieNode {
-            kind: PerfDwarfDieKind::Subprogram,
-            ranges: vec![test_range(0, 100)],
-            name: Some(names.intern("outer".to_string())),
-            children: vec![
-                PerfDwarfDieNode {
-                    kind: PerfDwarfDieKind::Subprogram,
-                    ranges: vec![test_range(10, 90)],
-                    name: Some(names.intern("nested_subprogram".to_string())),
-                    children: vec![PerfDwarfDieNode {
+        let segments = perf_dwarf_frame_ranges_from_roots(
+            &[PerfDwarfDieNode {
+                kind: PerfDwarfDieKind::Subprogram,
+                ranges: vec![test_range(0, 100)],
+                name: Some(names.intern("outer".to_string())),
+                children: vec![
+                    PerfDwarfDieNode {
+                        kind: PerfDwarfDieKind::Subprogram,
+                        ranges: vec![test_range(10, 90)],
+                        name: Some(names.intern("nested_subprogram".to_string())),
+                        children: vec![PerfDwarfDieNode {
+                            kind: PerfDwarfDieKind::Inline,
+                            ranges: vec![test_range(20, 30)],
+                            name: Some(names.intern("nested_inline".to_string())),
+                            children: Vec::new(),
+                        }],
+                    },
+                    PerfDwarfDieNode {
                         kind: PerfDwarfDieKind::Inline,
-                        ranges: vec![test_range(20, 30)],
-                        name: Some(names.intern("nested_inline".to_string())),
+                        ranges: vec![test_range(40, 50)],
+                        name: Some(names.intern("real_inline".to_string())),
                         children: Vec::new(),
-                    }],
-                },
-                PerfDwarfDieNode {
-                    kind: PerfDwarfDieKind::Inline,
-                    ranges: vec![test_range(40, 50)],
-                    name: Some(names.intern("real_inline".to_string())),
-                    children: Vec::new(),
-                },
-            ],
-        }]);
+                    },
+                ],
+            }],
+            &[],
+        );
 
         assert_eq!(
             perf_dwarf_frame_names_from_index(&segments, &names.names, 25, Some("outer")),
             None
         );
         assert_eq!(
-            perf_dwarf_frame_names_from_index(&segments, &names.names, 45, Some("outer")),
+            perf_dwarf_frame_names_from_index(&segments, &names.names, 45, Some("outer"))
+                .map(|frames| frames.frames),
             Some(vec!["real_inline".to_string(), "outer".to_string()])
         );
     }
@@ -4179,6 +5035,7 @@ mod tests {
             .resolve_frame_batch(&[SymbolRequest {
                 path: path.clone(),
                 relative_address: addresses[0],
+                kernel_mapping_range: None,
                 build_id: None,
                 file_identity: None,
                 kernel_relocation: None,
@@ -4190,6 +5047,7 @@ mod tests {
             .resolve_frame_batch(&[SymbolRequest {
                 path,
                 relative_address: addresses[1],
+                kernel_mapping_range: None,
                 build_id: None,
                 file_identity: None,
                 kernel_relocation: None,
@@ -4298,7 +5156,7 @@ mod tests {
     }
 
     #[test]
-    fn symbol_frame_cache_resolve_folded_mapping_ref_omits_fn0_before_mix_like_perf_script() {
+    fn symbol_frame_cache_resolve_folded_mapping_ref_keeps_fn0_before_mix_like_perf_script() {
         let resolver = CountingFrameResolver::new(vec![vec![
             "fn124".to_string(),
             "fn0".to_string(),
@@ -4309,11 +5167,11 @@ mod tests {
 
         let frames = cache.resolve_folded_mapping_ref(&mapping).expect("resolve");
 
-        assert_eq!(frames, "fn124;mix");
+        assert_eq!(frames, "fn124;fn0;mix");
     }
 
     #[test]
-    fn symbol_frame_cache_resolve_folded_mapping_ref_renders_multiframe_stacks_like_perf_script() {
+    fn symbol_frame_cache_resolve_folded_mapping_ref_keeps_multiframe_fn0_hops_like_perf_script() {
         let resolver = CountingFrameResolver::new(vec![vec![
             "entry::call".to_string(),
             "fn0".to_string(),
@@ -4325,7 +5183,7 @@ mod tests {
 
         let frames = cache.resolve_folded_mapping_ref(&mapping).expect("resolve");
 
-        assert_eq!(frames, "entry::call;mix;handler");
+        assert_eq!(frames, "entry::call;fn0;mix;handler");
     }
 
     #[test]
@@ -4396,6 +5254,7 @@ mod tests {
         SymbolRequest {
             path: path.into(),
             relative_address,
+            kernel_mapping_range: None,
             build_id: None,
             file_identity: None,
             kernel_relocation: None,
@@ -4407,6 +5266,8 @@ mod tests {
             symbol_source_id: 1,
             path,
             relative_address,
+            start: relative_address,
+            end: relative_address.saturating_add(1),
             build_id: None,
             file_identity: None,
             kernel_relocation: None,
