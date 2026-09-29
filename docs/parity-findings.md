@@ -3,6 +3,25 @@
 Status as of 2026-06-11. Goal: `pyroclast plumbing fold|flamegraph` fully replaces
 `perf script | inferno-collapse-perf | inferno-flamegraph`.
 
+## 2026-09-29 x86-64 replay
+
+Fresh output from the 390,376,668-byte `inferno-slow-collapse.perf.data` was
+compared with perf 7.2.5 and Inferno 0.12.8. The committed code initially
+produced the same 1,505 folded stacks and total period, but used `__clone3`
+where perf used `__GI___clone3`, and `memcpy` where perf used
+`memcpy@@GLIBC_2.14`. Perf's symbol chooser kept the preferred ELF aliases;
+Pyroclast had promoted binutils-style function records even when BFD had no
+`STT_FILE` filename for them. Commit `308faf6` records filename eligibility
+from the ELF symbol table before using that fallback.
+
+After the fix, `perf script --force -i <perf.data> | inferno-collapse-perf -q`
+and `pyroclast plumbing fold --count-periods <perf.data>` are byte-identical:
+1,505 lines, 609,079 bytes, SHA-256
+`124a24929267f42da993195bdf1aa12a37bb30d67d83ee455bf2a9e0cf8e4f47`.
+The recording's `entropy_burn` executable is unavailable on this machine, so
+its frames resolve to the module fallback in both pipelines. This result does
+not establish parity for that executable when its symbols are present.
+
 Companion deep-dives produced during this investigation:
 
 - `.ace-research-perf-unwind.md` — source-cited model of perf + elfutils libdw user
