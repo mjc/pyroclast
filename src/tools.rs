@@ -16,8 +16,7 @@ pub enum ToolKind {
 #[serde(rename_all = "snake_case")]
 pub enum ToolSource {
     Path,
-    InNixShell,
-    ProjectFlake,
+    InDevenv,
     EphemeralNix,
 }
 
@@ -95,7 +94,7 @@ impl ToolSpec {
                 name = self.name
             ),
             ToolKind::NixManaged => format!(
-                "{name} is required but was not found on PATH or in the project flake; install it or enter the project dev shell",
+                "{name} is required but was not found on PATH; install it or add it to devenv.nix",
                 name = self.name
             ),
         }
@@ -140,7 +139,7 @@ pub struct ResolverContext {
     platform: String,
     cwd: PathBuf,
     path: Option<OsString>,
-    in_nix_shell: bool,
+    in_devenv: bool,
 }
 
 impl ResolverContext {
@@ -150,7 +149,7 @@ impl ResolverContext {
             platform: platform.to_string(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             path: std::env::var_os("PATH"),
-            in_nix_shell: std::env::var_os("IN_NIX_SHELL").is_some(),
+            in_devenv: std::env::var_os("DEVENV_ROOT").is_some(),
         }
     }
 
@@ -159,13 +158,13 @@ impl ResolverContext {
         platform: &str,
         cwd: impl Into<PathBuf>,
         path: Option<OsString>,
-        in_nix_shell: bool,
+        in_devenv: bool,
     ) -> Self {
         Self {
             platform: platform.to_string(),
             cwd: cwd.into(),
             path,
-            in_nix_shell,
+            in_devenv,
         }
     }
 }
@@ -203,12 +202,11 @@ where
         }
 
         let mut attempts = Vec::new();
-        let resolved = if self.context.in_nix_shell {
+        let resolved = if self.context.in_devenv {
             self.resolve_from_path(tool, true, &mut attempts)
         } else {
             self.resolve_from_path(tool, false, &mut attempts)
         }
-        .or_else(|| self.resolve_from_project_flake(tool, &mut attempts))
         .or_else(|| self.resolve_from_ephemeral_nix(tool, &mut attempts));
         let resolved =
             resolved.ok_or_else(|| resolution_error(tool, &attempts, &self.context.cwd))?;
@@ -219,14 +217,14 @@ where
     fn resolve_from_path(
         &self,
         tool: &ToolSpec,
-        in_nix_shell: bool,
+        in_devenv: bool,
         attempts: &mut Vec<String>,
     ) -> Option<ResolvedTool> {
         let Some(path) = find_executable_on_path(tool.name, self.context.path.as_deref()) else {
             attempts.push(format!(
                 "{}: not found",
-                if in_nix_shell {
-                    "PATH (inside current nix shell)"
+                if in_devenv {
+                    "PATH (inside current devenv shell)"
                 } else {
                     "PATH"
                 }
@@ -238,8 +236,8 @@ where
                 let path = path.to_string_lossy().into_owned();
                 attempts.push(format!(
                     "{}: found {}",
-                    if in_nix_shell {
-                        "PATH (inside current nix shell)"
+                    if in_devenv {
+                        "PATH (inside current devenv shell)"
                     } else {
                         "PATH"
                     },
@@ -248,8 +246,8 @@ where
                 Some(ResolvedTool {
                     name: tool.name.to_string(),
                     path: path.clone(),
-                    source: if in_nix_shell {
-                        ToolSource::InNixShell
+                    source: if in_devenv {
+                        ToolSource::InDevenv
                     } else {
                         ToolSource::Path
                     },
@@ -261,51 +259,12 @@ where
             Err(error) => {
                 attempts.push(format!(
                     "{}: found {} but probe failed: {}",
-                    if in_nix_shell {
-                        "PATH (inside current nix shell)"
+                    if in_devenv {
+                        "PATH (inside current devenv shell)"
                     } else {
                         "PATH"
                     },
                     path.display(),
-                    error
-                ));
-                None
-            }
-        }
-    }
-
-    fn resolve_from_project_flake(
-        &self,
-        tool: &ToolSpec,
-        attempts: &mut Vec<String>,
-    ) -> Option<ResolvedTool> {
-        if tool.kind == ToolKind::AppleProvided {
-            return None;
-        }
-        let Some(nix) = find_executable_on_path("nix", self.context.path.as_deref()) else {
-            attempts.push("project flake: skipped because `nix` was not found on PATH".to_string());
-            return None;
-        };
-        let Some(flake_dir) = find_nearest_flake_dir(&self.context.cwd) else {
-            attempts.push(format!(
-                "project flake: skipped because no flake.nix was found from {} upward",
-                self.context.cwd.display()
-            ));
-            return None;
-        };
-        match self.probe_nix_shell_tool(&nix, tool, &flake_dir) {
-            Ok(resolved) => {
-                attempts.push(format!(
-                    "project flake via `nix develop {}`: found {}",
-                    flake_dir.display(),
-                    resolved.path
-                ));
-                Some(resolved)
-            }
-            Err(error) => {
-                attempts.push(format!(
-                    "project flake via `nix develop {}`: failed: {}",
-                    flake_dir.display(),
                     error
                 ));
                 None
@@ -347,40 +306,6 @@ where
                 None
             }
         }
-    }
-
-    fn probe_nix_shell_tool(
-        &self,
-        nix: &Path,
-        tool: &ToolSpec,
-        working_dir: &Path,
-    ) -> std::io::Result<ResolvedTool> {
-        let probe = CommandSpec::new(nix.to_string_lossy().into_owned()).args([
-            "--extra-experimental-features".to_string(),
-            "nix-command flakes".to_string(),
-            "develop".to_string(),
-            working_dir.display().to_string(),
-            "-c".to_string(),
-            "sh".to_string(),
-            "-c".to_string(),
-            format!("command -v {}", tool.name),
-        ]);
-        let output = self.runner.run(&probe)?;
-        if output.status_code != Some(0) {
-            return Err(command_probe_error("nix develop probe failed", &output));
-        }
-        let path = last_output_line(&output.stdout).ok_or_else(|| {
-            probe_output_error("nix develop probe did not report a tool path on stdout")
-        })?;
-        let version = self.probe_tool_version(tool, &path)?;
-        Ok(ResolvedTool {
-            name: tool.name.to_string(),
-            path: path.clone(),
-            source: ToolSource::ProjectFlake,
-            version,
-            launch_program: path.clone(),
-            launch_args: Vec::new(),
-        })
     }
 
     fn probe_ephemeral_nix_tool(
@@ -599,7 +524,7 @@ fn resolution_error(tool: &ToolSpec, attempts: &[String], cwd: &Path) -> std::io
     if tool.kind == ToolKind::NixManaged {
         let _ = write!(
             message,
-            "\nNext step: install `{}` directly, add it to the project flake, or run from a dev shell for {}.",
+            "\nNext step: install `{}` directly or add it to devenv.nix for {}.",
             tool.name,
             cwd.display()
         );
@@ -671,18 +596,6 @@ pub fn tool_spec_named(name: &str) -> Option<ToolSpec> {
         "xctrace" => Some(XCTRACE),
         _ => None,
     }
-}
-
-#[must_use]
-pub fn find_nearest_flake_dir(cwd: &Path) -> Option<PathBuf> {
-    let mut current = Some(cwd);
-    while let Some(path) = current {
-        if path.join("flake.nix").is_file() {
-            return Some(path.to_path_buf());
-        }
-        current = path.parent();
-    }
-    None
 }
 
 #[must_use]

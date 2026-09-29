@@ -622,10 +622,9 @@ fn find_unique_target(
         .exec()?
         .packages
         .into_iter()
-        .filter(|package_metadata| {
-            if let Some(package) = package {
-                package == package_metadata.name.as_str()
-            } else {
+        .filter(|package_metadata| match package {
+            Some(package) => package == package_metadata.name.as_str(),
+            None => {
                 // cargo metadata reports manifest paths as given, which can
                 // disagree with the canonicalized crate root through symlinks
                 // (macOS /var -> /private/var).
@@ -1119,7 +1118,8 @@ mod tests {
             "--serve",
         ]));
 
-        crate::run_parsed_cargo_cli_with_runner(cli, &runner).expect("run cargo memory command");
+        crate::run_parsed_cargo_cli_with_runner_on_platform(cli, &runner, "linux")
+            .expect("run cargo memory command");
 
         assert_eq!(
             std::fs::read_to_string(out_dir.join("command.txt")).expect("command.txt"),

@@ -1,3 +1,3 @@
-I'm on nix on darwin or nixos on linux, so use `nix develop`.
+On NixOS and nix-darwin, use the repository's `devenv shell` workflow.
 
 Run the full test suite with `cargo nextest run`.

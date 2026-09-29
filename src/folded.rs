@@ -70,8 +70,21 @@ pub(crate) fn append_inferno_perf_raw_function(
     if frame.starts_with('(') {
         return;
     }
+    if !frame.contains('$')
+        && !frame.contains("->")
+        && !frame.contains('(')
+        && !frame.contains(';')
+        && !frame.contains('\n')
+        && !frame.contains('\r')
+    {
+        append_separator(rendered);
+        rendered.push_str(frame);
+        return;
+    }
     let fixed_frame = fix_partially_demangled_rust_symbol(frame);
-    for (index, part) in fixed_frame.as_ref().split("->").enumerate() {
+    let frame = fixed_frame.as_ref();
+
+    for (index, part) in frame.split("->").enumerate() {
         append_separator(rendered);
         tidy_inferno_perf_generic_into(scratch, part);
         if index > 0 && !scratch.contains("_[i]") {
@@ -214,6 +227,15 @@ fn tidy_inferno_perf_generic_into(scratch: &mut String, frame: &str) {
 }
 
 fn escape_frame_into(escaped: &mut String, frame: &str) {
+    if frame
+        .bytes()
+        .all(|byte| !matches!(byte, b';' | b'\r' | b'\n'))
+    {
+        escaped.push_str(frame);
+        return;
+    }
+
+    escaped.reserve(frame.len());
     for character in frame.chars() {
         match character {
             ';' => escaped.push_str("\\;"),

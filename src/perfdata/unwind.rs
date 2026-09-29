@@ -1,13 +1,27 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs::File;
 use std::ops::{Deref, Range};
 use std::path::Path;
 use std::sync::Arc;
 
+use framehop::aarch64::{CacheAarch64, UnwindRegsAarch64, UnwinderAarch64};
 use framehop::x86_64::{CacheX86_64, Reg, UnwindRegsX86_64, UnwinderX86_64};
-use framehop::{ExplicitModuleSectionInfo, Unwinder};
+use framehop::{ExplicitModuleSectionInfo, Module, Unwinder};
 use gimli::{BaseAddresses, CieOrFde, DebugFrame, EhFrame, LittleEndian, UnwindSection};
 use memmap2::Mmap;
 use object::read::{Object, ObjectSection, ObjectSegment};
+use rustc_hash::FxBuildHasher;
+
+// The gap-2 skip gate queries `has_unwind_info_for_ip` once per sampled IP,
+// and the same hot leaves (libc `malloc`/`memmove`/`memcmp`) recur across
+// millions of samples. Memoizing collapses the otherwise-linear FDE-range scan
+// (`.ace-review-findings.md` PERF-6) into an O(1) lookup. The memo is keyed by
+// the EXACT ip, not `ip >> 12`: FDE pc-ranges are function-granular and two
+// functions (one covered, one not) can share a 4 KiB page, so a page-granular
+// memo could return a stale answer for a second IP in the page and perturb the
+// skip-gate decision. Exact-ip keying keeps the answer byte-identical to the
+// linear scan while still collapsing the dominant repeated-leaf query pattern.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PerfX86_64Regs {
@@ -15,6 +29,121 @@ pub struct PerfX86_64Regs {
     pub sp: u64,
     pub bp: u64,
     pub registers: [u64; 16],
+}
+
+/// The architecture a perf.data file's user register samples were recorded on,
+/// from the HEADER_ARCH feature string.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PerfArch {
+    #[default]
+    X86_64,
+    Aarch64,
+}
+
+impl PerfArch {
+    #[must_use]
+    pub fn from_header_arch(arch: &str) -> Option<Self> {
+        match arch {
+            "x86_64" | "amd64" => Some(Self::X86_64),
+            "aarch64" | "arm64" => Some(Self::Aarch64),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PerfAarch64Regs {
+    pub pc: u64,
+    pub sp: u64,
+    pub fp: u64,
+    pub lr: u64,
+}
+
+/// Architecture-neutral user register sample, decoded from a perf REGS_USER
+/// payload according to the recording machine's arch.
+///
+/// The fold path threads this through every unwind site so the x86_64 and
+/// aarch64 register layouts and frame-pointer fallbacks stay byte-faithful to
+/// perf/elfutils without forcing a fake bp/sp onto aarch64.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PerfUserRegs {
+    X86_64(PerfX86_64Regs),
+    Aarch64(PerfAarch64Regs),
+}
+
+impl PerfUserRegs {
+    /// Decodes the minimal user register set for `arch` from perf's ascending
+    /// register-mask encoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value slice does not match the mask or a
+    /// register required for unwinding is missing.
+    pub fn from_perf_masked_values(
+        arch: PerfArch,
+        mask: u64,
+        values: &[u64],
+    ) -> Result<Self, String> {
+        match arch {
+            PerfArch::X86_64 => {
+                PerfX86_64Regs::from_perf_masked_values(mask, values).map(Self::X86_64)
+            }
+            PerfArch::Aarch64 => {
+                PerfAarch64Regs::from_perf_masked_values(mask, values).map(Self::Aarch64)
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn arch(self) -> PerfArch {
+        match self {
+            Self::X86_64(_) => PerfArch::X86_64,
+            Self::Aarch64(_) => PerfArch::Aarch64,
+        }
+    }
+
+    /// The sampled instruction pointer (x86_64 IP / aarch64 PC).
+    #[must_use]
+    pub fn ip(self) -> u64 {
+        match self {
+            Self::X86_64(regs) => regs.ip,
+            Self::Aarch64(regs) => regs.pc,
+        }
+    }
+
+    /// The sampled stack pointer.
+    #[must_use]
+    pub fn sp(self) -> u64 {
+        match self {
+            Self::X86_64(regs) => regs.sp,
+            Self::Aarch64(regs) => regs.sp,
+        }
+    }
+
+    /// Whether the sample looks like an x86_64 syscall-return state, which perf
+    /// truncates after the first executable frame. aarch64 has no analogue, so
+    /// this is always `false` there.
+    #[must_use]
+    pub fn is_syscall_return_state(self) -> bool {
+        match self {
+            Self::X86_64(regs) => regs.is_syscall_return_state(),
+            Self::Aarch64(_) => false,
+        }
+    }
+
+    /// The x86_64 `ebl_unwind` frame-pointer precondition `bp >= sp`.
+    ///
+    /// elfutils' x86_64 backend only walks the rbp chain when the frame pointer
+    /// sits at or above the stack pointer. aarch64's backend has no such
+    /// precondition (its accept condition is internal to the walk), so this
+    /// returns `false` there and the fallback is gated differently.
+    #[must_use]
+    pub fn frame_pointer_at_or_above_stack_pointer(self) -> bool {
+        match self {
+            Self::X86_64(regs) => regs.bp >= regs.sp,
+            Self::Aarch64(_) => false,
+        }
+    }
 }
 
 pub struct PerfStackReader<'a> {
@@ -29,11 +158,29 @@ pub struct PerfUserMemoryReader<'a, F> {
 }
 
 pub struct FramehopUnwinder {
-    unwinder: UnwinderX86_64<ModuleBytes>,
-    cache: CacheX86_64,
+    arch: ArchUnwinder,
     module_count: usize,
     reported_modules: Vec<ReportedModule>,
     rejected_mapping_ranges: Vec<Range<u64>>,
+    /// Exact-ip memo for `has_unwind_info_for_ip`. Interior-mutable so the
+    /// predicate stays `&self`; cleared whenever a new module is added, since
+    /// that can extend coverage over a previously-uncovered ip.
+    unwind_info_memo: RefCell<HashMap<u64, bool, FxBuildHasher>>,
+}
+
+/// Per-architecture framehop unwinder and cache. Module registration is shared
+/// (both arches register `framehop::Module<ModuleBytes>` from the same
+/// `ExplicitModuleSectionInfo`); only the seeded registers and `iter_frames`
+/// differ, so the regs handed to `unwind` must match the active arch.
+enum ArchUnwinder {
+    X86_64 {
+        unwinder: Box<UnwinderX86_64<ModuleBytes>>,
+        cache: CacheX86_64,
+    },
+    Aarch64 {
+        unwinder: Box<UnwinderAarch64<ModuleBytes>>,
+        cache: CacheAarch64,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -45,7 +192,7 @@ pub struct UserStackUnwindResult {
 pub trait UserStackUnwinder {
     fn unwind_user_stack(
         &mut self,
-        regs: PerfX86_64Regs,
+        regs: PerfUserRegs,
         stack: &[u8],
         max_frames: usize,
     ) -> UserStackUnwindResult;
@@ -139,12 +286,27 @@ impl Default for FramehopUnwinder {
 impl FramehopUnwinder {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_arch(PerfArch::X86_64)
+    }
+
+    #[must_use]
+    pub fn with_arch(arch: PerfArch) -> Self {
+        let arch = match arch {
+            PerfArch::X86_64 => ArchUnwinder::X86_64 {
+                unwinder: Box::new(UnwinderX86_64::new()),
+                cache: CacheX86_64::new(),
+            },
+            PerfArch::Aarch64 => ArchUnwinder::Aarch64 {
+                unwinder: Box::new(UnwinderAarch64::new()),
+                cache: CacheAarch64::new(),
+            },
+        };
         Self {
-            unwinder: UnwinderX86_64::new(),
-            cache: CacheX86_64::new(),
+            arch,
             module_count: 0,
             reported_modules: Vec::new(),
             rejected_mapping_ranges: Vec::new(),
+            unwind_info_memo: RefCell::new(HashMap::with_hasher(FxBuildHasher)),
         }
     }
 
@@ -204,13 +366,13 @@ impl FramehopUnwinder {
         let section_info = explicit_module_section_info(&mapped, &object);
         let memory_segments = module_memory_segments(&mapped, &object, base);
         let unwind_ranges = object_unwind_ranges(&object, base);
-        let module = framehop::Module::<ModuleBytes>::new(
+        let module = Module::<ModuleBytes>::new(
             path.to_string_lossy().into_owned(),
             module_range.clone(),
             base,
             section_info,
         );
-        self.unwinder.add_module(module);
+        self.arch.add_module(module);
         self.reported_modules.push(ReportedModule {
             base,
             range: module_range,
@@ -218,6 +380,10 @@ impl FramehopUnwinder {
             unwind_ranges,
         });
         self.module_count += 1;
+        // A newly reported module can add CFI coverage over an ip that was
+        // previously memoized as uncovered; drop the memo so the next query
+        // re-scans against the full module set.
+        self.unwind_info_memo.borrow_mut().clear();
         Ok(true)
     }
 
@@ -242,9 +408,15 @@ impl FramehopUnwinder {
 
     #[must_use]
     pub fn has_unwind_info_for_ip(&self, ip: u64) -> bool {
-        self.reported_modules
+        if let Some(&cached) = self.unwind_info_memo.borrow().get(&ip) {
+            return cached;
+        }
+        let covered = self
+            .reported_modules
             .iter()
-            .any(|module| module.unwind_ranges.iter().any(|range| range.contains(&ip)))
+            .any(|module| module.unwind_ranges.iter().any(|range| range.contains(&ip)));
+        self.unwind_info_memo.borrow_mut().insert(ip, covered);
+        covered
     }
 
     #[must_use]
@@ -255,7 +427,7 @@ impl FramehopUnwinder {
     #[must_use]
     pub fn unwind_stack(
         &mut self,
-        regs: PerfX86_64Regs,
+        regs: PerfUserRegs,
         stack: &[u8],
         max_frames: usize,
     ) -> Vec<u64> {
@@ -266,34 +438,26 @@ impl FramehopUnwinder {
     #[must_use]
     pub fn unwind_stack_with_diagnostics(
         &mut self,
-        regs: PerfX86_64Regs,
+        regs: PerfUserRegs,
         stack: &[u8],
         max_frames: usize,
     ) -> UserStackUnwindResult {
         if self
             .rejected_mapping_ranges
             .iter()
-            .any(|range| range.contains(&regs.ip))
+            .any(|range| range.contains(&regs.ip()))
         {
             return UserStackUnwindResult::default();
         }
         let reported_modules = &self.reported_modules;
-        let mut memory_reader = PerfUserMemoryReader::new(regs.sp, stack, |address| {
+        let mut memory_reader = PerfUserMemoryReader::new(regs.sp(), stack, |address| {
             read_reported_module_u64(reported_modules, address)
         });
         let mut read_stack = |address| memory_reader.read_u64(address).ok_or(());
-        let ip = regs.ip;
-        let regs = regs.to_framehop_regs();
-        let mut iter = self
-            .unwinder
-            .iter_frames(ip, regs, &mut self.cache, &mut read_stack);
-        let mut frames = Vec::new();
-        while frames.len() < max_frames {
-            let Ok(Some(frame)) = iter.next() else {
-                break;
-            };
-            push_perf_unwind_address(&mut frames, frame.address());
-        }
+        let ip = regs.ip();
+        let frames = self
+            .arch
+            .iter_addresses(ip, regs, &mut read_stack, max_frames);
         let framehop_frame_count = frames.len();
         UserStackUnwindResult {
             accepted_frames: frames,
@@ -302,10 +466,54 @@ impl FramehopUnwinder {
     }
 }
 
+impl ArchUnwinder {
+    fn add_module(&mut self, module: Module<ModuleBytes>) {
+        match self {
+            Self::X86_64 { unwinder, .. } => unwinder.add_module(module),
+            Self::Aarch64 { unwinder, .. } => unwinder.add_module(module),
+        }
+    }
+
+    fn iter_addresses(
+        &mut self,
+        ip: u64,
+        regs: PerfUserRegs,
+        read_stack: &mut impl FnMut(u64) -> Result<u64, ()>,
+        max_frames: usize,
+    ) -> Vec<u64> {
+        let mut frames = Vec::new();
+        // The seeded register file must match the active arch; a mismatch means
+        // the file header arch and the regs decode disagreed, which cannot
+        // happen because both flow from the same PerfArch.
+        match (self, regs) {
+            (Self::X86_64 { unwinder, cache }, PerfUserRegs::X86_64(regs)) => {
+                let mut iter = unwinder.iter_frames(ip, regs.to_framehop_regs(), cache, read_stack);
+                while frames.len() < max_frames {
+                    let Ok(Some(frame)) = iter.next() else {
+                        break;
+                    };
+                    push_perf_unwind_address(&mut frames, frame.address());
+                }
+            }
+            (Self::Aarch64 { unwinder, cache }, PerfUserRegs::Aarch64(regs)) => {
+                let mut iter = unwinder.iter_frames(ip, regs.to_framehop_regs(), cache, read_stack);
+                while frames.len() < max_frames {
+                    let Ok(Some(frame)) = iter.next() else {
+                        break;
+                    };
+                    push_perf_unwind_address(&mut frames, frame.address());
+                }
+            }
+            _ => {}
+        }
+        frames
+    }
+}
+
 impl UserStackUnwinder for FramehopUnwinder {
     fn unwind_user_stack(
         &mut self,
-        regs: PerfX86_64Regs,
+        regs: PerfUserRegs,
         stack: &[u8],
         max_frames: usize,
     ) -> UserStackUnwindResult {
@@ -698,6 +906,94 @@ impl PerfX86_64Regs {
     }
 }
 
+impl PerfAarch64Regs {
+    /// Builds the minimal aarch64 register set needed for stack unwinding from
+    /// perf's ascending register-mask encoding (`PERF_REG_ARM64_*`: x29/fp=29,
+    /// lr=30, sp=31, pc=32).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value slice does not match the number of set
+    /// bits in `mask` or a required register is missing.
+    pub fn from_perf_masked_values(mask: u64, values: &[u64]) -> Result<Self, String> {
+        const FP: u32 = 29;
+        const LR: u32 = 30;
+        const SP: u32 = 31;
+        const PC: u32 = 32;
+
+        if mask.count_ones() as usize != values.len() {
+            return Err("perf register mask and value count differ".to_string());
+        }
+
+        let masked = |register: u32| -> Option<u64> {
+            if mask & (1_u64 << register) == 0 {
+                return None;
+            }
+            let index = (mask & ((1_u64 << register) - 1)).count_ones() as usize;
+            values.get(index).copied()
+        };
+
+        Ok(Self {
+            pc: masked(PC)
+                .ok_or_else(|| "perf sample is missing aarch64 PC register".to_string())?,
+            sp: masked(SP)
+                .ok_or_else(|| "perf sample is missing aarch64 SP register".to_string())?,
+            fp: masked(FP)
+                .ok_or_else(|| "perf sample is missing aarch64 FP register".to_string())?,
+            lr: masked(LR)
+                .ok_or_else(|| "perf sample is missing aarch64 LR register".to_string())?,
+        })
+    }
+
+    #[must_use]
+    pub fn to_framehop_regs(self) -> UnwindRegsAarch64 {
+        UnwindRegsAarch64::new(self.lr, self.sp, self.fp)
+    }
+}
+
+/// Walks an aarch64 frame-pointer chain the way elfutils' `ebl_unwind` backend
+/// does when no CFI covers the program counter.
+///
+/// Faithful to elfutils backends/aarch64_unwind.c: the caller's pc is the
+/// current lr (zero lr ends the walk before any caller is accepted), the next
+/// lr/fp load from `fp+8`/`fp+0` (zero on failed reads), the next sp is
+/// `fp+16`, and a step is accepted iff `fp == 0 || new_sp > sp`. Unlike the
+/// x86_64 backend there is no `fp >= sp` precondition, so a zero frame pointer
+/// still yields one lr-based caller.
+#[must_use]
+pub fn unwind_aarch64_frame_pointer_stack_like_elfutils(
+    regs: PerfAarch64Regs,
+    stack: &[u8],
+    max_frames: usize,
+) -> Vec<u64> {
+    let memory_reader = PerfStackReader::new(regs.sp, stack);
+    let mut frames = Vec::new();
+    if max_frames == 0 {
+        return frames;
+    }
+
+    frames.push(regs.pc);
+    let mut lr = regs.lr;
+    let mut fp = regs.fp;
+    let mut sp = regs.sp;
+    while frames.len() < max_frames {
+        if lr == 0 {
+            break;
+        }
+        let new_lr = memory_reader.read_u64(fp.saturating_add(8)).unwrap_or(0);
+        let new_fp = memory_reader.read_u64(fp).unwrap_or(0);
+        let new_sp = fp.saturating_add(16);
+        if fp != 0 && new_sp <= sp {
+            break;
+        }
+        push_perf_unwind_address(&mut frames, lr);
+        lr = new_lr;
+        fp = new_fp;
+        sp = new_sp;
+    }
+    frames
+}
+
 impl<'a> PerfStackReader<'a> {
     #[must_use]
     pub fn new(sp: u64, bytes: &'a [u8]) -> Self {
@@ -914,5 +1210,124 @@ mod tests {
         super::truncate_at_first_uncovered_unwind_frame(&mut frames, |_| true);
 
         assert_eq!(frames, vec![0x1000, 0x2000]);
+    }
+
+    #[test]
+    fn decodes_aarch64_registers_from_perf_mask() {
+        // perf record --call-graph dwarf on arm64 captures x0-x30, sp, pc.
+        let mask = (1_u64 << 33) - 1;
+        let mut values = (0_u64..33).collect::<Vec<_>>();
+        values[29] = 0x2900; // fp
+        values[30] = 0x3000; // lr
+        values[31] = 0x3100; // sp
+        values[32] = 0x3200; // pc
+
+        let regs = super::PerfAarch64Regs::from_perf_masked_values(mask, &values).expect("regs");
+
+        assert_eq!(
+            regs,
+            super::PerfAarch64Regs {
+                pc: 0x3200,
+                sp: 0x3100,
+                fp: 0x2900,
+                lr: 0x3000,
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_aarch64_registers_from_sparse_perf_mask() {
+        let mask = (1 << 29) | (1 << 30) | (1 << 31) | (1 << 32);
+        let values = [0x2900, 0x3000, 0x3100, 0x3200];
+
+        let regs = super::PerfAarch64Regs::from_perf_masked_values(mask, &values).expect("regs");
+
+        assert_eq!(regs.fp, 0x2900);
+        assert_eq!(regs.lr, 0x3000);
+        assert_eq!(regs.sp, 0x3100);
+        assert_eq!(regs.pc, 0x3200);
+    }
+
+    #[test]
+    fn rejects_aarch64_registers_missing_pc() {
+        let mask = (1 << 29) | (1 << 30) | (1 << 31);
+        let values = [0x2900, 0x3000, 0x3100];
+
+        let error =
+            super::PerfAarch64Regs::from_perf_masked_values(mask, &values).expect_err("missing pc");
+
+        assert!(error.contains("PC"));
+    }
+
+    #[test]
+    fn aarch64_frame_pointer_unwind_walks_fp_chain_like_elfutils() {
+        // Stack layout (sp = 0x1000): fp chain records at fp+0 / lr at fp+8,
+        // matching elfutils aarch64_unwind.c FP_OFFSET/LR_OFFSET/SP_OFFSET.
+        let regs = super::PerfAarch64Regs {
+            pc: 0x4000,
+            sp: 0x1000,
+            fp: 0x1010,
+            lr: 0x5000,
+        };
+        let mut stack = vec![0_u8; 0x40];
+        // frame at fp=0x1010: next fp = 0x1030, next lr = 0x6000
+        stack[0x10..0x18].copy_from_slice(&0x1030_u64.to_le_bytes());
+        stack[0x18..0x20].copy_from_slice(&0x6000_u64.to_le_bytes());
+        // frame at fp=0x1030: next fp = 0, next lr = 0 (end of chain)
+        stack[0x30..0x38].copy_from_slice(&0_u64.to_le_bytes());
+        stack[0x38..0x40].copy_from_slice(&0_u64.to_le_bytes());
+
+        let frames = super::unwind_aarch64_frame_pointer_stack_like_elfutils(regs, &stack, 256);
+
+        // Return addresses after the leaf take the perf `pc - 1` adjustment.
+        assert_eq!(frames, vec![0x4000, 0x4fff, 0x5fff]);
+    }
+
+    #[test]
+    fn aarch64_frame_pointer_unwind_accepts_one_lr_caller_when_fp_is_zero() {
+        // elfutils: `return fp == 0 || newSp > sp` — a zero fp still accepts
+        // the lr-based caller, then the walk ends on the zeroed next lr.
+        let regs = super::PerfAarch64Regs {
+            pc: 0x4000,
+            sp: 0x1000,
+            fp: 0,
+            lr: 0x5000,
+        };
+
+        let frames =
+            super::unwind_aarch64_frame_pointer_stack_like_elfutils(regs, &[0_u8; 0x20], 256);
+
+        assert_eq!(frames, vec![0x4000, 0x4fff]);
+    }
+
+    #[test]
+    fn aarch64_frame_pointer_unwind_rejects_backwards_stack_growth() {
+        // fp != 0 and newSp (fp+16) <= sp must discard the candidate caller.
+        let regs = super::PerfAarch64Regs {
+            pc: 0x4000,
+            sp: 0x1020,
+            fp: 0x1000,
+            lr: 0x5000,
+        };
+
+        let frames =
+            super::unwind_aarch64_frame_pointer_stack_like_elfutils(regs, &[0_u8; 0x40], 256);
+
+        assert_eq!(frames, vec![0x4000]);
+    }
+
+    #[test]
+    fn aarch64_frame_pointer_unwind_stops_on_zero_lr_without_callers() {
+        let regs = super::PerfAarch64Regs {
+            pc: 0x4000,
+            sp: 0x1000,
+            fp: 0x1010,
+            lr: 0,
+        };
+
+        let frames =
+            super::unwind_aarch64_frame_pointer_stack_like_elfutils(regs, &[0_u8; 0x40], 256);
+
+        assert_eq!(frames, vec![0x4000]);
     }
 }

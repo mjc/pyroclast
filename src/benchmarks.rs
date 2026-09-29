@@ -30,6 +30,12 @@ pub struct BenchArgs {
     pub export_perf_script: Option<PathBuf>,
 
     pub symbols: bool,
+
+    /// Expand each callchain entry into its DWARF inline frames when folding,
+    /// like `perf script --inline`. The dwarf oracle's perf.script is recorded
+    /// with inline expansion, so the comparison must fold with inline on to
+    /// line up frame counts.
+    pub inline: bool,
 }
 
 impl BenchArgs {
@@ -44,6 +50,8 @@ impl BenchArgs {
                 parsed.export_perf_script = iter.next();
             } else if arg.as_os_str() == "--symbols" {
                 parsed.symbols = true;
+            } else if arg.as_os_str() == "--inline" {
+                parsed.inline = true;
             } else {
                 parsed.perf_data = Some(arg);
             }
@@ -122,9 +130,14 @@ where
         ));
     }
 
-    let report =
-        run_streaming_comparison_with_symbols(&input, perf_script.as_deref(), runner, args.symbols)
-            .map_err(|error| format!("inferno comparison failed: {error}"))?;
+    let report = run_streaming_comparison_with_symbols(
+        &input,
+        perf_script.as_deref(),
+        runner,
+        args.symbols,
+        args.inline,
+    )
+    .map_err(|error| format!("inferno comparison failed: {error}"))?;
     Ok(format_bench_output(&report))
 }
 
@@ -160,7 +173,7 @@ fn append_bench_report(name: &str, report: &FoldBenchmarkReport, output: &mut St
 /// Returns an error when the input file cannot be mapped or parsed.
 pub fn run_fold_benchmark(input: &Path) -> Result<FoldBenchmarkReport, String> {
     run_fold_benchmark_with_writer(input, |writer| {
-        write_folded_perfdata_file_with_options(input, benchmark_fold_options(), writer)
+        write_folded_perfdata_file_with_options(input, benchmark_fold_options(false), writer)
     })
 }
 
@@ -175,6 +188,7 @@ pub fn run_fold_benchmark_with_runner<R>(
     input: &Path,
     runner: &R,
     symbols: bool,
+    inline: bool,
 ) -> Result<FoldBenchmarkReport, String>
 where
     R: CommandRunner,
@@ -184,7 +198,7 @@ where
         run_fold_benchmark_with_writer(input, |writer| {
             write_folded_perfdata_file_with_symbols(
                 input,
-                benchmark_fold_options(),
+                benchmark_fold_options(inline),
                 &resolver,
                 writer,
             )
@@ -287,7 +301,7 @@ pub fn compare_with_inferno_collapse<R>(
 where
     R: CommandRunner,
 {
-    compare_with_inferno_collapse_with_symbols(perf_data, perf_script, runner, false)
+    compare_with_inferno_collapse_with_symbols(perf_data, perf_script, runner, false, false)
 }
 
 /// Compares Pyroclast's direct folded stacks with the old
@@ -304,15 +318,16 @@ pub fn compare_with_inferno_collapse_with_symbols<R>(
     perf_script: &Path,
     runner: &R,
     symbols: bool,
+    inline: bool,
 ) -> Result<FoldComparisonReport, String>
 where
     R: CommandRunner,
 {
     let pyroclast_folded = if symbols {
         let resolver = perf_symbol_resolver_for_current_home(runner, perf_data);
-        fold_perfdata_file_with_symbols(perf_data, benchmark_fold_options(), &resolver)?
+        fold_perfdata_file_with_symbols(perf_data, benchmark_fold_options(inline), &resolver)?
     } else {
-        fold_perfdata_file_with_options(perf_data, benchmark_fold_options())?
+        fold_perfdata_file_with_options(perf_data, benchmark_fold_options(inline))?
     };
     let inferno_output = runner
         .run(&CommandSpec::new("inferno-collapse-perf").arg(perf_script.display().to_string()))
@@ -356,6 +371,7 @@ pub fn run_streaming_comparison_with_symbols<R>(
     perf_script: Option<&Path>,
     runner: &R,
     symbols: bool,
+    inline: bool,
 ) -> Result<StreamingComparisonReport, String>
 where
     R: CommandRunner + Sync,
@@ -364,7 +380,7 @@ where
         let (pyro_tx, pyro_rx) = sync_channel(64);
         let (inferno_tx, inferno_rx) = sync_channel(64);
         let pyro_thread =
-            scope.spawn(move || run_pyroclast_stream(perf_data, runner, symbols, pyro_tx));
+            scope.spawn(move || run_pyroclast_stream(perf_data, runner, symbols, inline, pyro_tx));
         let inferno_thread = scope
             .spawn(move || run_inferno_stream(perf_data, perf_script, runner, symbols, inferno_tx));
         let diff = compare_folded_line_receivers(&pyro_rx, &inferno_rx)?;
@@ -628,6 +644,7 @@ fn run_pyroclast_stream<R>(
     perf_data: &Path,
     runner: &R,
     symbols: bool,
+    inline: bool,
     line_sender: SyncSender<String>,
 ) -> Result<ProducerResult, String>
 where
@@ -647,12 +664,16 @@ where
         let resolver = perf_symbol_resolver_for_current_home(runner, &perf_data);
         write_folded_perfdata_file_with_symbols(
             &perf_data,
-            benchmark_fold_options(),
+            benchmark_fold_options(inline),
             &resolver,
             &mut writer,
         )?;
     } else {
-        write_folded_perfdata_file_with_options(&perf_data, benchmark_fold_options(), &mut writer)?;
+        write_folded_perfdata_file_with_options(
+            &perf_data,
+            benchmark_fold_options(inline),
+            &mut writer,
+        )?;
     }
     writer
         .flush()
@@ -739,14 +760,14 @@ where
                             perf_symbol_resolver_for_current_home(runner, &export_perf_data);
                         write_inferno_perf_script_file_with_symbols(
                             &export_perf_data,
-                            benchmark_fold_options(),
+                            benchmark_fold_options(false),
                             &resolver,
                             &mut stdin,
                         )
                     } else {
                         write_inferno_perf_script_file_with_options(
                             &export_perf_data,
-                            benchmark_fold_options(),
+                            benchmark_fold_options(false),
                             &mut stdin,
                         )
                     }?;
@@ -983,9 +1004,12 @@ fn join_result_thread<T>(
     }
 }
 
-fn benchmark_fold_options() -> FoldOptions {
+fn benchmark_fold_options(inline: bool) -> FoldOptions {
+    // The benchmark scoreboard compares against plain `perf | inferno`, which
+    // does not expand DWARF inline frames, so the parity path keeps inline off.
     FoldOptions {
         count_periods: true,
+        inline,
     }
 }
 

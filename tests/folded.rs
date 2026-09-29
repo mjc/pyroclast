@@ -9,6 +9,11 @@ fn escapes_frame_delimiters_and_newlines() {
 }
 
 #[test]
+fn leaves_plain_frames_untouched() {
+    assert_eq!(escape_frame("plain_frame_123"), "plain_frame_123");
+}
+
+#[test]
 fn renders_folded_stack_with_count() {
     let stack = render_folded_stack(["root", "leaf;semi"], 7);
 

@@ -5,7 +5,7 @@ use proptest::string::string_regex;
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
 use pyroclast::tools::{
     ResolverContext, SystemToolResolver, ToolKind, ToolSource, ToolSpec, collect_tool_versions,
-    find_executable_on_path, find_nearest_flake_dir, required_tools, tool_spec_named,
+    find_executable_on_path, required_tools, tool_spec_named,
 };
 
 #[test]
@@ -91,7 +91,7 @@ fn resolver_prefers_supported_path_tools() {
 }
 
 #[test]
-fn resolver_marks_path_tools_from_current_nix_shell() {
+fn resolver_marks_path_tools_from_current_devenv_shell() {
     let root = tempfile::tempdir().expect("tempdir");
     let bin = root.path().join("bin");
     std::fs::create_dir_all(&bin).expect("bin dir");
@@ -110,35 +110,7 @@ fn resolver_marks_path_tools_from_current_nix_shell() {
         tool_path.path,
         bin.join("inferno-flamegraph").display().to_string()
     );
-    assert_eq!(tool_path.source, ToolSource::InNixShell);
-}
-
-#[test]
-fn resolver_uses_project_flake_for_missing_safe_utility() {
-    let root = tempfile::tempdir().expect("tempdir");
-    let project = root.path().join("project/subdir");
-    let bin = root.path().join("bin");
-    std::fs::create_dir_all(&project).expect("project dir");
-    std::fs::create_dir_all(&bin).expect("bin dir");
-    std::fs::write(root.path().join("project/flake.nix"), b"{}").expect("flake");
-    std::fs::write(bin.join("nix"), b"").expect("nix stub");
-    let path = std::env::join_paths([bin.as_path()]).expect("join path");
-    let runner = NixFallbackRunner::default();
-    let mut resolver = SystemToolResolver::new(
-        &runner,
-        ResolverContext::for_tests("linux", &project, Some(path), false),
-    );
-
-    let tool_path = resolver
-        .resolve(&tool_spec_named("inferno-flamegraph").expect("inferno-flamegraph"))
-        .expect("resolve inferno-flamegraph");
-
-    assert_eq!(tool_path.source, ToolSource::ProjectFlake);
-    assert_eq!(
-        tool_path.path,
-        "/nix/store/fake/bin/inferno-flamegraph".to_string()
-    );
-    assert!(runner.saw_develop());
+    assert_eq!(tool_path.source, ToolSource::InDevenv);
 }
 
 #[test]
@@ -167,7 +139,6 @@ fn resolver_reports_full_attempt_trace_when_all_sources_fail() {
     let bin = root.path().join("bin");
     std::fs::create_dir_all(&project).expect("project dir");
     std::fs::create_dir_all(&bin).expect("bin dir");
-    std::fs::write(root.path().join("project/flake.nix"), b"{}").expect("flake");
     std::fs::write(bin.join("nix"), b"").expect("nix stub");
     let path = std::env::join_paths([bin.as_path()]).expect("join path");
     let runner = AllSourcesFailRunner::default();
@@ -183,8 +154,6 @@ fn resolver_reports_full_attempt_trace_when_all_sources_fail() {
 
     assert!(text.contains("Resolution attempts:"));
     assert!(text.contains("PATH: not found"));
-    assert!(text.contains("project flake via `nix develop"));
-    assert!(text.contains("command not found: inferno-flamegraph"));
     assert!(text.contains(
         "ephemeral nix shell via `nix shell nixpkgs#inferno --command inferno-flamegraph`"
     ));
@@ -206,7 +175,6 @@ fn resolver_reports_skip_reasons_when_nix_is_unavailable() {
     let text = error.to_string();
 
     assert!(text.contains("PATH: not found"));
-    assert!(text.contains("project flake: skipped because `nix` was not found on PATH"));
     assert!(text.contains("ephemeral nix shell: skipped because `nix` was not found on PATH"));
     assert!(text.contains("Next step: install `inferno-flamegraph` directly"));
 }
@@ -392,92 +360,6 @@ fn resolver_uses_ephemeral_nix_for_heaptrack_print() {
 }
 
 #[test]
-fn resolver_caches_project_flake_probes() {
-    let root = tempfile::tempdir().expect("tempdir");
-    let project = root.path().join("project/subdir");
-    let bin = root.path().join("bin");
-    std::fs::create_dir_all(&project).expect("project dir");
-    std::fs::create_dir_all(&bin).expect("bin dir");
-    std::fs::write(root.path().join("project/flake.nix"), b"{}").expect("flake");
-    std::fs::write(bin.join("nix"), b"").expect("nix stub");
-    let path = std::env::join_paths([bin.as_path()]).expect("join path");
-    let runner = NixFallbackRunner::default();
-    let mut resolver = SystemToolResolver::new(
-        &runner,
-        ResolverContext::for_tests("linux", &project, Some(path), false),
-    );
-    let tool = tool_spec_named("inferno-flamegraph").expect("inferno-flamegraph");
-
-    let first = resolver.resolve(&tool).expect("first resolve");
-    let second = resolver.resolve(&tool).expect("second resolve");
-
-    assert_eq!(first, second);
-    assert_eq!(runner.matching_commands("develop"), 1);
-    assert_eq!(
-        runner.matching_program("/nix/store/fake/bin/inferno-flamegraph"),
-        1
-    );
-}
-
-#[test]
-fn resolver_falls_back_to_ephemeral_nix_when_project_flake_lacks_tool() {
-    let root = tempfile::tempdir().expect("tempdir");
-    let project = root.path().join("project/subdir");
-    let bin = root.path().join("bin");
-    std::fs::create_dir_all(&project).expect("project dir");
-    std::fs::create_dir_all(&bin).expect("bin dir");
-    std::fs::write(root.path().join("project/flake.nix"), b"{}").expect("flake");
-    std::fs::write(bin.join("nix"), b"").expect("nix stub");
-    let path = std::env::join_paths([bin.as_path()]).expect("join path");
-    let runner = ProjectFlakeMissRunner::default();
-    let mut resolver = SystemToolResolver::new(
-        &runner,
-        ResolverContext::for_tests("linux", &project, Some(path), false),
-    );
-
-    let tool_path = resolver
-        .resolve(&tool_spec_named("inferno-flamegraph").expect("inferno-flamegraph"))
-        .expect("resolve inferno-flamegraph");
-
-    assert_eq!(tool_path.source, ToolSource::EphemeralNix);
-    assert_eq!(
-        tool_path.path,
-        "/nix/store/fake/bin/inferno-flamegraph".to_string()
-    );
-    assert_eq!(runner.matching_commands("develop"), 1);
-    assert_eq!(runner.matching_commands("shell"), 1);
-}
-
-#[test]
-fn resolver_falls_back_to_ephemeral_nix_when_project_flake_probe_errors() {
-    let root = tempfile::tempdir().expect("tempdir");
-    let project = root.path().join("project/subdir");
-    let bin = root.path().join("bin");
-    std::fs::create_dir_all(&project).expect("project dir");
-    std::fs::create_dir_all(&bin).expect("bin dir");
-    std::fs::write(root.path().join("project/flake.nix"), b"{}").expect("flake");
-    std::fs::write(bin.join("nix"), b"").expect("nix stub");
-    let path = std::env::join_paths([bin.as_path()]).expect("join path");
-    let runner = ProjectFlakeErrorRunner::default();
-    let mut resolver = SystemToolResolver::new(
-        &runner,
-        ResolverContext::for_tests("linux", &project, Some(path), false),
-    );
-
-    let tool_path = resolver
-        .resolve(&tool_spec_named("inferno-flamegraph").expect("inferno-flamegraph"))
-        .expect("resolve inferno-flamegraph");
-
-    assert_eq!(tool_path.source, ToolSource::EphemeralNix);
-    assert_eq!(
-        tool_path.path,
-        "/nix/store/fake/bin/inferno-flamegraph".to_string()
-    );
-    assert_eq!(runner.matching_commands("develop"), 1);
-    assert_eq!(runner.matching_commands("shell"), 1);
-}
-
-#[test]
 fn resolver_reports_ephemeral_nix_probe_failure_detail() {
     let root = tempfile::tempdir().expect("tempdir");
     let project = root.path().join("project/subdir");
@@ -555,39 +437,6 @@ proptest! {
         prop_assume!(!supported.contains(name.as_str()));
 
         prop_assert_eq!(tool_spec_named(&name), None);
-    }
-
-    #[test]
-    fn property_find_nearest_flake_dir_prefers_nearest_ancestor(
-        flake_levels in prop::collection::vec(any::<bool>(), 1..8),
-    ) {
-        let root = tempfile::tempdir().expect("tempdir");
-        let mut ancestors = Vec::with_capacity(flake_levels.len());
-        let mut current = root.path().join("project");
-        std::fs::create_dir_all(&current).expect("project dir");
-        ancestors.push(current.clone());
-
-        for index in 1..flake_levels.len() {
-            current = current.join(format!("level-{index}"));
-            std::fs::create_dir_all(&current).expect("nested dir");
-            ancestors.push(current.clone());
-        }
-
-        for (directory, has_flake) in ancestors.iter().zip(&flake_levels) {
-            if *has_flake {
-                std::fs::write(directory.join("flake.nix"), "{}").expect("flake");
-            }
-        }
-
-        let expected = flake_levels
-            .iter()
-            .rposition(|has_flake| *has_flake)
-            .map(|index| ancestors[index].clone());
-
-        prop_assert_eq!(
-            find_nearest_flake_dir(ancestors.last().expect("cwd ancestor")),
-            expected
-        );
     }
 
     #[test]
@@ -673,13 +522,6 @@ struct AllSourcesFailRunner {
 impl CommandRunner for &AllSourcesFailRunner {
     fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
         self.commands.lock().unwrap().push(command.clone());
-        if command.program.ends_with("/nix") && command.args.iter().any(|arg| arg == "develop") {
-            return Ok(CommandOutput {
-                status_code: Some(1),
-                stdout: Vec::new(),
-                stderr: b"command not found: inferno-flamegraph".to_vec(),
-            });
-        }
         if command.program.ends_with("/nix") && command.args.iter().any(|arg| arg == "shell") {
             return Ok(CommandOutput {
                 status_code: Some(1),
@@ -754,10 +596,6 @@ struct NixFallbackRunner {
 }
 
 impl NixFallbackRunner {
-    fn saw_develop(&self) -> bool {
-        self.matching_commands("develop") > 0
-    }
-
     fn saw_shell(&self) -> bool {
         self.matching_commands("shell") > 0
     }
@@ -798,11 +636,6 @@ fn nix_resolution_output(path: &str) -> CommandOutput {
 impl CommandRunner for &NixFallbackRunner {
     fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
         self.commands.lock().unwrap().push(command.clone());
-        if command.program.ends_with("/nix") && command.args.iter().any(|arg| arg == "develop") {
-            return Ok(nix_resolution_output(
-                "/nix/store/fake/bin/inferno-flamegraph",
-            ));
-        }
         if command.program == "/nix/store/fake/bin/inferno-flamegraph" && command.args == ["--help"]
         {
             return Ok(CommandOutput {
@@ -853,96 +686,6 @@ impl CommandRunner for &NixFallbackRunner {
 }
 
 #[derive(Default)]
-struct ProjectFlakeMissRunner {
-    commands: std::sync::Mutex<Vec<CommandSpec>>,
-}
-
-impl ProjectFlakeMissRunner {
-    fn matching_commands(&self, needle: &str) -> usize {
-        self.commands
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|command| {
-                command.program.ends_with("/nix") && command.args.iter().any(|arg| arg == needle)
-            })
-            .count()
-    }
-}
-
-impl CommandRunner for &ProjectFlakeMissRunner {
-    fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
-        self.commands.lock().unwrap().push(command.clone());
-        if command.program.ends_with("/nix") && command.args.iter().any(|arg| arg == "develop") {
-            return Ok(CommandOutput {
-                status_code: Some(1),
-                stdout: Vec::new(),
-                stderr: b"command not found: inferno-flamegraph".to_vec(),
-            });
-        }
-        if command.program.ends_with("/nix") && command.args.iter().any(|arg| arg == "shell") {
-            return Ok(CommandOutput {
-                status_code: Some(0),
-                stdout: b"/nix/store/fake/bin/inferno-flamegraph\n".to_vec(),
-                stderr: Vec::new(),
-            });
-        }
-        if command.program == "/nix/store/fake/bin/inferno-flamegraph" && command.args == ["--help"]
-        {
-            return Ok(CommandOutput {
-                status_code: Some(0),
-                stdout: b"Rust port of the FlameGraph performance profiling tool suite\n".to_vec(),
-                stderr: Vec::new(),
-            });
-        }
-        panic!("unexpected command: {command:?}");
-    }
-}
-
-#[derive(Default)]
-struct ProjectFlakeErrorRunner {
-    commands: std::sync::Mutex<Vec<CommandSpec>>,
-}
-
-impl ProjectFlakeErrorRunner {
-    fn matching_commands(&self, needle: &str) -> usize {
-        self.commands
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|command| {
-                command.program.ends_with("/nix") && command.args.iter().any(|arg| arg == needle)
-            })
-            .count()
-    }
-}
-
-impl CommandRunner for &ProjectFlakeErrorRunner {
-    fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
-        self.commands.lock().unwrap().push(command.clone());
-        if command.program.ends_with("/nix") && command.args.iter().any(|arg| arg == "develop") {
-            return Err(std::io::Error::other("nix develop exploded"));
-        }
-        if command.program.ends_with("/nix") && command.args.iter().any(|arg| arg == "shell") {
-            return Ok(CommandOutput {
-                status_code: Some(0),
-                stdout: b"/nix/store/fake/bin/inferno-flamegraph\n".to_vec(),
-                stderr: Vec::new(),
-            });
-        }
-        if command.program == "/nix/store/fake/bin/inferno-flamegraph" && command.args == ["--help"]
-        {
-            return Ok(CommandOutput {
-                status_code: Some(0),
-                stdout: b"Rust port of the FlameGraph performance profiling tool suite\n".to_vec(),
-                stderr: Vec::new(),
-            });
-        }
-        panic!("unexpected command: {command:?}");
-    }
-}
-
-#[derive(Default)]
 struct EphemeralNixFailureRunner {
     commands: std::sync::Mutex<Vec<CommandSpec>>,
 }
@@ -950,13 +693,6 @@ struct EphemeralNixFailureRunner {
 impl CommandRunner for &EphemeralNixFailureRunner {
     fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
         self.commands.lock().unwrap().push(command.clone());
-        if command.program.ends_with("/nix") && command.args.iter().any(|arg| arg == "develop") {
-            return Ok(CommandOutput {
-                status_code: Some(1),
-                stdout: Vec::new(),
-                stderr: b"command not found: inferno-flamegraph".to_vec(),
-            });
-        }
         if command.program.ends_with("/nix") && command.args.iter().any(|arg| arg == "shell") {
             return Ok(CommandOutput {
                 status_code: Some(1),

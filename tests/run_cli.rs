@@ -21,7 +21,7 @@ fn top_level_memory_command_uses_injected_heaptrack_runner() {
         "check",
     ]);
 
-    pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("run cli");
+    pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux").expect("run cli");
 
     assert!(out.join("run.json").is_file());
     assert!(out.join("command.txt").is_file());
@@ -125,7 +125,7 @@ fn perf_script_command_exports_inferno_compatible_perf_script() {
 
     assert_eq!(
         output.stdout,
-        "app       2 [003]     0.123456:        144 cycles:\n\t            2000 [unknown] (/bin/app)\n\n"
+        "app       2 [003]     0.123456:        144 cycles: \n\t            2000 [unknown] (/bin/app)\n\n"
     );
 }
 
@@ -176,7 +176,7 @@ fn perf_script_command_uses_perf_default_thread_comm_when_comm_is_missing() {
 
     assert_eq!(
         output.stdout,
-        ":2       2 [003]     0.123456:        144 cycles:\n\t            2000 [unknown] (/bin/app)\n\n"
+        ":2       2 [003]     0.123456:        144 cycles: \n\t            2000 [unknown] (/bin/app)\n\n"
     );
 }
 
@@ -225,9 +225,9 @@ fn perf_script_command_preserves_sample_event_records_like_perf_script() {
     assert_eq!(
         output.stdout,
         concat!(
-            "app       2 [004]     0.000010:          7 cycles:\n",
+            "app       2 [004]     0.000010:          7 cycles: \n",
             "\t            2000 [unknown] (/bin/app)\n\n",
-            "app       2 [005]     0.000020:         11 cycles:\n",
+            "app       2 [005]     0.000020:         11 cycles: \n",
             "\t            2000 [unknown] (/bin/app)\n\n",
         )
     );
@@ -308,7 +308,7 @@ fn perf_script_command_uses_perf_event_name_from_software_attr_like_perf_script(
 
     assert_eq!(
         output.stdout,
-        "app       2        144 cpu-clock:\n\t            2000 [unknown] (/bin/app)\n\n"
+        "app       2        144 cpu-clock: \n\t            2000 [unknown] (/bin/app)\n\n"
     );
 }
 
@@ -376,9 +376,9 @@ fn perf_script_command_pads_event_names_to_evlist_max_width_like_perf_script() {
     assert_eq!(
         output.stdout,
         concat!(
-            "app       2          5    cycles:\n",
+            "app       2          5    cycles: \n",
             "\t            2000 [unknown] ([unknown])\n\n",
-            "app       2          7 cpu-clock:\n",
+            "app       2          7 cpu-clock: \n",
             "\t            2000 [unknown] ([unknown])\n\n",
         )
     );
@@ -415,7 +415,7 @@ fn perf_script_command_omits_tid_column_when_sample_type_lacks_tid_like_perf_scr
 
     assert_eq!(
         output.stdout,
-        ":-1          5 cycles:\n\t            2000 [unknown] ([unknown])\n\n"
+        ":-1          5 cycles: \n\t            2000 [unknown] ([unknown])\n\n"
     );
 }
 
@@ -460,7 +460,7 @@ fn perf_script_command_inherits_parent_comm_on_fork_like_perf_script() {
 
     assert_eq!(
         output.stdout,
-        "sh      22 [006]     0.000030:          5 cycles:\n\t            2000 [unknown] (/bin/sh)\n\n"
+        "sh      22 [006]     0.000030:          5 cycles: \n\t            2000 [unknown] (/bin/sh)\n\n"
     );
 }
 
@@ -513,7 +513,7 @@ fn perf_script_command_keeps_perf_stack_order_and_skips_context_markers() {
     assert_eq!(
         output.stdout,
         concat!(
-            "app       2 [000]     0.000000:         13 cycles:\n",
+            "app       2 [000]     0.000000:         13 cycles: \n",
             "\t            2000 [unknown] (/bin/app)\n",
             "\t            2100 [unknown] (/bin/app)\n\n",
         )
@@ -541,10 +541,13 @@ fn fold_command_can_symbolize_mapped_frames() {
     )
     .expect("write perfdata");
     let runner = RecordingRunner::default();
+    // The base symbol comes from the in-process ELF symtab without --inline;
+    // exercising the external addr2line resolver requires the inline path.
     let cli = pyroclast::cli::Cli::parse_from([
         "pyroclast",
         "plumbing",
         "fold",
+        "--inline",
         "--symbolizer",
         "addr2line",
         perfdata.to_str().unwrap(),
@@ -743,10 +746,13 @@ fn flamegraph_command_can_symbolize_mapped_frames() {
     )
     .expect("write perfdata");
     let runner = RecordingRunner::default();
+    // The base symbol comes from the in-process ELF symtab without --inline;
+    // exercising the external addr2line resolver requires the inline path.
     let cli = pyroclast::cli::Cli::parse_from([
         "pyroclast",
         "plumbing",
         "flamegraph",
+        "--inline",
         "--symbolizer",
         "addr2line",
         perfdata.to_str().expect("perfdata path"),
@@ -995,7 +1001,7 @@ fn top_level_cpu_command_uses_injected_perf_runner() {
         "true",
     ]);
 
-    pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("run cli");
+    pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux").expect("run cli");
 
     assert_eq!(runner.programs(), vec!["perf", "inferno-flamegraph"]);
     let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
@@ -1030,7 +1036,7 @@ fn profile_cpu_command_uses_injected_perf_runner() {
         "true",
     ]);
 
-    pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("run cli");
+    pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux").expect("run cli");
 
     assert_eq!(runner.programs(), vec!["perf", "inferno-flamegraph"]);
     let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
@@ -1083,7 +1089,7 @@ fn profile_memory_command_keeps_symbols_off_by_default() {
         "true",
     ]);
 
-    pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("run cli");
+    pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux").expect("run cli");
 
     assert_eq!(runner.programs(), vec!["heaptrack", "heaptrack_print"]);
     let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
@@ -1105,7 +1111,7 @@ fn top_level_latency_command_uses_injected_strace_runner() {
         "true",
     ]);
 
-    pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("run cli");
+    pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux").expect("run cli");
 
     assert_eq!(runner.programs(), vec!["strace"]);
     let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
@@ -1131,7 +1137,7 @@ fn top_level_offcpu_command_uses_injected_perf_sched_runner() {
         "true",
     ]);
 
-    pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("run cli");
+    pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux").expect("run cli");
 
     assert_eq!(runner.programs(), vec!["perf", "perf"]);
     let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
@@ -1157,8 +1163,8 @@ fn top_level_offcpu_command_rejects_attach_workflows() {
         "5",
     ]);
 
-    let error =
-        pyroclast::run_parsed_cli_with_runner(cli, &runner).expect_err("attach should fail");
+    let error = pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux")
+        .expect_err("attach should fail");
 
     assert_eq!(
         error.to_string(),

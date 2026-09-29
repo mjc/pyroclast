@@ -1,2 +1,8 @@
 /target
 /pyroclast-runs
+/.claude/
+
+/.devenv/
+!/devenv.nix
+!/devenv.yaml
+!/devenv.lock

@@ -30,6 +30,35 @@ fn parses_build_id_events_from_header_feature_payload() {
 }
 
 #[test]
+fn parses_build_id_events_written_by_perf_write_buildid() {
+    // tools/perf/util/build-id.c write_buildid() emits perf_record_header_build_id
+    // records into the HEADER_BUILD_ID feature section WITHOUT setting
+    // header.type (so it stays 0), sets PERF_RECORD_MISC_BUILD_ID_SIZE in misc,
+    // and stores the real build-id length in the size byte at the end of the
+    // 24-byte build_id field (offset 32). pyroclast must accept type 0 and honor
+    // that size byte.
+    let payload = build_id_event_payload_like_perf(
+        u32::MAX,
+        &[
+            0x5a, 0xeb, 0xdc, 0xbb, 0xc2, 0x4d, 0xe5, 0xf6, 0x37, 0xea, 0xb4, 0x4b, 0x9d, 0x16,
+            0x2c, 0x84, 0xf1, 0xa8, 0x93, 0x38,
+        ],
+        "/tmp/oracle-workload",
+    );
+
+    let events = parse_build_id_events(&payload).expect("build ids");
+
+    assert_eq!(
+        events,
+        vec![BuildIdEvent {
+            pid: u32::MAX,
+            build_id: "5aebdcbbc24de5f637eab44b9d162c84f1a89338".to_string(),
+            filename: "/tmp/oracle-workload".to_string(),
+        }]
+    );
+}
+
+#[test]
 fn extracts_kernel_build_id_from_perfdata_header_feature() {
     let build_id = [
         0x16, 0xed, 0x3d, 0x53, 0x17, 0xad, 0x21, 0x9c, 0x89, 0xd0, 0xe3, 0xc5, 0xea, 0x0e, 0xa2,
@@ -249,6 +278,25 @@ fn build_id_event_payload(pid: u32, build_id: &[u8; 20], filename: &str) -> Vec<
     payload
 }
 
+// Mirrors tools/perf/util/build-id.c write_buildid(): header.type left 0,
+// PERF_RECORD_MISC_BUILD_ID_SIZE set in misc, build-id length stored in the
+// size byte at offset 20 of the 24-byte build_id field (record offset 32).
+fn build_id_event_payload_like_perf(pid: u32, build_id: &[u8; 20], filename: &str) -> Vec<u8> {
+    const PERF_RECORD_MISC_BUILD_ID_SIZE: u16 = 1 << 15;
+    let size = 36 + filename.len() + 1;
+    let mut payload = Vec::new();
+    payload.extend(0_u32.to_le_bytes());
+    payload.extend(PERF_RECORD_MISC_BUILD_ID_SIZE.to_le_bytes());
+    payload.extend(u16::try_from(size).expect("event size").to_le_bytes());
+    payload.extend(pid.to_le_bytes());
+    payload.extend(build_id);
+    payload.push(20);
+    payload.extend([0; 3]);
+    payload.extend(filename.as_bytes());
+    payload.push(0);
+    payload
+}
+
 fn perfdata_with_build_id_feature(payload: &[u8]) -> Vec<u8> {
     let feature_table_offset = 128;
     let payload_offset = 160;
@@ -257,7 +305,9 @@ fn perfdata_with_build_id_feature(payload: &[u8]) -> Vec<u8> {
     put_u64(&mut bytes, 8, 104);
     put_u64(&mut bytes, 40, 128);
     put_u64(&mut bytes, 48, 0);
-    put_u64(&mut bytes, 56, 1 << 2);
+    // HEADER_BUILD_ID feature bit (2) in the adds_features bitmap at byte
+    // offset 72 (struct perf_file_header, tools/perf/util/header.h).
+    put_u64(&mut bytes, 72, 1 << 2);
     put_u64(&mut bytes, feature_table_offset, payload_offset as u64);
     put_u64(
         &mut bytes,

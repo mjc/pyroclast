@@ -143,16 +143,32 @@ fn build_id_feature_payload(bytes: &[u8]) -> Result<Option<&[u8]>, String> {
 }
 
 fn parse_build_id_event(record: &[u8]) -> Result<BuildIdEvent, String> {
-    let record_type = read_u32(record, 0)?;
-    if record_type != PERF_RECORD_HEADER_BUILD_ID {
-        return Err(format!(
-            "expected PERF_RECORD_HEADER_BUILD_ID, got {record_type}"
-        ));
-    }
+    // tools/perf/util/build-id.c write_buildid() emits these feature-section
+    // records WITHOUT setting header.type (it leaves it 0) and sets
+    // PERF_RECORD_MISC_BUILD_ID_SIZE in misc with the real build-id length in
+    // the size byte at offset 20 of the 24-byte build_id field (record offset
+    // 32). Do not gate on the record type; rely on the size field (offset 6)
+    // for record framing, as perf_header__read_build_ids does.
+    let misc = read_u16(record, 4)?;
+    let build_id_size = if misc & PERF_RECORD_MISC_BUILD_ID_SIZE != 0 {
+        let size = usize::from(
+            *record
+                .get(12 + BUILD_ID_SIZE)
+                .ok_or_else(|| "truncated build-id size byte".to_string())?,
+        );
+        if size > BUILD_ID_SIZE {
+            return Err(format!(
+                "build-id event build-id size {size} exceeds {BUILD_ID_SIZE} bytes"
+            ));
+        }
+        size
+    } else {
+        BUILD_ID_SIZE
+    };
 
     Ok(BuildIdEvent {
         pid: read_u32(record, 8)?,
-        build_id: build_id_hex(&record[12..12 + BUILD_ID_SIZE]),
+        build_id: build_id_hex(&record[12..12 + build_id_size]),
         filename: filename(&record[BUILD_ID_EVENT_MIN_SIZE..])?,
     })
 }

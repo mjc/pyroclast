@@ -697,7 +697,7 @@ impl CommandRunner for MissingInfernoRunner {
     fn resolve_tool(&self, tool: &ToolSpec) -> std::io::Result<ResolvedTool> {
         if tool.name == "inferno-flamegraph" {
             return Err(std::io::Error::other(
-                "inferno-flamegraph is required but was not found on PATH or in the project flake; install it or enter the project dev shell",
+                "inferno-flamegraph is required but was not found on PATH; install it or add it to devenv.nix",
             ));
         }
 
