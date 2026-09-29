@@ -754,6 +754,50 @@ fn perf_dwarf_frame_names_keep_symtab_alias_without_inline_die_like_perf_script(
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn rust_addr2line_resolver_keeps_perf_symtab_alias_without_source_lines() {
+    // perf/util/symbol.c choose_best_symbol() selects the longer alias.
+    // perf/util/libdw.c requires a source line before it can emit inline
+    // frames; bfd/dwarf2.c cannot supply a fallback filename without an
+    // STT_FILE record. This fixture has neither, so it keeps the base symbol.
+    let (_root, binary, bytes) = compiled_c_fixture(
+        "void short_name(void) {} void preferred_alias(void) __attribute__((alias(\"short_name\")));",
+    );
+    let address = text_symbol_addresses_matching_name(&bytes, |name| name == "preferred_alias")[0];
+    let output = Command::new("objcopy")
+        .arg("--strip-debug")
+        .arg(&binary)
+        .output()
+        .expect("strip fixture debug info");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stripped = std::fs::read(&binary).expect("read stripped fixture");
+    let object = object::File::parse(&stripped[..]).expect("parse stripped fixture");
+    assert!(
+        object
+            .symbols()
+            .all(|symbol| symbol.kind() != SymbolKind::File),
+        "fixture must have no STT_FILE fallback filename"
+    );
+
+    let frames = RustAddr2lineResolver::new()
+        .resolve_frame_batch(&[SymbolRequest {
+            path: binary,
+            relative_address: address,
+            kernel_mapping_range: None,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        }])
+        .expect("resolve stripped alias");
+
+    assert_eq!(frames, vec![vec!["preferred_alias+0x0".to_string()]]);
+}
+
+#[test]
 fn rust_addr2line_resolver_uses_libdw_inline_die_name_for_cargo_read_to_end() {
     // Reference fixture:
     //   perf script --inline -i /tmp/backend768.perf.data

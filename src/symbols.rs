@@ -2301,28 +2301,21 @@ impl SymbolResolver for RustAddr2lineResolver {
                             })
                             .map_or_else(
                                 || {
-                                    let libdw_source_line_hit =
-                                        object_metadata.as_ref().is_some_and(|metadata| {
-                                            metadata.dwarf_has_source_line_for_address(address)
-                                        });
-                                    if libdw_source_line_hit {
-                                        (vec![object_symbol.to_string()], false, true)
-                                    } else {
-                                        object_metadata
-                                            .as_ref()
-                                            .and_then(|metadata| {
-                                                metadata
-                                                    .object_metadata
-                                                    .bfd_function_record_name(address)
-                                            })
-                                            .filter(|record_name| *record_name != object_symbol)
-                                            .map_or_else(
-                                                || (vec![object_symbol.to_string()], false, true),
-                                                |record_name| {
-                                                    (vec![record_name.to_string()], true, false)
-                                                },
-                                            )
-                                    }
+                                    let record_name = object_metadata
+                                        .as_ref()
+                                        .filter(|metadata| {
+                                            !metadata.dwarf_has_source_line_for_address(address)
+                                        })
+                                        .and_then(|metadata| {
+                                            metadata
+                                                .object_metadata
+                                                .bfd_function_record_name(address)
+                                        })
+                                        .filter(|record_name| *record_name != object_symbol);
+                                    record_name.map_or_else(
+                                        || (vec![object_symbol.to_string()], false, true),
+                                        |record_name| (vec![record_name.to_string()], true, false),
+                                    )
                                 },
                                 |dwarf_frames| {
                                     let has_non_inline_base_frame = dwarf_frames
@@ -2494,6 +2487,7 @@ struct PerfSymbolCandidate {
     binding: PerfSymbolBinding,
     bfd_function_like: bool,
     bfd_function: bool,
+    bfd_has_filename: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2606,10 +2600,25 @@ impl PerfObjectSymbolIndex {
         };
         let mut symbols =
             Vec::with_capacity(object.symbols().count() + object.dynamic_symbols().count());
+        // bfd/dwarf2.c _bfd_elf_find_function() assigns the last STT_FILE
+        // name to eligible function symbols while scanning the symtab.
+        let (mut file_seen, mut symbol_seen, mut file_after_symbol) = (false, false, false);
+        for symbol in object.symbols() {
+            if symbol.kind() == SymbolKind::File {
+                file_seen = true;
+                file_after_symbol |= symbol_seen;
+                continue;
+            }
+            symbol_seen = true;
+            if let Some(mut candidate) = perf_symbol_candidate_from_object_symbol(&symbol) {
+                candidate.bfd_has_filename = file_seen
+                    && (symbol.scope() == object::SymbolScope::Compilation || !file_after_symbol);
+                symbols.push(candidate);
+            }
+        }
         symbols.extend(
             object
-                .symbols()
-                .chain(object.dynamic_symbols())
+                .dynamic_symbols()
                 .filter_map(|symbol| perf_symbol_candidate_from_object_symbol(&symbol)),
         );
         symbols.extend(perf_synthesized_plt_symbols(&object, &symbols));
@@ -2641,6 +2650,7 @@ impl PerfObjectSymbolIndex {
 
     fn bfd_function_record_name(&self, address: u64) -> Option<&str> {
         self.bfd_function_record_symbol(address)
+            .filter(|candidate| candidate.bfd_has_filename)
             .map(|candidate| candidate.name.as_str())
     }
 
@@ -2811,6 +2821,7 @@ fn perf_synthesized_plt_symbols(
             binding: PerfSymbolBinding::Global,
             bfd_function_like: true,
             bfd_function: true,
+            bfd_has_filename: false,
         });
     }
     for relocation in relocations {
@@ -2833,6 +2844,7 @@ fn perf_synthesized_plt_symbols(
             binding: PerfSymbolBinding::Global,
             bfd_function_like: true,
             bfd_function: true,
+            bfd_has_filename: false,
         });
         plt_offset += X86_64_PLT_ENTRY_SIZE;
     }
@@ -2941,6 +2953,7 @@ fn perf_symbol_candidate_from_object_symbol(
         },
         bfd_function_like: !matches!(kind, SymbolKind::Data),
         bfd_function: matches!(kind, SymbolKind::Text),
+        bfd_has_filename: false,
     })
 }
 
@@ -4185,6 +4198,7 @@ mod tests {
             binding: PerfSymbolBinding::Global,
             bfd_function_like: true,
             bfd_function: true,
+            bfd_has_filename: false,
         };
         let public_alias = PerfSymbolCandidate {
             name: "read".to_string(),
@@ -4194,6 +4208,7 @@ mod tests {
             binding: PerfSymbolBinding::Global,
             bfd_function_like: true,
             bfd_function: true,
+            bfd_has_filename: false,
         };
 
         assert_eq!(
@@ -4212,6 +4227,7 @@ mod tests {
             binding: PerfSymbolBinding::Global,
             bfd_function_like: true,
             bfd_function: true,
+            bfd_has_filename: false,
         };
         let global_alias = PerfSymbolCandidate {
             name: "read".to_string(),
@@ -4221,6 +4237,7 @@ mod tests {
             binding: PerfSymbolBinding::Global,
             bfd_function_like: true,
             bfd_function: true,
+            bfd_has_filename: false,
         };
 
         assert_eq!(
@@ -4242,6 +4259,7 @@ mod tests {
             binding: PerfSymbolBinding::Global,
             bfd_function_like: true,
             bfd_function: true,
+            bfd_has_filename: false,
         };
         let weak_global_alias = PerfSymbolCandidate {
             name: "recv".to_string(),
@@ -4251,6 +4269,7 @@ mod tests {
             binding: PerfSymbolBinding::Weak,
             bfd_function_like: true,
             bfd_function: true,
+            bfd_has_filename: false,
         };
 
         assert_eq!(
@@ -4271,6 +4290,7 @@ mod tests {
                     binding: PerfSymbolBinding::Global,
                     bfd_function_like: true,
                     bfd_function: true,
+                    bfd_has_filename: false,
                 },
                 PerfSymbolCandidate {
                     name: "small".to_string(),
@@ -4280,6 +4300,7 @@ mod tests {
                     binding: PerfSymbolBinding::Global,
                     bfd_function_like: true,
                     bfd_function: true,
+                    bfd_has_filename: false,
                 },
             ],
             max_end_by_index: vec![0x2000, 0x2000],
@@ -4298,6 +4319,7 @@ mod tests {
             binding: PerfSymbolBinding::Global,
             bfd_function_like: true,
             bfd_function: true,
+            bfd_has_filename: false,
         };
         let symbols = PerfObjectSymbolIndex {
             symbols: vec![
@@ -4339,6 +4361,7 @@ mod tests {
                     binding: PerfSymbolBinding::Weak,
                     bfd_function_like: true,
                     bfd_function: true,
+                    bfd_has_filename: false,
                 },
                 PerfSymbolCandidate {
                     name: "__libc_recv".to_string(),
@@ -4348,6 +4371,7 @@ mod tests {
                     binding: PerfSymbolBinding::Global,
                     bfd_function_like: true,
                     bfd_function: true,
+                    bfd_has_filename: false,
                 },
                 PerfSymbolCandidate {
                     name: "write".to_string(),
@@ -4357,6 +4381,7 @@ mod tests {
                     binding: PerfSymbolBinding::Weak,
                     bfd_function_like: true,
                     bfd_function: true,
+                    bfd_has_filename: false,
                 },
                 PerfSymbolCandidate {
                     name: "__GI___libc_write".to_string(),
@@ -4366,6 +4391,7 @@ mod tests {
                     binding: PerfSymbolBinding::Global,
                     bfd_function_like: true,
                     bfd_function: true,
+                    bfd_has_filename: false,
                 },
             ],
             max_end_by_index: vec![0x102f, 0x102f, 0x202e, 0x202e],
@@ -4467,6 +4493,7 @@ mod tests {
                 binding: PerfSymbolBinding::Global,
                 bfd_function_like: true,
                 bfd_function: true,
+                bfd_has_filename: false,
             },
             PerfSymbolCandidate {
                 name: "__syscall_cancel_arch_start".to_string(),
@@ -4476,6 +4503,7 @@ mod tests {
                 binding: PerfSymbolBinding::Global,
                 bfd_function_like: true,
                 bfd_function: true,
+                bfd_has_filename: false,
             },
             PerfSymbolCandidate {
                 name: "__syscall_cancel_arch_end".to_string(),
@@ -4485,6 +4513,7 @@ mod tests {
                 binding: PerfSymbolBinding::Global,
                 bfd_function_like: true,
                 bfd_function: true,
+                bfd_has_filename: false,
             },
         ];
         fixup_object_symbol_ends_like_perf(&mut symbols);
