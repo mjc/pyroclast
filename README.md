@@ -3,8 +3,9 @@
 Rust-first profiling orchestration and perf.data analysis.
 
 Pyroclast is being built to replace the slow `perf script | inferno-collapse | inferno-flamegraph`
-path with direct Rust parsing and folding. External profilers and renderers still come from the
-Nix flake; Pyroclast owns orchestration, manifests, folding, summaries, and command construction.
+path with direct Rust parsing and folding. External profilers and renderers come from the host or
+the development environment; Pyroclast owns orchestration, manifests, folding, summaries, and
+command construction.
 
 ## Porcelain
 
@@ -66,19 +67,20 @@ profiling uses Apple-provided `xctrace`.
 
 ## Development
 
-Build or run the CLI from the flake:
+Build or run the CLI from the Nix flake:
 
 ```sh
 nix build .#
 nix run .# -- --help
 ```
 
-Use the Nix shell:
+Enter the development environment and run the full test suite:
 
 ```sh
-nix develop
+devenv shell
 cargo nextest run
 scripts/pyroclast-bench [<perf.data>] [--perf-script <perf.script>] [--export-perf-script <out>] [--symbols]
 ```
 
-The pre-commit hook runs rustfmt, Clippy pedantic, `cargo nextest run`, and `nix flake check`.
+The pre-commit hook enters `devenv shell` and runs rustfmt, Clippy pedantic,
+`cargo nextest run`, and `nix flake check`.

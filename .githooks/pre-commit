@@ -4,7 +4,7 @@ set -eu
 repo="$(git rev-parse --show-toplevel)"
 cd "$repo"
 
-exec nix develop "$repo" --command sh -eu -c '
+exec devenv shell -- sh -eu -c '
   echo "pre-commit: rustfmt" >&2
   cargo fmt --check
   echo "pre-commit: clippy pedantic" >&2
