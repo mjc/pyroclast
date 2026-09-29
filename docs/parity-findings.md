@@ -39,9 +39,11 @@ places `adds_features` after the three file sections), and feature-section
 build-id records (which carry `header.type == 0`) were rejected.
 
 Dwarf note: the dwarf oracle's `perf script` output contains `(inlined)` frames —
-modern perf expands inline frames by default for DWARF-symbolized stacks — so the
-dwarf comparison runs pyroclast with `--inline`. The remaining dwarf divergence is
-the aarch64 unwind support (in progress; spec in `.ace-aarch64-unwind-spec.md`).
+modern perf expands inline frames by default for DWARF-symbolized stacks. Pyroclast's
+parity paths therefore keep the inline-capable renderer on for every profile: fp data
+with no printable inline DIEs still renders one frame per callchain entry, while DWARF
+data can match perf's `(inlined)` rows. Pyroclast keeps `--inline` available as an
+explicit no-op for parity with perf, and provides `--no-inline` as the opt-out.
 
 ## Parity gaps found via the oracle (fp call-graph path, arch-independent)
 
@@ -56,12 +58,13 @@ Measured by diffing `target/oracle/fp.pyroclast.script` against `fp.perf.script`
    the mapping's long path for every mapped frame.
 3. **Double symbol offset.** Lines like `quicksort+0x854+0x0` — a label that already
    carries `+0xNNN` gets a second offset appended in the symbolized script path.
-4. **Inline expansion on by default.** With debuginfo present pyroclast expands one
-   address into multiple DWARF inline frames (DIE names like
-   `catch_unwind<std::rt::lang_start_internal::{closure_env#0}, isize>`); plain
-   `perf script` (the stated replacement target — no `--inline`) prints exactly one
-   symtab-named line per callchain entry. The expansion mirrors `perf script --inline`
-   and should be opt-in.
+4. **Historical correction: inline expansion was treated as a bug.** The fp oracle
+   rendered one symtab-named line per callchain entry, and the initial fix wrongly
+   generalized that into "plain `perf script` never emits inline frames." The arm64
+   DWARF oracle and the x86-64 `inferno-slow-collapse.perf.data` run both disprove
+   that: real `perf script` emits `(inlined)` rows when the stack and debuginfo make
+   them printable. The parity path should be inline-capable by default; fp data remains
+   single-frame naturally.
 5. **Dropped callchain entry.** A real frame (`...+0x6cb`, adjacent-but-distinct ip to
    its neighbor) disappears from pyroclast's output; perf does not dedupe entries.
 6. **Basename instead of full DSO path** for unsymbolized mapped frames
@@ -153,7 +156,7 @@ From `.ace-research-perf-unwind.md`: libdwfl always fires the frame callback onc
 the sampled IP before unwinding, and perf keeps partial stacks. So:
 
 - **pyroclast-5gr** (current-IP-only stacks): pyroclast must emit the single leaf
-  (plus inlines when enabled) when the initial IP reported into a module and neither
+  (plus printable inlines) when the initial IP reported into a module and neither
   CFI (`has_unwind_info_for_ip`) nor the rbp fallback (`bp >= sp`) can produce a
   caller. The hook exists (`object_unwind_initial_frame_policy`) but is currently
   ignored in `perf_accepted_object_unwind_frames`.
@@ -166,9 +169,9 @@ the sampled IP before unwinding, and perf keeps partial stacks. So:
 
 - **PERF-1 (critical, likely the rc=124 root cause):** `PerfDwarfNameResolver` fully
   re-parses each DSO's DWARF (object parse + DIE walk) on every fold round —
-  `CachedObjectMetadata` caches symbols but not parsed DWARF. Making inline expansion
-  opt-in removes this from the default path; the cache is still worth adding for
-  `--inline`.
+  `CachedObjectMetadata` caches symbols but not parsed DWARF. Since parity keeps the
+  inline-capable path on, this cache is required for the default path rather than only
+  for an opt-in mode.
 - **PERF-2/3 (fixed):** mmap ingestion re-scanned and re-indexed the whole mapping
   table per record (two independent O(n²) patterns). Now incremental via the per-pid
   interval index; overlap splits keep the perf-faithful path.
