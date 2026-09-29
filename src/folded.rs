@@ -192,13 +192,13 @@ fn render_folded_stack_into<'a>(rendered: &mut String, frames: impl IntoIterator
 }
 
 fn tidy_inferno_perf_generic_into(scratch: &mut String, frame: &str) {
-    let mut bracket_depth = 0_u32;
+    let mut bracket_depth = 0_i32;
     let mut last_dot_index = None;
     let mut length_without_parameters = frame.len();
     for (index, character) in frame.char_indices() {
         match character {
             '<' | '{' | '[' => bracket_depth += 1,
-            '>' | '}' | ']' | ')' => bracket_depth = bracket_depth.saturating_sub(1),
+            '>' | '}' | ']' | ')' => bracket_depth -= 1,
             '(' => {
                 if bracket_depth == 0 {
                     let is_go_function = last_dot_index == Some(index);

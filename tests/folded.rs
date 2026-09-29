@@ -52,6 +52,21 @@ fn renders_inferno_perf_tidy_generic_names() {
 }
 
 #[test]
+fn renders_inferno_perf_split_return_type_with_unbalanced_generic_depth_like_inferno() {
+    let stack = render_inferno_perf_folded_stack(
+        [
+            "with<core::cell::RefCell<alloc::string::String>, tracing_subscriber::fmt::fmt_layer::{impl#12}::on_event::{closure_env#0}<tracing_subscriber::registry::sharded::Registry, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format<tracing_subscriber::fmt::format::Full, tracing_subscriber::fmt::time::SystemTime>, fn() -> std::io::stdio::Stdout>, ()>",
+        ],
+        1,
+    );
+
+    assert_eq!(
+        stack,
+        "with<core::cell::RefCell<alloc::string::String>, tracing_subscriber::fmt::fmt_layer::{impl#12}::on_event::{closure_env#0}<tracing_subscriber::registry::sharded::Registry, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format<tracing_subscriber::fmt::format::Full, tracing_subscriber::fmt::time::SystemTime>, fn() ; std::io::stdio::Stdout>, ()>_[i] 1",
+    );
+}
+
+#[test]
 fn renders_inferno_perf_partially_demangled_rust_symbols() {
     let stack = render_inferno_perf_folded_stack(
         [
