@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -15,6 +16,7 @@ use object::{
 };
 use rustc_hash::FxBuildHasher;
 use serde::Serialize;
+use smallvec::SmallVec;
 
 use crate::perfdata::build_id::{
     kernel_build_id_from_perfdata, kernel_build_id_from_perfdata_file,
@@ -228,23 +230,44 @@ struct CachedMappingFrames {
     base_offset: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Eq)]
-struct UserMappingFrameKey {
-    symbol_source_id: usize,
-    relative_address: u64,
+#[derive(Default)]
+struct UserFrameTable {
+    by_source: FxHashMap<usize, usize>,
+    sources: Vec<FxHashMap<u64, usize>>,
+    last_source: Cell<Option<(usize, usize)>>,
+    #[cfg(test)]
+    source_searches: Cell<usize>,
 }
 
-impl PartialEq for UserMappingFrameKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.symbol_source_id == other.symbol_source_id
-            && self.relative_address == other.relative_address
+impl UserFrameTable {
+    fn slot(&self, source: usize, address: u64) -> Option<usize> {
+        let index = if let Some((cached_source, index)) = self.last_source.get()
+            && cached_source == source
+        {
+            index
+        } else {
+            #[cfg(test)]
+            self.source_searches.set(self.source_searches.get() + 1);
+            let index = *self.by_source.get(&source)?;
+            self.last_source.set(Some((source, index)));
+            index
+        };
+        self.sources[index].get(&address).copied()
     }
-}
 
-impl std::hash::Hash for UserMappingFrameKey {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::hash::Hash::hash(&self.symbol_source_id, state);
-        std::hash::Hash::hash(&self.relative_address, state);
+    fn insert(&mut self, source: usize, address: u64, slot: usize) {
+        let index = *self.by_source.entry(source).or_insert_with(|| {
+            let index = self.sources.len();
+            self.sources.push(FxHashMap::default());
+            index
+        });
+        self.last_source.set(Some((source, index)));
+        self.sources[index].insert(address, slot);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.sources.iter().map(FxHashMap::len).sum()
     }
 }
 
@@ -268,19 +291,14 @@ impl CachedMappingFrames {
 
 #[derive(Default)]
 struct MappingFrameTable {
-    user: FxHashMap<UserMappingFrameKey, usize>,
+    user: UserFrameTable,
     kernel: FxHashMap<MappingFrameKey, usize>,
     frames: Vec<CachedMappingFrames>,
 }
 
 impl MappingFrameTable {
     fn user_slot(&self, symbol_source_id: usize, relative_address: u64) -> Option<usize> {
-        self.user
-            .get(&UserMappingFrameKey {
-                symbol_source_id,
-                relative_address,
-            })
-            .copied()
+        self.user.slot(symbol_source_id, relative_address)
     }
 
     fn slot(&self, key: &MappingFrameKey) -> Option<usize> {
@@ -343,13 +361,8 @@ impl MappingFrameTable {
         if key.kernel_mapping_range.is_some() {
             self.kernel.insert(key, slot);
         } else {
-            self.user.insert(
-                UserMappingFrameKey {
-                    symbol_source_id: key.symbol_source_id,
-                    relative_address: key.relative_address,
-                },
-                slot,
-            );
+            self.user
+                .insert(key.symbol_source_id, key.relative_address, slot);
         }
     }
 }
@@ -1606,7 +1619,6 @@ where
         let mut requests = std::mem::take(&mut self.scratch_missing_requests);
         seen.clear();
         keys.clear();
-        requests.clear();
         let result = (|| {
             for mapping in mappings {
                 let key = mapping_frame_key(mapping);
@@ -1614,16 +1626,22 @@ where
                     continue;
                 }
                 keys.push(key);
-                requests.push(symbol_request_from_mapping_ref(mapping));
+                let index = keys.len() - 1;
+                if let Some(request) = requests.get_mut(index) {
+                    update_symbol_request_from_mapping_ref(request, mapping);
+                } else {
+                    requests.push(symbol_request_from_mapping_ref(mapping));
+                }
             }
-            if requests.is_empty() {
+            if keys.is_empty() {
                 return Ok(());
             }
+            let requests = &requests[..keys.len()];
             let resolved = if inline {
-                self.resolver.resolve_frame_batch_with_metadata(&requests)?
+                self.resolver.resolve_frame_batch_with_metadata(requests)?
             } else {
                 self.resolver
-                    .resolve_base_frame_batch_with_metadata(&requests)?
+                    .resolve_base_frame_batch_with_metadata(requests)?
             };
             if resolved.len() != requests.len() {
                 return Err(format!(
@@ -3799,15 +3817,43 @@ pub fn perf_inline_frame_order(mut frames: Vec<String>) -> Vec<String> {
     frames
 }
 
-fn grouped_request_indexes(requests: &[SymbolRequest]) -> FxHashMap<&OsStr, Vec<usize>> {
-    let mut grouped = FxHashMap::<&OsStr, Vec<usize>>::default();
+type RequestIndexes = SmallVec<[usize; 16]>;
+
+enum RequestGroups<'a> {
+    Single(Option<(&'a OsStr, RequestIndexes)>),
+    Multiple(hashbrown::hash_map::IntoIter<&'a OsStr, RequestIndexes>),
+}
+
+impl<'a> Iterator for RequestGroups<'a> {
+    type Item = (&'a OsStr, RequestIndexes);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Single(group) => group.take(),
+            Self::Multiple(groups) => groups.next(),
+        }
+    }
+}
+
+fn grouped_request_indexes(requests: &[SymbolRequest]) -> RequestGroups<'_> {
+    let Some(first) = requests.first() else {
+        return RequestGroups::Single(None);
+    };
+    let path = first.path.as_os_str();
+    if requests
+        .iter()
+        .all(|request| request.path.as_os_str() == path)
+    {
+        return RequestGroups::Single(Some((path, (0..requests.len()).collect())));
+    }
+    let mut grouped = FxHashMap::<&OsStr, RequestIndexes>::default();
     for (index, request) in requests.iter().enumerate() {
         grouped
             .entry(request.path.as_os_str())
             .or_default()
             .push(index);
     }
-    grouped
+    RequestGroups::Multiple(grouped.into_iter())
 }
 
 fn mapping_frame_key(mapping: &ResolvedMappingRef<'_>) -> MappingFrameKey {
@@ -3824,20 +3870,45 @@ fn is_kernel_mapping_ref(mapping: &ResolvedMappingRef<'_>) -> bool {
 }
 
 fn symbol_request_from_mapping_ref(mapping: &ResolvedMappingRef<'_>) -> SymbolRequest {
-    SymbolRequest {
-        path: if is_kernel_symbol_path(Path::new(mapping.path))
-            && mapping.path.starts_with("[kernel")
-        {
-            PathBuf::from("[kernel.kallsyms]")
+    let mut request = SymbolRequest {
+        path: PathBuf::new(),
+        relative_address: 0,
+        kernel_mapping_range: None,
+        build_id: None,
+        file_identity: None,
+        kernel_relocation: None,
+    };
+    update_symbol_request_from_mapping_ref(&mut request, mapping);
+    request
+}
+
+fn update_symbol_request_from_mapping_ref(
+    request: &mut SymbolRequest,
+    mapping: &ResolvedMappingRef<'_>,
+) {
+    request.path.clear();
+    request.path.push(
+        if is_kernel_symbol_path(Path::new(mapping.path)) && mapping.path.starts_with("[kernel") {
+            "[kernel.kallsyms]"
         } else {
-            PathBuf::from(mapping.path)
+            mapping.path
         },
-        relative_address: mapping.relative_address,
-        kernel_mapping_range: kernel_mapping_range_from_ref(mapping),
-        build_id: mapping.build_id.map(build_id_hex),
-        file_identity: mapping.file_identity,
-        kernel_relocation: mapping.kernel_relocation.clone(),
+    );
+    request.relative_address = mapping.relative_address;
+    request.kernel_mapping_range = kernel_mapping_range_from_ref(mapping);
+    if let Some(build_id) = mapping.build_id {
+        let hex = request.build_id.get_or_insert_with(String::new);
+        hex.clear();
+        for byte in build_id {
+            write!(hex, "{byte:02x}").expect("writing to a string cannot fail");
+        }
+    } else {
+        request.build_id = None;
     }
+    request.file_identity = mapping.file_identity;
+    request
+        .kernel_relocation
+        .clone_from(&mapping.kernel_relocation);
 }
 
 fn build_id_hex(bytes: &[u8]) -> String {
@@ -5478,7 +5549,12 @@ mod tests {
         }
         let resolver = CountingFrameResolver::new(vec![Vec::new()]);
         let cache = SymbolFrameCache::new(&resolver);
-        assert!(bucket_bytes(&cache.resolved_by_mapping.user) <= 3 * std::mem::size_of::<u64>());
+        assert!(
+            bucket_bytes(&cache.resolved_by_mapping.user.by_source)
+                <= 2 * std::mem::size_of::<u64>()
+        );
+        let addresses = super::FxHashMap::<u64, usize>::default();
+        assert!(bucket_bytes(&addresses) <= 2 * std::mem::size_of::<u64>());
     }
 
     fn cached_table_frames(label: String, offset: u64) -> super::CachedMappingFrames {
@@ -5581,32 +5657,39 @@ mod tests {
     }
 
     #[test]
-    fn user_cache_key_equality_and_hash_use_both_identity_fields() {
-        use std::hash::{Hash, Hasher};
-        let key = super::UserMappingFrameKey {
-            symbol_source_id: 7,
-            relative_address: 42,
-        };
-        assert_eq!(key, key);
-        assert_ne!(
-            key,
-            super::UserMappingFrameKey {
-                symbol_source_id: 8,
-                ..key
-            }
-        );
-        assert_ne!(
-            key,
-            super::UserMappingFrameKey {
-                relative_address: 43,
-                ..key
-            }
-        );
-        let mut actual = std::collections::hash_map::DefaultHasher::new();
-        let mut expected = std::collections::hash_map::DefaultHasher::new();
-        key.hash(&mut actual);
-        (key.symbol_source_id, key.relative_address).hash(&mut expected);
-        assert_eq!(actual.finish(), expected.finish());
+    fn user_cache_keeps_sparse_sources_and_addresses_separate_without_sparse_storage() {
+        let mut table = super::UserFrameTable::default();
+        for (source, address, slot) in [(7, 42, 1), (usize::MAX, 42, 2), (7, 43, 3)] {
+            table.insert(source, address, slot);
+        }
+        assert_eq!(table.slot(7, 42), Some(1));
+        assert_eq!(table.slot(usize::MAX, 42), Some(2));
+        assert_eq!(table.slot(7, 43), Some(3));
+        assert_eq!(table.slot(8, 42), None);
+        assert_eq!(table.slot(7, 44), None);
+        assert_eq!(table.sources.len(), 2);
+        assert_eq!(table.by_source.len(), 2);
+        assert_eq!(table.len(), 3);
+    }
+
+    #[test]
+    fn same_source_address_lookups_reuse_source_hint_after_a_source_switch() {
+        let mut table = super::UserFrameTable::default();
+        for address in 0..256 {
+            table.insert(7, address, usize::try_from(address).unwrap());
+        }
+        table.insert(9, 0, 1);
+        let searches = table.source_searches.get();
+        for address in 0..256 {
+            assert_eq!(
+                table.slot(7, address),
+                Some(usize::try_from(address).unwrap())
+            );
+        }
+        assert_eq!(table.source_searches.get() - searches, 1);
+        assert_eq!(table.slot(9, 0), Some(1));
+        assert_eq!(table.slot(7, 0), Some(0));
+        assert_eq!(table.source_searches.get() - searches, 3);
     }
 
     #[test]
@@ -5729,6 +5812,81 @@ mod tests {
         assert_eq!(resolver.calls.get(), 1);
     }
 
+    #[test]
+    fn cold_mapping_requests_reuse_path_storage_across_shorter_paths_and_warm_batches() {
+        let resolver = CountingFrameResolver::new(vec![Vec::new()]);
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let first = test_mapping_ref(
+            "/a/very/long/object/path/whose/request/storage/should/be/reused",
+            1,
+        );
+        cache
+            .prefetch_mapping_refs(std::slice::from_ref(&first))
+            .unwrap();
+        let pointer = cache.scratch_missing_requests[0]
+            .path
+            .as_os_str()
+            .as_encoded_bytes()
+            .as_ptr();
+        cache
+            .prefetch_mapping_refs(std::slice::from_ref(&first))
+            .unwrap();
+        assert_eq!(cache.scratch_missing_requests.len(), 1);
+        let mut second = test_mapping_ref("/short", 2);
+        second.symbol_source_id = 9;
+        cache
+            .prefetch_mapping_refs(std::slice::from_ref(&second))
+            .unwrap();
+        assert_eq!(
+            cache.scratch_missing_requests[0].path,
+            PathBuf::from("/short")
+        );
+        assert_eq!(
+            cache.scratch_missing_requests[0]
+                .path
+                .as_os_str()
+                .as_encoded_bytes()
+                .as_ptr(),
+            pointer
+        );
+        assert_eq!(resolver.calls.get(), 2);
+    }
+
+    #[test]
+    fn request_groups_preserve_indices_for_empty_single_and_interleaved_objects() {
+        for paths in [
+            vec![],
+            vec!["/a"],
+            vec!["/a"; 40],
+            vec!["/a", "/b", "/a", "/c", "/b"],
+        ] {
+            let requests: Vec<_> = paths
+                .iter()
+                .enumerate()
+                .map(|(i, path)| SymbolRequest {
+                    path: PathBuf::from(path),
+                    relative_address: i as u64,
+                    kernel_mapping_range: None,
+                    build_id: None,
+                    file_identity: None,
+                    kernel_relocation: None,
+                })
+                .collect();
+            let mut actual = std::collections::BTreeMap::new();
+            for (path, indices) in super::grouped_request_indexes(&requests) {
+                actual.insert(path.to_owned(), indices.into_iter().collect::<Vec<_>>());
+            }
+            let mut expected = std::collections::BTreeMap::<_, Vec<_>>::new();
+            for (i, path) in paths.iter().enumerate() {
+                expected
+                    .entry(std::ffi::OsString::from(path))
+                    .or_default()
+                    .push(i);
+            }
+            assert_eq!(actual, expected);
+        }
+    }
+
     fn frame_names(names: &PerfDwarfNameInterner, frames: &[u32]) -> Vec<String> {
         frames
             .iter()
@@ -5749,6 +5907,45 @@ mod tests {
             file_identity: None,
             kernel_relocation: None,
         }
+    }
+
+    #[test]
+    fn reused_symbol_request_replaces_identity_and_clears_stale_kernel_metadata() {
+        let mut kernel = test_mapping_ref("[kernel.kallsyms]_text", 0xffff_ffff_8100_0010);
+        kernel.build_id = Some(&[0xab, 0xcd, 0xef]);
+        kernel.kernel_relocation = Some(super::KernelRelocation {
+            reference_symbol: "_text".into(),
+            recorded_reference_address: 42,
+        });
+        let mut request = super::symbol_request_from_mapping_ref(&kernel);
+        assert_eq!(request.path, std::path::Path::new("[kernel.kallsyms]"));
+        assert!(request.kernel_mapping_range.is_some());
+        let build_id_pointer = request.build_id.as_ref().unwrap().as_ptr();
+        let mut user = test_mapping_ref("/bin/app", 1);
+        user.build_id = Some(&[1]);
+        super::update_symbol_request_from_mapping_ref(&mut request, &user);
+        assert_eq!(request.build_id.as_deref(), Some("01"));
+        assert_eq!(
+            request.build_id.as_ref().unwrap().as_ptr(),
+            build_id_pointer
+        );
+        assert_eq!(request.path, std::path::Path::new("/bin/app"));
+        assert_eq!(request.relative_address, 1);
+        assert_eq!(request.kernel_mapping_range, None);
+        assert_eq!(request.kernel_relocation, None);
+        user.build_id = None;
+        user.file_identity = Some(super::FileIdentity {
+            major: 1,
+            minor: 2,
+            inode: 3,
+            inode_generation: 4,
+        });
+        super::update_symbol_request_from_mapping_ref(&mut request, &user);
+        assert_eq!(request.build_id, None);
+        assert_eq!(request.file_identity, user.file_identity);
+        user.file_identity = None;
+        super::update_symbol_request_from_mapping_ref(&mut request, &user);
+        assert_eq!(request.file_identity, None);
     }
 
     fn test_mapping_ref(path: &'static str, relative_address: u64) -> ResolvedMappingRef<'static> {
