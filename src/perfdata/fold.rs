@@ -1225,7 +1225,13 @@ fn perf_script_comm<'a>(
 
 impl OrderedRecordQueue {
     fn queue(&mut self, offset: usize, time: u64) {
-        self.max_timestamp = Some(self.max_timestamp.map_or(time, |max| max.max(time)));
+        // perf util/ordered-events.c:queue_event resets max_timestamp when
+        // oe->last is NULL, which do_flush sets after emptying the queue.
+        self.max_timestamp = Some(if self.pending_records.is_empty() {
+            time
+        } else {
+            self.max_timestamp.map_or(time, |max| max.max(time))
+        });
         self.pending_records
             .push(PendingFoldRecord { offset, time });
     }
@@ -4095,6 +4101,43 @@ mod tests {
             })
             .unwrap();
         assert_eq!(delivered, [8, 24, 16, 32]);
+    }
+
+    #[test]
+    fn ordered_delivery_resets_the_watermark_when_an_empty_queue_refills_like_perf() {
+        // perf util/ordered-events.c:do_flush clears oe->last when empty;
+        // queue_event then sets max_timestamp to the first new timestamp.
+        // Older timestamps are counted as unordered, not rejected.
+        let mut queue = super::OrderedRecordQueue::default();
+        queue.queue(0, 100);
+        queue.flush_round_with(|_| Ok(())).unwrap();
+        queue.flush_round_with(|_| Ok(())).unwrap();
+        assert!(queue.pending_records.is_empty());
+
+        queue.queue(8, 10);
+        let mut delivered = Vec::new();
+        queue
+            .flush_round_with(|offset| {
+                delivered.push(offset);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(delivered, [8]);
+        queue.queue(16, 50);
+        queue
+            .flush_round_with(|offset| {
+                delivered.push(offset);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(delivered, [8], "new round must retain its one-round lag");
+        queue
+            .flush_final_with(|offset| {
+                delivered.push(offset);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(delivered, [8, 16]);
     }
 
     // tools/perf/util/header.c write_event_desc: nre(u32), attr_sz(u32), then
