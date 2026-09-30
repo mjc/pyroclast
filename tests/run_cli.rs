@@ -276,9 +276,12 @@ fn fold_command_processes_zero_data_size_like_perf_script_and_inferno() {
 }
 
 #[test]
-fn perf_script_command_expands_inline_frames_by_default_like_perf_script() {
+fn perf_script_command_keeps_unreadable_objects_unknown_with_inline_enabled_like_perf() {
+    // perf machine.c:append_inlines does not ask addr2line for names without
+    // a base symbol. This fixture has no ELF or DWARF inline chain.
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
+    let missing_object = root.path().join("app");
     std::fs::write(
         &perfdata,
         perfdata_with_records_and_attrs(
@@ -289,7 +292,10 @@ fn perf_script_command_expands_inline_frames_by_default_like_perf_script() {
             )],
             [
                 record_bytes(3, &comm_payload(1, 2, "app")),
-                record_bytes(1, &mmap_payload(1, 2, 0x1000, 0x2000, 0, "/bin/app")),
+                record_bytes(
+                    1,
+                    &mmap_payload(1, 2, 0x1000, 0x2000, 0, missing_object.to_str().unwrap()),
+                ),
                 record_bytes(9, &sample_payload(0x1000, 1, 2, [0x2000])),
             ],
         ),
@@ -309,10 +315,13 @@ fn perf_script_command_expands_inline_frames_by_default_like_perf_script() {
 
     assert_eq!(
         output.stdout,
-        "app       2          1 cycles: \n\t            2000 app::work (/bin/app)\n\n"
+        format!(
+            "app       2          1 cycles: \n\t            2000 [unknown] ({})\n\n",
+            missing_object.display()
+        )
     );
-    assert_eq!(runner.programs(), vec!["addr2line"]);
-    assert_eq!(runner.stdins(), vec![Some(b"0x1000\n".to_vec())]);
+    assert!(runner.programs().is_empty());
+    assert!(runner.stdins().is_empty());
 }
 
 #[test]
@@ -757,9 +766,12 @@ fn perf_script_command_keeps_perf_stack_order_and_skips_context_markers() {
 }
 
 #[test]
-fn fold_command_can_symbolize_mapped_frames() {
+fn fold_command_uses_module_fallback_without_a_perf_base_symbol() {
+    // Inferno perf.rs:with_module_fallback uses the module basename when
+    // perf's ELF loader cannot provide a symbol for append_inlines.
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
+    let missing_object = root.path().join("app");
     std::fs::write(
         &perfdata,
         perfdata_with_records_and_attrs(
@@ -770,7 +782,10 @@ fn fold_command_can_symbolize_mapped_frames() {
             )],
             [
                 record_bytes(3, &comm_payload(1, 2, "app")),
-                record_bytes(1, &mmap_payload(1, 2, 0x1000, 0x2000, 0, "/bin/app")),
+                record_bytes(
+                    1,
+                    &mmap_payload(1, 2, 0x1000, 0x2000, 0, missing_object.to_str().unwrap()),
+                ),
                 record_bytes(9, &sample_payload(0x1000, 1, 2, [0x2000])),
             ],
         ),
@@ -788,9 +803,9 @@ fn fold_command_can_symbolize_mapped_frames() {
 
     let output = pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("fold command");
 
-    assert_eq!(output.stdout, "app;app::work 1\n");
-    assert_eq!(runner.programs(), vec!["addr2line"]);
-    assert_eq!(runner.stdins(), vec![Some(b"0x1000\n".to_vec())]);
+    assert_eq!(output.stdout, "app;[app] 1\n");
+    assert!(runner.programs().is_empty());
+    assert!(runner.stdins().is_empty());
 }
 
 #[test]
@@ -958,10 +973,13 @@ fn flamegraph_command_accepts_injected_renderer() {
 }
 
 #[test]
-fn flamegraph_command_can_symbolize_mapped_frames() {
+fn flamegraph_command_keeps_module_fallback_without_a_perf_base_symbol() {
+    // perf machine.c:append_inlines cannot revive a symbol from addr2line
+    // when the mapped ELF is unreadable; Inferno keeps the module fallback.
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
     let output_svg = root.path().join("flamegraph.svg");
+    let missing_object = root.path().join("app");
     std::fs::write(
         &perfdata,
         perfdata_with_records_and_attrs(
@@ -972,7 +990,10 @@ fn flamegraph_command_can_symbolize_mapped_frames() {
             )],
             [
                 record_bytes(3, &comm_payload(1, 2, "app")),
-                record_bytes(1, &mmap_payload(1, 2, 0x1000, 0x2000, 0, "/bin/app")),
+                record_bytes(
+                    1,
+                    &mmap_payload(1, 2, 0x1000, 0x2000, 0, missing_object.to_str().unwrap()),
+                ),
                 record_bytes(9, &sample_payload(0x1000, 1, 2, [0x2000])),
             ],
         ),
@@ -992,14 +1013,8 @@ fn flamegraph_command_can_symbolize_mapped_frames() {
 
     pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("flamegraph command");
 
-    assert_eq!(runner.programs(), vec!["addr2line", "inferno-flamegraph"]);
-    assert_eq!(
-        runner.stdins(),
-        vec![
-            Some(b"0x1000\n".to_vec()),
-            Some(b"app;app::work 1\n".to_vec()),
-        ]
-    );
+    assert_eq!(runner.programs(), vec!["inferno-flamegraph"]);
+    assert_eq!(runner.stdins(), vec![Some(b"app;[app] 1\n".to_vec())]);
 }
 
 #[test]

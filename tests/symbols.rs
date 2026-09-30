@@ -947,6 +947,29 @@ fn addr2line_resolver_uses_perf_dwarf_names_for_inline_frames() {
 }
 
 #[test]
+fn addr2line_inline_resolver_requires_a_perf_base_symbol() {
+    // perf util/machine.c:append_inlines rejects a NULL ms->sym before
+    // calling libdw__addr2line or the binutils addr2line subprocess.
+    let object = tempfile::NamedTempFile::new().unwrap();
+    let runner = Addr2lineRunner::new(b"invented_without_a_base_symbol\n??:0\n");
+    let resolver = Addr2lineResolver::new(&runner);
+    let request = SymbolRequest {
+        path: object.path().to_path_buf(),
+        relative_address: 0x1000,
+        kernel_mapping_range: None,
+        build_id: None,
+        file_identity: None,
+        kernel_relocation: None,
+    };
+    let results = resolver
+        .resolve_frame_batch_with_metadata(&[request])
+        .unwrap();
+    assert!(results[0].frames.is_empty());
+    assert!(!results[0].has_base_symbol);
+    assert!(runner.commands().is_empty());
+}
+
+#[test]
 fn rust_addr2line_resolver_uses_object_symbol_for_non_inline_frames_like_perf_script() {
     let Some((profiling_binary, object_bytes)) = profiling_binary_fixture() else {
         return;

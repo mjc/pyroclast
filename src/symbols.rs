@@ -2033,7 +2033,6 @@ where
         let mut resolved = vec![ResolvedSymbolFrames::default(); requests.len()];
         for (path, indexes) in grouped_request_indexes(requests) {
             let path = Path::new(path);
-            let symbols = self.resolve_group_symbols(path, requests, &indexes)?;
             let object_metadata = self.object_metadata(path);
             if let Some(metadata) = object_metadata.as_ref() {
                 let addresses = indexes
@@ -2042,7 +2041,7 @@ where
                     .collect::<Vec<_>>();
                 metadata.prepare_dwarf_frames_for_addresses(&addresses);
             }
-            for (index, symbol) in indexes.into_iter().zip(symbols) {
+            for index in indexes {
                 let request = &requests[index];
                 let object_symbols =
                     object_symbols_for_frame(object_metadata.as_ref(), request.relative_address);
@@ -2073,11 +2072,9 @@ where
                                 },
                             )
                     } else {
-                        (
-                            symbol.map_or_else(Vec::new, |name| vec![name]),
-                            false,
-                            false,
-                        )
+                        // perf util/machine.c:append_inlines requires a base
+                        // symbol before calling either addr2line backend.
+                        (Vec::new(), false, false)
                     };
                 frames = perf_frames_with_object_alias_and_offset(
                     frames,

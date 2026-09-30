@@ -83,7 +83,9 @@ fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
 }
 
 #[test]
-fn linux_perf_backend_can_symbolize_folded_stacks() {
+fn linux_perf_backend_keeps_module_fallback_without_a_perf_base_symbol() {
+    // perf machine.c:append_inlines requires an ELF base symbol before
+    // invoking addr2line; the runner's recording maps an unreadable /bin/app.
     let root = tempfile::tempdir().expect("tempdir");
     let runner = RecordingRunner::default();
     let backend = LinuxPerfBackend::new(&runner);
@@ -107,13 +109,10 @@ fn linux_perf_backend_can_symbolize_folded_stacks() {
 
     let result = backend.profile(&request).expect("profile");
 
-    assert_eq!(
-        runner.programs(),
-        vec!["perf", "addr2line", "inferno-flamegraph"]
-    );
+    assert_eq!(runner.programs(), vec!["perf", "inferno-flamegraph"]);
     assert_eq!(
         std::fs::read_to_string(result.layout.stacks_folded()).expect("stacks folded"),
-        "app;app::work 1\n"
+        "app;[app] 1\n"
     );
 }
 

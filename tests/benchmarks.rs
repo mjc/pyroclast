@@ -94,9 +94,12 @@ fn inferno_collapse_benchmark_reports_folded_output_size() {
 }
 
 #[test]
-fn symbolized_fold_benchmark_uses_runner_addr2line() {
+fn symbolized_fold_benchmark_keeps_module_fallback_without_a_perf_base_symbol() {
+    // perf machine.c:append_inlines requires a loaded ELF symbol, not merely
+    // a name returned by an addr2line runner for a nonexistent object.
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
+    let missing_object = root.path().join("app");
     std::fs::write(
         &perfdata,
         perfdata_with_records_and_attrs(
@@ -106,7 +109,10 @@ fn symbolized_fold_benchmark_uses_runner_addr2line() {
                 0,
             )],
             [
-                record_bytes(1, &mmap_payload(11, 11, 0x1000, 0x100, 0, "/bin/app")),
+                record_bytes(
+                    1,
+                    &mmap_payload(11, 11, 0x1000, 0x100, 0, missing_object.to_str().unwrap()),
+                ),
                 record_bytes(9, &sample_payload(0x1000, 11, 12, [0x1010])),
             ],
         ),
@@ -116,8 +122,8 @@ fn symbolized_fold_benchmark_uses_runner_addr2line() {
 
     let report = run_fold_benchmark_with_runner(&perfdata, &runner, true, true).expect("benchmark");
 
-    assert_eq!(report.folded_bytes, ":12;app::main 1\n".len());
-    assert_eq!(runner.programs(), vec!["addr2line"]);
+    assert_eq!(report.folded_bytes, ":12;[app] 1\n".len());
+    assert!(runner.programs().is_empty());
 }
 
 #[test]
@@ -157,10 +163,13 @@ fn compares_pyroclast_folded_stacks_with_inferno_collapse() {
 }
 
 #[test]
-fn compares_symbolized_pyroclast_folded_stacks_with_inferno_collapse() {
+fn symbolized_comparison_reports_names_without_a_perf_base_symbol_as_mismatches() {
+    // An oracle claiming a symbol for an unreadable ELF must not make the
+    // comparison pass by reviving names perf's append_inlines would reject.
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
     let perf_script = root.path().join("perf-script.txt");
+    let missing_object = root.path().join("app");
     std::fs::write(
         &perfdata,
         perfdata_with_records_and_attrs(
@@ -170,7 +179,10 @@ fn compares_symbolized_pyroclast_folded_stacks_with_inferno_collapse() {
                 0,
             )],
             [
-                record_bytes(1, &mmap_payload(11, 11, 0x1000, 0x100, 0, "/bin/app")),
+                record_bytes(
+                    1,
+                    &mmap_payload(11, 11, 0x1000, 0x100, 0, missing_object.to_str().unwrap()),
+                ),
                 record_bytes(9, &sample_payload(0x1000, 11, 12, [0x1010])),
             ],
         ),
@@ -183,12 +195,13 @@ fn compares_symbolized_pyroclast_folded_stacks_with_inferno_collapse() {
         compare_with_inferno_collapse_with_symbols(&perfdata, &perf_script, &runner, true, true)
             .expect("comparison");
 
-    assert!(report.matches);
-    assert!(report.svg_matches);
+    assert!(!report.matches);
+    assert!(!report.svg_matches);
+    assert_eq!(report.only_pyroclast, [":12;[app] 1"]);
+    assert_eq!(report.only_inferno, [":12;app::main 1"]);
     assert_eq!(
         runner.programs(),
         vec![
-            "addr2line",
             "inferno-collapse-perf",
             "inferno-flamegraph",
             "inferno-flamegraph"

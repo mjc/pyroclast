@@ -64,6 +64,31 @@ heap. Ten paired runs under load did not demonstrate a runtime win: median
 wall time was 12.092s before versus 12.717s after (5.2% higher). This is a
 correctness and allocation-lifetime fix, not a claimed wall-time speedup.
 
+ELF symbol eligibility now follows `tools/perf/util/symbol-elf.c`:
+`elf_sym__is_function`, `elf_sym__is_object`, `elf_sym__is_label`, and
+`dso__load_sym`. Hidden/internal NOTYPE labels, absolute symbols, unsupported
+types, nonallocated sections, and NOTYPE labels outside text/data sections
+were incorrectly accepted. Synthetic ELF tests proved all five exclusions
+red; companion cases retain hidden functions/data, IFUNCs, and visible labels.
+
+A second red failure remained after fixing the index: the inline resolver
+revived a rejected hidden label from Rust addr2line's broader symbol map.
+`machine.c:append_inlines` returns before calling libdw or binutils addr2line
+when there is no base symbol. Both backends now follow that gate. Six green
+benchmark, CLI, and Linux-backend tests that expected a subprocess-supplied
+name for an unreadable ELF were retained, renamed, and proved red against the
+old fallback; they now
+require module fallback and report mismatches against an incorrect oracle.
+Neither libdw's DIE walk nor binutils' inline iteration was changed, and
+Inferno's `with_module_fallback` still determines the unresolved folded name.
+
+Fresh native/reference, direct-fold, and streamed-text folds remain identical
+on the 373 MiB recording. Removing the invalid loader fallback reduced
+Heaptrack's allocation count from 231,662 to 160,066 (30.9% fewer), with peak
+heap unchanged at 17.88 MB.
+Ten paired runs, alternating command order, measured median 9.995s before
+versus 10.065s after (0.7% higher under load); no runtime speedup is claimed.
+
 ## 2026-09-29 x86-64 replay
 
 Fresh output from the 390,376,668-byte `inferno-slow-collapse.perf.data` was
