@@ -167,6 +167,91 @@ fn extracts_kernel_build_id_from_perfdata_file() {
     );
 }
 
+#[test]
+fn file_kernel_build_id_lookup_matches_memory_for_record_stream_formats() {
+    let build_id = [0xab; 20];
+    let build_id_record = build_id_event_payload(u32::MAX, &build_id, "[kernel.kallsyms]");
+    let mmap_record = perf_record(
+        PERF_RECORD_MMAP2,
+        PERF_RECORD_MISC_MMAP_BUILD_ID,
+        &mmap2_build_id_payload(u32::MAX, &build_id, "[kernel.kallsyms]_text"),
+    );
+    for records in [build_id_record, mmap_record, Vec::new()] {
+        let bytes = perfdata_with_data_records(&records);
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, &bytes).unwrap();
+        assert_eq!(
+            kernel_build_id_from_perfdata_file(file.path()).unwrap(),
+            kernel_build_id_from_perfdata(&bytes).unwrap()
+        );
+    }
+}
+
+#[test]
+fn file_kernel_build_id_lookup_uses_first_kernel_record_and_skips_user_build_ids() {
+    let mut records = build_id_event_payload(42, &[0x11; 20], "/tmp/user");
+    records.extend(build_id_event_payload(u32::MAX, &[0x22; 20], "[kernel]"));
+    records.extend(build_id_event_payload(
+        u32::MAX,
+        &[0x33; 20],
+        "[kernel.kallsyms]",
+    ));
+    let bytes = perfdata_with_data_records(&records);
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut file, &bytes).unwrap();
+    assert_eq!(
+        kernel_build_id_from_perfdata_file(file.path()).unwrap(),
+        Some("22".repeat(20))
+    );
+}
+
+#[test]
+fn file_kernel_build_id_lookup_prefers_header_feature_and_falls_back_without_kernel_feature() {
+    let records = build_id_event_payload(u32::MAX, &[0x22; 20], "[kernel]");
+    for (feature_filename, expected) in [("[kernel.kallsyms]", "11"), ("/tmp/user", "22")] {
+        let payload = build_id_event_payload(u32::MAX, &[0x11; 20], feature_filename);
+        let mut bytes = perfdata_with_data_records(&records);
+        put_u64(&mut bytes, 72, 1 << 2);
+        let payload_offset = bytes.len() + 16;
+        bytes.extend(u64::try_from(payload_offset).unwrap().to_le_bytes());
+        bytes.extend(u64::try_from(payload.len()).unwrap().to_le_bytes());
+        bytes.extend(payload);
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, &bytes).unwrap();
+        assert_eq!(
+            kernel_build_id_from_perfdata_file(file.path()).unwrap(),
+            Some(expected.repeat(20))
+        );
+        assert_eq!(
+            kernel_build_id_from_perfdata_file(file.path()).unwrap(),
+            kernel_build_id_from_perfdata(&bytes).unwrap()
+        );
+    }
+}
+
+#[test]
+fn file_kernel_build_id_lookup_rejects_truncated_sections_and_invalid_records() {
+    let valid_record = build_id_event_payload(u32::MAX, &[0xab; 20], "[kernel.kallsyms]");
+    let valid_data = perfdata_with_data_records(&valid_record);
+    let valid_feature = perfdata_with_build_id_feature(&valid_record);
+    let mut invalid_size = valid_data.clone();
+    invalid_size[134..136].copy_from_slice(&4_u16.to_le_bytes());
+    let mut overrun = valid_data.clone();
+    overrun[134..136].copy_from_slice(&u16::MAX.to_le_bytes());
+    for bytes in [
+        valid_data[..valid_data.len() - 1].to_vec(),
+        valid_feature[..valid_feature.len() - 1].to_vec(),
+        invalid_size,
+        overrun,
+        perfdata_with_data_records(&[0; 7]),
+        vec![0; 103],
+    ] {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, &bytes).unwrap();
+        assert!(kernel_build_id_from_perfdata_file(file.path()).is_err());
+    }
+}
+
 proptest! {
     #[test]
     fn property_parses_concatenated_build_id_events_in_order(

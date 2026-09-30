@@ -1,5 +1,7 @@
 const PERF_MAGIC: &[u8; 8] = b"PERFILE2";
 
+use std::io::{Read, Seek, SeekFrom};
+
 use crate::perfdata::endian::read_u64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,6 +71,37 @@ pub fn parse_feature_sections(
         table_offset += 16;
     }
 
+    Ok(sections)
+}
+
+pub(super) fn feature_sections_from_reader(
+    reader: &mut (impl Read + Seek),
+    header: &PerfHeader,
+    header_bytes: &[u8],
+) -> Result<Vec<PerfFeatureSection>, String> {
+    let features = set_feature_bits(header_bytes)?;
+    if features.is_empty() {
+        return Ok(Vec::new());
+    }
+    let table_offset = header
+        .data_offset
+        .checked_add(header.data_size)
+        .ok_or_else(|| "perf.data feature table offset overflows u64".to_string())?;
+    reader
+        .seek(SeekFrom::Start(table_offset))
+        .map_err(|error| format!("failed to seek perf feature table: {error}"))?;
+    let mut sections = Vec::with_capacity(features.len());
+    for feature in features {
+        let mut entry = [0_u8; 16];
+        reader
+            .read_exact(&mut entry)
+            .map_err(|error| format!("failed to read perf feature table: {error}"))?;
+        sections.push(PerfFeatureSection {
+            feature,
+            offset: read_u64(&entry, 0)?,
+            size: read_u64(&entry, 8)?,
+        });
+    }
     Ok(sections)
 }
 

@@ -18,7 +18,9 @@ use crate::perfdata::build_id::{
     BuildIdEvent, build_id_events_from_perfdata, parse_build_id_events,
 };
 use crate::perfdata::endian::{read_u32, read_u64};
-use crate::perfdata::header::{PerfFeatureSection, PerfHeader, parse_header, parse_header_arch};
+use crate::perfdata::header::{
+    PerfFeatureSection, PerfHeader, feature_sections_from_reader, parse_header, parse_header_arch,
+};
 use crate::perfdata::mappings::{
     FileIdentity, MappingResolveCache, MmapTable, ResolvedMappingRef, UserMapping,
 };
@@ -1533,47 +1535,10 @@ fn feature_sections_from_file(
     header: PerfHeader,
     header_bytes: &[u8; 104],
 ) -> Result<Vec<PerfFeatureSection>, String> {
-    let features = perf_feature_bits(header_bytes)?;
-    if features.is_empty() {
-        return Ok(Vec::new());
-    }
-    let table_offset = header
-        .data_offset
-        .checked_add(header.data_size)
-        .ok_or_else(|| "perf.data feature table offset overflows u64".to_string())?;
-    let table_size = features
-        .len()
-        .checked_mul(16)
-        .ok_or_else(|| "perf.data feature table size overflows usize".to_string())?;
-    let table = read_file_range(file, table_offset, table_size, "perf feature table")?;
-
-    let mut sections = Vec::with_capacity(features.len());
-    for (index, feature) in features.into_iter().enumerate() {
-        let entry_offset = index * 16;
-        sections.push(PerfFeatureSection {
-            feature,
-            offset: read_u64(&table, entry_offset)?,
-            size: read_u64(&table, entry_offset + 8)?,
-        });
-    }
-    Ok(sections)
-}
-
-fn perf_feature_bits(header_bytes: &[u8; 104]) -> Result<Vec<u16>, String> {
-    // adds_features bitmap begins at byte offset 72 in struct perf_file_header
-    // (tools/perf/util/header.h); see set_feature_bits in header.rs.
-    let mut features = Vec::new();
-    for word_index in 0..4 {
-        let word = read_u64(header_bytes, 72 + word_index * 8)?;
-        for bit_index in 0..64 {
-            if word & (1_u64 << bit_index) != 0 {
-                let feature = u16::try_from(word_index * 64 + bit_index)
-                    .map_err(|_| "perf.data feature bit exceeds u16".to_string())?;
-                features.push(feature);
-            }
-        }
-    }
-    Ok(features)
+    let mut reader = file
+        .try_clone()
+        .map_err(|error| format!("failed to clone perf.data handle: {error}"))?;
+    feature_sections_from_reader(&mut reader, &header, header_bytes)
 }
 
 fn read_file_range(
