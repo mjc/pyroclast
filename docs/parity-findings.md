@@ -48,6 +48,22 @@ these are paired measurements, not an unloaded absolute runtime claim.
 Both direct folding and streamed perf text through Inferno matched a freshly
 executed native perf/Inferno reference byte-for-byte.
 
+Object-address translation now lives for the resolver session, shared by
+scalar, base-only, and inline-capable batches. Previously each batch reopened
+the ELF and rebuilt a temporary segment table, even though symbol metadata
+was retained. A red test loaded a small DSO, unlinked it, then queried a new
+address: the old code lost `read+0x1`. Perf retains the loaded DSO's translation
+(`symbol-elf.c:dso__load_sym`, `map.c:map__rip_2objdump`) and skips subsequent
+loads (`symbol.c:dso__load`); libdw likewise retains successful Dwfl sessions
+(`libdw.c:dso__libdw_dwfl`). The test covers base-only and inline-capable
+resolution. The translation lock is released before invoking the backend.
+
+Fresh replay and streamed-text parity still pass. Heaptrack counted 231,662
+allocations versus 267,397 before (13.4% fewer), with unchanged 17.88 MB peak
+heap. Ten paired runs under load did not demonstrate a runtime win: median
+wall time was 12.092s before versus 12.717s after (5.2% higher). This is a
+correctness and allocation-lifetime fix, not a claimed wall-time speedup.
+
 ## 2026-09-29 x86-64 replay
 
 Fresh output from the 390,376,668-byte `inferno-slow-collapse.perf.data` was

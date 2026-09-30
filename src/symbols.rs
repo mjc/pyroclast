@@ -359,6 +359,7 @@ struct PerfObjectSymbolIndex {
 
 pub struct PerfSymbolResolver<O> {
     object_resolver: O,
+    address_cache: Mutex<ObjectAddressCache>,
     debug_dir: Option<PathBuf>,
     kernel_elf: Option<PathBuf>,
     recorded_kernel_build_id: Option<String>,
@@ -803,6 +804,7 @@ where
     pub fn from_object_resolver(object_resolver: O) -> Self {
         Self {
             object_resolver,
+            address_cache: Mutex::new(ObjectAddressCache::default()),
             debug_dir: None,
             kernel_elf: None,
             recorded_kernel_build_id: None,
@@ -1547,7 +1549,10 @@ where
         let mut kernel_elf_indexes = Vec::new();
         let mut user_requests = Vec::new();
         let mut user_indexes = Vec::new();
-        let mut address_cache = ObjectAddressCache::default();
+        let mut address_cache = self
+            .address_cache
+            .lock()
+            .expect("object address cache lock");
 
         for (index, request) in requests.iter().enumerate() {
             if is_kernel_module_symbol_path(&request.path) {
@@ -1577,6 +1582,7 @@ where
             }
         }
 
+        drop(address_cache);
         if !kernel_elf_requests.is_empty() {
             let kernel_symbols = self.object_resolver.resolve_batch(&kernel_elf_requests)?;
             for (index, symbol) in kernel_elf_indexes.into_iter().zip(kernel_symbols) {
@@ -1616,7 +1622,10 @@ where
         let mut kernel_elf_indexes = Vec::new();
         let mut user_requests = Vec::new();
         let mut user_indexes = Vec::new();
-        let mut address_cache = ObjectAddressCache::default();
+        let mut address_cache = self
+            .address_cache
+            .lock()
+            .expect("object address cache lock");
 
         for (index, request) in requests.iter().enumerate() {
             if is_kernel_module_symbol_path(&request.path) {
@@ -1646,6 +1655,7 @@ where
             }
         }
 
+        drop(address_cache);
         if !kernel_elf_requests.is_empty() {
             let kernel_frames = self
                 .object_resolver
@@ -1683,7 +1693,10 @@ where
         let mut kernel_elf_indexes = Vec::new();
         let mut user_requests = Vec::new();
         let mut user_indexes = Vec::new();
-        let mut address_cache = ObjectAddressCache::default();
+        let mut address_cache = self
+            .address_cache
+            .lock()
+            .expect("object address cache lock");
 
         for (index, request) in requests.iter().enumerate() {
             if is_kernel_module_symbol_path(&request.path) {
@@ -1713,6 +1726,7 @@ where
             }
         }
 
+        drop(address_cache);
         if !kernel_elf_requests.is_empty() {
             let kernel_frames = self
                 .object_resolver
@@ -4917,6 +4931,37 @@ mod tests {
                 .map(|frames| frames.frames),
             Some(vec!["real_inline".to_string(), "outer".to_string()])
         );
+    }
+
+    #[test]
+    fn perf_symbol_resolver_retains_loaded_address_translation_after_unlink_like_perf() {
+        // perf symbol-elf.c:dso__load_sym stores the text offset in the DSO;
+        // map.c:map__rip_2objdump reuses it, and symbol.c:dso__load does not
+        // reload an already-loaded DSO. Translation and symbol data must
+        // have the same lifetime rather than reopening the ELF every batch.
+        for inline in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("library.so");
+            let bytes = elf_with_dynamic_text_symbol(b"read", 0x1000, 46);
+            let object = object::File::parse(bytes.as_slice()).unwrap();
+            let file_offset = object.segments().next().unwrap().file_range().0;
+            std::fs::write(&path, &bytes).unwrap();
+            let resolver =
+                super::PerfSymbolResolver::from_object_resolver(RustAddr2lineResolver::new());
+            let mut request = test_request(path.to_str().unwrap(), file_offset);
+            let resolve = |request| {
+                if inline {
+                    resolver.resolve_frame_batch_with_metadata(&[request])
+                } else {
+                    resolver.resolve_base_frame_batch_with_metadata(&[request])
+                }
+                .unwrap()
+            };
+            assert_eq!(resolve(request.clone())[0].frames, ["read+0x0"]);
+            std::fs::remove_file(&path).unwrap();
+            request.relative_address += 1;
+            assert_eq!(resolve(request)[0].frames, ["read+0x1"]);
+        }
     }
 
     #[test]
