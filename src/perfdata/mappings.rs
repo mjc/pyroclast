@@ -21,6 +21,8 @@ pub struct MmapTable {
     executable_pids: HashSet<u32, FxBuildHasher>,
     has_global_mappings: bool,
     has_global_executable_mappings: bool,
+    #[cfg(test)]
+    index_searches: std::cell::Cell<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -667,6 +669,8 @@ impl MmapTable {
     }
 
     fn resolve_mapping_index_for_pid(&self, pid: u32, ip: u64) -> Option<usize> {
+        #[cfg(test)]
+        self.index_searches.set(self.index_searches.get() + 1);
         let bucket = self.mappings_by_pid.get(&pid)?;
         let mut upper_bound = bucket.partition_point(|indexed| indexed.start <= ip);
         let mut latest_matching_index = None;
@@ -691,9 +695,7 @@ impl MmapTable {
         ip: u64,
         cached_index: &mut Option<usize>,
     ) -> Option<usize> {
-        let resolved = self.resolve_mapping_index_for_pid(pid, ip);
-        *cached_index = resolved;
-        resolved
+        self.resolve_mapping_index_for_pid_with_cache_and_predicate(pid, ip, cached_index, |_| true)
     }
 
     fn resolve_mapping_index_for_pid_with_cache_and_predicate(
@@ -703,6 +705,19 @@ impl MmapTable {
         cached_index: &mut Option<usize>,
         predicate: impl Fn(&Mapping) -> bool,
     ) -> Option<usize> {
+        // maps.c:__maps__fixup_overlap_and_insert leaves disjoint ranges per
+        // PID. Check the current entry, not a stored mapping: splits and fork
+        // rebuilds can move indices, and callers share a cache across modes.
+        if let Some(index) = *cached_index
+            && self.mappings.get(index).is_some_and(|mapping| {
+                mapping.pid == pid
+                    && mapping.start <= ip
+                    && ip < mapping.end()
+                    && predicate(mapping)
+            })
+        {
+            return Some(index);
+        }
         let resolved = self.resolve_mapping_index_for_pid_with_predicate(pid, ip, predicate);
         *cached_index = resolved;
         resolved
@@ -714,6 +729,8 @@ impl MmapTable {
         ip: u64,
         predicate: impl Fn(&Mapping) -> bool,
     ) -> Option<usize> {
+        #[cfg(test)]
+        self.index_searches.set(self.index_searches.get() + 1);
         let bucket = self.mappings_by_pid.get(&pid)?;
         let mut upper_bound = bucket.partition_point(|indexed| indexed.start <= ip);
         let mut latest_matching_index = None;
@@ -950,6 +967,128 @@ mod tests {
 
         assert!(!table.has_mapping_for_pid_cached(7, 0x5000, &mut cache));
         assert_eq!(cache.pid_index, None);
+    }
+
+    #[test]
+    fn cached_lookup_reuses_a_containing_mapping_without_researching_the_pid_index() {
+        let mut table = MmapTable::default();
+        table.insert_mmap(MmapRecord {
+            pid: 7,
+            tid: 7,
+            start: 0x1000,
+            len: 0x100,
+            pgoff: 0,
+            path: "/app".into(),
+        });
+        let mut cache = MappingResolveCache::default();
+        table
+            .resolve_user_pid_ref_cached(7, 0x1000, &mut cache)
+            .unwrap();
+        let searches = table.index_searches.get();
+        for ip in 0x1001..0x1100 {
+            let mapping = table
+                .resolve_user_pid_ref_cached(7, ip, &mut cache)
+                .unwrap();
+            assert_eq!(mapping.relative_address, ip - 0x1000);
+        }
+        assert_eq!(table.index_searches.get(), searches);
+    }
+
+    #[test]
+    fn cached_lookup_checks_the_current_cpu_mode_before_reusing_an_index() {
+        let mut table = MmapTable::default();
+        table.insert_mmap_with_misc(
+            MmapRecord {
+                pid: 7,
+                tid: 7,
+                start: 0x1000,
+                len: 0x100,
+                pgoff: 0,
+                path: "[kernel]".into(),
+            },
+            crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_KERNEL,
+        );
+        let mut cache = MappingResolveCache::default();
+        assert!(table.resolve_ref_cached(7, 0x1010, &mut cache).is_some());
+        assert!(
+            table
+                .resolve_user_pid_ref_cached(7, 0x1010, &mut cache)
+                .is_none()
+        );
+        assert_eq!(cache.pid_index, None);
+    }
+
+    #[test]
+    fn cached_lookups_match_current_maps_after_splits_reindexing_and_pid_switches() {
+        let mut table = MmapTable::default();
+        for (pid, path) in [(7, "/first"), (8, "/other"), (u32::MAX, "[global]")] {
+            table.insert_mmap(MmapRecord {
+                pid,
+                tid: pid,
+                start: 0x1000,
+                len: 0x1000,
+                pgoff: u64::from(pid),
+                path: path.into(),
+            });
+        }
+        let mut cache = MappingResolveCache::default();
+        let mut user_cache = MappingResolveCache::default();
+        assert!(table.resolve_ref_cached(7, 0x1800, &mut cache).is_some());
+        assert!(
+            table
+                .resolve_user_pid_ref_cached(7, 0x1800, &mut user_cache)
+                .is_some()
+        );
+        // Removing a middle interval shifts entries belonging to other PIDs
+        // and creates both old-map fragments with adjusted file offsets.
+        for (start, len) in [(0x1700, 0x200), (0x1000, 0x1000), (0x1800, 0x100)] {
+            table.insert_mmap(MmapRecord {
+                pid: 7,
+                tid: 7,
+                start,
+                len,
+                pgoff: start,
+                path: format!("/replacement-{start:x}"),
+            });
+            for pid in [7, 8, 9, u32::MAX] {
+                for ip in [
+                    0xfff, 0x1000, 0x16ff, 0x1700, 0x1800, 0x18ff, 0x1900, 0x1fff, 0x2000,
+                ] {
+                    assert_eq!(
+                        table.resolve_ref_cached(pid, ip, &mut cache),
+                        table.resolve_ref(pid, ip)
+                    );
+                    let expected = table
+                        .mappings
+                        .iter()
+                        .find(|mapping| {
+                            mapping.pid == pid
+                                && mapping.start <= ip
+                                && ip < mapping.end()
+                                && mapping.is_user_cpumode()
+                        })
+                        .map(|mapping| {
+                            (
+                                mapping.path.as_str(),
+                                mapping.relative_address(ip),
+                                mapping.start,
+                                mapping.end(),
+                            )
+                        });
+                    let actual = table
+                        .resolve_user_pid_ref_cached(pid, ip, &mut user_cache)
+                        .map(|mapping| {
+                            (
+                                mapping.path,
+                                mapping.relative_address,
+                                mapping.start,
+                                mapping.end,
+                            )
+                        });
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
     }
 
     #[test]

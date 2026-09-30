@@ -32,6 +32,22 @@ with `(`; `after_event` emits only nonempty stacks. The corrected test fails on
 the prior implementation and requires no output for a process-name-only stack.
 Unresolved symbols still use Inferno's module fallback.
 
+Mapping lookups now reuse a containing cached index after validating the
+current entry's PID, address range, and CPU-mode predicate. This relies on
+the same per-PID disjoint-range invariant as perf's
+`tools/perf/util/maps.c:__maps__fixup_overlap_and_insert`, not on retaining a
+stale mapping across mutations. The old "cached" lookup never read its cache;
+a red test observed 256 index searches for 256 addresses in one mapping.
+Regression tests compare cached and uncached lookups after splits, complete
+remaps, index shifts, PID switches, and CPU-mode changes.
+
+Ten paired Hyperfine runs on the replay recording, reversing command order
+each pair, measured median wall time 11.908s before versus 9.836s after
+(17.4% lower), with mean user CPU 7.216s versus 5.744s. The machine was loaded;
+these are paired measurements, not an unloaded absolute runtime claim.
+Both direct folding and streamed perf text through Inferno matched a freshly
+executed native perf/Inferno reference byte-for-byte.
+
 ## 2026-09-29 x86-64 replay
 
 Fresh output from the 390,376,668-byte `inferno-slow-collapse.perf.data` was
