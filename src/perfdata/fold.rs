@@ -384,13 +384,6 @@ impl PerfSummary {
 }
 
 impl FoldCounts {
-    fn reserve_first_drain(&mut self, additional_entries: usize) {
-        if self.entries.is_empty() {
-            self.entries.reserve(additional_entries);
-            self.by_hash.reserve(additional_entries);
-        }
-    }
-
     fn add_rendered(&mut self, rendered: &str, count: u64) {
         let rendered = rendered.as_bytes();
         let hash = fold_count_hash(rendered);
@@ -2274,7 +2267,6 @@ where
     R: SymbolResolver,
 {
     let raw_stacks = raw_stacks.sorted_entries();
-    counts.reserve_first_drain(raw_stacks.len());
     if let Some(cache) = symbol_cache.as_deref_mut() {
         prefetch_symbols(&raw_stacks, mmap_table, cache, inline)?;
     }
@@ -5682,19 +5674,56 @@ mod tests {
     }
 
     #[test]
-    fn fold_counts_reserve_for_drain_extends_capacity_after_first_drain() {
+    fn fold_counts_drains_size_tables_for_unique_folded_labels_not_raw_stacks() {
+        // inferno src/collapse/perf.rs after_event() inserts rendered labels;
+        // src/collapse/common.rs Occurrences::insert_or_add() grows the map
+        // only for distinct folded labels, not distinct raw IP callchains.
+        let mut raw_stacks = super::RawStackAccumulator::new();
+        for address in 1..=4096 {
+            raw_stacks.add_slice_with_borrowed_comm(
+                Some(7),
+                Some("alpha"),
+                &[super::FoldFrame::UnmappedAtSample(address)],
+                1,
+            );
+        }
         let mut counts = super::FoldCounts::default();
-
-        counts.reserve_first_drain(1);
-        counts.add_rendered("alpha;leaf", 1);
+        let mappings = super::MmapTable::default();
+        super::accumulate_fold_counts(
+            &raw_stacks,
+            &mappings,
+            &mut counts,
+            None::<&mut SymbolFrameCache<'_, super::NoopSymbolResolver>>,
+            false,
+        )
+        .unwrap();
+        assert_eq!(counts.entries.len(), 1);
+        assert!(
+            counts.entries.capacity() < 1024,
+            "reserved {} folded entries for one label",
+            counts.entries.capacity()
+        );
+        assert!(
+            counts.by_hash.capacity() < 1024,
+            "reserved {} hash entries for one label",
+            counts.by_hash.capacity()
+        );
 
         let previous_entry_capacity = counts.entries.capacity();
         let previous_hash_capacity = counts.by_hash.capacity();
 
-        counts.reserve_first_drain(128);
+        super::accumulate_fold_counts(
+            &raw_stacks,
+            &mappings,
+            &mut counts,
+            None::<&mut SymbolFrameCache<'_, super::NoopSymbolResolver>>,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(counts.entries.capacity(), previous_entry_capacity);
         assert_eq!(counts.by_hash.capacity(), previous_hash_capacity);
+        assert_eq!(counts.entries[0].count, 8192);
     }
 
     #[test]
