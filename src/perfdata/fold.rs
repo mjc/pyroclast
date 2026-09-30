@@ -26,7 +26,7 @@ use crate::perfdata::raw_stack::{RawStackAccumulator, RawStackEntryRef};
 use crate::perfdata::records::{
     PERF_RECORD_FINISHED_ROUND, PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_CPUMODE_KERNEL,
     PERF_RECORD_MISC_CPUMODE_MASK, PERF_RECORD_MISC_CPUMODE_USER, PERF_RECORD_MISC_FORK_EXEC,
-    PERF_RECORD_MISC_MMAP_BUILD_ID, ParsedRecord, PerfRecord, PerfRecordHeader, iter_records,
+    PERF_RECORD_MISC_MMAP_BUILD_ID, ParsedRecord, PerfRecord, iter_records,
     parse_aux_output_hw_id_record, parse_aux_record, parse_bpf_event_record,
     parse_callchain_deferred_record, parse_cgroup_record, parse_comm_record, parse_exit_record,
     parse_fork_record, parse_itrace_start_record, parse_ksymbol_record, parse_lost_record,
@@ -193,11 +193,10 @@ type UnwindMappingKey = (String, u64, u64, u64);
 type UnwindModuleKey = (String, u64);
 const MAX_LIBDW_CALLBACK_REPORT_PASSES: usize = 8;
 
-struct TimedRecord {
+struct TimedRecord<'a> {
     index: usize,
     time: Option<u64>,
-    offset: usize,
-    header: PerfRecordHeader,
+    record: PerfRecord<'a>,
 }
 
 enum FoldRecord<'a> {
@@ -837,15 +836,19 @@ fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData,
     let mut ordered_records = OrderedRecordQueue::default();
 
     for timed_record in records {
-        let record = timed_record.record(bytes)?;
+        let TimedRecord {
+            index,
+            time,
+            record,
+        } = timed_record?;
         if record.header.record_type == PERF_RECORD_FINISHED_ROUND {
             ordered_records.flush_round(&mut accumulator, &sample_layouts, options)?;
             continue;
         }
         let parsed_record = parse_fold_record(record)?;
         let record_result = ordered_records.apply_or_queue(
-            timed_record.index,
-            timed_record.time,
+            index,
+            time,
             parsed_record,
             &mut accumulator,
             &sample_layouts,
@@ -893,7 +896,11 @@ where
     let records = timed_records(&mapped, header, &sample_layouts)?;
 
     for timed_record in records {
-        let record = timed_record.record(&mapped)?;
+        let TimedRecord {
+            index,
+            time,
+            record,
+        } = timed_record?;
         if record.header.record_type == PERF_RECORD_FINISHED_ROUND {
             ordered_records.flush_round(&mut accumulator, &sample_layouts, options)?;
             accumulator.drain_fold_counts(
@@ -904,10 +911,9 @@ where
             continue;
         }
 
-        let time = timed_record.time;
         let parsed_record = parse_fold_record(record)?;
         ordered_records.apply_or_queue(
-            timed_record.index,
+            index,
             time,
             parsed_record,
             &mut accumulator,
@@ -951,7 +957,11 @@ where
     let records = timed_records(&mapped, header, &sample_layouts)?;
 
     for timed_record in records {
-        let record = timed_record.record(&mapped)?;
+        let TimedRecord {
+            index,
+            time,
+            record,
+        } = timed_record?;
         if record.header.record_type == PERF_RECORD_FINISHED_ROUND {
             ordered_records.flush_round_with(|record| {
                 sink.apply_fold_record(record, &sample_layouts, options)
@@ -959,9 +969,8 @@ where
             continue;
         }
 
-        let time = timed_record.time;
         let parsed_record = parse_fold_record(record)?;
-        ordered_records.apply_or_queue_with(timed_record.index, time, parsed_record, |record| {
+        ordered_records.apply_or_queue_with(index, time, parsed_record, |record| {
             sink.apply_fold_record(record, &sample_layouts, options)
         })?;
     }
@@ -1738,12 +1747,11 @@ impl FoldAccumulator {
     }
 }
 
-fn timed_records(
-    bytes: &[u8],
+fn timed_records<'a>(
+    bytes: &'a [u8],
     header: PerfHeader,
-    sample_layouts: &SampleLayouts,
-) -> Result<Vec<TimedRecord>, String> {
-    let mut timed = Vec::new();
+    sample_layouts: &'a SampleLayouts,
+) -> Result<impl Iterator<Item = Result<TimedRecord<'a>, String>> + 'a, String> {
     let mut offset = usize::try_from(header.data_offset)
         .map_err(|_| "perf data section offset exceeds usize".to_string())?;
     let data_size = usize::try_from(header.data_size)
@@ -1756,59 +1764,54 @@ fn timed_records(
     }
 
     let mut index = 0usize;
-    while offset < end {
-        let header = parse_record_header(
-            bytes
-                .get(offset..offset + 8)
-                .ok_or_else(|| format!("truncated perf record header at offset {offset}"))?,
-        )?;
-        let size = usize::from(header.size);
-        if size < 8 {
-            return Err(format!(
-                "invalid perf record size {size} at offset {offset}"
-            ));
+    // perf's session.c processes each record as it is read; only ordered
+    // events are retained until the next round flush.
+    Ok(std::iter::from_fn(move || {
+        if offset >= end {
+            return None;
         }
-        let next = offset
-            .checked_add(size)
-            .ok_or_else(|| format!("perf record size overflows at offset {offset}"))?;
-        if next > end {
-            return Err(format!(
-                "perf record overruns data section at offset {offset}"
-            ));
+        let result = (|| {
+            let payload_start = offset
+                .checked_add(8)
+                .ok_or_else(|| format!("perf record header overflows at offset {offset}"))?;
+            let header = parse_record_header(
+                bytes
+                    .get(offset..payload_start)
+                    .ok_or_else(|| format!("truncated perf record header at offset {offset}"))?,
+            )?;
+            let size = usize::from(header.size);
+            if size < 8 {
+                return Err(format!(
+                    "invalid perf record size {size} at offset {offset}"
+                ));
+            }
+            let next = offset
+                .checked_add(size)
+                .ok_or_else(|| format!("perf record size overflows at offset {offset}"))?;
+            if next > end {
+                return Err(format!(
+                    "perf record overruns data section at offset {offset}"
+                ));
+            }
+            let record = PerfRecord {
+                offset,
+                header,
+                payload: &bytes[payload_start..next],
+            };
+            let timed = TimedRecord {
+                index,
+                time: record_time(record, sample_layouts)?,
+                record,
+            };
+            index += 1;
+            offset = next;
+            Ok(timed)
+        })();
+        if result.is_err() {
+            offset = end;
         }
-        let record = PerfRecord {
-            offset,
-            header,
-            payload: &bytes[offset + 8..next],
-        };
-        let time = record_time(record, sample_layouts)?;
-        timed.push(TimedRecord {
-            index,
-            time,
-            offset,
-            header,
-        });
-        index += 1;
-        offset = next;
-    }
-    Ok(timed)
-}
-
-impl TimedRecord {
-    fn record<'a>(&self, bytes: &'a [u8]) -> Result<PerfRecord<'a>, String> {
-        let next = self
-            .offset
-            .checked_add(usize::from(self.header.size))
-            .ok_or_else(|| format!("perf record size overflows at offset {}", self.offset))?;
-        let payload = bytes
-            .get(self.offset + 8..next)
-            .ok_or_else(|| format!("perf record payload is truncated at offset {}", self.offset))?;
-        Ok(PerfRecord {
-            offset: self.offset,
-            header: self.header,
-            payload,
-        })
-    }
+        Some(result)
+    }))
 }
 
 fn record_time(
@@ -4517,6 +4520,100 @@ mod tests {
         PerfArch, PerfUserRegs, PerfX86_64Regs, UserStackUnwindResult, UserStackUnwinder,
     };
     use crate::symbols::{ResolvedSymbolFrames, SymbolFrameCache, SymbolRequest, SymbolResolver};
+
+    #[test]
+    fn timed_records_deliver_valid_events_before_later_invalid_header_like_perf_session() {
+        let mut bytes = Vec::new();
+        for size in [8_u16, 4] {
+            bytes.extend_from_slice(&super::PERF_RECORD_FINISHED_ROUND.to_le_bytes());
+            bytes.extend_from_slice(&0_u16.to_le_bytes());
+            bytes.extend_from_slice(&size.to_le_bytes());
+        }
+        let header = super::PerfHeader {
+            header_size: 0,
+            attr_offset: 0,
+            attr_size: 0,
+            data_offset: 0,
+            data_size: bytes.len() as u64,
+        };
+
+        assert!(
+            super::timed_records(&bytes, header, &super::SampleLayouts::default()).is_ok(),
+            "the first record should be available before the later header is parsed"
+        );
+        let layouts = super::SampleLayouts::default();
+        let mut records = super::timed_records(&bytes, header, &layouts).unwrap();
+        let first = records.next().unwrap().unwrap();
+        assert_eq!(first.index, 0);
+        assert_eq!(first.record.offset, 0);
+        assert_eq!(
+            first.record.header.record_type,
+            super::PERF_RECORD_FINISHED_ROUND
+        );
+        assert_eq!(first.time, None);
+        assert_eq!(
+            records.next().unwrap().err().unwrap(),
+            "invalid perf record size 4 at offset 8"
+        );
+        assert!(records.next().is_none());
+        assert!(records.next().is_none());
+    }
+
+    #[test]
+    fn timed_records_preserve_file_order_indices_and_payload_boundaries() {
+        let mut bytes = vec![0; 8];
+        for payload in [b"abcd", b"efgh"] {
+            bytes.extend_from_slice(&super::PERF_RECORD_FINISHED_ROUND.to_le_bytes());
+            bytes.extend_from_slice(&0_u16.to_le_bytes());
+            bytes.extend_from_slice(&12_u16.to_le_bytes());
+            bytes.extend_from_slice(payload);
+        }
+        let header = super::PerfHeader {
+            header_size: 0,
+            attr_offset: 0,
+            attr_size: 0,
+            data_offset: 8,
+            data_size: 24,
+        };
+        let layouts = super::SampleLayouts::default();
+        let mut records = super::timed_records(&bytes, header, &layouts).unwrap();
+        for (index, payload) in [b"abcd", b"efgh"].into_iter().enumerate() {
+            let record = records.next().unwrap().unwrap();
+            assert_eq!(record.index, index);
+            assert_eq!(record.record.offset, 8 + index * 12);
+            assert_eq!(record.record.payload, payload);
+        }
+        assert!(records.next().is_none());
+    }
+
+    #[test]
+    fn timed_records_reject_section_overrun_and_end_after_record_overrun() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&super::PERF_RECORD_FINISHED_ROUND.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        let mut header = super::PerfHeader {
+            header_size: 0,
+            attr_offset: 0,
+            attr_size: 0,
+            data_offset: 0,
+            data_size: 16,
+        };
+        let layouts = super::SampleLayouts::default();
+        assert_eq!(
+            super::timed_records(&bytes, header, &layouts)
+                .err()
+                .unwrap(),
+            "perf data section extends past end of file"
+        );
+        header.data_size = 8;
+        let mut records = super::timed_records(&bytes, header, &layouts).unwrap();
+        assert_eq!(
+            records.next().unwrap().err().unwrap(),
+            "perf record overruns data section at offset 0"
+        );
+        assert!(records.next().is_none());
+    }
 
     // tools/perf/util/header.c write_event_desc: nre(u32), attr_sz(u32), then
     // per event attr_sz attr bytes, nr(u32), do_write_string(name), nr u64 ids.
