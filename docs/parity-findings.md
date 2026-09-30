@@ -89,6 +89,26 @@ heap unchanged at 17.88 MB.
 Ten paired runs, alternating command order, measured median 9.995s before
 versus 10.065s after (0.7% higher under load); no runtime speedup is claimed.
 
+Unix file windows now use positional reads against one borrowed file rather
+than cloned descriptors sharing a cursor. Perf's `session.c:reader__mmap`
+likewise addresses input by explicit offsets; this change does not alter
+record ordering, libdw's PC handling, addr2line's inline walk, or Inferno's
+folding rules. A red test observed the caller's cursor move from 3 to 131084.
+A second red test exposed a partial-refill error: the old cached range
+remained valid after its first bytes were overwritten, returning `XY` where
+the file contained `ab`. Refills now invalidate that range before reading.
+
+On the replay recording, syscall traces went from 1,755,837 seeks and
+1,757,624 reads to 45,226 seeks, 47,013 reads, and 1,710,613 positional reads
+(including two preexisting positional reads). The combined read/seek count
+fell from 3,513,463 to 1,802,852 (48.7% fewer). Ten alternating paired runs
+measured median 9.952s before versus 9.844s after (1.1% lower), with seven
+candidate wins; mean paired ratios were essentially unchanged under load.
+This is not evidence of a large runtime speedup. Heaptrack still reports
+160,066 allocations and 17.88 MB peak heap. Both symbolizers' direct folds
+and streamed text through Inferno match a freshly executed native reference
+byte-for-byte; all 736 tests and pedantic Clippy pass.
+
 ## 2026-09-29 x86-64 replay
 
 Fresh output from the 390,376,668-byte `inferno-slow-collapse.perf.data` was

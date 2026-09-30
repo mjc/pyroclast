@@ -1,5 +1,8 @@
 use std::fs::File;
+#[cfg(not(unix))]
 use std::io::{Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 
 use super::records::{PerfRecord, parse_record_header};
 
@@ -50,8 +53,8 @@ impl RecordSource for SliceSource<'_> {
     }
 }
 
-struct FileWindow {
-    file: File,
+struct FileWindow<'a> {
+    file: &'a File,
     len: usize,
     buffer: Vec<u8>,
     start: usize,
@@ -61,8 +64,8 @@ struct FileWindow {
     bytes_read: usize,
 }
 
-impl FileWindow {
-    fn new(file: &File, read_size: usize) -> Result<Self, String> {
+impl<'a> FileWindow<'a> {
+    fn new(file: &'a File, read_size: usize) -> Result<Self, String> {
         let len = usize::try_from(
             file.metadata()
                 .map_err(|error| format!("failed to stat perf.data: {error}"))?
@@ -70,9 +73,7 @@ impl FileWindow {
         )
         .map_err(|_| "perf.data size exceeds usize".to_string())?;
         Ok(Self {
-            file: file
-                .try_clone()
-                .map_err(|error| format!("failed to clone perf.data: {error}"))?,
+            file,
             len,
             // A reusable read window, not a cache of the recording. Ordered
             // delivery can revisit offsets without retaining record payloads.
@@ -86,7 +87,7 @@ impl FileWindow {
     }
 }
 
-impl RecordSource for FileWindow {
+impl RecordSource for FileWindow<'_> {
     fn len(&self) -> usize {
         self.len
     }
@@ -97,16 +98,26 @@ impl RecordSource for FileWindow {
             .filter(|end| *end <= self.len)
             .ok_or_else(|| format!("truncated perf record at offset {offset}"))?;
         if offset < self.start || end > self.start + self.valid {
-            self.file
-                .seek(SeekFrom::Start(offset as u64))
-                .map_err(|error| format!("failed to seek perf record: {error}"))?;
+            // A failed read can partially overwrite the buffer, so its old
+            // range must stop being readable before starting the refill.
+            self.valid = 0;
             let size = self.read_size.max(len).min(self.len - offset);
             if self.buffer.len() < size {
                 self.buffer.resize(size, 0);
             }
+            #[cfg(unix)]
             self.file
-                .read_exact(&mut self.buffer[..size])
+                .read_exact_at(&mut self.buffer[..size], offset as u64)
                 .map_err(|error| format!("failed to read perf record: {error}"))?;
+            #[cfg(not(unix))]
+            {
+                self.file
+                    .seek(SeekFrom::Start(offset as u64))
+                    .map_err(|error| format!("failed to seek perf record: {error}"))?;
+                self.file
+                    .read_exact(&mut self.buffer[..size])
+                    .map_err(|error| format!("failed to read perf record: {error}"))?;
+            }
             #[cfg(test)]
             {
                 self.bytes_read += size;
@@ -118,13 +129,13 @@ impl RecordSource for FileWindow {
     }
 }
 
-pub(super) struct FileSource {
-    scan: FileWindow,
-    delivery: FileWindow,
+pub(super) struct FileSource<'a> {
+    scan: FileWindow<'a>,
+    delivery: FileWindow<'a>,
 }
 
-impl FileSource {
-    pub fn new(file: &File) -> Result<Self, String> {
+impl<'a> FileSource<'a> {
+    pub fn new(file: &'a File) -> Result<Self, String> {
         Ok(Self {
             scan: FileWindow::new(file, 1024 * 1024)?,
             delivery: FileWindow::new(file, 4096)?,
@@ -137,7 +148,7 @@ impl FileSource {
     }
 }
 
-impl RecordSource for FileSource {
+impl RecordSource for FileSource<'_> {
     fn len(&self) -> usize {
         self.scan.len()
     }
@@ -221,6 +232,51 @@ mod tests {
             "copied {} bytes to deliver 32 eight-byte records",
             source.bytes_read()
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn file_windows_read_by_offset_without_moving_the_callers_cursor() {
+        use std::io::{Seek, SeekFrom};
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut bytes = record(b"first");
+        let far = 128 * 1024;
+        bytes.resize(far, 0);
+        bytes.extend(record(b"last"));
+        std::fs::write(file.path(), &bytes).unwrap();
+        let mut cursor = file.as_file();
+        cursor.seek(SeekFrom::Start(3)).unwrap();
+        let mut source = FileSource::new(file.as_file()).unwrap();
+        for (offset, expected) in [(0, &b"first"[..]), (far, &b"last"[..]), (0, &b"first"[..])] {
+            assert_eq!(
+                source.record_at(offset, bytes.len()).unwrap().payload,
+                expected
+            );
+            assert_eq!(cursor.stream_position().unwrap(), 3);
+            assert_eq!(
+                source
+                    .delivered_record_at(offset, bytes.len())
+                    .unwrap()
+                    .payload,
+                expected
+            );
+            assert_eq!(cursor.stream_position().unwrap(), 3);
+        }
+    }
+
+    #[test]
+    fn failed_refill_cannot_reuse_partially_overwritten_cached_bytes() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut bytes = b"abcdefghijklmnop".to_vec();
+        bytes.resize(32, 0);
+        bytes.extend(b"XY");
+        std::fs::write(file.path(), &bytes).unwrap();
+        file.as_file().set_len(64).unwrap();
+        let mut window = super::FileWindow::new(file.as_file(), 16).unwrap();
+        assert_eq!(window.bytes_at(0, 2).unwrap(), b"ab");
+        file.as_file().set_len(34).unwrap();
+        assert!(window.bytes_at(32, 16).is_err());
+        assert_eq!(window.bytes_at(0, 2).unwrap(), b"ab");
     }
 
     #[test]
