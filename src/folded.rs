@@ -183,6 +183,15 @@ pub(crate) fn render_inferno_perf_folded_label(frame: &str) -> String {
     rendered
 }
 
+pub(crate) fn render_inferno_perf_bracketed_label(name: &str) -> String {
+    let escaped_semicolons = name.bytes().filter(|byte| *byte == b';').count();
+    let mut rendered = String::with_capacity(name.len() + escaped_semicolons + 2);
+    rendered.push('[');
+    escape_frame_into(&mut rendered, name);
+    rendered.push(']');
+    rendered
+}
+
 fn render_folded_stack_into<'a>(rendered: &mut String, frames: impl IntoIterator<Item = &'a str>) {
     rendered.clear();
     for frame in frames {

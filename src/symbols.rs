@@ -1451,9 +1451,7 @@ where
                 .zip(resolved)
             {
                 let folded_rendered = if resolved_frames.frames.is_empty() {
-                    crate::folded::render_inferno_perf_folded_label(
-                        mapping_fallback_frame(&mappings[index]).as_str(),
-                    )
+                    mapping_fallback_folded_frame(&mappings[index])
                 } else {
                     render_perf_script_inferno_folded_frames(&resolved_frames.frames)
                 };
@@ -1568,9 +1566,7 @@ where
                 .zip(resolved)
             {
                 let folded_rendered = if resolved_frames.frames.is_empty() {
-                    crate::folded::render_inferno_perf_folded_label(
-                        mapping_fallback_frame(&mappings[index]).as_str(),
-                    )
+                    mapping_fallback_folded_frame(&mappings[index])
                 } else {
                     render_perf_script_inferno_folded_frames(&resolved_frames.frames)
                 };
@@ -3749,30 +3745,21 @@ fn mapping_frame_key(mapping: &ResolvedMappingRef<'_>) -> MappingFrameKey {
     }
 }
 
-fn mapping_fallback_frame(mapping: &ResolvedMappingRef<'_>) -> String {
-    if is_kernel_mapping_ref(mapping) {
-        kernel_module_fallback_frame(mapping.path)
-    } else if mapping.path == "[unknown]" {
-        mapping.path.to_string()
+fn mapping_fallback_folded_frame(mapping: &ResolvedMappingRef<'_>) -> String {
+    let kernel_mapping = is_kernel_mapping_ref(mapping);
+    let path = if kernel_mapping && mapping.path.starts_with("[kernel.kallsyms]") {
+        "[kernel.kallsyms]"
     } else {
-        let name = Path::new(mapping.path)
-            .file_name()
-            .and_then(OsStr::to_str)
-            .unwrap_or(mapping.path);
-        format!("[{name}]")
+        mapping.path
+    };
+    if !kernel_mapping && path == "[unknown]" {
+        return crate::folded::render_inferno_perf_folded_label(path);
     }
-}
-
-fn kernel_module_fallback_frame(path: &str) -> String {
-    if path.starts_with("[kernel.kallsyms]") {
-        "[[kernel.kallsyms]]".to_string()
-    } else {
-        let name = Path::new(path)
-            .file_name()
-            .and_then(OsStr::to_str)
-            .unwrap_or(path);
-        format!("[{name}]")
-    }
+    let name = Path::new(path)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or(path);
+    crate::folded::render_inferno_perf_bracketed_label(name)
 }
 
 fn is_kernel_mapping_ref(mapping: &ResolvedMappingRef<'_>) -> bool {
@@ -5236,6 +5223,24 @@ mod tests {
         let frames = cache.resolve_folded_mapping_ref(&mapping).expect("resolve");
 
         assert_eq!(frames, "[[vdso]]");
+    }
+
+    #[test]
+    fn symbol_frame_cache_fallback_labels_preserve_inferno_module_escaping() {
+        for (path, address, expected) in [
+            ("/tmp/semi;line\nname", 0x10, "[semi\\;line name]"),
+            ("[unknown]", 0x10, "[unknown]"),
+            ("[kernel.kallsyms]", u64::MAX - 1, "[[kernel.kallsyms]]"),
+        ] {
+            let resolver = CountingFrameResolver::new(vec![Vec::new()]);
+            let mut cache = SymbolFrameCache::new(&resolver);
+            let mapping = test_mapping_ref(path, address);
+
+            assert_eq!(
+                cache.resolve_folded_mapping_ref(&mapping).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]
