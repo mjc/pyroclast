@@ -130,12 +130,30 @@ fn perf_script_command_exports_inferno_compatible_perf_script() {
 }
 
 #[test]
-fn perf_script_command_rejects_zero_data_size_like_perf_script() {
+fn perf_script_command_returns_empty_failure_for_zero_data_size_like_perf_script() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
     let mut bytes = tiny_perfdata();
+    put_u64(&mut bytes, 16, 144);
     put_u64(&mut bytes, 48, 0);
     std::fs::write(&perfdata, bytes).expect("write perfdata");
+
+    #[cfg(target_os = "linux")]
+    {
+        let perf = std::process::Command::new("perf")
+            .args(["script", "--force", "-i", perfdata.to_str().unwrap()])
+            .output()
+            .expect("run reference perf script");
+        assert!(
+            !perf.status.success(),
+            "perf unexpectedly accepted a zero-sized data section"
+        );
+        assert!(
+            perf.stdout.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&perf.stdout)
+        );
+    }
 
     let error = pyroclast::run_cli([
         "pyroclast",
@@ -144,13 +162,30 @@ fn perf_script_command_rejects_zero_data_size_like_perf_script() {
         "--no-symbols",
         perfdata.to_str().unwrap(),
     ])
-    .expect_err("zero data-size perfdata should fail");
+    .expect_err("perf script cannot process a zero-sized event section");
 
-    assert!(
-        error.to_string().contains("data size field is 0"),
-        "{error}"
-    );
-    assert!(error.to_string().contains("properly terminated"), "{error}");
+    assert!(!error.to_string().is_empty());
+}
+
+#[test]
+fn fold_command_processes_zero_data_size_like_perf_script_and_inferno() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    let mut bytes = tiny_perfdata();
+    put_u64(&mut bytes, 16, 144);
+    put_u64(&mut bytes, 48, 0);
+    std::fs::write(&perfdata, bytes).expect("write perfdata");
+
+    let output = pyroclast::run_cli([
+        "pyroclast",
+        "plumbing",
+        "fold",
+        "--no-symbols",
+        perfdata.to_str().unwrap(),
+    ])
+    .expect("empty perf script stream folds to empty output");
+
+    assert_eq!(output.stdout, "");
 }
 
 #[test]

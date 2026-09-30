@@ -827,7 +827,6 @@ fn parse_fold_record(record: PerfRecord<'_>) -> Result<FoldRecord<'_>, String> {
 
 fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData, String> {
     let header = parse_header(bytes)?;
-    ensure_perfdata_has_event_data(header)?;
     let sample_layouts = sample_layouts(bytes, header)?;
     let header_build_ids = header_build_ids_by_filename(bytes)?;
     let arch = perf_arch_from_header(parse_header_arch(bytes, &header)?.as_deref());
@@ -881,7 +880,6 @@ where
     W: IoWrite + ?Sized,
 {
     let (header, header_bytes) = perfdata_header_from_file(file)?;
-    ensure_perfdata_has_event_data(header)?;
     let sample_layouts = sample_layouts_from_file(file, header, &header_bytes)?;
     let header_build_ids = header_build_ids_by_filename_from_file(file, header, &header_bytes)?;
     let arch =
