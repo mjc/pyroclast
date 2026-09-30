@@ -2916,6 +2916,36 @@ fn applies_comm_records_by_perf_timestamp_from_file_path_like_perf_script() {
 }
 
 #[test]
+fn file_and_slice_replay_apply_timestamp_order_across_distant_input_ranges() {
+    let mut records = vec![
+        record_bytes(3, &comm_payload_with_sample_id_time(11, 12, "before", 10)),
+        record_bytes(9, &sample_payload_with_time(0x1000, 11, 12, 30, [0x2000])),
+    ];
+    let padding = record_bytes(100, &vec![0; 65520]);
+    records.extend(std::iter::repeat_n(padding.clone(), 160));
+    records.extend([
+        record_bytes(3, &comm_payload_with_sample_id_time(11, 12, "after", 20)),
+        record_bytes(9, &sample_payload_with_time(0x1000, 11, 12, 15, [0x2000])),
+    ]);
+    records.extend(std::iter::repeat_n(padding, 80));
+    records.push(record_bytes(PERF_RECORD_FINISHED_ROUND, b""));
+    let bytes = perfdata_with_records_and_attrs_vec(
+        vec![file_attr_bytes_with_flags(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CALLCHAIN,
+            1 << 18,
+        )],
+        records,
+    );
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), &bytes).unwrap();
+    let options = FoldOptions::default();
+    let memory = fold_perfdata_callchains_with_options(&bytes, options).unwrap();
+    let disk = fold_perfdata_file_with_options(file.path(), options).unwrap();
+    assert_eq!(memory, "after;[unknown] 1\nbefore;[unknown] 1\n");
+    assert_eq!(disk, memory);
+}
+
+#[test]
 fn folds_file_samples_from_multiple_attrs_when_generated_perf_script_event_name_matches_inferno_filter()
  {
     let root = tempfile::tempdir().expect("tempdir");

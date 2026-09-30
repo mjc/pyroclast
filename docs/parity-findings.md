@@ -7,9 +7,9 @@ Status as of 2026-06-11. Goal: `pyroclast plumbing fold|flamegraph` fully replac
 
 Replay delivers samples against the maps visible at their ordered delivery,
 then discards their decoded payloads. Ordering retains timestamp/file-offset
-pairs, not decoded samples or a recording-wide raw-stack trie. File input uses
-separate reusable scan and delivery windows so backlog replay cannot repeatedly
-evict the sequential window. The CLI writes perf text directly to its writer.
+pairs, not decoded samples or a recording-wide raw-stack trie. File input keeps
+a reusable sequential scan window and separately retained, file-backed ranges
+for queued delivery. The CLI writes perf text directly to its writer.
 
 Folded stacks retain integer IDs for normalized serialized label segments.
 Names are interned once; normalization caches store ID sequences rather than
@@ -108,6 +108,44 @@ This is not evidence of a large runtime speedup. Heaptrack still reports
 160,066 allocations and 17.88 MB peak heap. Both symbolizers' direct folds
 and streamed text through Inferno match a freshly executed native reference
 byte-for-byte; all 736 tests and pedantic Clippy pass.
+
+### Queued Input Locality (PYROC-5)
+
+The 4 KiB delivery window still performed 1,710,611 positional reads returning
+7,395,557,356 bytes for the 390,376,668-byte input: 18.945 times the input size.
+Approximately 858,000 small-window refills jumped backward. These are returned
+read bytes, not measured physical disk traffic. Fresh user-CPU profiling also
+attributed 22.91% of samples to the mapping-frame hash-table lookup. Allocation
+reductions had not removed either source of repeated work.
+
+Queued records now retain read-only mapped input ranges until their final
+ordered delivery. Range size is mapping granularity, not a cache limit: there
+is no eviction of a range with pending records, no per-record payload copy, and
+no requirement to keep the whole recording mapped. Ranges overlap by the
+maximum record size so a split header and its payload remain contiguous. The
+sequential scan keeps its existing 1 MiB buffer. Completed recordings must not
+be modified or truncated during replay; this is the same immutable-file
+precondition as the existing mmap-based analysis and object-unwind paths.
+
+Reference review: perf's `tools/perf/util/session.c:reader__mmap` reads mapped
+input; `ordered-events.c:dup_event` retains or copies event backing until
+`do_flush` delivers it. This implementation pins file ranges instead of copying
+queued payloads. Timestamp ordering, map mutations, libdw's PC handling,
+binutils addr2line's inline walk, and Inferno's normalization are unchanged.
+Inferno's `perf.rs:process_single_stack` consumes text forward, `after_event`
+builds a stack string and calls `Occurrences::insert_or_add`, and `common.rs`
+can distribute batches of independent stacks among workers. Repeated frame
+resolution and parallel folding remain separate work in
+[PYROC-5](https://lific.mjc.lol/PYROC/issues/PYROC-5).
+
+The locality regression test was red on the previous reader: 32 alternating
+deliveries copied another 131,072 bytes. It now requires no delivery copies,
+exactly two mappings, and no retained ranges after delivery. An upstream test
+was separately proved red without the replay retention call; it verifies
+retention precedes delivery and release still happens on parse errors.
+Companion tests cover final-record range release, maximum-size records and
+split headers, invalid bounds without corrupting pending views, and identical
+file/slice folds across distant ranges with out-of-order timestamps.
 
 ## 2026-09-29 x86-64 replay
 

@@ -806,6 +806,7 @@ fn replay_records<O: SampleOutput>(
         {
             // ordered-events.c rejects zero/~0ULL with -ETIME; session.c then
             // delivers directly. Ties retain input order (file offset).
+            source.retain_record(offset)?;
             ordered.queue(offset, time);
         } else {
             sink.apply_fold_record(parse_fold_record(record)?, layouts, options)?;
@@ -825,13 +826,17 @@ fn deliver_record<O: SampleOutput>(
     options: FoldOptions,
     sink: &mut SampleSink<O>,
 ) -> Result<(), String> {
-    let record = source.delivered_record_at(offset, end)?;
-    let record_type = record.header.record_type;
-    let result = parse_fold_record(record)
-        .and_then(|record| sink.apply_fold_record(record, layouts, options));
-    result.map_err(|error| {
-        format!("failed to parse record type {record_type} at offset {offset}: {error}")
-    })
+    let result = (|| {
+        let record = source.delivered_record_at(offset, end)?;
+        let record_type = record.header.record_type;
+        parse_fold_record(record)
+            .and_then(|record| sink.apply_fold_record(record, layouts, options))
+            .map_err(|error| {
+                format!("failed to parse record type {record_type} at offset {offset}: {error}")
+            })
+    })();
+    source.release_record(offset);
+    result
 }
 
 fn header_build_ids_by_filename(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, String> {
@@ -4062,6 +4067,115 @@ mod tests {
         PerfArch, PerfUserRegs, PerfX86_64Regs, UserStackUnwindResult, UserStackUnwinder,
     };
     use crate::symbols::{ResolvedSymbolFrames, SymbolFrameCache, SymbolRequest, SymbolResolver};
+
+    struct RetentionCheckedSource<'a> {
+        source: super::SliceSource<'a>,
+        pending: std::collections::BTreeSet<usize>,
+        delivered: Vec<usize>,
+    }
+
+    impl super::RecordSource for RetentionCheckedSource<'_> {
+        fn len(&self) -> usize {
+            self.source.len()
+        }
+
+        fn bytes_at(&mut self, offset: usize, len: usize) -> Result<&[u8], String> {
+            self.source.bytes_at(offset, len)
+        }
+
+        fn retain_record(&mut self, offset: usize) -> Result<(), String> {
+            assert!(self.pending.insert(offset));
+            Ok(())
+        }
+
+        fn delivered_record_at(
+            &mut self,
+            offset: usize,
+            end: usize,
+        ) -> Result<super::PerfRecord<'_>, String> {
+            assert!(
+                self.pending.contains(&offset),
+                "delivery must retain backing first"
+            );
+            self.delivered.push(offset);
+            self.source.record_at(offset, end)
+        }
+
+        fn release_record(&mut self, offset: usize) {
+            assert!(
+                self.pending.remove(&offset),
+                "release must balance retention"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_retains_backing_until_ordered_delivery_and_releases_on_parse_errors() {
+        let layouts = super::SampleLayouts {
+            fallback: Some(std::sync::Arc::new(super::SampleEventLayout {
+                layout: crate::perfdata::samples::SampleLayout {
+                    sample_type: crate::perfdata::samples::PERF_SAMPLE_TIME,
+                    read_format: 0,
+                    branch_sample_type: 0,
+                    sample_regs_user: 0,
+                    sample_regs_intr: 0,
+                    sample_id_all: true,
+                },
+                event_name: "cycles".into(),
+            })),
+            ..super::SampleLayouts::default()
+        };
+        for malformed in [false, true] {
+            let mut bytes = Vec::new();
+            for (comm, time) in [("later", 30_u64), ("earlier", 10)] {
+                bytes.extend(if malformed { 1_u32 } else { 3 }.to_le_bytes());
+                bytes.extend(0_u16.to_le_bytes());
+                bytes.extend(32_u16.to_le_bytes());
+                bytes.extend(11_u32.to_le_bytes());
+                bytes.extend(12_u32.to_le_bytes());
+                bytes.extend(comm.as_bytes());
+                bytes.resize(bytes.len().next_multiple_of(8), 0);
+                bytes.extend(time.to_le_bytes());
+            }
+            let header = super::PerfHeader {
+                header_size: 0,
+                attr_offset: 0,
+                attr_size: 0,
+                data_offset: 0,
+                data_size: u64::try_from(bytes.len()).unwrap(),
+            };
+            let mut source = RetentionCheckedSource {
+                source: super::SliceSource(&bytes),
+                pending: std::collections::BTreeSet::new(),
+                delivered: Vec::new(),
+            };
+            let mut sink = super::SampleSink::new(
+                super::SessionState::new(std::collections::BTreeMap::new()),
+                super::FoldedOutput::<super::NoopSymbolResolver>::new(None, false),
+            );
+            let result = super::replay_records(
+                &mut source,
+                header,
+                &layouts,
+                super::FoldOptions::default(),
+                &mut sink,
+            );
+            if malformed {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .contains("failed to parse record type 1")
+                );
+                assert_eq!(source.delivered, [32]);
+                assert_eq!(source.pending, std::collections::BTreeSet::from([0]));
+            } else {
+                result.unwrap();
+                assert_eq!(source.delivered, [32, 0]);
+                assert!(source.pending.is_empty());
+                assert_eq!(sink.accumulator.thread_comms[&12], "later");
+            }
+        }
+    }
 
     #[test]
     fn ordered_backlog_retains_only_timestamp_and_record_location() {
