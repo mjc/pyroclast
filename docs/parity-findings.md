@@ -3,6 +3,35 @@
 Status as of 2026-06-11. Goal: `pyroclast plumbing fold|flamegraph` fully replaces
 `perf script | inferno-collapse-perf | inferno-flamegraph`.
 
+## 2026-09-30 streaming replay and folded storage
+
+Replay delivers samples against the maps visible at their ordered delivery,
+then discards their decoded payloads. Ordering retains timestamp/file-offset
+pairs, not decoded samples or a recording-wide raw-stack trie. File input uses
+separate reusable scan and delivery windows so backlog replay cannot repeatedly
+evict the sequential window. The CLI writes perf text directly to its writer.
+
+Folded stacks retain integer IDs for normalized serialized label segments.
+Names are interned once; normalization caches store ID sequences rather than
+full rendered labels. Existing stack lookup borrows the current ID slice, and
+only a new unique stack allocates its stored sequence. Serialization happens
+once per final stack. Sorting compares serialized bytes including delimiters,
+as Inferno's `src/collapse/common.rs` sorts its final string keys.
+
+Symbol caches retain borrowed raw frame lists and perf metadata, not a second
+folded rendering. Folding skips already-cached addresses before constructing
+prefetch batches. Base-only and inline-capable lookup remain distinct: perf's
+event-line IP goes through `machine__resolve`, whereas callchains can expand
+inlines. This changes storage and delivery, not libdw's PC adjustment or
+binutils addr2line's `bfd_find_inliner_info` expansion.
+
+A previously green test confused an empty normalized label with a missing
+symbol: it invented a module fallback for a resolved `(python)` frame. Inferno's
+`src/collapse/perf.rs:on_stack_line` returns immediately for names beginning
+with `(`; `after_event` emits only nonempty stacks. The corrected test fails on
+the prior implementation and requires no output for a process-name-only stack.
+Unresolved symbols still use Inferno's module fallback.
+
 ## 2026-09-29 x86-64 replay
 
 Fresh output from the 390,376,668-byte `inferno-slow-collapse.perf.data` was

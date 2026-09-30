@@ -208,7 +208,6 @@ pub struct SymbolFrameCache<'a, R> {
     resolved_base_by_mapping: FxHashMap<MappingFrameKey, CachedMappingFrames>,
     scratch_seen_mapping: FxHashSet<MappingFrameKey>,
     scratch_missing_keys: Vec<MappingFrameKey>,
-    scratch_missing_indexes: Vec<usize>,
     scratch_missing_requests: Vec<SymbolRequest>,
 }
 
@@ -223,7 +222,6 @@ struct MappingFrameKey {
 
 struct CachedMappingFrames {
     frames: Vec<String>,
-    folded_rendered: String,
     has_base_symbol: bool,
     has_inline_frames: bool,
     has_non_inline_base_frame: bool,
@@ -1257,7 +1255,6 @@ where
             resolved_base_by_mapping: FxHashMap::default(),
             scratch_seen_mapping: FxHashSet::default(),
             scratch_missing_keys: Vec::new(),
-            scratch_missing_indexes: Vec::new(),
             scratch_missing_requests: Vec::new(),
         }
     }
@@ -1335,26 +1332,6 @@ where
             .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())
     }
 
-    /// Resolves one borrowed perfdata mapping through the cache and returns the
-    /// resolved frame list for its symbolized inline frames.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the backing resolver fails.
-    pub fn resolve_folded_mapping_ref(
-        &mut self,
-        mapping: &ResolvedMappingRef<'_>,
-    ) -> Result<&str, String> {
-        let key = mapping_frame_key(mapping);
-        if !self.resolved_by_mapping.contains_key(&key) {
-            self.prefetch_mapping_refs(std::slice::from_ref(mapping))?;
-        }
-        self.resolved_by_mapping
-            .get(&key)
-            .map(|cached| cached.folded_rendered.as_str())
-            .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())
-    }
-
     /// Resolves one borrowed perfdata mapping and returns frames only when perf
     /// would have had a base object symbol for the IP.
     ///
@@ -1378,23 +1355,20 @@ where
     /// Resolves one borrowed perfdata mapping to its single base object symbol
     /// frames (no DWARF inline expansion).
     ///
-    /// This is the default `perf script`/folded path: plain `perf` prints one
-    /// frame per callchain entry named from the ELF symtab.
-    ///
     /// # Errors
     ///
     /// Returns an error when the backing resolver fails.
-    pub fn resolve_base_folded_mapping_ref(
+    pub fn resolve_base_mapping_ref(
         &mut self,
         mapping: &ResolvedMappingRef<'_>,
-    ) -> Result<&str, String> {
+    ) -> Result<&[String], String> {
         let key = mapping_frame_key(mapping);
         if !self.resolved_base_by_mapping.contains_key(&key) {
             self.prefetch_base_mapping_refs(std::slice::from_ref(mapping))?;
         }
         self.resolved_base_by_mapping
             .get(&key)
-            .map(|cached| cached.folded_rendered.as_str())
+            .map(|cached| cached.frames.as_slice())
             .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())
     }
 
@@ -1408,73 +1382,7 @@ where
         &mut self,
         mappings: &[ResolvedMappingRef<'_>],
     ) -> Result<(), String> {
-        let mut seen = std::mem::take(&mut self.scratch_seen_mapping);
-        let mut missing_keys = std::mem::take(&mut self.scratch_missing_keys);
-        let mut missing_indexes = std::mem::take(&mut self.scratch_missing_indexes);
-        let mut missing_requests = std::mem::take(&mut self.scratch_missing_requests);
-        seen.clear();
-        missing_keys.clear();
-        missing_indexes.clear();
-        missing_requests.clear();
-
-        let result = (|| {
-            seen.reserve(mappings.len());
-            missing_keys.reserve(mappings.len());
-            missing_indexes.reserve(mappings.len());
-            missing_requests.reserve(mappings.len());
-            for (index, mapping) in mappings.iter().enumerate() {
-                let key = mapping_frame_key(mapping);
-                if self.resolved_base_by_mapping.contains_key(&key) || !seen.insert(key) {
-                    continue;
-                }
-                missing_keys.push(key);
-                missing_indexes.push(index);
-                missing_requests.push(symbol_request_from_mapping_ref(mapping));
-            }
-            if missing_requests.is_empty() {
-                return Ok(());
-            }
-            let resolved = self
-                .resolver
-                .resolve_base_frame_batch_with_metadata(&missing_requests)?;
-            if resolved.len() != missing_requests.len() {
-                return Err(format!(
-                    "symbol resolver returned {} base frame results for {} requests",
-                    resolved.len(),
-                    missing_requests.len()
-                ));
-            }
-            self.resolved_base_by_mapping.reserve(missing_keys.len());
-            for ((key, index), resolved_frames) in missing_keys
-                .drain(..)
-                .zip(missing_indexes.drain(..))
-                .zip(resolved)
-            {
-                let folded_rendered = if resolved_frames.frames.is_empty() {
-                    mapping_fallback_folded_frame(&mappings[index])
-                } else {
-                    render_perf_script_inferno_folded_frames(&resolved_frames.frames)
-                };
-                self.resolved_base_by_mapping.insert(
-                    key,
-                    CachedMappingFrames {
-                        frames: resolved_frames.frames,
-                        folded_rendered,
-                        has_base_symbol: resolved_frames.has_base_symbol,
-                        has_inline_frames: resolved_frames.has_inline_frames,
-                        has_non_inline_base_frame: resolved_frames.has_non_inline_base_frame,
-                        base_offset: resolved_frames.base_offset,
-                    },
-                );
-            }
-            Ok(())
-        })();
-
-        self.scratch_seen_mapping = seen;
-        self.scratch_missing_keys = missing_keys;
-        self.scratch_missing_indexes = missing_indexes;
-        self.scratch_missing_requests = missing_requests;
-        result
+        self.prefetch_mapping_refs_with_mode(mappings, false)
     }
 
     /// Resolves many object-relative addresses to frame lists, batching cache misses.
@@ -1523,72 +1431,80 @@ where
         &mut self,
         mappings: &[ResolvedMappingRef<'_>],
     ) -> Result<(), String> {
-        let mut seen = std::mem::take(&mut self.scratch_seen_mapping);
-        let mut missing_keys = std::mem::take(&mut self.scratch_missing_keys);
-        let mut missing_indexes = std::mem::take(&mut self.scratch_missing_indexes);
-        let mut missing_requests = std::mem::take(&mut self.scratch_missing_requests);
-        seen.clear();
-        missing_keys.clear();
-        missing_indexes.clear();
-        missing_requests.clear();
+        self.prefetch_mapping_refs_with_mode(mappings, true)
+    }
 
+    pub(crate) fn mapping_ref_cached(
+        &self,
+        mapping: &ResolvedMappingRef<'_>,
+        inline: bool,
+    ) -> bool {
+        let table = if inline {
+            &self.resolved_by_mapping
+        } else {
+            &self.resolved_base_by_mapping
+        };
+        table.contains_key(&mapping_frame_key(mapping))
+    }
+
+    fn prefetch_mapping_refs_with_mode(
+        &mut self,
+        mappings: &[ResolvedMappingRef<'_>],
+        inline: bool,
+    ) -> Result<(), String> {
+        let mut seen = std::mem::take(&mut self.scratch_seen_mapping);
+        let mut keys = std::mem::take(&mut self.scratch_missing_keys);
+        let mut requests = std::mem::take(&mut self.scratch_missing_requests);
+        seen.clear();
+        keys.clear();
+        requests.clear();
         let result = (|| {
-            seen.reserve(mappings.len());
-            missing_keys.reserve(mappings.len());
-            missing_indexes.reserve(mappings.len());
-            missing_requests.reserve(mappings.len());
-            for (index, mapping) in mappings.iter().enumerate() {
+            for mapping in mappings {
                 let key = mapping_frame_key(mapping);
-                if self.resolved_by_mapping.contains_key(&key) || !seen.insert(key) {
+                if self.mapping_ref_cached(mapping, inline) || !seen.insert(key) {
                     continue;
                 }
-                missing_keys.push(key);
-                missing_indexes.push(index);
-                missing_requests.push(symbol_request_from_mapping_ref(mapping));
+                keys.push(key);
+                requests.push(symbol_request_from_mapping_ref(mapping));
             }
-            if missing_requests.is_empty() {
+            if requests.is_empty() {
                 return Ok(());
             }
-            let resolved = self
-                .resolver
-                .resolve_frame_batch_with_metadata(&missing_requests)?;
-            if resolved.len() != missing_requests.len() {
+            let resolved = if inline {
+                self.resolver.resolve_frame_batch_with_metadata(&requests)?
+            } else {
+                self.resolver
+                    .resolve_base_frame_batch_with_metadata(&requests)?
+            };
+            if resolved.len() != requests.len() {
                 return Err(format!(
                     "symbol resolver returned {} frame results for {} requests",
                     resolved.len(),
-                    missing_requests.len()
+                    requests.len()
                 ));
             }
-            self.resolved_by_mapping.reserve(missing_keys.len());
-            for ((key, index), resolved_frames) in missing_keys
-                .drain(..)
-                .zip(missing_indexes.drain(..))
-                .zip(resolved)
-            {
-                let folded_rendered = if resolved_frames.frames.is_empty() {
-                    mapping_fallback_folded_frame(&mappings[index])
-                } else {
-                    render_perf_script_inferno_folded_frames(&resolved_frames.frames)
-                };
-                self.resolved_by_mapping.insert(
+            let table = if inline {
+                &mut self.resolved_by_mapping
+            } else {
+                &mut self.resolved_base_by_mapping
+            };
+            for (key, frames) in keys.drain(..).zip(resolved) {
+                table.insert(
                     key,
                     CachedMappingFrames {
-                        frames: resolved_frames.frames,
-                        folded_rendered,
-                        has_base_symbol: resolved_frames.has_base_symbol,
-                        has_inline_frames: resolved_frames.has_inline_frames,
-                        has_non_inline_base_frame: resolved_frames.has_non_inline_base_frame,
-                        base_offset: resolved_frames.base_offset,
+                        frames: frames.frames,
+                        has_base_symbol: frames.has_base_symbol,
+                        has_inline_frames: frames.has_inline_frames,
+                        has_non_inline_base_frame: frames.has_non_inline_base_frame,
+                        base_offset: frames.base_offset,
                     },
                 );
             }
             Ok(())
         })();
-
         self.scratch_seen_mapping = seen;
-        self.scratch_missing_keys = missing_keys;
-        self.scratch_missing_indexes = missing_indexes;
-        self.scratch_missing_requests = missing_requests;
+        self.scratch_missing_keys = keys;
+        self.scratch_missing_requests = requests;
         result
     }
 
@@ -1619,17 +1535,6 @@ where
         }
         Ok(())
     }
-}
-
-fn render_perf_script_inferno_folded_frames(frames: &[String]) -> String {
-    let mut rendered = String::with_capacity(frames.iter().map(|frame| frame.len() + 1).sum());
-    let mut scratch = String::new();
-    crate::folded::render_inferno_perf_raw_stack_into(
-        &mut rendered,
-        frames.iter().map(String::as_str),
-        &mut scratch,
-    );
-    rendered
 }
 
 impl<O> SymbolResolver for PerfSymbolResolver<O>
@@ -3745,23 +3650,6 @@ fn mapping_frame_key(mapping: &ResolvedMappingRef<'_>) -> MappingFrameKey {
     }
 }
 
-fn mapping_fallback_folded_frame(mapping: &ResolvedMappingRef<'_>) -> String {
-    let kernel_mapping = is_kernel_mapping_ref(mapping);
-    let path = if kernel_mapping && mapping.path.starts_with("[kernel.kallsyms]") {
-        "[kernel.kallsyms]"
-    } else {
-        mapping.path
-    };
-    if !kernel_mapping && path == "[unknown]" {
-        return crate::folded::render_inferno_perf_folded_label(path);
-    }
-    let name = Path::new(path)
-        .file_name()
-        .and_then(OsStr::to_str)
-        .unwrap_or(path);
-    crate::folded::render_inferno_perf_bracketed_label(name)
-}
-
 fn is_kernel_mapping_ref(mapping: &ResolvedMappingRef<'_>) -> bool {
     crate::perfdata::samples::is_kernel_space_frame(mapping.relative_address)
         && mapping.path.starts_with('[')
@@ -5135,111 +5023,59 @@ mod tests {
     }
 
     #[test]
-    fn symbol_frame_cache_resolve_folded_mapping_ref_reuses_cached_frame_slice() {
-        let resolver = CountingFrameResolver::new(vec![vec!["one".to_string(), "two".to_string()]]);
+    fn symbol_frame_cache_base_and_inline_views_borrow_unmodified_names() {
+        let resolver =
+            CountingFrameResolver::new(vec![vec!["handler+0x2a".into(), "inner".into()]]);
         let mut cache = SymbolFrameCache::new(&resolver);
         let mapping = test_mapping_ref("/bin/demo", 0x1234);
-
-        let first_ptr = {
-            let first = cache
-                .resolve_folded_mapping_ref(&mapping)
-                .expect("first resolve");
-            assert_eq!(first, "one;two");
-            first.as_ptr()
-        };
-
-        let second_ptr = {
-            let second = cache
-                .resolve_folded_mapping_ref(&mapping)
-                .expect("second resolve");
-            assert_eq!(second, "one;two");
-            second.as_ptr()
-        };
-
-        assert_eq!(first_ptr, second_ptr);
+        assert!(!cache.mapping_ref_cached(&mapping, true));
+        let first = cache.resolve_mapping_ref(&mapping).unwrap();
+        assert_eq!(first, ["handler+0x2a", "inner"]);
+        let pointer = first.as_ptr();
+        assert!(cache.mapping_ref_cached(&mapping, true));
+        assert_eq!(
+            cache.resolve_mapping_ref(&mapping).unwrap().as_ptr(),
+            pointer
+        );
         assert_eq!(resolver.calls.get(), 1);
+        // Base-only and inline resolution are distinct views of an address.
+        assert!(!cache.mapping_ref_cached(&mapping, false));
+        assert_eq!(
+            cache.resolve_base_mapping_ref(&mapping).unwrap(),
+            ["handler+0x2a", "inner"]
+        );
+        assert!(cache.mapping_ref_cached(&mapping, false));
     }
 
     #[test]
-    fn symbol_frame_cache_resolve_folded_mapping_ref_strips_symbol_offsets_like_inferno_perf() {
-        let resolver = CountingFrameResolver::new(vec![vec!["handler+0x2a".to_string()]]);
+    fn symbol_frame_cache_preserves_all_inline_names_and_duplicate_hops_for_renderers() {
+        let names = ["entry::call", "fn0", "mix", "fn0", "handler+0x2a"];
+        let resolver =
+            CountingFrameResolver::new(vec![names.iter().map(|name| (*name).into()).collect()]);
         let mut cache = SymbolFrameCache::new(&resolver);
-        let mapping = test_mapping_ref("/bin/demo", 0x1234);
-
-        let frames = cache.resolve_folded_mapping_ref(&mapping).expect("resolve");
-
-        assert_eq!(frames, "handler");
+        assert_eq!(
+            cache
+                .resolve_mapping_ref(&test_mapping_ref("/bin/demo", 0x1234))
+                .unwrap(),
+            names
+        );
     }
 
     #[test]
-    fn symbol_frame_cache_resolve_folded_mapping_ref_keeps_fn0_before_mix_like_perf_script() {
-        let resolver = CountingFrameResolver::new(vec![vec![
-            "fn124".to_string(),
-            "fn0".to_string(),
-            "mix".to_string(),
-        ]]);
-        let mut cache = SymbolFrameCache::new(&resolver);
-        let mapping = test_mapping_ref("/bin/demo", 0x1234);
-
-        let frames = cache.resolve_folded_mapping_ref(&mapping).expect("resolve");
-
-        assert_eq!(frames, "fn124;fn0;mix");
-    }
-
-    #[test]
-    fn symbol_frame_cache_resolve_folded_mapping_ref_keeps_multiframe_fn0_hops_like_perf_script() {
-        let resolver = CountingFrameResolver::new(vec![vec![
-            "entry::call".to_string(),
-            "fn0".to_string(),
-            "mix".to_string(),
-            "handler+0x2a".to_string(),
-        ]]);
-        let mut cache = SymbolFrameCache::new(&resolver);
-        let mapping = test_mapping_ref("/bin/demo", 0x1234);
-
-        let frames = cache.resolve_folded_mapping_ref(&mapping).expect("resolve");
-
-        assert_eq!(frames, "entry::call;fn0;mix;handler");
-    }
-
-    #[test]
-    fn symbol_frame_cache_resolve_folded_mapping_ref_returns_empty_slice_for_empty_frames() {
-        let resolver = CountingFrameResolver::new(vec![Vec::new()]);
-        let mut cache = SymbolFrameCache::new(&resolver);
-        let mapping = test_mapping_ref("/usr/lib/libdemo.so", 0x1234);
-
-        let frames = cache.resolve_folded_mapping_ref(&mapping).expect("resolve");
-
-        assert_eq!(frames, "[libdemo.so]");
-        assert_eq!(resolver.calls.get(), 1);
-    }
-
-    #[test]
-    fn symbol_frame_cache_resolve_folded_mapping_ref_returns_empty_slice_for_bracket_dso() {
-        let resolver = CountingFrameResolver::new(vec![Vec::new()]);
-        let mut cache = SymbolFrameCache::new(&resolver);
-        let mapping = test_mapping_ref("[vdso]", 0x10);
-
-        let frames = cache.resolve_folded_mapping_ref(&mapping).expect("resolve");
-
-        assert_eq!(frames, "[[vdso]]");
-    }
-
-    #[test]
-    fn symbol_frame_cache_fallback_labels_preserve_inferno_module_escaping() {
-        for (path, address, expected) in [
-            ("/tmp/semi;line\nname", 0x10, "[semi\\;line name]"),
-            ("[unknown]", 0x10, "[unknown]"),
-            ("[kernel.kallsyms]", u64::MAX - 1, "[[kernel.kallsyms]]"),
+    fn unresolved_symbol_cache_does_not_store_output_specific_module_labels() {
+        for (path, address) in [
+            ("/usr/lib/libdemo.so", 0x1234),
+            ("[vdso]", 0x10),
+            ("/tmp/semi;line\nname", 0x10),
+            ("[unknown]", 0x10),
+            ("[kernel.kallsyms]", u64::MAX - 1),
         ] {
             let resolver = CountingFrameResolver::new(vec![Vec::new()]);
             let mut cache = SymbolFrameCache::new(&resolver);
             let mapping = test_mapping_ref(path, address);
-
-            assert_eq!(
-                cache.resolve_folded_mapping_ref(&mapping).unwrap(),
-                expected
-            );
+            assert!(cache.resolve_mapping_ref(&mapping).unwrap().is_empty());
+            assert!(cache.mapping_ref_cached(&mapping, true));
+            assert_eq!(resolver.calls.get(), 1);
         }
     }
 

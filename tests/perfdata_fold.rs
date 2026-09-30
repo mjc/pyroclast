@@ -3555,7 +3555,10 @@ fn symbolized_fold_uses_module_fallback_for_unresolved_user_frames_like_inferno(
 }
 
 #[test]
-fn symbolized_fold_omits_process_name_frames_like_inferno_collapse_perf() {
+fn symbolized_fold_drops_process_name_only_stacks_without_inventing_module_fallback() {
+    // Inferno src/collapse/perf.rs:on_stack_line returns immediately when
+    // rawfunc starts with '('. after_event emits only nonempty stacks. A
+    // resolved-but-suppressed name is not an unresolved [unknown] symbol.
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
             PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
@@ -3572,7 +3575,7 @@ fn symbolized_fold_omits_process_name_frames_like_inferno_collapse_perf() {
     let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
         .expect("folded");
 
-    assert_eq!(folded, ":12;[app] 1\n");
+    assert_eq!(folded, "");
 }
 
 #[test]
