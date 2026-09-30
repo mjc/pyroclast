@@ -2199,7 +2199,6 @@ impl SymbolResolver for RustAddr2lineResolver {
                     .collect();
                 metadata.prepare_dwarf_frames_for_addresses(&addresses);
             }
-            let (mut loader, mut loader_attempted) = (None, false);
             for index in indexes {
                 let request = &requests[index];
                 let address = request.relative_address;
@@ -2245,18 +2244,9 @@ impl SymbolResolver for RustAddr2lineResolver {
                                 },
                             )
                     } else {
-                        (
-                            rust_addr2line_loader(path, &mut loader, &mut loader_attempted)
-                                .and_then(|loader| {
-                                    loader
-                                        .find_symbol(address)
-                                        .map(|name| vec![demangle_addr2line_name_qualified(name)])
-                                        .or_else(|| rust_addr2line_frame_names(loader, address))
-                                })
-                                .unwrap_or_default(),
-                            false,
-                            false,
-                        )
+                        // perf util/machine.c:append_inlines never calls
+                        // libdw/addr2line without an eligible base symbol.
+                        (Vec::new(), false, false)
                     };
                 frames = perf_frames_with_object_alias_and_offset(
                     frames,
@@ -2417,13 +2407,43 @@ enum PerfSymbolBinding {
     Weak,
 }
 
-fn perf_symbol_is_candidate(symbol: &object::Symbol<'_, '_>) -> bool {
-    !symbol.is_undefined()
-        && !symbol.name().unwrap_or_default().is_empty()
-        && matches!(
+fn perf_symbol_is_candidate(object: &object::File<'_>, symbol: &object::Symbol<'_, '_>) -> bool {
+    if symbol.is_undefined() || symbol.name().unwrap_or_default().is_empty() {
+        return false;
+    }
+    let object::SymbolFlags::Elf { st_info, st_other } = symbol.flags() else {
+        return matches!(
             symbol.kind(),
             SymbolKind::Text | SymbolKind::Data | SymbolKind::Label | SymbolKind::Unknown
-        )
+        );
+    };
+    // perf util/symbol-elf.c:elf_sym__is_label/elf_sym__filter and dso__load_sym:
+    // FUNC/IFUNC/OBJECT may be hidden, but NOTYPE labels may not. All require
+    // an allocated section; labels additionally need a text/data section name.
+    let symbol_type = st_info & 0xf;
+    match symbol_type {
+        object::elf::STT_FUNC | object::elf::STT_GNU_IFUNC | object::elf::STT_OBJECT => {}
+        object::elf::STT_NOTYPE
+            if !matches!(
+                st_other & 3,
+                object::elf::STV_HIDDEN | object::elf::STV_INTERNAL
+            ) => {}
+        _ => return false,
+    }
+    let Some(section) = symbol
+        .section_index()
+        .and_then(|index| object.section_by_index(index).ok())
+    else {
+        return false;
+    };
+    let object::SectionFlags::Elf { sh_flags } = section.flags() else {
+        return false;
+    };
+    sh_flags & u64::from(object::elf::SHF_ALLOC) != 0
+        && (symbol_type != object::elf::STT_NOTYPE
+            || section
+                .name()
+                .is_ok_and(|name| name.contains("text") || name.contains("data")))
 }
 
 fn perf_symbol_candidate_search_end(candidate: &PerfSymbolCandidate) -> u64 {
@@ -2525,7 +2545,8 @@ impl PerfObjectSymbolIndex {
                 continue;
             }
             symbol_seen = true;
-            if let Some(mut candidate) = perf_symbol_candidate_from_object_symbol(&symbol) {
+            if let Some(mut candidate) = perf_symbol_candidate_from_object_symbol(&object, &symbol)
+            {
                 candidate.bfd_has_filename = file_seen
                     && (symbol.scope() == object::SymbolScope::Compilation || !file_after_symbol);
                 symbols.push(candidate);
@@ -2534,7 +2555,7 @@ impl PerfObjectSymbolIndex {
         symbols.extend(
             object
                 .dynamic_symbols()
-                .filter_map(|symbol| perf_symbol_candidate_from_object_symbol(&symbol)),
+                .filter_map(|symbol| perf_symbol_candidate_from_object_symbol(&object, &symbol)),
         );
         symbols.extend(perf_synthesized_plt_symbols(&object, &symbols));
         symbols.sort_by_key(|symbol| symbol.address);
@@ -2846,10 +2867,11 @@ fn perf_best_symbol_at(
 }
 
 fn perf_symbol_candidate_from_object_symbol(
+    object: &object::File<'_>,
     symbol: &object::Symbol<'_, '_>,
 ) -> Option<PerfSymbolCandidate> {
     let kind = symbol.kind();
-    perf_symbol_is_candidate(symbol).then(|| PerfSymbolCandidate {
+    perf_symbol_is_candidate(object, symbol).then(|| PerfSymbolCandidate {
         name: perf_symbol_name(&addr2line::demangle_auto(
             Cow::Borrowed(symbol.name().unwrap_or_default()),
             None,
@@ -2870,18 +2892,6 @@ fn perf_symbol_candidate_from_object_symbol(
         bfd_function: matches!(kind, SymbolKind::Text),
         bfd_has_filename: false,
     })
-}
-
-fn rust_addr2line_loader<'a>(
-    path: &Path,
-    loader: &'a mut Option<addr2line::Loader>,
-    loader_attempted: &mut bool,
-) -> Option<&'a addr2line::Loader> {
-    if !*loader_attempted {
-        *loader = addr2line::Loader::new(path).ok();
-        *loader_attempted = true;
-    }
-    loader.as_ref()
 }
 
 fn rust_addr2line_frame_name(loader: &addr2line::Loader, address: u64) -> Option<String> {
@@ -4499,6 +4509,38 @@ mod tests {
     }
 
     fn elf_with_dynamic_text_symbol(name: &'static [u8], address: u64, size: usize) -> Vec<u8> {
+        elf_with_dynamic_symbol(
+            name,
+            address,
+            size,
+            (elf::STT_FUNC, elf::STV_DEFAULT, false),
+        )
+    }
+
+    fn elf_with_dynamic_symbol(
+        name: &'static [u8],
+        address: u64,
+        size: usize,
+        attributes: (u8, u8, bool),
+    ) -> Vec<u8> {
+        elf_with_dynamic_symbol_in_section(
+            name,
+            address,
+            size,
+            attributes,
+            b".text",
+            elf::SHF_ALLOC | elf::SHF_EXECINSTR,
+        )
+    }
+
+    fn elf_with_dynamic_symbol_in_section(
+        name: &'static [u8],
+        address: u64,
+        size: usize,
+        attributes: (u8, u8, bool),
+        section_name: &'static [u8],
+        section_flags: u32,
+    ) -> Vec<u8> {
         let mut builder = build::elf::Builder::new(object::Endianness::Little, true);
         builder.header.e_type = elf::ET_DYN;
         builder.header.e_machine = elf::EM_X86_64;
@@ -4510,9 +4552,9 @@ mod tests {
         section.data = build::elf::SectionData::SectionString;
 
         let section = builder.sections.add();
-        section.name = b".text"[..].into();
+        section.name = section_name.into();
         section.sh_type = elf::SHT_PROGBITS;
-        section.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_EXECINSTR);
+        section.sh_flags = u64::from(section_flags);
         section.sh_addr = address;
         section.sh_addralign = 16;
         section.data = build::elf::SectionData::Data(vec![0xcc; size].into());
@@ -4538,8 +4580,13 @@ mod tests {
         symbol.name = name.into();
         symbol.st_value = address;
         symbol.st_size = u64::try_from(size).expect("fixture size fits in u64");
-        symbol.set_st_info(elf::STB_GLOBAL, elf::STT_FUNC);
-        symbol.section = Some(text_id);
+        symbol.set_st_info(elf::STB_GLOBAL, attributes.0);
+        symbol.st_other = attributes.1;
+        if attributes.2 {
+            symbol.st_shndx = elf::SHN_ABS;
+        } else {
+            symbol.section = Some(text_id);
+        }
 
         builder.set_section_sizes();
 
@@ -4558,6 +4605,148 @@ mod tests {
         let mut bytes = Vec::new();
         builder.write(&mut bytes).expect("write dynamic-symbol ELF");
         bytes
+    }
+
+    #[test]
+    fn object_symbol_index_rejects_hidden_and_internal_labels_like_perf() {
+        // perf util/symbol-elf.c:elf_sym__is_label rejects STV_HIDDEN and
+        // STV_INTERNAL only for STT_NOTYPE, not STT_FUNC or STT_OBJECT.
+        for visibility in [elf::STV_HIDDEN, elf::STV_INTERNAL] {
+            let bytes =
+                elf_with_dynamic_symbol(b"label", 0x1000, 16, (elf::STT_NOTYPE, visibility, false));
+            assert!(
+                PerfObjectSymbolIndex::from_object_bytes(&bytes)
+                    .symbols
+                    .is_empty(),
+                "visibility {visibility}"
+            );
+        }
+    }
+
+    #[test]
+    fn object_symbol_index_rejects_absolute_symbols_like_perf() {
+        // perf util/symbol-elf.c:dso__load_sym skips SHN_ABS after its
+        // type/visibility filter, including functions and data symbols.
+        for symbol_type in [elf::STT_NOTYPE, elf::STT_FUNC, elf::STT_OBJECT] {
+            let bytes = elf_with_dynamic_symbol(
+                b"absolute",
+                0x1000,
+                16,
+                (symbol_type, elf::STV_DEFAULT, true),
+            );
+            assert!(
+                PerfObjectSymbolIndex::from_object_bytes(&bytes)
+                    .symbols
+                    .is_empty(),
+                "type {symbol_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn object_symbol_index_rejects_unrecognized_elf_types_like_perf() {
+        // elf_sym__filter accepts only FUNC, GNU_IFUNC, OBJECT; the label
+        // exception is specifically NOTYPE, not every object::Unknown kind.
+        let bytes = elf_with_dynamic_symbol(
+            b"other",
+            0x1000,
+            16,
+            (elf::STT_LOOS + 1, elf::STV_DEFAULT, false),
+        );
+        assert!(
+            PerfObjectSymbolIndex::from_object_bytes(&bytes)
+                .symbols
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn object_symbol_index_accepts_visible_labels_and_hidden_functions_like_perf() {
+        for attributes in [
+            (elf::STT_NOTYPE, elf::STV_DEFAULT, false),
+            (elf::STT_NOTYPE, elf::STV_PROTECTED, false),
+            (elf::STT_FUNC, elf::STV_HIDDEN, false),
+            (elf::STT_OBJECT, elf::STV_INTERNAL, false),
+            (elf::STT_GNU_IFUNC, elf::STV_DEFAULT, false),
+        ] {
+            let bytes = elf_with_dynamic_symbol(b"allowed", 0x1000, 16, attributes);
+            assert_eq!(
+                PerfObjectSymbolIndex::from_object_bytes(&bytes)
+                    .symbols
+                    .len(),
+                1,
+                "attributes {attributes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn object_symbol_index_rejects_nonallocated_sections_like_perf() {
+        // perf util/symbol-elf.c:dso__load_sym skips sections without SHF_ALLOC.
+        let bytes = elf_with_dynamic_symbol_in_section(
+            b"warning",
+            0x1000,
+            16,
+            (elf::STT_FUNC, elf::STV_DEFAULT, false),
+            b".gnu.warning",
+            0,
+        );
+        assert!(
+            PerfObjectSymbolIndex::from_object_bytes(&bytes)
+                .symbols
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn object_symbol_index_only_accepts_notype_labels_in_text_or_data_sections_like_perf() {
+        // perf util/symbol-elf.c:elf_sec__filter matches section names containing
+        // "text" or "data"; this extra restriction applies only to labels.
+        for (section, symbol_type, accepted) in [
+            (&b".bss"[..], elf::STT_NOTYPE, false),
+            (&b".bss"[..], elf::STT_OBJECT, true),
+            (&b".rodata"[..], elf::STT_NOTYPE, true),
+            (&b".text.hot"[..], elf::STT_NOTYPE, true),
+        ] {
+            let bytes = elf_with_dynamic_symbol_in_section(
+                b"label",
+                0x1000,
+                16,
+                (symbol_type, elf::STV_DEFAULT, false),
+                section,
+                elf::SHF_ALLOC,
+            );
+            assert_eq!(
+                !PerfObjectSymbolIndex::from_object_bytes(&bytes)
+                    .symbols
+                    .is_empty(),
+                accepted,
+                "section {section:?}, type {symbol_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_inline_resolver_does_not_resurrect_a_hidden_label_like_perf() {
+        // perf util/machine.c:append_inlines returns immediately when
+        // ms->sym is NULL. addr2line's broader symbol map is not a fallback
+        // for symbols excluded by perf's ELF loading rules.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hidden-label.so");
+        let bytes = elf_with_dynamic_symbol(
+            b"hidden_label",
+            0x1000,
+            16,
+            (elf::STT_NOTYPE, elf::STV_HIDDEN, false),
+        );
+        std::fs::write(&path, &bytes).unwrap();
+        let loader = addr2line::Loader::new(&path).unwrap();
+        assert_eq!(loader.find_symbol(0x1000), Some("hidden_label"));
+        let resolver = RustAddr2lineResolver::new();
+        let results = resolver
+            .resolve_frame_batch_with_metadata(&[test_request(path.to_str().unwrap(), 0x1000)])
+            .unwrap();
+        assert_eq!(results[0], ResolvedSymbolFrames::default());
     }
 
     #[test]
