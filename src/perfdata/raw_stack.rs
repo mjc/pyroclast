@@ -1,10 +1,11 @@
 use std::hash::{BuildHasher, Hash, Hasher};
+use std::num::NonZeroU64;
 
 use hashbrown::{HashMap, HashTable};
 use rustc_hash::FxBuildHasher;
 
 type CommId = u64;
-type NodeId = u64;
+type NodeId = NonZeroU64;
 const RAW_STACK_GROWTH_MIN_CHUNK: usize = 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -178,7 +179,7 @@ where
                 pid: key.pid,
                 comm: key
                     .comm
-                    .and_then(|comm| comms.get(node_index(comm)).cloned()),
+                    .and_then(|comm| comms.get(comm_index(comm)).cloned()),
                 callchain: rebuild_callchain(&nodes, key.tail),
                 count,
             })
@@ -200,7 +201,7 @@ where
                 pid: key.pid,
                 comm: key
                     .comm
-                    .and_then(|comm| self.comms.get(node_index(comm)).map(String::as_str)),
+                    .and_then(|comm| self.comms.get(comm_index(comm)).map(String::as_str)),
                 tail: key.tail,
                 count,
                 nodes: &self.nodes,
@@ -358,12 +359,20 @@ fn next_comm_id(len: usize) -> CommId {
     CommId::try_from(len).expect("raw stack comm ids exceeded u64::MAX")
 }
 
+fn comm_index(comm: CommId) -> usize {
+    usize::try_from(comm).expect("raw stack comm id does not fit in usize")
+}
+
 fn next_node_id(len: usize) -> NodeId {
-    NodeId::try_from(len).expect("raw stack node ids exceeded u64::MAX")
+    let ordinal = u64::try_from(len)
+        .ok()
+        .and_then(|index| index.checked_add(1))
+        .expect("raw stack node ids exceeded u64::MAX");
+    NodeId::new(ordinal).expect("raw stack node id must be nonzero")
 }
 
 fn node_index(node: NodeId) -> usize {
-    usize::try_from(node).expect("raw stack node id does not fit in usize")
+    usize::try_from(node.get() - 1).expect("raw stack node id does not fit in usize")
 }
 
 fn growth_chunk(len: usize, additional: usize) -> usize {
@@ -440,7 +449,13 @@ impl<'a, T> Iterator for RawStackFrameIter<'a, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::RawStackAccumulator;
+    use super::{NodeId, RawStackAccumulator, StackNode};
+
+    #[test]
+    fn node_parent_id_uses_single_word_and_compact_node_layout() {
+        assert_eq!(std::mem::size_of::<Option<NodeId>>(), 8);
+        assert_eq!(std::mem::size_of::<StackNode<u64>>(), 16);
+    }
 
     #[test]
     fn accumulates_identical_raw_stacks() {
