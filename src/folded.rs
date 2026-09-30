@@ -61,29 +61,28 @@ pub(crate) fn append_inferno_perf_raw_function(
     mut frame: &str,
     scratch: &mut String,
 ) {
-    if let Some(offset) = frame.rfind("+0x") {
+    if let Some(offset) = memchr::memrchr(b'+', frame.as_bytes())
+        && frame[offset..].starts_with("+0x")
+    {
         let suffix = &frame[offset + 3..];
-        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_hexdigit()) {
+        if suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             frame = &frame[..offset];
         }
     }
     if frame.starts_with('(') {
         return;
     }
-    if !frame.contains('$')
+    // Inferno perf.rs:on_stack_line fixes Rust hashes before any tidy fast path.
+    let fixed_frame = fix_partially_demangled_rust_symbol(frame);
+    let frame = fixed_frame.as_ref();
+    if memchr::memchr3(b'$', b'(', b';', frame.as_bytes()).is_none()
+        && memchr::memchr2(b'\n', b'\r', frame.as_bytes()).is_none()
         && !frame.contains("->")
-        && !frame.contains('(')
-        && !frame.contains(';')
-        && !frame.contains('\n')
-        && !frame.contains('\r')
     {
         append_separator(rendered);
         rendered.push_str(frame);
         return;
     }
-    let fixed_frame = fix_partially_demangled_rust_symbol(frame);
-    let frame = fixed_frame.as_ref();
-
     for (index, part) in frame.split("->").enumerate() {
         append_separator(rendered);
         tidy_inferno_perf_generic_into(scratch, part);
@@ -97,15 +96,15 @@ pub(crate) fn append_inferno_perf_raw_function(
 fn fix_partially_demangled_rust_symbol(symbol: &str) -> Cow<'_, str> {
     const RUST_HASH_LENGTH: usize = 17;
 
-    let is_rust_hash =
-        |value: &str| value.starts_with('h') && value[1..].chars().all(|c| c.is_ascii_hexdigit());
-
-    if symbol.len() < RUST_HASH_LENGTH || !is_rust_hash(&symbol[symbol.len() - RUST_HASH_LENGTH..])
-    {
+    let Some(hash_start) = symbol.len().checked_sub(RUST_HASH_LENGTH) else {
+        return Cow::Borrowed(symbol);
+    };
+    let hash = &symbol.as_bytes()[hash_start..];
+    if hash[0] != b'h' || !hash[1..].iter().all(u8::is_ascii_hexdigit) {
         return Cow::Borrowed(symbol);
     }
 
-    let mut rest = &symbol[..symbol.len() - RUST_HASH_LENGTH];
+    let mut rest = &symbol[..hash_start];
     if rest.ends_with("::") {
         rest = &rest[..rest.len() - 2];
     }
@@ -184,15 +183,15 @@ fn render_folded_stack_into<'a>(rendered: &mut String, frames: impl IntoIterator
     }
 }
 
-fn tidy_inferno_perf_generic_into(scratch: &mut String, frame: &str) {
+pub(crate) fn tidy_inferno_perf_generic_into(scratch: &mut String, frame: &str) {
     let mut bracket_depth = 0_i32;
     let mut last_dot_index = None;
     let mut length_without_parameters = frame.len();
-    for (index, character) in frame.char_indices() {
-        match character {
-            '<' | '{' | '[' => bracket_depth += 1,
-            '>' | '}' | ']' | ')' => bracket_depth -= 1,
-            '(' => {
+    for (index, byte) in frame.bytes().enumerate() {
+        match byte {
+            b'<' | b'{' | b'[' => bracket_depth += 1,
+            b'>' | b'}' | b']' | b')' => bracket_depth -= 1,
+            b'(' => {
                 if bracket_depth == 0 {
                     let is_go_function = last_dot_index == Some(index);
                     let is_anonymous_namespace =
@@ -204,41 +203,43 @@ fn tidy_inferno_perf_generic_into(scratch: &mut String, frame: &str) {
                 }
                 bracket_depth += 1;
             }
-            '.' => last_dot_index = Some(index + 1),
+            b'.' => last_dot_index = Some(index + 1),
             _ => {}
         }
     }
     scratch.clear();
     scratch.reserve(length_without_parameters);
-    for character in frame[..length_without_parameters].chars() {
-        if character == ';' {
-            scratch.push(':');
-        } else {
-            scratch.push(character);
-        }
+    let frame = &frame[..length_without_parameters];
+    let mut start = 0;
+    for index in memchr::memchr_iter(b';', frame.as_bytes()) {
+        scratch.push_str(&frame[start..index]);
+        scratch.push(':');
+        start = index + 1;
     }
+    scratch.push_str(&frame[start..]);
 }
 
-fn escape_frame_into(escaped: &mut String, frame: &str) {
-    if frame
-        .bytes()
-        .all(|byte| !matches!(byte, b';' | b'\r' | b'\n'))
-    {
-        escaped.push_str(frame);
-        return;
-    }
+pub(crate) fn escape_frame_into(escaped: &mut String, frame: &str) {
+    append_escaped_spans(escaped, frame, "\\;");
+}
 
+pub(crate) fn append_escaped_spans(escaped: &mut String, frame: &str, semicolon: &str) {
     escaped.reserve(frame.len());
-    for character in frame.chars() {
-        match character {
-            ';' => escaped.push_str("\\;"),
-            '\r' | '\n' => escaped.push(' '),
-            _ => escaped.push(character),
+    let mut start = 0;
+    // ASCII delimiter matches are UTF-8 boundaries; copy unchanged spans whole.
+    for index in memchr::memchr3_iter(b';', b'\r', b'\n', frame.as_bytes()) {
+        escaped.push_str(&frame[start..index]);
+        if frame.as_bytes()[index] == b';' {
+            escaped.push_str(semicolon);
+        } else {
+            escaped.push(' ');
         }
+        start = index + 1;
     }
+    escaped.push_str(&frame[start..]);
 }
 
-fn append_separator(rendered: &mut String) {
+pub(crate) fn append_separator(rendered: &mut String) {
     if !rendered.is_empty() {
         rendered.push(';');
     }
