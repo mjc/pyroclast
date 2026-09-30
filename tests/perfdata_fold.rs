@@ -22,6 +22,10 @@ use pyroclast::symbols::{
     perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources,
 };
 use std::cell::RefCell;
+#[cfg(target_os = "linux")]
+use std::io::Write as _;
+#[cfg(target_os = "linux")]
+use std::process::{Command, Stdio};
 
 fn render_unknown_folded_callchain(frames: &[u64], count: u64) -> String {
     if frames.is_empty() {
@@ -150,11 +154,9 @@ fn summarizes_dwarf_user_stack_payloads() {
 }
 
 #[test]
-fn keeps_unmapped_dwarf_user_stack_payloads_like_perf_libdw_ebl() {
-    // perf machine.c attempts thread__resolve_callchain_unwind() whenever the
-    // sample has user regs and a non-empty user stack. libdw
-    // __report_module() succeeds with no DSO, and elfutils frame_unwind.c can
-    // still fall back to x86_64_unwind() using frame pointers.
+fn skips_dwarf_unwind_when_sampled_ip_has_no_mapping_like_perf_libdw() {
+    // perf's libdw path produces no accepted frame callbacks without a module
+    // for the initial sampled IP, even when regs and stack bytes are present.
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -184,20 +186,13 @@ fn keeps_unmapped_dwarf_user_stack_payloads_like_perf_libdw_ebl() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
+    assert_eq!(folded, "");
 }
 
 #[test]
-fn folds_aarch64_dwarf_user_stack_with_single_lr_frame_pointer_fallback_like_perf_libdw_ebl() {
-    // perf record --call-graph dwarf on arm64 captures x0-x30, sp, pc. The
-    // recording machine's HEADER_ARCH ("aarch64") tells the fold path to decode
-    // PerfAarch64Regs (fp=29, lr=30, sp=31, pc=32) and use elfutils'
-    // backends/aarch64_unwind.c frame-pointer fallback when no DSO/CFI covers the
-    // sampled pc: the caller pc comes from lr (taking the perf pc-1 adjustment),
-    // the next lr/fp are loaded from fp+8/fp+0, and the walk ends on the zeroed
-    // next lr. perf's tools/perf/util/machine.c unwind_entry() appends one cursor
-    // entry for each Dwfl_Frame callback, so this fixture has exactly one user
-    // unwind frame after the event-line leaf.
+fn skips_aarch64_dwarf_unwind_when_sampled_ip_has_no_mapping_like_perf_libdw() {
+    // With no mapping for the initial sampled IP, perf never reaches an
+    // accepted libdw frame callback; register contents cannot create frames.
     let mask = (1_u64 << 29) | (1_u64 << 30) | (1_u64 << 31) | (1_u64 << 32);
     let bytes = perfdata_with_records_attrs_and_arch_feature(
         [file_attr_bytes_with_regs(
@@ -229,7 +224,7 @@ fn folds_aarch64_dwarf_user_stack_with_single_lr_frame_pointer_fallback_like_per
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown] 1\n");
+    assert_eq!(folded, "");
 }
 
 #[test]
@@ -470,10 +465,9 @@ fn keeps_dwarf_user_stack_when_newer_mapping_overlaps_before_first_report_like_p
 }
 
 #[test]
-fn keeps_dwarf_user_stack_when_build_id_mapping_overlaps_before_first_report_like_perf_script() {
-    // Same lazy report_module() rule as plain MMAP: a build-id-backed mapping
-    // can only overlap a prior DWFL module after an earlier unwind report
-    // populated that module.
+fn skips_unwind_when_build_id_mapping_cannot_report_initial_module_like_perf_script() {
+    // The recorded build-id mappings do not let perf report this initial
+    // module, so libdw aborts before emitting an unwind entry.
     let current_exe = std::env::current_exe().expect("current exe");
     let current_exe = current_exe.to_string_lossy();
     let bytes = perfdata_with_records_and_attrs(
@@ -515,7 +509,7 @@ fn keeps_dwarf_user_stack_when_build_id_mapping_overlaps_before_first_report_lik
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
+    assert_eq!(folded, "");
 }
 
 #[test]
@@ -575,7 +569,7 @@ fn keeps_dwarf_user_stack_when_header_build_id_mmap2_overlaps_before_first_repor
 }
 
 #[test]
-fn folds_dwarf_user_stack_payloads_before_kernel_callchain_frames() {
+fn folds_recorded_callchain_only_without_initial_module_like_perf_script() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -605,11 +599,11 @@ fn folds_dwarf_user_stack_payloads_before_kernel_callchain_frames() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown];[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
 }
 
 #[test]
-fn keeps_unmapped_kernel_looking_user_unwind_frame_like_perf_libdw_entry() {
+fn skips_unmapped_user_unwind_frames_and_keeps_recorded_callchain_like_perf_script() {
     // perf's libdw entry path reports unwind frames with
     // thread__find_symbol(..., PERF_RECORD_MISC_USER, ip). If that lookup finds
     // no DSO, __report_module() returns success and unwind_entry() later keeps
@@ -643,11 +637,11 @@ fn keeps_unmapped_kernel_looking_user_unwind_frame_like_perf_libdw_entry() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;0xffffffff80ffffff;[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown] 1\n");
 }
 
 #[test]
-fn keeps_dwarf_user_stack_payloads_when_kernel_callchain_has_user_context_marker() {
+fn uses_recorded_kernel_callchain_only_without_initial_module_with_user_marker() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -681,11 +675,11 @@ fn keeps_dwarf_user_stack_payloads_when_kernel_callchain_has_user_context_marker
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown];[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
 }
 
 #[test]
-fn keeps_dwarf_user_stack_payloads_when_kernel_callchain_has_no_user_context_marker() {
+fn uses_recorded_callchain_only_without_initial_module_for_user_sample() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -720,12 +714,11 @@ fn keeps_dwarf_user_stack_payloads_when_kernel_callchain_has_no_user_context_mar
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown];[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
 }
 
 #[test]
-fn keeps_dwarf_user_stack_payloads_for_kernel_samples_without_user_context_marker_like_perf_script()
-{
+fn uses_recorded_kernel_callchain_only_without_initial_module_like_perf_script() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -760,7 +753,7 @@ fn keeps_dwarf_user_stack_payloads_for_kernel_samples_without_user_context_marke
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown];[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -874,11 +867,9 @@ fn keeps_recorded_user_frame_without_dwarf_callers_for_mixed_callchain_like_perf
 }
 
 #[test]
-fn keeps_dwarf_user_stack_for_kernel_sample_with_empty_kernel_callchain_like_perf_libdw_ebl() {
-    // For ORDER_CALLEE, perf resolves the recorded callchain first and then
-    // calls thread__resolve_callchain_unwind(); a present-but-empty kernel
-    // callchain payload does not suppress the captured user-regs/user-stack
-    // unwind path.
+fn skips_kernel_sample_unwind_without_initial_module_like_perf_libdw() {
+    // A present-but-empty kernel callchain still cannot produce user unwind
+    // entries when the user sampled IP has no reportable module.
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -909,7 +900,7 @@ fn keeps_dwarf_user_stack_for_kernel_sample_with_empty_kernel_callchain_like_per
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
+    assert_eq!(folded, "");
 }
 
 #[test]
@@ -952,7 +943,7 @@ fn skips_dwarf_unwind_when_perf_user_stack_dynamic_size_is_zero_like_perf_script
 }
 
 #[test]
-fn limits_dwarf_unwind_to_perf_user_stack_dynamic_size_like_perf_script() {
+fn skips_unwind_with_short_stack_when_sampled_ip_is_unmapped() {
     let mut sample = sample_payload(
         0x4000,
         11,
@@ -992,7 +983,7 @@ fn limits_dwarf_unwind_to_perf_user_stack_dynamic_size_like_perf_script() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -1040,6 +1031,65 @@ fn keeps_current_ip_only_object_unwind_for_mapped_dwarf_user_stack_like_perf_lib
     let expected = format!(":12;[{}] 1\n", fixture.file_name());
 
     assert_eq!(folded, expected);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn keeps_unwind_frame_for_valid_elf_named_perf_data_like_perf_libdw_and_inferno() {
+    let fixture = SyntheticX86_64Object::create();
+    let object_path = fixture.dir.path().join("perf.data");
+    std::fs::copy(&fixture.path, &object_path).expect("copy fixture ELF as perf.data");
+    let object_path = object_path.to_str().expect("utf8 object path");
+    let mut bytes = x86_leaf_only_perfdata(
+        object_path,
+        [0x7ffe_ff00, 0x7fff_0000, 0x4000],
+        [
+            0, 0, 0, 0, 0, 0, 0, 0, //
+            0x40, 0, 0, 0, 0, 0, 0, 0, //
+            0x34, 0x12, 0, 0, 0, 0, 0, 0,
+        ],
+    );
+    put_u64(&mut bytes, 16, 144);
+    let perfdata = fixture.dir.path().join("recording.perf.data");
+    std::fs::write(&perfdata, bytes).expect("write recording");
+
+    let perf = Command::new("perf")
+        .args([
+            "script",
+            "--force",
+            "-i",
+            perfdata.to_str().expect("utf8 perfdata path"),
+        ])
+        .output()
+        .expect("run perf script");
+    assert!(
+        perf.status.success(),
+        "perf script failed: {}",
+        String::from_utf8_lossy(&perf.stderr)
+    );
+
+    let mut inferno = Command::new("inferno-collapse-perf")
+        .arg("-q")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("run Inferno");
+    inferno
+        .stdin
+        .take()
+        .expect("Inferno stdin")
+        .write_all(&perf.stdout)
+        .expect("send perf script output to Inferno");
+    let inferno = inferno.wait_with_output().expect("wait for Inferno");
+    assert!(inferno.status.success());
+
+    let folded = fold_perfdata_callchains(&std::fs::read(&perfdata).expect("read recording"))
+        .expect("fold recording");
+    assert_eq!(
+        folded,
+        String::from_utf8(inferno.stdout).expect("Inferno UTF-8 output")
+    );
+    assert_eq!(folded, ":12;[perf.data] 1\n");
 }
 
 #[test]
@@ -1199,6 +1249,10 @@ fn keeps_current_ip_only_object_unwind_from_pid_specific_modules_like_perf_libdw
 /// sample. `regs` are `[bp, sp, ip]` in perf's ascending register order
 /// (RBP=6, RSP=7, IP=8).
 fn x86_leaf_only_perfdata(fixture_path: &str, regs: [u64; 3], stack: [u8; 24]) -> Vec<u8> {
+    let mut mmap = mmap_payload(11, 11, 0, 0x1000_0000, 0, fixture_path);
+    while !(8 + mmap.len()).is_multiple_of(8) {
+        mmap.push(0);
+    }
     perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -1209,7 +1263,7 @@ fn x86_leaf_only_perfdata(fixture_path: &str, regs: [u64; 3], stack: [u8; 24]) -
             (1 << 6) | (1 << 7) | (1 << 8),
         )],
         [
-            record_bytes(1, &mmap_payload(11, 11, 0, 0x1000_0000, 0, fixture_path)),
+            record_bytes(1, &mmap),
             record_bytes(
                 9,
                 &sample_payload_with_user_stack(regs[2], 11, 12, [], 1, regs, stack),
@@ -1626,7 +1680,7 @@ fn drops_dwarf_user_stack_when_late_synthetic_mapping_cannot_be_loaded_like_perf
 }
 
 #[test]
-fn drops_dwarf_user_stack_frames_from_known_non_executable_mappings() {
+fn skips_object_unwind_when_sampled_ip_has_no_mapping_before_mmap2_frame() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -1662,11 +1716,11 @@ fn drops_dwarf_user_stack_frames_from_known_non_executable_mappings() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown] 1\n");
 }
 
 #[test]
-fn keeps_dwarf_user_stack_frames_from_mapped_non_executable_libraries_like_perf_script() {
+fn skips_unwind_when_sampled_ip_is_outside_mapped_library_like_perf_script() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -1702,11 +1756,11 @@ fn keeps_dwarf_user_stack_frames_from_mapped_non_executable_libraries_like_perf_
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[libc.so.6];[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown] 1\n");
 }
 
 #[test]
-fn drops_dwarf_user_stack_frames_from_stack_mappings_like_perf_script() {
+fn skips_unwind_when_sampled_ip_is_outside_stack_mapping_like_perf_script() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -1739,11 +1793,11 @@ fn drops_dwarf_user_stack_frames_from_stack_mappings_like_perf_script() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown] 1\n");
 }
 
 #[test]
-fn drops_dwarf_user_stack_frames_from_perf_data_file_mappings_without_prot() {
+fn skips_object_unwind_when_sampled_ip_has_no_mapping_before_mmap_frame() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -1776,12 +1830,17 @@ fn drops_dwarf_user_stack_frames_from_perf_data_file_mappings_without_prot() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown] 1\n");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
-fn drops_perf_data_file_frames_when_mapping_arrives_after_sample() {
-    let bytes = perfdata_with_records_and_attrs(
+fn mapping_arriving_after_sample_is_not_applied_retroactively_like_perf_script() {
+    let mut mmap = mmap_payload(11, 11, 0x1200, 0x100, 0, "/tmp/perf.data");
+    while !(8 + mmap.len()).is_multiple_of(8) {
+        mmap.push(0);
+    }
+    let mut bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
                 | PERF_SAMPLE_TID
@@ -1807,13 +1866,51 @@ fn drops_perf_data_file_frames_when_mapping_arrives_after_sample() {
                     ],
                 ),
             ),
-            record_bytes(1, &mmap_payload(11, 11, 0x1200, 0x100, 0, "/tmp/perf.data")),
+            record_bytes(1, &mmap),
         ],
     );
+    put_u64(&mut bytes, 16, 144);
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("recording.perf.data");
+    std::fs::write(&perfdata, &bytes).expect("write recording");
+    let perf = Command::new("perf")
+        .args([
+            "script",
+            "--force",
+            "-i",
+            perfdata.to_str().expect("utf8 perfdata path"),
+        ])
+        .output()
+        .expect("run perf script");
+    assert!(
+        perf.status.success(),
+        "perf script failed: {}",
+        String::from_utf8_lossy(&perf.stderr)
+    );
+
+    let mut inferno = Command::new("inferno-collapse-perf")
+        .arg("-q")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("run Inferno");
+    inferno
+        .stdin
+        .take()
+        .expect("Inferno stdin")
+        .write_all(&perf.stdout)
+        .expect("send perf script output to Inferno");
+    let inferno = inferno.wait_with_output().expect("wait for Inferno");
+    assert!(inferno.status.success());
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
-
-    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
+    assert_eq!(
+        folded,
+        String::from_utf8(inferno.stdout).expect("Inferno UTF-8 output"),
+        "perf script:\n{}",
+        String::from_utf8_lossy(&perf.stdout)
+    );
 }
 
 #[test]
@@ -4461,7 +4558,7 @@ impl SymbolResolver for SampleIpInlineSymbolResolver {
 struct ArrowInlineSymbolResolver;
 
 struct SyntheticX86_64Object {
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     path: std::path::PathBuf,
 }
 
@@ -4534,7 +4631,7 @@ impl SyntheticX86_64Object {
         let dir = tempfile::tempdir().expect("fixture dir");
         let path = dir.path().join("fixture-x86-64");
         std::fs::write(&path, &bytes).expect("write fixture elf");
-        Self { _dir: dir, path }
+        Self { dir, path }
     }
 
     fn path_string(&self) -> String {

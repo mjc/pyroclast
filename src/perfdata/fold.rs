@@ -278,6 +278,7 @@ enum FoldFrame {
     SampleIp { address: u64, cpumode: u16 },
     UserUnwind(u64),
     InlineCurrentIp(u64),
+    UnmappedAtSample(u64),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -339,7 +340,8 @@ impl FoldFrame {
             | Self::UserCallchain(address)
             | Self::SampleIp { address, .. }
             | Self::UserUnwind(address)
-            | Self::InlineCurrentIp(address) => address,
+            | Self::InlineCurrentIp(address)
+            | Self::UnmappedAtSample(address) => address,
         }
     }
 }
@@ -2038,10 +2040,17 @@ fn add_fold_stack(
     mapping_cache: &mut MappingResolveCache,
     raw_stacks: &mut RawStackAccumulator<FoldFrame>,
 ) {
-    let mut filtered_frames = frames.iter().rev().copied().filter(|frame| {
-        let address = frame.address();
-        !is_perf_context_marker(address)
-            && !should_drop_perf_data_user_unwind_frame(pid, *frame, mmap_table, mapping_cache)
+    let mut filtered_frames = frames.iter().rev().copied().filter_map(|frame| {
+        if is_perf_context_marker(frame.address()) {
+            return None;
+        }
+        Some(
+            if resolve_frame_mapping_ref(mmap_table, pid, frame, mapping_cache).is_none() {
+                FoldFrame::UnmappedAtSample(frame.address())
+            } else {
+                frame
+            },
+        )
     });
     let Some(first_frame) = filtered_frames.next() else {
         return;
@@ -2438,6 +2447,7 @@ fn resolve_frame_mapping_ref<'a>(
         | FoldFrame::InlineCurrentIp(_) => {
             mmap_table.resolve_user_pid_ref_cached(pid, address, mapping_cache)
         }
+        FoldFrame::UnmappedAtSample(_) => None,
     }
 }
 
@@ -2530,14 +2540,6 @@ impl<'a> FoldFrameResolver<'a> {
             {
                 continue;
             }
-            if should_drop_perf_data_user_unwind_frame(
-                pid,
-                frame,
-                self.mmap_table,
-                &mut buffers.mapping_cache,
-            ) {
-                continue;
-            }
             if let FoldFrame::InlineCurrentIp(address) = frame {
                 if self.inline {
                     self.append_inline_current_ip_with_inline_folded_frame(
@@ -2583,14 +2585,6 @@ impl<'a> FoldFrameResolver<'a> {
             if symbol_cache.is_none()
                 && !is_valid_unwound_user_frame(pid, frame, self.mmap_table, &mut mapping_cache)
             {
-                continue;
-            }
-            if should_drop_perf_data_user_unwind_frame(
-                pid,
-                frame,
-                self.mmap_table,
-                &mut mapping_cache,
-            ) {
                 continue;
             }
             if let FoldFrame::InlineCurrentIp(address) = frame {
@@ -3332,32 +3326,6 @@ fn looks_like_mapped_frame_label(label: &str) -> bool {
     })
 }
 
-fn should_drop_perf_data_user_unwind_frame(
-    pid: Option<u32>,
-    frame: FoldFrame,
-    mmap_table: &MmapTable,
-    mapping_cache: &mut MappingResolveCache,
-) -> bool {
-    let (FoldFrame::UserUnwind(address) | FoldFrame::InlineCurrentIp(address)) = frame else {
-        return false;
-    };
-    pid.is_some_and(|pid| {
-        mmap_table
-            .resolve_user_pid_ref_cached(pid, address, mapping_cache)
-            .is_some_and(|mapping| should_drop_user_unwind_mapping_path(mapping.path))
-    })
-}
-
-fn should_drop_user_unwind_mapping_path(path: &str) -> bool {
-    is_perf_data_mapping_path(path) || matches!(path, "//anon" | "[anon]" | "[stack]" | "[heap]")
-}
-
-fn is_perf_data_mapping_path(path: &str) -> bool {
-    path.rsplit('/')
-        .next()
-        .is_some_and(|file_name| file_name == "perf.data" || file_name.starts_with("perf.data."))
-}
-
 fn symbol_fallback_frame_ref(mapping: &ResolvedMappingRef<'_>) -> String {
     if is_kernel_mapping_ref(mapping) {
         kernel_module_fallback_frame(mapping.path)
@@ -3805,7 +3773,16 @@ fn unwind_object_frame_addresses_like_perf(
         }
         object_unwind = next_unwind;
     }
-    let raw_frames = object_unwind.accepted_frames;
+    let mut raw_frames = object_unwind.accepted_frames;
+    // perf's frame_callback reports each module, then entry() calls
+    // __report_module() again and aborts at the first hard failure.
+    let first_unreportable = raw_frames.iter().position(|address| {
+        report_unwind_module_for_ip_like_perf(state, mmap_table, pid, *address, unwind_debug_dir)
+            == ReportModuleResult::Failed
+    });
+    if let Some(index) = first_unreportable {
+        raw_frames.truncate(index);
+    }
     let initial_ip_has_reported_module = initial_ip_mapping_has_reported_unwind_module(
         Some(pid),
         regs.ip(),
@@ -3902,6 +3879,11 @@ fn classify_object_unwind(context: UserUnwindContext, leaf_only: bool) -> Object
     // Research §3.5: a recorded kernel->user callchain is not extended with
     // extra user DWARF callers — perf emits zero unwound frames here.
     if context.callchain == SampleCallchainState::KernelWithUserFrame {
+        return ObjectUnwindClass::SkipUnwind;
+    }
+    // Without a mapping for the sampled IP, perf's libdw path has no initial
+    // module to seed DWFL and emits no object-unwind entries.
+    if context.initial_ip_mapping == InitialIpMappingState::NoRecordedMapping {
         return ObjectUnwindClass::SkipUnwind;
     }
     if leaf_only {
@@ -5692,7 +5674,7 @@ mod tests {
     }
 
     #[test]
-    fn fold_accumulator_clears_mapping_cache_after_mapping_update() {
+    fn fold_accumulator_keeps_user_unwind_frame_for_perf_data_named_mapping() {
         let mut accumulator = super::FoldAccumulator::new(std::collections::BTreeMap::new());
         let sample_layouts = super::SampleLayouts::default();
         let options = super::FoldOptions::default();
@@ -5721,7 +5703,7 @@ mod tests {
             &mut accumulator.mapping_cache,
             &mut accumulator.raw_stacks,
         );
-        assert!(accumulator.raw_stacks.entries().is_empty());
+        assert_eq!(accumulator.raw_stacks.entries().len(), 1);
 
         accumulator
             .apply_record(
@@ -5750,6 +5732,7 @@ mod tests {
 
         let entries = accumulator.raw_stacks.sorted_entries();
         assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].count(), 2);
         let mut scratch = Vec::new();
         assert_eq!(
             entries[0].callchain(&mut scratch),
@@ -5758,7 +5741,7 @@ mod tests {
     }
 
     #[test]
-    fn user_unwind_drop_filter_ignores_global_mappings_like_perf_libdw_user_lookup() {
+    fn user_unwind_frame_does_not_resolve_through_global_mapping_like_perf_libdw() {
         // tools/perf/util/unwind-libdw.c __report_module() and access_dso_mem()
         // use PERF_RECORD_MISC_USER, so an unwound user frame must not inherit
         // global/kernel mapping fallback behavior from recorded callchain frames.
@@ -5769,7 +5752,7 @@ mod tests {
             start: 0x1000,
             len: 0x100,
             pgoff: 0,
-            path: "/tmp/perf.data".to_string(),
+            path: "/bin/demo".to_string(),
         });
 
         let mut mapping_cache = super::MappingResolveCache::default();
@@ -5789,7 +5772,7 @@ mod tests {
         let mut scratch = Vec::new();
         assert_eq!(
             entries[0].callchain(&mut scratch),
-            [super::FoldFrame::UserUnwind(0x1010)]
+            [super::FoldFrame::UnmappedAtSample(0x1010)]
         );
     }
 
