@@ -221,12 +221,12 @@ struct DeferredFoldSample {
     has_callchain: bool,
 }
 
-struct PreparedFoldSample {
+struct PreparedFoldSample<'layout> {
     pid: Option<u32>,
     tid: Option<u32>,
     time: Option<u64>,
     cpu: Option<u32>,
-    event_name: Arc<str>,
+    event_name: &'layout str,
     count: u64,
     frames: FoldFrameStack,
     deferred_cookie: Option<u64>,
@@ -328,6 +328,48 @@ struct SampleLayouts {
 struct SampleEventLayout {
     layout: SampleLayout,
     event_name: Arc<str>,
+    offsets: SampleOffsets,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SampleOffsets {
+    id: Option<usize>,
+    time: Option<usize>,
+}
+
+impl SampleOffsets {
+    fn new(sample_type: u64) -> Self {
+        // tools/perf/util/evsel.c:__perf_evsel__calc_id_pos() and
+        // evsel__parse_sample_timestamp() compute these fixed u64 positions.
+        let id = if sample_type & PERF_SAMPLE_IDENTIFIER != 0 {
+            Some(0)
+        } else if sample_type & PERF_SAMPLE_ID != 0 {
+            Some(
+                (sample_type
+                    & (PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_ADDR))
+                    .count_ones() as usize
+                    * 8,
+            )
+        } else {
+            None
+        };
+        let time = (sample_type & PERF_SAMPLE_TIME != 0).then(|| {
+            (sample_type & (PERF_SAMPLE_IDENTIFIER | PERF_SAMPLE_IP | PERF_SAMPLE_TID)).count_ones()
+                as usize
+                * 8
+        });
+        Self { id, time }
+    }
+}
+
+impl SampleEventLayout {
+    fn new(layout: SampleLayout, event_name: impl Into<Arc<str>>) -> Self {
+        Self {
+            layout,
+            event_name: event_name.into(),
+            offsets: SampleOffsets::new(layout.sample_type),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1046,7 +1088,7 @@ impl<O: SampleOutput> SampleSink<O> {
                 tid: sample.tid,
                 time: sample.time,
                 cpu: sample.cpu,
-                event_name: sample.event_name,
+                event_name: Arc::from(sample.event_name),
                 count: sample.count,
                 frames: sample.frames,
                 has_callchain: sample.has_callchain,
@@ -1073,7 +1115,7 @@ impl<O: SampleOutput> SampleSink<O> {
                 tid: sample.tid,
                 time: sample.time,
                 cpu: sample.cpu,
-                event_name: sample.event_name,
+                event_name: &sample.event_name,
                 count: sample.count,
                 frames: sample.frames,
                 deferred_cookie: None,
@@ -1093,7 +1135,7 @@ impl<O: SampleOutput> SampleSink<O> {
                 tid: sample.tid,
                 time: sample.time,
                 cpu: sample.cpu,
-                event_name: sample.event_name,
+                event_name: &sample.event_name,
                 count: sample.count,
                 frames: sample.frames,
                 deferred_cookie: None,
@@ -1176,7 +1218,7 @@ where
             self.writer,
             "{:>10} {:>width$}: ",
             sample.count,
-            sample.event_name.as_ref(),
+            sample.event_name,
             width = self.event_name_width,
         )
         .map_err(|error| format!("failed to write perf script output: {error}"))
@@ -1211,7 +1253,7 @@ where
             self.writer,
             "{:>10} {:>width$}:  ",
             sample.count,
-            sample.event_name.as_ref(),
+            sample.event_name,
             width = self.event_name_width,
         )
         .map_err(|error| format!("failed to write perf script output: {error}"))
@@ -1341,19 +1383,16 @@ fn sample_layouts_from_file(
         .unwrap_or_default();
     let mut layouts = SampleLayouts {
         fallback: attrs.first().map(|attr| {
-            Arc::new(SampleEventLayout {
-                layout: layout_from_attr(attr),
-                event_name: event_names.first().cloned().unwrap_or_default().into(),
-            })
+            Arc::new(SampleEventLayout::new(
+                layout_from_attr(attr),
+                event_names.first().cloned().unwrap_or_default(),
+            ))
         }),
         by_identifier: BTreeMap::new(),
         event_name_width,
     };
     for ((attr, event_name), ids) in attrs.iter().zip(event_names).zip(attr_ids) {
-        let event = Arc::new(SampleEventLayout {
-            layout: layout_from_attr(attr),
-            event_name: event_name.into(),
-        });
+        let event = Arc::new(SampleEventLayout::new(layout_from_attr(attr), event_name));
         for id in ids {
             layouts.by_identifier.insert(id, Arc::clone(&event));
         }
@@ -1625,34 +1664,21 @@ fn record_time(
         return sample_layouts
             .layout_for_payload(record.payload)?
             .map_or(Ok(None), |event| {
-                sample_payload_time(record.payload, event.layout)
+                event
+                    .offsets
+                    .time
+                    .map(|offset| read_u64(record.payload, offset))
+                    .transpose()
             });
     }
 
     sample_layouts
         .fallback
-        .clone()
+        .as_ref()
         .filter(|event| event.layout.sample_id_all)
         .map_or(Ok(None), |event| {
             sample_id_payload_time(record.payload, event.layout)
         })
-}
-
-fn sample_payload_time(payload: &[u8], layout: SampleLayout) -> Result<Option<u64>, String> {
-    if layout.sample_type & PERF_SAMPLE_TIME == 0 {
-        return Ok(None);
-    }
-    let mut offset = 0usize;
-    if layout.sample_type & PERF_SAMPLE_IDENTIFIER != 0 {
-        offset += 8;
-    }
-    if layout.sample_type & PERF_SAMPLE_IP != 0 {
-        offset += 8;
-    }
-    if layout.sample_type & PERF_SAMPLE_TID != 0 {
-        offset += 8;
-    }
-    read_u64(payload, offset).map(Some)
 }
 
 fn sample_id_payload_time(payload: &[u8], layout: SampleLayout) -> Result<Option<u64>, String> {
@@ -3017,13 +3043,13 @@ fn perf_user_reg_value(mask: u64, values: &[u64], register: u32) -> Option<u64> 
     values.get(index).copied()
 }
 
-fn prepare_sample_for_fold(
+fn prepare_sample_for_fold<'layout>(
     accumulator: &mut SessionState,
     misc: u16,
     payload: &[u8],
-    sample_layouts: &SampleLayouts,
+    sample_layouts: &'layout SampleLayouts,
     options: FoldOptions,
-) -> Result<Option<PreparedFoldSample>, String> {
+) -> Result<Option<PreparedFoldSample<'layout>>, String> {
     let Some(event) = sample_layouts.layout_for_payload(payload)? else {
         return Ok(None);
     };
@@ -3047,13 +3073,13 @@ fn prepare_sample_for_fold(
         );
     }
     let deferred_cookie = take_deferred_cookie(&mut accumulator.sample_frames);
-    append_perf_user_unwind_frames(accumulator, misc, &event, &sample);
+    append_perf_user_unwind_frames(accumulator, misc, event, &sample);
     Ok(Some(PreparedFoldSample {
         pid: sample.pid,
         tid: sample.tid,
         time: sample.time,
         cpu: sample.cpu,
-        event_name: Arc::clone(&event.event_name),
+        event_name: &event.event_name,
         count,
         frames: std::mem::take(&mut accumulator.sample_frames),
         deferred_cookie,
@@ -3823,19 +3849,16 @@ fn sample_layouts(
         .unwrap_or_default();
     let mut layouts = SampleLayouts {
         fallback: attrs.first().map(|attr| {
-            Arc::new(SampleEventLayout {
-                layout: layout_from_attr(attr),
-                event_name: event_names.first().cloned().unwrap_or_default().into(),
-            })
+            Arc::new(SampleEventLayout::new(
+                layout_from_attr(attr),
+                event_names.first().cloned().unwrap_or_default(),
+            ))
         }),
         by_identifier: BTreeMap::new(),
         event_name_width,
     };
     for ((attr, event_name), ids) in attrs.iter().zip(event_names).zip(attr_ids) {
-        let event = Arc::new(SampleEventLayout {
-            layout: layout_from_attr(attr),
-            event_name: event_name.into(),
-        });
+        let event = Arc::new(SampleEventLayout::new(layout_from_attr(attr), event_name));
         for id in ids {
             layouts.by_identifier.insert(id, Arc::clone(&event));
         }
@@ -4009,46 +4032,27 @@ fn software_event_name(config: u64) -> &'static str {
 }
 
 impl SampleLayouts {
-    fn layout_for_payload(&self, payload: &[u8]) -> Result<Option<Arc<SampleEventLayout>>, String> {
+    fn layout_for_payload(&self, payload: &[u8]) -> Result<Option<&SampleEventLayout>, String> {
         if self.by_identifier.is_empty() {
-            return Ok(self.fallback.as_ref().map(Arc::clone));
+            return Ok(self.fallback.as_deref());
         }
-        let Some(fallback) = self.fallback.clone() else {
+        let Some(fallback) = self.fallback.as_deref() else {
             return Ok(None);
         };
-        if let Some(identifier) = sample_event_id(payload, fallback.layout)? {
+        if let Some(identifier) = fallback
+            .offsets
+            .id
+            .map(|offset| read_sample_u64(payload, offset))
+            .transpose()?
+        {
             return Ok(self
                 .by_identifier
                 .get(&identifier)
-                .map(Arc::clone)
+                .map(Arc::as_ref)
                 .or(Some(fallback)));
         }
         Ok(Some(fallback))
     }
-}
-
-fn sample_event_id(payload: &[u8], layout: SampleLayout) -> Result<Option<u64>, String> {
-    if layout.sample_type & PERF_SAMPLE_IDENTIFIER != 0 {
-        return read_sample_u64(payload, 0).map(Some);
-    }
-    if layout.sample_type & PERF_SAMPLE_ID == 0 {
-        return Ok(None);
-    }
-
-    let mut offset = 0usize;
-    if layout.sample_type & PERF_SAMPLE_IP != 0 {
-        offset += 8;
-    }
-    if layout.sample_type & PERF_SAMPLE_TID != 0 {
-        offset += 8;
-    }
-    if layout.sample_type & PERF_SAMPLE_TIME != 0 {
-        offset += 8;
-    }
-    if layout.sample_type & PERF_SAMPLE_ADDR != 0 {
-        offset += 8;
-    }
-    read_sample_u64(payload, offset).map(Some)
 }
 
 fn read_sample_u64(payload: &[u8], offset: usize) -> Result<u64, String> {
@@ -4118,8 +4122,8 @@ mod tests {
     #[test]
     fn replay_retains_backing_until_ordered_delivery_and_releases_on_parse_errors() {
         let layouts = super::SampleLayouts {
-            fallback: Some(std::sync::Arc::new(super::SampleEventLayout {
-                layout: crate::perfdata::samples::SampleLayout {
+            fallback: Some(std::sync::Arc::new(super::SampleEventLayout::new(
+                crate::perfdata::samples::SampleLayout {
                     sample_type: crate::perfdata::samples::PERF_SAMPLE_TIME,
                     read_format: 0,
                     branch_sample_type: 0,
@@ -4127,8 +4131,8 @@ mod tests {
                     sample_regs_intr: 0,
                     sample_id_all: true,
                 },
-                event_name: "cycles".into(),
-            })),
+                "cycles",
+            ))),
             ..super::SampleLayouts::default()
         };
         for malformed in [false, true] {
@@ -5353,6 +5357,142 @@ mod tests {
         assert_eq!(buffers.rendered(), "handler");
     }
 
+    fn metadata_test_layouts() -> super::SampleLayouts {
+        super::SampleLayouts {
+            fallback: Some(std::sync::Arc::new(super::SampleEventLayout::new(
+                crate::perfdata::samples::SampleLayout {
+                    sample_type: super::PERF_SAMPLE_IP,
+                    read_format: 0,
+                    branch_sample_type: 0,
+                    sample_regs_user: 0,
+                    sample_regs_intr: 0,
+                    sample_id_all: false,
+                },
+                "cycles",
+            ))),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn fixed_sample_offsets_follow_perf_evsel_for_all_prefix_field_combinations() {
+        // tools/perf/util/evsel.c:__perf_evsel__calc_id_pos() gives identifier
+        // precedence; evsel__parse_sample_timestamp() walks identifier/IP/TID.
+        let fields = [
+            super::PERF_SAMPLE_IDENTIFIER,
+            super::PERF_SAMPLE_IP,
+            super::PERF_SAMPLE_TID,
+            super::PERF_SAMPLE_TIME,
+            super::PERF_SAMPLE_ADDR,
+            super::PERF_SAMPLE_ID,
+        ];
+        for mask in 0..64 {
+            let mut sample_type = 0;
+            let mut payload = Vec::new();
+            let mut expected_id = None;
+            let mut expected_time = None;
+            for (index, field) in fields.iter().copied().enumerate() {
+                if mask & (1 << index) == 0 {
+                    continue;
+                }
+                sample_type |= field;
+                let value = 100 + index as u64;
+                if field == super::PERF_SAMPLE_IDENTIFIER
+                    || (field == super::PERF_SAMPLE_ID && expected_id.is_none())
+                {
+                    expected_id = Some(value);
+                }
+                if field == super::PERF_SAMPLE_TIME {
+                    expected_time = Some(value);
+                }
+                payload.extend(value.to_le_bytes());
+            }
+            let offsets = super::SampleOffsets::new(sample_type);
+            assert_eq!(
+                offsets
+                    .id
+                    .map(|offset| super::read_sample_u64(&payload, offset).unwrap()),
+                expected_id
+            );
+            assert_eq!(
+                offsets
+                    .time
+                    .map(|offset| super::read_u64(&payload, offset).unwrap()),
+                expected_time
+            );
+            for offset in [offsets.id, offsets.time].into_iter().flatten() {
+                assert!(super::read_sample_u64(&payload[..offset + 7], offset).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn sample_layout_selection_borrows_without_arc_reference_churn() {
+        let layouts = metadata_test_layouts();
+        let stored = layouts.fallback.as_ref().unwrap();
+        let owners = std::sync::Arc::strong_count(stored);
+        let selected = layouts
+            .layout_for_payload(&0x1010_u64.to_le_bytes())
+            .unwrap()
+            .unwrap();
+        assert!(std::ptr::eq(selected, stored.as_ref()));
+        assert_eq!(std::sync::Arc::strong_count(stored), owners);
+    }
+
+    #[test]
+    fn identified_layouts_borrow_selected_or_fallback_and_reject_truncation() {
+        let mut layouts = metadata_test_layouts();
+        let mut layout = layouts.fallback.as_ref().unwrap().layout;
+        layout.sample_type |= super::PERF_SAMPLE_IDENTIFIER;
+        layouts.fallback = Some(std::sync::Arc::new(super::SampleEventLayout::new(
+            layout, "cycles",
+        )));
+        let selected = std::sync::Arc::new(super::SampleEventLayout::new(layout, "instructions"));
+        layouts.by_identifier.insert(12, selected.clone());
+        for identifier in [12_u64, 13] {
+            let event = layouts
+                .layout_for_payload(&identifier.to_le_bytes())
+                .unwrap()
+                .unwrap();
+            let expected = if identifier == 12 {
+                selected.as_ref()
+            } else {
+                layouts.fallback.as_deref().unwrap()
+            };
+            assert!(std::ptr::eq(event, expected));
+            assert_eq!(std::sync::Arc::strong_count(&selected), 2);
+            assert_eq!(
+                std::sync::Arc::strong_count(layouts.fallback.as_ref().unwrap()),
+                1
+            );
+        }
+        assert!(
+            layouts
+                .layout_for_payload(&[])
+                .unwrap_err()
+                .contains("truncated")
+        );
+    }
+
+    #[test]
+    fn prepared_samples_borrow_event_names_until_deferred_ownership_is_needed() {
+        let layouts = metadata_test_layouts();
+        let stored_name = &layouts.fallback.as_ref().unwrap().event_name;
+        let owners = std::sync::Arc::strong_count(stored_name);
+        let mut state = super::SessionState::new(std::collections::BTreeMap::new());
+        let sample = super::prepare_sample_for_fold(
+            &mut state,
+            super::PERF_RECORD_MISC_CPUMODE_USER,
+            &0x1010_u64.to_le_bytes(),
+            &layouts,
+            super::FoldOptions::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(sample.event_name, "cycles");
+        assert_eq!(std::sync::Arc::strong_count(stored_name), owners);
+    }
+
     #[test]
     fn fold_counts_round_trip_many_large_entries_after_growth() {
         let mut counts = super::FoldCounts::default();
@@ -5385,13 +5525,13 @@ mod tests {
         assert_eq!(String::from_utf8(written).expect("utf-8"), expected);
     }
 
-    fn prepared_sample(frames: &[super::FoldFrame]) -> super::PreparedFoldSample {
+    fn prepared_sample(frames: &[super::FoldFrame]) -> super::PreparedFoldSample<'static> {
         super::PreparedFoldSample {
             pid: Some(7),
             tid: Some(7),
             time: None,
             cpu: None,
-            event_name: std::sync::Arc::from("cpu-clock"),
+            event_name: "cpu-clock",
             count: 1,
             frames: frames.iter().copied().collect(),
             deferred_cookie: None,
@@ -6877,8 +7017,8 @@ mod tests {
         // A user-record payload tail that looks like sample_id_all data must not
         // advance ordered-events next_flush and flush later samples early.
         let layouts = super::SampleLayouts {
-            fallback: Some(std::sync::Arc::new(super::SampleEventLayout {
-                layout: crate::perfdata::samples::SampleLayout {
+            fallback: Some(std::sync::Arc::new(super::SampleEventLayout::new(
+                crate::perfdata::samples::SampleLayout {
                     sample_type: crate::perfdata::samples::PERF_SAMPLE_TID
                         | crate::perfdata::samples::PERF_SAMPLE_TIME,
                     read_format: 0,
@@ -6887,8 +7027,8 @@ mod tests {
                     sample_regs_intr: 0,
                     sample_id_all: true,
                 },
-                event_name: std::sync::Arc::from("cpu-clock"),
-            })),
+                "cpu-clock",
+            ))),
             by_identifier: std::collections::BTreeMap::new(),
             event_name_width: 9,
         };
