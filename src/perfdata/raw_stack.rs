@@ -7,8 +7,6 @@ use rustc_hash::FxBuildHasher;
 type CommId = u64;
 type NodeId = NonZeroU64;
 const RAW_STACK_GROWTH_MIN_CHUNK: usize = 1024;
-const RAW_STACK_NODE_LINEAR_GROWTH_THRESHOLD: usize = 64 * 1024 * 1024;
-const RAW_STACK_NODE_LINEAR_GROWTH_CHUNK: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollapsedRawStack<T = u64> {
@@ -291,19 +289,9 @@ where
         if additional == 0 {
             return;
         }
-        let available = self.nodes.capacity().saturating_sub(self.nodes.len());
-        if available < additional {
-            let node_size = std::mem::size_of::<StackNode<T>>();
-            if self.nodes.capacity().saturating_mul(node_size)
-                >= RAW_STACK_NODE_LINEAR_GROWTH_THRESHOLD
-            {
-                let chunk = (RAW_STACK_NODE_LINEAR_GROWTH_CHUNK / node_size).max(1);
-                self.nodes
-                    .reserve_exact(additional.max(available.saturating_add(chunk)));
-            } else {
-                self.nodes
-                    .reserve(growth_chunk(self.nodes.len(), additional));
-            }
+        if self.nodes.capacity().saturating_sub(self.nodes.len()) < additional {
+            self.nodes
+                .reserve(growth_chunk(self.nodes.len(), additional));
         }
         if self.node_ids.capacity().saturating_sub(self.node_ids.len()) < additional {
             let nodes = &self.nodes;
@@ -467,40 +455,6 @@ mod tests {
     fn node_parent_id_uses_single_word_and_compact_node_layout() {
         assert_eq!(std::mem::size_of::<Option<NodeId>>(), 8);
         assert_eq!(std::mem::size_of::<StackNode<u64>>(), 16);
-    }
-
-    #[test]
-    fn large_node_arena_growth_limits_spare_capacity_to_one_chunk() {
-        let node_size = std::mem::size_of::<StackNode<u64>>();
-        let mut accumulator = RawStackAccumulator::<u64>::new();
-        let threshold_nodes = 64 * 1024 * 1024 / node_size;
-        accumulator.nodes.resize(
-            threshold_nodes,
-            StackNode {
-                parent: None,
-                frame: 0,
-            },
-        );
-        let previous_capacity = accumulator.node_capacity();
-
-        accumulator.reserve_node_growth(1);
-
-        assert!(accumulator.node_capacity() > previous_capacity);
-        assert!(
-            accumulator.node_capacity() <= previous_capacity + 8 * 1024 * 1024 / node_size,
-            "node arena grew from {} to {} bytes for one node",
-            previous_capacity * node_size,
-            accumulator.node_capacity() * node_size
-        );
-        let additional = 2 * 8 * 1024 * 1024 / node_size;
-        accumulator.reserve_node_growth(additional);
-        assert!(accumulator.node_capacity() >= accumulator.nodes.len() + additional);
-        assert!(
-            accumulator
-                .nodes
-                .iter()
-                .all(|node| node.frame == 0 && node.parent.is_none())
-        );
     }
 
     #[test]
