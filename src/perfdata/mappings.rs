@@ -48,6 +48,80 @@ pub struct ResolvedMappingRef<'a> {
     pub kernel_relocation: Option<KernelRelocation>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MappedFrame<'a> {
+    mapping: &'a Mapping,
+    pub(crate) relative_address: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct MappingPathLayout {
+    pub(crate) basename_start: usize,
+    pub(crate) last_space: Option<usize>,
+    pub(crate) basename_has_parentheses: bool,
+    pub(crate) basename_needs_escaping: bool,
+    bracketed: bool,
+}
+
+impl MappingPathLayout {
+    pub(crate) fn new(path: &str) -> Self {
+        let basename_start = memchr::memrchr(b'/', path.as_bytes()).map_or(0, |index| index + 1);
+        Self {
+            bracketed: path.starts_with('['),
+            basename_start,
+            last_space: memchr::memrchr(b' ', path.as_bytes()),
+            basename_has_parentheses: path[basename_start..].contains('('),
+            basename_needs_escaping: memchr::memchr3(
+                b';',
+                b'\r',
+                b'\n',
+                &path.as_bytes()[basename_start..],
+            )
+            .is_some(),
+        }
+    }
+}
+
+impl<'a> MappedFrame<'a> {
+    fn new(mapping: &'a Mapping, ip: u64) -> Self {
+        let relative_address = mapping.relative_address(ip);
+        Self {
+            mapping,
+            relative_address,
+        }
+    }
+
+    pub(crate) fn symbol_source_id(self) -> usize {
+        self.mapping.symbol_source_id
+    }
+    pub(crate) fn path(self) -> &'a str {
+        &self.mapping.path
+    }
+    pub(crate) fn kernel_range(self) -> Option<(u64, u64)> {
+        self.is_kernel()
+            .then(|| (self.mapping.start, self.mapping.end()))
+    }
+    pub(crate) fn is_kernel(self) -> bool {
+        crate::perfdata::samples::is_kernel_space_frame(self.relative_address)
+            && self.mapping.path_layout.bracketed
+    }
+    pub(crate) fn path_layout(self) -> &'a MappingPathLayout {
+        &self.mapping.path_layout
+    }
+    pub(crate) fn resolved_ref(self) -> ResolvedMappingRef<'a> {
+        ResolvedMappingRef {
+            symbol_source_id: self.mapping.symbol_source_id,
+            path: &self.mapping.path,
+            relative_address: self.relative_address,
+            start: self.mapping.start,
+            end: self.mapping.end(),
+            build_id: self.mapping.build_id.as_deref(),
+            file_identity: self.mapping.file_identity,
+            kernel_relocation: self.mapping.kernel_relocation(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MappingResolveCache {
     pid: Option<u32>,
@@ -134,6 +208,7 @@ struct Mapping {
     pgoff: u64,
     symbol_source_id: usize,
     path: String,
+    path_layout: MappingPathLayout,
     build_id: Option<Vec<u8>>,
     file_identity: Option<FileIdentity>,
     prot: Option<u32>,
@@ -156,6 +231,11 @@ struct SymbolSourceKey {
 }
 
 impl MmapTable {
+    #[cfg(test)]
+    pub(crate) fn index_search_count(&self) -> usize {
+        self.index_searches.get()
+    }
+
     pub fn insert_mmap(&mut self, record: MmapRecord) {
         self.insert_mapping(Mapping {
             pid: record.pid,
@@ -164,6 +244,7 @@ impl MmapTable {
             pgoff: record.pgoff,
             symbol_source_id: 0,
             path: record.path,
+            path_layout: MappingPathLayout::default(),
             build_id: None,
             file_identity: None,
             prot: None,
@@ -179,6 +260,7 @@ impl MmapTable {
             pgoff: record.pgoff,
             symbol_source_id: 0,
             path: record.path,
+            path_layout: MappingPathLayout::default(),
             build_id: None,
             file_identity: None,
             prot: None,
@@ -211,6 +293,7 @@ impl MmapTable {
             pgoff: record.pgoff,
             symbol_source_id: 0,
             path: record.path,
+            path_layout: MappingPathLayout::default(),
             build_id,
             file_identity: Some(FileIdentity {
                 major: record.major,
@@ -239,6 +322,7 @@ impl MmapTable {
             pgoff: record.pgoff,
             symbol_source_id: 0,
             path: record.path,
+            path_layout: MappingPathLayout::default(),
             build_id: Some(record.build_id),
             file_identity: None,
             prot: Some(record.prot),
@@ -269,7 +353,8 @@ impl MmapTable {
         }
     }
 
-    fn insert_mapping(&mut self, mapping: Mapping) {
+    fn insert_mapping(&mut self, mut mapping: Mapping) {
+        mapping.path_layout = MappingPathLayout::new(&mapping.path);
         // Common case: the new mapping does not overlap any existing mapping for
         // its pid. Detect this in O(log n + matches) using the per-pid interval
         // index and take a pure incremental insert, skipping the whole-table
@@ -483,17 +568,18 @@ impl MmapTable {
         ip: u64,
         cache: &mut MappingResolveCache,
     ) -> Option<ResolvedMappingRef<'_>> {
+        self.resolve_frame_cached(pid, ip, cache)
+            .map(MappedFrame::resolved_ref)
+    }
+
+    pub(crate) fn resolve_frame_cached(
+        &self,
+        pid: u32,
+        ip: u64,
+        cache: &mut MappingResolveCache,
+    ) -> Option<MappedFrame<'_>> {
         self.resolve_mapping_with_index_cached(pid, ip, cache)
-            .map(|(_, mapping)| ResolvedMappingRef {
-                symbol_source_id: mapping.symbol_source_id,
-                path: mapping.path.as_str(),
-                relative_address: mapping.relative_address(ip),
-                start: mapping.start,
-                end: mapping.end(),
-                build_id: mapping.build_id.as_deref(),
-                file_identity: mapping.file_identity,
-                kernel_relocation: mapping.kernel_relocation(),
-            })
+            .map(|(_, mapping)| MappedFrame::new(mapping, ip))
     }
 
     #[must_use]
@@ -503,6 +589,16 @@ impl MmapTable {
         ip: u64,
         cache: &mut MappingResolveCache,
     ) -> Option<ResolvedMappingRef<'_>> {
+        self.resolve_user_frame_cached(pid, ip, cache)
+            .map(MappedFrame::resolved_ref)
+    }
+
+    pub(crate) fn resolve_user_frame_cached(
+        &self,
+        pid: u32,
+        ip: u64,
+        cache: &mut MappingResolveCache,
+    ) -> Option<MappedFrame<'_>> {
         if cache.pid != Some(pid) {
             cache.pid = Some(pid);
             cache.pid_index = None;
@@ -513,19 +609,7 @@ impl MmapTable {
             &mut cache.pid_index,
             Mapping::is_user_cpumode,
         )
-        .map(|index| {
-            let mapping = &self.mappings[index];
-            ResolvedMappingRef {
-                symbol_source_id: mapping.symbol_source_id,
-                path: mapping.path.as_str(),
-                relative_address: mapping.relative_address(ip),
-                start: mapping.start,
-                end: mapping.end(),
-                build_id: mapping.build_id.as_deref(),
-                file_identity: mapping.file_identity,
-                kernel_relocation: mapping.kernel_relocation(),
-            }
-        })
+        .map(|index| MappedFrame::new(&self.mappings[index], ip))
     }
 
     #[must_use]
@@ -851,6 +935,62 @@ fn is_perf_data_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mapped_frame_views_borrow_paths_and_preserve_resolved_metadata() {
+        assert!(std::mem::size_of::<super::MappedFrame<'_>>() <= 2 * std::mem::size_of::<usize>());
+        for (pid, start, path) in [
+            (7, 0x1000, "/tmp/demo.so"),
+            (7, 0x1000, "/tmp/\u{e9};demo(args).so"),
+            (u32::MAX, 0xffff_ffff_8100_0000, "[kernel.kallsyms]_text"),
+        ] {
+            let mut table = super::MmapTable::default();
+            table.insert_mmap(super::MmapRecord {
+                pid,
+                tid: pid,
+                start,
+                len: 0x100,
+                pgoff: 0,
+                path: path.into(),
+            });
+            let mut hint = super::MappingResolveCache::default();
+            let frame = table
+                .resolve_frame_cached(pid, start + 0x10, &mut hint)
+                .unwrap();
+            let reference = table.resolve_ref(pid, start + 0x10).unwrap();
+            assert_eq!(frame.resolved_ref(), reference);
+            assert_eq!(frame.path().as_ptr(), table.mappings[0].path.as_ptr());
+            assert_eq!(*frame.path_layout(), super::MappingPathLayout::new(path));
+            assert_eq!(frame.is_kernel(), pid == u32::MAX);
+            assert_eq!(
+                frame.kernel_range(),
+                (pid == u32::MAX).then_some((start, start + 0x100))
+            );
+        }
+    }
+
+    #[test]
+    fn mapping_path_layout_preserves_literal_utf8_boundaries_and_escape_requirements() {
+        for path in [
+            "/",
+            "/tmp/demo///",
+            "/tmp/\u{e9}.so",
+            "/tmp/a;b.so",
+            "/tmp/a\r\nb.so",
+            "/tmp/a (b).so",
+            "[vdso]",
+        ] {
+            let layout = super::MappingPathLayout::new(path);
+            let basename = &path[path.rfind('/').map_or(0, |index| index + 1)..];
+            assert_eq!(&path[layout.basename_start..], basename);
+            assert_eq!(layout.last_space, path.rfind(' '));
+            assert_eq!(layout.basename_has_parentheses, basename.contains('('));
+            assert_eq!(
+                layout.basename_needs_escaping,
+                basename.contains([';', '\r', '\n'])
+            );
+        }
+    }
+
     use super::{MappingResolveCache, MmapTable};
     use crate::perfdata::records::MmapRecord;
 

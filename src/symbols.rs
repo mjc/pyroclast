@@ -19,7 +19,7 @@ use serde::Serialize;
 use crate::perfdata::build_id::{
     kernel_build_id_from_perfdata, kernel_build_id_from_perfdata_file,
 };
-use crate::perfdata::mappings::{FileIdentity, ResolvedMappingRef};
+use crate::perfdata::mappings::{FileIdentity, MappedFrame, ResolvedMappingRef};
 use crate::process::{CommandRunner, CommandSpec};
 
 type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
@@ -204,8 +204,8 @@ pub struct SymbolCache<'a, R> {
 pub struct SymbolFrameCache<'a, R> {
     resolver: &'a R,
     resolved: FxHashMap<SymbolRequest, Vec<String>>,
-    resolved_by_mapping: FxHashMap<MappingFrameKey, CachedMappingFrames>,
-    resolved_base_by_mapping: FxHashMap<MappingFrameKey, CachedMappingFrames>,
+    resolved_by_mapping: MappingFrameTable,
+    resolved_base_by_mapping: MappingFrameTable,
     scratch_seen_mapping: FxHashSet<MappingFrameKey>,
     scratch_missing_keys: Vec<MappingFrameKey>,
     scratch_missing_requests: Vec<SymbolRequest>,
@@ -226,6 +226,132 @@ struct CachedMappingFrames {
     has_inline_frames: bool,
     has_non_inline_base_frame: bool,
     base_offset: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq)]
+struct UserMappingFrameKey {
+    symbol_source_id: usize,
+    relative_address: u64,
+}
+
+impl PartialEq for UserMappingFrameKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.symbol_source_id == other.symbol_source_id
+            && self.relative_address == other.relative_address
+    }
+}
+
+impl std::hash::Hash for UserMappingFrameKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.symbol_source_id, state);
+        std::hash::Hash::hash(&self.relative_address, state);
+    }
+}
+
+static UNRESOLVED_MAPPING_FRAMES: CachedMappingFrames = CachedMappingFrames {
+    frames: Vec::new(),
+    has_base_symbol: false,
+    has_inline_frames: false,
+    has_non_inline_base_frame: false,
+    base_offset: None,
+};
+
+impl CachedMappingFrames {
+    fn is_fully_unresolved(&self) -> bool {
+        self.frames.is_empty()
+            && !self.has_base_symbol
+            && !self.has_inline_frames
+            && !self.has_non_inline_base_frame
+            && self.base_offset.is_none()
+    }
+}
+
+#[derive(Default)]
+struct MappingFrameTable {
+    user: FxHashMap<UserMappingFrameKey, usize>,
+    kernel: FxHashMap<MappingFrameKey, usize>,
+    frames: Vec<CachedMappingFrames>,
+}
+
+impl MappingFrameTable {
+    fn user_slot(&self, symbol_source_id: usize, relative_address: u64) -> Option<usize> {
+        self.user
+            .get(&UserMappingFrameKey {
+                symbol_source_id,
+                relative_address,
+            })
+            .copied()
+    }
+
+    fn slot(&self, key: &MappingFrameKey) -> Option<usize> {
+        if key.kernel_mapping_range.is_some() {
+            self.kernel.get(key).copied()
+        } else {
+            self.user_slot(key.symbol_source_id, key.relative_address)
+        }
+    }
+
+    fn contains_key(&self, key: &MappingFrameKey) -> bool {
+        self.slot(key).is_some()
+    }
+
+    #[cfg(test)]
+    fn get(&self, key: &MappingFrameKey) -> Option<&CachedMappingFrames> {
+        self.slot(key).map(|slot| self.at_slot(slot))
+    }
+
+    fn at_slot(&self, slot: usize) -> &CachedMappingFrames {
+        // Zero represents a resolved negative result, not a cache miss.
+        if slot == 0 {
+            &UNRESOLVED_MAPPING_FRAMES
+        } else {
+            &self.frames[slot - 1]
+        }
+    }
+
+    fn get_frame(&self, mapping: &MappedFrame<'_>) -> Option<&CachedMappingFrames> {
+        let slot = if let Some(range) = mapping.kernel_range() {
+            self.kernel
+                .get(&MappingFrameKey {
+                    symbol_source_id: mapping.symbol_source_id(),
+                    relative_address: mapping.relative_address,
+                    kernel_mapping_range: Some(range),
+                })
+                .copied()
+        } else {
+            self.user_slot(mapping.symbol_source_id(), mapping.relative_address)
+        };
+        slot.map(|slot| self.at_slot(slot))
+    }
+
+    fn insert(&mut self, key: MappingFrameKey, frames: CachedMappingFrames) {
+        if let Some(slot) = self.slot(&key) {
+            if slot != 0 {
+                self.frames[slot - 1] = frames;
+                return;
+            }
+            if frames.is_fully_unresolved() {
+                return;
+            }
+        }
+        let slot = if frames.is_fully_unresolved() {
+            0
+        } else {
+            self.frames.push(frames);
+            self.frames.len()
+        };
+        if key.kernel_mapping_range.is_some() {
+            self.kernel.insert(key, slot);
+        } else {
+            self.user.insert(
+                UserMappingFrameKey {
+                    symbol_source_id: key.symbol_source_id,
+                    relative_address: key.relative_address,
+                },
+                slot,
+            );
+        }
+    }
 }
 
 pub struct Addr2lineResolver<'a, R> {
@@ -1253,8 +1379,8 @@ where
         Self {
             resolver,
             resolved: FxHashMap::default(),
-            resolved_by_mapping: FxHashMap::default(),
-            resolved_base_by_mapping: FxHashMap::default(),
+            resolved_by_mapping: MappingFrameTable::default(),
+            resolved_base_by_mapping: MappingFrameTable::default(),
             scratch_seen_mapping: FxHashSet::default(),
             scratch_missing_keys: Vec::new(),
             scratch_missing_requests: Vec::new(),
@@ -1295,14 +1421,7 @@ where
         &mut self,
         mapping: &ResolvedMappingRef<'_>,
     ) -> Result<&[String], String> {
-        let key = mapping_frame_key(mapping);
-        if !self.resolved_by_mapping.contains_key(&key) {
-            self.prefetch_mapping_refs(std::slice::from_ref(mapping))?;
-        }
-        let cached = self
-            .resolved_by_mapping
-            .get(&key)
-            .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())?;
+        let cached = self.resolve_cached_mapping(mapping, true)?;
         Ok(cached.frames.as_slice())
     }
 
@@ -1317,21 +1436,13 @@ where
         &mut self,
         mapping: &ResolvedMappingRef<'_>,
     ) -> Result<ResolvedFrameSlice<'_>, String> {
-        let key = mapping_frame_key(mapping);
-        if !self.resolved_by_mapping.contains_key(&key) {
-            self.prefetch_mapping_refs(std::slice::from_ref(mapping))?;
-        }
-        self.resolved_by_mapping
-            .get(&key)
-            .map(|cached| {
-                (
-                    cached.frames.as_slice(),
-                    cached.base_offset,
-                    cached.has_inline_frames,
-                    cached.has_non_inline_base_frame,
-                )
-            })
-            .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())
+        let cached = self.resolve_cached_mapping(mapping, true)?;
+        Ok((
+            cached.frames.as_slice(),
+            cached.base_offset,
+            cached.has_inline_frames,
+            cached.has_non_inline_base_frame,
+        ))
     }
 
     /// Resolves one borrowed perfdata mapping and returns frames only when perf
@@ -1344,14 +1455,8 @@ where
         &mut self,
         mapping: &ResolvedMappingRef<'_>,
     ) -> Result<Option<&[String]>, String> {
-        let key = mapping_frame_key(mapping);
-        if !self.resolved_base_by_mapping.contains_key(&key) {
-            self.prefetch_base_mapping_refs(std::slice::from_ref(mapping))?;
-        }
-        self.resolved_base_by_mapping
-            .get(&key)
-            .map(|cached| cached.has_base_symbol.then_some(cached.frames.as_slice()))
-            .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())
+        let cached = self.resolve_cached_mapping(mapping, false)?;
+        Ok(cached.has_base_symbol.then_some(cached.frames.as_slice()))
     }
 
     /// Resolves one borrowed perfdata mapping to its single base object symbol
@@ -1364,14 +1469,41 @@ where
         &mut self,
         mapping: &ResolvedMappingRef<'_>,
     ) -> Result<&[String], String> {
+        let cached = self.resolve_cached_mapping(mapping, false)?;
+        Ok(cached.frames.as_slice())
+    }
+
+    fn resolve_cached_mapping(
+        &mut self,
+        mapping: &ResolvedMappingRef<'_>,
+        inline: bool,
+    ) -> Result<&CachedMappingFrames, String> {
         let key = mapping_frame_key(mapping);
-        if !self.resolved_base_by_mapping.contains_key(&key) {
-            self.prefetch_base_mapping_refs(std::slice::from_ref(mapping))?;
-        }
-        self.resolved_base_by_mapping
-            .get(&key)
-            .map(|cached| cached.frames.as_slice())
-            .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())
+        let table = if inline {
+            &self.resolved_by_mapping
+        } else {
+            &self.resolved_base_by_mapping
+        };
+        let slot = table.slot(&key);
+        let slot = if let Some(slot) = slot {
+            slot
+        } else {
+            self.prefetch_mapping_refs_with_mode(std::slice::from_ref(mapping), inline)?;
+            let table = if inline {
+                &self.resolved_by_mapping
+            } else {
+                &self.resolved_base_by_mapping
+            };
+            table
+                .slot(&key)
+                .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())?
+        };
+        let table = if inline {
+            &self.resolved_by_mapping
+        } else {
+            &self.resolved_base_by_mapping
+        };
+        Ok(table.at_slot(slot))
     }
 
     /// Resolves many borrowed perfdata mappings to base symbols only.
@@ -1447,6 +1579,21 @@ where
             &self.resolved_base_by_mapping
         };
         table.contains_key(&mapping_frame_key(mapping))
+    }
+
+    pub(crate) fn cached_mapping_frames(
+        &self,
+        mapping: &MappedFrame<'_>,
+        inline: bool,
+    ) -> Option<(&[String], bool)> {
+        let table = if inline {
+            &self.resolved_by_mapping
+        } else {
+            &self.resolved_base_by_mapping
+        };
+        table
+            .get_frame(mapping)
+            .map(|cached| (cached.frames.as_slice(), cached.has_base_symbol))
     }
 
     fn prefetch_mapping_refs_with_mode(
@@ -5307,6 +5454,248 @@ mod tests {
             assert!(cache.resolve_mapping_ref(&mapping).unwrap().is_empty());
             assert!(cache.mapping_ref_cached(&mapping, true));
             assert_eq!(resolver.calls.get(), 1);
+            assert_eq!(cache.resolved_by_mapping.frames.capacity(), 0);
+            assert_eq!(
+                cache.resolve_mapping_ref_with_offset(&mapping).unwrap(),
+                (&[][..], None, false, false)
+            );
+            assert_eq!(
+                cache
+                    .resolve_mapping_ref_with_base_symbol(&mapping)
+                    .unwrap(),
+                None
+            );
+            assert!(cache.resolve_base_mapping_ref(&mapping).unwrap().is_empty());
+            assert_eq!(cache.resolved_base_by_mapping.frames.capacity(), 0);
+            assert_eq!(resolver.calls.get(), 2);
+        }
+    }
+
+    #[test]
+    fn user_mapping_cache_buckets_keep_only_compact_key_and_slot_index() {
+        fn bucket_bytes<K, V>(_: &super::FxHashMap<K, V>) -> usize {
+            std::mem::size_of::<(K, V)>()
+        }
+        let resolver = CountingFrameResolver::new(vec![Vec::new()]);
+        let cache = SymbolFrameCache::new(&resolver);
+        assert!(bucket_bytes(&cache.resolved_by_mapping.user) <= 3 * std::mem::size_of::<u64>());
+    }
+
+    fn cached_table_frames(label: String, offset: u64) -> super::CachedMappingFrames {
+        super::CachedMappingFrames {
+            frames: vec![label],
+            has_base_symbol: true,
+            has_inline_frames: false,
+            has_non_inline_base_frame: true,
+            base_offset: Some(offset),
+        }
+    }
+
+    fn empty_cached_table_frames() -> super::CachedMappingFrames {
+        super::CachedMappingFrames {
+            frames: Vec::new(),
+            has_base_symbol: false,
+            has_inline_frames: false,
+            has_non_inline_base_frame: false,
+            base_offset: None,
+        }
+    }
+
+    #[test]
+    fn fully_unresolved_mapping_entries_need_no_frame_storage() {
+        let mut table = super::MappingFrameTable::default();
+        for relative_address in 0..4096 {
+            for kernel_mapping_range in [None, Some((0x1000, 0x2000))] {
+                let key = super::MappingFrameKey {
+                    symbol_source_id: 7,
+                    relative_address,
+                    kernel_mapping_range,
+                };
+                table.insert(key, empty_cached_table_frames());
+                assert!(table.get(&key).unwrap().frames.is_empty());
+                assert!(!table.get(&key).unwrap().has_base_symbol);
+            }
+        }
+        assert_eq!(table.user.len(), 4096);
+        assert_eq!(table.kernel.len(), 4096);
+        assert_eq!(table.frames.len(), 0);
+        assert_eq!(table.frames.capacity(), 0);
+    }
+
+    #[test]
+    fn empty_frame_lists_keep_metadata_and_survive_negative_positive_transitions() {
+        let mut table = super::MappingFrameTable::default();
+        let key = super::MappingFrameKey {
+            symbol_source_id: 7,
+            relative_address: 42,
+            kernel_mapping_range: None,
+        };
+        table.insert(key, empty_cached_table_frames());
+        let mut metadata = empty_cached_table_frames();
+        metadata.has_base_symbol = true;
+        metadata.has_inline_frames = true;
+        metadata.base_offset = Some(0);
+        table.insert(key, metadata);
+        let cached = table.get(&key).unwrap();
+        assert!(cached.frames.is_empty());
+        assert!(cached.has_base_symbol);
+        assert!(cached.has_inline_frames);
+        assert_eq!(cached.base_offset, Some(0));
+        table.insert(key, cached_table_frames("live".into(), 9));
+        assert_eq!(table.get(&key).unwrap().frames, ["live"]);
+        table.insert(key, empty_cached_table_frames());
+        assert!(table.get(&key).unwrap().frames.is_empty());
+        assert!(!table.get(&key).unwrap().has_base_symbol);
+        assert_eq!(table.get(&key).unwrap().base_offset, None);
+        assert!(table.frames.iter().all(|entry| entry.frames.is_empty()));
+        table.insert(key, cached_table_frames("replacement".into(), 3));
+        assert_eq!(table.get(&key).unwrap().frames, ["replacement"]);
+        assert_eq!(table.frames.len(), 1);
+    }
+
+    #[test]
+    fn each_empty_frame_metadata_field_prevents_negative_slot_canonicalization() {
+        let mut table = super::MappingFrameTable::default();
+        for relative_address in 0..4 {
+            let mut metadata = empty_cached_table_frames();
+            match relative_address {
+                0 => metadata.has_base_symbol = true,
+                1 => metadata.has_inline_frames = true,
+                2 => metadata.has_non_inline_base_frame = true,
+                _ => metadata.base_offset = Some(0),
+            }
+            let key = super::MappingFrameKey {
+                symbol_source_id: 7,
+                relative_address,
+                kernel_mapping_range: None,
+            };
+            table.insert(key, metadata);
+            assert_ne!(table.slot(&key), Some(0));
+            let cached = table.get(&key).unwrap();
+            assert_eq!(cached.has_base_symbol, relative_address == 0);
+            assert_eq!(cached.has_inline_frames, relative_address == 1);
+            assert_eq!(cached.has_non_inline_base_frame, relative_address == 2);
+            assert_eq!(cached.base_offset, (relative_address == 3).then_some(0));
+        }
+        assert_eq!(table.frames.len(), 4);
+    }
+
+    #[test]
+    fn user_cache_key_equality_and_hash_use_both_identity_fields() {
+        use std::hash::{Hash, Hasher};
+        let key = super::UserMappingFrameKey {
+            symbol_source_id: 7,
+            relative_address: 42,
+        };
+        assert_eq!(key, key);
+        assert_ne!(
+            key,
+            super::UserMappingFrameKey {
+                symbol_source_id: 8,
+                ..key
+            }
+        );
+        assert_ne!(
+            key,
+            super::UserMappingFrameKey {
+                relative_address: 43,
+                ..key
+            }
+        );
+        let mut actual = std::collections::hash_map::DefaultHasher::new();
+        let mut expected = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut actual);
+        (key.symbol_source_id, key.relative_address).hash(&mut expected);
+        assert_eq!(actual.finish(), expected.finish());
+    }
+
+    #[test]
+    fn compact_mapping_cache_keeps_source_address_and_kernel_range_identities_separate() {
+        let mut table = super::MappingFrameTable::default();
+        let keys = [
+            super::MappingFrameKey {
+                symbol_source_id: 1,
+                relative_address: 42,
+                kernel_mapping_range: None,
+            },
+            super::MappingFrameKey {
+                symbol_source_id: 2,
+                relative_address: 42,
+                kernel_mapping_range: None,
+            },
+            super::MappingFrameKey {
+                symbol_source_id: 1,
+                relative_address: 43,
+                kernel_mapping_range: None,
+            },
+            super::MappingFrameKey {
+                symbol_source_id: 1,
+                relative_address: 42,
+                kernel_mapping_range: Some((0x1000, 0x2000)),
+            },
+            super::MappingFrameKey {
+                symbol_source_id: 1,
+                relative_address: 42,
+                kernel_mapping_range: Some((0x1000, 0x3000)),
+            },
+        ];
+        for (index, key) in keys.into_iter().enumerate() {
+            table.insert(
+                key,
+                cached_table_frames(format!("symbol-{index}"), index as u64),
+            );
+        }
+        assert_eq!(table.user.len(), 3);
+        assert_eq!(table.kernel.len(), 2);
+        assert_eq!(table.frames.len(), keys.len());
+        for (index, key) in keys.iter().enumerate() {
+            let frames = table.get(key).unwrap();
+            assert_eq!(frames.frames, [format!("symbol-{index}")]);
+            assert_eq!(frames.base_offset, Some(index as u64));
+        }
+    }
+
+    #[test]
+    fn dense_mapping_frame_slots_survive_growth_and_replace_without_retaining_old_values() {
+        let mut table = super::MappingFrameTable::default();
+        for relative_address in 0..4096_u64 {
+            let key = super::MappingFrameKey {
+                symbol_source_id: 7,
+                relative_address,
+                kernel_mapping_range: None,
+            };
+            table.insert(
+                key,
+                cached_table_frames(format!("symbol-{relative_address}"), relative_address),
+            );
+        }
+        for relative_address in 0..4096_u64 {
+            let key = super::MappingFrameKey {
+                symbol_source_id: 7,
+                relative_address,
+                kernel_mapping_range: None,
+            };
+            assert_eq!(
+                table.get(&key).unwrap().frames,
+                [format!("symbol-{relative_address}")]
+            );
+            table.insert(
+                key,
+                cached_table_frames(format!("replacement-{relative_address}"), relative_address),
+            );
+        }
+        assert_eq!(table.frames.len(), 4096);
+        assert_eq!(table.user.len(), 4096);
+        for relative_address in 0..4096_u64 {
+            let key = super::MappingFrameKey {
+                symbol_source_id: 7,
+                relative_address,
+                kernel_mapping_range: None,
+            };
+            assert_eq!(
+                table.get(&key).unwrap().frames,
+                [format!("replacement-{relative_address}")]
+            );
         }
     }
 
