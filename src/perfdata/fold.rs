@@ -7,8 +7,7 @@ use std::io::{Read, Seek, SeekFrom, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use hashbrown::{HashMap, HashSet};
-use memmap2::{Mmap, MmapOptions};
+use hashbrown::HashMap;
 use rustc_hash::{FxBuildHasher, FxHasher};
 use smallvec::SmallVec;
 
@@ -24,7 +23,6 @@ use crate::perfdata::header::{
 use crate::perfdata::mappings::{
     FileIdentity, MappingResolveCache, MmapTable, ResolvedMappingRef, UserMapping,
 };
-use crate::perfdata::raw_stack::{RawStackAccumulator, RawStackEntryRef};
 use crate::perfdata::records::{
     PERF_RECORD_FINISHED_ROUND, PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_CPUMODE_KERNEL,
     PERF_RECORD_MISC_CPUMODE_MASK, PERF_RECORD_MISC_CPUMODE_USER, PERF_RECORD_MISC_FORK_EXEC,
@@ -33,9 +31,8 @@ use crate::perfdata::records::{
     parse_callchain_deferred_record, parse_cgroup_record, parse_comm_record, parse_exit_record,
     parse_fork_record, parse_itrace_start_record, parse_ksymbol_record, parse_lost_record,
     parse_lost_samples_record, parse_mmap_record, parse_mmap2_build_id_record, parse_mmap2_record,
-    parse_namespaces_record, parse_read_record, parse_record, parse_record_header,
-    parse_switch_cpu_wide_record, parse_switch_record, parse_text_poke_record,
-    parse_throttle_record, parse_unthrottle_record,
+    parse_namespaces_record, parse_read_record, parse_record, parse_switch_cpu_wide_record,
+    parse_switch_record, parse_text_poke_record, parse_throttle_record, parse_unthrottle_record,
 };
 use crate::perfdata::samples::{
     PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_ID,
@@ -43,6 +40,7 @@ use crate::perfdata::samples::{
     PERF_SAMPLE_TIME, SampleLayout, is_kernel_space_frame, is_perf_context_marker,
     is_perf_user_deferred_context_marker, parse_sample_record_callchain,
 };
+use crate::perfdata::source::{FileSource, RecordSource, SliceSource};
 use crate::perfdata::unwind::{
     FramehopUnwinder, PerfArch, PerfUserRegs, UserStackUnwindResult, UserStackUnwinder,
     unwind_aarch64_frame_pointer_stack_like_elfutils,
@@ -53,7 +51,6 @@ use crate::symbols::{
 };
 
 const UNKNOWN_FRAME: &str = "[unknown]";
-const PREFETCH_SYMBOL_REQUEST_BATCH_SIZE: usize = 4096;
 const FOLD_COUNT_STORAGE_LINEAR_GROWTH_THRESHOLD: usize = 64 * 1024 * 1024;
 const FOLD_COUNT_STORAGE_LINEAR_GROWTH_CHUNK: usize = 8 * 1024 * 1024;
 const PROT_EXEC: u32 = 4;
@@ -111,12 +108,7 @@ pub struct PerfSampleStack {
     pub user_stack_dynamic_size: u64,
 }
 
-struct PerfFoldData {
-    mmap_table: MmapTable,
-    raw_stacks: RawStackAccumulator<FoldFrame>,
-}
-
-struct FoldAccumulator {
+struct SessionState {
     process_comms: BTreeMap<u32, String>,
     exec_process_comms: BTreeMap<u32, String>,
     thread_comms: BTreeMap<u32, String>,
@@ -124,7 +116,6 @@ struct FoldAccumulator {
     mapping_cache: MappingResolveCache,
     unwind_states: HashMap<u32, PidUnwindState, FxBuildHasher>,
     header_build_ids: BTreeMap<String, Vec<u8>>,
-    raw_stacks: RawStackAccumulator<FoldFrame>,
     deferred_samples: Vec<DeferredFoldSample>,
     sample_frames: FoldFrameStack,
     unwind_debug_dir: Option<PathBuf>,
@@ -195,12 +186,6 @@ type UnwindMappingKey = (String, u64, u64, u64);
 type UnwindModuleKey = (String, u64);
 const MAX_LIBDW_CALLBACK_REPORT_PASSES: usize = 8;
 
-struct TimedRecord<'a> {
-    index: usize,
-    time: Option<u64>,
-    record: PerfRecord<'a>,
-}
-
 enum FoldRecord<'a> {
     Comm(crate::perfdata::records::CommRecord),
     Mmap {
@@ -224,15 +209,15 @@ enum FoldRecord<'a> {
     Ignored,
 }
 
-struct PendingFoldRecord<'a> {
-    index: usize,
+#[derive(Clone, Copy)]
+struct PendingFoldRecord {
+    offset: usize,
     time: u64,
-    record: FoldRecord<'a>,
 }
 
 #[derive(Default)]
-struct OrderedRecordQueue<'a> {
-    pending_records: Vec<PendingFoldRecord<'a>>,
+struct OrderedRecordQueue {
+    pending_records: Vec<PendingFoldRecord>,
     next_flush_time: Option<u64>,
     max_timestamp: Option<u64>,
 }
@@ -279,7 +264,6 @@ enum FoldFrame {
     SampleIp { address: u64, cpumode: u16 },
     UserUnwind(u64),
     InlineCurrentIp(u64),
-    UnmappedAtSample(u64),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -341,16 +325,9 @@ impl FoldFrame {
             | Self::UserCallchain(address)
             | Self::SampleIp { address, .. }
             | Self::UserUnwind(address)
-            | Self::InlineCurrentIp(address)
-            | Self::UnmappedAtSample(address) => address,
+            | Self::InlineCurrentIp(address) => address,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct PrefetchMappingKey {
-    symbol_source_id: usize,
-    relative_address: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -587,8 +564,10 @@ pub fn fold_perfdata_callchains_with_options(
     bytes: &[u8],
     options: FoldOptions,
 ) -> Result<String, String> {
-    let fold_data = collect_fold_data(bytes, options)?;
-    render_fold_data::<NoopSymbolResolver>(fold_data, None, options.inline)
+    let counts = collect_fold_counts::<NoopSymbolResolver>(bytes, options, None)?;
+    let mut output = Vec::new();
+    write_fold_counts(counts, &mut output)?;
+    String::from_utf8(output).map_err(|error| format!("folded output is not utf-8: {error}"))
 }
 
 /// Collapses perf sample callchains from a `perf.data` file path.
@@ -629,9 +608,11 @@ pub fn fold_perfdata_callchains_with_symbols<R>(
 where
     R: SymbolResolver,
 {
-    let fold_data = collect_fold_data(bytes, options)?;
     let mut symbol_cache = SymbolFrameCache::new(symbol_resolver);
-    render_fold_data(fold_data, Some(&mut symbol_cache), options.inline)
+    let counts = collect_fold_counts(bytes, options, Some(&mut symbol_cache))?;
+    let mut output = Vec::new();
+    write_fold_counts(counts, &mut output)?;
+    String::from_utf8(output).map_err(|error| format!("folded output is not utf-8: {error}"))
 }
 
 /// Collapses symbolized perf sample callchains from a `perf.data` file path.
@@ -821,45 +802,87 @@ fn parse_fold_record(record: PerfRecord<'_>) -> Result<FoldRecord<'_>, String> {
     Ok(parsed)
 }
 
-fn collect_fold_data(bytes: &[u8], options: FoldOptions) -> Result<PerfFoldData, String> {
+fn collect_fold_counts<R>(
+    bytes: &[u8],
+    options: FoldOptions,
+    symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+) -> Result<FoldCounts, String>
+where
+    R: SymbolResolver,
+{
     let header = parse_header(bytes)?;
-    let sample_layouts = sample_layouts(bytes, header)?;
-    let header_build_ids = header_build_ids_by_filename(bytes)?;
+    let layouts = sample_layouts(bytes, header)?;
     let arch = perf_arch_from_header(parse_header_arch(bytes, &header)?.as_deref());
-    let mut accumulator = FoldAccumulator::new(header_build_ids).with_arch(arch);
-    let records = timed_records(bytes, header, &sample_layouts)?;
-    let mut ordered_records = OrderedRecordQueue::default();
+    let mut sink = SampleSink::new(
+        SessionState::new(header_build_ids_by_filename(bytes)?).with_arch(arch),
+        FoldedOutput::new(symbol_cache, options.inline),
+    );
+    replay_records(
+        &mut SliceSource(bytes),
+        header,
+        &layouts,
+        options,
+        &mut sink,
+    )?;
+    Ok(sink.output.counts)
+}
 
-    for timed_record in records {
-        let TimedRecord {
-            index,
-            time,
-            record,
-        } = timed_record?;
-        if record.header.record_type == PERF_RECORD_FINISHED_ROUND {
-            ordered_records.flush_round(&mut accumulator, &sample_layouts, options)?;
-            continue;
-        }
-        let parsed_record = parse_fold_record(record)?;
-        let record_result = ordered_records.apply_or_queue(
-            index,
-            time,
-            parsed_record,
-            &mut accumulator,
-            &sample_layouts,
-            options,
-        );
-        record_result.map_err(|error| {
-            format!(
-                "failed to parse record type {} at offset {}: {error}",
-                record.header.record_type, record.offset
-            )
-        })?;
+fn replay_records<O: SampleOutput>(
+    source: &mut impl RecordSource,
+    header: PerfHeader,
+    layouts: &SampleLayouts,
+    options: FoldOptions,
+    sink: &mut SampleSink<O>,
+) -> Result<(), String> {
+    let mut offset = usize::try_from(header.data_offset)
+        .map_err(|_| "perf data section offset exceeds usize".to_string())?;
+    let size = usize::try_from(header.data_size)
+        .map_err(|_| "perf data section size exceeds usize".to_string())?;
+    let end = offset
+        .checked_add(size)
+        .ok_or_else(|| "perf data section size overflows usize".to_string())?;
+    if end > source.len() {
+        return Err("perf data section extends past end of file".to_string());
     }
-    ordered_records.flush_final(&mut accumulator, &sample_layouts, options)?;
-    accumulator.flush_deferred_samples();
+    let mut ordered = OrderedRecordQueue::default();
+    while offset < end {
+        let record = source.record_at(offset, end)?;
+        let next = offset + usize::from(record.header.size);
+        if record.header.record_type == PERF_RECORD_FINISHED_ROUND {
+            ordered.flush_round_with(|offset| {
+                deliver_record(source, offset, end, layouts, options, sink)
+            })?;
+        } else if let Some(time) =
+            record_time(record, layouts)?.filter(|time| *time != 0 && *time != u64::MAX)
+        {
+            // ordered-events.c rejects zero/~0ULL with -ETIME; session.c then
+            // delivers directly. Ties retain input order (file offset).
+            ordered.queue(offset, time);
+        } else {
+            sink.apply_fold_record(parse_fold_record(record)?, layouts, options)?;
+        }
+        offset = next;
+    }
+    ordered
+        .flush_final_with(|offset| deliver_record(source, offset, end, layouts, options, sink))?;
+    sink.flush_deferred_samples()
+}
 
-    Ok(accumulator.into_fold_data())
+fn deliver_record<O: SampleOutput>(
+    source: &mut impl RecordSource,
+    offset: usize,
+    end: usize,
+    layouts: &SampleLayouts,
+    options: FoldOptions,
+    sink: &mut SampleSink<O>,
+) -> Result<(), String> {
+    let record = source.delivered_record_at(offset, end)?;
+    let record_type = record.header.record_type;
+    let result = parse_fold_record(record)
+        .and_then(|record| sink.apply_fold_record(record, layouts, options));
+    result.map_err(|error| {
+        format!("failed to parse record type {record_type} at offset {offset}: {error}")
+    })
 }
 
 fn header_build_ids_by_filename(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, String> {
@@ -869,58 +892,34 @@ fn header_build_ids_by_filename(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>
         .collect()
 }
 
+fn file_replay_state(file: &File) -> Result<(PerfHeader, SampleLayouts, SessionState), String> {
+    let (header, bytes) = perfdata_header_from_file(file)?;
+    let layouts = sample_layouts_from_file(file, header, &bytes)?;
+    let ids = header_build_ids_by_filename_from_file(file, header, &bytes)?;
+    let arch = perf_arch_from_header(header_arch_from_file(file, header, &bytes)?.as_deref());
+    Ok((header, layouts, SessionState::new(ids).with_arch(arch)))
+}
+
 fn write_folded_perfdata_from_file<R, W>(
     file: &File,
     options: FoldOptions,
-    mut symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+    symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
     writer: &mut W,
 ) -> Result<(), String>
 where
     R: SymbolResolver,
     W: IoWrite + ?Sized,
 {
-    let (header, header_bytes) = perfdata_header_from_file(file)?;
-    let sample_layouts = sample_layouts_from_file(file, header, &header_bytes)?;
-    let header_build_ids = header_build_ids_by_filename_from_file(file, header, &header_bytes)?;
-    let arch =
-        perf_arch_from_header(header_arch_from_file(file, header, &header_bytes)?.as_deref());
-    let mut accumulator = FoldAccumulator::new(header_build_ids).with_arch(arch);
-    let mut counts = FoldCounts::default();
-    let mut ordered_records = OrderedRecordQueue::default();
-    let mapped = map_perfdata_file(file)?;
-    let records = timed_records(&mapped, header, &sample_layouts)?;
-
-    for timed_record in records {
-        let TimedRecord {
-            index,
-            time,
-            record,
-        } = timed_record?;
-        if record.header.record_type == PERF_RECORD_FINISHED_ROUND {
-            ordered_records.flush_round(&mut accumulator, &sample_layouts, options)?;
-            accumulator.drain_fold_counts(
-                &mut counts,
-                symbol_cache.as_deref_mut(),
-                options.inline,
-            )?;
-            continue;
-        }
-
-        let parsed_record = parse_fold_record(record)?;
-        ordered_records.apply_or_queue(
-            index,
-            time,
-            parsed_record,
-            &mut accumulator,
-            &sample_layouts,
-            options,
-        )?;
-    }
-
-    ordered_records.flush_final(&mut accumulator, &sample_layouts, options)?;
-    accumulator.flush_deferred_samples();
-    accumulator.drain_fold_counts(&mut counts, symbol_cache, options.inline)?;
-    write_fold_counts(counts, writer)
+    let (header, layouts, state) = file_replay_state(file)?;
+    let mut sink = SampleSink::new(state, FoldedOutput::new(symbol_cache, options.inline));
+    replay_records(
+        &mut FileSource::new(file)?,
+        header,
+        &layouts,
+        options,
+        &mut sink,
+    )?;
+    write_fold_counts(sink.output.counts, writer)
 }
 
 fn write_inferno_perf_script_from_file<R, W>(
@@ -933,75 +932,113 @@ where
     R: SymbolResolver,
     W: IoWrite + ?Sized,
 {
-    let (header, header_bytes) = perfdata_header_from_file(file)?;
+    let (header, layouts, state) = file_replay_state(file)?;
     ensure_perfdata_has_event_data(header)?;
-    let sample_layouts = sample_layouts_from_file(file, header, &header_bytes)?;
-    let header_build_ids = header_build_ids_by_filename_from_file(file, header, &header_bytes)?;
-    let arch =
-        perf_arch_from_header(header_arch_from_file(file, header, &header_bytes)?.as_deref());
-    let mut sink = PerfScriptSink::new(
-        header_build_ids,
-        symbol_cache,
-        writer,
-        sample_layouts.event_name_width,
-        options.inline,
-        arch,
+    let mut sink = SampleSink::new(
+        state,
+        PerfScriptOutput {
+            symbol_cache,
+            writer,
+            event_name_width: layouts.event_name_width,
+            inline: options.inline,
+        },
     );
-    let mut ordered_records = OrderedRecordQueue::default();
-    let mapped = map_perfdata_file(file)?;
-    let records = timed_records(&mapped, header, &sample_layouts)?;
-
-    for timed_record in records {
-        let TimedRecord {
-            index,
-            time,
-            record,
-        } = timed_record?;
-        if record.header.record_type == PERF_RECORD_FINISHED_ROUND {
-            ordered_records.flush_round_with(|record| {
-                sink.apply_fold_record(record, &sample_layouts, options)
-            })?;
-            continue;
-        }
-
-        let parsed_record = parse_fold_record(record)?;
-        ordered_records.apply_or_queue_with(index, time, parsed_record, |record| {
-            sink.apply_fold_record(record, &sample_layouts, options)
-        })?;
-    }
-
-    ordered_records
-        .flush_final_with(|record| sink.apply_fold_record(record, &sample_layouts, options))?;
-    sink.flush_deferred_samples()
+    replay_records(
+        &mut FileSource::new(file)?,
+        header,
+        &layouts,
+        options,
+        &mut sink,
+    )
 }
 
-struct PerfScriptSink<'io, 'cache, R, W: ?Sized> {
-    accumulator: FoldAccumulator,
+struct FoldedOutput<'a, 'cache, R> {
+    symbol_cache: Option<&'a mut SymbolFrameCache<'cache, R>>,
+    inline: bool,
+    counts: FoldCounts,
+    buffers: FoldedRenderBuffers,
+    frames: FoldFrameStack,
+}
+
+impl<'a, 'cache, R: SymbolResolver> FoldedOutput<'a, 'cache, R> {
+    fn new(symbol_cache: Option<&'a mut SymbolFrameCache<'cache, R>>, inline: bool) -> Self {
+        Self {
+            symbol_cache,
+            inline,
+            counts: FoldCounts::default(),
+            buffers: FoldedRenderBuffers::default(),
+            frames: FoldFrameStack::new(),
+        }
+    }
+}
+
+impl<R: SymbolResolver> SampleOutput for FoldedOutput<'_, '_, R> {
+    fn write_sample_event(
+        &mut self,
+        accumulator: &SessionState,
+        sample: &PreparedFoldSample,
+    ) -> Result<(), String> {
+        self.frames.clear();
+        self.frames.extend(
+            sample
+                .frames
+                .iter()
+                .rev()
+                .copied()
+                .filter(|frame| !is_perf_context_marker(frame.address())),
+        );
+        if let Some(cache) = self.symbol_cache.as_deref_mut() {
+            prefetch_sample_symbols(
+                sample.pid,
+                &self.frames,
+                &accumulator.mmap_table,
+                &mut self.buffers.mapping_cache,
+                cache,
+                self.inline,
+            )?;
+        }
+        let comm = comm_for_ids(&accumulator.thread_comms, sample.tid);
+        FoldFrameResolver::new(&accumulator.mmap_table, self.inline)
+            .render_folded_stack_for_stack(
+                sample.pid,
+                comm.as_deref(),
+                &self.frames,
+                self.symbol_cache.as_deref_mut(),
+                &mut self.buffers,
+            )?;
+        if !self.buffers.rendered.is_empty() {
+            self.counts
+                .add_rendered(&self.buffers.rendered, sample.count);
+        }
+        Ok(())
+    }
+}
+
+trait SampleOutput {
+    fn write_sample_event(
+        &mut self,
+        accumulator: &SessionState,
+        sample: &PreparedFoldSample,
+    ) -> Result<(), String>;
+}
+
+struct SampleSink<O> {
+    accumulator: SessionState,
+    output: O,
+}
+
+struct PerfScriptOutput<'io, 'cache, R, W: ?Sized> {
     symbol_cache: Option<&'io mut SymbolFrameCache<'cache, R>>,
     writer: &'io mut W,
     event_name_width: usize,
     inline: bool,
 }
 
-impl<'io, 'cache, R, W> PerfScriptSink<'io, 'cache, R, W>
-where
-    R: SymbolResolver,
-    W: IoWrite + ?Sized,
-{
-    fn new(
-        header_build_ids: BTreeMap<String, Vec<u8>>,
-        symbol_cache: Option<&'io mut SymbolFrameCache<'cache, R>>,
-        writer: &'io mut W,
-        event_name_width: usize,
-        inline: bool,
-        arch: PerfArch,
-    ) -> Self {
+impl<O: SampleOutput> SampleSink<O> {
+    fn new(accumulator: SessionState, output: O) -> Self {
         Self {
-            accumulator: FoldAccumulator::new(header_build_ids).with_arch(arch),
-            symbol_cache,
-            writer,
-            event_name_width,
-            inline,
+            accumulator,
+            output,
         }
     }
 
@@ -1019,9 +1056,10 @@ where
                 let tid = deferred_callchain_tid(&record.sample_id, sample_layouts);
                 self.write_deferred_callchain(record.cookie, tid, &record.ips)
             }
-            record => self
-                .accumulator
-                .apply_fold_record(record, sample_layouts, options),
+            record => {
+                self.accumulator.apply_metadata(record);
+                Ok(())
+            }
         }
     }
 
@@ -1056,7 +1094,9 @@ where
             });
             return Ok(());
         }
-        self.write_sample_event(&sample)
+        let result = self.output.write_sample_event(&self.accumulator, &sample);
+        self.accumulator.sample_frames = sample.frames;
+        result
     }
 
     fn write_deferred_callchain(
@@ -1080,7 +1120,8 @@ where
                 deferred_cookie: None,
                 has_callchain: sample.has_callchain,
             };
-            self.write_sample_event(&sample)?;
+            self.output.write_sample_event(&self.accumulator, &sample)?;
+            self.accumulator.sample_frames = sample.frames;
         }
         Ok(())
     }
@@ -1099,15 +1140,26 @@ where
                 deferred_cookie: None,
                 has_callchain: sample.has_callchain,
             };
-            self.write_sample_event(&sample)?;
+            self.output.write_sample_event(&self.accumulator, &sample)?;
+            self.accumulator.sample_frames = sample.frames;
         }
         Ok(())
     }
+}
 
-    fn write_sample_event(&mut self, sample: &PreparedFoldSample) -> Result<(), String> {
+impl<R, W> SampleOutput for PerfScriptOutput<'_, '_, R, W>
+where
+    R: SymbolResolver,
+    W: IoWrite + ?Sized,
+{
+    fn write_sample_event(
+        &mut self,
+        accumulator: &SessionState,
+        sample: &PreparedFoldSample,
+    ) -> Result<(), String> {
         if sample.has_callchain {
-            self.write_sample_header(sample)?;
-            let frame_resolver = FoldFrameResolver::new(&self.accumulator.mmap_table, self.inline);
+            self.write_sample_header(accumulator, sample)?;
+            let frame_resolver = FoldFrameResolver::new(&accumulator.mmap_table, self.inline);
             frame_resolver.write_script_frames_for_stack(
                 sample.pid,
                 &sample.frames,
@@ -1115,8 +1167,8 @@ where
                 self.writer,
             )?;
         } else {
-            self.write_sample_inline_header(sample)?;
-            let frame_resolver = FoldFrameResolver::new(&self.accumulator.mmap_table, self.inline);
+            self.write_sample_inline_header(accumulator, sample)?;
+            let frame_resolver = FoldFrameResolver::new(&accumulator.mmap_table, self.inline);
             frame_resolver.write_inline_sample_frame_for_stack(
                 sample.pid,
                 &sample.frames,
@@ -1128,9 +1180,19 @@ where
             .write_all(b"\n")
             .map_err(|error| format!("failed to write perf script output: {error}"))
     }
+}
 
-    fn write_sample_header(&mut self, sample: &PreparedFoldSample) -> Result<(), String> {
-        let comm = perf_script_comm(&self.accumulator.thread_comms, sample);
+impl<R, W> PerfScriptOutput<'_, '_, R, W>
+where
+    R: SymbolResolver,
+    W: IoWrite + ?Sized,
+{
+    fn write_sample_header(
+        &mut self,
+        accumulator: &SessionState,
+        sample: &PreparedFoldSample,
+    ) -> Result<(), String> {
+        let comm = perf_script_comm(&accumulator.thread_comms, sample);
         write!(self.writer, "{comm} ")
             .map_err(|error| format!("failed to write perf script output: {error}"))?;
         if let Some(tid) = sample.tid.or(sample.pid) {
@@ -1161,8 +1223,12 @@ where
         .map_err(|error| format!("failed to write perf script output: {error}"))
     }
 
-    fn write_sample_inline_header(&mut self, sample: &PreparedFoldSample) -> Result<(), String> {
-        let comm = perf_script_comm(&self.accumulator.thread_comms, sample);
+    fn write_sample_inline_header(
+        &mut self,
+        accumulator: &SessionState,
+        sample: &PreparedFoldSample,
+    ) -> Result<(), String> {
+        let comm = perf_script_comm(&accumulator.thread_comms, sample);
         write!(self.writer, "{comm:>16} ")
             .map_err(|error| format!("failed to write perf script output: {error}"))?;
         if let Some(tid) = sample.tid.or(sample.pid) {
@@ -1209,62 +1275,16 @@ fn perf_script_comm<'a>(
     Cow::Borrowed(":-1")
 }
 
-impl<'a> OrderedRecordQueue<'a> {
-    fn apply_or_queue_with<F>(
-        &mut self,
-        index: usize,
-        time: Option<u64>,
-        record: FoldRecord<'a>,
-        mut apply: F,
-    ) -> Result<(), String>
-    where
-        F: FnMut(FoldRecord<'a>) -> Result<(), String>,
-    {
-        if let Some(time) = time {
-            self.queue(index, time, record);
-            Ok(())
-        } else {
-            apply(record)
-        }
-    }
-
-    fn apply_or_queue(
-        &mut self,
-        index: usize,
-        time: Option<u64>,
-        record: FoldRecord<'a>,
-        accumulator: &mut FoldAccumulator,
-        sample_layouts: &SampleLayouts,
-        options: FoldOptions,
-    ) -> Result<(), String> {
-        self.apply_or_queue_with(index, time, record, |record| {
-            accumulator.apply_fold_record(record, sample_layouts, options)
-        })
-    }
-
-    fn queue(&mut self, index: usize, time: u64, record: FoldRecord<'a>) {
+impl OrderedRecordQueue {
+    fn queue(&mut self, offset: usize, time: u64) {
         self.max_timestamp = Some(self.max_timestamp.map_or(time, |max| max.max(time)));
-        self.pending_records.push(PendingFoldRecord {
-            index,
-            time,
-            record,
-        });
-    }
-
-    fn flush_round(
-        &mut self,
-        accumulator: &mut FoldAccumulator,
-        sample_layouts: &SampleLayouts,
-        options: FoldOptions,
-    ) -> Result<(), String> {
-        self.flush_round_with(|record| {
-            accumulator.apply_fold_record(record, sample_layouts, options)
-        })
+        self.pending_records
+            .push(PendingFoldRecord { offset, time });
     }
 
     fn flush_round_with<F>(&mut self, apply: F) -> Result<(), String>
     where
-        F: FnMut(FoldRecord<'a>) -> Result<(), String>,
+        F: FnMut(usize) -> Result<(), String>,
     {
         if let Some(limit) = self.next_flush_time {
             self.flush_through_with(Some(limit), apply)?;
@@ -1273,36 +1293,25 @@ impl<'a> OrderedRecordQueue<'a> {
         Ok(())
     }
 
-    fn flush_final(
-        &mut self,
-        accumulator: &mut FoldAccumulator,
-        sample_layouts: &SampleLayouts,
-        options: FoldOptions,
-    ) -> Result<(), String> {
-        self.flush_final_with(|record| {
-            accumulator.apply_fold_record(record, sample_layouts, options)
-        })
-    }
-
     fn flush_final_with<F>(&mut self, apply: F) -> Result<(), String>
     where
-        F: FnMut(FoldRecord<'a>) -> Result<(), String>,
+        F: FnMut(usize) -> Result<(), String>,
     {
         self.flush_through_with(None, apply)
     }
 
     fn flush_through_with<F>(&mut self, limit: Option<u64>, mut apply: F) -> Result<(), String>
     where
-        F: FnMut(FoldRecord<'a>) -> Result<(), String>,
+        F: FnMut(usize) -> Result<(), String>,
     {
         self.pending_records
-            .sort_by_key(|record| (record.time, record.index));
+            .sort_unstable_by_key(|record| (record.time, record.offset));
         let split = limit.map_or(self.pending_records.len(), |limit| {
             self.pending_records
                 .partition_point(|record| record.time <= limit)
         });
-        for pending_record in self.pending_records.drain(..split) {
-            apply(pending_record.record)?;
+        for record in self.pending_records.drain(..split) {
+            apply(record.offset)?;
         }
         Ok(())
     }
@@ -1333,11 +1342,6 @@ fn ensure_perfdata_has_event_data(header: PerfHeader) -> Result<(), String> {
         );
     }
     Ok(())
-}
-
-fn map_perfdata_file(file: &File) -> Result<Mmap, String> {
-    unsafe { MmapOptions::new().map(file) }
-        .map_err(|error| format!("failed to memory-map perf.data: {error}"))
 }
 
 fn sample_layouts_from_file(
@@ -1566,7 +1570,7 @@ fn hex_build_id_bytes(hex: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
-impl FoldAccumulator {
+impl SessionState {
     fn new(header_build_ids: BTreeMap<String, Vec<u8>>) -> Self {
         Self {
             process_comms: BTreeMap::new(),
@@ -1576,7 +1580,6 @@ impl FoldAccumulator {
             mapping_cache: MappingResolveCache::default(),
             unwind_states: HashMap::with_hasher(FxBuildHasher),
             header_build_ids,
-            raw_stacks: RawStackAccumulator::<FoldFrame>::new(),
             deferred_samples: Vec::new(),
             sample_frames: FoldFrameStack::new(),
             unwind_debug_dir: current_perf_debug_dir(),
@@ -1590,73 +1593,18 @@ impl FoldAccumulator {
     }
 
     #[cfg(test)]
-    fn apply_record(
-        &mut self,
-        record: ParsedRecord,
-        sample_layouts: &SampleLayouts,
-        options: FoldOptions,
-    ) -> Result<(), String> {
-        match record {
-            ParsedRecord::Comm(record) => {
-                update_comm_tables(
-                    &mut self.process_comms,
-                    &mut self.exec_process_comms,
-                    &mut self.thread_comms,
-                    &record,
-                );
-                Ok(())
-            }
-            ParsedRecord::Mmap(record) => {
-                self.invalidate_pid_unwinder_if_mapping_overlaps_like_perf(
-                    record.pid,
-                    record.start,
-                    record.len,
-                );
-                self.mmap_table.insert_mmap(record);
-                self.mapping_cache = MappingResolveCache::default();
-                Ok(())
-            }
-            ParsedRecord::Sample(record) => {
-                parse_sample_for_fold(self, record.misc, &record.payload, sample_layouts, options)
-            }
-            ParsedRecord::CallchainDeferred(record) => {
-                let tid = deferred_callchain_tid(&record.sample_id, sample_layouts);
-                self.add_deferred_callchain(record.cookie, tid, &record.ips);
-                Ok(())
-            }
-            ParsedRecord::Mmap2(record) => {
-                self.invalidate_pid_unwinder_if_mapping_overlaps_like_perf(
-                    record.pid,
-                    record.start,
-                    record.len,
-                );
-                let build_id = self.header_build_ids.get(&record.path).cloned();
-                if let Some(build_id) = build_id {
-                    self.mmap_table
-                        .insert_mmap2_with_build_id(record, Some(build_id));
-                } else {
-                    self.mmap_table.insert_mmap2(record);
-                }
-                self.mapping_cache = MappingResolveCache::default();
-                Ok(())
-            }
+    fn apply_record(&mut self, record: ParsedRecord) {
+        let record = match record {
+            ParsedRecord::Comm(record) => FoldRecord::Comm(record),
+            ParsedRecord::Mmap(record) => FoldRecord::Mmap { misc: 0, record },
+            ParsedRecord::Mmap2(record) => FoldRecord::Mmap2 { misc: 0, record },
             ParsedRecord::Mmap2BuildId { misc, record } => {
-                self.invalidate_pid_unwinder_if_mapping_overlaps_like_perf(
-                    record.pid,
-                    record.start,
-                    record.len,
-                );
-                self.mmap_table
-                    .insert_mmap2_build_id_with_misc(record, misc);
-                self.mapping_cache = MappingResolveCache::default();
-                Ok(())
+                FoldRecord::Mmap2BuildId { misc, record }
             }
-            ParsedRecord::Fork(record) => {
-                self.apply_fork_record(record);
-                Ok(())
-            }
-            _ => Ok(()),
-        }
+            ParsedRecord::Fork(record) => FoldRecord::Fork(record),
+            _ => panic!("test adapter accepts only session metadata"),
+        };
+        self.apply_metadata(record);
     }
 
     fn apply_fork_record(&mut self, record: crate::perfdata::records::ForkRecord) {
@@ -1670,13 +1618,6 @@ impl FoldAccumulator {
         if record.clone_maps {
             self.mmap_table.clone_pid_mappings(record.ppid, record.pid);
             self.mapping_cache = MappingResolveCache::default();
-        }
-    }
-
-    fn into_fold_data(self) -> PerfFoldData {
-        PerfFoldData {
-            mmap_table: self.mmap_table,
-            raw_stacks: self.raw_stacks,
         }
     }
 
@@ -1703,73 +1644,6 @@ impl FoldAccumulator {
             self.unwind_states.remove(&pid);
         }
     }
-}
-
-fn timed_records<'a>(
-    bytes: &'a [u8],
-    header: PerfHeader,
-    sample_layouts: &'a SampleLayouts,
-) -> Result<impl Iterator<Item = Result<TimedRecord<'a>, String>> + 'a, String> {
-    let mut offset = usize::try_from(header.data_offset)
-        .map_err(|_| "perf data section offset exceeds usize".to_string())?;
-    let data_size = usize::try_from(header.data_size)
-        .map_err(|_| "perf data section size exceeds usize".to_string())?;
-    let end = offset
-        .checked_add(data_size)
-        .ok_or_else(|| "perf data section size overflows usize".to_string())?;
-    if end > bytes.len() {
-        return Err("perf data section extends past end of file".to_string());
-    }
-
-    let mut index = 0usize;
-    // perf's session.c processes each record as it is read; only ordered
-    // events are retained until the next round flush.
-    Ok(std::iter::from_fn(move || {
-        if offset >= end {
-            return None;
-        }
-        let result = (|| {
-            let payload_start = offset
-                .checked_add(8)
-                .ok_or_else(|| format!("perf record header overflows at offset {offset}"))?;
-            let header = parse_record_header(
-                bytes
-                    .get(offset..payload_start)
-                    .ok_or_else(|| format!("truncated perf record header at offset {offset}"))?,
-            )?;
-            let size = usize::from(header.size);
-            if size < 8 {
-                return Err(format!(
-                    "invalid perf record size {size} at offset {offset}"
-                ));
-            }
-            let next = offset
-                .checked_add(size)
-                .ok_or_else(|| format!("perf record size overflows at offset {offset}"))?;
-            if next > end {
-                return Err(format!(
-                    "perf record overruns data section at offset {offset}"
-                ));
-            }
-            let record = PerfRecord {
-                offset,
-                header,
-                payload: &bytes[payload_start..next],
-            };
-            let timed = TimedRecord {
-                index,
-                time: record_time(record, sample_layouts)?,
-                record,
-            };
-            index += 1;
-            offset = next;
-            Ok(timed)
-        })();
-        if result.is_err() {
-            offset = end;
-        }
-        Some(result)
-    }))
 }
 
 fn record_time(
@@ -1894,13 +1768,8 @@ fn upsert_comm(map: &mut BTreeMap<u32, String>, id: u32, comm: &str) {
     }
 }
 
-impl FoldAccumulator {
-    fn apply_fold_record(
-        &mut self,
-        record: FoldRecord<'_>,
-        sample_layouts: &SampleLayouts,
-        options: FoldOptions,
-    ) -> Result<(), String> {
+impl SessionState {
+    fn apply_metadata(&mut self, record: FoldRecord<'_>) {
         match record {
             FoldRecord::Comm(record) => {
                 update_comm_tables(
@@ -1909,7 +1778,6 @@ impl FoldAccumulator {
                     &mut self.thread_comms,
                     &record,
                 );
-                Ok(())
             }
             FoldRecord::Mmap { misc, record } => {
                 self.invalidate_pid_unwinder_if_mapping_overlaps_like_perf(
@@ -1919,15 +1787,6 @@ impl FoldAccumulator {
                 );
                 self.mmap_table.insert_mmap_with_misc(record, misc);
                 self.mapping_cache = MappingResolveCache::default();
-                Ok(())
-            }
-            FoldRecord::Sample { misc, payload } => {
-                parse_sample_for_fold(self, misc, payload, sample_layouts, options)
-            }
-            FoldRecord::CallchainDeferred(record) => {
-                let tid = deferred_callchain_tid(&record.sample_id, sample_layouts);
-                self.add_deferred_callchain(record.cookie, tid, &record.ips);
-                Ok(())
             }
             FoldRecord::Mmap2 { misc, record } => {
                 self.invalidate_pid_unwinder_if_mapping_overlaps_like_perf(
@@ -1946,7 +1805,6 @@ impl FoldAccumulator {
                     self.mmap_table.insert_mmap2_with_misc(record, misc);
                 }
                 self.mapping_cache = MappingResolveCache::default();
-                Ok(())
             }
             FoldRecord::Mmap2BuildId { misc, record } => {
                 self.invalidate_pid_unwinder_if_mapping_overlaps_like_perf(
@@ -1957,13 +1815,14 @@ impl FoldAccumulator {
                 self.mmap_table
                     .insert_mmap2_build_id_with_misc(record, misc);
                 self.mapping_cache = MappingResolveCache::default();
-                Ok(())
             }
             FoldRecord::Fork(record) => {
                 self.apply_fork_record(record);
-                Ok(())
             }
-            FoldRecord::Ignored => Ok(()),
+            FoldRecord::Ignored => {}
+            FoldRecord::Sample { .. } | FoldRecord::CallchainDeferred(_) => {
+                unreachable!("samples are delivered by the replay sink")
+            }
         }
     }
 }
@@ -1992,40 +1851,7 @@ fn inherit_fork_comm_tables(
     }
 }
 
-fn add_fold_stack(
-    pid: Option<u32>,
-    comm: Option<&str>,
-    count: u64,
-    frames: &[FoldFrame],
-    mmap_table: &MmapTable,
-    mapping_cache: &mut MappingResolveCache,
-    raw_stacks: &mut RawStackAccumulator<FoldFrame>,
-) {
-    let mut filtered_frames = frames.iter().rev().copied().filter_map(|frame| {
-        if is_perf_context_marker(frame.address()) {
-            return None;
-        }
-        Some(
-            if resolve_frame_mapping_ref(mmap_table, pid, frame, mapping_cache).is_none() {
-                FoldFrame::UnmappedAtSample(frame.address())
-            } else {
-                frame
-            },
-        )
-    });
-    let Some(first_frame) = filtered_frames.next() else {
-        return;
-    };
-    raw_stacks.add_iter_with_borrowed_comm(
-        pid,
-        comm,
-        std::iter::once(first_frame).chain(filtered_frames),
-        count,
-        frames.len(),
-    );
-}
-
-impl FoldAccumulator {
+impl SessionState {
     fn ensure_unwind_mapping_for_ip(&mut self, pid: Option<u32>, ip: u64) {
         let Some(pid) = pid else {
             return;
@@ -2052,37 +1878,6 @@ impl FoldAccumulator {
             mapping,
             unwind_debug_dir.as_deref(),
         );
-    }
-
-    fn add_deferred_callchain(&mut self, cookie: u64, tid: Option<u32>, ips: &[u64]) {
-        for sample in self.take_resolved_deferred_samples(cookie, tid, ips) {
-            let comm = comm_for_ids(&self.thread_comms, sample.tid);
-            add_fold_stack(
-                sample.pid,
-                comm.as_deref(),
-                sample.count,
-                &sample.frames,
-                &self.mmap_table,
-                &mut self.mapping_cache,
-                &mut self.raw_stacks,
-            );
-        }
-    }
-
-    fn flush_deferred_samples(&mut self) {
-        let samples = self.take_deferred_samples();
-        for sample in samples {
-            let comm = comm_for_ids(&self.thread_comms, sample.tid);
-            add_fold_stack(
-                sample.pid,
-                comm.as_deref(),
-                sample.count,
-                &sample.frames,
-                &self.mmap_table,
-                &mut self.mapping_cache,
-                &mut self.raw_stacks,
-            );
-        }
     }
 
     fn take_deferred_samples(&mut self) -> Vec<DeferredFoldSample> {
@@ -2141,26 +1936,6 @@ impl FoldAccumulator {
                 mapping.pgoff,
             ))
     }
-
-    fn drain_fold_counts<R>(
-        &mut self,
-        counts: &mut FoldCounts,
-        symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
-        inline: bool,
-    ) -> Result<(), String>
-    where
-        R: SymbolResolver,
-    {
-        accumulate_fold_counts(
-            &self.raw_stacks,
-            &self.mmap_table,
-            counts,
-            symbol_cache,
-            inline,
-        )?;
-        self.raw_stacks.clear_preserving_capacity();
-        Ok(())
-    }
 }
 
 fn is_valid_unwound_user_frame(
@@ -2181,111 +1956,6 @@ fn comm_for_ids(thread_comms: &BTreeMap<u32, String>, tid: Option<u32>) -> Optio
         || Cow::Owned(format!(":{tid}")),
         |comm| Cow::Borrowed(comm.as_str()),
     ))
-}
-
-fn render_fold_data<R>(
-    fold_data: PerfFoldData,
-    symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
-    inline: bool,
-) -> Result<String, String>
-where
-    R: SymbolResolver,
-{
-    let mut folded = Vec::new();
-    write_fold_data(fold_data, symbol_cache, inline, &mut folded)?;
-    String::from_utf8(folded).map_err(|error| format!("folded output is not utf-8: {error}"))
-}
-
-fn write_fold_data<R, W>(
-    fold_data: PerfFoldData,
-    symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
-    inline: bool,
-    writer: &mut W,
-) -> Result<(), String>
-where
-    R: SymbolResolver,
-    W: IoWrite + ?Sized,
-{
-    let PerfFoldData {
-        mmap_table,
-        raw_stacks,
-    } = fold_data;
-    let mut counts = FoldCounts::default();
-    accumulate_fold_counts(&raw_stacks, &mmap_table, &mut counts, symbol_cache, inline)?;
-    write_fold_counts(counts, writer)
-}
-
-fn prefetch_symbols<R>(
-    raw_stacks: &[RawStackEntryRef<'_, FoldFrame>],
-    mmap_table: &MmapTable,
-    symbol_cache: &mut SymbolFrameCache<'_, R>,
-    inline: bool,
-) -> Result<(), String>
-where
-    R: SymbolResolver,
-{
-    let mut batches = SymbolPrefetchBatches::new();
-    let mut callchain = Vec::new();
-    let mut mapping_cache = MappingResolveCache::default();
-    for stack in raw_stacks {
-        extend_symbol_mappings_for_stack(
-            stack.pid(),
-            stack.callchain(&mut callchain),
-            mmap_table,
-            &mut mapping_cache,
-            &mut batches,
-            inline,
-        );
-        if batches.full_mappings.len() >= PREFETCH_SYMBOL_REQUEST_BATCH_SIZE {
-            symbol_cache.prefetch_mapping_refs(&batches.full_mappings)?;
-            batches.full_mappings.clear();
-            batches.seen_full.clear();
-        }
-        if batches.base_mappings.len() >= PREFETCH_SYMBOL_REQUEST_BATCH_SIZE {
-            symbol_cache.prefetch_base_mapping_refs(&batches.base_mappings)?;
-            batches.base_mappings.clear();
-            batches.seen_base.clear();
-        }
-    }
-    if !batches.full_mappings.is_empty() {
-        symbol_cache.prefetch_mapping_refs(&batches.full_mappings)?;
-    }
-    if !batches.base_mappings.is_empty() {
-        symbol_cache.prefetch_base_mapping_refs(&batches.base_mappings)?;
-    }
-    Ok(())
-}
-
-fn accumulate_fold_counts<R>(
-    raw_stacks: &RawStackAccumulator<FoldFrame>,
-    mmap_table: &MmapTable,
-    counts: &mut FoldCounts,
-    mut symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
-    inline: bool,
-) -> Result<(), String>
-where
-    R: SymbolResolver,
-{
-    let raw_stacks = raw_stacks.sorted_entries();
-    if let Some(cache) = symbol_cache.as_deref_mut() {
-        prefetch_symbols(&raw_stacks, mmap_table, cache, inline)?;
-    }
-    let frame_resolver = FoldFrameResolver::new(mmap_table, inline);
-    let mut callchain = Vec::new();
-    let mut buffers = FoldedRenderBuffers::default();
-    for stack in raw_stacks {
-        frame_resolver.render_folded_stack_for_stack(
-            stack.pid(),
-            stack.comm(),
-            stack.callchain(&mut callchain),
-            symbol_cache.as_deref_mut(),
-            &mut buffers,
-        )?;
-        if !buffers.rendered.is_empty() {
-            counts.add_rendered(buffers.rendered.as_str(), stack.count());
-        }
-    }
-    Ok(())
 }
 
 fn write_fold_counts<W>(counts: FoldCounts, writer: &mut W) -> Result<(), String>
@@ -2322,56 +1992,38 @@ where
     writeln!(writer, "{count}").map_err(|error| format!("failed to write folded output: {error}"))
 }
 
-struct SymbolPrefetchBatches<'a> {
-    full_mappings: Vec<ResolvedMappingRef<'a>>,
-    base_mappings: Vec<ResolvedMappingRef<'a>>,
-    seen_full: HashSet<PrefetchMappingKey, FxBuildHasher>,
-    seen_base: HashSet<PrefetchMappingKey, FxBuildHasher>,
-}
-
-impl SymbolPrefetchBatches<'_> {
-    fn new() -> Self {
-        Self {
-            full_mappings: Vec::new(),
-            base_mappings: Vec::new(),
-            seen_full: HashSet::with_hasher(FxBuildHasher),
-            seen_base: HashSet::with_hasher(FxBuildHasher),
-        }
-    }
-}
-
-fn extend_symbol_mappings_for_stack<'a>(
+fn prefetch_sample_symbols<R: SymbolResolver>(
     pid: Option<u32>,
-    callchain: &[FoldFrame],
-    mmap_table: &'a MmapTable,
+    frames: &[FoldFrame],
+    mappings: &MmapTable,
     mapping_cache: &mut MappingResolveCache,
-    batches: &mut SymbolPrefetchBatches<'a>,
+    cache: &mut SymbolFrameCache<'_, R>,
     inline: bool,
-) {
-    for frame in callchain {
-        let address = frame.address();
-        if let Some(mapping) = resolve_frame_mapping_ref(mmap_table, pid, *frame, mapping_cache)
-            .filter(|mapping| !is_kernel_space_frame(address) || is_kernel_mapping_ref(mapping))
+) -> Result<(), String> {
+    let mut full = SmallVec::<[ResolvedMappingRef<'_>; 16]>::new();
+    let mut base = SmallVec::<[ResolvedMappingRef<'_>; 16]>::new();
+    for frame in frames {
+        if let Some(mapping) = resolve_frame_mapping_ref(mappings, pid, *frame, mapping_cache)
+            .filter(|mapping| {
+                !is_kernel_space_frame(frame.address()) || is_kernel_mapping_ref(mapping)
+            })
         {
-            let key = PrefetchMappingKey {
-                symbol_source_id: mapping.symbol_source_id,
-                relative_address: mapping.relative_address,
-            };
-            // The base-only mode is retained for low-level renderer tests and
-            // specialized callers. The CLI parity path keeps inline on for
-            // recorded callchain entries because perf's machine.c unwind_entry()
-            // runs append_inlines() on accepted entries. No-callchain SampleIp
-            // frames are different: builtin-script.c process_event() prints the
-            // event-line IP with machine__resolve()/map__find_symbol().
-            if !inline || matches!(frame, FoldFrame::SampleIp { .. }) {
-                if batches.seen_base.insert(key) {
-                    batches.base_mappings.push(mapping);
-                }
-            } else if batches.seen_full.insert(key) {
-                batches.full_mappings.push(mapping);
+            if inline && !matches!(frame, FoldFrame::SampleIp { .. }) {
+                full.push(mapping);
+            } else {
+                base.push(mapping);
             }
         }
     }
+    // Batch only the currently delivered sample. Future samples may observe a
+    // different map; SymbolFrameCache deduplicates already resolved addresses.
+    if !full.is_empty() {
+        cache.prefetch_mapping_refs(&full)?;
+    }
+    if !base.is_empty() {
+        cache.prefetch_base_mapping_refs(&base)?;
+    }
+    Ok(())
 }
 
 struct FoldFrameResolver<'a> {
@@ -2407,7 +2059,6 @@ fn resolve_frame_mapping_ref<'a>(
         | FoldFrame::InlineCurrentIp(_) => {
             mmap_table.resolve_user_pid_ref_cached(pid, address, mapping_cache)
         }
-        FoldFrame::UnmappedAtSample(_) => None,
     }
 }
 
@@ -3381,48 +3032,8 @@ fn perf_user_reg_value(mask: u64, values: &[u64], register: u32) -> Option<u64> 
     values.get(index).copied()
 }
 
-fn parse_sample_for_fold(
-    accumulator: &mut FoldAccumulator,
-    misc: u16,
-    payload: &[u8],
-    sample_layouts: &SampleLayouts,
-    options: FoldOptions,
-) -> Result<(), String> {
-    let Some(sample) =
-        prepare_sample_for_fold(accumulator, misc, payload, sample_layouts, options)?
-    else {
-        return Ok(());
-    };
-    if let Some(cookie) = sample.deferred_cookie {
-        accumulator.deferred_samples.push(DeferredFoldSample {
-            cookie,
-            pid: sample.pid,
-            tid: sample.tid,
-            time: sample.time,
-            cpu: sample.cpu,
-            event_name: sample.event_name,
-            count: sample.count,
-            frames: sample.frames,
-            has_callchain: sample.has_callchain,
-        });
-    } else {
-        let comm = comm_for_ids(&accumulator.thread_comms, sample.tid);
-        add_fold_stack(
-            sample.pid,
-            comm.as_deref(),
-            sample.count,
-            &sample.frames,
-            &accumulator.mmap_table,
-            &mut accumulator.mapping_cache,
-            &mut accumulator.raw_stacks,
-        );
-        accumulator.sample_frames = sample.frames;
-    }
-    Ok(())
-}
-
 fn prepare_sample_for_fold(
-    accumulator: &mut FoldAccumulator,
+    accumulator: &mut SessionState,
     misc: u16,
     payload: &[u8],
     sample_layouts: &SampleLayouts,
@@ -3510,7 +3121,7 @@ fn extend_recorded_callchain_frames_like_perf(
 }
 
 fn append_perf_user_unwind_frames(
-    accumulator: &mut FoldAccumulator,
+    accumulator: &mut SessionState,
     misc: u16,
     event: &SampleEventLayout,
     sample: &crate::perfdata::samples::SampleCallchain<'_>,
@@ -3542,7 +3153,7 @@ fn append_perf_user_unwind_frames(
 }
 
 fn build_user_unwind_context(
-    accumulator: &FoldAccumulator,
+    accumulator: &SessionState,
     misc: u16,
     event: &SampleEventLayout,
     sample: &crate::perfdata::samples::SampleCallchain<'_>,
@@ -3571,7 +3182,7 @@ fn build_user_unwind_context(
 }
 
 fn initial_ip_mapping_state(
-    accumulator: &FoldAccumulator,
+    accumulator: &SessionState,
     pid: Option<u32>,
     ip: u64,
 ) -> InitialIpMappingState {
@@ -3585,7 +3196,7 @@ fn initial_ip_mapping_state(
     }
 }
 
-fn loaded_unwind_module_count(accumulator: &FoldAccumulator, pid: Option<u32>) -> usize {
+fn loaded_unwind_module_count(accumulator: &SessionState, pid: Option<u32>) -> usize {
     pid.and_then(|pid| accumulator.unwind_states.get(&pid))
         .map_or(0, |state| state.object_unwinder.module_count())
 }
@@ -3622,7 +3233,7 @@ fn sample_callchain_state(
 }
 
 fn unwind_user_stack_like_perf(
-    accumulator: &mut FoldAccumulator,
+    accumulator: &mut SessionState,
     sample: &crate::perfdata::samples::SampleCallchain<'_>,
     regs: &PerfUserRegs,
     context: UserUnwindContext,
@@ -3642,7 +3253,7 @@ fn unwind_user_stack_like_perf(
 }
 
 fn unwind_object_stack_like_perf(
-    accumulator: &mut FoldAccumulator,
+    accumulator: &mut SessionState,
     pid: Option<u32>,
     regs: &PerfUserRegs,
     stack_bytes: &[u8],
@@ -4479,97 +4090,43 @@ mod tests {
     use crate::symbols::{ResolvedSymbolFrames, SymbolFrameCache, SymbolRequest, SymbolResolver};
 
     #[test]
-    fn timed_records_deliver_valid_events_before_later_invalid_header_like_perf_session() {
-        let mut bytes = Vec::new();
-        for size in [8_u16, 4] {
-            bytes.extend_from_slice(&super::PERF_RECORD_FINISHED_ROUND.to_le_bytes());
-            bytes.extend_from_slice(&0_u16.to_le_bytes());
-            bytes.extend_from_slice(&size.to_le_bytes());
-        }
-        let header = super::PerfHeader {
-            header_size: 0,
-            attr_offset: 0,
-            attr_size: 0,
-            data_offset: 0,
-            data_size: bytes.len() as u64,
-        };
-
+    fn ordered_backlog_retains_only_timestamp_and_record_location() {
         assert!(
-            super::timed_records(&bytes, header, &super::SampleLayouts::default()).is_ok(),
-            "the first record should be available before the later header is parsed"
+            std::mem::size_of::<super::PendingFoldRecord>() <= 24,
+            "ordering must not retain decoded records or sample payloads: {} bytes",
+            std::mem::size_of::<super::PendingFoldRecord>()
         );
-        let layouts = super::SampleLayouts::default();
-        let mut records = super::timed_records(&bytes, header, &layouts).unwrap();
-        let first = records.next().unwrap().unwrap();
-        assert_eq!(first.index, 0);
-        assert_eq!(first.record.offset, 0);
-        assert_eq!(
-            first.record.header.record_type,
-            super::PERF_RECORD_FINISHED_ROUND
-        );
-        assert_eq!(first.time, None);
-        assert_eq!(
-            records.next().unwrap().err().unwrap(),
-            "invalid perf record size 4 at offset 8"
-        );
-        assert!(records.next().is_none());
-        assert!(records.next().is_none());
     }
 
     #[test]
-    fn timed_records_preserve_file_order_indices_and_payload_boundaries() {
-        let mut bytes = vec![0; 8];
-        for payload in [b"abcd", b"efgh"] {
-            bytes.extend_from_slice(&super::PERF_RECORD_FINISHED_ROUND.to_le_bytes());
-            bytes.extend_from_slice(&0_u16.to_le_bytes());
-            bytes.extend_from_slice(&12_u16.to_le_bytes());
-            bytes.extend_from_slice(payload);
-        }
-        let header = super::PerfHeader {
-            header_size: 0,
-            attr_offset: 0,
-            attr_size: 0,
-            data_offset: 8,
-            data_size: 24,
-        };
-        let layouts = super::SampleLayouts::default();
-        let mut records = super::timed_records(&bytes, header, &layouts).unwrap();
-        for (index, payload) in [b"abcd", b"efgh"].into_iter().enumerate() {
-            let record = records.next().unwrap().unwrap();
-            assert_eq!(record.index, index);
-            assert_eq!(record.record.offset, 8 + index * 12);
-            assert_eq!(record.record.payload, payload);
-        }
-        assert!(records.next().is_none());
-    }
-
-    #[test]
-    fn timed_records_reject_section_overrun_and_end_after_record_overrun() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&super::PERF_RECORD_FINISHED_ROUND.to_le_bytes());
-        bytes.extend_from_slice(&0_u16.to_le_bytes());
-        bytes.extend_from_slice(&16_u16.to_le_bytes());
-        let mut header = super::PerfHeader {
-            header_size: 0,
-            attr_offset: 0,
-            attr_size: 0,
-            data_offset: 0,
-            data_size: 16,
-        };
-        let layouts = super::SampleLayouts::default();
-        assert_eq!(
-            super::timed_records(&bytes, header, &layouts)
-                .err()
-                .unwrap(),
-            "perf data section extends past end of file"
-        );
-        header.data_size = 8;
-        let mut records = super::timed_records(&bytes, header, &layouts).unwrap();
-        assert_eq!(
-            records.next().unwrap().err().unwrap(),
-            "perf record overruns data section at offset 0"
-        );
-        assert!(records.next().is_none());
+    fn ordered_delivery_preserves_ties_and_one_round_lag_like_perf() {
+        let mut queue = super::OrderedRecordQueue::default();
+        queue.queue(24, 10);
+        queue.queue(8, 10);
+        queue.queue(16, 20);
+        let mut delivered = Vec::new();
+        queue
+            .flush_round_with(|offset| {
+                delivered.push(offset);
+                Ok(())
+            })
+            .unwrap();
+        assert!(delivered.is_empty());
+        queue.queue(32, 30);
+        queue
+            .flush_round_with(|offset| {
+                delivered.push(offset);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(delivered, [8, 24, 16]);
+        queue
+            .flush_final_with(|offset| {
+                delivered.push(offset);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(delivered, [8, 24, 16, 32]);
     }
 
     // tools/perf/util/header.c write_event_desc: nre(u32), attr_sz(u32), then
@@ -4895,41 +4452,28 @@ mod tests {
     fn fork_clone_copies_maps_without_preloading_unwind_modules_like_perf() {
         let current_exe = std::env::current_exe().expect("current exe");
         let current_exe = current_exe.to_string_lossy().into_owned();
-        let mut accumulator = super::FoldAccumulator::new(std::collections::BTreeMap::default());
-        let sample_layouts = super::SampleLayouts::default();
-        accumulator
-            .apply_record(
-                crate::perfdata::records::ParsedRecord::Mmap(
-                    crate::perfdata::records::MmapRecord {
-                        pid: 11,
-                        tid: 11,
-                        start: 0,
-                        len: 0x1000_0000,
-                        pgoff: 0,
-                        path: current_exe,
-                    },
-                ),
-                &sample_layouts,
-                super::FoldOptions::default(),
-            )
-            .expect("parent mmap");
+        let mut accumulator = super::SessionState::new(std::collections::BTreeMap::default());
+        accumulator.apply_record(crate::perfdata::records::ParsedRecord::Mmap(
+            crate::perfdata::records::MmapRecord {
+                pid: 11,
+                tid: 11,
+                start: 0,
+                len: 0x1000_0000,
+                pgoff: 0,
+                path: current_exe,
+            },
+        ));
 
-        accumulator
-            .apply_record(
-                crate::perfdata::records::ParsedRecord::Fork(
-                    crate::perfdata::records::ForkRecord {
-                        pid: 22,
-                        ppid: 11,
-                        tid: 22,
-                        ptid: 11,
-                        time: 99,
-                        clone_maps: true,
-                    },
-                ),
-                &sample_layouts,
-                super::FoldOptions::default(),
-            )
-            .expect("fork");
+        accumulator.apply_record(crate::perfdata::records::ParsedRecord::Fork(
+            crate::perfdata::records::ForkRecord {
+                pid: 22,
+                ppid: 11,
+                tid: 22,
+                ptid: 11,
+                time: 99,
+                clone_maps: true,
+            },
+        ));
 
         assert!(
             accumulator
@@ -5673,197 +5217,96 @@ mod tests {
         assert_eq!(String::from_utf8(written).expect("utf-8"), expected);
     }
 
-    #[test]
-    fn fold_counts_drains_size_tables_for_unique_folded_labels_not_raw_stacks() {
-        // inferno src/collapse/perf.rs after_event() inserts rendered labels;
-        // src/collapse/common.rs Occurrences::insert_or_add() grows the map
-        // only for distinct folded labels, not distinct raw IP callchains.
-        let mut raw_stacks = super::RawStackAccumulator::new();
-        for address in 1..=4096 {
-            raw_stacks.add_slice_with_borrowed_comm(
-                Some(7),
-                Some("alpha"),
-                &[super::FoldFrame::UnmappedAtSample(address)],
-                1,
-            );
+    fn prepared_sample(frames: &[super::FoldFrame]) -> super::PreparedFoldSample {
+        super::PreparedFoldSample {
+            pid: Some(7),
+            tid: Some(7),
+            time: None,
+            cpu: None,
+            event_name: std::sync::Arc::from("cpu-clock"),
+            count: 1,
+            frames: frames.iter().copied().collect(),
+            deferred_cookie: None,
+            has_callchain: true,
         }
-        let mut counts = super::FoldCounts::default();
-        let mappings = super::MmapTable::default();
-        super::accumulate_fold_counts(
-            &raw_stacks,
-            &mappings,
-            &mut counts,
-            None::<&mut SymbolFrameCache<'_, super::NoopSymbolResolver>>,
-            false,
-        )
-        .unwrap();
-        assert_eq!(counts.entries.len(), 1);
-        assert!(
-            counts.entries.capacity() < 1024,
-            "reserved {} folded entries for one label",
-            counts.entries.capacity()
-        );
-        assert!(
-            counts.by_hash.capacity() < 1024,
-            "reserved {} hash entries for one label",
-            counts.by_hash.capacity()
-        );
-
-        let previous_entry_capacity = counts.entries.capacity();
-        let previous_hash_capacity = counts.by_hash.capacity();
-
-        super::accumulate_fold_counts(
-            &raw_stacks,
-            &mappings,
-            &mut counts,
-            None::<&mut SymbolFrameCache<'_, super::NoopSymbolResolver>>,
-            false,
-        )
-        .unwrap();
-
-        assert_eq!(counts.entries.capacity(), previous_entry_capacity);
-        assert_eq!(counts.by_hash.capacity(), previous_hash_capacity);
-        assert_eq!(counts.entries[0].count, 8192);
     }
 
     #[test]
-    fn fold_accumulator_drain_reuses_raw_stack_capacity_across_rounds() {
-        let mut accumulator = super::FoldAccumulator::new(std::collections::BTreeMap::new());
-        let mut counts = super::FoldCounts::default();
-
-        for address in 0_u64..128 {
-            super::add_fold_stack(
-                Some(7),
-                Some("pyroclast"),
-                1,
-                &[
-                    super::FoldFrame::Callchain(address),
-                    super::FoldFrame::Callchain(address + 1),
-                    super::FoldFrame::Callchain(address + 2),
-                ],
-                &accumulator.mmap_table,
-                &mut accumulator.mapping_cache,
-                &mut accumulator.raw_stacks,
-            );
+    fn delivered_samples_retain_only_distinct_normalized_stacks() {
+        use super::SampleOutput as _;
+        // Inferno after_event() counts final normalized stacks. Distinct raw
+        // addresses that all print [unknown] must not build a raw-IP arena.
+        let state = super::SessionState::new(std::collections::BTreeMap::new());
+        let mut output = super::FoldedOutput::<super::NoopSymbolResolver>::new(None, false);
+        for _ in 0..2 {
+            for address in 1..=4096 {
+                output
+                    .write_sample_event(
+                        &state,
+                        &prepared_sample(&[super::FoldFrame::UserUnwind(address)]),
+                    )
+                    .unwrap();
+            }
         }
-        let counts_capacity = accumulator.raw_stacks.counts_capacity();
-        let node_capacity = accumulator.raw_stacks.node_capacity();
-        let node_id_capacity = accumulator.raw_stacks.node_id_capacity();
-
-        accumulator
-            .drain_fold_counts(
-                &mut counts,
-                None::<&mut SymbolFrameCache<'_, super::NoopSymbolResolver>>,
-                false,
-            )
-            .expect("drain fold counts");
-
-        assert!(accumulator.raw_stacks.entries().is_empty());
-        assert_eq!(accumulator.raw_stacks.counts_capacity(), counts_capacity);
-        assert_eq!(accumulator.raw_stacks.node_capacity(), node_capacity);
-        assert_eq!(accumulator.raw_stacks.node_id_capacity(), node_id_capacity);
+        assert_eq!(output.counts.entries.len(), 1);
+        assert!(output.counts.entries.capacity() < 1024);
+        assert!(output.counts.by_hash.capacity() < 1024);
+        assert_eq!(output.counts.entries[0].count, 8192);
+        assert!(state.deferred_samples.is_empty());
     }
 
     #[test]
-    fn fold_accumulator_keeps_user_unwind_frame_for_perf_data_named_mapping() {
-        let mut accumulator = super::FoldAccumulator::new(std::collections::BTreeMap::new());
-        let sample_layouts = super::SampleLayouts::default();
-        let options = super::FoldOptions::default();
-
-        accumulator
-            .apply_record(
-                super::ParsedRecord::Mmap(crate::perfdata::records::MmapRecord {
+    fn delivered_user_unwind_frames_resolve_before_mapping_replacement() {
+        use super::SampleOutput as _;
+        let mut state = super::SessionState::new(std::collections::BTreeMap::new());
+        state.thread_comms.insert(7, "pyroclast".into());
+        let mut output = super::FoldedOutput::<super::NoopSymbolResolver>::new(None, false);
+        for path in ["/tmp/perf.data", "/bin/demo"] {
+            state
+                .mmap_table
+                .insert_mmap(crate::perfdata::records::MmapRecord {
                     pid: 7,
                     tid: 7,
                     start: 0x1000,
                     len: 0x100,
                     pgoff: 0,
-                    path: "/tmp/perf.data".to_string(),
-                }),
-                &sample_layouts,
-                options,
-            )
-            .expect("insert perf.data mapping");
-
-        super::add_fold_stack(
-            Some(7),
-            Some("pyroclast"),
-            1,
-            &[super::FoldFrame::UserUnwind(0x1010)],
-            &accumulator.mmap_table,
-            &mut accumulator.mapping_cache,
-            &mut accumulator.raw_stacks,
-        );
-        assert_eq!(accumulator.raw_stacks.entries().len(), 1);
-
-        accumulator
-            .apply_record(
-                super::ParsedRecord::Mmap(crate::perfdata::records::MmapRecord {
-                    pid: 7,
-                    tid: 7,
-                    start: 0x1000,
-                    len: 0x100,
-                    pgoff: 0,
-                    path: "/bin/demo".to_string(),
-                }),
-                &sample_layouts,
-                options,
-            )
-            .expect("insert executable mapping");
-
-        super::add_fold_stack(
-            Some(7),
-            Some("pyroclast"),
-            1,
-            &[super::FoldFrame::UserUnwind(0x1010)],
-            &accumulator.mmap_table,
-            &mut accumulator.mapping_cache,
-            &mut accumulator.raw_stacks,
-        );
-
-        let entries = accumulator.raw_stacks.sorted_entries();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].count(), 2);
-        let mut scratch = Vec::new();
+                    path: path.into(),
+                });
+            output
+                .write_sample_event(
+                    &state,
+                    &prepared_sample(&[super::FoldFrame::UserUnwind(0x1010)]),
+                )
+                .unwrap();
+        }
+        let mut written = Vec::new();
+        super::write_fold_counts(output.counts, &mut written).unwrap();
         assert_eq!(
-            entries[0].callchain(&mut scratch),
-            [super::FoldFrame::UserUnwind(0x1010)]
+            String::from_utf8(written).unwrap(),
+            "pyroclast;[demo] 1\npyroclast;[perf.data] 1\n"
         );
     }
 
     #[test]
     fn user_unwind_frame_does_not_resolve_through_global_mapping_like_perf_libdw() {
-        // tools/perf/util/unwind-libdw.c __report_module() and access_dso_mem()
-        // use PERF_RECORD_MISC_USER, so an unwound user frame must not inherit
-        // global/kernel mapping fallback behavior from recorded callchain frames.
-        let mut mmap_table = super::MmapTable::default();
-        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+        // unwind-libdw.c __report_module()/access_dso_mem() use USER maps.
+        let mut table = super::MmapTable::default();
+        table.insert_mmap(crate::perfdata::records::MmapRecord {
             pid: u32::MAX,
             tid: u32::MAX,
             start: 0x1000,
             len: 0x100,
             pgoff: 0,
-            path: "/bin/demo".to_string(),
+            path: "/bin/demo".into(),
         });
-
-        let mut mapping_cache = super::MappingResolveCache::default();
-        let mut raw_stacks = crate::perfdata::raw_stack::RawStackAccumulator::new();
-        super::add_fold_stack(
-            Some(7),
-            Some("pyroclast"),
-            1,
-            &[super::FoldFrame::UserUnwind(0x1010)],
-            &mmap_table,
-            &mut mapping_cache,
-            &mut raw_stacks,
-        );
-
-        let entries = raw_stacks.sorted_entries();
-        assert_eq!(entries.len(), 1);
-        let mut scratch = Vec::new();
-        assert_eq!(
-            entries[0].callchain(&mut scratch),
-            [super::FoldFrame::UnmappedAtSample(0x1010)]
+        assert!(
+            super::resolve_frame_mapping_ref(
+                &table,
+                Some(7),
+                super::FoldFrame::UserUnwind(0x1010),
+                &mut super::MappingResolveCache::default()
+            )
+            .is_none()
         );
     }
 
@@ -5903,84 +5346,34 @@ mod tests {
     }
 
     #[test]
-    fn extend_symbol_mappings_deduplicates_prefetch_keys_across_stacks() {
-        let mut mmap_table = super::MmapTable::default();
-        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+    fn sample_symbol_resolution_deduplicates_addresses_and_expands_seed_inlines() {
+        let mut table = super::MmapTable::default();
+        table.insert_mmap(crate::perfdata::records::MmapRecord {
             pid: 11,
             tid: 11,
             start: 0x1000,
             len: 0x1000,
             pgoff: 0,
-            path: "/bin/demo".to_string(),
+            path: "/bin/demo".into(),
         });
-
-        let mut mapping_cache = super::MappingResolveCache::default();
-        let mut batches = super::SymbolPrefetchBatches::new();
-        let callchain = [
-            super::FoldFrame::Callchain(0x1010),
-            super::FoldFrame::Callchain(0x1020),
-        ];
-
-        // Inline mode routes regular Callchain frames into the full-mapping
-        // batch; this test exercises the cross-stack dedup of those keys.
-        super::extend_symbol_mappings_for_stack(
-            Some(11),
-            &callchain,
-            &mmap_table,
-            &mut mapping_cache,
-            &mut batches,
-            true,
-        );
-        super::extend_symbol_mappings_for_stack(
-            Some(11),
-            &callchain,
-            &mmap_table,
-            &mut mapping_cache,
-            &mut batches,
-            true,
-        );
-
-        assert_eq!(batches.full_mappings.len(), 2);
-        assert_eq!(batches.full_mappings[0].relative_address, 0x10);
-        assert_eq!(batches.full_mappings[1].relative_address, 0x20);
-        assert!(batches.base_mappings.is_empty());
-    }
-
-    #[test]
-    fn prefetch_symbols_batches_inline_current_ip_through_full_dwarf_with_inline() {
-        // perf's machine.c unwind_entry() runs append_inlines() on EVERY
-        // accepted entry, including the initial sampled IP (the InlineCurrentIp
-        // leaf), so inline-capable mode symbolizes the leaf through the full
-        // DWARF inline chain exactly like a caller frame. Only base-only mode
-        // resolves it from the single base symtab symbol.
-        let mut mmap_table = super::MmapTable::default();
-        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
-            pid: 11,
-            tid: 11,
-            start: 0x1000,
-            len: 0x1000,
-            pgoff: 0,
-            path: "/bin/demo".to_string(),
-        });
-        let mut raw_stacks = crate::perfdata::raw_stack::RawStackAccumulator::new();
-        raw_stacks.add_vec_with_comm(
-            Some(11),
-            Some("demo".to_string()),
-            vec![
-                super::FoldFrame::UserUnwind(0x1010),
-                super::FoldFrame::InlineCurrentIp(0x1020),
-            ],
-            1,
-        );
-        let entries = raw_stacks.sorted_entries();
         let resolver = RecordingFrameResolver::default();
-        let mut symbol_cache = SymbolFrameCache::new(&resolver);
-
-        // In inline-capable mode, both the caller (UserUnwind 0x1010) and the
-        // leaf (InlineCurrentIp 0x1020) prefetch the full DWARF inline chain.
-        super::prefetch_symbols(&entries, &mmap_table, &mut symbol_cache, true)
-            .expect("prefetch folded stack symbols");
-
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let frames = [
+            super::FoldFrame::UserUnwind(0x1010),
+            super::FoldFrame::InlineCurrentIp(0x1020),
+            super::FoldFrame::UserUnwind(0x1010),
+        ];
+        for _ in 0..2 {
+            super::prefetch_sample_symbols(
+                Some(11),
+                &frames,
+                &table,
+                &mut super::MappingResolveCache::default(),
+                &mut cache,
+                true,
+            )
+            .unwrap();
+        }
         assert_eq!(*resolver.full_requests.borrow(), vec![0x10, 0x20]);
         assert!(resolver.base_requests.borrow().is_empty());
     }
@@ -6523,7 +5916,7 @@ mod tests {
         // segment must therefore satisfy a later IP resolved through another
         // segment with the same load base.
         let path = "/nix/store/glibc/lib/libc.so.6";
-        let mut accumulator = super::FoldAccumulator::new(std::collections::BTreeMap::new());
+        let mut accumulator = super::SessionState::new(std::collections::BTreeMap::new());
         accumulator
             .mmap_table
             .insert_mmap(crate::perfdata::records::MmapRecord {
@@ -6559,7 +5952,7 @@ mod tests {
         // when no earlier mmap path was loaded into the unwinder.
         let current_exe = std::env::current_exe().expect("current exe");
         let current_exe = current_exe.to_string_lossy().into_owned();
-        let mut accumulator = super::FoldAccumulator::new(std::collections::BTreeMap::new());
+        let mut accumulator = super::SessionState::new(std::collections::BTreeMap::new());
         accumulator
             .mmap_table
             .insert_mmap(crate::perfdata::records::MmapRecord {
@@ -6584,7 +5977,7 @@ mod tests {
         // cloning, so stale pre-exec DWFL state must not survive.
         let current_exe = std::env::current_exe().expect("current exe");
         let current_exe = current_exe.to_string_lossy().into_owned();
-        let mut accumulator = super::FoldAccumulator::new(std::collections::BTreeMap::new());
+        let mut accumulator = super::SessionState::new(std::collections::BTreeMap::new());
         accumulator
             .mmap_table
             .insert_mmap(crate::perfdata::records::MmapRecord {
@@ -6598,22 +5991,16 @@ mod tests {
         accumulator.ensure_unwind_mapping_for_ip(Some(11), 0x2000);
         assert!(accumulator.unwind_states.contains_key(&11));
 
-        accumulator
-            .apply_record(
-                crate::perfdata::records::ParsedRecord::Fork(
-                    crate::perfdata::records::ForkRecord {
-                        pid: 11,
-                        tid: 11,
-                        ppid: 10,
-                        ptid: 10,
-                        time: 0,
-                        clone_maps: false,
-                    },
-                ),
-                &super::SampleLayouts::default(),
-                super::FoldOptions::default(),
-            )
-            .expect("fork exec");
+        accumulator.apply_record(crate::perfdata::records::ParsedRecord::Fork(
+            crate::perfdata::records::ForkRecord {
+                pid: 11,
+                tid: 11,
+                ppid: 10,
+                ptid: 10,
+                time: 0,
+                clone_maps: false,
+            },
+        ));
 
         assert!(accumulator.unwind_states.get(&11).is_none());
     }
@@ -6626,48 +6013,36 @@ mod tests {
         // module that rejects the later executable MMAP2 split.
         let current_exe = std::env::current_exe().expect("current exe");
         let current_exe = current_exe.to_string_lossy().into_owned();
-        let mut accumulator = super::FoldAccumulator::new(std::collections::BTreeMap::new());
-        accumulator
-            .apply_record(
-                crate::perfdata::records::ParsedRecord::Mmap(
-                    crate::perfdata::records::MmapRecord {
-                        pid: 11,
-                        tid: 11,
-                        start: 0x5555_5555_4000,
-                        len: 0x002b_e000,
-                        pgoff: 0,
-                        path: current_exe.clone(),
-                    },
-                ),
-                &super::SampleLayouts::default(),
-                super::FoldOptions::default(),
-            )
-            .expect("broad mmap");
+        let mut accumulator = super::SessionState::new(std::collections::BTreeMap::new());
+        accumulator.apply_record(crate::perfdata::records::ParsedRecord::Mmap(
+            crate::perfdata::records::MmapRecord {
+                pid: 11,
+                tid: 11,
+                start: 0x5555_5555_4000,
+                len: 0x002b_e000,
+                pgoff: 0,
+                path: current_exe.clone(),
+            },
+        ));
         accumulator.ensure_unwind_mapping_for_ip(Some(11), 0x5555_5555_5000);
         assert!(accumulator.unwind_states.contains_key(&11));
 
-        accumulator
-            .apply_record(
-                crate::perfdata::records::ParsedRecord::Mmap2(
-                    crate::perfdata::records::Mmap2Record {
-                        pid: 11,
-                        tid: 11,
-                        start: 0x5555_555d_6000,
-                        len: 0x0022_b000,
-                        pgoff: 0x0008_1000,
-                        major: 0,
-                        minor: 0,
-                        inode: 0,
-                        inode_generation: 0,
-                        prot: super::PROT_EXEC,
-                        flags: 2,
-                        path: current_exe,
-                    },
-                ),
-                &super::SampleLayouts::default(),
-                super::FoldOptions::default(),
-            )
-            .expect("exec mmap2");
+        accumulator.apply_record(crate::perfdata::records::ParsedRecord::Mmap2(
+            crate::perfdata::records::Mmap2Record {
+                pid: 11,
+                tid: 11,
+                start: 0x5555_555d_6000,
+                len: 0x0022_b000,
+                pgoff: 0x0008_1000,
+                major: 0,
+                minor: 0,
+                inode: 0,
+                inode_generation: 0,
+                prot: super::PROT_EXEC,
+                flags: 2,
+                path: current_exe,
+            },
+        ));
 
         assert!(
             accumulator.unwind_states.get(&11).is_none(),
@@ -6697,7 +6072,7 @@ mod tests {
         // callback-frame modules too.
         let current_exe = std::env::current_exe().expect("current exe");
         let current_exe = current_exe.to_string_lossy().into_owned();
-        let mut accumulator = super::FoldAccumulator::new(std::collections::BTreeMap::new());
+        let mut accumulator = super::SessionState::new(std::collections::BTreeMap::new());
         accumulator
             .mmap_table
             .insert_mmap(crate::perfdata::records::MmapRecord {
@@ -6745,7 +6120,7 @@ mod tests {
         // mapped one by probing ip + 1.
         let current_exe = std::env::current_exe().expect("current exe");
         let current_exe = current_exe.to_string_lossy().into_owned();
-        let mut accumulator = super::FoldAccumulator::new(std::collections::BTreeMap::new());
+        let mut accumulator = super::SessionState::new(std::collections::BTreeMap::new());
         accumulator
             .mmap_table
             .insert_mmap(crate::perfdata::records::MmapRecord {
@@ -7253,7 +6628,7 @@ mod tests {
         // tools/perf/util/ordered-events.c queue_event() inserts events by
         // timestamp while preserving input order for equal timestamps. Final
         // deferred-callchain flush must therefore not drain by cookie key.
-        let mut accumulator = super::FoldAccumulator::new(std::collections::BTreeMap::new());
+        let mut accumulator = super::SessionState::new(std::collections::BTreeMap::new());
         accumulator
             .deferred_samples
             .push(super::DeferredFoldSample {
@@ -7336,7 +6711,7 @@ mod tests {
         // in the order perf's ordered-events delivery queued those samples.
         // Same-tid entries are delivered in list order even when only one entry
         // matches the deferred-callchain cookie; different tids remain queued.
-        let mut accumulator = super::FoldAccumulator::new(std::collections::BTreeMap::new());
+        let mut accumulator = super::SessionState::new(std::collections::BTreeMap::new());
         accumulator
             .deferred_samples
             .push(super::DeferredFoldSample {

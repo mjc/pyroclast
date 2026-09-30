@@ -2247,6 +2247,40 @@ fn process_exec_comm_is_fallback_when_sample_thread_has_no_comm() {
 }
 
 #[test]
+fn resolves_each_sample_before_later_remaps_like_perf_script() {
+    // perf util/session.c perf_session__deliver_event() invokes
+    // builtin-script.c process_sample_event()/machine__resolve() before the
+    // next ordered mmap is applied. Inferno counts the emitted label, not IPs.
+    let mapping = |path: &str, time: u64| {
+        let mut payload = mmap_payload(11, 12, 0x1000, 0x1000, 0, path);
+        payload.extend(11_u32.to_le_bytes());
+        payload.extend(12_u32.to_le_bytes());
+        payload.extend(time.to_le_bytes());
+        record_bytes(1, &payload)
+    };
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_flags(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CALLCHAIN,
+            1 << 18,
+        )],
+        [
+            mapping("/missing/first.so", 10),
+            record_bytes(9, &sample_payload_with_time(0x1010, 11, 12, 20, [0x1010])),
+            mapping("/missing/second.so", 30),
+            record_bytes(9, &sample_payload_with_time(0x1010, 11, 12, 40, [0x1010])),
+        ],
+    );
+    let expected = ":12;[first.so] 1\n:12;[second.so] 1\n";
+    assert_eq!(fold_perfdata_callchains(&bytes).unwrap(), expected);
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), &bytes).unwrap();
+    assert_eq!(
+        fold_perfdata_file_with_options(file.path(), FoldOptions::default()).unwrap(),
+        expected
+    );
+}
+
+#[test]
 fn applies_comm_records_by_perf_timestamp_like_perf_script() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_flags(
@@ -3774,7 +3808,7 @@ fn symbolized_fold_resolves_kernel_module_frames() {
 }
 
 #[test]
-fn prefetches_unique_symbol_requests_before_folding() {
+fn resolves_unique_addresses_once_per_delivered_sample() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
             PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
@@ -3821,7 +3855,7 @@ fn prefetches_unique_symbol_requests_before_folding() {
 }
 
 #[test]
-fn prefetches_symbol_requests_in_batches_before_folding() {
+fn resolves_samples_at_delivery_without_a_recording_sized_symbol_batch() {
     let mut records = vec![record_bytes(
         1,
         &mmap_payload(11, 11, 0x1000, 0x3000, 0, "/bin/app"),
@@ -3847,9 +3881,8 @@ fn prefetches_symbol_requests_in_batches_before_folding() {
 
     assert_eq!(folded, ":12;[app] 4097\n");
     let calls = resolver.calls();
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].len(), 4096);
-    assert_eq!(calls[1].len(), 1);
+    assert_eq!(calls.len(), 4097);
+    assert!(calls.iter().all(|batch| batch.len() == 1));
 }
 
 fn perfdata_with_records_and_attrs<const A: usize, const R: usize>(
