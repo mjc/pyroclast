@@ -147,6 +147,29 @@ Companion tests cover final-record range release, maximum-size records and
 split headers, invalid bounds without corrupting pending views, and identical
 file/slice folds across distant ranges with out-of-order timestamps.
 
+Fresh execution now performs 373 positional reads returning 390,422,508 bytes
+(1.000117 times the input size), plus 112 mapped ranges. Both symbolizers'
+direct folds and streamed text through Inferno match a freshly run native
+perf/Inferno reference byte-for-byte: 1,505 stacks, SHA-256
+`124a24929267f42da993195bdf1aa12a37bb30d67d83ee455bf2a9e0cf8e4f47`.
+The unavailable `entropy_burn` executable remains the same parity caveat.
+
+Ten paired Hyperfine runs, reversing command order each pair, measured median
+8.218s before versus 5.789s after (29.6% lower); all ten candidates were faster.
+Mean user CPU was 5.936s versus 5.403s and mean system CPU 2.202s versus 0.501s.
+The mean within-pair runtime ratio was 0.730. The machine remained loaded;
+these results establish a paired improvement, not an unloaded runtime claim
+or achievement of the sub-second goal.
+
+Heaptrack reports 160,068 allocations and unchanged 17.88 MB peak heap.
+Separate `/proc/<pid>/smaps_rollup` sampling at 50 ms intervals measured maximum
+RSS 18,576 KiB before versus 80,076 KiB after; maximum anonymous memory was
+16,052 KiB versus 16,048 KiB. Maximum file-backed PSS was 1,996 KiB versus
+63,170 KiB. These are separately sampled maxima, not an additive breakdown of
+one instant. File-backed views increase process RSS; this is not new owned
+payload storage, and their lifetimes follow the outstanding ordered records.
+The 742-test full suite, format checks, pedantic Clippy, and commit hooks pass.
+
 ## 2026-09-29 x86-64 replay
 
 Fresh output from the 390,376,668-byte `inferno-slow-collapse.perf.data` was

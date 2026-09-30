@@ -521,6 +521,8 @@ pub fn fold_perfdata_callchains_with_options(
 
 /// Collapses perf sample callchains from a `perf.data` file path.
 ///
+/// The completed recording must remain unmodified and untruncated during this call.
+///
 /// # Errors
 ///
 /// Returns an error when the file cannot be opened, mapped, or parsed.
@@ -529,6 +531,8 @@ pub fn fold_perfdata_file(path: &Path) -> Result<String, String> {
 }
 
 /// Collapses perf sample callchains from a `perf.data` file path.
+///
+/// The completed recording must remain unmodified and untruncated during this call.
 ///
 /// # Errors
 ///
@@ -565,6 +569,8 @@ where
 }
 
 /// Collapses symbolized perf sample callchains from a `perf.data` file path.
+///
+/// The completed recording must remain unmodified and untruncated during this call.
 ///
 /// # Errors
 ///
