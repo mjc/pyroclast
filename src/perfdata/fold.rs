@@ -425,12 +425,7 @@ impl FoldCounts {
                 self.scratch_stack.push(id);
             }
         }
-        if let Some(total) = self.stacks.get_mut(self.scratch_stack.as_slice()) {
-            *total += count;
-        } else {
-            self.stacks
-                .insert(self.scratch_stack.as_slice().into(), count);
-        }
+        add_stack_count(&mut self.stacks, self.scratch_stack.as_slice(), count);
     }
 
     #[cfg(test)]
@@ -447,6 +442,23 @@ impl FoldCounts {
     fn count_for_rendered(&mut self, stack: &str) -> Option<u64> {
         let ids = self.intern_normalized(stack);
         self.stacks.get(ids.as_slice()).copied()
+    }
+}
+
+fn add_stack_count<K, Q, S>(stacks: &mut HashMap<K, u64, S>, key: &Q, count: u64)
+where
+    K: std::hash::Hash + Eq + std::borrow::Borrow<Q> + for<'a> From<&'a Q>,
+    Q: std::hash::Hash + Eq + ?Sized,
+    S: std::hash::BuildHasher,
+{
+    let hash = stacks.hasher().hash_one(key);
+    match stacks.raw_entry_mut().from_key_hashed_nocheck(hash, key) {
+        hashbrown::hash_map::RawEntryMut::Occupied(entry) => *entry.into_mut() += count,
+        hashbrown::hash_map::RawEntryMut::Vacant(entry) => {
+            // Borrow<Q> requires owned and borrowed keys to hash and compare
+            // identically. Keep full equality checks even when hashes collide.
+            entry.insert_hashed_nocheck(hash, K::from(key), count);
+        }
     }
 }
 
@@ -3999,6 +4011,70 @@ mod tests {
         PerfArch, PerfUserRegs, PerfX86_64Regs, UserStackUnwindResult, UserStackUnwinder,
     };
     use crate::symbols::{ResolvedSymbolFrames, SymbolFrameCache, SymbolRequest, SymbolResolver};
+
+    #[derive(Clone)]
+    struct CountingCollisionHasher(std::rc::Rc<std::cell::Cell<usize>>);
+
+    impl std::hash::BuildHasher for CountingCollisionHasher {
+        type Hasher = ZeroHasher;
+
+        fn build_hasher(&self) -> ZeroHasher {
+            self.0.set(self.0.get() + 1);
+            ZeroHasher
+        }
+    }
+
+    struct ZeroHasher;
+
+    impl std::hash::Hasher for ZeroHasher {
+        fn finish(&self) -> u64 {
+            0
+        }
+
+        fn write(&mut self, _: &[u8]) {}
+    }
+
+    #[test]
+    fn stack_count_hashes_once_per_sample_and_compares_colliding_full_keys() {
+        let hashes = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut stacks = super::HashMap::<String, u64, _>::with_capacity_and_hasher(
+            32,
+            CountingCollisionHasher(hashes.clone()),
+        );
+        for (index, (key, count)) in [
+            ("root;a", 1),
+            ("root;a", 2),
+            ("root;ab", 4),
+            ("", 8),
+            ("root;\u{e9}", 16),
+            ("root;a", 32),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            super::add_stack_count(&mut stacks, key, count);
+            assert_eq!(hashes.get(), index + 1);
+        }
+        assert_eq!(stacks.len(), 4);
+        assert_eq!(stacks.get("root;a"), Some(&35));
+        assert_eq!(stacks.get("root;ab"), Some(&4));
+        assert_eq!(stacks.get(""), Some(&8));
+        assert_eq!(stacks.get("root;\u{e9}"), Some(&16));
+    }
+
+    #[test]
+    fn borrowed_stack_count_supports_boxed_ids_and_survives_table_growth() {
+        let mut stacks = super::HashMap::<Box<[usize]>, u64, super::FxBuildHasher>::default();
+        for value in 0..1024 {
+            let key = [value, 1, 2, 3];
+            super::add_stack_count(&mut stacks, key.as_slice(), 2);
+            super::add_stack_count(&mut stacks, key.as_slice(), 3);
+        }
+        for value in 0..1024 {
+            assert_eq!(stacks.get([value, 1, 2, 3].as_slice()), Some(&5));
+        }
+        assert_eq!(stacks.len(), 1024);
+    }
 
     struct RetentionCheckedSource<'a> {
         source: super::SliceSource<'a>,
