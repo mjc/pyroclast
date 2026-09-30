@@ -23,8 +23,8 @@ use crate::perfdata::header::{
     PerfFeatureSection, PerfHeader, feature_sections_from_reader, parse_header, parse_header_arch,
 };
 use crate::perfdata::mappings::{
-    FileIdentity, MappedFrame, MappingPathLayout, MappingResolveCache, MmapTable,
-    ResolvedMappingRef, UserMapping,
+    FileIdentity, FrameMappingContext, MappedFrame, MappingPathLayout, MappingResolveCache,
+    MmapTable, ModuleFallbackKind, ResolvedMappingRef, UserMapping,
 };
 use crate::perfdata::records::{
     PERF_RECORD_FINISHED_ROUND, PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_CPUMODE_KERNEL,
@@ -1999,9 +1999,8 @@ where
 }
 
 fn prefetch_sample_symbols<R: SymbolResolver>(
-    pid: Option<u32>,
     frames: impl IntoIterator<Item = FoldFrame>,
-    mappings: &MmapTable,
+    context: Option<&FrameMappingContext<'_>>,
     mapping_cache: &mut MappingResolveCache,
     cache: &mut SymbolFrameCache<'_, R>,
     inline: bool,
@@ -2009,8 +2008,8 @@ fn prefetch_sample_symbols<R: SymbolResolver>(
     let mut full = SmallVec::<[ResolvedMappingRef<'_>; 16]>::new();
     let mut base = SmallVec::<[ResolvedMappingRef<'_>; 16]>::new();
     for frame in frames {
-        if let Some(mapping) = resolve_frame_mapping_ref(mappings, pid, frame, mapping_cache)
-            .filter(|mapping| {
+        if let Some(mapping) =
+            resolve_frame_in_context(context, frame, mapping_cache).filter(|mapping| {
                 matches!(frame, FoldFrame::InlineCurrentIp(_))
                     || !is_kernel_space_frame(frame.address())
                     || mapping.is_kernel()
@@ -2050,27 +2049,24 @@ enum FrameMappingDecision<'a> {
     Address,
 }
 
-fn resolve_frame_mapping_ref<'a>(
-    mmap_table: &'a MmapTable,
-    pid: Option<u32>,
+fn resolve_frame_in_context<'a>(
+    context: Option<&FrameMappingContext<'a>>,
     frame: FoldFrame,
     mapping_cache: &mut MappingResolveCache,
 ) -> Option<MappedFrame<'a>> {
-    let pid = pid?;
+    let context = context?;
     let address = frame.address();
     match frame {
-        FoldFrame::Callchain(_) => mmap_table.resolve_frame_cached(pid, address, mapping_cache),
+        FoldFrame::Callchain(_) => context.resolve(address, mapping_cache),
         FoldFrame::SampleIp { cpumode, .. }
             if cpumode & PERF_RECORD_MISC_CPUMODE_MASK == PERF_RECORD_MISC_CPUMODE_KERNEL =>
         {
-            mmap_table.resolve_frame_cached(pid, address, mapping_cache)
+            context.resolve(address, mapping_cache)
         }
         FoldFrame::SampleIp { .. }
         | FoldFrame::UserCallchain(_)
         | FoldFrame::UserUnwind(_)
-        | FoldFrame::InlineCurrentIp(_) => {
-            mmap_table.resolve_user_frame_cached(pid, address, mapping_cache)
-        }
+        | FoldFrame::InlineCurrentIp(_) => context.resolve_user(address, mapping_cache),
     }
 }
 
@@ -2109,9 +2105,17 @@ impl<'a> FoldFrameResolver<'a> {
         frame: FoldFrame,
         mapping_cache: &mut MappingResolveCache,
     ) -> FrameMappingDecision<'a> {
+        let context = pid.map(|pid| self.mmap_table.frame_context(pid, mapping_cache));
+        Self::mapping_decision_in_context(context.as_ref(), frame, mapping_cache)
+    }
+
+    fn mapping_decision_in_context(
+        context: Option<&FrameMappingContext<'a>>,
+        frame: FoldFrame,
+        mapping_cache: &mut MappingResolveCache,
+    ) -> FrameMappingDecision<'a> {
         let address = frame.address();
-        if let Some(mapping) = resolve_frame_mapping_ref(self.mmap_table, pid, frame, mapping_cache)
-        {
+        if let Some(mapping) = resolve_frame_in_context(context, frame, mapping_cache) {
             if is_kernel_space_frame(address) && !mapping.is_kernel() {
                 FrameMappingDecision::KernelAddress
             } else {
@@ -2151,6 +2155,11 @@ impl<'a> FoldFrameResolver<'a> {
         }
         let comm_prefix_len = buffers.current.len();
 
+        let context = pid.map(|pid| {
+            self.mmap_table
+                .frame_context(pid, &mut buffers.mapping_cache)
+        });
+
         let mut callchain = callchain.into_iter();
         while let Some(frame) = callchain.next() {
             if symbol_cache.is_none()
@@ -2163,19 +2172,18 @@ impl<'a> FoldFrameResolver<'a> {
             {
                 continue;
             }
-            let decision = if symbol_cache.is_some()
-                && matches!(frame, FoldFrame::InlineCurrentIp(_))
-            {
-                resolve_frame_mapping_ref(self.mmap_table, pid, frame, &mut buffers.mapping_cache)
-                    .map_or(FrameMappingDecision::Unknown, FrameMappingDecision::Mapped)
-            } else {
-                self.mapping_decision_for_folded_frame(
-                    pid,
-                    frame,
-                    symbol_cache.is_some(),
-                    &mut buffers.mapping_cache,
-                )
-            };
+            let decision =
+                if symbol_cache.is_some() && matches!(frame, FoldFrame::InlineCurrentIp(_)) {
+                    resolve_frame_in_context(context.as_ref(), frame, &mut buffers.mapping_cache)
+                        .map_or(FrameMappingDecision::Unknown, FrameMappingDecision::Mapped)
+                } else {
+                    Self::mapping_decision_for_folded_frame(
+                        context.as_ref(),
+                        frame,
+                        symbol_cache.is_some(),
+                        &mut buffers.mapping_cache,
+                    )
+                };
             match decision {
                 FrameMappingDecision::Mapped(mapping) => {
                     if let Some(cache) = symbol_cache.as_deref_mut() {
@@ -2195,9 +2203,8 @@ impl<'a> FoldFrameResolver<'a> {
                             continue;
                         }
                         prefetch_sample_symbols(
-                            pid,
                             std::iter::once(frame).chain(callchain.clone()),
-                            self.mmap_table,
+                            context.as_ref(),
                             &mut buffers.mapping_cache,
                             cache,
                             self.inline,
@@ -2439,14 +2446,13 @@ impl<'a> FoldFrameResolver<'a> {
     }
 
     fn mapping_decision_for_folded_frame(
-        &self,
-        pid: Option<u32>,
+        context: Option<&FrameMappingContext<'a>>,
         frame: FoldFrame,
         symbolizing: bool,
         mapping_cache: &mut MappingResolveCache,
     ) -> FrameMappingDecision<'a> {
         let address = frame.address();
-        let decision = self.mapping_decision(pid, frame, mapping_cache);
+        let decision = Self::mapping_decision_in_context(context, frame, mapping_cache);
         if !symbolizing
             && matches!(
                 frame,
@@ -2528,13 +2534,11 @@ fn append_frame_mapping_fallback(buffers: &mut FoldedRenderBuffers, mapping: &Ma
     } else {
         raw_path
     };
-    let canonical_layout = MappingPathLayout::default();
-    let layout = if path.len() == raw_path.len() {
-        mapping.path_layout()
+    if path.len() == raw_path.len() {
+        append_module_fallback(buffers, path, mapping.path_layout(), kernel);
     } else {
-        &canonical_layout
-    };
-    append_module_fallback(buffers, path, layout, kernel);
+        append_literal_module(&mut buffers.current, path, false);
+    }
 }
 
 fn append_module_fallback(
@@ -2543,17 +2547,18 @@ fn append_module_fallback(
     layout: &MappingPathLayout,
     kernel: bool,
 ) {
-    if !kernel && path == UNKNOWN_FRAME {
+    if layout.fallback == ModuleFallbackKind::Unknown && !kernel {
         append_cached_inferno_perf_folded_label_to_buffers(buffers, UNKNOWN_FRAME);
         return;
     }
     // Inferno perf.rs:stack_line_parts splits at the final literal space.
     // Most whitespace-containing DSO paths therefore do not form a stack row;
     // a final '(' token instead leaves the path prefix in the raw function.
-    if let Some(index) = layout.last_space {
-        if path.as_bytes().get(index + 1) != Some(&b'(') {
-            return;
-        }
+    if layout.fallback == ModuleFallbackKind::Skip {
+        return;
+    }
+    if layout.fallback == ModuleFallbackKind::RawFunction {
+        let index = layout.last_space.expect("raw function has a final space");
         buffers.module_scratch.clear();
         buffers.module_scratch.push_str("[unknown] (");
         buffers.module_scratch.push_str(path[..index].trim_end());
@@ -2567,7 +2572,7 @@ fn append_module_fallback(
     // Inferno perf.rs:with_module_fallback uses the literal suffix after '/';
     // tidy_generic then normalizes this synthetic function, including ';' -> ':'.
     let name = &path[layout.basename_start..];
-    if layout.basename_has_parentheses {
+    if layout.fallback == ModuleFallbackKind::Normalized {
         buffers.module_scratch.clear();
         buffers.module_scratch.push('[');
         buffers.module_scratch.push_str(name);
@@ -2578,16 +2583,24 @@ fn append_module_fallback(
         append_separator(&mut buffers.current);
         escape_frame_into(&mut buffers.current, &buffers.render_scratch);
     } else {
-        append_separator(&mut buffers.current);
-        buffers.current.reserve(name.len() + 2);
-        buffers.current.push('[');
-        if layout.basename_needs_escaping {
-            append_escaped_spans(&mut buffers.current, name, ":");
-        } else {
-            buffers.current.push_str(name);
-        }
-        buffers.current.push(']');
+        append_literal_module(
+            &mut buffers.current,
+            name,
+            layout.fallback == ModuleFallbackKind::Escaped,
+        );
     }
+}
+
+fn append_literal_module(output: &mut String, name: &str, escape: bool) {
+    output.reserve(name.len() + 2 + usize::from(!output.is_empty()));
+    append_separator(output);
+    output.push('[');
+    if escape {
+        append_escaped_spans(output, name, ":");
+    } else {
+        output.push_str(name);
+    }
+    output.push(']');
 }
 
 fn write_perf_script_frame_for_label<W>(
@@ -5522,11 +5535,17 @@ mod tests {
         ]);
         output.write_sample_event(&state, &sample).unwrap();
         let searches = state.mmap_table.index_search_count();
+        let buckets = state.mmap_table.bucket_search_count();
         output.write_sample_event(&state, &sample).unwrap();
         assert_eq!(
             state.mmap_table.index_search_count() - searches,
             4,
             "cached samples should not scan their mappings again for prefetch"
+        );
+        assert_eq!(
+            state.mmap_table.bucket_search_count() - buckets,
+            2,
+            "one PID bucket and one global bucket per sample, not per frame"
         );
         assert_eq!(resolver.full_requests.borrow().len(), 4);
         assert_eq!(output.buffers.counts.stacks.len(), 1);
@@ -5872,9 +5891,8 @@ mod tests {
             path: "/bin/demo".into(),
         });
         assert!(
-            super::resolve_frame_mapping_ref(
-                &table,
-                Some(7),
+            super::resolve_frame_in_context(
+                Some(&table.frame_context(7, &mut super::MappingResolveCache::default())),
                 super::FoldFrame::UserUnwind(0x1010),
                 &mut super::MappingResolveCache::default()
             )
@@ -5936,11 +5954,12 @@ mod tests {
             super::FoldFrame::UserUnwind(0x1010),
         ];
         for _ in 0..2 {
+            let mut mapping_cache = super::MappingResolveCache::default();
+            let context = table.frame_context(11, &mut mapping_cache);
             super::prefetch_sample_symbols(
-                Some(11),
                 frames.iter().copied(),
-                &table,
-                &mut super::MappingResolveCache::default(),
+                Some(&context),
+                &mut mapping_cache,
                 &mut cache,
                 true,
             )
@@ -7138,6 +7157,8 @@ mod tests {
             "/tmp/a;name.so",
             "/tmp/demo///",
             "/tmp/\u{e9}.so",
+            "/tmp/\u{4e2d}\u{6587}.so",
+            "/tmp/\u{1f642};\u{e9}.so",
             "/tmp/demo(args).so",
             "/tmp/demo->inner.so",
             "/tmp/demo;other->inner(args).so",
@@ -7146,6 +7167,7 @@ mod tests {
             "/tmp/a b.so",
             "/tmp/a (nested)",
             "[vdso]",
+            "[unknown]",
         ] {
             state
                 .mmap_table

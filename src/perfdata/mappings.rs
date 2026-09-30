@@ -23,6 +23,8 @@ pub struct MmapTable {
     has_global_executable_mappings: bool,
     #[cfg(test)]
     index_searches: std::cell::Cell<usize>,
+    #[cfg(test)]
+    bucket_searches: std::cell::Cell<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55,18 +57,30 @@ pub(crate) struct MappedFrame<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ModuleFallbackKind {
+    #[default]
+    Literal,
+    Escaped,
+    Normalized,
+    RawFunction,
+    Skip,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MappingPathLayout {
     pub(crate) basename_start: usize,
     pub(crate) last_space: Option<usize>,
     pub(crate) basename_has_parentheses: bool,
     pub(crate) basename_needs_escaping: bool,
+    pub(crate) fallback: ModuleFallbackKind,
     bracketed: bool,
 }
 
 impl MappingPathLayout {
     pub(crate) fn new(path: &str) -> Self {
         let basename_start = memchr::memrchr(b'/', path.as_bytes()).map_or(0, |index| index + 1);
-        Self {
+        let mut layout = Self {
             bracketed: path.starts_with('['),
             basename_start,
             last_space: memchr::memrchr(b' ', path.as_bytes()),
@@ -78,7 +92,26 @@ impl MappingPathLayout {
                 &path.as_bytes()[basename_start..],
             )
             .is_some(),
-        }
+            fallback: ModuleFallbackKind::Literal,
+        };
+        // Inferno perf.rs:stack_line_parts and with_module_fallback. Store
+        // path classification, never an output-specific rendered label.
+        layout.fallback = if path == "[unknown]" {
+            ModuleFallbackKind::Unknown
+        } else if let Some(index) = layout.last_space {
+            if path.as_bytes().get(index + 1) == Some(&b'(') {
+                ModuleFallbackKind::RawFunction
+            } else {
+                ModuleFallbackKind::Skip
+            }
+        } else if layout.basename_has_parentheses {
+            ModuleFallbackKind::Normalized
+        } else if layout.basename_needs_escaping {
+            ModuleFallbackKind::Escaped
+        } else {
+            ModuleFallbackKind::Literal
+        };
+        layout
     }
 }
 
@@ -127,6 +160,67 @@ pub(crate) struct MappingResolveCache {
     pid: Option<u32>,
     pid_index: Option<usize>,
     global_index: Option<usize>,
+}
+
+pub(crate) struct FrameMappingContext<'a> {
+    table: &'a MmapTable,
+    pid: u32,
+    user: &'a [IndexedMapping],
+    global: &'a [IndexedMapping],
+}
+
+impl<'a> FrameMappingContext<'a> {
+    pub(crate) fn resolve_user(
+        &self,
+        ip: u64,
+        cache: &mut MappingResolveCache,
+    ) -> Option<MappedFrame<'a>> {
+        let index = self.table.resolve_bucket_with_cache(
+            self.pid,
+            self.user,
+            ip,
+            &mut cache.pid_index,
+            Mapping::is_user_cpumode,
+        )?;
+        Some(MappedFrame::new(&self.table.mappings[index], ip))
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        ip: u64,
+        cache: &mut MappingResolveCache,
+    ) -> Option<MappedFrame<'a>> {
+        let global = self.table.resolve_bucket_with_cache(
+            u32::MAX,
+            self.global,
+            ip,
+            &mut cache.global_index,
+            |_| true,
+        );
+        let index = if self.pid == u32::MAX {
+            global?
+        } else {
+            let user = self.table.resolve_bucket_with_cache(
+                self.pid,
+                self.user,
+                ip,
+                &mut cache.pid_index,
+                |_| true,
+            );
+            match (user, global) {
+                (Some(left), Some(right)) => {
+                    if self.table.mappings[left].start >= self.table.mappings[right].start {
+                        left
+                    } else {
+                        right
+                    }
+                }
+                (Some(index), None) | (None, Some(index)) => index,
+                (None, None) => return None,
+            }
+        };
+        Some(MappedFrame::new(&self.table.mappings[index], ip))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -234,6 +328,40 @@ impl MmapTable {
     #[cfg(test)]
     pub(crate) fn index_search_count(&self) -> usize {
         self.index_searches.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bucket_search_count(&self) -> usize {
+        self.bucket_searches.get()
+    }
+
+    fn bucket(&self, pid: u32) -> &[IndexedMapping] {
+        #[cfg(test)]
+        self.bucket_searches.set(self.bucket_searches.get() + 1);
+        self.mappings_by_pid.get(&pid).map_or(&[], Vec::as_slice)
+    }
+
+    pub(crate) fn frame_context(
+        &self,
+        pid: u32,
+        cache: &mut MappingResolveCache,
+    ) -> FrameMappingContext<'_> {
+        if cache.pid != Some(pid) {
+            cache.pid = Some(pid);
+            cache.pid_index = None;
+        }
+        let user = self.bucket(pid);
+        let global = if pid == u32::MAX {
+            user
+        } else {
+            self.bucket(u32::MAX)
+        };
+        FrameMappingContext {
+            table: self,
+            pid,
+            user,
+            global,
+        }
     }
 
     pub fn insert_mmap(&mut self, record: MmapRecord) {
@@ -755,7 +883,7 @@ impl MmapTable {
     fn resolve_mapping_index_for_pid(&self, pid: u32, ip: u64) -> Option<usize> {
         #[cfg(test)]
         self.index_searches.set(self.index_searches.get() + 1);
-        let bucket = self.mappings_by_pid.get(&pid)?;
+        let bucket = self.bucket(pid);
         let mut upper_bound = bucket.partition_point(|indexed| indexed.start <= ip);
         let mut latest_matching_index = None;
         while upper_bound > 0 {
@@ -789,10 +917,41 @@ impl MmapTable {
         cached_index: &mut Option<usize>,
         predicate: impl Fn(&Mapping) -> bool,
     ) -> Option<usize> {
+        if let Some(index) = self.cached_mapping_index(pid, ip, *cached_index, &predicate) {
+            return Some(index);
+        }
+        let resolved = self.resolve_bucket_with_predicate(self.bucket(pid), ip, predicate);
+        *cached_index = resolved;
+        resolved
+    }
+
+    fn resolve_bucket_with_cache(
+        &self,
+        pid: u32,
+        bucket: &[IndexedMapping],
+        ip: u64,
+        cached_index: &mut Option<usize>,
+        predicate: impl Fn(&Mapping) -> bool,
+    ) -> Option<usize> {
+        if let Some(index) = self.cached_mapping_index(pid, ip, *cached_index, &predicate) {
+            return Some(index);
+        }
+        let resolved = self.resolve_bucket_with_predicate(bucket, ip, predicate);
+        *cached_index = resolved;
+        resolved
+    }
+
+    fn cached_mapping_index(
+        &self,
+        pid: u32,
+        ip: u64,
+        cached_index: Option<usize>,
+        predicate: &impl Fn(&Mapping) -> bool,
+    ) -> Option<usize> {
         // maps.c:__maps__fixup_overlap_and_insert leaves disjoint ranges per
         // PID. Check the current entry, not a stored mapping: splits and fork
         // rebuilds can move indices, and callers share a cache across modes.
-        if let Some(index) = *cached_index
+        if let Some(index) = cached_index
             && self.mappings.get(index).is_some_and(|mapping| {
                 mapping.pid == pid
                     && mapping.start <= ip
@@ -802,20 +961,17 @@ impl MmapTable {
         {
             return Some(index);
         }
-        let resolved = self.resolve_mapping_index_for_pid_with_predicate(pid, ip, predicate);
-        *cached_index = resolved;
-        resolved
+        None
     }
 
-    fn resolve_mapping_index_for_pid_with_predicate(
+    fn resolve_bucket_with_predicate(
         &self,
-        pid: u32,
+        bucket: &[IndexedMapping],
         ip: u64,
         predicate: impl Fn(&Mapping) -> bool,
     ) -> Option<usize> {
         #[cfg(test)]
         self.index_searches.set(self.index_searches.get() + 1);
-        let bucket = self.mappings_by_pid.get(&pid)?;
         let mut upper_bound = bucket.partition_point(|indexed| indexed.start <= ip);
         let mut latest_matching_index = None;
         while upper_bound > 0 {
@@ -1198,6 +1354,13 @@ mod tests {
                         table.resolve_ref_cached(pid, ip, &mut cache),
                         table.resolve_ref(pid, ip)
                     );
+                    let context = table.frame_context(pid, &mut cache);
+                    assert_eq!(
+                        context
+                            .resolve(ip, &mut cache)
+                            .map(super::MappedFrame::resolved_ref),
+                        table.resolve_ref(pid, ip)
+                    );
                     let expected = table
                         .mappings
                         .iter()
@@ -1225,6 +1388,17 @@ mod tests {
                                 mapping.end,
                             )
                         });
+                    assert_eq!(actual, expected);
+                    let context = table.frame_context(pid, &mut user_cache);
+                    let actual = context.resolve_user(ip, &mut user_cache).map(|mapping| {
+                        let mapping = mapping.resolved_ref();
+                        (
+                            mapping.path,
+                            mapping.relative_address,
+                            mapping.start,
+                            mapping.end,
+                        )
+                    });
                     assert_eq!(actual, expected);
                 }
             }
