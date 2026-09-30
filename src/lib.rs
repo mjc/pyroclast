@@ -37,8 +37,8 @@ use flamegraph::{FlamegraphRenderer, FlamegraphRequest, InfernoFlamegraphRendere
 pub use output::{CliOutput, write_cli_output};
 use perfdata::analysis::{PerfdataAnalysis, analyze_perfdata_file};
 use perfdata::fold::{
-    FoldOptions, fold_perfdata_file, fold_perfdata_file_with_options,
-    fold_perfdata_file_with_symbols, write_inferno_perf_script_file_with_options,
+    FoldOptions, fold_perfdata_file, write_folded_perfdata_file_with_options,
+    write_folded_perfdata_file_with_symbols, write_inferno_perf_script_file_with_options,
     write_inferno_perf_script_file_with_symbols,
 };
 use process::{CommandRunner, RealCommandRunner};
@@ -58,6 +58,69 @@ where
 {
     let cli = Cli::parse_from(args);
     run_parsed_cli(cli)
+}
+
+/// Runs the CLI with streaming perf text and folded output.
+///
+/// # Errors
+///
+/// Returns an error when parsing, resolution, or writing fails.
+pub fn run_cli_to_writers<I, T>(
+    args: I,
+    mut stdout: impl std::io::Write,
+    mut stderr: impl std::io::Write,
+) -> backends::BackendResult<()>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let cli = Cli::parse_from(args);
+    let runner = RealCommandRunner::default();
+    let mut stream = output::PipeWriter::new(&mut stdout);
+    let result = match cli.command {
+        CliCommand::Plumbing {
+            command: PlumbingCommand::Fold(command),
+        } => write_perfdata_for_cli(
+            &command.input,
+            FoldOptions {
+                count_periods: command.count_periods,
+                inline: command.inline_frames.enabled(),
+            },
+            command.symbols,
+            command.symbolizer,
+            &runner,
+            PerfdataOutput::Folded,
+            &mut stream,
+        ),
+        CliCommand::Plumbing {
+            command: PlumbingCommand::PerfScript(command),
+        } => write_perfdata_for_cli(
+            &command.input,
+            FoldOptions {
+                count_periods: true,
+                inline: command.inline_frames.enabled(),
+            },
+            command.symbols,
+            command.symbolizer,
+            &runner,
+            PerfdataOutput::PerfScript,
+            &mut stream,
+        ),
+        command => {
+            let output = run_parsed_cli(Cli { command })?;
+            write_cli_output(&output, &mut stream, &mut stderr).map_err(Into::into)
+        }
+    };
+    if stream.broken_pipe() {
+        return Ok(());
+    }
+    // Flush even on a parse error: samples already delivered are valid text.
+    let flushed = std::io::Write::flush(&mut stream);
+    if stream.broken_pipe() {
+        return Ok(());
+    }
+    flushed?;
+    result
 }
 
 /// Parses cargo-subcommand arguments and runs the requested Pyroclast profile.
@@ -681,19 +744,17 @@ fn fold_perfdata_for_cli<R>(
 where
     R: CommandRunner,
 {
-    if symbols {
-        let symbol_resolver =
-            perf_symbol_resolver_for_current_home_with_symbolizer(runner, path, symbolizer);
-        Ok(fold_perfdata_file_with_symbols(
-            path,
-            options,
-            &symbol_resolver,
-        )?)
-    } else if options == FoldOptions::default() {
-        Ok(fold_perfdata_file(path)?)
-    } else {
-        Ok(fold_perfdata_file_with_options(path, options)?)
-    }
+    let mut output = Vec::new();
+    write_perfdata_for_cli(
+        path,
+        options,
+        symbols,
+        symbolizer,
+        runner,
+        PerfdataOutput::Folded,
+        &mut output,
+    )?;
+    Ok(String::from_utf8(output)?)
 }
 
 fn perf_script_for_cli<R>(
@@ -711,12 +772,53 @@ where
         inline,
     };
     let mut output = Vec::new();
-    if symbols {
-        let symbol_resolver =
-            perf_symbol_resolver_for_current_home_with_symbolizer(runner, path, symbolizer);
-        write_inferno_perf_script_file_with_symbols(path, options, &symbol_resolver, &mut output)?;
-    } else {
-        write_inferno_perf_script_file_with_options(path, options, &mut output)?;
-    }
+    write_perfdata_for_cli(
+        path,
+        options,
+        symbols,
+        symbolizer,
+        runner,
+        PerfdataOutput::PerfScript,
+        &mut output,
+    )?;
     Ok(String::from_utf8(output)?)
+}
+
+#[derive(Clone, Copy)]
+enum PerfdataOutput {
+    Folded,
+    PerfScript,
+}
+
+fn write_perfdata_for_cli<R: CommandRunner>(
+    path: &std::path::Path,
+    options: FoldOptions,
+    symbols: bool,
+    symbolizer: SymbolizerKind,
+    runner: &R,
+    format: PerfdataOutput,
+    writer: &mut impl std::io::Write,
+) -> backends::BackendResult<()> {
+    if symbols {
+        let resolver =
+            perf_symbol_resolver_for_current_home_with_symbolizer(runner, path, symbolizer);
+        match format {
+            PerfdataOutput::Folded => {
+                write_folded_perfdata_file_with_symbols(path, options, &resolver, writer)?;
+            }
+            PerfdataOutput::PerfScript => {
+                write_inferno_perf_script_file_with_symbols(path, options, &resolver, writer)?;
+            }
+        }
+    } else {
+        match format {
+            PerfdataOutput::Folded => {
+                write_folded_perfdata_file_with_options(path, options, writer)?;
+            }
+            PerfdataOutput::PerfScript => {
+                write_inferno_perf_script_file_with_options(path, options, writer)?;
+            }
+        }
+    }
+    Ok(())
 }

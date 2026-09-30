@@ -78,6 +78,93 @@ fn fold_command_reads_perfdata_directly() {
 }
 
 #[test]
+fn streaming_perf_commands_match_explicit_owned_output_adapters() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), tiny_perfdata()).unwrap();
+    for command in ["fold", "perf-script"] {
+        let args = [
+            "pyroclast",
+            "plumbing",
+            command,
+            "--no-symbols",
+            file.path().to_str().unwrap(),
+        ];
+        let expected = pyroclast::run_cli(args).unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        pyroclast::run_cli_to_writers(args, &mut stdout, &mut stderr).unwrap();
+        assert_eq!(stdout, expected.stdout.as_bytes());
+        assert_eq!(stderr, expected.stderr.as_bytes());
+    }
+}
+
+struct FailingStream(std::io::ErrorKind);
+
+impl std::io::Write for FailingStream {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::from(self.0))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::from(self.0))
+    }
+}
+
+#[test]
+fn streaming_perf_text_accepts_broken_pipe_but_reports_other_write_errors() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), tiny_perfdata()).unwrap();
+    let args = [
+        "pyroclast",
+        "plumbing",
+        "perf-script",
+        "--no-symbols",
+        file.path().to_str().unwrap(),
+    ];
+    assert!(
+        pyroclast::run_cli_to_writers(
+            args,
+            FailingStream(std::io::ErrorKind::BrokenPipe),
+            Vec::new()
+        )
+        .is_ok()
+    );
+    assert!(
+        pyroclast::run_cli_to_writers(
+            args,
+            FailingStream(std::io::ErrorKind::PermissionDenied),
+            Vec::new()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn perf_script_binary_streams_delivered_samples_before_a_later_parse_error() {
+    // perf session.c delivers an untimed sample immediately. A malformed
+    // later record must not make the CLI buffer and discard earlier text.
+    let mut bytes = tiny_perfdata();
+    let mut invalid = record_bytes(68, &[]);
+    invalid[6..8].copy_from_slice(&4_u16.to_le_bytes());
+    bytes.extend(invalid);
+    let data_offset = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
+    let data_size = bytes.len() as u64 - data_offset;
+    put_u64(&mut bytes, 48, data_size);
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), bytes).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pyroclast"))
+        .args(["plumbing", "perf-script", "--no-symbols"])
+        .arg(file.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid perf record size"));
+    assert!(
+        !output.stdout.is_empty(),
+        "delivered text must not be retained in CliOutput"
+    );
+}
+
+#[test]
 fn perf_script_command_exports_inferno_compatible_perf_script() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
