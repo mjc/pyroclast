@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::fs::File;
@@ -1014,7 +1013,7 @@ impl<R: SymbolResolver> SampleOutput for FoldedOutput<'_, '_, R> {
         FoldFrameResolver::new(&accumulator.mmap_table, self.inline)
             .render_folded_stack_for_stack(
                 sample.pid,
-                comm.as_deref(),
+                comm,
                 frames,
                 self.symbol_cache.as_deref_mut(),
                 &mut self.buffers,
@@ -1277,17 +1276,14 @@ where
 fn perf_script_comm<'a>(
     thread_comms: &'a BTreeMap<u32, String>,
     sample: &PreparedFoldSample,
-) -> Cow<'a, str> {
+) -> SampleComm<'a> {
     if let Some(tid) = sample.tid {
-        return thread_comms.get(&tid).map_or_else(
-            || Cow::Owned(format!(":{tid}")),
-            |comm| Cow::Borrowed(comm.as_str()),
-        );
+        return comm_for_ids(thread_comms, Some(tid)).unwrap();
     }
     if sample.pid.is_some() {
-        return Cow::Borrowed("[unknown]");
+        return SampleComm::Name("[unknown]");
     }
-    Cow::Borrowed(":-1")
+    SampleComm::Name(":-1")
 }
 
 impl OrderedRecordQueue {
@@ -1954,12 +1950,38 @@ fn is_valid_unwound_user_frame(
     address != 0
 }
 
-fn comm_for_ids(thread_comms: &BTreeMap<u32, String>, tid: Option<u32>) -> Option<Cow<'_, str>> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SampleComm<'a> {
+    Name(&'a str),
+    Tid(u32),
+}
+
+impl std::fmt::Display for SampleComm<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Name(name) => formatter.pad(name),
+            Self::Tid(tid) => {
+                // A colon and the ten decimal digits of u32::MAX fit on the stack.
+                let mut bytes = [0; 11];
+                let mut writer = std::io::Cursor::new(bytes.as_mut_slice());
+                write!(writer, ":{tid}").map_err(|_| std::fmt::Error)?;
+                let len = usize::try_from(writer.position()).map_err(|_| std::fmt::Error)?;
+                let name = std::str::from_utf8(&bytes[..len]).map_err(|_| std::fmt::Error)?;
+                formatter.pad(name)
+            }
+        }
+    }
+}
+
+fn comm_for_ids(thread_comms: &BTreeMap<u32, String>, tid: Option<u32>) -> Option<SampleComm<'_>> {
     let tid = tid?;
-    Some(thread_comms.get(&tid).map_or_else(
-        || Cow::Owned(format!(":{tid}")),
-        |comm| Cow::Borrowed(comm.as_str()),
-    ))
+    // perf util/thread.c:thread__new initializes ":%d" once per thread.
+    // Keep that fallback numeric rather than allocating it for every sample.
+    Some(
+        thread_comms
+            .get(&tid)
+            .map_or(SampleComm::Tid(tid), |comm| SampleComm::Name(comm.as_str())),
+    )
 }
 
 fn stack_bytes<'a>(names: &'a [Arc<str>], stack: &'a [LabelId]) -> impl Iterator<Item = u8> + 'a {
@@ -2113,7 +2135,7 @@ impl<'a> FoldFrameResolver<'a> {
     fn render_folded_stack_for_stack<R, I>(
         &self,
         pid: Option<u32>,
-        comm: Option<&str>,
+        comm: Option<SampleComm<'_>>,
         callchain: I,
         mut symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
         buffers: &mut FoldedRenderBuffers,
@@ -2123,7 +2145,7 @@ impl<'a> FoldFrameResolver<'a> {
         I: IntoIterator<Item = FoldFrame>,
     {
         buffers.current.clear();
-        if let Some(comm) = comm {
+        if let Some(SampleComm::Name(comm)) = comm {
             buffers.current.reserve(comm.len());
             for character in comm.chars() {
                 match character {
@@ -2133,6 +2155,8 @@ impl<'a> FoldFrameResolver<'a> {
                     _ => buffers.current.push(character),
                 }
             }
+        } else if let Some(SampleComm::Tid(tid)) = comm {
+            write!(buffers.current, ":{tid}").map_err(|error| error.to_string())?;
         } else {
             append_cached_inferno_perf_folded_label_to_buffers(buffers, UNKNOWN_FRAME);
         }
@@ -4831,7 +4855,7 @@ mod tests {
         super::FoldFrameResolver::new(&mmap_table, false)
             .render_folded_stack_for_stack(
                 Some(11),
-                Some("pyroclast"),
+                Some(super::SampleComm::Name("pyroclast")),
                 [super::FoldFrame::InlineCurrentIp(0x5555_5567_6876)],
                 Some(&mut symbol_cache),
                 &mut buffers,
@@ -4950,7 +4974,7 @@ mod tests {
         super::FoldFrameResolver::new(&mmap_table, false)
             .render_folded_stack_for_stack(
                 Some(11),
-                Some("pyroclast"),
+                Some(super::SampleComm::Name("pyroclast")),
                 [super::FoldFrame::InlineCurrentIp(0x5555_5567_a0be)],
                 Some(&mut symbol_cache),
                 &mut buffers,
@@ -4995,7 +5019,7 @@ mod tests {
         super::FoldFrameResolver::new(&mmap_table, false)
             .render_folded_stack_for_stack(
                 Some(11),
-                Some("pyroclast"),
+                Some(super::SampleComm::Name("pyroclast")),
                 [super::FoldFrame::InlineCurrentIp(0x5555_557a_e068)],
                 Some(&mut symbol_cache),
                 &mut buffers,
@@ -5036,7 +5060,7 @@ mod tests {
         super::FoldFrameResolver::new(&mmap_table, false)
             .render_folded_stack_for_stack(
                 Some(11),
-                Some("pyroclast"),
+                Some(super::SampleComm::Name("pyroclast")),
                 [super::FoldFrame::InlineCurrentIp(0x5555_556f_bbbb)],
                 Some(&mut symbol_cache),
                 &mut buffers,
@@ -5076,7 +5100,7 @@ mod tests {
         super::FoldFrameResolver::new(&mmap_table, true)
             .render_folded_stack_for_stack(
                 Some(11),
-                Some("burn-00"),
+                Some(super::SampleComm::Name("burn-00")),
                 [super::FoldFrame::InlineCurrentIp(0x4010)],
                 Some(&mut symbol_cache),
                 &mut buffers,
@@ -5112,7 +5136,7 @@ mod tests {
         super::FoldFrameResolver::new(&mmap_table, true)
             .render_folded_stack_for_stack(
                 Some(11),
-                Some("burn-00"),
+                Some(super::SampleComm::Name("burn-00")),
                 [
                     super::FoldFrame::UserUnwind(0x4010),
                     super::FoldFrame::UserUnwind(0x4020),
@@ -5153,7 +5177,7 @@ mod tests {
         super::FoldFrameResolver::new(&mmap_table, true)
             .render_folded_stack_for_stack(
                 Some(11),
-                Some("burn-00"),
+                Some(super::SampleComm::Name("burn-00")),
                 [super::FoldFrame::InlineCurrentIp(0x4010)],
                 Some(&mut symbol_cache),
                 &mut buffers,
@@ -5498,7 +5522,7 @@ mod tests {
         super::FoldFrameResolver::new(&table, true)
             .render_folded_stack_for_stack(
                 Some(7),
-                Some("worker"),
+                Some(super::SampleComm::Name("worker")),
                 [
                     super::FoldFrame::UserUnwind(0x1010),
                     super::FoldFrame::UserUnwind(0x2020),
@@ -5564,7 +5588,7 @@ mod tests {
         super::FoldFrameResolver::new(&table, true)
             .render_folded_stack_for_stack(
                 Some(7),
-                Some("worker"),
+                Some(super::SampleComm::Name("worker")),
                 CountingFrames {
                     frames: frames.iter(),
                     visits: &visits,
@@ -5601,7 +5625,7 @@ mod tests {
         renderer
             .render_folded_stack_for_stack(
                 Some(7),
-                Some("worker"),
+                Some(super::SampleComm::Name("worker")),
                 [super::FoldFrame::UserUnwind(0x1001)],
                 Some(&mut cache),
                 &mut buffers,
@@ -5617,7 +5641,7 @@ mod tests {
         renderer
             .render_folded_stack_for_stack(
                 Some(7),
-                Some("worker"),
+                Some(super::SampleComm::Name("worker")),
                 frames,
                 Some(&mut cache),
                 &mut buffers,
@@ -6021,6 +6045,45 @@ mod tests {
             std::mem::size_of::<super::PreparedFoldSample>() <= 128,
             "a delivered sample is metadata and a borrowed frame view"
         );
+    }
+
+    #[test]
+    fn missing_comm_stays_numeric_until_output() {
+        let names = std::collections::BTreeMap::new();
+        let comm = super::comm_for_ids(&names, Some(7)).unwrap();
+        assert_eq!(comm, super::SampleComm::Tid(7));
+        assert_eq!(comm.to_string(), ":7");
+    }
+
+    #[test]
+    fn numeric_and_borrowed_comms_preserve_header_padding() {
+        let mut names = std::collections::BTreeMap::new();
+        names.insert(7, "worker".to_string());
+        names.insert(8, "w\u{e9}".to_string());
+        for tid in [0, 7, 8, 12345, u32::MAX] {
+            let expected = names
+                .get(&tid)
+                .cloned()
+                .unwrap_or_else(|| format!(":{tid}"));
+            let comm = super::comm_for_ids(&names, Some(tid)).unwrap();
+            assert_eq!(comm.to_string(), expected);
+            for width in [0, 16, 32] {
+                assert_eq!(format!("{comm:>width$}"), format!("{expected:>width$}"));
+                assert_eq!(format!("{comm:<width$}"), format!("{expected:<width$}"));
+            }
+            if let super::SampleComm::Name(name) = comm {
+                assert_eq!(name.as_ptr(), names[&tid].as_ptr());
+            }
+        }
+        assert_eq!(super::comm_for_ids(&names, None), None);
+        let mut sample = prepared_sample(&[]);
+        sample.tid = None;
+        assert_eq!(
+            super::perf_script_comm(&names, &sample).to_string(),
+            "[unknown]"
+        );
+        sample.pid = None;
+        assert_eq!(super::perf_script_comm(&names, &sample).to_string(), ":-1");
     }
 
     #[test]
