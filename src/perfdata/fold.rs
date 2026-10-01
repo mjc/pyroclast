@@ -5548,8 +5548,8 @@ mod tests {
         );
         assert_eq!(
             state.mmap_table.bucket_search_count() - buckets,
-            2,
-            "one PID bucket and one global bucket per sample, not per frame"
+            1,
+            "one PID bucket per sample; no global bucket exists"
         );
         assert_eq!(resolver.full_requests.borrow().len(), 4);
         assert_eq!(output.buffers.counts.stacks.len(), 1);

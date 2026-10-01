@@ -5,6 +5,7 @@ use crate::perfdata::records::{
 use crate::symbols::KernelRelocation;
 use hashbrown::{HashMap, HashSet};
 use rustc_hash::FxBuildHasher;
+use std::cell::Cell;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -25,6 +26,8 @@ pub struct MmapTable {
     index_searches: std::cell::Cell<usize>,
     #[cfg(test)]
     bucket_searches: std::cell::Cell<usize>,
+    #[cfg(test)]
+    cache_index_probes: std::cell::Cell<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -167,6 +170,27 @@ pub(crate) struct FrameMappingContext<'a> {
     pid: u32,
     user: &'a [IndexedMapping],
     global: &'a [IndexedMapping],
+    user_hint: Cell<Option<FrameMappingHint<'a>>>,
+    global_hint: Cell<Option<FrameMappingHint<'a>>>,
+}
+
+#[derive(Clone, Copy)]
+struct FrameMappingHint<'a> {
+    mapping: &'a Mapping,
+    index: usize,
+    start: u64,
+    end: u64,
+}
+
+impl<'a> FrameMappingHint<'a> {
+    fn new(index: usize, mapping: &'a Mapping) -> Self {
+        Self {
+            mapping,
+            index,
+            start: mapping.start,
+            end: mapping.end(),
+        }
+    }
 }
 
 impl<'a> FrameMappingContext<'a> {
@@ -175,14 +199,9 @@ impl<'a> FrameMappingContext<'a> {
         ip: u64,
         cache: &mut MappingResolveCache,
     ) -> Option<MappedFrame<'a>> {
-        let index = self.table.resolve_bucket_with_cache(
-            self.pid,
-            self.user,
-            ip,
-            &mut cache.pid_index,
-            Mapping::is_user_cpumode,
-        )?;
-        Some(MappedFrame::new(&self.table.mappings[index], ip))
+        let mapping =
+            self.resolve_bucket::<true>(self.user, ip, &mut cache.pid_index, &self.user_hint)?;
+        Some(MappedFrame::new(mapping, ip))
     }
 
     pub(crate) fn resolve(
@@ -190,36 +209,63 @@ impl<'a> FrameMappingContext<'a> {
         ip: u64,
         cache: &mut MappingResolveCache,
     ) -> Option<MappedFrame<'a>> {
-        let global = self.table.resolve_bucket_with_cache(
-            u32::MAX,
+        let global = self.resolve_bucket::<false>(
             self.global,
             ip,
             &mut cache.global_index,
-            |_| true,
+            &self.global_hint,
         );
-        let index = if self.pid == u32::MAX {
+        let mapping = if self.pid == u32::MAX {
             global?
         } else {
-            let user = self.table.resolve_bucket_with_cache(
-                self.pid,
-                self.user,
-                ip,
-                &mut cache.pid_index,
-                |_| true,
-            );
+            let user =
+                self.resolve_bucket::<false>(self.user, ip, &mut cache.pid_index, &self.user_hint);
             match (user, global) {
                 (Some(left), Some(right)) => {
-                    if self.table.mappings[left].start >= self.table.mappings[right].start {
+                    if left.start >= right.start {
                         left
                     } else {
                         right
                     }
                 }
-                (Some(index), None) | (None, Some(index)) => index,
+                (Some(mapping), None) | (None, Some(mapping)) => mapping,
                 (None, None) => return None,
             }
         };
-        Some(MappedFrame::new(&self.table.mappings[index], ip))
+        Some(MappedFrame::new(mapping, ip))
+    }
+
+    fn resolve_bucket<const USER_ONLY: bool>(
+        &self,
+        bucket: &[IndexedMapping],
+        ip: u64,
+        cached_index: &mut Option<usize>,
+        hint: &Cell<Option<FrameMappingHint<'a>>>,
+    ) -> Option<&'a Mapping> {
+        // The context borrows the table for one delivered sample: map edits
+        // cannot invalidate these references until that sample is finished.
+        if let Some(found) = hint.get()
+            && found.start <= ip
+            && ip < found.end
+            && (!USER_ONLY || found.mapping.is_user_cpumode())
+        {
+            *cached_index = Some(found.index);
+            return Some(found.mapping);
+        }
+        if bucket.is_empty() {
+            *cached_index = None;
+            return None;
+        }
+        let index = self
+            .table
+            .resolve_bucket_with_predicate(bucket, ip, |mapping| {
+                !USER_ONLY || mapping.is_user_cpumode()
+            });
+        *cached_index = index;
+        let index = index?;
+        let found = FrameMappingHint::new(index, &self.table.mappings[index]);
+        hint.set(Some(found));
+        Some(found.mapping)
     }
 }
 
@@ -353,6 +399,8 @@ impl MmapTable {
         let user = self.bucket(pid);
         let global = if pid == u32::MAX {
             user
+        } else if !self.has_global_mappings {
+            &[]
         } else {
             self.bucket(u32::MAX)
         };
@@ -361,7 +409,20 @@ impl MmapTable {
             pid,
             user,
             global,
+            user_hint: Cell::new(self.frame_mapping_hint(pid, cache.pid_index)),
+            global_hint: Cell::new(self.frame_mapping_hint(u32::MAX, cache.global_index)),
         }
+    }
+
+    fn frame_mapping_hint(&self, pid: u32, index: Option<usize>) -> Option<FrameMappingHint<'_>> {
+        #[cfg(test)]
+        self.cache_index_probes
+            .set(self.cache_index_probes.get() + 1);
+        let index = index?;
+        self.mappings
+            .get(index)
+            .filter(|mapping| mapping.pid == pid)
+            .map(|mapping| FrameMappingHint::new(index, mapping))
     }
 
     pub fn insert_mmap(&mut self, record: MmapRecord) {
@@ -925,22 +986,6 @@ impl MmapTable {
         resolved
     }
 
-    fn resolve_bucket_with_cache(
-        &self,
-        pid: u32,
-        bucket: &[IndexedMapping],
-        ip: u64,
-        cached_index: &mut Option<usize>,
-        predicate: impl Fn(&Mapping) -> bool,
-    ) -> Option<usize> {
-        if let Some(index) = self.cached_mapping_index(pid, ip, *cached_index, &predicate) {
-            return Some(index);
-        }
-        let resolved = self.resolve_bucket_with_predicate(bucket, ip, predicate);
-        *cached_index = resolved;
-        resolved
-    }
-
     fn cached_mapping_index(
         &self,
         pid: u32,
@@ -948,6 +993,9 @@ impl MmapTable {
         cached_index: Option<usize>,
         predicate: &impl Fn(&Mapping) -> bool,
     ) -> Option<usize> {
+        #[cfg(test)]
+        self.cache_index_probes
+            .set(self.cache_index_probes.get() + 1);
         // maps.c:__maps__fixup_overlap_and_insert leaves disjoint ranges per
         // PID. Check the current entry, not a stored mapping: splits and fork
         // rebuilds can move indices, and callers share a cache across modes.
@@ -1315,6 +1363,165 @@ mod tests {
     }
 
     #[test]
+    fn sample_context_reuses_borrowed_maps_without_probing_table_indices_on_hits() {
+        let mut table = MmapTable::default();
+        for (pid, start, path) in [(7, 0x1000, "/user"), (u32::MAX, 0x2000, "[global]")] {
+            table.insert_mmap(MmapRecord {
+                pid,
+                tid: pid,
+                start,
+                len: 0x100,
+                pgoff: 0,
+                path: path.into(),
+            });
+        }
+        let mut cache = MappingResolveCache::default();
+        let context = table.frame_context(7, &mut cache);
+        assert!(context.resolve_user(0x1000, &mut cache).is_some());
+        assert!(context.resolve(0x2000, &mut cache).is_some());
+        let probes = table.cache_index_probes.get();
+        for offset in 0..0x100 {
+            let user = context.resolve_user(0x1000 + offset, &mut cache).unwrap();
+            assert_eq!(user.path(), "/user");
+            assert_eq!(user.relative_address, offset);
+            assert_eq!(
+                context.resolve(0x2000 + offset, &mut cache).unwrap().path(),
+                "[global]"
+            );
+        }
+        assert_eq!(
+            table.cache_index_probes.get(),
+            probes,
+            "an immutable sample context must reuse borrowed maps, not revalidate global vector indices"
+        );
+    }
+
+    #[test]
+    fn sample_context_skips_absent_global_buckets() {
+        let mut table = MmapTable::default();
+        table.insert_mmap(MmapRecord {
+            pid: 7,
+            tid: 7,
+            start: 0x1000,
+            len: 0x100,
+            pgoff: 0,
+            path: "/user".into(),
+        });
+        let mut cache = MappingResolveCache::default();
+        let context = table.frame_context(7, &mut cache);
+        assert_eq!(
+            table.bucket_searches.get(),
+            1,
+            "no global bucket exists to fetch"
+        );
+        context.resolve(0x1000, &mut cache).unwrap();
+        let searches = table.index_searches.get();
+        for offset in 0..0x100 {
+            assert!(context.resolve(0x1000 + offset, &mut cache).is_some());
+        }
+        assert_eq!(
+            table.index_searches.get(),
+            searches,
+            "an empty global index must not be searched on every hit"
+        );
+    }
+
+    #[test]
+    fn sample_context_hints_preserve_cpu_mode_and_global_precedence() {
+        let mut table = MmapTable::default();
+        for (pid, start, path, mode) in [
+            (
+                7,
+                0x1000,
+                "/user",
+                crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_USER,
+            ),
+            (
+                7,
+                0x2000,
+                "[local-kernel]",
+                crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_KERNEL,
+            ),
+            (
+                u32::MAX,
+                0x1080,
+                "[global]",
+                crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_KERNEL,
+            ),
+            (
+                u32::MAX,
+                0x2000,
+                "[global-tie]",
+                crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_KERNEL,
+            ),
+        ] {
+            table.insert_mmap_with_misc(
+                MmapRecord {
+                    pid,
+                    tid: pid,
+                    start,
+                    len: 0x100,
+                    pgoff: 0,
+                    path: path.into(),
+                },
+                mode,
+            );
+        }
+        let mut cache = MappingResolveCache::default();
+        let context = table.frame_context(7, &mut cache);
+        for _ in 0..3 {
+            assert_eq!(
+                context.resolve(0x1090, &mut cache).unwrap().path(),
+                "[global]"
+            );
+            assert_eq!(
+                context.resolve_user(0x1090, &mut cache).unwrap().path(),
+                "/user"
+            );
+            assert_eq!(
+                context.resolve(0x2010, &mut cache).unwrap().path(),
+                "[local-kernel]"
+            );
+            assert!(context.resolve_user(0x2010, &mut cache).is_none());
+            assert_eq!(cache.pid_index, None);
+            assert_eq!(
+                context.resolve(0x2010, &mut cache).unwrap().path(),
+                "[local-kernel]"
+            );
+        }
+    }
+
+    #[test]
+    fn sample_context_hints_keep_exclusive_saturating_bounds_after_misses() {
+        let mut table = MmapTable::default();
+        table.insert_mmap(MmapRecord {
+            pid: 7,
+            tid: 7,
+            start: u64::MAX - 0x100,
+            len: 0x200,
+            pgoff: 0,
+            path: "/end".into(),
+        });
+        let mut cache = MappingResolveCache::default();
+        let context = table.frame_context(7, &mut cache);
+        for ip in [
+            u64::MAX - 1,
+            u64::MAX,
+            0,
+            u64::MAX - 0x101,
+            u64::MAX - 0x100,
+            u64::MAX - 1,
+        ] {
+            assert_eq!(
+                context
+                    .resolve(ip, &mut cache)
+                    .map(super::MappedFrame::resolved_ref),
+                table.resolve_ref(7, ip)
+            );
+        }
+    }
+
+    #[test]
     fn cached_lookups_match_current_maps_after_splits_reindexing_and_pid_switches() {
         let mut table = MmapTable::default();
         for (pid, path) in [(7, "/first"), (8, "/other"), (u32::MAX, "[global]")] {
@@ -1347,6 +1554,8 @@ mod tests {
                 path: format!("/replacement-{start:x}"),
             });
             for pid in [7, 8, 9, u32::MAX] {
+                let context = table.frame_context(pid, &mut cache);
+                let user_context = table.frame_context(pid, &mut user_cache);
                 for ip in [
                     0xfff, 0x1000, 0x16ff, 0x1700, 0x1800, 0x18ff, 0x1900, 0x1fff, 0x2000,
                 ] {
@@ -1354,7 +1563,6 @@ mod tests {
                         table.resolve_ref_cached(pid, ip, &mut cache),
                         table.resolve_ref(pid, ip)
                     );
-                    let context = table.frame_context(pid, &mut cache);
                     assert_eq!(
                         context
                             .resolve(ip, &mut cache)
@@ -1389,16 +1597,17 @@ mod tests {
                             )
                         });
                     assert_eq!(actual, expected);
-                    let context = table.frame_context(pid, &mut user_cache);
-                    let actual = context.resolve_user(ip, &mut user_cache).map(|mapping| {
-                        let mapping = mapping.resolved_ref();
-                        (
-                            mapping.path,
-                            mapping.relative_address,
-                            mapping.start,
-                            mapping.end,
-                        )
-                    });
+                    let actual = user_context
+                        .resolve_user(ip, &mut user_cache)
+                        .map(|mapping| {
+                            let mapping = mapping.resolved_ref();
+                            (
+                                mapping.path,
+                                mapping.relative_address,
+                                mapping.start,
+                                mapping.end,
+                            )
+                        });
                     assert_eq!(actual, expected);
                 }
             }
