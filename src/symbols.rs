@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::borrow::{Borrow, Cow};
 use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -321,6 +321,8 @@ struct MappingFrameTable {
     user: UserFrameTable,
     kernel: FxHashMap<MappingFrameKey, usize>,
     frames: Vec<CachedMappingFrames>,
+    #[cfg(test)]
+    lookups: Cell<usize>,
 }
 
 impl MappingFrameTable {
@@ -329,6 +331,8 @@ impl MappingFrameTable {
     }
 
     fn slot(&self, key: &MappingFrameKey) -> Option<usize> {
+        #[cfg(test)]
+        self.lookups.set(self.lookups.get() + 1);
         if key.kernel_mapping_range.is_some() {
             self.kernel.get(key).copied()
         } else {
@@ -355,6 +359,8 @@ impl MappingFrameTable {
     }
 
     fn get_frame(&self, mapping: &MappedFrame<'_>) -> Option<&CachedMappingFrames> {
+        #[cfg(test)]
+        self.lookups.set(self.lookups.get() + 1);
         let slot = if let Some(range) = mapping.kernel_range() {
             self.kernel
                 .get(&MappingFrameKey {
@@ -1621,6 +1627,11 @@ where
         table.contains_key(&mapping_frame_key(mapping))
     }
 
+    #[cfg(test)]
+    pub(crate) fn mapping_frame_lookup_count(&self) -> usize {
+        self.resolved_by_mapping.lookups.get() + self.resolved_base_by_mapping.lookups.get()
+    }
+
     pub(crate) fn cached_mapping_frames(
         &self,
         mapping: &MappedFrame<'_>,
@@ -1636,11 +1647,14 @@ where
             .map(|cached| (cached.frames.as_slice(), cached.has_base_symbol))
     }
 
-    fn prefetch_mapping_refs_with_mode(
+    pub(crate) fn prefetch_mapping_refs_with_mode<'mapping, M>(
         &mut self,
-        mappings: &[ResolvedMappingRef<'_>],
+        mappings: impl IntoIterator<Item = M>,
         inline: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), String>
+    where
+        M: Borrow<ResolvedMappingRef<'mapping>>,
+    {
         let mut seen = std::mem::take(&mut self.scratch_seen_mapping);
         let mut keys = std::mem::take(&mut self.scratch_missing_keys);
         let mut requests = std::mem::take(&mut self.scratch_missing_requests);
@@ -1648,6 +1662,7 @@ where
         keys.clear();
         let result = (|| {
             for mapping in mappings {
+                let mapping = mapping.borrow();
                 let key = mapping_frame_key(mapping);
                 if self.mapping_ref_cached(mapping, inline) || !seen.insert(key) {
                     continue;
@@ -5841,6 +5856,50 @@ mod tests {
                 table.get(&key).unwrap().frames,
                 [format!("replacement-{relative_address}")]
             );
+        }
+    }
+
+    #[test]
+    fn symbol_frame_cache_accepts_owned_mapping_iterators_and_borrowed_batches() {
+        for inline in [false, true] {
+            let resolver = CountingFrameResolver::new(vec![vec!["one".into()], vec!["two".into()]]);
+            let mut cache = SymbolFrameCache::new(&resolver);
+            let mut visits = 0;
+            let mappings = std::iter::from_fn(|| {
+                let address = match visits {
+                    0 | 1 => 0x1234,
+                    2 => 0x5678,
+                    _ => return None,
+                };
+                visits += 1;
+                Some(test_mapping_ref("/bin/demo", address))
+            });
+            cache
+                .prefetch_mapping_refs_with_mode(mappings, inline)
+                .unwrap();
+            assert_eq!(visits, 3);
+            let batch = [
+                test_mapping_ref("/bin/demo", 0x1234),
+                test_mapping_ref("/bin/demo", 0x5678),
+            ];
+            cache
+                .prefetch_mapping_refs_with_mode(&batch, inline)
+                .unwrap();
+            assert_eq!(
+                resolver.calls.get(),
+                1,
+                "borrowed batches must reuse the owned iterator's cache entries"
+            );
+            for (mapping, expected) in batch.iter().zip(["one", "two"]) {
+                let frames = if inline {
+                    cache.resolve_mapping_ref(mapping)
+                } else {
+                    cache.resolve_base_mapping_ref(mapping)
+                }
+                .unwrap();
+                assert_eq!(frames, [expected]);
+            }
+            assert_eq!(resolver.calls.get(), 1);
         }
     }
 

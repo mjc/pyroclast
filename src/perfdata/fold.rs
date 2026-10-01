@@ -1998,33 +1998,25 @@ where
     Ok(())
 }
 
-fn prefetch_sample_symbols<'a, R: SymbolResolver>(
-    frames: impl IntoIterator<Item = (FoldFrame, FrameMappingDecision<'a>)>,
+fn prefetch_sample_symbols<R: SymbolResolver>(
+    frames: &[(FoldFrame, FrameMappingDecision<'_>)],
     cache: &mut SymbolFrameCache<'_, R>,
     inline: bool,
 ) -> Result<(), String> {
-    let mut full = SmallVec::<[ResolvedMappingRef<'_>; 16]>::new();
-    let mut base = SmallVec::<[ResolvedMappingRef<'_>; 16]>::new();
-    for (frame, decision) in frames {
-        if let FrameMappingDecision::Mapped(mapping) = decision {
-            let expand = inline && !matches!(frame, FoldFrame::SampleIp { .. });
-            if cache.cached_mapping_frames(&mapping, expand).is_some() {
-                continue;
-            }
-            if expand {
-                full.push(mapping.resolved_ref());
-            } else {
-                base.push(mapping.resolved_ref());
-            }
-        }
-    }
     // Batch only the currently delivered sample. Future samples may observe a
     // different map; SymbolFrameCache deduplicates already resolved addresses.
-    if !full.is_empty() {
-        cache.prefetch_mapping_refs(&full)?;
-    }
-    if !base.is_empty() {
-        cache.prefetch_base_mapping_refs(&base)?;
+    for expand in [true, false] {
+        if expand && !inline {
+            continue;
+        }
+        let mappings = frames.iter().filter_map(|(frame, decision)| {
+            let FrameMappingDecision::Mapped(mapping) = decision else {
+                return None;
+            };
+            (expand == (inline && !matches!(frame, FoldFrame::SampleIp { .. })))
+                .then(|| mapping.resolved_ref())
+        });
+        cache.prefetch_mapping_refs_with_mode(mappings, expand)?;
     }
     Ok(())
 }
@@ -2202,7 +2194,7 @@ impl<'a> FoldFrameResolver<'a> {
                             );
                             (frame, decision)
                         }));
-                        prefetch_sample_symbols(pending.iter().copied(), cache, self.inline)?;
+                        prefetch_sample_symbols(&pending, cache, self.inline)?;
                         for (frame, decision) in pending {
                             append_prefetched_folded_frame(
                                 buffers,
@@ -5532,6 +5524,11 @@ mod tests {
         );
         assert_eq!(*resolver.full_batch_sizes.borrow(), [4]);
         assert_eq!(
+            cache.mapping_frame_lookup_count(),
+            13,
+            "one initial miss plus one miss check, insertion probe and render lookup per frame"
+        );
+        assert_eq!(
             table.index_search_count(),
             4,
             "cold prefetch must retain map decisions, not re-walk frames"
@@ -6148,8 +6145,10 @@ mod tests {
         for _ in 0..2 {
             let mut mapping_cache = super::MappingResolveCache::default();
             let context = table.frame_context(11, &mut mapping_cache);
-            super::prefetch_sample_symbols(
-                frames.iter().copied().map(|frame| {
+            let decisions = frames
+                .iter()
+                .copied()
+                .map(|frame| {
                     (
                         frame,
                         super::FoldFrameResolver::mapping_decision_for_folded_frame(
@@ -6159,11 +6158,9 @@ mod tests {
                             &mut mapping_cache,
                         ),
                     )
-                }),
-                &mut cache,
-                true,
-            )
-            .unwrap();
+                })
+                .collect::<Vec<_>>();
+            super::prefetch_sample_symbols(&decisions, &mut cache, true).unwrap();
         }
         assert_eq!(*resolver.full_requests.borrow(), vec![0x10, 0x20]);
         assert!(resolver.base_requests.borrow().is_empty());
