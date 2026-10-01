@@ -167,9 +167,20 @@ pub trait SymbolResolver {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SymbolSourceState {
+    #[default]
+    AddressDependent,
+    /// Object loading established that every address is unresolved, not merely
+    /// a symbol gap. perf `util/symbol.c:dso__load` records `dso__set_loaded`
+    /// on failure as well as success.
+    Unavailable,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ResolvedSymbolFrames {
     pub frames: Vec<String>,
+    pub source_state: SymbolSourceState,
     pub has_base_symbol: bool,
     pub has_inline_frames: bool,
     pub has_non_inline_base_frame: bool,
@@ -190,6 +201,7 @@ impl ResolvedSymbolFrames {
         let has_non_inline_base_frame = has_base_symbol && !has_inline_frames;
         Self {
             frames,
+            source_state: SymbolSourceState::AddressDependent,
             has_base_symbol,
             has_inline_frames,
             has_non_inline_base_frame,
@@ -233,7 +245,8 @@ struct CachedMappingFrames {
 #[derive(Default)]
 struct UserFrameTable {
     by_source: FxHashMap<usize, usize>,
-    sources: Vec<FxHashMap<u64, usize>>,
+    // None is a terminal unavailable object, not a per-address negative result.
+    sources: Vec<Option<FxHashMap<u64, usize>>>,
     last_source: Cell<Option<(usize, usize)>>,
     #[cfg(test)]
     source_searches: Cell<usize>,
@@ -252,22 +265,36 @@ impl UserFrameTable {
             self.last_source.set(Some((source, index)));
             index
         };
-        self.sources[index].get(&address).copied()
+        self.sources[index]
+            .as_ref()
+            .map_or(Some(0), |addresses| addresses.get(&address).copied())
     }
 
-    fn insert(&mut self, source: usize, address: u64, slot: usize) {
+    fn source_index(&mut self, source: usize) -> usize {
         let index = *self.by_source.entry(source).or_insert_with(|| {
             let index = self.sources.len();
-            self.sources.push(FxHashMap::default());
+            self.sources.push(Some(FxHashMap::default()));
             index
         });
         self.last_source.set(Some((source, index)));
-        self.sources[index].insert(address, slot);
+        index
+    }
+
+    fn insert(&mut self, source: usize, address: u64, slot: usize) {
+        let index = self.source_index(source);
+        self.sources[index]
+            .get_or_insert_with(FxHashMap::default)
+            .insert(address, slot);
+    }
+
+    fn mark_unavailable(&mut self, source: usize) {
+        let index = self.source_index(source);
+        self.sources[index] = None;
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.sources.iter().map(FxHashMap::len).sum()
+        self.sources.iter().flatten().map(FxHashMap::len).sum()
     }
 }
 
@@ -1650,22 +1677,31 @@ where
                     requests.len()
                 ));
             }
-            let table = if inline {
-                &mut self.resolved_by_mapping
-            } else {
-                &mut self.resolved_base_by_mapping
-            };
             for (key, frames) in keys.drain(..).zip(resolved) {
-                table.insert(
-                    key,
-                    CachedMappingFrames {
-                        frames: frames.frames,
-                        has_base_symbol: frames.has_base_symbol,
-                        has_inline_frames: frames.has_inline_frames,
-                        has_non_inline_base_frame: frames.has_non_inline_base_frame,
-                        base_offset: frames.base_offset,
-                    },
-                );
+                let unavailable = frames.source_state == SymbolSourceState::Unavailable;
+                let frames = CachedMappingFrames {
+                    frames: frames.frames,
+                    has_base_symbol: frames.has_base_symbol,
+                    has_inline_frames: frames.has_inline_frames,
+                    has_non_inline_base_frame: frames.has_non_inline_base_frame,
+                    base_offset: frames.base_offset,
+                };
+                if unavailable && key.kernel_mapping_range.is_none() && frames.is_fully_unresolved()
+                {
+                    self.resolved_by_mapping
+                        .user
+                        .mark_unavailable(key.symbol_source_id);
+                    self.resolved_base_by_mapping
+                        .user
+                        .mark_unavailable(key.symbol_source_id);
+                } else {
+                    let table = if inline {
+                        &mut self.resolved_by_mapping
+                    } else {
+                        &mut self.resolved_base_by_mapping
+                    };
+                    table.insert(key, frames);
+                }
             }
             Ok(())
         })();
@@ -1825,7 +1861,8 @@ where
             let kernel_frames = self
                 .object_resolver
                 .resolve_frame_batch_with_metadata(&kernel_elf_requests)?;
-            for (index, frames) in kernel_elf_indexes.into_iter().zip(kernel_frames) {
+            for (index, mut frames) in kernel_elf_indexes.into_iter().zip(kernel_frames) {
+                frames.source_state = SymbolSourceState::AddressDependent;
                 resolved[index] = frames;
             }
         }
@@ -1835,15 +1872,19 @@ where
                 .object_resolver
                 .resolve_frame_batch_with_metadata(&user_requests)?;
             for (index, frames) in user_indexes.into_iter().zip(user_frames) {
-                resolved[index] = if frames.frames.is_empty()
-                    && is_kernel_module_symbol_path(&requests[index].path)
-                {
+                let module = is_kernel_module_symbol_path(&requests[index].path);
+                let mut frames = if frames.frames.is_empty() && module {
                     self.resolve_kernel_symbol(&requests[index])
                         .map(|symbol| ResolvedSymbolFrames::from_frames(vec![symbol]))
                         .unwrap_or(frames)
                 } else {
                     frames
                 };
+                // A missing module ELF does not rule out its kallsyms source.
+                if module {
+                    frames.source_state = SymbolSourceState::AddressDependent;
+                }
+                resolved[index] = frames;
             }
         }
         Ok(resolved)
@@ -1896,7 +1937,8 @@ where
             let kernel_frames = self
                 .object_resolver
                 .resolve_base_frame_batch_with_metadata(&kernel_elf_requests)?;
-            for (index, frames) in kernel_elf_indexes.into_iter().zip(kernel_frames) {
+            for (index, mut frames) in kernel_elf_indexes.into_iter().zip(kernel_frames) {
+                frames.source_state = SymbolSourceState::AddressDependent;
                 resolved[index] = frames;
             }
         }
@@ -1906,15 +1948,18 @@ where
                 .object_resolver
                 .resolve_base_frame_batch_with_metadata(&user_requests)?;
             for (index, frames) in user_indexes.into_iter().zip(user_frames) {
-                resolved[index] = if frames.frames.is_empty()
-                    && is_kernel_module_symbol_path(&requests[index].path)
-                {
+                let module = is_kernel_module_symbol_path(&requests[index].path);
+                let mut frames = if frames.frames.is_empty() && module {
                     self.resolve_kernel_symbol(&requests[index])
                         .map(|symbol| ResolvedSymbolFrames::from_frames(vec![symbol]))
                         .unwrap_or(frames)
                 } else {
                     frames
                 };
+                if module {
+                    frames.source_state = SymbolSourceState::AddressDependent;
+                }
+                resolved[index] = frames;
             }
         }
         Ok(resolved)
@@ -2199,12 +2244,14 @@ where
         for (path, indexes) in grouped_request_indexes(requests) {
             let path = Path::new(path);
             let object_metadata = self.object_metadata(path);
+            if object_source_state(object_metadata.as_deref()) == SymbolSourceState::Unavailable {
+                for index in indexes {
+                    resolved[index].source_state = SymbolSourceState::Unavailable;
+                }
+                continue;
+            }
             if let Some(metadata) = object_metadata.as_ref() {
-                let addresses = indexes
-                    .iter()
-                    .map(|&i| requests[i].relative_address)
-                    .collect::<Vec<_>>();
-                metadata.prepare_dwarf_frames_for_addresses(&addresses);
+                prepare_inline_object_addresses(metadata, requests, &indexes);
             }
             for index in indexes {
                 let request = &requests[index];
@@ -2249,6 +2296,7 @@ where
                 );
                 resolved[index] = ResolvedSymbolFrames {
                     frames,
+                    source_state: SymbolSourceState::AddressDependent,
                     has_base_symbol,
                     has_inline_frames,
                     has_non_inline_base_frame,
@@ -2354,12 +2402,14 @@ impl SymbolResolver for RustAddr2lineResolver {
         for (path, indexes) in grouped_request_indexes(requests) {
             let path = Path::new(path);
             let object_metadata = self.object_metadata(path);
+            if object_source_state(object_metadata.as_deref()) == SymbolSourceState::Unavailable {
+                for index in indexes {
+                    resolved[index].source_state = SymbolSourceState::Unavailable;
+                }
+                continue;
+            }
             if let Some(metadata) = object_metadata.as_ref() {
-                let addresses: Vec<_> = indexes
-                    .iter()
-                    .map(|&i| requests[i].relative_address)
-                    .collect();
-                metadata.prepare_dwarf_frames_for_addresses(&addresses);
+                prepare_inline_object_addresses(metadata, requests, &indexes);
             }
             for index in indexes {
                 let request = &requests[index];
@@ -2421,6 +2471,7 @@ impl SymbolResolver for RustAddr2lineResolver {
                 // them again can invent spellings perf never printed.
                 resolved[index] = ResolvedSymbolFrames {
                     frames,
+                    source_state: SymbolSourceState::AddressDependent,
                     has_base_symbol,
                     has_inline_frames,
                     has_non_inline_base_frame,
@@ -2441,6 +2492,30 @@ impl SymbolResolver for RustAddr2lineResolver {
     }
 }
 
+fn object_source_state(metadata: Option<&CachedObjectMetadata>) -> SymbolSourceState {
+    if metadata.is_none_or(|metadata| metadata.object_metadata.object_symbols.symbols.is_empty()) {
+        SymbolSourceState::Unavailable
+    } else {
+        SymbolSourceState::AddressDependent
+    }
+}
+
+fn prepare_inline_object_addresses(
+    metadata: &CachedObjectMetadata,
+    requests: &[SymbolRequest],
+    indexes: &[usize],
+) {
+    // perf machine.c:append_inlines never calls libdw/addr2line for symbol gaps.
+    let addresses: SmallVec<[u64; 16]> = indexes
+        .iter()
+        .map(|&index| requests[index].relative_address)
+        .filter(|&address| metadata.object_metadata.object_symbol(address).is_some())
+        .collect();
+    if !addresses.is_empty() {
+        metadata.prepare_dwarf_frames_for_addresses(&addresses);
+    }
+}
+
 fn resolve_base_frames_from_object_metadata(
     requests: &[SymbolRequest],
     object_metadata: impl Fn(&Path) -> Option<Arc<CachedObjectMetadata>>,
@@ -2449,6 +2524,12 @@ fn resolve_base_frames_from_object_metadata(
     for (path, indexes) in grouped_request_indexes(requests) {
         let path = Path::new(path);
         let metadata = object_metadata(path);
+        if object_source_state(metadata.as_deref()) == SymbolSourceState::Unavailable {
+            for index in indexes {
+                resolved[index].source_state = SymbolSourceState::Unavailable;
+            }
+            continue;
+        }
         for index in indexes {
             let request = &requests[index];
             let object_symbols =
@@ -2469,6 +2550,7 @@ fn resolve_base_frames_from_object_metadata(
             // leaf name.
             resolved[index] = ResolvedSymbolFrames {
                 frames,
+                source_state: SymbolSourceState::AddressDependent,
                 has_base_symbol: true,
                 has_inline_frames: false,
                 has_non_inline_base_frame: true,
@@ -4585,6 +4667,7 @@ mod tests {
                 frames: vec![
                     "alloc::collections::btree::map::IntoIter<K,V,A>::dying_next+0x180".to_string()
                 ],
+                source_state: super::SymbolSourceState::AddressDependent,
                 has_base_symbol: true,
                 has_inline_frames: false,
                 has_non_inline_base_frame: true,
@@ -4961,7 +5044,13 @@ mod tests {
         let results = resolver
             .resolve_frame_batch_with_metadata(&[test_request(path.to_str().unwrap(), 0x1000)])
             .unwrap();
-        assert_eq!(results[0], ResolvedSymbolFrames::default());
+        assert_eq!(
+            results[0],
+            ResolvedSymbolFrames {
+                source_state: super::SymbolSourceState::Unavailable,
+                ..ResolvedSymbolFrames::default()
+            }
+        );
     }
 
     #[test]
@@ -5948,7 +6037,212 @@ mod tests {
         assert_eq!(request.file_identity, None);
     }
 
-    fn test_mapping_ref(path: &'static str, relative_address: u64) -> ResolvedMappingRef<'static> {
+    #[test]
+    fn source_without_object_symbols_never_initializes_the_inline_dwarf_index() {
+        // machine.c:append_inlines requires both a map and a base symbol.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let resolver = super::RustAddr2lineResolver::new();
+        let request = super::clean_object_symbol_request(file.path().into(), 0x10);
+        let frames = resolver
+            .resolve_frame_batch_with_metadata(&[request])
+            .unwrap();
+        assert_eq!(
+            frames[0].source_state,
+            super::SymbolSourceState::Unavailable
+        );
+        let metadata = resolver.object_metadata(file.path()).unwrap();
+        let index = metadata.dwarf_index.lock().unwrap();
+        assert!(index.units.is_none());
+        assert!(
+            !index.failed,
+            "DWARF preparation should not have run without any base symbols"
+        );
+    }
+
+    #[test]
+    fn a_symbol_gap_at_one_address_does_not_mark_its_source_unavailable() {
+        struct GapResolver;
+        impl SymbolResolver for GapResolver {
+            fn resolve_batch(
+                &self,
+                requests: &[SymbolRequest],
+            ) -> Result<Vec<Option<String>>, String> {
+                Ok(requests
+                    .iter()
+                    .map(|request| (request.relative_address == 0x20).then(|| "present".into()))
+                    .collect())
+            }
+        }
+        let resolver = GapResolver;
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let first = test_mapping_ref("/bin/gap", 0x10);
+        assert!(cache.resolve_mapping_ref(&first).unwrap().is_empty());
+        let second = ResolvedMappingRef {
+            relative_address: 0x20,
+            ..first.clone()
+        };
+        assert!(!cache.mapping_ref_cached(&second, true));
+        assert!(!cache.mapping_ref_cached(&first, false));
+        assert_eq!(cache.resolve_mapping_ref(&second).unwrap(), ["present"]);
+        let other_source = ResolvedMappingRef {
+            symbol_source_id: usize::MAX,
+            ..first
+        };
+        assert!(!cache.mapping_ref_cached(&other_source, true));
+    }
+
+    struct UnavailableObjectResolver;
+
+    impl SymbolResolver for UnavailableObjectResolver {
+        fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
+            Ok(vec![None; requests.len()])
+        }
+
+        fn resolve_frame_batch_with_metadata(
+            &self,
+            requests: &[SymbolRequest],
+        ) -> Result<Vec<ResolvedSymbolFrames>, String> {
+            Ok(vec![
+                ResolvedSymbolFrames {
+                    source_state: super::SymbolSourceState::Unavailable,
+                    ..ResolvedSymbolFrames::default()
+                };
+                requests.len()
+            ])
+        }
+    }
+
+    #[test]
+    fn missing_module_object_does_not_hide_kallsyms_symbols_at_other_addresses() {
+        // perf util/symbol.c:dso__find_kallsyms is an alternate source even
+        // when an object load failed. Only the complete source can be negative.
+        let root = tempfile::tempdir().unwrap();
+        let build_id = "0102";
+        let elf = super::perf_build_id_elf_path_for_dso(
+            root.path(),
+            std::path::Path::new("[demo]"),
+            build_id,
+        );
+        std::fs::create_dir_all(elf.parent().unwrap()).unwrap();
+        std::fs::write(&elf, []).unwrap();
+        let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
+            .with_debug_dir(root.path().into())
+            .with_kallsyms(
+                super::Kallsyms::parse_modules("0000000000001000 t handler [demo]\n").unwrap(),
+            );
+        for inline in [true, false] {
+            let mut cache = SymbolFrameCache::new(&resolver);
+            let mut first = test_mapping_ref("[demo]", 0x10);
+            first.build_id = Some(&[1, 2]);
+            assert!(
+                cache
+                    .resolve_cached_mapping(&first, inline)
+                    .unwrap()
+                    .frames
+                    .is_empty()
+            );
+            let second = ResolvedMappingRef {
+                relative_address: 0x1010,
+                ..first
+            };
+            assert!(
+                !cache
+                    .resolve_cached_mapping(&second, inline)
+                    .unwrap()
+                    .frames
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_object_source_caches_all_addresses_and_both_inline_modes_without_ip_entries() {
+        // perf util/symbol.c:dso__load exits via dso__set_loaded even after
+        // object loading fails. A missing DSO is not a per-address symbol gap.
+        let path = format!("/tmp/pyroclast-unavailable-source-{}", std::process::id());
+        assert!(!std::path::Path::new(&path).exists());
+        let resolver = super::RustAddr2lineResolver::new();
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let mapping = test_mapping_ref(&path, 0x10);
+        assert!(cache.resolve_mapping_ref(&mapping).unwrap().is_empty());
+        let unseen = ResolvedMappingRef {
+            relative_address: 0x20,
+            ..mapping
+        };
+        assert!(cache.mapping_ref_cached(&unseen, true));
+        assert!(cache.mapping_ref_cached(&unseen, false));
+        assert!(cache.resolve_mapping_ref(&unseen).unwrap().is_empty());
+        assert!(cache.resolve_base_mapping_ref(&unseen).unwrap().is_empty());
+        assert_eq!(cache.resolved_by_mapping.user.len(), 0);
+        assert_eq!(cache.resolved_base_by_mapping.user.len(), 0);
+        assert_eq!(cache.resolved_by_mapping.frames.capacity(), 0);
+        assert_eq!(resolver.cached_object_count(), 1);
+    }
+
+    #[test]
+    fn unavailable_source_state_does_not_cross_source_ids_or_kernel_ranges() {
+        let resolver = UnavailableObjectResolver;
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let first = test_mapping_ref("/missing", 0x10);
+        cache.resolve_mapping_ref(&first).unwrap();
+        let other_source = ResolvedMappingRef {
+            symbol_source_id: usize::MAX,
+            ..first.clone()
+        };
+        assert!(!cache.mapping_ref_cached(&other_source, true));
+        assert!(!cache.mapping_ref_cached(&other_source, false));
+
+        let kernel = test_mapping_ref("[kernel.kallsyms]", 0xffff_ffff_8000_0010);
+        cache.resolve_mapping_ref(&kernel).unwrap();
+        let unseen = ResolvedMappingRef {
+            relative_address: kernel.relative_address + 8,
+            ..kernel.clone()
+        };
+        let another_range = ResolvedMappingRef {
+            end: kernel.end + 1,
+            ..kernel
+        };
+        assert!(!cache.mapping_ref_cached(&unseen, true));
+        assert!(!cache.mapping_ref_cached(&another_range, true));
+    }
+
+    #[test]
+    fn unavailable_source_marker_never_discards_positive_frame_metadata() {
+        struct PositiveResolver;
+        impl SymbolResolver for PositiveResolver {
+            fn resolve_batch(
+                &self,
+                requests: &[SymbolRequest],
+            ) -> Result<Vec<Option<String>>, String> {
+                Ok(vec![None; requests.len()])
+            }
+
+            fn resolve_frame_batch_with_metadata(
+                &self,
+                requests: &[SymbolRequest],
+            ) -> Result<Vec<ResolvedSymbolFrames>, String> {
+                Ok(requests
+                    .iter()
+                    .map(|_| ResolvedSymbolFrames {
+                        source_state: super::SymbolSourceState::Unavailable,
+                        ..ResolvedSymbolFrames::from_frames(vec!["present".into()])
+                    })
+                    .collect())
+            }
+        }
+        let resolver = PositiveResolver;
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let first = test_mapping_ref("/contradictory-metadata", 0x10);
+        assert_eq!(cache.resolve_mapping_ref(&first).unwrap(), ["present"]);
+        let unseen = ResolvedMappingRef {
+            relative_address: 0x20,
+            ..first
+        };
+        assert!(!cache.mapping_ref_cached(&unseen, true));
+        assert!(!cache.mapping_ref_cached(&unseen, false));
+    }
+
+    fn test_mapping_ref(path: &str, relative_address: u64) -> ResolvedMappingRef<'_> {
         ResolvedMappingRef {
             symbol_source_id: 1,
             path,

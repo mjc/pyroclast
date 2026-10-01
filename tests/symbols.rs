@@ -2320,6 +2320,7 @@ ffffffffc0e38940 t nvs_xdr_nvp_op [zfs]
         frames,
         vec![pyroclast::symbols::ResolvedSymbolFrames {
             frames: vec!["nvs_xdr_nvp_op+0x231".to_string()],
+            source_state: pyroclast::symbols::SymbolSourceState::AddressDependent,
             has_base_symbol: true,
             has_inline_frames: false,
             has_non_inline_base_frame: true,

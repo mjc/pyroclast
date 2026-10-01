@@ -4608,6 +4608,7 @@ impl SymbolResolver for SampleIpInlineSymbolResolver {
                 {
                     ResolvedSymbolFrames {
                         frames: vec!["app::main".to_string()],
+                        source_state: pyroclast::symbols::SymbolSourceState::AddressDependent,
                         has_base_symbol: true,
                         has_inline_frames: false,
                         has_non_inline_base_frame: true,

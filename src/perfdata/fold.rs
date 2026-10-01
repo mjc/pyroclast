@@ -4406,6 +4406,7 @@ mod tests {
             Ok(vec![
                 ResolvedSymbolFrames {
                     frames: self.frames.clone(),
+                    source_state: crate::symbols::SymbolSourceState::AddressDependent,
                     has_base_symbol: self.has_base_symbol,
                     has_inline_frames: self.has_inline_frames,
                     has_non_inline_base_frame: self.has_non_inline_base_frame,
@@ -4430,6 +4431,7 @@ mod tests {
             Ok(vec![
                 ResolvedSymbolFrames {
                     frames: vec!["wrong_dwarf_leaf".to_string()],
+                    source_state: crate::symbols::SymbolSourceState::AddressDependent,
                     has_base_symbol: true,
                     has_inline_frames: false,
                     has_non_inline_base_frame: true,
@@ -4448,6 +4450,7 @@ mod tests {
                     frames: vec![
                         "pyroclast::parsers::strace::parse_strace_summary+0xaa0".to_string(),
                     ],
+                    source_state: crate::symbols::SymbolSourceState::AddressDependent,
                     has_base_symbol: true,
                     has_inline_frames: false,
                     has_non_inline_base_frame: true,
@@ -4489,6 +4492,7 @@ mod tests {
                 .iter()
                 .map(|request| ResolvedSymbolFrames {
                     frames: vec![format!("symbol_{:x}", request.relative_address)],
+                    source_state: crate::symbols::SymbolSourceState::AddressDependent,
                     has_base_symbol: true,
                     has_inline_frames: false,
                     has_non_inline_base_frame: true,
