@@ -2146,15 +2146,17 @@ impl<'a> FoldFrameResolver<'a> {
     {
         buffers.current.clear();
         if let Some(SampleComm::Name(comm)) = comm {
+            // Inferno perf.rs:event_line_parts trims the comm; on_event_line
+            // replaces only literal spaces. after_event copies pname verbatim.
+            let comm = comm.trim();
             buffers.current.reserve(comm.len());
-            for character in comm.chars() {
-                match character {
-                    ' ' => buffers.current.push('_'),
-                    ';' => buffers.current.push_str("\\;"),
-                    '\r' | '\n' => buffers.current.push(' '),
-                    _ => buffers.current.push(character),
-                }
+            let mut start = 0;
+            for index in memchr::memchr_iter(b' ', comm.as_bytes()) {
+                buffers.current.push_str(&comm[start..index]);
+                buffers.current.push('_');
+                start = index + 1;
             }
+            buffers.current.push_str(&comm[start..]);
         } else if let Some(SampleComm::Tid(tid)) = comm {
             write!(buffers.current, ":{tid}").map_err(|error| error.to_string())?;
         } else {
@@ -5455,6 +5457,50 @@ mod tests {
                 .count_for_rendered("worker_task;[unknown]"),
             Some(2)
         );
+    }
+
+    #[test]
+    fn folded_comms_match_native_inferno_space_replacement_without_frame_escaping() {
+        for comm in [
+            "worker",
+            "work;er",
+            "work\\;er",
+            "worker task",
+            "\u{e9};\u{4e2d} task",
+        ] {
+            assert_comm_matches_native_inferno(comm);
+        }
+    }
+
+    #[test]
+    fn folded_comms_trim_header_whitespace_like_native_inferno() {
+        for comm in ["  worker task  ", "\tworker\t", "\u{2003}worker\u{2003}"] {
+            assert_comm_matches_native_inferno(comm);
+        }
+    }
+
+    fn assert_comm_matches_native_inferno(comm: &str) {
+        use super::SampleOutput as _;
+        use inferno::collapse::Collapse as _;
+        // perf builtin-script.c:perf_sample__fprintf_start prints comm with %s.
+        // Inferno perf.rs:event_line_parts trims it, on_event_line replaces
+        // spaces, and after_event copies pname verbatim (not frame escaping).
+        let mut state = super::SessionState::new(std::collections::BTreeMap::new());
+        state.thread_comms.insert(7, comm.into());
+        let sample = prepared_sample(&[super::FoldFrame::UserUnwind(0x1010)]);
+        let mut output = super::FoldedOutput::<super::NoopSymbolResolver>::new(None, false);
+        output.write_sample_event(&state, &sample).unwrap();
+        let mut actual = Vec::new();
+        super::write_fold_counts(output.buffers.counts, &mut actual).unwrap();
+        let script = format!("{comm} 7 1.000000: 1 cpu-clock:\n\t1010 [unknown] ([unknown])\n\n");
+        let mut options = inferno::collapse::perf::Options::default();
+        options.nthreads = 1;
+        let mut expected = Vec::new();
+        inferno::collapse::perf::Folder::from(options)
+            .collapse(std::io::Cursor::new(script), &mut expected)
+            .unwrap();
+        assert!(!expected.is_empty(), "comm {comm:?}");
+        assert_eq!(actual, expected, "comm {comm:?}");
     }
 
     #[test]
