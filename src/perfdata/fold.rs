@@ -1998,23 +1998,15 @@ where
     Ok(())
 }
 
-fn prefetch_sample_symbols<R: SymbolResolver>(
-    frames: impl IntoIterator<Item = FoldFrame>,
-    context: Option<&FrameMappingContext<'_>>,
-    mapping_cache: &mut MappingResolveCache,
+fn prefetch_sample_symbols<'a, R: SymbolResolver>(
+    frames: impl IntoIterator<Item = (FoldFrame, FrameMappingDecision<'a>)>,
     cache: &mut SymbolFrameCache<'_, R>,
     inline: bool,
 ) -> Result<(), String> {
     let mut full = SmallVec::<[ResolvedMappingRef<'_>; 16]>::new();
     let mut base = SmallVec::<[ResolvedMappingRef<'_>; 16]>::new();
-    for frame in frames {
-        if let Some(mapping) =
-            resolve_frame_in_context(context, frame, mapping_cache).filter(|mapping| {
-                matches!(frame, FoldFrame::InlineCurrentIp(_))
-                    || !is_kernel_space_frame(frame.address())
-                    || mapping.is_kernel()
-            })
-        {
+    for (frame, decision) in frames {
+        if let FrameMappingDecision::Mapped(mapping) = decision {
             let expand = inline && !matches!(frame, FoldFrame::SampleIp { .. });
             if cache.cached_mapping_frames(&mapping, expand).is_some() {
                 continue;
@@ -2042,6 +2034,7 @@ struct FoldFrameResolver<'a> {
     inline: bool,
 }
 
+#[derive(Clone, Copy)]
 enum FrameMappingDecision<'a> {
     Mapped(MappedFrame<'a>),
     KernelAddress,
@@ -2137,7 +2130,6 @@ impl<'a> FoldFrameResolver<'a> {
     where
         R: SymbolResolver,
         I: IntoIterator<Item = FoldFrame>,
-        I::IntoIter: Clone,
     {
         buffers.current.clear();
         if let Some(comm) = comm {
@@ -2172,18 +2164,12 @@ impl<'a> FoldFrameResolver<'a> {
             {
                 continue;
             }
-            let decision =
-                if symbol_cache.is_some() && matches!(frame, FoldFrame::InlineCurrentIp(_)) {
-                    resolve_frame_in_context(context.as_ref(), frame, &mut buffers.mapping_cache)
-                        .map_or(FrameMappingDecision::Unknown, FrameMappingDecision::Mapped)
-                } else {
-                    Self::mapping_decision_for_folded_frame(
-                        context.as_ref(),
-                        frame,
-                        symbol_cache.is_some(),
-                        &mut buffers.mapping_cache,
-                    )
-                };
+            let decision = Self::mapping_decision_for_folded_frame(
+                context.as_ref(),
+                frame,
+                symbol_cache.is_some(),
+                &mut buffers.mapping_cache,
+            );
             match decision {
                 FrameMappingDecision::Mapped(mapping) => {
                     if let Some(cache) = symbol_cache.as_deref_mut() {
@@ -2202,29 +2188,33 @@ impl<'a> FoldFrameResolver<'a> {
                             );
                             continue;
                         }
-                        prefetch_sample_symbols(
-                            std::iter::once(frame).chain(callchain.clone()),
-                            context.as_ref(),
-                            &mut buffers.mapping_cache,
-                            cache,
-                            self.inline,
-                        )?;
-                        let (frames, has_base_symbol) = cache
-                            .cached_mapping_frames(&mapping, expand)
-                            .ok_or_else(|| {
-                                "symbol frame cache lookup missed after resolution".to_string()
-                            })?;
-                        append_resolved_folded_frames(
-                            buffers,
-                            &mapping,
-                            frame,
-                            expand,
-                            frames,
-                            has_base_symbol,
-                        );
-                    } else {
-                        append_frame_mapping_fallback(buffers, &mapping);
+                        // Keep decisions only on a cold miss. Warm samples stream
+                        // directly; cold samples consume each remaining frame once.
+                        let mut pending =
+                            SmallVec::<[(FoldFrame, FrameMappingDecision<'_>); 16]>::new();
+                        pending.push((frame, decision));
+                        pending.extend(callchain.by_ref().map(|frame| {
+                            let decision = Self::mapping_decision_for_folded_frame(
+                                context.as_ref(),
+                                frame,
+                                true,
+                                &mut buffers.mapping_cache,
+                            );
+                            (frame, decision)
+                        }));
+                        prefetch_sample_symbols(pending.iter().copied(), cache, self.inline)?;
+                        for (frame, decision) in pending {
+                            append_prefetched_folded_frame(
+                                buffers,
+                                frame,
+                                decision,
+                                cache,
+                                self.inline,
+                            )?;
+                        }
+                        break;
                     }
+                    append_frame_mapping_fallback(buffers, &mapping);
                 }
                 FrameMappingDecision::KernelAddress | FrameMappingDecision::Address => {
                     append_folded_address_label(buffers, frame.address());
@@ -2451,6 +2441,10 @@ impl<'a> FoldFrameResolver<'a> {
         symbolizing: bool,
         mapping_cache: &mut MappingResolveCache,
     ) -> FrameMappingDecision<'a> {
+        if symbolizing && matches!(frame, FoldFrame::InlineCurrentIp(_)) {
+            return resolve_frame_in_context(context, frame, mapping_cache)
+                .map_or(FrameMappingDecision::Unknown, FrameMappingDecision::Mapped);
+        }
         let address = frame.address();
         let decision = Self::mapping_decision_in_context(context, frame, mapping_cache);
         if !symbolizing
@@ -2466,6 +2460,38 @@ impl<'a> FoldFrameResolver<'a> {
             decision
         }
     }
+}
+
+fn append_prefetched_folded_frame<R: SymbolResolver>(
+    buffers: &mut FoldedRenderBuffers,
+    frame: FoldFrame,
+    decision: FrameMappingDecision<'_>,
+    cache: &SymbolFrameCache<'_, R>,
+    inline: bool,
+) -> Result<(), String> {
+    match decision {
+        FrameMappingDecision::Mapped(mapping) => {
+            let expand = inline && !matches!(frame, FoldFrame::SampleIp { .. });
+            let (frames, has_base_symbol) = cache
+                .cached_mapping_frames(&mapping, expand)
+                .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())?;
+            append_resolved_folded_frames(
+                buffers,
+                &mapping,
+                frame,
+                expand,
+                frames,
+                has_base_symbol,
+            );
+        }
+        FrameMappingDecision::KernelAddress | FrameMappingDecision::Address => {
+            append_folded_address_label(buffers, frame.address());
+        }
+        FrameMappingDecision::Unknown => {
+            append_cached_inferno_perf_folded_label_to_buffers(buffers, UNKNOWN_FRAME);
+        }
+    }
+    Ok(())
 }
 
 fn append_resolved_folded_frames(
@@ -5471,6 +5497,168 @@ mod tests {
     }
 
     #[test]
+    fn cold_symbol_batch_resolves_each_frame_mapping_once() {
+        let mut table = super::MmapTable::default();
+        for start in [0x1000, 0x2000] {
+            table.insert_mmap(crate::perfdata::records::MmapRecord {
+                pid: 7,
+                tid: 7,
+                start,
+                len: 0x100,
+                pgoff: 0,
+                path: format!("/bin/app-{start:x}"),
+            });
+        }
+        let resolver = RecordingFrameResolver::default();
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let mut buffers = super::FoldedRenderBuffers::default();
+        super::FoldFrameResolver::new(&table, true)
+            .render_folded_stack_for_stack(
+                Some(7),
+                Some("worker"),
+                [
+                    super::FoldFrame::UserUnwind(0x1010),
+                    super::FoldFrame::UserUnwind(0x2020),
+                    super::FoldFrame::UserUnwind(0x1030),
+                    super::FoldFrame::UserUnwind(0x2040),
+                ],
+                Some(&mut cache),
+                &mut buffers,
+            )
+            .unwrap();
+        assert_eq!(
+            buffers.rendered(),
+            "worker;symbol_10;symbol_20;symbol_30;symbol_40"
+        );
+        assert_eq!(*resolver.full_batch_sizes.borrow(), [4]);
+        assert_eq!(
+            table.index_search_count(),
+            4,
+            "cold prefetch must retain map decisions, not re-walk frames"
+        );
+    }
+
+    #[test]
+    fn cold_symbol_batch_consumes_the_frame_iterator_only_once() {
+        struct CountingFrames<'a> {
+            frames: std::slice::Iter<'a, super::FoldFrame>,
+            visits: &'a std::cell::Cell<usize>,
+        }
+        impl Iterator for CountingFrames<'_> {
+            type Item = super::FoldFrame;
+            fn next(&mut self) -> Option<Self::Item> {
+                let frame = self.frames.next().copied()?;
+                self.visits.set(self.visits.get() + 1);
+                Some(frame)
+            }
+        }
+        let mut table = super::MmapTable::default();
+        table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 7,
+            tid: 7,
+            start: 0x1000,
+            len: 0x100,
+            pgoff: 0,
+            path: "/bin/demo".into(),
+        });
+        let frames = [
+            super::FoldFrame::UserUnwind(0x1010),
+            super::FoldFrame::InlineCurrentIp(0x1020),
+            super::FoldFrame::SampleIp {
+                address: 0x1030,
+                cpumode: super::PERF_RECORD_MISC_CPUMODE_USER,
+            },
+        ];
+        let visits = std::cell::Cell::new(0);
+        let resolver = RecordingFrameResolver::default();
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let mut buffers = super::FoldedRenderBuffers::default();
+        super::FoldFrameResolver::new(&table, true)
+            .render_folded_stack_for_stack(
+                Some(7),
+                Some("worker"),
+                CountingFrames {
+                    frames: frames.iter(),
+                    visits: &visits,
+                },
+                Some(&mut cache),
+                &mut buffers,
+            )
+            .unwrap();
+        assert_eq!(buffers.rendered(), "worker;symbol_10;symbol_20;symbol_30");
+        assert_eq!(*resolver.full_requests.borrow(), [0x10, 0x20]);
+        assert_eq!(*resolver.base_requests.borrow(), [0x30]);
+        assert_eq!(
+            visits.get(),
+            frames.len(),
+            "prefetch must not clone and traverse the remaining iterator"
+        );
+    }
+
+    #[test]
+    fn cold_symbol_batch_keeps_a_warm_prefix_and_unmapped_frames_in_deep_stacks() {
+        let mut table = super::MmapTable::default();
+        table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 7,
+            tid: 7,
+            start: 0x1000,
+            len: 0x100,
+            pgoff: 0,
+            path: "/bin/demo".into(),
+        });
+        let resolver = RecordingFrameResolver::default();
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let mut buffers = super::FoldedRenderBuffers::default();
+        let renderer = super::FoldFrameResolver::new(&table, true);
+        renderer
+            .render_folded_stack_for_stack(
+                Some(7),
+                Some("worker"),
+                [super::FoldFrame::UserUnwind(0x1001)],
+                Some(&mut cache),
+                &mut buffers,
+            )
+            .unwrap();
+        let frames = (1..=40).map(|offset| {
+            if offset == 20 {
+                super::FoldFrame::UserUnwind(0x6)
+            } else {
+                super::FoldFrame::UserUnwind(0x1000 + offset)
+            }
+        });
+        renderer
+            .render_folded_stack_for_stack(
+                Some(7),
+                Some("worker"),
+                frames,
+                Some(&mut cache),
+                &mut buffers,
+            )
+            .unwrap();
+        let expected = (1..=40).fold(String::from("worker"), |mut stack, offset| {
+            use std::fmt::Write as _;
+            if offset == 20 {
+                stack.push_str(";[unknown]");
+            } else {
+                write!(stack, ";symbol_{offset:x}").unwrap();
+            }
+            stack
+        });
+        assert_eq!(buffers.rendered(), expected);
+        assert_eq!(*resolver.full_batch_sizes.borrow(), [1, 38]);
+        assert!(resolver.base_requests.borrow().is_empty());
+        assert_eq!(
+            resolver
+                .full_requests
+                .borrow()
+                .iter()
+                .filter(|&&ip| ip == 1)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn delivered_deep_stacks_reverse_once_and_filter_context_markers() {
         use super::SampleOutput as _;
         use std::fmt::Write as _;
@@ -5961,9 +6149,17 @@ mod tests {
             let mut mapping_cache = super::MappingResolveCache::default();
             let context = table.frame_context(11, &mut mapping_cache);
             super::prefetch_sample_symbols(
-                frames.iter().copied(),
-                Some(&context),
-                &mut mapping_cache,
+                frames.iter().copied().map(|frame| {
+                    (
+                        frame,
+                        super::FoldFrameResolver::mapping_decision_for_folded_frame(
+                            Some(&context),
+                            frame,
+                            true,
+                            &mut mapping_cache,
+                        ),
+                    )
+                }),
                 &mut cache,
                 true,
             )
