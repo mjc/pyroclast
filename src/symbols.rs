@@ -2250,13 +2250,13 @@ where
                 }
                 continue;
             }
-            if let Some(metadata) = object_metadata.as_ref() {
-                prepare_inline_object_addresses(metadata, requests, &indexes);
-            }
-            for index in indexes {
+            let object_symbols = object_metadata
+                .as_ref()
+                .map_or_else(SmallVec::new, |metadata| {
+                    prepare_inline_object_symbols(metadata, requests, &indexes)
+                });
+            for (index, object_symbols) in indexes.into_iter().zip(object_symbols) {
                 let request = &requests[index];
-                let object_symbols =
-                    object_symbols_for_frame(object_metadata.as_ref(), request.relative_address);
                 let object_symbol = object_symbols.bare;
                 let has_base_symbol = object_symbol.is_some();
                 let (mut frames, has_inline_frames, has_non_inline_base_frame) =
@@ -2408,13 +2408,14 @@ impl SymbolResolver for RustAddr2lineResolver {
                 }
                 continue;
             }
-            if let Some(metadata) = object_metadata.as_ref() {
-                prepare_inline_object_addresses(metadata, requests, &indexes);
-            }
-            for index in indexes {
+            let object_symbols = object_metadata
+                .as_ref()
+                .map_or_else(SmallVec::new, |metadata| {
+                    prepare_inline_object_symbols(metadata, requests, &indexes)
+                });
+            for (index, object_symbols) in indexes.into_iter().zip(object_symbols) {
                 let request = &requests[index];
                 let address = request.relative_address;
-                let object_symbols = object_symbols_for_frame(object_metadata.as_ref(), address);
                 let object_symbol = object_symbols.bare;
                 let has_base_symbol = object_symbol.is_some();
                 let (mut frames, has_inline_frames, has_non_inline_base_frame) =
@@ -2500,20 +2501,29 @@ fn object_source_state(metadata: Option<&CachedObjectMetadata>) -> SymbolSourceS
     }
 }
 
-fn prepare_inline_object_addresses(
-    metadata: &CachedObjectMetadata,
+fn prepare_inline_object_symbols<'a>(
+    metadata: &'a CachedObjectMetadata,
     requests: &[SymbolRequest],
     indexes: &[usize],
-) {
+) -> SmallVec<[PerfObjectSymbolNames<'a>; 16]> {
+    let symbols: SmallVec<[PerfObjectSymbolNames<'a>; 16]> = indexes
+        .iter()
+        .map(|&index| {
+            metadata
+                .object_metadata
+                .object_symbol_names(requests[index].relative_address)
+        })
+        .collect();
     // perf machine.c:append_inlines never calls libdw/addr2line for symbol gaps.
     let addresses: SmallVec<[u64; 16]> = indexes
         .iter()
-        .map(|&index| requests[index].relative_address)
-        .filter(|&address| metadata.object_metadata.object_symbol(address).is_some())
+        .zip(&symbols)
+        .filter_map(|(&index, symbol)| symbol.bare.map(|_| requests[index].relative_address))
         .collect();
     if !addresses.is_empty() {
         metadata.prepare_dwarf_frames_for_addresses(&addresses);
     }
+    symbols
 }
 
 fn resolve_base_frames_from_object_metadata(
@@ -2761,10 +2771,14 @@ impl PreparedObjectMetadata {
     }
 
     fn object_symbol_names(&self, address: u64) -> PerfObjectSymbolNames<'_> {
-        PerfObjectSymbolNames {
-            bare: self.object_symbol(address),
-            offset: self.object_symbols.symbol_offset(address),
-        }
+        self.object_symbols
+            .symbol(address)
+            .map_or_else(PerfObjectSymbolNames::default, |symbol| {
+                PerfObjectSymbolNames {
+                    bare: Some(&symbol.name),
+                    offset: Some(address.saturating_sub(symbol.address)),
+                }
+            })
     }
 
     fn bfd_function_record_name(&self, address: u64) -> Option<&str> {
@@ -2821,11 +2835,6 @@ impl PerfObjectSymbolIndex {
     fn symbol_name(&self, address: u64) -> Option<&str> {
         self.symbol(address)
             .map(|candidate| candidate.name.as_str())
-    }
-
-    fn symbol_offset(&self, address: u64) -> Option<u64> {
-        let candidate = self.symbol(address)?;
-        Some(address.saturating_sub(candidate.address))
     }
 
     fn bfd_function_record_name(&self, address: u64) -> Option<&str> {
@@ -4503,6 +4512,20 @@ mod tests {
         };
 
         assert_eq!(symbols.symbol_name(0x1810), Some("large"));
+        let metadata = super::PreparedObjectMetadata {
+            object_symbols: symbols,
+        };
+        for (address, expected_name, expected_offset) in [
+            (0xfff, None, None),
+            (0x1000, Some("large"), Some(0)),
+            (0x1800, Some("small"), Some(0)),
+            (0x1810, Some("large"), Some(0x810)),
+            (0x2000, None, None),
+        ] {
+            let selected = metadata.object_symbol_names(address);
+            assert_eq!(selected.bare, expected_name);
+            assert_eq!(selected.offset, expected_offset);
+        }
     }
 
     #[test]
