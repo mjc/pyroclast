@@ -108,7 +108,6 @@ struct SessionState {
     unwind_states: HashMap<u32, PidUnwindState, FxBuildHasher>,
     header_build_ids: BTreeMap<String, Vec<u8>>,
     deferred_samples: Vec<DeferredFoldSample>,
-    sample_frames: FoldFrameStack,
     unwind_debug_dir: Option<PathBuf>,
     /// Architecture of the recording machine (`HEADER_ARCH`), used to decode
     /// `REGS_USER` samples and construct per-pid unwinders. Defaults to `x86_64`
@@ -225,14 +224,14 @@ struct DeferredFoldSample {
     has_callchain: bool,
 }
 
-struct PreparedFoldSample<'layout> {
+struct PreparedFoldSample<'layout, 'frames> {
     pid: Option<u32>,
     tid: Option<u32>,
     time: Option<u64>,
     cpu: Option<u32>,
     event_name: &'layout str,
     count: u64,
-    frames: FoldFrameStack,
+    frames: &'frames [FoldFrame],
     deferred_cookie: Option<u64>,
     has_callchain: bool,
 }
@@ -1040,6 +1039,7 @@ trait SampleOutput {
 struct SampleSink<O> {
     accumulator: SessionState,
     output: O,
+    sample_frames: FoldFrameStack,
 }
 
 struct PerfScriptOutput<'io, 'cache, R, W: ?Sized> {
@@ -1054,6 +1054,7 @@ impl<O: SampleOutput> SampleSink<O> {
         Self {
             accumulator,
             output,
+            sample_frames: FoldFrameStack::new(),
         }
     }
 
@@ -1091,6 +1092,7 @@ impl<O: SampleOutput> SampleSink<O> {
             payload,
             sample_layouts,
             options,
+            &mut self.sample_frames,
         )?
         else {
             return Ok(());
@@ -1104,14 +1106,12 @@ impl<O: SampleOutput> SampleSink<O> {
                 cpu: sample.cpu,
                 event_name: Arc::from(sample.event_name),
                 count: sample.count,
-                frames: sample.frames,
                 has_callchain: sample.has_callchain,
+                frames: std::mem::take(&mut self.sample_frames),
             });
             return Ok(());
         }
-        let result = self.output.write_sample_event(&self.accumulator, &sample);
-        self.accumulator.sample_frames = sample.frames;
-        result
+        self.output.write_sample_event(&self.accumulator, &sample)
     }
 
     fn write_deferred_callchain(
@@ -1120,43 +1120,43 @@ impl<O: SampleOutput> SampleSink<O> {
         tid: Option<u32>,
         ips: &[u64],
     ) -> Result<(), String> {
-        for sample in self
+        for deferred in self
             .accumulator
             .take_resolved_deferred_samples(cookie, tid, ips)
         {
             let sample = PreparedFoldSample {
-                pid: sample.pid,
-                tid: sample.tid,
-                time: sample.time,
-                cpu: sample.cpu,
-                event_name: &sample.event_name,
-                count: sample.count,
-                frames: sample.frames,
+                pid: deferred.pid,
+                tid: deferred.tid,
+                time: deferred.time,
+                cpu: deferred.cpu,
+                event_name: &deferred.event_name,
+                count: deferred.count,
+                frames: &deferred.frames,
                 deferred_cookie: None,
-                has_callchain: sample.has_callchain,
+                has_callchain: deferred.has_callchain,
             };
             self.output.write_sample_event(&self.accumulator, &sample)?;
-            self.accumulator.sample_frames = sample.frames;
+            self.sample_frames = deferred.frames;
         }
         Ok(())
     }
 
     fn flush_deferred_samples(&mut self) -> Result<(), String> {
         let samples = self.accumulator.take_deferred_samples();
-        for sample in samples {
+        for deferred in samples {
             let sample = PreparedFoldSample {
-                pid: sample.pid,
-                tid: sample.tid,
-                time: sample.time,
-                cpu: sample.cpu,
-                event_name: &sample.event_name,
-                count: sample.count,
-                frames: sample.frames,
+                pid: deferred.pid,
+                tid: deferred.tid,
+                time: deferred.time,
+                cpu: deferred.cpu,
+                event_name: &deferred.event_name,
+                count: deferred.count,
+                frames: &deferred.frames,
                 deferred_cookie: None,
-                has_callchain: sample.has_callchain,
+                has_callchain: deferred.has_callchain,
             };
             self.output.write_sample_event(&self.accumulator, &sample)?;
-            self.accumulator.sample_frames = sample.frames;
+            self.sample_frames = deferred.frames;
         }
         Ok(())
     }
@@ -1177,7 +1177,7 @@ where
             let frame_resolver = FoldFrameResolver::new(&accumulator.mmap_table, self.inline);
             frame_resolver.write_script_frames_for_stack(
                 sample.pid,
-                &sample.frames,
+                sample.frames,
                 self.symbol_cache.as_deref_mut(),
                 self.writer,
             )?;
@@ -1186,7 +1186,7 @@ where
             let frame_resolver = FoldFrameResolver::new(&accumulator.mmap_table, self.inline);
             frame_resolver.write_inline_sample_frame_for_stack(
                 sample.pid,
-                &sample.frames,
+                sample.frames,
                 self.symbol_cache.as_deref_mut(),
                 self.writer,
             )?;
@@ -1599,7 +1599,6 @@ impl SessionState {
             unwind_states: HashMap::with_hasher(FxBuildHasher),
             header_build_ids,
             deferred_samples: Vec::new(),
-            sample_frames: FoldFrameStack::new(),
             unwind_debug_dir: current_perf_debug_dir(),
             arch: PerfArch::default(),
         }
@@ -3008,13 +3007,14 @@ fn perf_user_reg_value(mask: u64, values: &[u64], register: u32) -> Option<u64> 
     values.get(index).copied()
 }
 
-fn prepare_sample_for_fold<'layout>(
+fn prepare_sample_for_fold<'layout, 'frames>(
     accumulator: &mut SessionState,
     misc: u16,
     payload: &[u8],
     sample_layouts: &'layout SampleLayouts,
     options: FoldOptions,
-) -> Result<Option<PreparedFoldSample<'layout>>, String> {
+    frames: &'frames mut FoldFrameStack,
+) -> Result<Option<PreparedFoldSample<'layout, 'frames>>, String> {
     let Some(event) = sample_layouts.layout_for_payload(payload)? else {
         return Ok(None);
     };
@@ -3022,23 +3022,16 @@ fn prepare_sample_for_fold<'layout>(
         return Ok(None);
     };
     let count = sample_fold_count(sample.period, options);
-    accumulator.sample_frames.clear();
-    accumulator.sample_frames.reserve(sample.frames.len());
+    frames.clear();
+    frames.reserve(sample.frames.len());
     let has_callchain = event.layout.sample_type & PERF_SAMPLE_CALLCHAIN != 0;
     if has_callchain {
-        extend_recorded_callchain_frames_like_perf(
-            &mut accumulator.sample_frames,
-            sample.frames.clone(),
-        );
+        extend_recorded_callchain_frames_like_perf(frames, sample.frames.clone());
     } else {
-        extend_sample_ip_frame_like_perf_machine_resolve(
-            &mut accumulator.sample_frames,
-            misc,
-            sample.frames.clone(),
-        );
+        extend_sample_ip_frame_like_perf_machine_resolve(frames, misc, sample.frames.clone());
     }
-    let deferred_cookie = take_deferred_cookie(&mut accumulator.sample_frames);
-    append_perf_user_unwind_frames(accumulator, misc, event, &sample);
+    let deferred_cookie = take_deferred_cookie(frames);
+    append_perf_user_unwind_frames(accumulator, misc, event, &sample, frames);
     Ok(Some(PreparedFoldSample {
         pid: sample.pid,
         tid: sample.tid,
@@ -3046,7 +3039,7 @@ fn prepare_sample_for_fold<'layout>(
         cpu: sample.cpu,
         event_name: &event.event_name,
         count,
-        frames: std::mem::take(&mut accumulator.sample_frames),
+        frames,
         deferred_cookie,
         has_callchain,
     }))
@@ -3101,6 +3094,7 @@ fn append_perf_user_unwind_frames(
     misc: u16,
     event: &SampleEventLayout,
     sample: &crate::perfdata::samples::SampleCallchain<'_>,
+    frames: &mut FoldFrameStack,
 ) {
     let (Some(regs), Some(stack)) = (&sample.user_regs, &sample.user_stack) else {
         return;
@@ -3116,7 +3110,8 @@ fn append_perf_user_unwind_frames(
         return;
     };
     accumulator.ensure_unwind_mapping_for_ip(sample.pid, regs.ip());
-    let context = build_user_unwind_context(accumulator, misc, event, sample, &regs);
+    let context =
+        build_user_unwind_context(accumulator, misc, event, sample, &regs, !frames.is_empty());
     let mut unwound_frames = unwind_user_stack_like_perf(accumulator, sample, &regs, context);
     let mut mapping_cache = MappingResolveCache::default();
     truncate_user_unwind_at_first_unmapped_frame(
@@ -3125,7 +3120,7 @@ fn append_perf_user_unwind_frames(
         &accumulator.mmap_table,
         &mut mapping_cache,
     );
-    accumulator.sample_frames.extend(unwound_frames);
+    frames.extend(unwound_frames);
 }
 
 fn build_user_unwind_context(
@@ -3134,6 +3129,7 @@ fn build_user_unwind_context(
     event: &SampleEventLayout,
     sample: &crate::perfdata::samples::SampleCallchain<'_>,
     regs: &PerfUserRegs,
+    has_sample_frames: bool,
 ) -> UserUnwindContext {
     let sample_callchain = if event.layout.sample_type & PERF_SAMPLE_CALLCHAIN != 0 {
         SampleCallchainPresence::Present
@@ -3142,12 +3138,7 @@ fn build_user_unwind_context(
     };
     UserUnwindContext {
         sample_callchain,
-        callchain: sample_callchain_state(
-            misc,
-            event,
-            sample,
-            !accumulator.sample_frames.is_empty(),
-        ),
+        callchain: sample_callchain_state(misc, event, sample, has_sample_frames),
         initial_ip_mapping: initial_ip_mapping_state(accumulator, sample.pid, regs.ip()),
         module_count: loaded_unwind_module_count(accumulator, sample.pid),
         // x86_64-specific `ebl_unwind` precondition (false on aarch64, whose
@@ -5679,7 +5670,7 @@ mod tests {
             }
         }
         let sample = prepared_sample(&frames);
-        let original = sample.frames.clone();
+        let original = sample.frames.to_vec();
         let mut output = super::FoldedOutput::<super::NoopSymbolResolver>::new(None, false);
         output.write_sample_event(&state, &sample).unwrap();
         let expected = (1..=40)
@@ -5938,17 +5929,114 @@ mod tests {
     }
 
     #[test]
+    fn synchronous_sample_frames_stay_in_delivery_scratch() {
+        let layouts = metadata_test_layouts();
+        let mut state = super::SessionState::new(std::collections::BTreeMap::new());
+        let mut frames = super::FoldFrameStack::new();
+        let scratch = frames.as_ptr();
+        let payload = 0x1010_u64.to_le_bytes();
+        let sample = super::prepare_sample_for_fold(
+            &mut state,
+            super::PERF_RECORD_MISC_CPUMODE_USER,
+            &payload,
+            &layouts,
+            super::FoldOptions::default(),
+            &mut frames,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(sample.frames.len(), 1);
+        assert_eq!(
+            sample.frames.as_ptr(),
+            scratch,
+            "delivery must borrow frames, not move their inline array out of scratch"
+        );
+    }
+
+    #[test]
+    fn borrowed_sample_delivery_reuses_inline_and_spilled_storage_after_output_errors() {
+        struct ObservingOutput {
+            seen: Vec<(usize, usize)>,
+            fail_next: bool,
+        }
+        impl super::SampleOutput for ObservingOutput {
+            fn write_sample_event(
+                &mut self,
+                _state: &super::SessionState,
+                sample: &super::PreparedFoldSample,
+            ) -> Result<(), String> {
+                self.seen
+                    .push((sample.frames.as_ptr() as usize, sample.frames.len()));
+                if std::mem::take(&mut self.fail_next) {
+                    Err("output failed".into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let mut layout = metadata_test_layouts().fallback.unwrap().layout;
+        layout.sample_type = super::PERF_SAMPLE_CALLCHAIN;
+        let layouts = super::SampleLayouts {
+            fallback: Some(std::sync::Arc::new(super::SampleEventLayout::new(
+                layout, "cycles",
+            ))),
+            ..Default::default()
+        };
+        let mut sink = super::SampleSink::new(
+            super::SessionState::new(std::collections::BTreeMap::new()),
+            ObservingOutput {
+                seen: Vec::new(),
+                fail_next: true,
+            },
+        );
+        let mut spilled_pointer = None;
+        for depth in [3_u64, 64, 2, 64] {
+            let mut payload = depth.to_le_bytes().to_vec();
+            for offset in 0..depth {
+                payload.extend((0x1000 + offset).to_le_bytes());
+            }
+            let result = sink.write_sample(
+                super::PERF_RECORD_MISC_CPUMODE_USER,
+                &payload,
+                &layouts,
+                super::FoldOptions::default(),
+            );
+            assert_eq!(result.is_err(), sink.output.seen.len() == 1);
+            assert_eq!(
+                sink.output.seen.last(),
+                Some(&(
+                    sink.sample_frames.as_ptr() as usize,
+                    usize::try_from(depth).unwrap()
+                ))
+            );
+            if let Some(pointer) = spilled_pointer {
+                assert_eq!(sink.sample_frames.as_ptr(), pointer);
+            }
+            if depth == 64 {
+                spilled_pointer = Some(sink.sample_frames.as_ptr());
+            }
+        }
+        assert!(sink.sample_frames.spilled());
+        assert!(
+            std::mem::size_of::<super::PreparedFoldSample>() <= 128,
+            "a delivered sample is metadata and a borrowed frame view"
+        );
+    }
+
+    #[test]
     fn prepared_samples_borrow_event_names_until_deferred_ownership_is_needed() {
         let layouts = metadata_test_layouts();
         let stored_name = &layouts.fallback.as_ref().unwrap().event_name;
         let owners = std::sync::Arc::strong_count(stored_name);
         let mut state = super::SessionState::new(std::collections::BTreeMap::new());
+        let mut frames = super::FoldFrameStack::new();
         let sample = super::prepare_sample_for_fold(
             &mut state,
             super::PERF_RECORD_MISC_CPUMODE_USER,
             &0x1010_u64.to_le_bytes(),
             &layouts,
             super::FoldOptions::default(),
+            &mut frames,
         )
         .unwrap()
         .unwrap();
@@ -5988,7 +6076,7 @@ mod tests {
         assert_eq!(String::from_utf8(written).expect("utf-8"), expected);
     }
 
-    fn prepared_sample(frames: &[super::FoldFrame]) -> super::PreparedFoldSample<'static> {
+    fn prepared_sample(frames: &[super::FoldFrame]) -> super::PreparedFoldSample<'static, '_> {
         super::PreparedFoldSample {
             pid: Some(7),
             tid: Some(7),
@@ -5996,7 +6084,7 @@ mod tests {
             cpu: None,
             event_name: "cpu-clock",
             count: 1,
-            frames: frames.iter().copied().collect(),
+            frames,
             deferred_cookie: None,
             has_callchain: true,
         }
