@@ -1818,11 +1818,31 @@ where
         &self,
         requests: &[SymbolRequest],
     ) -> Result<Vec<ResolvedSymbolFrames>, String> {
+        self.resolve_routed_frame_batch(requests, true)
+    }
+
+    fn resolve_base_frame_batch_with_metadata(
+        &self,
+        requests: &[SymbolRequest],
+    ) -> Result<Vec<ResolvedSymbolFrames>, String> {
+        self.resolve_routed_frame_batch(requests, false)
+    }
+}
+
+impl<O> PerfSymbolResolver<O>
+where
+    O: SymbolResolver,
+{
+    fn resolve_routed_frame_batch(
+        &self,
+        requests: &[SymbolRequest],
+        inline: bool,
+    ) -> Result<Vec<ResolvedSymbolFrames>, String> {
         let mut resolved = vec![ResolvedSymbolFrames::default(); requests.len()];
-        let mut kernel_elf_requests = Vec::new();
-        let mut kernel_elf_indexes = Vec::new();
-        let mut user_requests = Vec::new();
-        let mut user_indexes = Vec::new();
+        let mut kernel_elf_requests = SmallVec::<[SymbolRequest; 16]>::new();
+        let mut kernel_elf_indexes = RequestIndexes::new();
+        let mut user_requests = SmallVec::<[SymbolRequest; 16]>::new();
+        let mut user_indexes = RequestIndexes::new();
         let mut address_cache = self
             .address_cache
             .lock()
@@ -1858,9 +1878,7 @@ where
 
         drop(address_cache);
         if !kernel_elf_requests.is_empty() {
-            let kernel_frames = self
-                .object_resolver
-                .resolve_frame_batch_with_metadata(&kernel_elf_requests)?;
+            let kernel_frames = self.resolve_object_frame_batch(&kernel_elf_requests, inline)?;
             for (index, mut frames) in kernel_elf_indexes.into_iter().zip(kernel_frames) {
                 frames.source_state = SymbolSourceState::AddressDependent;
                 resolved[index] = frames;
@@ -1868,9 +1886,7 @@ where
         }
 
         if !user_requests.is_empty() {
-            let user_frames = self
-                .object_resolver
-                .resolve_frame_batch_with_metadata(&user_requests)?;
+            let user_frames = self.resolve_object_frame_batch(&user_requests, inline)?;
             for (index, frames) in user_indexes.into_iter().zip(user_frames) {
                 let module = is_kernel_module_symbol_path(&requests[index].path);
                 let mut frames = if frames.frames.is_empty() && module {
@@ -1890,86 +1906,20 @@ where
         Ok(resolved)
     }
 
-    fn resolve_base_frame_batch_with_metadata(
+    fn resolve_object_frame_batch(
         &self,
         requests: &[SymbolRequest],
+        inline: bool,
     ) -> Result<Vec<ResolvedSymbolFrames>, String> {
-        let mut resolved = vec![ResolvedSymbolFrames::default(); requests.len()];
-        let mut kernel_elf_requests = Vec::new();
-        let mut kernel_elf_indexes = Vec::new();
-        let mut user_requests = Vec::new();
-        let mut user_indexes = Vec::new();
-        let mut address_cache = self
-            .address_cache
-            .lock()
-            .expect("object address cache lock");
-
-        for (index, request) in requests.iter().enumerate() {
-            if is_kernel_module_symbol_path(&request.path) {
-                if let Some(object_request) =
-                    self.cached_object_symbol_request(request, &mut address_cache)
-                {
-                    user_indexes.push(index);
-                    user_requests.push(object_request);
-                } else if let Some(symbol) = self.resolve_kernel_symbol(request) {
-                    resolved[index] = ResolvedSymbolFrames::from_frames(vec![symbol]);
-                }
-            } else if is_kernel_symbol_path(&request.path) {
-                if let Some(symbol) = self.resolve_kernel_symbol(request) {
-                    resolved[index] = ResolvedSymbolFrames::from_frames(vec![symbol]);
-                } else if let Some(kernel_elf) = &self.kernel_elf {
-                    kernel_elf_indexes.push(index);
-                    kernel_elf_requests.push(clean_object_symbol_request_with_cache(
-                        kernel_elf.clone(),
-                        request.relative_address,
-                        &mut address_cache,
-                    ));
-                }
-            } else {
-                let object_request = self.object_symbol_request(request, &mut address_cache);
-                user_indexes.push(index);
-                user_requests.push(object_request);
-            }
+        if inline {
+            self.object_resolver
+                .resolve_frame_batch_with_metadata(requests)
+        } else {
+            self.object_resolver
+                .resolve_base_frame_batch_with_metadata(requests)
         }
-
-        drop(address_cache);
-        if !kernel_elf_requests.is_empty() {
-            let kernel_frames = self
-                .object_resolver
-                .resolve_base_frame_batch_with_metadata(&kernel_elf_requests)?;
-            for (index, mut frames) in kernel_elf_indexes.into_iter().zip(kernel_frames) {
-                frames.source_state = SymbolSourceState::AddressDependent;
-                resolved[index] = frames;
-            }
-        }
-
-        if !user_requests.is_empty() {
-            let user_frames = self
-                .object_resolver
-                .resolve_base_frame_batch_with_metadata(&user_requests)?;
-            for (index, frames) in user_indexes.into_iter().zip(user_frames) {
-                let module = is_kernel_module_symbol_path(&requests[index].path);
-                let mut frames = if frames.frames.is_empty() && module {
-                    self.resolve_kernel_symbol(&requests[index])
-                        .map(|symbol| ResolvedSymbolFrames::from_frames(vec![symbol]))
-                        .unwrap_or(frames)
-                } else {
-                    frames
-                };
-                if module {
-                    frames.source_state = SymbolSourceState::AddressDependent;
-                }
-                resolved[index] = frames;
-            }
-        }
-        Ok(resolved)
     }
-}
 
-impl<O> PerfSymbolResolver<O>
-where
-    O: SymbolResolver,
-{
     fn object_symbol_request(
         &self,
         request: &SymbolRequest,
@@ -6080,6 +6030,95 @@ mod tests {
             !index.failed,
             "DWARF preparation should not have run without any base symbols"
         );
+    }
+
+    #[test]
+    fn routed_frame_batches_preserve_mode_and_order_before_and_after_inline_storage_spills() {
+        struct ModeResolver;
+        impl SymbolResolver for ModeResolver {
+            fn resolve_batch(&self, _: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
+                Err("frame routing must preserve metadata".into())
+            }
+            fn resolve_frame_batch_with_metadata(
+                &self,
+                requests: &[SymbolRequest],
+            ) -> Result<Vec<ResolvedSymbolFrames>, String> {
+                Ok(requests
+                    .iter()
+                    .map(|request| {
+                        ResolvedSymbolFrames::from_frames(vec![format!(
+                            "inline:{}:{:x}",
+                            request.path.display(),
+                            request.relative_address
+                        )])
+                    })
+                    .collect())
+            }
+            fn resolve_base_frame_batch_with_metadata(
+                &self,
+                requests: &[SymbolRequest],
+            ) -> Result<Vec<ResolvedSymbolFrames>, String> {
+                Ok(requests
+                    .iter()
+                    .map(|request| {
+                        ResolvedSymbolFrames::from_frames(vec![format!(
+                            "base:{}:{:x}",
+                            request.path.display(),
+                            request.relative_address
+                        )])
+                    })
+                    .collect())
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let user = root.path().join("missing-user-object");
+        let kernel = root.path().join("missing-kernel-object");
+        let resolver = super::PerfSymbolResolver::from_object_resolver(ModeResolver)
+            .with_kernel_elf(kernel.clone())
+            .with_kallsyms(super::Kallsyms::parse("0000000000001000 T known\n").unwrap());
+        for size in [0_usize, 1, 16, 17, 65] {
+            for inline in [true, false] {
+                let mut requests: Vec<_> = (0..size)
+                    .map(|address| {
+                        test_request(user.to_str().unwrap(), u64::try_from(address).unwrap())
+                    })
+                    .collect();
+                requests.insert(size / 2, test_request("[kernel.kallsyms]", 0x50));
+                requests.insert(0, test_request("[kernel.kallsyms]", 0x1001));
+                requests.push(test_request("[demo]", 0x55));
+                let results = if inline {
+                    resolver.resolve_frame_batch_with_metadata(&requests)
+                } else {
+                    resolver.resolve_base_frame_batch_with_metadata(&requests)
+                }
+                .unwrap();
+                assert_eq!(results.len(), requests.len());
+                for (request, frames) in requests.iter().zip(results) {
+                    let expected = match request.path.to_str().unwrap() {
+                        "[demo]" => Vec::new(),
+                        "[kernel.kallsyms]" if request.relative_address == 0x1001 => {
+                            vec!["known+0x1".into()]
+                        }
+                        _ => vec![format!(
+                            "{}:{}:{:x}",
+                            if inline { "inline" } else { "base" },
+                            if request.path == std::path::Path::new("[kernel.kallsyms]") {
+                                &kernel
+                            } else {
+                                &user
+                            }
+                            .display(),
+                            request.relative_address
+                        )],
+                    };
+                    assert_eq!(frames.frames, expected);
+                    assert_eq!(
+                        frames.source_state,
+                        super::SymbolSourceState::AddressDependent
+                    );
+                }
+            }
+        }
     }
 
     #[test]
