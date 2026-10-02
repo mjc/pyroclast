@@ -2502,6 +2502,104 @@ fn callchains_without_tid_follow_native_inferno_header_parsing() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn absent_sample_period_uses_event_attribute_default_like_real_perf() {
+    // tools/perf/util/evsel.c:evsel__parse_sample (3232) initializes period
+    // from attr.sample_period; only PERF_SAMPLE_PERIOD (3322) overrides it.
+    for default_period in [0, 1, 37] {
+        let mut attr = file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        );
+        put_u64(&mut attr, 16, default_period);
+        let mut comm = comm_payload(11, 12, "worker");
+        comm.resize(comm.len().next_multiple_of(8), 0);
+        let bytes = perfdata_with_records_and_attrs(
+            [attr],
+            [
+                record_bytes(3, &comm),
+                record_bytes_with_misc(
+                    PERF_RECORD_SAMPLE,
+                    PERF_RECORD_MISC_CPUMODE_USER,
+                    &sample_payload_with_time(0x2000, 11, 12, 1_000_000_000, [0x2000]),
+                ),
+            ],
+        );
+        let (script, expected) = native_script_and_fold(&bytes);
+        let actual = fold_perfdata_callchains_with_options(
+            &bytes,
+            FoldOptions {
+                count_periods: true,
+                inline: false,
+            },
+        )
+        .expect("fold");
+        assert_eq!(
+            actual, expected,
+            "default={default_period}; native script={script}"
+        );
+        let root = tempfile::tempdir().expect("tempdir");
+        let input = root.path().join("perf.data");
+        std::fs::write(&input, &bytes).expect("write fixture");
+        let file_folded = fold_perfdata_file_with_options(
+            &input,
+            FoldOptions {
+                count_periods: true,
+                inline: false,
+            },
+        )
+        .expect("fold file");
+        assert_eq!(file_folded, expected);
+        assert_eq!(
+            fold_perfdata_callchains(&bytes).expect("unweighted fold"),
+            "worker;[unknown] 1\n"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn absent_sample_period_uses_the_selected_identifier_events_default() {
+    let mask = PERF_SAMPLE_IDENTIFIER
+        | PERF_SAMPLE_IP
+        | PERF_SAMPLE_TID
+        | PERF_SAMPLE_TIME
+        | PERF_SAMPLE_CALLCHAIN;
+    let mut first = file_attr_bytes_with_ids(mask, 392, [111]);
+    let mut second = file_attr_bytes_with_ids(mask, 400, [222]);
+    put_u64(&mut first, 16, 37);
+    put_u64(&mut second, 16, 99);
+    let records = [222_u64, 111].map(|identifier| {
+        let mut payload = identifier.to_le_bytes().to_vec();
+        payload.extend(sample_payload_with_time(
+            0x2000,
+            11,
+            12,
+            1_000_000_000,
+            [0x2000],
+        ));
+        record_bytes_with_misc(PERF_RECORD_SAMPLE, PERF_RECORD_MISC_CPUMODE_USER, &payload)
+    });
+    let bytes = perfdata_with_attrs_ids_and_records([first, second], [111, 222], records);
+    let (script, expected) = native_script_and_fold(&bytes);
+    let weighted = FoldOptions {
+        count_periods: true,
+        inline: false,
+    };
+    let actual = fold_perfdata_callchains_with_options(&bytes, weighted).expect("fold");
+    assert_eq!(actual, expected, "native script={script}");
+    assert_eq!(actual, ":12;[unknown] 136\n");
+    let root = tempfile::tempdir().expect("tempdir");
+    let input = root.path().join("perf.data");
+    std::fs::write(&input, bytes).expect("write fixture");
+    assert_eq!(
+        fold_perfdata_file_with_options(&input, weighted).expect("fold file"),
+        actual
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn numeric_words_in_comms_follow_infernos_first_numeric_header_word() {
     // perf prints comm verbatim (builtin-script.c:perf_sample__fprintf_start).
     // Inferno event_line_parts recognizes digits/slashes after literal spaces.

@@ -329,6 +329,7 @@ struct SampleLayouts {
 #[derive(Clone, Debug)]
 struct SampleEventLayout {
     layout: SampleLayout,
+    default_period: u64,
     event_name: Arc<str>,
     offsets: SampleOffsets,
 }
@@ -365,9 +366,10 @@ impl SampleOffsets {
 }
 
 impl SampleEventLayout {
-    fn new(layout: SampleLayout, event_name: impl Into<Arc<str>>) -> Self {
+    fn new(layout: SampleLayout, event_name: impl Into<Arc<str>>, default_period: u64) -> Self {
         Self {
             layout,
+            default_period,
             event_name: event_name.into(),
             offsets: SampleOffsets::new(layout.sample_type),
         }
@@ -1674,13 +1676,18 @@ fn sample_layouts_from_file(
             Arc::new(SampleEventLayout::new(
                 layout_from_attr(attr),
                 event_names.first().cloned().unwrap_or_default(),
+                attr.sample_period,
             ))
         }),
         by_identifier: BTreeMap::new(),
         event_name_width,
     };
     for ((attr, event_name), ids) in attrs.iter().zip(event_names).zip(attr_ids) {
-        let event = Arc::new(SampleEventLayout::new(layout_from_attr(attr), event_name));
+        let event = Arc::new(SampleEventLayout::new(
+            layout_from_attr(attr),
+            event_name,
+            attr.sample_period,
+        ));
         for id in ids {
             layouts.by_identifier.insert(id, Arc::clone(&event));
         }
@@ -3360,7 +3367,7 @@ fn prepare_sample_for_fold<'layout, 'frames>(
     let Some(sample) = parse_sample_record_callchain(payload, event.layout)? else {
         return Ok(None);
     };
-    let count = sample_fold_count(sample.period, options);
+    let count = sample_fold_count(sample.period, event.default_period, options);
     frames.clear();
     frames.reserve(sample.frames.len());
     let has_callchain = event.layout.sample_type & PERF_SAMPLE_CALLCHAIN != 0;
@@ -3938,9 +3945,11 @@ fn has_perf_object_unwind(context: UserUnwindContext) -> bool {
     context.sample_callchain == SampleCallchainPresence::Present
 }
 
-fn sample_fold_count(period: Option<u64>, options: FoldOptions) -> u64 {
+fn sample_fold_count(period: Option<u64>, default_period: u64, options: FoldOptions) -> u64 {
+    // evsel.c:evsel__parse_sample initializes data->period from the selected
+    // attr.sample_period, then reads the payload only with PERF_SAMPLE_PERIOD.
     if options.count_periods {
-        period.unwrap_or(1)
+        period.unwrap_or(default_period)
     } else {
         1
     }
@@ -4147,13 +4156,18 @@ fn sample_layouts(
             Arc::new(SampleEventLayout::new(
                 layout_from_attr(attr),
                 event_names.first().cloned().unwrap_or_default(),
+                attr.sample_period,
             ))
         }),
         by_identifier: BTreeMap::new(),
         event_name_width,
     };
     for ((attr, event_name), ids) in attrs.iter().zip(event_names).zip(attr_ids) {
-        let event = Arc::new(SampleEventLayout::new(layout_from_attr(attr), event_name));
+        let event = Arc::new(SampleEventLayout::new(
+            layout_from_attr(attr),
+            event_name,
+            attr.sample_period,
+        ));
         for id in ids {
             layouts.by_identifier.insert(id, Arc::clone(&event));
         }
@@ -4491,6 +4505,7 @@ mod tests {
                     sample_id_all: true,
                 },
                 "cycles",
+                1,
             ))),
             ..super::SampleLayouts::default()
         };
@@ -6268,6 +6283,7 @@ mod tests {
                     sample_id_all: false,
                 },
                 "cycles",
+                1,
             ))),
             ..Default::default()
         }
@@ -6344,9 +6360,10 @@ mod tests {
         let mut layout = layouts.fallback.as_ref().unwrap().layout;
         layout.sample_type |= super::PERF_SAMPLE_IDENTIFIER;
         layouts.fallback = Some(std::sync::Arc::new(super::SampleEventLayout::new(
-            layout, "cycles",
+            layout, "cycles", 1,
         )));
-        let selected = std::sync::Arc::new(super::SampleEventLayout::new(layout, "instructions"));
+        let selected =
+            std::sync::Arc::new(super::SampleEventLayout::new(layout, "instructions", 1));
         layouts.by_identifier.insert(12, selected.clone());
         for identifier in [12_u64, 13] {
             let event = layouts
@@ -6517,7 +6534,7 @@ mod tests {
         layout.sample_type = super::PERF_SAMPLE_CALLCHAIN;
         let layouts = super::SampleLayouts {
             fallback: Some(std::sync::Arc::new(super::SampleEventLayout::new(
-                layout, "cycles",
+                layout, "cycles", 1,
             ))),
             ..Default::default()
         };
@@ -7932,10 +7949,11 @@ mod tests {
     }
 
     #[test]
-    fn sample_fold_count_uses_period_only_when_requested() {
+    fn sample_fold_count_uses_recorded_period_before_event_default_when_requested() {
         assert_eq!(
             super::sample_fold_count(
                 Some(37),
+                99,
                 super::FoldOptions {
                     count_periods: true,
                     ..super::FoldOptions::default()
@@ -7946,6 +7964,7 @@ mod tests {
         assert_eq!(
             super::sample_fold_count(
                 Some(37),
+                99,
                 super::FoldOptions {
                     count_periods: false,
                     ..super::FoldOptions::default()
@@ -7956,15 +7975,28 @@ mod tests {
     }
 
     #[test]
-    fn sample_fold_count_defaults_missing_period_to_one() {
+    fn sample_fold_count_uses_event_default_including_zero_when_period_is_absent() {
+        // evsel.c:evsel__parse_sample initializes period from attr.sample_period,
+        // not a universal 1. A zero attribute remains zero without PERIOD.
         assert_eq!(
             super::sample_fold_count(
                 None,
+                0,
                 super::FoldOptions {
                     count_periods: true,
                     ..super::FoldOptions::default()
                 }
             ),
+            0
+        );
+        let weighted = super::FoldOptions {
+            count_periods: true,
+            inline: false,
+        };
+        assert_eq!(super::sample_fold_count(None, 37, weighted), 37);
+        assert_eq!(super::sample_fold_count(Some(0), 37, weighted), 0);
+        assert_eq!(
+            super::sample_fold_count(None, 37, super::FoldOptions::default()),
             1
         );
     }
@@ -8427,6 +8459,7 @@ mod tests {
                     sample_id_all: true,
                 },
                 "cpu-clock",
+                1,
             ))),
             by_identifier: std::collections::BTreeMap::new(),
             event_name_width: 9,

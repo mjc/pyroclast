@@ -276,9 +276,11 @@ fn fold_command_processes_zero_data_size_like_perf_script_and_inferno() {
 }
 
 #[test]
-fn perf_script_command_keeps_unreadable_objects_unknown_with_inline_enabled_like_perf() {
+fn perf_script_command_keeps_unreadable_objects_unknown_and_zero_default_period_like_perf() {
     // perf machine.c:append_inlines does not ask addr2line for names without
     // a base symbol. This fixture has no ELF or DWARF inline chain.
+    // evsel.c:evsel__parse_sample uses attr.sample_period (zero here) without
+    // PERF_SAMPLE_PERIOD. Script output prints that value even without TIME.
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
     let missing_object = root.path().join("app");
@@ -316,7 +318,7 @@ fn perf_script_command_keeps_unreadable_objects_unknown_with_inline_enabled_like
     assert_eq!(
         output.stdout,
         format!(
-            "app       2          1 cycles: \n\t            2000 [unknown] ({})\n\n",
+            "app       2          0 cycles: \n\t            2000 [unknown] ({})\n\n",
             missing_object.display()
         )
     );

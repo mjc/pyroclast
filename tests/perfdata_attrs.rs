@@ -22,6 +22,7 @@ fn parses_sample_type_from_file_attr_section() {
         vec![PerfFileAttr {
             event_type: 0,
             config: 0,
+            sample_period: 0,
             sample_type,
             read_format: 0,
             branch_sample_type: 0,
@@ -101,6 +102,7 @@ fn parses_file_attr_id_lists() {
     let attr = PerfFileAttr {
         event_type: 0,
         config: 0,
+        sample_period: 0,
         sample_type: PERF_SAMPLE_IP,
         read_format: 0,
         branch_sample_type: 0,
@@ -189,6 +191,7 @@ proptest! {
     #[test]
     fn property_parses_file_attr_fields_for_any_record(
         sample_type in any::<u64>(),
+        sample_period in any::<u64>(),
         read_format in any::<u64>(),
         branch_sample_type in any::<u64>(),
         sample_regs_user in any::<u64>(),
@@ -198,6 +201,7 @@ proptest! {
         ids_size in any::<u64>(),
     ) {
         let mut attr = file_attr_bytes(sample_type, ids_offset, ids_size);
+        put_u64(&mut attr, 16, sample_period);
         put_u64(&mut attr, 32, read_format);
         put_u64(
             &mut attr,
@@ -221,6 +225,7 @@ proptest! {
             vec![PerfFileAttr {
                 event_type: 0,
                 config: 0,
+                sample_period,
                 sample_type,
                 read_format,
                 branch_sample_type,
@@ -242,6 +247,7 @@ proptest! {
         let attr = PerfFileAttr {
             event_type: 0,
             config: 0,
+            sample_period: 0,
             sample_type: PERF_SAMPLE_IP,
             read_format: 0,
             branch_sample_type: 0,
