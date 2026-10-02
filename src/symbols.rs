@@ -236,6 +236,7 @@ struct MappingFrameKey {
 
 pub(crate) struct CachedMappingFrames {
     pub(crate) frames: Vec<String>,
+    pub(crate) literal_ends: Vec<Option<usize>>,
     pub(crate) has_base_symbol: bool,
     pub(crate) render_mode: SymbolFrameRenderMode,
     has_inline_frames: bool,
@@ -249,63 +250,98 @@ pub(crate) enum SymbolFrameRenderMode {
 }
 
 #[derive(Default)]
+struct UserFrameAddresses {
+    by_address: FxHashMap<u64, usize>,
+    // A per-source hint survives intervening lookups in other objects.
+    last_address: Cell<Option<(u64, Option<usize>)>>,
+}
+
+#[derive(Default)]
 struct UserFrameTable {
     by_source: FxHashMap<usize, usize>,
     // None is a terminal unavailable object, not a per-address negative result.
-    sources: Vec<Option<FxHashMap<u64, usize>>>,
-    last_source: Cell<Option<(usize, usize)>>,
+    sources: Vec<Option<UserFrameAddresses>>,
+    // A cached source with no index is terminal unavailable, including all IPs.
+    last_source: Cell<Option<(usize, Option<usize>)>>,
     #[cfg(test)]
     source_searches: Cell<usize>,
+    #[cfg(test)]
+    source_accesses: Cell<usize>,
+    #[cfg(test)]
+    address_searches: Cell<usize>,
 }
 
 impl UserFrameTable {
+    #[inline]
     fn slot(&self, source: usize, address: u64) -> Option<usize> {
         let index = if let Some((cached_source, index)) = self.last_source.get()
             && cached_source == source
         {
-            index
+            match index {
+                Some(index) => index,
+                None => return Some(0),
+            }
         } else {
             #[cfg(test)]
             self.source_searches.set(self.source_searches.get() + 1);
             let index = *self.by_source.get(&source)?;
-            self.last_source.set(Some((source, index)));
+            self.last_source.set(Some((source, Some(index))));
             index
         };
-        self.sources[index]
-            .as_ref()
-            .map_or(Some(0), |addresses| addresses.get(&address).copied())
+        #[cfg(test)]
+        self.source_accesses.set(self.source_accesses.get() + 1);
+        let Some(addresses) = &self.sources[index] else {
+            self.last_source.set(Some((source, None)));
+            return Some(0);
+        };
+        if let Some((cached_address, slot)) = addresses.last_address.get()
+            && cached_address == address
+        {
+            return slot;
+        }
+        #[cfg(test)]
+        self.address_searches.set(self.address_searches.get() + 1);
+        let slot = addresses.by_address.get(&address).copied();
+        addresses.last_address.set(Some((address, slot)));
+        slot
     }
 
     fn source_index(&mut self, source: usize) -> usize {
         let index = *self.by_source.entry(source).or_insert_with(|| {
             let index = self.sources.len();
-            self.sources.push(Some(FxHashMap::default()));
+            self.sources.push(Some(UserFrameAddresses::default()));
             index
         });
-        self.last_source.set(Some((source, index)));
+        self.last_source.set(Some((source, Some(index))));
         index
     }
 
     fn insert(&mut self, source: usize, address: u64, slot: usize) {
         let index = self.source_index(source);
-        self.sources[index]
-            .get_or_insert_with(FxHashMap::default)
-            .insert(address, slot);
+        let addresses = self.sources[index].get_or_insert_with(UserFrameAddresses::default);
+        addresses.by_address.insert(address, slot);
+        addresses.last_address.set(None);
     }
 
     fn mark_unavailable(&mut self, source: usize) {
         let index = self.source_index(source);
         self.sources[index] = None;
+        self.last_source.set(Some((source, None)));
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.sources.iter().flatten().map(FxHashMap::len).sum()
+        self.sources
+            .iter()
+            .flatten()
+            .map(|addresses| addresses.by_address.len())
+            .sum()
     }
 }
 
 static UNRESOLVED_MAPPING_FRAMES: CachedMappingFrames = CachedMappingFrames {
     frames: Vec::new(),
+    literal_ends: Vec::new(),
     has_base_symbol: false,
     render_mode: SymbolFrameRenderMode::Direct,
     has_inline_frames: false,
@@ -333,6 +369,7 @@ struct MappingFrameTable {
 }
 
 impl MappingFrameTable {
+    #[inline]
     fn user_slot(&self, symbol_source_id: usize, relative_address: u64) -> Option<usize> {
         self.user.slot(symbol_source_id, relative_address)
     }
@@ -356,6 +393,7 @@ impl MappingFrameTable {
         self.slot(key).map(|slot| self.at_slot(slot))
     }
 
+    #[inline]
     fn at_slot(&self, slot: usize) -> &CachedMappingFrames {
         // Zero represents a resolved negative result, not a cache miss.
         if slot == 0 {
@@ -365,6 +403,7 @@ impl MappingFrameTable {
         }
     }
 
+    #[inline]
     fn get_frame(&self, mapping: &MappedFrame<'_>) -> Option<&CachedMappingFrames> {
         #[cfg(test)]
         self.lookups.set(self.lookups.get() + 1);
@@ -1699,6 +1738,7 @@ where
         self.resolved_by_mapping.lookups.get() + self.resolved_base_by_mapping.lookups.get()
     }
 
+    #[inline]
     pub(crate) fn cached_mapping_frames(
         &self,
         mapping: &MappedFrame<'_>,
@@ -1760,6 +1800,11 @@ where
             for (key, frames) in keys.drain(..).zip(resolved) {
                 let unavailable = frames.source_state == SymbolSourceState::Unavailable;
                 let frames = CachedMappingFrames {
+                    literal_ends: frames
+                        .frames
+                        .iter()
+                        .map(|frame| crate::folded::inferno_perf_raw_function_literal_end(frame))
+                        .collect(),
                     // symbol_fprintf.c prints names verbatim. Inferno splits
                     // LF before stack_line_parts trims rawfunc, so these labels
                     // require row parsing, not folded-label escaping. Classify
@@ -6094,8 +6139,10 @@ mod tests {
     }
 
     fn cached_table_frames(label: String, offset: u64) -> super::CachedMappingFrames {
+        let literal_end = crate::folded::inferno_perf_raw_function_literal_end(&label);
         super::CachedMappingFrames {
             frames: vec![label],
+            literal_ends: vec![literal_end],
             has_base_symbol: true,
             render_mode: super::SymbolFrameRenderMode::Direct,
             has_inline_frames: false,
@@ -6107,12 +6154,52 @@ mod tests {
     fn empty_cached_table_frames() -> super::CachedMappingFrames {
         super::CachedMappingFrames {
             frames: Vec::new(),
+            literal_ends: Vec::new(),
             has_base_symbol: false,
             render_mode: super::SymbolFrameRenderMode::Direct,
             has_inline_frames: false,
             has_non_inline_base_frame: false,
             base_offset: None,
         }
+    }
+
+    #[test]
+    fn cached_mapping_literal_ranges_preserve_frames_and_keep_render_modes_separate() {
+        let names: Vec<String> = [
+            "literal",
+            "literal+0x2a",
+            "outer->inner",
+            "with$variable",
+            "with;separator",
+            "with\rnewline",
+            "with\nnewline",
+            "crate::name::h0123456789abcdef",
+            "function(param)",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let resolver = CountingFrameResolver::new(vec![names.clone()]);
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let mapping = test_mapping_ref("/bin/demo", 0x1234);
+        for inline in [true, false] {
+            cache
+                .prefetch_mapping_refs_with_mode([&mapping], inline)
+                .unwrap();
+            let table = if inline {
+                &cache.resolved_by_mapping
+            } else {
+                &cache.resolved_base_by_mapping
+            };
+            let cached = table.get(&super::mapping_frame_key(&mapping)).unwrap();
+            assert_eq!(cached.frames, names);
+            assert_eq!(
+                cached.literal_ends,
+                [Some(7), Some(7), None, None, None, None, None, None, None]
+            );
+        }
+        assert_eq!(resolver.calls.get(), 2);
+        assert!(super::UNRESOLVED_MAPPING_FRAMES.literal_ends.is_empty());
     }
 
     #[test]
@@ -6228,6 +6315,128 @@ mod tests {
         assert_eq!(table.slot(9, 0), Some(1));
         assert_eq!(table.slot(7, 0), Some(0));
         assert_eq!(table.source_searches.get() - searches, 3);
+    }
+
+    #[test]
+    fn repeated_user_frame_lookups_skip_address_probes_for_hits_negatives_and_misses() {
+        let mut table = super::UserFrameTable::default();
+        for source in [0, 7, usize::MAX] {
+            table.insert(source, 0, 11);
+            table.insert(source, u64::MAX, 0);
+        }
+        for source in [0, 7, usize::MAX] {
+            for (address, expected) in [(0, Some(11)), (u64::MAX, Some(0)), (42, None)] {
+                assert_eq!(table.slot(source, address), expected);
+                let searches = table.address_searches.get();
+                for _ in 0..256 {
+                    assert_eq!(table.slot(source, address), expected);
+                }
+                assert_eq!(table.address_searches.get(), searches);
+            }
+        }
+        assert_eq!(table.address_searches.get(), 9);
+    }
+
+    #[test]
+    fn user_frame_lookup_hint_reuses_address_after_intervening_sources() {
+        for (address, expected) in [(0, Some(11)), (u64::MAX, Some(0)), (42, None)] {
+            let mut table = super::UserFrameTable::default();
+            for source in [0, 7, usize::MAX] {
+                table.insert(source, 0, 11);
+                table.insert(source, u64::MAX, 0);
+            }
+            for _ in 0..256 {
+                for source in [0, 7, usize::MAX] {
+                    assert_eq!(table.slot(source, address), expected);
+                }
+            }
+            assert_eq!(table.address_searches.get(), 3);
+            assert_eq!(table.len(), 6);
+        }
+    }
+
+    #[test]
+    fn unavailable_user_frame_lookups_skip_source_storage_for_every_address() {
+        let mut table = super::UserFrameTable::default();
+        table.insert(7, 42, 11);
+        table.mark_unavailable(usize::MAX);
+        let accesses = table.source_accesses.get();
+        for address in (0..256).chain([u64::MAX]) {
+            assert_eq!(table.slot(usize::MAX, address), Some(0));
+        }
+        assert_eq!(table.source_accesses.get(), accesses);
+        assert_eq!(table.address_searches.get(), 0);
+        assert_eq!(table.slot(7, 42), Some(11));
+        assert_eq!(table.slot(usize::MAX, 0), Some(0));
+        let accesses = table.source_accesses.get();
+        assert_eq!(table.slot(usize::MAX, u64::MAX), Some(0));
+        assert_eq!(table.source_accesses.get(), accesses);
+    }
+
+    #[test]
+    fn user_frame_lookup_hint_tracks_mutations_source_switches_and_growth() {
+        let mut table = super::UserFrameTable::default();
+        assert_eq!(table.slot(usize::MAX, u64::MAX), None);
+        table.insert(usize::MAX, 0, 0);
+        assert_eq!(table.slot(usize::MAX, u64::MAX), None);
+        table.insert(usize::MAX, u64::MAX, 11);
+        assert_eq!(table.slot(usize::MAX, u64::MAX), Some(11));
+        table.insert(usize::MAX, u64::MAX, 12);
+        assert_eq!(table.slot(usize::MAX, u64::MAX), Some(12));
+        table.insert(usize::MAX, u64::MAX, 0);
+        assert_eq!(table.slot(usize::MAX, u64::MAX), Some(0));
+        for source in 0..4096 {
+            table.insert(source, u64::MAX, source + 1);
+        }
+        assert_eq!(table.slot(usize::MAX, u64::MAX), Some(0));
+        table.mark_unavailable(usize::MAX);
+        assert_eq!(table.slot(usize::MAX, 42), Some(0));
+        assert_eq!(table.slot(0, u64::MAX), Some(1));
+        assert_eq!(table.slot(usize::MAX, u64::MAX), Some(0));
+        table.insert(usize::MAX, 42, 13);
+        assert_eq!(table.slot(usize::MAX, 42), Some(13));
+        assert_eq!(table.slot(usize::MAX, 0), None);
+        assert_eq!(table.slot(usize::MAX, u64::MAX), None);
+        table.mark_unavailable(usize::MAX);
+        assert_eq!(table.slot(usize::MAX, 42), Some(0));
+    }
+
+    #[test]
+    fn mapping_frame_lookup_hint_preserves_replacements_and_kernel_separation() {
+        let mut table = super::MappingFrameTable::default();
+        let user = super::MappingFrameKey {
+            symbol_source_id: usize::MAX,
+            relative_address: u64::MAX,
+            kernel_mapping_range: None,
+        };
+        let kernel = super::MappingFrameKey {
+            kernel_mapping_range: Some((0, u64::MAX)),
+            ..user
+        };
+        table.insert(user, empty_cached_table_frames());
+        table.insert(kernel, cached_table_frames("kernel".into(), 2));
+        assert!(table.get(&user).unwrap().frames.is_empty());
+        let searches = table.user.address_searches.get();
+        for _ in 0..256 {
+            assert!(table.get(&user).unwrap().frames.is_empty());
+            assert_eq!(table.get(&kernel).unwrap().frames, ["kernel"]);
+        }
+        assert_eq!(table.user.address_searches.get(), searches);
+        table.insert(user, cached_table_frames("user".into(), 3));
+        assert_eq!(table.get(&user).unwrap().frames, ["user"]);
+        assert_eq!(table.get(&user).unwrap().literal_ends, [Some(4)]);
+        table.insert(user, cached_table_frames("replacement".into(), 4));
+        assert_eq!(table.get(&user).unwrap().frames, ["replacement"]);
+        assert_eq!(table.get(&user).unwrap().literal_ends, [Some(11)]);
+        table.insert(user, empty_cached_table_frames());
+        assert!(table.get(&user).unwrap().frames.is_empty());
+        assert!(table.get(&user).unwrap().literal_ends.is_empty());
+        table.user.mark_unavailable(usize::MAX);
+        assert_eq!(table.get(&kernel).unwrap().frames, ["kernel"]);
+        table.insert(user, cached_table_frames("revived".into(), 5));
+        assert_eq!(table.get(&user).unwrap().frames, ["revived"]);
+        assert_eq!(table.get(&user).unwrap().literal_ends, [Some(7)]);
+        assert_eq!(table.get(&kernel).unwrap().frames, ["kernel"]);
     }
 
     #[test]

@@ -57,20 +57,43 @@ pub(crate) fn render_inferno_perf_raw_stack_into<'a>(
     }
 }
 
+fn raw_function_without_offset(frame: &str) -> &str {
+    if let Some(offset) = memchr::memrchr(b'+', frame.as_bytes())
+        && frame[offset..].starts_with("+0x")
+        && frame[offset + 3..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        &frame[..offset]
+    } else {
+        frame
+    }
+}
+
+pub(crate) fn inferno_perf_raw_function_literal_end(frame: &str) -> Option<usize> {
+    let frame = raw_function_without_offset(frame);
+    // Inferno perf.rs:on_stack_line (491-524): offsets, process labels,
+    // Rust fixups and Java arrows precede tidy_generic. Cache byte ranges,
+    // never another owned or normalized copy of the symbol text.
+    if frame.starts_with('(')
+        || partially_demangled_rust_hash_start(frame).is_some()
+        || memchr::memchr3(b'$', b'(', b';', frame.as_bytes()).is_some()
+        || memchr::memchr2(b'\n', b'\r', frame.as_bytes()).is_some()
+        || frame.contains("->")
+    {
+        None
+    } else {
+        Some(frame.len())
+    }
+}
+
 pub(crate) fn append_inferno_perf_raw_function(
     rendered: &mut String,
-    mut frame: &str,
+    frame: &str,
     scratch: &mut String,
     has_prefix: bool,
 ) -> bool {
-    if let Some(offset) = memchr::memrchr(b'+', frame.as_bytes())
-        && frame[offset..].starts_with("+0x")
-    {
-        let suffix = &frame[offset + 3..];
-        if suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            frame = &frame[..offset];
-        }
-    }
+    let frame = raw_function_without_offset(frame);
     if frame.starts_with('(') {
         return false;
     }
@@ -99,16 +122,17 @@ pub(crate) fn append_inferno_perf_raw_function(
     true
 }
 
-fn fix_partially_demangled_rust_symbol(symbol: &str) -> Cow<'_, str> {
+fn partially_demangled_rust_hash_start(symbol: &str) -> Option<usize> {
     const RUST_HASH_LENGTH: usize = 17;
+    let hash_start = symbol.len().checked_sub(RUST_HASH_LENGTH)?;
+    let hash = &symbol.as_bytes()[hash_start..];
+    (hash[0] == b'h' && hash[1..].iter().all(u8::is_ascii_hexdigit)).then_some(hash_start)
+}
 
-    let Some(hash_start) = symbol.len().checked_sub(RUST_HASH_LENGTH) else {
+fn fix_partially_demangled_rust_symbol(symbol: &str) -> Cow<'_, str> {
+    let Some(hash_start) = partially_demangled_rust_hash_start(symbol) else {
         return Cow::Borrowed(symbol);
     };
-    let hash = &symbol.as_bytes()[hash_start..];
-    if hash[0] != b'h' || !hash[1..].iter().all(u8::is_ascii_hexdigit) {
-        return Cow::Borrowed(symbol);
-    }
 
     let mut rest = &symbol[..hash_start];
     if rest.ends_with("::") {
@@ -253,5 +277,58 @@ pub(crate) fn append_separator(rendered: &mut String, has_prefix: bool) {
     // Inferno after_event joins logical segments, including empty strings.
     if has_prefix || !rendered.is_empty() {
         rendered.push(';');
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn literal_source_ranges_match_full_normalization_without_owned_labels() {
+        for symbol in [
+            "",
+            "plain",
+            "plain+0x10",
+            "plain+0x",
+            "plain+0xGG",
+            "a+0x10+tail",
+            "a+0x10+0x20",
+            "unicode_\u{e9}+0x10",
+            "[unknown]",
+            "square[brackets]",
+            "with<angle>",
+            "raw$escape",
+            "outer->inner",
+            "semi;colon",
+            "fn(params)",
+            "(process)",
+            "line\nfeed",
+            "carriage\rreturn",
+            "name::h0123456789abcdef",
+            "h0123456789abcdef",
+            "_$LT$demo$GT$::h0123456789abcdef+0x10",
+            "not_a_hash_h0123456789abcdeg",
+            "\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}",
+        ] {
+            if let Some(end) = super::inferno_perf_raw_function_literal_end(symbol) {
+                assert!(symbol.is_char_boundary(end));
+                let mut rendered = String::new();
+                let mut scratch = String::new();
+                super::append_inferno_perf_raw_function(&mut rendered, symbol, &mut scratch, false);
+                assert_eq!(&symbol[..end], rendered, "symbol {symbol:?}");
+            }
+        }
+        assert_eq!(
+            super::inferno_perf_raw_function_literal_end("plain+0x10"),
+            Some(5)
+        );
+        for symbol in [
+            "(process)",
+            "outer->inner",
+            "name::h0123456789abcdef",
+            "fn()",
+            "semi;colon",
+        ] {
+            assert_eq!(super::inferno_perf_raw_function_literal_end(symbol), None);
+        }
     }
 }
