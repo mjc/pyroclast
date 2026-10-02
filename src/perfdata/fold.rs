@@ -949,6 +949,12 @@ fn replay_records<O: SampleOutput>(
         return Err("perf data section extends past end of file".to_string());
     }
     let mut ordered = OrderedRecordQueue::default();
+    // builtin-script.c sets ordering_requires_timestamps; session.c disables
+    // ordered_events without evlist__sample_id_all (the first event's flag).
+    let ordered_events = layouts
+        .fallback
+        .as_ref()
+        .is_some_and(|event| event.layout.sample_id_all);
     while offset < end {
         let record = source.record_at(offset, end)?;
         let next = offset + usize::from(record.header.size);
@@ -956,8 +962,9 @@ fn replay_records<O: SampleOutput>(
             ordered.flush_round_with(|offset| {
                 deliver_record(source, offset, end, layouts, options, sink)
             })?;
-        } else if let Some(time) =
-            record_time(record, layouts)?.filter(|time| *time != 0 && *time != u64::MAX)
+        } else if ordered_events
+            && let Some(time) =
+                record_time(record, layouts)?.filter(|time| *time != 0 && *time != u64::MAX)
         {
             // ordered-events.c rejects zero/~0ULL with -ETIME; session.c then
             // delivers directly. Ties retain input order (file offset).

@@ -2657,6 +2657,54 @@ fn numeric_words_in_comms_follow_infernos_first_numeric_header_word() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn without_sample_id_all_metadata_and_timed_samples_follow_native_input_order() {
+    // util/session.c:perf_session__new disables ordered_events when timestamps
+    // are required but evlist__sample_id_all is false.
+    let mut records = Vec::new();
+    for (name, period) in [("before", 3), ("after", 7)] {
+        let mut comm = comm_payload(11, 12, name);
+        comm.resize(comm.len().next_multiple_of(8), 0);
+        records.push(record_bytes(3, &comm));
+        records.push(record_bytes_with_misc(
+            PERF_RECORD_SAMPLE,
+            PERF_RECORD_MISC_CPUMODE_USER,
+            &sample_payload_with_optional_timestamp(
+                sample_payload_with_period(0x2000, 11, 12, period, [0x2000]),
+                true,
+            ),
+        ));
+    }
+    let bytes = perfdata_with_records_and_attrs_vec(
+        vec![file_attr_bytes(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_TIME
+                | PERF_SAMPLE_PERIOD
+                | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        records,
+    );
+    let (script, expected) = native_script_and_fold(&bytes);
+    let options = FoldOptions {
+        count_periods: true,
+        inline: false,
+    };
+    assert_eq!(expected, "after;[unknown] 7\nbefore;[unknown] 3\n");
+    let actual = fold_perfdata_callchains_with_options(&bytes, options).expect("fold");
+    assert_eq!(actual, expected, "native script={script}");
+    let root = tempfile::tempdir().expect("tempdir");
+    let input = root.path().join("perf.data");
+    std::fs::write(&input, bytes).expect("write fixture");
+    assert_eq!(
+        fold_perfdata_file_with_options(&input, options).expect("fold file"),
+        expected
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn timed_sample_ip_with_a_newline_dso_preserves_inferno_state_across_samples() {
     use inferno::collapse::Collapse as _;
     // Inferno process_single_stack doesn't reset in_event at sample boundaries;
@@ -3085,7 +3133,7 @@ fn folds_untimed_perfdata_from_file_with_infernos_unit_weights() {
 }
 
 #[test]
-fn file_path_folding_applies_late_untimed_mmaps_before_timed_samples_like_global_sort() {
+fn file_path_folding_without_sample_id_all_does_not_apply_future_mmaps_to_samples() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
     let mut records = Vec::new();
@@ -3112,11 +3160,11 @@ fn file_path_folding_applies_late_untimed_mmaps_before_timed_samples_like_global
     let folded =
         fold_perfdata_file_with_options(&perfdata, FoldOptions::default()).expect("folded");
 
-    assert_eq!(folded, ":12;[app] 10000\n");
+    assert_eq!(folded, ":12;[unknown] 10000\n");
 }
 
 #[test]
-fn file_path_folding_uses_finished_round_as_perf_ordered_event_watermark() {
+fn file_path_folding_without_sample_id_all_keeps_input_order_across_finished_rounds() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
     let bytes = perfdata_with_records_and_attrs(
@@ -3137,7 +3185,7 @@ fn file_path_folding_uses_finished_round_as_perf_ordered_event_watermark() {
     let folded =
         fold_perfdata_file_with_options(&perfdata, FoldOptions::default()).expect("folded");
 
-    assert_eq!(folded, ":12;[app] 1\n");
+    assert_eq!(folded, ":12;[unknown] 1\n");
 }
 
 #[test]
