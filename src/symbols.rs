@@ -541,6 +541,7 @@ pub struct PerfSymbolResolver<O> {
     debug_dir: Option<PathBuf>,
     kernel_elf: Option<PathBuf>,
     recorded_kernel_build_id: Option<String>,
+    file_kernel_cache: Option<FileKernelCache>,
     kallsyms: Option<Kallsyms>,
     live_kallsyms: Option<Kallsyms>,
     live_kallsyms_path: Option<PathBuf>,
@@ -557,6 +558,38 @@ pub struct PerfSymbolResolver<O> {
     /// relocates it through the recorded reference symbol.
     live_kernel_notes_path: Option<PathBuf>,
     live_kernel_build_id_cache: OnceLock<Option<String>>,
+}
+
+struct FileKernelCache {
+    perfdata: PathBuf,
+    debug_dir: PathBuf,
+    loaded: OnceLock<CachedKernelSymbols>,
+}
+
+#[derive(Default)]
+struct CachedKernelSymbols {
+    build_id: Option<String>,
+    kallsyms: Option<Kallsyms>,
+    elf: Option<PathBuf>,
+}
+
+impl FileKernelCache {
+    fn symbols(&self) -> &CachedKernelSymbols {
+        self.loaded.get_or_init(|| {
+            let Some(build_id) = kernel_build_id_from_perfdata_file(&self.perfdata)
+                .ok()
+                .flatten()
+            else {
+                return CachedKernelSymbols::default();
+            };
+            let elf = perf_build_id_elf_path(&self.debug_dir, &build_id);
+            CachedKernelSymbols {
+                kallsyms: Kallsyms::load_perf_build_id_cache(&self.debug_dir, &build_id),
+                elf: elf.exists().then_some(elf),
+                build_id: Some(build_id),
+            }
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -986,6 +1019,7 @@ where
             debug_dir: None,
             kernel_elf: None,
             recorded_kernel_build_id: None,
+            file_kernel_cache: None,
             kallsyms: None,
             live_kallsyms: None,
             live_kallsyms_path: None,
@@ -1059,11 +1093,16 @@ where
     }
 
     #[must_use]
-    pub fn with_perfdata_file_kernel_cache(self, perfdata: &Path, debug_dir: &Path) -> Self {
-        match kernel_build_id_from_perfdata_file(perfdata) {
-            Ok(Some(build_id)) => self.with_perfdata_kernel_build_id(&build_id, debug_dir),
-            Ok(None) | Err(_) => self,
-        }
+    pub fn with_perfdata_file_kernel_cache(mut self, perfdata: &Path, debug_dir: &Path) -> Self {
+        // tools/perf/util/symbol.c:dso__load loads symbols on demand. A
+        // user-only recording must not first be traversed to find kernel IDs.
+        self.file_kernel_cache = Some(FileKernelCache {
+            perfdata: perfdata.to_path_buf(),
+            debug_dir: debug_dir.to_path_buf(),
+            loaded: OnceLock::new(),
+        });
+        self.debug_dir = Some(debug_dir.to_path_buf());
+        self
     }
 
     fn with_perfdata_kernel_build_id(self, build_id: &str, debug_dir: &Path) -> Self {
@@ -1122,12 +1161,34 @@ where
     /// symbolized against. perf trusts kallsyms for the recorded kernel; this is
     /// the equivalent guard for the direct-fold path on the recording machine.
     fn live_kernel_matches_recorded(&self) -> bool {
-        match &self.recorded_kernel_build_id {
+        match self.recorded_kernel_build_id_ref() {
             Some(recorded) => self
                 .live_kernel_build_id()
                 .is_some_and(|live| live == recorded),
             None => false,
         }
+    }
+
+    fn recorded_kernel_build_id_ref(&self) -> Option<&str> {
+        self.recorded_kernel_build_id.as_deref().or_else(|| {
+            self.file_kernel_cache
+                .as_ref()?
+                .symbols()
+                .build_id
+                .as_deref()
+        })
+    }
+
+    fn kernel_elf_ref(&self) -> Option<&PathBuf> {
+        self.kernel_elf
+            .as_ref()
+            .or_else(|| self.file_kernel_cache.as_ref()?.symbols().elf.as_ref())
+    }
+
+    fn kallsyms_ref(&self) -> Option<&Kallsyms> {
+        self.kallsyms
+            .as_ref()
+            .or_else(|| self.file_kernel_cache.as_ref()?.symbols().kallsyms.as_ref())
     }
 }
 
@@ -1800,7 +1861,7 @@ where
             } else if is_kernel_symbol_path(&request.path) {
                 if let Some(symbol) = self.resolve_kernel_symbol(request) {
                     resolved[index] = Some(symbol);
-                } else if let Some(kernel_elf) = &self.kernel_elf {
+                } else if let Some(kernel_elf) = self.kernel_elf_ref() {
                     kernel_elf_indexes.push(index);
                     kernel_elf_requests.push(clean_object_symbol_request_with_cache(
                         kernel_elf.clone(),
@@ -1893,7 +1954,7 @@ where
             } else if is_kernel_symbol_path(&request.path) {
                 if let Some(symbol) = self.resolve_kernel_symbol(request) {
                     resolved[index] = ResolvedSymbolFrames::from_frames(vec![symbol]);
-                } else if let Some(kernel_elf) = &self.kernel_elf {
+                } else if let Some(kernel_elf) = self.kernel_elf_ref() {
                     kernel_elf_indexes.push(index);
                     kernel_elf_requests.push(clean_object_symbol_request_with_cache(
                         kernel_elf.clone(),
@@ -2070,8 +2131,7 @@ where
 
     fn resolve_kernel_symbol(&self, request: &SymbolRequest) -> Option<String> {
         if is_kernel_module_symbol_path(&request.path) {
-            self.kallsyms
-                .as_ref()
+            self.kallsyms_ref()
                 .and_then(|kallsyms| resolve_module_kallsyms(kallsyms, request))
                 .or_else(|| {
                     // tools/perf/util/symbol.c dso__find_kallsyms() does not
@@ -2090,8 +2150,7 @@ where
                         .and_then(|kallsyms| resolve_module_kallsyms(kallsyms.as_ref(), request))
                 })
         } else {
-            self.kallsyms
-                .as_ref()
+            self.kallsyms_ref()
                 .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
                 .or_else(|| {
                     // tools/perf/util/symbol.c dso__find_kallsyms() tries the
@@ -2115,7 +2174,7 @@ where
         // recorded no kernel build-id, the request is not for the core kernel,
         // or the running kernel's build-id matches the recorded one (the
         // recording machine: live /proc/kallsyms describes the same kernel).
-        self.recorded_kernel_build_id.is_none()
+        self.recorded_kernel_build_id_ref().is_none()
             || request.path != Path::new("[kernel.kallsyms]")
             || self.live_kernel_matches_recorded()
     }

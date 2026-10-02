@@ -1755,6 +1755,38 @@ fn perf_symbol_resolver_loads_perfdata_kernel_build_id_cache_from_file() {
 }
 
 #[test]
+fn perf_symbol_resolver_opens_kernel_metadata_only_on_a_kernel_request() {
+    // tools/perf/util/symbol.c:dso__load loads a DSO on demand, not when
+    // constructing a session that may contain only user-space samples.
+    let root = tempfile::tempdir().unwrap();
+    let perfdata = root.path().join("perf.data");
+    let runner = Addr2lineRunner::new(b"");
+    let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
+        .with_perfdata_file_kernel_cache(&perfdata, root.path());
+
+    std::fs::write(&perfdata, perfdata_with_kernel_build_id()).unwrap();
+    let cached = root
+        .path()
+        .join("[kernel.kallsyms]")
+        .join("16ed3d5317ad219c89d0e3c5ea0ea2caa3cd4949")
+        .join("kallsyms");
+    std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
+    std::fs::write(cached, "ffffffff88000080 t asm_exc_page_fault\n").unwrap();
+    let symbols = resolver
+        .resolve_batch(&[SymbolRequest {
+            path: PathBuf::from("[kernel.kallsyms]"),
+            relative_address: 0xffff_ffff_8800_008f,
+            kernel_mapping_range: None,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        }])
+        .unwrap();
+    assert_eq!(symbols, vec![Some("asm_exc_page_fault+0xf".to_string())]);
+    assert!(runner.commands().is_empty());
+}
+
+#[test]
 fn perf_debug_dir_uses_home_debug_cache() {
     assert_eq!(
         perf_debug_dir(&PathBuf::from("/home/mjc")),
