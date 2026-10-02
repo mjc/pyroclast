@@ -49,7 +49,8 @@ use crate::perfdata::unwind::{
     unwind_x86_64_frame_pointer_stack_like_elfutils,
 };
 use crate::symbols::{
-    SymbolFrameCache, SymbolRequest, SymbolResolver, perf_build_id_elf_path_for_dso,
+    CachedMappingFrames, SymbolFrameCache, SymbolRequest, SymbolResolver,
+    perf_build_id_elf_path_for_dso,
 };
 
 const UNKNOWN_FRAME: &str = "[unknown]";
@@ -2331,7 +2332,7 @@ where
 }
 
 fn prefetch_sample_symbols<R: SymbolResolver>(
-    frames: &[(FoldFrame, FrameMappingDecision<'_>)],
+    frames: &[(FoldFrame, FrameMappingDecision<'_>, usize)],
     cache: &mut SymbolFrameCache<'_, R>,
     inline: bool,
 ) -> Result<(), String> {
@@ -2341,7 +2342,7 @@ fn prefetch_sample_symbols<R: SymbolResolver>(
         if expand && !inline {
             continue;
         }
-        let mappings = frames.iter().filter_map(|(frame, decision)| {
+        let mappings = frames.iter().filter_map(|(frame, decision, _)| {
             let FrameMappingDecision::Mapped(mapping) = decision else {
                 return None;
             };
@@ -2395,6 +2396,8 @@ struct FoldedRenderBuffers {
     render_scratch: String,
     module_scratch: String,
     mapping_cache: MappingResolveCache,
+    #[cfg(test)]
+    raw_function_normalizations: usize,
 }
 
 enum FoldedRenderStatus {
@@ -2402,11 +2405,41 @@ enum FoldedRenderStatus {
     RequiresPerfText,
 }
 
+fn fold_frame_runs(
+    frames: impl IntoIterator<Item = FoldFrame>,
+) -> impl Iterator<Item = (FoldFrame, usize)> {
+    let mut frames = frames.into_iter().peekable();
+    std::iter::from_fn(move || {
+        let frame = frames.next()?;
+        let mut repeats = 1;
+        while frames.next_if_eq(&frame).is_some() {
+            repeats += 1;
+        }
+        Some((frame, repeats))
+    })
+}
+
 fn mapping_requires_perf_text(mapping: &MappedFrame<'_>) -> bool {
     mapping.path_layout().text_row_boundary.is_some()
 }
 
 impl FoldedRenderBuffers {
+    fn repeat_segment(&mut self, start: usize, repeats: usize) {
+        if repeats <= 1 || start == self.current.len() {
+            return;
+        }
+        // Each rendered run starts after comm and contains its separator.
+        // Duplicate whole UTF-8 segments, including any expanded inline chain.
+        let len = self.current.len() - start;
+        self.current.reserve(len * (repeats - 1));
+        let mut copied = 1;
+        while copied < repeats {
+            let batch = copied.min(repeats - copied);
+            self.current.extend_from_within(start..start + len * batch);
+            copied += batch;
+        }
+    }
+
     fn start_stack(&mut self, comm: Option<SampleComm<'_>>) -> Result<(), String> {
         self.current.clear();
         self.has_comm = false;
@@ -2497,8 +2530,9 @@ impl<'a> FoldFrameResolver<'a> {
                 .frame_context(pid, &mut buffers.mapping_cache)
         });
 
-        let mut callchain = callchain.into_iter();
-        while let Some(frame) = callchain.next() {
+        let mut callchain = fold_frame_runs(callchain);
+        while let Some((frame, repeats)) = callchain.next() {
+            let segment_start = buffers.current.len();
             if symbol_cache.is_none()
                 && !is_valid_unwound_user_frame(
                     pid,
@@ -2530,31 +2564,25 @@ impl<'a> FoldFrameResolver<'a> {
                             ) {
                                 return Ok(FoldedRenderStatus::RequiresPerfText);
                             }
-                            append_resolved_folded_frames(
-                                buffers,
-                                &mapping,
-                                frame,
-                                expand,
-                                &cached.frames,
-                                cached.has_base_symbol,
-                            );
+                            append_resolved_folded_frames(buffers, &mapping, frame, expand, cached);
+                            buffers.repeat_segment(segment_start, repeats);
                             continue;
                         }
                         // Keep decisions only on a cold miss. Warm samples stream
                         // directly; cold samples consume each remaining frame once.
                         let mut pending =
-                            SmallVec::<[(FoldFrame, FrameMappingDecision<'_>); 16]>::new();
-                        pending.push((frame, decision));
-                        pending.extend(callchain.by_ref().map(|frame| {
+                            SmallVec::<[(FoldFrame, FrameMappingDecision<'_>, usize); 16]>::new();
+                        pending.push((frame, decision, repeats));
+                        pending.extend(callchain.by_ref().map(|(frame, repeats)| {
                             let decision = Self::mapping_decision_for_folded_frame(
                                 context.as_ref(),
                                 frame,
                                 true,
                                 &mut buffers.mapping_cache,
                             );
-                            (frame, decision)
+                            (frame, decision, repeats)
                         }));
-                        if pending.iter().any(|(_, decision)| {
+                        if pending.iter().any(|(_, decision, _)| {
                             matches!(
                                 decision, FrameMappingDecision::Mapped(mapping)
                                     if mapping_requires_perf_text(mapping)
@@ -2563,7 +2591,8 @@ impl<'a> FoldFrameResolver<'a> {
                             return Ok(FoldedRenderStatus::RequiresPerfText);
                         }
                         prefetch_sample_symbols(&pending, cache, self.inline)?;
-                        for (frame, decision) in pending {
+                        for (frame, decision, repeats) in pending {
+                            let segment_start = buffers.current.len();
                             let status = append_prefetched_folded_frame(
                                 buffers,
                                 frame,
@@ -2574,6 +2603,7 @@ impl<'a> FoldFrameResolver<'a> {
                             if matches!(status, FoldedRenderStatus::RequiresPerfText) {
                                 return Ok(status);
                             }
+                            buffers.repeat_segment(segment_start, repeats);
                         }
                         break;
                     }
@@ -2586,6 +2616,7 @@ impl<'a> FoldFrameResolver<'a> {
                     append_cached_inferno_perf_folded_label_to_buffers(buffers, UNKNOWN_FRAME);
                 }
             }
+            buffers.repeat_segment(segment_start, repeats);
         }
         if buffers.current.len() == comm_prefix_len {
             buffers.current.clear();
@@ -2844,14 +2875,7 @@ fn append_prefetched_folded_frame<R: SymbolResolver>(
             ) {
                 return Ok(FoldedRenderStatus::RequiresPerfText);
             }
-            append_resolved_folded_frames(
-                buffers,
-                &mapping,
-                frame,
-                expand,
-                &cached.frames,
-                cached.has_base_symbol,
-            );
+            append_resolved_folded_frames(buffers, &mapping, frame, expand, cached);
         }
         FrameMappingDecision::KernelAddress | FrameMappingDecision::Address => {
             append_folded_address_label(buffers, frame.address());
@@ -2868,11 +2892,10 @@ fn append_resolved_folded_frames(
     mapping: &MappedFrame<'_>,
     frame: FoldFrame,
     expand: bool,
-    frames: &[String],
-    has_base_symbol: bool,
+    cached: &CachedMappingFrames,
 ) {
     if matches!(frame, FoldFrame::InlineCurrentIp(_)) && !expand {
-        if !has_base_symbol {
+        if !cached.has_base_symbol {
             if is_kernel_space_frame(frame.address()) && !mapping.is_kernel() {
                 append_folded_address_label(buffers, frame.address());
             } else {
@@ -2880,12 +2903,18 @@ fn append_resolved_folded_frames(
             }
             return;
         }
-    } else if frames.is_empty() {
+    } else if cached.frames.is_empty() {
         append_frame_mapping_fallback(buffers, mapping);
         return;
     }
-    for label in frames {
-        append_cached_inferno_perf_raw_function_to_buffers(buffers, label);
+    debug_assert_eq!(cached.frames.len(), cached.literal_ends.len());
+    for (index, label) in cached.frames.iter().enumerate() {
+        if let Some(end) = cached.literal_ends[index] {
+            append_separator(&mut buffers.current, buffers.has_comm);
+            buffers.current.push_str(&label[..end]);
+        } else {
+            append_cached_inferno_perf_raw_function_to_buffers(buffers, label);
+        }
     }
 }
 
@@ -2898,6 +2927,10 @@ fn append_cached_inferno_perf_raw_function_to_buffers(
     buffers: &mut FoldedRenderBuffers,
     frame: &str,
 ) {
+    #[cfg(test)]
+    {
+        buffers.raw_function_normalizations += 1;
+    }
     append_inferno_perf_raw_function(
         &mut buffers.current,
         frame,
@@ -6260,6 +6293,223 @@ mod tests {
     }
 
     #[test]
+    fn recursive_run_identity_includes_frame_variant_cpu_mode_and_order() {
+        use super::FoldFrame;
+        let a = FoldFrame::UserUnwind(0x1010);
+        let b = FoldFrame::InlineCurrentIp(0x1010);
+        let user = FoldFrame::SampleIp {
+            address: 0x1010,
+            cpumode: super::PERF_RECORD_MISC_CPUMODE_USER,
+        };
+        let kernel = FoldFrame::SampleIp {
+            address: 0x1010,
+            cpumode: super::PERF_RECORD_MISC_CPUMODE_KERNEL,
+        };
+        let frames = [a, a, b, b, a, a, user, user, kernel, kernel];
+        assert_eq!(
+            super::fold_frame_runs(frames).collect::<Vec<_>>(),
+            [(a, 2), (b, 2), (a, 2), (user, 2), (kernel, 2)]
+        );
+        assert_eq!(frames[0], a);
+        assert_eq!(super::fold_frame_runs([]).count(), 0);
+    }
+
+    #[test]
+    fn repeated_folded_segments_preserve_utf8_empty_labels_and_odd_run_lengths() {
+        for repeats in [1, 2, 3, 5, 511, 512, 513] {
+            for segment in [";", ";unicode_\u{e9}", ";outer;inner_[i]", ""] {
+                let mut buffers = super::FoldedRenderBuffers::default();
+                buffers
+                    .start_stack(Some(super::SampleComm::Name("comm_\u{e9}")))
+                    .unwrap();
+                let start = buffers.current.len();
+                buffers.current.push_str(segment);
+                buffers.repeat_segment(start, repeats);
+                assert_eq!(
+                    buffers.rendered(),
+                    format!("comm_\u{e9}{}", segment.repeat(repeats))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recursive_runs_preserve_native_inferno_labels_modes_and_text_fallbacks() {
+        use super::SampleOutput as _;
+        use inferno::collapse::Collapse as _;
+        // Perf machine.c:append_inlines/unwind_entry emits every accepted
+        // entry; Inferno perf.rs:on_stack_line/after_event preserves repeats.
+        for (path, labels) in [
+            ("/bin/demo", vec![]),
+            ("/bin/unicode_\u{e9}", vec![]),
+            ("/bin/semi;colon", vec![]),
+            ("/bin/(params)", vec![]),
+            ("/bin/with space", vec![]),
+            ("/bin/line\nbreak", vec![]),
+            ("/bin/demo", vec!["outer+0x10", "inner_[i]"]),
+            ("/bin/demo", vec!["java->inlined", "unicode_\u{e9}"]),
+            ("/bin/demo", vec!["(process)"]),
+            ("/bin/demo", vec![" padded "]),
+            ("/bin/demo", vec!["line\nbreak"]),
+        ] {
+            for comm in ["worker", ""] {
+                let mut state = super::SessionState::new(std::collections::BTreeMap::new());
+                state.thread_comms.insert(7, comm.into());
+                insert_test_mapping(&mut state.mmap_table, 7, 0x1000, 0x100, path);
+                let resolver = StaticFrameResolver {
+                    frames: labels.iter().map(|label| (*label).into()).collect(),
+                    has_base_symbol: !labels.is_empty(),
+                    has_inline_frames: labels.len() > 1,
+                    has_non_inline_base_frame: !labels.is_empty(),
+                    ..Default::default()
+                };
+                let mut cache = SymbolFrameCache::new(&resolver);
+                let mut direct = super::FoldedOutput::new(
+                    Some(&mut cache),
+                    super::FoldOptions {
+                        inline: true,
+                        count_periods: true,
+                    },
+                    6,
+                );
+                let mut frames = vec![super::FoldFrame::UserUnwind(0x1010); 33];
+                frames.extend([super::FoldFrame::InlineCurrentIp(0x1010); 17]);
+                frames.extend(
+                    [super::FoldFrame::SampleIp {
+                        address: 0x1010,
+                        cpumode: super::PERF_RECORD_MISC_CPUMODE_USER,
+                    }; 5],
+                );
+                frames.extend([super::FoldFrame::UserUnwind(0x2000); 9]);
+                let sample = prepared_sample(&frames);
+                let mut script = Vec::new();
+                let mut text_cache = SymbolFrameCache::new(&resolver);
+                let mut text = super::PerfScriptOutput {
+                    symbol_cache: Some(&mut text_cache),
+                    writer: &mut script,
+                    event_name_width: 6,
+                    inline: true,
+                };
+                for _ in 0..2 {
+                    direct.write_sample_event(&state, &sample).unwrap();
+                    text.write_sample_event(&state, &sample).unwrap();
+                }
+                let mut options = inferno::collapse::perf::Options::default();
+                options.nthreads = 1;
+                let mut expected = Vec::new();
+                inferno::collapse::perf::Folder::from(options)
+                    .collapse(std::io::Cursor::new(script), &mut expected)
+                    .unwrap();
+                let mut actual = Vec::new();
+                super::write_fold_counts(direct.buffers.counts, &mut actual).unwrap();
+                assert_eq!(
+                    actual, expected,
+                    "path {path:?}, labels {labels:?}, comm {comm:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cached_literal_symbols_skip_repeated_raw_function_normalization() {
+        let mut table = super::MmapTable::default();
+        insert_test_mapping(&mut table, 7, 0x1000, 0x1000, "/bin/demo");
+        let resolver = StaticFrameResolver {
+            frames: vec!["literal_symbol+0x10".into()],
+            has_base_symbol: true,
+            has_non_inline_base_frame: true,
+            ..Default::default()
+        };
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let mut buffers = super::FoldedRenderBuffers::default();
+        for _ in 0..2 {
+            let frames = (0..512).map(|offset| super::FoldFrame::UserUnwind(0x1000 + offset));
+            super::FoldFrameResolver::new(&table, true)
+                .render_folded_stack_for_stack(
+                    Some(7),
+                    Some(super::SampleComm::Name("worker")),
+                    frames,
+                    Some(&mut cache),
+                    &mut buffers,
+                )
+                .unwrap();
+            assert_eq!(
+                buffers.rendered(),
+                format!("worker{}", ";literal_symbol".repeat(512))
+            );
+            assert_eq!(
+                buffers.raw_function_normalizations, 0,
+                "cached literal source ranges must not rerun offset, Rust-hash, and arrow parsing"
+            );
+        }
+    }
+
+    #[test]
+    fn recursive_folded_runs_probe_cached_symbols_once_without_dropping_frames() {
+        use super::SampleOutput as _;
+        let mut state = super::SessionState::new(std::collections::BTreeMap::new());
+        state.thread_comms.insert(7, "worker".into());
+        state
+            .mmap_table
+            .insert_mmap(crate::perfdata::records::MmapRecord {
+                pid: 7,
+                tid: 7,
+                start: 0x1000,
+                len: 0x100,
+                pgoff: 0,
+                path: "/bin/demo".into(),
+            });
+        let resolver = RecordingFrameResolver::default();
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let mut output = super::FoldedOutput::new(
+            Some(&mut cache),
+            super::FoldOptions {
+                inline: true,
+                ..Default::default()
+            },
+            0,
+        );
+        let frames = [super::FoldFrame::UserUnwind(0x1010); 512];
+        let sample = prepared_sample(&frames);
+        output.write_sample_event(&state, &sample).unwrap();
+        assert_eq!(
+            output.buffers.rendered(),
+            format!("worker{}", ";symbol_10".repeat(512))
+        );
+        assert_eq!(resolver.full_requests.borrow().as_slice(), &[0x10]);
+        let lookups = output
+            .symbol_cache
+            .as_ref()
+            .unwrap()
+            .mapping_frame_lookup_count();
+        assert_eq!(
+            lookups, 4,
+            "cold runs need one miss, prefetch, insert, and render lookup"
+        );
+        output.write_sample_event(&state, &sample).unwrap();
+        assert_eq!(
+            output
+                .symbol_cache
+                .as_ref()
+                .unwrap()
+                .mapping_frame_lookup_count()
+                - lookups,
+            1,
+            "a warm recursive run must not resolve the same cached frame 512 times"
+        );
+        assert_eq!(
+            output
+                .buffers
+                .counts
+                .stacks
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            [2]
+        );
+    }
+
+    #[test]
     fn symbol_cache_hits_resolve_each_frame_mapping_once() {
         use super::SampleOutput as _;
         let mut state = super::SessionState::new(std::collections::BTreeMap::new());
@@ -6937,6 +7187,7 @@ mod tests {
                             true,
                             &mut mapping_cache,
                         ),
+                        1,
                     )
                 })
                 .collect::<Vec<_>>();
