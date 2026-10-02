@@ -172,6 +172,8 @@ pub(crate) struct FrameMappingContext<'a> {
     global: &'a [IndexedMapping],
     user_hint: Cell<Option<FrameMappingHint<'a>>>,
     global_hint: Cell<Option<FrameMappingHint<'a>>>,
+    user_miss: Cell<Option<u64>>,
+    global_miss: Cell<Option<u64>>,
 }
 
 #[derive(Clone, Copy)]
@@ -199,8 +201,13 @@ impl<'a> FrameMappingContext<'a> {
         ip: u64,
         cache: &mut MappingResolveCache,
     ) -> Option<MappedFrame<'a>> {
-        let mapping =
-            self.resolve_bucket::<true>(self.user, ip, &mut cache.pid_index, &self.user_hint)?;
+        let mapping = self.resolve_bucket::<true>(
+            self.user,
+            ip,
+            &mut cache.pid_index,
+            &self.user_hint,
+            &self.user_miss,
+        )?;
         Some(MappedFrame::new(mapping, ip))
     }
 
@@ -214,12 +221,18 @@ impl<'a> FrameMappingContext<'a> {
             ip,
             &mut cache.global_index,
             &self.global_hint,
+            &self.global_miss,
         );
         let mapping = if self.pid == u32::MAX {
             global?
         } else {
-            let user =
-                self.resolve_bucket::<false>(self.user, ip, &mut cache.pid_index, &self.user_hint);
+            let user = self.resolve_bucket::<false>(
+                self.user,
+                ip,
+                &mut cache.pid_index,
+                &self.user_hint,
+                &self.user_miss,
+            );
             match (user, global) {
                 (Some(left), Some(right)) => {
                     if left.start >= right.start {
@@ -241,18 +254,24 @@ impl<'a> FrameMappingContext<'a> {
         ip: u64,
         cached_index: &mut Option<usize>,
         hint: &Cell<Option<FrameMappingHint<'a>>>,
+        miss: &Cell<Option<u64>>,
     ) -> Option<&'a Mapping> {
         // The context borrows the table for one delivered sample: map edits
         // cannot invalidate these references until that sample is finished.
         if let Some(found) = hint.get()
             && found.start <= ip
             && ip < found.end
-            && (!USER_ONLY || found.mapping.is_user_cpumode())
         {
+            // Perf overlap fixup leaves disjoint ranges per PID, so this
+            // containing non-USER map also proves that USER lookup misses.
+            if USER_ONLY && !found.mapping.is_user_cpumode() {
+                *cached_index = None;
+                return None;
+            }
             *cached_index = Some(found.index);
             return Some(found.mapping);
         }
-        if bucket.is_empty() {
+        if bucket.is_empty() || miss.get() == Some(ip) {
             *cached_index = None;
             return None;
         }
@@ -262,7 +281,14 @@ impl<'a> FrameMappingContext<'a> {
                 !USER_ONLY || mapping.is_user_cpumode()
             });
         *cached_index = index;
-        let index = index?;
+        let Some(index) = index else {
+            // Only general misses apply to both modes. Keep them in this
+            // immutable context, never in the cache shared across map edits.
+            if !USER_ONLY {
+                miss.set(Some(ip));
+            }
+            return None;
+        };
         let found = FrameMappingHint::new(index, &self.table.mappings[index]);
         hint.set(Some(found));
         Some(found.mapping)
@@ -411,6 +437,8 @@ impl MmapTable {
             global,
             user_hint: Cell::new(self.frame_mapping_hint(pid, cache.pid_index)),
             global_hint: Cell::new(self.frame_mapping_hint(u32::MAX, cache.global_index)),
+            user_miss: Cell::new(None),
+            global_miss: Cell::new(None),
         }
     }
 
@@ -1394,6 +1422,182 @@ mod tests {
             probes,
             "an immutable sample context must reuse borrowed maps, not revalidate global vector indices"
         );
+    }
+
+    #[test]
+    fn sample_context_reuses_exact_misses_for_alternating_user_and_global_frames() {
+        let mut table = MmapTable::default();
+        for (pid, start, path) in [(7, 0x1000, "/user"), (u32::MAX, 0x2000, "[global]")] {
+            table.insert_mmap(MmapRecord {
+                pid,
+                tid: pid,
+                start,
+                len: 0x100,
+                pgoff: 0,
+                path: path.into(),
+            });
+        }
+        let mut cache = MappingResolveCache::default();
+        let context = table.frame_context(7, &mut cache);
+        assert_eq!(context.resolve(0x1010, &mut cache).unwrap().path(), "/user");
+        assert_eq!(
+            context.resolve(0x2010, &mut cache).unwrap().path(),
+            "[global]"
+        );
+        let searches = table.index_search_count();
+        for _ in 0..32 {
+            assert_eq!(context.resolve(0x1010, &mut cache).unwrap().path(), "/user");
+            assert_eq!(cache.global_index, None);
+            assert_eq!(
+                context.resolve(0x2010, &mut cache).unwrap().path(),
+                "[global]"
+            );
+        }
+        assert_eq!(
+            table.index_search_count(),
+            searches,
+            "retain positive hint across misses"
+        );
+        assert_eq!(
+            context
+                .resolve(0x1020, &mut cache)
+                .unwrap()
+                .relative_address,
+            0x20
+        );
+        assert_eq!(
+            table.index_search_count(),
+            searches + 1,
+            "different IP must be searched"
+        );
+    }
+
+    #[test]
+    fn sample_context_rejects_non_user_hint_without_researching_or_losing_it() {
+        let mut table = MmapTable::default();
+        table.insert_mmap_with_misc(
+            MmapRecord {
+                pid: 7,
+                tid: 7,
+                start: 0x1000,
+                len: 0x100,
+                pgoff: 0,
+                path: "[local-kernel]".into(),
+            },
+            crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_KERNEL,
+        );
+        let mut cache = MappingResolveCache::default();
+        table.resolve_ref_cached(7, 0x1000, &mut cache).unwrap();
+        let context = table.frame_context(7, &mut cache);
+        let searches = table.index_search_count();
+        let probes = table.cache_index_probes.get();
+        for offset in 0..0x100 {
+            assert!(context.resolve_user(0x1000 + offset, &mut cache).is_none());
+            assert_eq!(cache.pid_index, None);
+            assert_eq!(
+                context.resolve(0x1000 + offset, &mut cache).unwrap().path(),
+                "[local-kernel]"
+            );
+        }
+        assert_eq!(
+            table.index_search_count(),
+            searches,
+            "containing non-USER hint proves a USER miss"
+        );
+        assert_eq!(table.cache_index_probes.get(), probes);
+    }
+
+    #[test]
+    fn sample_context_misses_reset_after_mutations_and_do_not_cross_modes() {
+        let mut table = MmapTable::default();
+        let mut cache = MappingResolveCache::default();
+        for (pid, start, path, mode) in [
+            (
+                7,
+                0x1000,
+                "/user",
+                crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_USER,
+            ),
+            (
+                u32::MAX,
+                0x2000,
+                "[global]",
+                crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_KERNEL,
+            ),
+            (
+                u32::MAX,
+                0x1000,
+                "[global-overlap]",
+                crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_KERNEL,
+            ),
+            (
+                7,
+                0x1000,
+                "[local-kernel]",
+                crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_KERNEL,
+            ),
+            (
+                8,
+                0x3000,
+                "/parent",
+                crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_USER,
+            ),
+        ] {
+            // Each old context observes misses before the next map edit.
+            {
+                let context = table.frame_context(7, &mut cache);
+                let mut user_oracle_cache = MappingResolveCache::default();
+                for ip in [0x1010, 0x2010, 0x3010] {
+                    assert_eq!(
+                        context
+                            .resolve(ip, &mut cache)
+                            .map(super::MappedFrame::resolved_ref),
+                        table.resolve_ref(7, ip)
+                    );
+                    assert_eq!(
+                        context
+                            .resolve_user(ip, &mut cache)
+                            .map(super::MappedFrame::resolved_ref),
+                        table.resolve_user_pid_ref_cached(7, ip, &mut user_oracle_cache)
+                    );
+                }
+            }
+            table.insert_mmap_with_misc(
+                MmapRecord {
+                    pid,
+                    tid: pid,
+                    start,
+                    len: 0x100,
+                    pgoff: 0,
+                    path: path.into(),
+                },
+                mode,
+            );
+        }
+        table.clone_pid_mappings(8, 7);
+        let context = table.frame_context(7, &mut cache);
+        assert_eq!(
+            context.resolve_user(0x3010, &mut cache).unwrap().path(),
+            "/parent"
+        );
+        assert!(context.resolve_user(0x1010, &mut cache).is_none());
+        assert_eq!(
+            context.resolve(0x1010, &mut cache).unwrap().path(),
+            "[global-overlap]"
+        );
+        let searches = table.index_search_count();
+        for _ in 0..8 {
+            assert_eq!(
+                context.resolve_user(0x3010, &mut cache).unwrap().path(),
+                "/parent"
+            );
+            assert!(context.resolve_user(0x1010, &mut cache).is_none());
+            assert_eq!(
+                context.resolve(0x1010, &mut cache).unwrap().path(),
+                "[global-overlap]"
+            );
+        }
+        assert_eq!(table.index_search_count(), searches);
     }
 
     #[test]
