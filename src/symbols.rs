@@ -6675,6 +6675,35 @@ mod tests {
 
     struct UnavailableObjectResolver;
 
+    #[test]
+    fn user_symbol_lookups_leave_recorded_kernel_metadata_unopened() {
+        let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
+            .with_perfdata_file_kernel_cache(
+                super::Path::new("/missing/perf.data"),
+                super::Path::new("/missing/debug"),
+            );
+        let requests = [clean_object_symbol_request(
+            PathBuf::from("/missing/user-object"),
+            0,
+        )];
+        resolver.resolve_batch(&requests).unwrap();
+        resolver
+            .resolve_frame_batch_with_metadata(&requests)
+            .unwrap();
+        resolver
+            .resolve_base_frame_batch_with_metadata(&requests)
+            .unwrap();
+        assert!(
+            resolver
+                .file_kernel_cache
+                .as_ref()
+                .unwrap()
+                .loaded
+                .get()
+                .is_none()
+        );
+    }
+
     impl SymbolResolver for UnavailableObjectResolver {
         fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
             Ok(vec![None; requests.len()])

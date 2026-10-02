@@ -145,6 +145,7 @@ fn kernel_build_id_from_record_section(
         .map_err(|error| format!("failed to seek build-id record section: {error}"))?;
     let mut reader = BufReader::new(reader);
     let mut bytes = Vec::new();
+    let mut kernel_build_id = None;
     while offset < end {
         if end - offset < 8 {
             return Err(format!("truncated perf record header at offset {offset}"));
@@ -188,8 +189,12 @@ fn kernel_build_id_from_record_section(
             } else {
                 parse_build_id_record(header.misc, &bytes[8..])?
             };
-            if is_kernel_build_id_filename(&event.filename) {
-                return Ok(Some(event.build_id));
+            if kernel_build_id.is_none() && is_kernel_build_id_filename(&event.filename) {
+                if !feature {
+                    return Ok(Some(event.build_id));
+                }
+                // perf_header__read_build_ids validates the whole feature.
+                kernel_build_id = Some(event.build_id);
             }
         } else {
             reader
@@ -200,7 +205,7 @@ fn kernel_build_id_from_record_section(
         }
         offset = next;
     }
-    Ok(None)
+    Ok(kernel_build_id)
 }
 
 fn build_id_events_from_record_stream(bytes: &[u8]) -> Result<Vec<BuildIdEvent>, String> {
@@ -385,6 +390,30 @@ mod tests {
             reader.bytes_read < 16384,
             "kernel ID lookup continued through {} bytes",
             reader.bytes_read
+        );
+    }
+
+    #[test]
+    fn kernel_build_id_feature_lookup_validates_later_feature_records_like_perf_header() {
+        // header.c:perf_header__read_build_ids reads every feature record.
+        // Stopping an ID probe must not bypass validation of this metadata.
+        let filename = b"[kernel.kallsyms]\0";
+        let size = super::BUILD_ID_EVENT_MIN_SIZE + filename.len();
+        let mut bytes = vec![0; size];
+        bytes[6..8].copy_from_slice(&u16::try_from(size).unwrap().to_le_bytes());
+        bytes[12..32].fill(0xab);
+        bytes[36..].copy_from_slice(filename);
+        bytes.extend([0, 0, 0, 0, 0, 0, 4, 0]);
+        let section_size = bytes.len() as u64;
+        assert!(
+            super::kernel_build_id_from_record_section(
+                &mut Cursor::new(bytes),
+                0,
+                section_size,
+                section_size,
+                true,
+            )
+            .is_err()
         );
     }
 
