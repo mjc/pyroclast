@@ -98,7 +98,7 @@ fn renders_inferno_perf_partially_demangled_rust_symbols() {
 }
 
 #[test]
-fn raw_function_normalization_matches_native_inferno_before_and_after_fast_paths() {
+fn raw_function_normalization_preserves_native_inferno_text_through_fast_paths() {
     // Inferno perf.rs:on_stack_line strips offsets and fixes Rust names before
     // splitting inline arrows, regardless of whether the name needs tidying.
     for symbol in [
@@ -106,6 +106,7 @@ fn raw_function_normalization_matches_native_inferno_before_and_after_fast_paths
         "plain+0xdead+tail",
         "plain+0xdead+0x2",
         "plain-name",
+        "plain\rname",
         "method(arg)+0x1a",
         "root->inner",
         "->inner",

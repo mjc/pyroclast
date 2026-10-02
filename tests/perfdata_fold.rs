@@ -2600,6 +2600,143 @@ fn absent_sample_period_uses_the_selected_identifier_events_default() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn newline_elf_symbol_names_follow_native_perf_and_inferno_row_boundaries() {
+    assert_elf_symbol_text_matches_native_pipeline("entry");
+    assert_elf_symbol_text_matches_native_pipeline("entry\nsuffix");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn leading_whitespace_in_elf_symbols_follows_native_inferno_row_trimming() {
+    for name in [" \tentry", " ", "\tentry", "\u{2003}entry", "entry "] {
+        assert_elf_symbol_text_matches_native_pipeline(name);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn interior_carriage_returns_in_elf_symbols_are_preserved_like_native_inferno() {
+    assert_elf_symbol_text_matches_native_pipeline("entry\rsuffix");
+}
+
+#[cfg(target_os = "linux")]
+fn compiled_elf_with_symbol_text(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let root = tempfile::tempdir().expect("tempdir");
+    let source = root.path().join("fixture.c");
+    let original = root.path().join("original");
+    let elf = root.path().join("renamed");
+    std::fs::write(
+        &source,
+        "void entry(void) {} int main(void) { entry(); return 0; }",
+    )
+    .expect("write C");
+    let compiled = Command::new("cc")
+        .args(["-g0", "-O0", "-no-pie"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&original)
+        .output()
+        .expect("compile fixture");
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let renamed = Command::new("objcopy")
+        .arg("--redefine-sym")
+        .arg(format!("entry={name}"))
+        .arg(&original)
+        .arg(&elf)
+        .output()
+        .expect("rename ELF symbol");
+    assert!(
+        renamed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&renamed.stderr)
+    );
+    (root, elf)
+}
+
+#[cfg(target_os = "linux")]
+fn assert_elf_symbol_text_matches_native_pipeline(name: &str) {
+    // util/symbol_fprintf.c:__symbol__fprintf_symname_offs prints sym->name
+    // verbatim; Inferno reads physical lines before stack_line_parts trims.
+    let (root, elf) = compiled_elf_with_symbol_text(name);
+    let object_bytes = std::fs::read(&elf).expect("read ELF");
+    let object = object::File::parse(&object_bytes[..]).expect("parse ELF");
+    let symbol = object
+        .symbols()
+        .find(|symbol| symbol.name() == Ok(name))
+        .expect("renamed symbol");
+    let segment = object
+        .segments()
+        .find(|segment| {
+            segment.address() <= symbol.address()
+                && symbol.address() < segment.address() + segment.size()
+        })
+        .expect("symbol segment");
+    let (pgoff, len) = segment.file_range();
+    let start = 0x7000_0000 + pgoff;
+    let ip = start + symbol.address() - segment.address();
+    let mut mmap = mmap_payload(11, 12, start, len, pgoff, elf.to_str().expect("ELF path"));
+    mmap.resize(mmap.len().next_multiple_of(8), 0);
+    let sample = record_bytes_with_misc(
+        PERF_RECORD_SAMPLE,
+        PERF_RECORD_MISC_CPUMODE_USER,
+        &sample_payload_with_optional_timestamp(
+            sample_payload_with_period(ip, 11, 12, 7, [ip]),
+            true,
+        ),
+    );
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_TIME
+                | PERF_SAMPLE_PERIOD
+                | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes_with_misc(1, PERF_RECORD_MISC_CPUMODE_USER, &mmap),
+            sample.clone(),
+            sample,
+        ],
+    );
+    let (script, expected) = native_script_and_fold(&bytes);
+    assert!(
+        script.contains(name),
+        "native must resolve ELF symbol: {script}"
+    );
+    let input = root.path().join("perf.data");
+    std::fs::write(&input, &bytes).expect("write perf.data");
+    for inline in [false, true] {
+        let options = FoldOptions {
+            count_periods: true,
+            inline,
+        };
+        let resolver = pyroclast::symbols::PerfSymbolResolver::from_object_resolver(
+            pyroclast::symbols::RustAddr2lineResolver::new(),
+        );
+        let actual =
+            fold_perfdata_callchains_with_symbols(&bytes, options, &resolver).expect("fold");
+        assert_eq!(
+            actual, expected,
+            "symbol={name:?}, inline={inline}; native script={script}"
+        );
+        let file_backed =
+            pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(&input, options, &resolver)
+                .expect("fold file");
+        assert_eq!(
+            file_backed, expected,
+            "symbol={name:?}, inline={inline}; native script={script}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn multiline_event_names_preserve_native_infernos_first_event_filter() {
     // util/header.c:read_event_desc retains the name; builtin-script.c:
     // process_event prints it with %*s. Inferno process_single_stack splits LF

@@ -91,7 +91,10 @@ pub(crate) fn append_inferno_perf_raw_function(
         if index > 0 && !scratch.contains("_[i]") {
             scratch.push_str("_[i]");
         }
-        escape_frame_into(rendered, scratch);
+        // Inferno perf.rs:tidy_generic only replaces semicolons and removes
+        // parameters. It preserves interior CR; row boundaries are parsed
+        // before this normalization, not escaped into different labels.
+        rendered.push_str(scratch);
     }
     true
 }

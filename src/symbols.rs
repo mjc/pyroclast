@@ -234,12 +234,18 @@ struct MappingFrameKey {
     kernel_mapping_range: Option<(u64, u64)>,
 }
 
-struct CachedMappingFrames {
-    frames: Vec<String>,
-    has_base_symbol: bool,
+pub(crate) struct CachedMappingFrames {
+    pub(crate) frames: Vec<String>,
+    pub(crate) has_base_symbol: bool,
+    pub(crate) render_mode: SymbolFrameRenderMode,
     has_inline_frames: bool,
     has_non_inline_base_frame: bool,
     base_offset: Option<u64>,
+}
+
+pub(crate) enum SymbolFrameRenderMode {
+    Direct,
+    PerfScript,
 }
 
 #[derive(Default)]
@@ -301,6 +307,7 @@ impl UserFrameTable {
 static UNRESOLVED_MAPPING_FRAMES: CachedMappingFrames = CachedMappingFrames {
     frames: Vec::new(),
     has_base_symbol: false,
+    render_mode: SymbolFrameRenderMode::Direct,
     has_inline_frames: false,
     has_non_inline_base_frame: false,
     base_offset: None,
@@ -1635,15 +1642,13 @@ where
         &self,
         mapping: &MappedFrame<'_>,
         inline: bool,
-    ) -> Option<(&[String], bool)> {
+    ) -> Option<&CachedMappingFrames> {
         let table = if inline {
             &self.resolved_by_mapping
         } else {
             &self.resolved_base_by_mapping
         };
-        table
-            .get_frame(mapping)
-            .map(|cached| (cached.frames.as_slice(), cached.has_base_symbol))
+        table.get_frame(mapping)
     }
 
     pub(crate) fn prefetch_mapping_refs_with_mode<'mapping, M>(
@@ -1694,6 +1699,19 @@ where
             for (key, frames) in keys.drain(..).zip(resolved) {
                 let unavailable = frames.source_state == SymbolSourceState::Unavailable;
                 let frames = CachedMappingFrames {
+                    // symbol_fprintf.c prints names verbatim. Inferno splits
+                    // LF before stack_line_parts trims rawfunc, so these labels
+                    // require row parsing, not folded-label escaping. Classify
+                    // once on cache insertion, not on each sampled stack.
+                    render_mode: if frames
+                        .frames
+                        .iter()
+                        .any(|name| name.contains('\n') || name.trim().len() != name.len())
+                    {
+                        SymbolFrameRenderMode::PerfScript
+                    } else {
+                        SymbolFrameRenderMode::Direct
+                    },
                     frames: frames.frames,
                     has_base_symbol: frames.has_base_symbol,
                     has_inline_frames: frames.has_inline_frames,
@@ -6020,6 +6038,7 @@ mod tests {
         super::CachedMappingFrames {
             frames: vec![label],
             has_base_symbol: true,
+            render_mode: super::SymbolFrameRenderMode::Direct,
             has_inline_frames: false,
             has_non_inline_base_frame: true,
             base_offset: Some(offset),
@@ -6030,6 +6049,7 @@ mod tests {
         super::CachedMappingFrames {
             frames: Vec::new(),
             has_base_symbol: false,
+            render_mode: super::SymbolFrameRenderMode::Direct,
             has_inline_frames: false,
             has_non_inline_base_frame: false,
             base_offset: None,

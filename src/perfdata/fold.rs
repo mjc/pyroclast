@@ -2523,16 +2523,20 @@ impl<'a> FoldFrameResolver<'a> {
                     if let Some(cache) = symbol_cache.as_deref_mut() {
                         // Event-line IPs use machine__resolve(), not append_inlines().
                         let expand = self.inline && !matches!(frame, FoldFrame::SampleIp { .. });
-                        if let Some((frames, has_base_symbol)) =
-                            cache.cached_mapping_frames(&mapping, expand)
-                        {
+                        if let Some(cached) = cache.cached_mapping_frames(&mapping, expand) {
+                            if matches!(
+                                cached.render_mode,
+                                crate::symbols::SymbolFrameRenderMode::PerfScript
+                            ) {
+                                return Ok(FoldedRenderStatus::RequiresPerfText);
+                            }
                             append_resolved_folded_frames(
                                 buffers,
                                 &mapping,
                                 frame,
                                 expand,
-                                frames,
-                                has_base_symbol,
+                                &cached.frames,
+                                cached.has_base_symbol,
                             );
                             continue;
                         }
@@ -2560,13 +2564,16 @@ impl<'a> FoldFrameResolver<'a> {
                         }
                         prefetch_sample_symbols(&pending, cache, self.inline)?;
                         for (frame, decision) in pending {
-                            append_prefetched_folded_frame(
+                            let status = append_prefetched_folded_frame(
                                 buffers,
                                 frame,
                                 decision,
                                 cache,
                                 self.inline,
                             )?;
+                            if matches!(status, FoldedRenderStatus::RequiresPerfText) {
+                                return Ok(status);
+                            }
                         }
                         break;
                     }
@@ -2824,20 +2831,26 @@ fn append_prefetched_folded_frame<R: SymbolResolver>(
     decision: FrameMappingDecision<'_>,
     cache: &SymbolFrameCache<'_, R>,
     inline: bool,
-) -> Result<(), String> {
+) -> Result<FoldedRenderStatus, String> {
     match decision {
         FrameMappingDecision::Mapped(mapping) => {
             let expand = inline && !matches!(frame, FoldFrame::SampleIp { .. });
-            let (frames, has_base_symbol) = cache
+            let cached = cache
                 .cached_mapping_frames(&mapping, expand)
                 .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())?;
+            if matches!(
+                cached.render_mode,
+                crate::symbols::SymbolFrameRenderMode::PerfScript
+            ) {
+                return Ok(FoldedRenderStatus::RequiresPerfText);
+            }
             append_resolved_folded_frames(
                 buffers,
                 &mapping,
                 frame,
                 expand,
-                frames,
-                has_base_symbol,
+                &cached.frames,
+                cached.has_base_symbol,
             );
         }
         FrameMappingDecision::KernelAddress | FrameMappingDecision::Address => {
@@ -2847,7 +2860,7 @@ fn append_prefetched_folded_frame<R: SymbolResolver>(
             append_cached_inferno_perf_folded_label_to_buffers(buffers, UNKNOWN_FRAME);
         }
     }
-    Ok(())
+    Ok(FoldedRenderStatus::Rendered)
 }
 
 fn append_resolved_folded_frames(
