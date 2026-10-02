@@ -28,6 +28,8 @@ pub struct MmapTable {
     bucket_searches: std::cell::Cell<usize>,
     #[cfg(test)]
     cache_index_probes: std::cell::Cell<usize>,
+    #[cfg(test)]
+    gap_computations: std::cell::Cell<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -172,8 +174,20 @@ pub(crate) struct FrameMappingContext<'a> {
     global: &'a [IndexedMapping],
     user_hint: Cell<Option<FrameMappingHint<'a>>>,
     global_hint: Cell<Option<FrameMappingHint<'a>>>,
-    user_miss: Cell<Option<u64>>,
-    global_miss: Cell<Option<u64>>,
+    user_miss: Cell<Option<FrameMappingMiss>>,
+    global_miss: Cell<Option<FrameMappingMiss>>,
+}
+
+#[derive(Clone, Copy)]
+struct FrameMappingMiss {
+    start: u64,
+    last: u64,
+}
+
+impl FrameMappingMiss {
+    fn contains(self, ip: u64) -> bool {
+        self.start <= ip && ip <= self.last
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -254,7 +268,7 @@ impl<'a> FrameMappingContext<'a> {
         ip: u64,
         cached_index: &mut Option<usize>,
         hint: &Cell<Option<FrameMappingHint<'a>>>,
-        miss: &Cell<Option<u64>>,
+        miss: &Cell<Option<FrameMappingMiss>>,
     ) -> Option<&'a Mapping> {
         // The context borrows the table for one delivered sample: map edits
         // cannot invalidate these references until that sample is finished.
@@ -271,26 +285,31 @@ impl<'a> FrameMappingContext<'a> {
             *cached_index = Some(found.index);
             return Some(found.mapping);
         }
-        if bucket.is_empty() || miss.get() == Some(ip) {
+        if bucket.is_empty() || miss.get().is_some_and(|range| range.contains(ip)) {
             *cached_index = None;
             return None;
         }
-        let index = self
-            .table
-            .resolve_bucket_with_predicate(bucket, ip, |mapping| {
-                !USER_ONLY || mapping.is_user_cpumode()
-            });
-        *cached_index = index;
-        let Some(index) = index else {
-            // Only general misses apply to both modes. Keep them in this
-            // immutable context, never in the cache shared across map edits.
-            if !USER_ONLY {
-                miss.set(Some(ip));
+        let index = match self.table.search_bucket(bucket, ip) {
+            Ok(index) => index,
+            Err(insertion) => {
+                // Only this immutable context retains interval proofs.
+                // Ordinary lookups need neither their bounds nor storage.
+                #[cfg(test)]
+                self.table
+                    .gap_computations
+                    .set(self.table.gap_computations.get() + 1);
+                miss.set(Some(MmapTable::bucket_gap(bucket, insertion)));
+                *cached_index = None;
+                return None;
             }
-            return None;
         };
+        *cached_index = Some(index);
         let found = FrameMappingHint::new(index, &self.table.mappings[index]);
         hint.set(Some(found));
+        if USER_ONLY && !found.mapping.is_user_cpumode() {
+            *cached_index = None;
+            return None;
+        }
         Some(found.mapping)
     }
 }
@@ -1046,10 +1065,19 @@ impl MmapTable {
         ip: u64,
         predicate: impl Fn(&Mapping) -> bool,
     ) -> Option<usize> {
+        // maps.c:844 overlap fixup leaves disjoint ranges, so CPU-mode
+        // filtering can happen after the containing map has been found.
+        self.search_bucket(bucket, ip)
+            .ok()
+            .filter(|&index| predicate(&self.mappings[index]))
+    }
+
+    #[inline]
+    fn search_bucket(&self, bucket: &[IndexedMapping], ip: u64) -> Result<usize, usize> {
         #[cfg(test)]
         self.index_searches.set(self.index_searches.get() + 1);
-        let mut upper_bound = bucket.partition_point(|indexed| indexed.start <= ip);
-        let mut latest_matching_index = None;
+        let insertion = bucket.partition_point(|indexed| indexed.start <= ip);
+        let mut upper_bound = insertion;
         while upper_bound > 0 {
             upper_bound -= 1;
             let indexed = &bucket[upper_bound];
@@ -1058,11 +1086,26 @@ impl MmapTable {
             }
             let index = indexed.index;
             let mapping = &self.mappings[index];
-            if ip < mapping.end() && predicate(mapping) {
-                latest_matching_index = latest_matching_index.max(Some(index));
+            if ip < mapping.end() {
+                // Perf maps.c:844 removes overlapping ranges per PID. Keep
+                // walking past zero-length entries, but only one map can hit.
+                return Ok(index);
             }
         }
-        latest_matching_index
+        Err(insertion)
+    }
+
+    fn bucket_gap(bucket: &[IndexedMapping], insertion: usize) -> FrameMappingMiss {
+        // maps.c:1110 map__addr_cmp uses [start, end). The prefix maximum
+        // also handles zero-length entries when deriving the surrounding gap.
+        // An inclusive last address represents the unmapped u64::MAX itself.
+        let start = insertion
+            .checked_sub(1)
+            .map_or(0, |index| bucket[index].max_end);
+        let last = bucket
+            .get(insertion)
+            .map_or(u64::MAX, |next| next.start - 1);
+        FrameMappingMiss { start, last }
     }
 
     fn intern_symbol_source(&mut self, mapping: &Mapping) -> usize {
@@ -1224,7 +1267,9 @@ mod tests {
     }
 
     use super::{MappingResolveCache, MmapTable};
-    use crate::perfdata::records::MmapRecord;
+    use crate::perfdata::records::{
+        MmapRecord, PERF_RECORD_MISC_CPUMODE_KERNEL, PERF_RECORD_MISC_CPUMODE_USER,
+    };
 
     #[test]
     fn broad_new_mapping_replaces_covered_old_mapping_like_perf_maps_fixup() {
@@ -1425,7 +1470,7 @@ mod tests {
     }
 
     #[test]
-    fn sample_context_reuses_exact_misses_for_alternating_user_and_global_frames() {
+    fn sample_context_reuses_gap_misses_for_alternating_user_and_global_frames() {
         let mut table = MmapTable::default();
         for (pid, start, path) in [(7, 0x1000, "/user"), (u32::MAX, 0x2000, "[global]")] {
             table.insert_mmap(MmapRecord {
@@ -1467,9 +1512,221 @@ mod tests {
         );
         assert_eq!(
             table.index_search_count(),
-            searches + 1,
-            "different IP must be searched"
+            searches,
+            "different IP in the same global gap needs no search"
         );
+    }
+
+    #[test]
+    fn sample_context_reuses_unmapped_intervals_for_distinct_frame_addresses() {
+        let mut table = MmapTable::default();
+        for (pid, start, path) in [
+            (7, 0x1000, "/before"),
+            (7, 0x3000, "/after"),
+            (u32::MAX, 0x2000, "[global]"),
+        ] {
+            table.insert_mmap(MmapRecord {
+                pid,
+                tid: pid,
+                start,
+                len: 0x100,
+                pgoff: 0,
+                path: path.into(),
+            });
+        }
+        let mut cache = MappingResolveCache::default();
+        let context = table.frame_context(7, &mut cache);
+        assert!(context.resolve(0x1100, &mut cache).is_none());
+        let searches = table.index_search_count();
+        for ip in 0x1101..0x1201 {
+            assert!(context.resolve(ip, &mut cache).is_none());
+            assert!(context.resolve_user(ip, &mut cache).is_none());
+        }
+        assert_eq!(
+            table.index_search_count(),
+            searches,
+            "distinct addresses in the same immutable mapping gap need no new binary search"
+        );
+        // The global gap ends where its map starts, not where the PID gap ends.
+        assert_eq!(
+            context.resolve(0x2000, &mut cache).unwrap().path(),
+            "[global]"
+        );
+        assert!(context.resolve_user(0x2000, &mut cache).is_none());
+        assert_eq!(
+            context.resolve(0x10ff, &mut cache).unwrap().path(),
+            "/before"
+        );
+        assert_eq!(
+            context.resolve(0x3000, &mut cache).unwrap().path(),
+            "/after"
+        );
+    }
+
+    #[test]
+    fn ordinary_mapping_lookups_do_not_compute_unused_gap_bounds() {
+        let mut table = MmapTable::default();
+        table.insert_mmap(MmapRecord {
+            pid: 7,
+            tid: 7,
+            start: 0x1000,
+            len: 0x100,
+            pgoff: 0,
+            path: "/mapped".into(),
+        });
+        let mut cache = MappingResolveCache::default();
+        for ip in 0x2000..0x2100 {
+            assert!(table.resolve_ref(7, ip).is_none());
+            assert!(table.resolve_ref_cached(7, ip, &mut cache).is_none());
+        }
+        assert_eq!(
+            table.gap_computations.get(),
+            0,
+            "ordinary lookups do not retain gap proofs and must not construct their bounds"
+        );
+        let context = table.frame_context(7, &mut cache);
+        assert!(context.resolve(0x2000, &mut cache).is_none());
+        assert_eq!(table.gap_computations.get(), 1);
+        assert!(context.resolve(0x20ff, &mut cache).is_none());
+        assert_eq!(table.gap_computations.get(), 1);
+    }
+
+    #[test]
+    fn sample_context_cold_user_rejection_retains_the_containing_non_user_map() {
+        let mut table = MmapTable::default();
+        table.insert_mmap_with_misc(
+            MmapRecord {
+                pid: 7,
+                tid: 7,
+                start: 0x1000,
+                len: 0x100,
+                pgoff: 0,
+                path: "[local-kernel]".into(),
+            },
+            crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_KERNEL,
+        );
+        let mut cache = MappingResolveCache::default();
+        let context = table.frame_context(7, &mut cache);
+        assert!(context.resolve_user(0x1000, &mut cache).is_none());
+        let searches = table.index_search_count();
+        for ip in 0x1001..0x1100 {
+            assert!(context.resolve_user(ip, &mut cache).is_none());
+            assert_eq!(cache.pid_index, None);
+        }
+        assert_eq!(
+            table.index_search_count(),
+            searches,
+            "a cold USER rejection must retain the containing map, not search again for each IP"
+        );
+        assert_eq!(
+            context.resolve(0x1010, &mut cache).unwrap().path(),
+            "[local-kernel]"
+        );
+        assert_eq!(table.index_search_count(), searches);
+    }
+
+    #[test]
+    fn sample_context_gap_proofs_preserve_boundaries_zero_lengths_and_cpu_modes() {
+        let mut table = MmapTable::default();
+        for (pid, start, len, mode) in [
+            (7, 0x10, 0x10, PERF_RECORD_MISC_CPUMODE_USER),
+            (7, 0x30, 0x10, PERF_RECORD_MISC_CPUMODE_KERNEL),
+            (7, 0x18, 0, PERF_RECORD_MISC_CPUMODE_USER),
+            (7, 0, 0, PERF_RECORD_MISC_CPUMODE_USER),
+            (u32::MAX, 0x25, 0x20, PERF_RECORD_MISC_CPUMODE_KERNEL),
+            (u32::MAX, 0x60, 0, PERF_RECORD_MISC_CPUMODE_KERNEL),
+            (7, u64::MAX - 4, 16, PERF_RECORD_MISC_CPUMODE_USER),
+            (u32::MAX, u64::MAX - 8, 4, PERF_RECORD_MISC_CPUMODE_KERNEL),
+        ] {
+            table.insert_mmap_with_misc(
+                MmapRecord {
+                    pid,
+                    tid: pid,
+                    start,
+                    len,
+                    pgoff: 0,
+                    path: format!("/map-{pid}-{start}"),
+                },
+                mode,
+            );
+        }
+        let mut cache = MappingResolveCache::default();
+        let context = table.frame_context(7, &mut cache);
+        let addresses = (0..0x80).chain(u64::MAX - 9..=u64::MAX).collect::<Vec<_>>();
+        for ip in addresses.iter().chain(addresses.iter().rev()).copied() {
+            assert_eq!(
+                context
+                    .resolve(ip, &mut cache)
+                    .map(super::MappedFrame::resolved_ref),
+                table.resolve_ref(7, ip),
+                "general lookup at {ip:#x}"
+            );
+            let expected_user = table.mappings.iter().find(|mapping| {
+                mapping.pid == 7
+                    && mapping.start <= ip
+                    && ip < mapping.end()
+                    && mapping.is_user_cpumode()
+            });
+            assert_eq!(
+                context
+                    .resolve_user(ip, &mut cache)
+                    .map(super::MappedFrame::path),
+                expected_user.map(|mapping| mapping.path.as_str()),
+                "USER lookup at {ip:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn sample_context_gap_proofs_are_discarded_after_map_insertions_and_fork() {
+        let mut table = MmapTable::default();
+        let mut cache = MappingResolveCache::default();
+        for (pid, start, len, path, mode) in [
+            (7, 0x1000, 0x100, "/before", PERF_RECORD_MISC_CPUMODE_USER),
+            (7, 0x3000, 0x100, "/after", PERF_RECORD_MISC_CPUMODE_USER),
+            (7, 0x1800, 0x80, "[kernel]", PERF_RECORD_MISC_CPUMODE_KERNEL),
+            (
+                7,
+                0x1820,
+                0x20,
+                "/replacement",
+                PERF_RECORD_MISC_CPUMODE_USER,
+            ),
+            (8, 0x1500, 0x500, "/parent", PERF_RECORD_MISC_CPUMODE_USER),
+        ] {
+            {
+                let context = table.frame_context(7, &mut cache);
+                for ip in [0x1100, 0x1810, 0x1820, 0x1880, 0x2fff] {
+                    assert_eq!(
+                        context
+                            .resolve(ip, &mut cache)
+                            .map(super::MappedFrame::resolved_ref),
+                        table.resolve_ref(7, ip)
+                    );
+                }
+            }
+            table.insert_mmap_with_misc(
+                MmapRecord {
+                    pid,
+                    tid: pid,
+                    start,
+                    len,
+                    pgoff: 0,
+                    path: path.into(),
+                },
+                mode,
+            );
+        }
+        table.clone_pid_mappings(8, 7);
+        let context = table.frame_context(7, &mut cache);
+        for ip in 0x1500..0x1a00 {
+            assert_eq!(
+                context.resolve_user(ip, &mut cache).unwrap().path(),
+                "/parent"
+            );
+        }
+        assert!(context.resolve(0x1000, &mut cache).is_none());
+        assert!(context.resolve(0x3000, &mut cache).is_none());
     }
 
     #[test]
