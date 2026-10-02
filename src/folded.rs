@@ -75,8 +75,16 @@ pub(crate) fn inferno_perf_raw_function_literal_end(frame: &str) -> Option<usize
     // Inferno perf.rs:on_stack_line (491-524): offsets, process labels,
     // Rust fixups and Java arrows precede tidy_generic. Cache byte ranges,
     // never another owned or normalized copy of the symbol text.
+    let frame = if let Some(hash_start) = partially_demangled_rust_hash_start(frame) {
+        let prefix = &frame[..hash_start];
+        if prefix.contains("..") {
+            return None;
+        }
+        prefix.strip_suffix("::").unwrap_or(prefix)
+    } else {
+        frame
+    };
     if frame.starts_with('(')
-        || partially_demangled_rust_hash_start(frame).is_some()
         || memchr::memchr3(b'$', b'(', b';', frame.as_bytes()).is_some()
         || memchr::memchr2(b'\n', b'\r', frame.as_bytes()).is_some()
         || frame.contains("->")
@@ -140,6 +148,12 @@ fn fix_partially_demangled_rust_symbol(symbol: &str) -> Cow<'_, str> {
     }
     if rest.starts_with("_$") {
         rest = &rest[1..];
+    }
+
+    // Inferno collapse/common.rs:fix_partially_demangled_rust_symbol only
+    // rewrites dollar escapes and double dots after removing the hash.
+    if !rest.contains('$') && !rest.contains("..") {
+        return Cow::Borrowed(rest);
     }
 
     let mut demangled = String::new();
@@ -283,6 +297,69 @@ pub(crate) fn append_separator(rendered: &mut String, has_prefix: bool) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn rust_hash_only_fixups_borrow_symbol_text() {
+        for (symbol, expected) in [
+            ("crate::name::h0123456789abcdef", "crate::name"),
+            ("crate::nameh0123456789abcdef", "crate::name"),
+            ("dot.name::h0123456789ABCDEF", "dot.name"),
+            ("unicode_\u{e9}::h0123456789abcdef", "unicode_\u{e9}"),
+            ("fn(params)::h0123456789abcdef", "fn(params)"),
+            ("outer->inner::h0123456789abcdef", "outer->inner"),
+            ("h0123456789abcdef", ""),
+        ] {
+            let fixed = super::fix_partially_demangled_rust_symbol(symbol);
+            assert_eq!(fixed, expected);
+            assert!(matches!(fixed, std::borrow::Cow::Borrowed(_)));
+        }
+        for (symbol, expected) in [
+            ("crate..name::h0123456789abcdef", "crate::name"),
+            ("_$LT$name$GT$::h0123456789abcdef", "<name>"),
+        ] {
+            assert_eq!(super::fix_partially_demangled_rust_symbol(symbol), expected);
+        }
+    }
+
+    #[test]
+    fn rust_hash_only_fixups_use_literal_source_ranges() {
+        // Inferno collapse/common.rs:fix_partially_demangled_rust_symbol strips
+        // the trailing hash and optional :: before decoding dollars/double dots.
+        for (symbol, expected) in [
+            ("crate::name::h0123456789abcdef", "crate::name"),
+            ("crate::nameh0123456789abcdef", "crate::name"),
+            ("crate::name::h0123456789abcdef+0x10", "crate::name"),
+            ("dot.name::h0123456789ABCDEF", "dot.name"),
+            ("unicode_\u{e9}::h0123456789abcdef", "unicode_\u{e9}"),
+            ("h0123456789abcdef", ""),
+            ("::h0123456789abcdef", ""),
+        ] {
+            assert_eq!(
+                super::inferno_perf_raw_function_literal_end(symbol),
+                Some(expected.len()),
+                "symbol {symbol:?}"
+            );
+            let mut rendered = String::new();
+            let mut scratch = String::new();
+            assert!(super::append_inferno_perf_raw_function(
+                &mut rendered,
+                symbol,
+                &mut scratch,
+                false
+            ));
+            assert_eq!(rendered, expected);
+        }
+        for symbol in [
+            "crate..name::h0123456789abcdef",
+            "_$LT$name$GT$::h0123456789abcdef",
+            "$unknown$name::h0123456789abcdef",
+            "outer->inner::h0123456789abcdef",
+            "function(param)::h0123456789abcdef",
+            "name;separator::h0123456789abcdef",
+        ] {
+            assert_eq!(super::inferno_perf_raw_function_literal_end(symbol), None);
+        }
+    }
+
+    #[test]
     fn literal_source_ranges_match_full_normalization_without_owned_labels() {
         for symbol in [
             "",
@@ -321,13 +398,7 @@ mod tests {
             super::inferno_perf_raw_function_literal_end("plain+0x10"),
             Some(5)
         );
-        for symbol in [
-            "(process)",
-            "outer->inner",
-            "name::h0123456789abcdef",
-            "fn()",
-            "semi;colon",
-        ] {
+        for symbol in ["(process)", "outer->inner", "fn()", "semi;colon"] {
             assert_eq!(super::inferno_perf_raw_function_literal_end(symbol), None);
         }
     }

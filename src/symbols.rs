@@ -256,13 +256,20 @@ struct UserFrameAddresses {
     last_address: Cell<Option<(u64, Option<usize>)>>,
 }
 
+#[derive(Clone, Copy)]
+struct UserFrameSourceHint {
+    source: usize,
+    index: Option<usize>,
+    last_address: Option<(u64, Option<usize>)>,
+}
+
 #[derive(Default)]
 struct UserFrameTable {
     by_source: FxHashMap<usize, usize>,
     // None is a terminal unavailable object, not a per-address negative result.
     sources: Vec<Option<UserFrameAddresses>>,
     // A cached source with no index is terminal unavailable, including all IPs.
-    last_source: Cell<Option<(usize, Option<usize>)>>,
+    last_source: Cell<Option<UserFrameSourceHint>>,
     #[cfg(test)]
     source_searches: Cell<usize>,
     #[cfg(test)]
@@ -274,35 +281,52 @@ struct UserFrameTable {
 impl UserFrameTable {
     #[inline]
     fn slot(&self, source: usize, address: u64) -> Option<usize> {
-        let index = if let Some((cached_source, index)) = self.last_source.get()
-            && cached_source == source
+        let index = if let Some(hint) = self.last_source.get()
+            && hint.source == source
         {
-            match index {
+            // perf util/symbol.c:dso__find_symbol (575-583) keys a hit by IP.
+            // Keep the source-qualified result beside the source index so
+            // repeated IPs need no source-vector access. Mutations reset it.
+            if let Some((cached_address, slot)) = hint.last_address
+                && cached_address == address
+            {
+                return slot;
+            }
+            match hint.index {
                 Some(index) => index,
                 None => return Some(0),
             }
         } else {
             #[cfg(test)]
             self.source_searches.set(self.source_searches.get() + 1);
-            let index = *self.by_source.get(&source)?;
-            self.last_source.set(Some((source, Some(index))));
-            index
+            *self.by_source.get(&source)?
         };
         #[cfg(test)]
         self.source_accesses.set(self.source_accesses.get() + 1);
         let Some(addresses) = &self.sources[index] else {
-            self.last_source.set(Some((source, None)));
+            self.last_source.set(Some(UserFrameSourceHint {
+                source,
+                index: None,
+                last_address: None,
+            }));
             return Some(0);
         };
-        if let Some((cached_address, slot)) = addresses.last_address.get()
+        let slot = if let Some((cached_address, slot)) = addresses.last_address.get()
             && cached_address == address
         {
-            return slot;
-        }
-        #[cfg(test)]
-        self.address_searches.set(self.address_searches.get() + 1);
-        let slot = addresses.by_address.get(&address).copied();
-        addresses.last_address.set(Some((address, slot)));
+            slot
+        } else {
+            #[cfg(test)]
+            self.address_searches.set(self.address_searches.get() + 1);
+            let slot = addresses.by_address.get(&address).copied();
+            addresses.last_address.set(Some((address, slot)));
+            slot
+        };
+        self.last_source.set(Some(UserFrameSourceHint {
+            source,
+            index: Some(index),
+            last_address: Some((address, slot)),
+        }));
         slot
     }
 
@@ -312,7 +336,11 @@ impl UserFrameTable {
             self.sources.push(Some(UserFrameAddresses::default()));
             index
         });
-        self.last_source.set(Some((source, Some(index))));
+        self.last_source.set(Some(UserFrameSourceHint {
+            source,
+            index: Some(index),
+            last_address: None,
+        }));
         index
     }
 
@@ -326,7 +354,11 @@ impl UserFrameTable {
     fn mark_unavailable(&mut self, source: usize) {
         let index = self.source_index(source);
         self.sources[index] = None;
-        self.last_source.set(Some((source, None)));
+        self.last_source.set(Some(UserFrameSourceHint {
+            source,
+            index: None,
+            last_address: None,
+        }));
     }
 
     #[cfg(test)]
@@ -6195,7 +6227,17 @@ mod tests {
             assert_eq!(cached.frames, names);
             assert_eq!(
                 cached.literal_ends,
-                [Some(7), Some(7), None, None, None, None, None, None, None]
+                [
+                    Some(7),
+                    Some(7),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(11),
+                    None
+                ]
             );
         }
         assert_eq!(resolver.calls.get(), 2);
@@ -6315,6 +6357,23 @@ mod tests {
         assert_eq!(table.slot(9, 0), Some(1));
         assert_eq!(table.slot(7, 0), Some(0));
         assert_eq!(table.source_searches.get() - searches, 3);
+    }
+
+    #[test]
+    fn repeated_user_frame_lookups_skip_source_storage_for_hits_negatives_and_misses() {
+        // perf util/symbol.c:dso__find_symbol (575-583) reuses exact last hits.
+        // Source identity and mutation invalidation must also remain explicit.
+        let mut table = super::UserFrameTable::default();
+        table.insert(7, 0, 11);
+        table.insert(7, u64::MAX, 0);
+        for (address, expected) in [(0, Some(11)), (u64::MAX, Some(0)), (42, None)] {
+            assert_eq!(table.slot(7, address), expected);
+            let accesses = table.source_accesses.get();
+            for _ in 0..256 {
+                assert_eq!(table.slot(7, address), expected);
+            }
+            assert_eq!(table.source_accesses.get(), accesses);
+        }
     }
 
     #[test]
