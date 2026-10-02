@@ -867,7 +867,10 @@ fn layouts_require_stream_parser(layouts: &SampleLayouts) -> bool {
         .fallback
         .iter()
         .chain(layouts.by_identifier.values())
-        .any(|event| event.layout.sample_type & PERF_SAMPLE_CALLCHAIN == 0)
+        .any(|event| {
+            event.layout.sample_type & (PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_TID)
+                != PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_TID
+        })
 }
 
 fn collect_stream_fold_counts<R: SymbolResolver>(
@@ -883,6 +886,8 @@ fn collect_stream_fold_counts<R: SymbolResolver>(
     // (missing TIME/frames or embedded DSO newlines). Subsequent sample headers
     // then become stack rows, so per-sample parser resets are incorrect.
     // Preserve the complete stream grammar without buffering it all in RAM.
+    // Without TID (builtin-script.c:evsel__check_attr), Inferno can instead
+    // recognize the period as the numeric header word and change the comm.
     let mut script = tempfile::tempfile().map_err(|error| error.to_string())?;
     {
         let mut writer = std::io::BufWriter::new(&mut script);
@@ -1074,6 +1079,7 @@ struct FoldedOutput<'a, 'cache, R> {
     count_periods: bool,
     event_name_width: usize,
     event_filter: Option<Box<str>>,
+    header_scratch: Vec<u8>,
     buffers: FoldedRenderBuffers,
 }
 
@@ -1089,6 +1095,7 @@ impl<'a, 'cache, R: SymbolResolver> FoldedOutput<'a, 'cache, R> {
             count_periods: options.count_periods,
             event_name_width,
             event_filter: None,
+            header_scratch: Vec::new(),
             buffers: FoldedRenderBuffers::default(),
         }
     }
@@ -1121,43 +1128,135 @@ impl<'a, 'cache, R: SymbolResolver> FoldedOutput<'a, 'cache, R> {
     }
 }
 
+fn inferno_sample_event_fields<'a>(
+    sample: &PreparedFoldSample<'a, '_>,
+    width: usize,
+) -> (&'a str, u64) {
+    // perf builtin-script.c:process_event prints the padded evname after
+    // the period. Inferno perf.rs:on_event_line selects the first event
+    // token and reads the immediately preceding space-delimited word.
+    let mut parts = sample.event_name.split(':');
+    let name = if sample.time.is_some() {
+        parts.next().unwrap()
+    } else {
+        parts.nth(1).unwrap_or("")
+    };
+    if let Some((prefix, token)) = name.rsplit_once(' ') {
+        (
+            token,
+            prefix.rsplit(' ').next().unwrap().parse().unwrap_or(1),
+        )
+    } else {
+        (
+            name,
+            if sample.time.is_none() || width > sample.event_name.len() {
+                1
+            } else {
+                sample.count
+            },
+        )
+    }
+}
+
+fn inferno_numeric_header_word(line: &str) -> Option<(usize, usize)> {
+    // Inferno perf.rs:event_line_parts (328-365) starts recognizing numeric
+    // words only after a literal space. Slashes do not unset all_digits;
+    // the first unpadded word is never a TID, even if it is numeric.
+    let mut start = 0;
+    for end in memchr::memchr_iter(b' ', line.as_bytes()) {
+        if start != 0
+            && end != start
+            && line.as_bytes()[start..end]
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || *byte == b'/')
+        {
+            return Some((start, end + 1));
+        }
+        start = end + 1;
+    }
+    // The script writer appends a space after comm, so include its final word
+    // when this helper is called with just comm rather than the full header.
+    if start != 0
+        && start != line.len()
+        && line.as_bytes()[start..]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || *byte == b'/')
+    {
+        return Some((start, line.len()));
+    }
+    None
+}
+
+struct InfernoFoldHeader<'a> {
+    comm: &'a str,
+    event: Option<&'a str>,
+    count: u64,
+    combined_frame: bool,
+}
+
+fn parse_inferno_fold_header(line: &str) -> Option<InfernoFoldHeader<'_>> {
+    let line = line.trim_end();
+    let (start, end) = inferno_numeric_header_word(line)?;
+    let mut colons = line[end..].splitn(3, ':').skip(1);
+    let mut count = 1;
+    let event = colons.next().map(|field| {
+        let mut words = field.rsplit(' ');
+        let event = words.next().unwrap();
+        count = words.next().and_then(|word| word.parse().ok()).unwrap_or(1);
+        event
+    });
+    // on_event_line (405-428) interprets nonempty text after the second colon
+    // as a combined frame, even if that colon came from comm rather than TIME.
+    let combined_frame = colons.next().is_some_and(|field| {
+        let offset = field.find([':', ' ']).map_or(0, |index| index + 1);
+        !field[offset..].trim().is_empty()
+    });
+    Some(InfernoFoldHeader {
+        comm: line[..start - 1].trim(),
+        event,
+        count,
+        combined_frame,
+    })
+}
+
 impl<R: SymbolResolver> SampleOutput for FoldedOutput<'_, '_, R> {
     fn write_sample_event(
         &mut self,
         accumulator: &SessionState,
         sample: &PreparedFoldSample,
     ) -> Result<(), String> {
-        // perf builtin-script.c:process_event prints the padded evname after
-        // the period. Inferno perf.rs:on_event_line selects the first event
-        // token and reads the immediately preceding space-delimited word.
-        let mut parts = sample.event_name.split(':');
-        let name = if sample.time.is_some() {
-            parts.next().unwrap()
-        } else {
-            // Without TIME, the first colon is the event-name separator,
-            // so Inferno reads the following fragment, not the event name.
-            parts.nth(1).unwrap_or("")
-        };
-        let (event, count) = if let Some((prefix, token)) = name.rsplit_once(' ') {
-            let count = prefix.rsplit(' ').next().unwrap().parse().unwrap_or(1);
-            (token, count)
-        } else {
-            let count = if sample.time.is_none() || self.event_name_width > sample.event_name.len()
-            {
-                1
-            } else {
-                sample.count
-            };
-            (name, count)
-        };
-        if let Some(selected) = self.event_filter.as_deref() {
-            if selected != event {
-                return Ok(());
+        let mut comm = comm_for_ids(&accumulator.thread_comms, sample.tid);
+        let (event, count, combined_frame) = if let Some(SampleComm::Name(name)) = comm
+            && inferno_numeric_header_word(name).is_some()
+        {
+            self.header_scratch.clear();
+            PerfScriptOutput::<R, _> {
+                symbol_cache: None,
+                writer: &mut self.header_scratch,
+                event_name_width: self.event_name_width,
+                inline: self.inline,
             }
+            .write_sample_header(accumulator, sample)?;
+            let header =
+                std::str::from_utf8(&self.header_scratch).map_err(|error| error.to_string())?;
+            let parsed = parse_inferno_fold_header(header)
+                .expect("numeric comm word is present in the header");
+            comm = Some(SampleComm::Name(parsed.comm));
+            (parsed.event, parsed.count, parsed.combined_frame)
         } else {
-            self.event_filter = Some(event.into());
+            let (event, count) = inferno_sample_event_fields(sample, self.event_name_width);
+            (Some(event), count, false)
+        };
+        if let Some(event) = event {
+            if let Some(selected) = self.event_filter.as_deref() {
+                if selected != event {
+                    return Ok(());
+                }
+            } else {
+                self.event_filter = Some(event.into());
+            }
         }
-        if sample.time.is_none() && !sample.has_callchain {
+        if combined_frame || (sample.time.is_none() && !sample.has_callchain) {
             return self.fold_perf_text(accumulator, sample);
         }
         let frames = sample
@@ -1166,7 +1265,6 @@ impl<R: SymbolResolver> SampleOutput for FoldedOutput<'_, '_, R> {
             .rev()
             .copied()
             .filter(|frame| !is_perf_context_marker(frame.address()));
-        let comm = comm_for_ids(&accumulator.thread_comms, sample.tid);
         let status = FoldFrameResolver::new(&accumulator.mmap_table, self.inline)
             .render_folded_stack_for_stack(
                 sample.pid,

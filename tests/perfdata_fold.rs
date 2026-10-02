@@ -2436,6 +2436,128 @@ fn period_weights_with_and_without_timestamps_match_real_perf_script_and_inferno
 }
 
 #[cfg(target_os = "linux")]
+fn native_script_and_fold(bytes: &[u8]) -> (String, String) {
+    use inferno::collapse::Collapse as _;
+    let mut bytes = bytes.to_vec();
+    put_u64(&mut bytes, 16, 144);
+    let root = tempfile::tempdir().expect("tempdir");
+    let input = root.path().join("perf.data");
+    std::fs::write(&input, bytes).expect("write fixture");
+    let perf = Command::new("perf")
+        .args(["script", "--force", "-i"])
+        .arg(&input)
+        .output()
+        .expect("perf script");
+    assert!(
+        perf.status.success(),
+        "{}",
+        String::from_utf8_lossy(&perf.stderr)
+    );
+    let mut folded = Vec::new();
+    inferno::collapse::perf::Folder::default()
+        .collapse(std::io::Cursor::new(&perf.stdout), &mut folded)
+        .expect("native Inferno");
+    (
+        String::from_utf8(perf.stdout).expect("native script"),
+        String::from_utf8(folded).expect("native fold"),
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn callchains_without_tid_follow_native_inferno_header_parsing() {
+    // builtin-script.c:evsel__check_attr (TID check) removes PID/TID when
+    // PERF_SAMPLE_TID is absent. Inferno perf.rs:event_line_parts then finds
+    // any other numeric word, not a fixed TID column.
+    for timed in [false, true] {
+        let mut sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN;
+        let mut payload = 0x2000_u64.to_le_bytes().to_vec();
+        if timed {
+            sample_type |= PERF_SAMPLE_TIME;
+            payload.extend(1_000_000_000_u64.to_le_bytes());
+        }
+        payload.extend(7_u64.to_le_bytes());
+        payload.extend(1_u64.to_le_bytes());
+        payload.extend(0x2000_u64.to_le_bytes());
+        let bytes = perfdata_with_records_and_attrs(
+            [file_attr_bytes(sample_type, 0, 0)],
+            [record_bytes_with_misc(
+                PERF_RECORD_SAMPLE,
+                PERF_RECORD_MISC_CPUMODE_USER,
+                &payload,
+            )],
+        );
+        let (script, expected) = native_script_and_fold(&bytes);
+        let actual = fold_perfdata_callchains_with_options(
+            &bytes,
+            FoldOptions {
+                count_periods: true,
+                inline: false,
+            },
+        )
+        .expect("fold");
+        assert_eq!(actual, expected, "timed={timed}; native script={script}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn numeric_words_in_comms_follow_infernos_first_numeric_header_word() {
+    // perf prints comm verbatim (builtin-script.c:perf_sample__fprintf_start).
+    // Inferno event_line_parts recognizes digits/slashes after literal spaces.
+    for timed in [false, true] {
+        for name in [
+            "work 123 task",
+            "work 123",
+            "work 12/34 task",
+            "123 worker",
+            "work 123 tag:",
+            "work / task",
+            "work ١ task",
+            "work\t123 task",
+        ] {
+            let mut comm = comm_payload(11, 12, name);
+            comm.resize(comm.len().next_multiple_of(8), 0);
+            let bytes = perfdata_with_records_and_attrs(
+                [file_attr_bytes(
+                    PERF_SAMPLE_IP
+                        | PERF_SAMPLE_TID
+                        | PERF_SAMPLE_PERIOD
+                        | PERF_SAMPLE_CALLCHAIN
+                        | if timed { PERF_SAMPLE_TIME } else { 0 },
+                    0,
+                    0,
+                )],
+                [
+                    record_bytes(3, &comm),
+                    record_bytes_with_misc(
+                        PERF_RECORD_SAMPLE,
+                        PERF_RECORD_MISC_CPUMODE_USER,
+                        &sample_payload_with_optional_timestamp(
+                            sample_payload_with_period(0x2000, 11, 12, 7, [0x2000]),
+                            timed,
+                        ),
+                    ),
+                ],
+            );
+            let (script, expected) = native_script_and_fold(&bytes);
+            let actual = fold_perfdata_callchains_with_options(
+                &bytes,
+                FoldOptions {
+                    count_periods: true,
+                    inline: false,
+                },
+            )
+            .expect("fold");
+            assert_eq!(
+                actual, expected,
+                "name={name:?}, timed={timed}; native script={script}"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn timed_sample_ip_with_a_newline_dso_preserves_inferno_state_across_samples() {
     use inferno::collapse::Collapse as _;
