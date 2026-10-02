@@ -2600,6 +2600,73 @@ fn absent_sample_period_uses_the_selected_identifier_events_default() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn multiline_event_names_preserve_native_infernos_first_event_filter() {
+    // util/header.c:read_event_desc retains the name; builtin-script.c:
+    // process_event prints it with %*s. Inferno process_single_stack splits LF
+    // before on_event_line chooses the first event token for the whole stream.
+    for name in ["cycles\nsuffix", "cycles\n\nsuffix", "cycles\n#comment"] {
+        let mask = PERF_SAMPLE_IDENTIFIER
+            | PERF_SAMPLE_IP
+            | PERF_SAMPLE_TID
+            | PERF_SAMPLE_TIME
+            | PERF_SAMPLE_PERIOD
+            | PERF_SAMPLE_CALLCHAIN;
+        let attrs = [
+            file_attr_bytes_with_ids(mask, 392, [111]),
+            file_attr_bytes_with_ids(mask, 400, [222]),
+        ];
+        let records = [111_u64, 222].map(|identifier| {
+            let mut payload = identifier.to_le_bytes().to_vec();
+            payload.extend(sample_payload_with_optional_timestamp(
+                sample_payload_with_period(0x2000, 11, 12, 7, [0x2000]),
+                true,
+            ));
+            record_bytes_with_misc(PERF_RECORD_SAMPLE, PERF_RECORD_MISC_CPUMODE_USER, &payload)
+        });
+        let mut bytes = perfdata_with_attrs_ids_and_records(attrs, [111, 222], records);
+        // HEADER_EVENT_DESC (12): nre, attr_sz, then attr, nr, name, ids.
+        let mut feature = Vec::new();
+        feature.extend_from_slice(&2_u32.to_le_bytes());
+        feature.extend_from_slice(&128_u32.to_le_bytes());
+        for (attr, event_name) in attrs.iter().zip([name, "cycles"]) {
+            feature.extend_from_slice(&attr[..128]);
+            feature.extend_from_slice(&0_u32.to_le_bytes());
+            let len = (event_name.len() + 1).next_multiple_of(64);
+            feature.extend_from_slice(&u32::try_from(len).unwrap().to_le_bytes());
+            let start = feature.len();
+            feature.extend_from_slice(event_name.as_bytes());
+            feature.resize(start + len, 0);
+        }
+        let table = bytes.len();
+        bytes.resize(table + 16, 0);
+        put_u64(&mut bytes, 72, 1 << 12);
+        put_u64(&mut bytes, table, (table + 16) as u64);
+        put_u64(&mut bytes, table + 8, feature.len() as u64);
+        bytes.extend(feature);
+        let (script, expected) = native_script_and_fold(&bytes);
+        assert!(
+            script.contains(name),
+            "native must use EVENT_DESC: {script}"
+        );
+        let options = FoldOptions {
+            count_periods: true,
+            inline: false,
+        };
+        let actual = fold_perfdata_callchains_with_options(&bytes, options).expect("fold");
+        assert_eq!(actual, expected, "event={name:?}; native script={script}");
+        let root = tempfile::tempdir().expect("tempdir");
+        let input = root.path().join("perf.data");
+        std::fs::write(&input, bytes).expect("write fixture");
+        assert_eq!(
+            fold_perfdata_file_with_options(&input, options).expect("fold file"),
+            expected,
+            "event={name:?}; native script={script}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn numeric_words_in_comms_follow_infernos_first_numeric_header_word() {
     // perf prints comm verbatim (builtin-script.c:perf_sample__fprintf_start).
     // Inferno event_line_parts recognizes digits/slashes after literal spaces.

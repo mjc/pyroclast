@@ -888,6 +888,9 @@ fn layouts_require_stream_parser(layouts: &SampleLayouts) -> bool {
         .any(|event| {
             event.layout.sample_type & (PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_TID)
                 != PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_TID
+                // builtin-script.c:process_event prints evname verbatim;
+                // Inferno process_single_stack splits LF before event parsing.
+                || event.event_name.contains('\n')
         })
 }
 
