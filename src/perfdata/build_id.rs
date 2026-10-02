@@ -145,7 +145,6 @@ fn kernel_build_id_from_record_section(
         .map_err(|error| format!("failed to seek build-id record section: {error}"))?;
     let mut reader = BufReader::new(reader);
     let mut bytes = Vec::new();
-    let mut kernel_build_id = None;
     while offset < end {
         if end - offset < 8 {
             return Err(format!("truncated perf record header at offset {offset}"));
@@ -189,8 +188,8 @@ fn kernel_build_id_from_record_section(
             } else {
                 parse_build_id_record(header.misc, &bytes[8..])?
             };
-            if kernel_build_id.is_none() && is_kernel_build_id_filename(&event.filename) {
-                kernel_build_id = Some(event.build_id);
+            if is_kernel_build_id_filename(&event.filename) {
+                return Ok(Some(event.build_id));
             }
         } else {
             reader
@@ -201,7 +200,7 @@ fn kernel_build_id_from_record_section(
         }
         offset = next;
     }
-    Ok(kernel_build_id)
+    Ok(None)
 }
 
 fn build_id_events_from_record_stream(bytes: &[u8]) -> Result<Vec<BuildIdEvent>, String> {
@@ -347,6 +346,46 @@ mod tests {
         fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
             self.cursor.seek(position)
         }
+    }
+
+    #[test]
+    fn kernel_build_id_probe_stops_after_the_first_matching_record() {
+        // header.c:process_build_id is a metadata lookup. Normal record replay
+        // validates subsequent samples; locating the ID need not read them.
+        let filename = b"[kernel.kallsyms]\0";
+        let size = super::BUILD_ID_EVENT_MIN_SIZE + filename.len();
+        let mut bytes = vec![0; 104 + size];
+        bytes[..8].copy_from_slice(b"PERFILE2");
+        bytes[8..16].copy_from_slice(&104_u64.to_le_bytes());
+        bytes[40..48].copy_from_slice(&104_u64.to_le_bytes());
+        let first = &mut bytes[104..];
+        first[..4]
+            .copy_from_slice(&crate::perfdata::records::PERF_RECORD_HEADER_BUILD_ID.to_le_bytes());
+        first[6..8].copy_from_slice(&u16::try_from(size).unwrap().to_le_bytes());
+        first[12..32].fill(0xab);
+        first[36..].copy_from_slice(filename);
+        for _ in 0..65536 {
+            let mut sample = [0; 8];
+            sample[..4]
+                .copy_from_slice(&crate::perfdata::records::PERF_RECORD_SAMPLE.to_le_bytes());
+            sample[6..8].copy_from_slice(&8_u16.to_le_bytes());
+            bytes.extend(sample);
+        }
+        let data_size = bytes.len() - 104;
+        bytes[48..56].copy_from_slice(&(data_size as u64).to_le_bytes());
+        let mut reader = CountingReader {
+            cursor: Cursor::new(bytes),
+            bytes_read: 0,
+        };
+        assert_eq!(
+            super::kernel_build_id_from_reader(&mut reader).unwrap(),
+            Some("ab".repeat(20))
+        );
+        assert!(
+            reader.bytes_read < 16384,
+            "kernel ID lookup continued through {} bytes",
+            reader.bytes_read
+        );
     }
 
     #[test]
