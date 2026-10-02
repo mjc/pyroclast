@@ -102,7 +102,7 @@ pub struct PerfSampleStack {
 struct SessionState {
     process_comms: BTreeMap<u32, String>,
     exec_process_comms: BTreeMap<u32, String>,
-    thread_comms: BTreeMap<u32, String>,
+    thread_comms: BTreeMap<u32, ThreadComm>,
     mmap_table: MmapTable,
     mapping_cache: MappingResolveCache,
     unwind_states: HashMap<u32, PidUnwindState, FxBuildHasher>,
@@ -1176,6 +1176,8 @@ fn inferno_sample_event_fields<'a>(
 }
 
 fn inferno_numeric_header_word(line: &str) -> Option<(usize, usize)> {
+    #[cfg(test)]
+    COMM_SYNTAX_SCANS.with(|scans| scans.set(scans.get() + 1));
     // Inferno perf.rs:event_line_parts (328-365) starts recognizing numeric
     // words only after a literal space. Slashes do not unset all_digits;
     // the first unpadded word is never a TID, even if it is numeric.
@@ -1202,6 +1204,11 @@ fn inferno_numeric_header_word(line: &str) -> Option<(usize, usize)> {
         return Some((start, line.len()));
     }
     None
+}
+
+#[cfg(test)]
+thread_local! {
+    static COMM_SYNTAX_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 struct InfernoFoldHeader<'a> {
@@ -1249,14 +1256,14 @@ impl<R: SymbolResolver> SampleOutput for FoldedOutput<'_, '_, R> {
         // perf_sample__fprintf_start prints comm verbatim. Inferno's
         // process_single_stack skips # lines and read_until splits at LF.
         // These are stream syntax, not characters in a folded comm label.
-        if let Some(SampleComm::Name(name)) = comm
-            && (name.starts_with('#') || name.contains('\n'))
+        if let Some(SampleComm::Stored(name)) = comm
+            && name.syntax == CommSyntax::Stream
         {
             self.requires_stream_parser = true;
             return Ok(());
         }
-        let (event, count, combined_frame) = if let Some(SampleComm::Name(name)) = comm
-            && inferno_numeric_header_word(name).is_some()
+        let (event, count, combined_frame) = if let Some(SampleComm::Stored(name)) = comm
+            && name.syntax == CommSyntax::Numeric
         {
             self.header_scratch.clear();
             PerfScriptOutput::<R, _> {
@@ -1541,6 +1548,7 @@ where
         // perf's %16s pads byte lengths; Rust string widths count characters.
         let padding = match comm {
             SampleComm::Name(name) => 16_usize.saturating_sub(name.len()),
+            SampleComm::Stored(name) => 16_usize.saturating_sub(name.name.len()),
             SampleComm::Tid(tid) => 16_usize
                 .saturating_sub(usize::try_from(tid.checked_ilog10().unwrap_or(0) + 2).unwrap()),
         };
@@ -1581,7 +1589,7 @@ where
 }
 
 fn perf_script_comm<'a>(
-    thread_comms: &'a BTreeMap<u32, String>,
+    thread_comms: &'a BTreeMap<u32, ThreadComm>,
     sample: &PreparedFoldSample,
 ) -> SampleComm<'a> {
     if let Some(tid) = sample.tid {
@@ -2054,7 +2062,7 @@ fn deferred_callchain_tid(sample_id: &[u8], sample_layouts: &SampleLayouts) -> O
 fn update_comm_tables(
     process_comms: &mut BTreeMap<u32, String>,
     exec_process_comms: &mut BTreeMap<u32, String>,
-    thread_comms: &mut BTreeMap<u32, String>,
+    thread_comms: &mut BTreeMap<u32, ThreadComm>,
     record: &crate::perfdata::records::CommRecord,
 ) {
     let comm = record.comm.as_ref();
@@ -2062,7 +2070,12 @@ fn update_comm_tables(
         upsert_comm(exec_process_comms, record.pid, comm);
     }
     upsert_comm(process_comms, record.pid, comm);
-    upsert_comm(thread_comms, record.tid, comm);
+    if thread_comms
+        .get(&record.tid)
+        .is_none_or(|stored| stored.name != comm)
+    {
+        thread_comms.insert(record.tid, comm.into());
+    }
 }
 
 fn upsert_comm(map: &mut BTreeMap<u32, String>, id: u32, comm: &str) {
@@ -2140,7 +2153,7 @@ impl SessionState {
 }
 
 fn inherit_fork_comm(
-    thread_comms: &mut BTreeMap<u32, String>,
+    thread_comms: &mut BTreeMap<u32, ThreadComm>,
     record: crate::perfdata::records::ForkRecord,
 ) {
     if let Some(comm) = thread_comms.get(&record.ptid).cloned() {
@@ -2151,12 +2164,12 @@ fn inherit_fork_comm(
 fn inherit_fork_comm_tables(
     process_comms: &mut BTreeMap<u32, String>,
     exec_process_comms: &mut BTreeMap<u32, String>,
-    thread_comms: &mut BTreeMap<u32, String>,
+    thread_comms: &mut BTreeMap<u32, ThreadComm>,
     record: crate::perfdata::records::ForkRecord,
 ) {
     inherit_fork_comm(thread_comms, record);
     if let Some(comm) = thread_comms.get(&record.tid).cloned() {
-        process_comms.insert(record.pid, comm);
+        process_comms.insert(record.pid, comm.name);
     }
     if let Some(comm) = exec_process_comms.get(&record.ppid).cloned() {
         exec_process_comms.insert(record.pid, comm);
@@ -2263,8 +2276,54 @@ fn is_valid_unwound_user_frame(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommSyntax {
+    Ordinary,
+    Numeric,
+    Stream,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ThreadComm {
+    name: String,
+    syntax: CommSyntax,
+    trimmed: std::ops::Range<usize>,
+    has_spaces: bool,
+}
+
+impl From<String> for ThreadComm {
+    fn from(name: String) -> Self {
+        // perf builtin-script.c:847 prints comm verbatim. Inferno perf.rs:293,
+        // 331 and 431 interpret stream syntax, trim comm and replace spaces.
+        let syntax = if name.starts_with('#') || name.contains('\n') {
+            CommSyntax::Stream
+        } else if inferno_numeric_header_word(&name).is_some() {
+            CommSyntax::Numeric
+        } else {
+            CommSyntax::Ordinary
+        };
+        let trimmed = name.trim();
+        let start = name.len() - name.trim_start().len();
+        let end = start + trimmed.len();
+        let has_spaces = trimmed.contains(' ');
+        Self {
+            name,
+            syntax,
+            trimmed: start..end,
+            has_spaces,
+        }
+    }
+}
+
+impl From<&str> for ThreadComm {
+    fn from(name: &str) -> Self {
+        Self::from(name.to_owned())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SampleComm<'a> {
     Name(&'a str),
+    Stored(&'a ThreadComm),
     Tid(u32),
 }
 
@@ -2272,6 +2331,7 @@ impl std::fmt::Display for SampleComm<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Name(name) => formatter.pad(name),
+            Self::Stored(comm) => formatter.pad(&comm.name),
             Self::Tid(tid) => {
                 // A colon and the ten decimal digits of u32::MAX fit on the stack.
                 let mut bytes = [0; 11];
@@ -2285,14 +2345,17 @@ impl std::fmt::Display for SampleComm<'_> {
     }
 }
 
-fn comm_for_ids(thread_comms: &BTreeMap<u32, String>, tid: Option<u32>) -> Option<SampleComm<'_>> {
+fn comm_for_ids(
+    thread_comms: &BTreeMap<u32, ThreadComm>,
+    tid: Option<u32>,
+) -> Option<SampleComm<'_>> {
     let tid = tid?;
     // perf util/thread.c:thread__new initializes ":%d" once per thread.
     // Keep that fallback numeric rather than allocating it for every sample.
     Some(
         thread_comms
             .get(&tid)
-            .map_or(SampleComm::Tid(tid), |comm| SampleComm::Name(comm.as_str())),
+            .map_or(SampleComm::Tid(tid), SampleComm::Stored),
     )
 }
 
@@ -2398,6 +2461,8 @@ struct FoldedRenderBuffers {
     mapping_cache: MappingResolveCache,
     #[cfg(test)]
     raw_function_normalizations: usize,
+    #[cfg(test)]
+    segment_copy_entries: usize,
 }
 
 enum FoldedRenderStatus {
@@ -2424,8 +2489,20 @@ fn mapping_requires_perf_text(mapping: &MappedFrame<'_>) -> bool {
 }
 
 impl FoldedRenderBuffers {
+    #[inline]
     fn repeat_segment(&mut self, start: usize, repeats: usize) {
-        if repeats <= 1 || start == self.current.len() {
+        if repeats <= 1 {
+            return;
+        }
+        self.copy_segment(start, repeats);
+    }
+
+    fn copy_segment(&mut self, start: usize, repeats: usize) {
+        #[cfg(test)]
+        {
+            self.segment_copy_entries += 1;
+        }
+        if start == self.current.len() {
             return;
         }
         // Each rendered run starts after comm and contains its separator.
@@ -2443,18 +2520,17 @@ impl FoldedRenderBuffers {
     fn start_stack(&mut self, comm: Option<SampleComm<'_>>) -> Result<(), String> {
         self.current.clear();
         self.has_comm = false;
-        if let Some(SampleComm::Name(comm)) = comm {
+        if let Some(SampleComm::Stored(comm)) = comm {
+            let name = &comm.name[comm.trimmed.clone()];
+            if comm.has_spaces {
+                self.append_comm_with_spaces(name);
+            } else {
+                self.current.push_str(name);
+            }
+        } else if let Some(SampleComm::Name(comm)) = comm {
             // Inferno perf.rs:event_line_parts trims the comm; on_event_line
             // replaces only literal spaces. after_event copies pname verbatim.
-            let comm = comm.trim();
-            self.current.reserve(comm.len());
-            let mut start = 0;
-            for index in memchr::memchr_iter(b' ', comm.as_bytes()) {
-                self.current.push_str(&comm[start..index]);
-                self.current.push('_');
-                start = index + 1;
-            }
-            self.current.push_str(&comm[start..]);
+            self.append_comm_with_spaces(comm.trim());
         } else if let Some(SampleComm::Tid(tid)) = comm {
             write!(self.current, ":{tid}").map_err(|error| error.to_string())?;
         } else {
@@ -2462,6 +2538,17 @@ impl FoldedRenderBuffers {
         }
         self.has_comm = true;
         Ok(())
+    }
+
+    fn append_comm_with_spaces(&mut self, comm: &str) {
+        self.current.reserve(comm.len());
+        let mut start = 0;
+        for index in memchr::memchr_iter(b' ', comm.as_bytes()) {
+            self.current.push_str(&comm[start..index]);
+            self.current.push('_');
+            start = index + 1;
+        }
+        self.current.push_str(&comm[start..]);
     }
 
     #[cfg(test)]
@@ -4635,7 +4722,7 @@ mod tests {
                 result.unwrap();
                 assert_eq!(source.delivered, [32, 0]);
                 assert!(source.pending.is_empty());
-                assert_eq!(sink.accumulator.thread_comms[&12], "later");
+                assert_eq!(sink.accumulator.thread_comms[&12].name, "later");
             }
         }
     }
@@ -6334,6 +6421,222 @@ mod tests {
     }
 
     #[test]
+    fn stable_comm_names_are_classified_only_at_metadata_insertion() {
+        use super::SampleOutput as _;
+        let mut state = super::SessionState::new(std::collections::BTreeMap::new());
+        state.thread_comms.insert(7, "worker task".into());
+        let mut output = super::FoldedOutput::<super::NoopSymbolResolver>::new(
+            None,
+            super::FoldOptions::default(),
+            0,
+        );
+        let frames = [super::FoldFrame::Callchain(0x1010)];
+        let sample = prepared_sample(&frames);
+        let before = super::COMM_SYNTAX_SCANS.with(std::cell::Cell::get);
+        for _ in 0..512 {
+            output.write_sample_event(&state, &sample).unwrap();
+        }
+        let after = super::COMM_SYNTAX_SCANS.with(std::cell::Cell::get);
+        assert_eq!(
+            after - before,
+            0,
+            "stable comm syntax must not be rescanned for every sample"
+        );
+        assert_eq!(output.buffers.rendered(), "worker_task;[unknown]");
+    }
+
+    #[test]
+    fn comm_source_metadata_changes_with_replacement_and_fork_inheritance() {
+        // Perf thread.c:250 updates the current name; thread.c:414 inherits
+        // it at fork. Cached syntax/ranges belong to that name, not to the TID.
+        let mut state = super::SessionState::new(std::collections::BTreeMap::new());
+        for (name, syntax, trimmed, has_spaces) in [
+            ("worker", super::CommSyntax::Ordinary, "worker", false),
+            (
+                " \u{2003}worker task\u{2003} ",
+                super::CommSyntax::Ordinary,
+                "worker task",
+                true,
+            ),
+            ("worker 123", super::CommSyntax::Numeric, "worker 123", true),
+            ("#comment", super::CommSyntax::Stream, "#comment", false),
+            (
+                "line\nbreak",
+                super::CommSyntax::Stream,
+                "line\nbreak",
+                false,
+            ),
+            ("", super::CommSyntax::Ordinary, "", false),
+            ("   ", super::CommSyntax::Ordinary, "", false),
+        ] {
+            let record = crate::perfdata::records::CommRecord {
+                pid: 7,
+                tid: 7,
+                comm: name.into(),
+                is_exec: true,
+            };
+            state.apply_metadata(super::FoldRecord::Comm(record.clone()));
+            let comm = &state.thread_comms[&7];
+            assert_eq!(comm.name, name);
+            assert_eq!(comm.syntax, syntax);
+            assert_eq!(&comm.name[comm.trimmed.clone()], trimmed);
+            assert_eq!(comm.has_spaces, has_spaces);
+            let scans = super::COMM_SYNTAX_SCANS.with(std::cell::Cell::get);
+            let pointer = comm.name.as_ptr();
+            state.apply_metadata(super::FoldRecord::Comm(record));
+            assert_eq!(state.thread_comms[&7].name.as_ptr(), pointer);
+            assert_eq!(super::COMM_SYNTAX_SCANS.with(std::cell::Cell::get), scans);
+            state.apply_fork_record(crate::perfdata::records::ForkRecord {
+                pid: 8,
+                ppid: 7,
+                tid: 8,
+                ptid: 7,
+                time: 1,
+                clone_maps: false,
+            });
+            assert_eq!(state.thread_comms[&7], state.thread_comms[&8]);
+            assert_eq!(state.process_comms[&8], name);
+            let mut stored = super::FoldedRenderBuffers::default();
+            let mut borrowed = super::FoldedRenderBuffers::default();
+            stored
+                .start_stack(Some(super::SampleComm::Stored(&state.thread_comms[&8])))
+                .unwrap();
+            borrowed
+                .start_stack(Some(super::SampleComm::Name(name)))
+                .unwrap();
+            assert_eq!(stored.rendered(), borrowed.rendered());
+        }
+        state.apply_metadata(super::FoldRecord::Comm(
+            crate::perfdata::records::CommRecord {
+                pid: 8,
+                tid: 8,
+                comm: "child renamed".into(),
+                is_exec: false,
+            },
+        ));
+        assert_eq!(state.thread_comms[&7].name, "   ");
+        assert_eq!(state.thread_comms[&8].name, "child renamed");
+        assert!(state.thread_comms[&8].has_spaces);
+    }
+
+    #[test]
+    fn singleton_frame_runs_never_enter_the_segment_copy_path() {
+        let maps = super::MmapTable::default();
+        let mut buffers = super::FoldedRenderBuffers::default();
+        super::FoldFrameResolver::new(&maps, true)
+            .render_folded_stack_for_stack::<super::NoopSymbolResolver, _>(
+                Some(7),
+                Some(super::SampleComm::Name("worker")),
+                (1..=512).map(super::FoldFrame::Callchain),
+                None,
+                &mut buffers,
+            )
+            .unwrap();
+        assert_eq!(
+            buffers.segment_copy_entries, 0,
+            "singleton runs must not dispatch to the segment copy routine"
+        );
+        assert_eq!(
+            buffers.rendered(),
+            format!("worker{}", ";[unknown]".repeat(512))
+        );
+    }
+
+    #[test]
+    fn comm_replacements_and_forked_names_match_inferno_on_the_whole_stream() {
+        use super::SampleOutput as _;
+        use inferno::collapse::Collapse as _;
+        let mut state = super::SessionState::new(std::collections::BTreeMap::new());
+        let mut direct = super::FoldedOutput::<super::NoopSymbolResolver>::new(
+            None,
+            super::FoldOptions {
+                inline: true,
+                count_periods: true,
+            },
+            9,
+        );
+        let frames = [super::FoldFrame::Callchain(0x1010)];
+        let mut sample = prepared_sample(&frames);
+        sample.time = Some(1_000_000_000);
+        sample.count = 17;
+        let mut script = Vec::new();
+        for comm in [
+            "worker",
+            "worker 123",
+            "\u{2003}wide name\u{2003}",
+            "",
+            "renamed",
+        ] {
+            state.apply_metadata(super::FoldRecord::Comm(
+                crate::perfdata::records::CommRecord {
+                    pid: 7,
+                    tid: 7,
+                    comm: comm.into(),
+                    is_exec: false,
+                },
+            ));
+            state.apply_fork_record(crate::perfdata::records::ForkRecord {
+                pid: 8,
+                ppid: 7,
+                tid: 8,
+                ptid: 7,
+                time: 1,
+                clone_maps: false,
+            });
+            for tid in [7, 8] {
+                sample.pid = Some(tid);
+                sample.tid = Some(tid);
+                direct.write_sample_event(&state, &sample).unwrap();
+                super::PerfScriptOutput::<super::NoopSymbolResolver, _> {
+                    symbol_cache: None,
+                    writer: &mut script,
+                    event_name_width: 9,
+                    inline: true,
+                }
+                .write_sample_event(&state, &sample)
+                .unwrap();
+            }
+        }
+        let mut options = inferno::collapse::perf::Options::default();
+        options.nthreads = 1;
+        let mut expected = Vec::new();
+        inferno::collapse::perf::Folder::from(options)
+            .collapse(std::io::Cursor::new(script), &mut expected)
+            .unwrap();
+        let mut actual = Vec::new();
+        super::write_fold_counts(direct.buffers.counts, &mut actual).unwrap();
+        assert_eq!(actual, expected);
+        assert!(!direct.requires_stream_parser);
+    }
+
+    #[test]
+    fn comm_replacement_with_stream_syntax_requests_whole_stream_parsing() {
+        use super::SampleOutput as _;
+        for comm in ["#comment", "line\nbreak"] {
+            let mut state = super::SessionState::new(std::collections::BTreeMap::new());
+            let mut output = super::FoldedOutput::<super::NoopSymbolResolver>::new(
+                None,
+                super::FoldOptions::default(),
+                0,
+            );
+            let frames = [super::FoldFrame::Callchain(0x1010)];
+            let sample = prepared_sample(&frames);
+            for name in ["ordinary", comm] {
+                state.apply_metadata(super::FoldRecord::Comm(
+                    crate::perfdata::records::CommRecord {
+                        pid: 7,
+                        tid: 7,
+                        comm: name.into(),
+                        is_exec: false,
+                    },
+                ));
+                output.write_sample_event(&state, &sample).unwrap();
+            }
+            assert!(output.requires_stream_parser, "comm {comm:?}");
+        }
+    }
+
+    #[test]
     fn recursive_runs_preserve_native_inferno_labels_modes_and_text_fallbacks() {
         use super::SampleOutput as _;
         use inferno::collapse::Collapse as _;
@@ -6879,21 +7182,21 @@ mod tests {
     #[test]
     fn numeric_and_borrowed_comms_preserve_header_padding() {
         let mut names = std::collections::BTreeMap::new();
-        names.insert(7, "worker".to_string());
-        names.insert(8, "w\u{e9}".to_string());
+        names.insert(7, "worker".into());
+        names.insert(8, "w\u{e9}".into());
         for tid in [0, 7, 8, 12345, u32::MAX] {
-            let expected = names
-                .get(&tid)
-                .cloned()
-                .unwrap_or_else(|| format!(":{tid}"));
+            let expected = names.get(&tid).map_or_else(
+                || format!(":{tid}"),
+                |comm: &super::ThreadComm| comm.name.clone(),
+            );
             let comm = super::comm_for_ids(&names, Some(tid)).unwrap();
             assert_eq!(comm.to_string(), expected);
             for width in [0, 16, 32] {
                 assert_eq!(format!("{comm:>width$}"), format!("{expected:>width$}"));
                 assert_eq!(format!("{comm:<width$}"), format!("{expected:<width$}"));
             }
-            if let super::SampleComm::Name(name) = comm {
-                assert_eq!(name.as_ptr(), names[&tid].as_ptr());
+            if let super::SampleComm::Stored(comm) = comm {
+                assert_eq!(comm.name.as_ptr(), names[&tid].name.as_ptr());
             }
         }
         assert_eq!(super::comm_for_ids(&names, None), None);
