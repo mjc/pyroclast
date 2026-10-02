@@ -2326,7 +2326,10 @@ fn normalizes_comm_spaces_like_inferno() {
 }
 
 #[test]
-fn can_fold_samples_weighted_by_period() {
+fn untimed_samples_use_infernos_unit_weight_even_with_period_fields() {
+    // perf builtin-script.c:evsel__do_check_stype removes absent TIME.
+    // Inferno perf.rs:on_event_line parses after the first colon; without
+    // TIME it cannot recover the preceding period and after_event uses 1.
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
             PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN,
@@ -2348,11 +2351,183 @@ fn can_fold_samples_weighted_by_period() {
     )
     .expect("folded");
 
-    assert_eq!(folded, ":12;[unknown] 10\n");
+    assert_eq!(folded, ":12;[unknown] 2\n");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn period_weights_with_and_without_timestamps_match_real_perf_script_and_inferno() {
+    use inferno::collapse::Collapse as _;
+
+    // builtin-script.c:evsel__check_attr checks TIME with
+    // evsel__do_check_stype, removing absent default fields. Compare the
+    // resulting native headers, not just our own script writer's grammar.
+    for timed in [false, true] {
+        for callchain in [false, true] {
+            let mut sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD;
+            if timed {
+                sample_type |= PERF_SAMPLE_TIME;
+            }
+            if callchain {
+                sample_type |= PERF_SAMPLE_CALLCHAIN;
+            }
+            let mut comm = comm_payload(11, 12, "worker");
+            comm.resize(comm.len().next_multiple_of(8), 0);
+            let mut records = vec![record_bytes(3, &comm)];
+            for period in [7, 3] {
+                let mut payload = if callchain {
+                    sample_payload_with_period(0x2000, 11, 12, period, [0x2000])
+                } else {
+                    sample_payload_with_period_no_callchain(0x2000, 11, 12, period)
+                };
+                if timed {
+                    payload.splice(16..16, 1_000_000_000_u64.to_le_bytes());
+                }
+                records.push(record_bytes_with_misc(
+                    PERF_RECORD_SAMPLE,
+                    PERF_RECORD_MISC_CPUMODE_USER,
+                    &payload,
+                ));
+            }
+            let mut bytes = perfdata_with_records_and_attrs_vec(
+                vec![file_attr_bytes(sample_type, 0, 0)],
+                records,
+            );
+            put_u64(&mut bytes, 16, 144);
+            let root = tempfile::tempdir().expect("tempdir");
+            let input = root.path().join("perf.data");
+            std::fs::write(&input, &bytes).expect("write fixture");
+            let perf = Command::new("perf")
+                .args(["script", "--force", "-i"])
+                .arg(&input)
+                .output()
+                .expect("run perf script");
+            assert!(
+                perf.status.success(),
+                "{}",
+                String::from_utf8_lossy(&perf.stderr)
+            );
+            let mut native = Vec::new();
+            inferno::collapse::perf::Folder::default()
+                .collapse(std::io::Cursor::new(&perf.stdout), &mut native)
+                .expect("native Inferno");
+            let folded = fold_perfdata_callchains_with_options(
+                &bytes,
+                FoldOptions {
+                    count_periods: true,
+                    inline: false,
+                },
+            )
+            .expect("fold fixture");
+            assert_eq!(
+                folded.as_bytes(),
+                native,
+                "timed={timed}, callchain={callchain}, native script={}",
+                String::from_utf8_lossy(&perf.stdout)
+            );
+            if timed || callchain {
+                assert_eq!(
+                    folded,
+                    format!("worker;[unknown] {}\n", if timed { 10 } else { 2 })
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn timed_sample_ip_with_a_newline_dso_preserves_inferno_state_across_samples() {
+    use inferno::collapse::Collapse as _;
+    // Inferno process_single_stack doesn't reset in_event at sample boundaries;
+    // map.c:map__fprintf_dsoname writes newlines in DSO paths verbatim.
+    let mut records = Vec::new();
+    for (kind, mut payload) in [
+        (3, comm_payload(11, 12, "worker")),
+        (
+            1,
+            mmap_payload(
+                11,
+                12,
+                0x1000,
+                0x100,
+                0,
+                "/tmp/a\nworker 12 1.000000: 2 cycles",
+            ),
+        ),
+        (1, mmap_payload(11, 12, 0x2000, 0x100, 0, "/tmp/normal")),
+    ] {
+        payload.resize(payload.len().next_multiple_of(8), 0);
+        records.push(record_bytes_with_misc(
+            kind,
+            PERF_RECORD_MISC_CPUMODE_USER,
+            &payload,
+        ));
+    }
+    for ip in [0x1010, 0x2010] {
+        records.push(record_bytes_with_misc(
+            PERF_RECORD_SAMPLE,
+            PERF_RECORD_MISC_CPUMODE_USER,
+            &sample_payload_with_optional_timestamp(
+                sample_payload_with_period_no_callchain(ip, 11, 12, 5),
+                true,
+            ),
+        ));
+    }
+    let mut bytes = perfdata_with_records_and_attrs_vec(
+        vec![file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_PERIOD,
+            0,
+            0,
+        )],
+        records,
+    );
+    put_u64(&mut bytes, 16, 144);
+    let root = tempfile::tempdir().expect("tempdir");
+    let input = root.path().join("perf.data");
+    std::fs::write(&input, &bytes).expect("write fixture");
+    let perf = Command::new("perf")
+        .args(["script", "--force", "-i"])
+        .arg(&input)
+        .output()
+        .expect("perf script");
+    assert!(
+        perf.status.success(),
+        "{}",
+        String::from_utf8_lossy(&perf.stderr)
+    );
+    let mut native = Vec::new();
+    inferno::collapse::perf::Folder::default()
+        .collapse(std::io::Cursor::new(&perf.stdout), &mut native)
+        .expect("Inferno");
+    let actual = fold_perfdata_callchains_with_options(
+        &bytes,
+        FoldOptions {
+            count_periods: true,
+            inline: false,
+        },
+    )
+    .expect("fold");
+    assert_eq!(
+        actual.as_bytes(),
+        native,
+        "native script={}",
+        String::from_utf8_lossy(&perf.stdout)
+    );
+    assert!(native.is_empty());
+    let file_backed = fold_perfdata_file_with_options(
+        &input,
+        FoldOptions {
+            count_periods: true,
+            inline: false,
+        },
+    )
+    .expect("fold file");
+    assert_eq!(file_backed, actual);
 }
 
 #[test]
-fn folds_sample_ip_when_callchain_is_absent_like_perf_script() {
+fn untimed_sample_ip_headers_without_callchains_form_one_inferno_stack() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
             PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD,
@@ -2380,135 +2555,167 @@ fn folds_sample_ip_when_callchain_is_absent_like_perf_script() {
     )
     .expect("folded");
 
-    assert_eq!(folded, ":12;[unknown] 10\n");
+    assert_eq!(
+        folded,
+        ":12;12          3 cycles:              2000 [unknown] 1\n"
+    );
 }
 
 #[test]
-fn folds_kernel_sample_ip_without_callchain_using_record_cpumode_like_perf_script() {
+fn sample_ip_kernel_cpumode_folds_only_with_a_timestamp_like_native_pipeline() {
     // perf builtin-script.c process_sample_event() resolves the event-line IP
     // with machine__resolve(), and util/event.c machine__resolve() passes
     // sample->cpumode into thread__find_map(). This is not the recorded
     // callchain path, whose util/machine.c thread__resolve_callchain_sample()
     // starts in PERF_RECORD_MISC_USER and switches only on PERF_CONTEXT_*.
-    let bytes = perfdata_with_records_and_attrs(
-        [file_attr_bytes(
-            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD,
-            0,
-            0,
-        )],
-        [
-            record_bytes_with_misc(
-                1,
-                PERF_RECORD_MISC_CPUMODE_KERNEL,
-                &mmap_payload(
-                    u32::MAX,
-                    u32::MAX,
-                    0xffff_ffff_8800_0000,
-                    0x2000,
-                    0,
-                    "[kernel.kallsyms]",
+    for timed in [false, true] {
+        let bytes = perfdata_with_records_and_attrs(
+            [file_attr_bytes(
+                PERF_SAMPLE_IP
+                    | PERF_SAMPLE_TID
+                    | PERF_SAMPLE_PERIOD
+                    | if timed { PERF_SAMPLE_TIME } else { 0 },
+                0,
+                0,
+            )],
+            [
+                record_bytes_with_misc(
+                    1,
+                    PERF_RECORD_MISC_CPUMODE_KERNEL,
+                    &mmap_payload(
+                        u32::MAX,
+                        u32::MAX,
+                        0xffff_ffff_8800_0000,
+                        0x2000,
+                        0,
+                        "[kernel.kallsyms]",
+                    ),
                 ),
-            ),
-            record_bytes_with_misc(
+                record_bytes_with_misc(
+                    9,
+                    PERF_RECORD_MISC_CPUMODE_KERNEL,
+                    &sample_payload_with_optional_timestamp(
+                        sample_payload_with_period_no_callchain(0xffff_ffff_8800_0010, 11, 12, 7),
+                        timed,
+                    ),
+                ),
+            ],
+        );
+        let resolver = StaticSymbolResolver;
+
+        let folded = fold_perfdata_callchains_with_symbols(
+            &bytes,
+            FoldOptions {
+                count_periods: true,
+                inline: false,
+            },
+            &resolver,
+        )
+        .expect("folded");
+
+        assert_eq!(
+            folded,
+            if timed {
+                ":12;asm_exc_page_fault 7\n"
+            } else {
+                ""
+            }
+        );
+    }
+}
+
+#[test]
+fn sample_ip_with_dwarf_payload_but_no_callchain_folds_only_with_a_timestamp() {
+    for timed in [false, true] {
+        let bytes = perfdata_with_records_and_attrs(
+            [file_attr_bytes_with_regs(
+                PERF_SAMPLE_IP
+                    | PERF_SAMPLE_TID
+                    | PERF_SAMPLE_PERIOD
+                    | PERF_SAMPLE_REGS_USER
+                    | PERF_SAMPLE_STACK_USER
+                    | if timed { PERF_SAMPLE_TIME } else { 0 },
+                (1 << 6) | (1 << 7) | (1 << 8),
+            )],
+            [record_bytes(
                 9,
-                PERF_RECORD_MISC_CPUMODE_KERNEL,
-                &sample_payload_with_period_no_callchain(0xffff_ffff_8800_0010, 11, 12, 7),
-            ),
-        ],
-    );
-    let resolver = StaticSymbolResolver;
+                &sample_payload_with_optional_timestamp(
+                    sample_payload_with_period_and_user_stack_no_callchain(
+                        0x4000,
+                        11,
+                        12,
+                        7,
+                        1,
+                        [0x7fff_0008, 0x7fff_0000, 0x4000],
+                        [
+                            0, 0, 0, 0, 0, 0, 0, 0, //
+                            0x40, 0, 0, 0, 0, 0, 0, 0, //
+                            0x34, 0x12, 0, 0, 0, 0, 0, 0,
+                        ],
+                    ),
+                    timed,
+                ),
+            )],
+        );
 
-    let folded = fold_perfdata_callchains_with_symbols(
-        &bytes,
-        FoldOptions {
-            count_periods: true,
-            inline: false,
-        },
-        &resolver,
-    )
-    .expect("folded");
+        let folded = fold_perfdata_callchains_with_options(
+            &bytes,
+            FoldOptions {
+                count_periods: true,
+                inline: false,
+            },
+        )
+        .expect("folded");
 
-    assert_eq!(folded, ":12;asm_exc_page_fault 7\n");
+        assert_eq!(folded, if timed { ":12;[unknown] 7\n" } else { "" });
+    }
 }
 
 #[test]
-fn emits_sample_ip_when_callchain_field_is_absent_even_with_dwarf_payload_like_perf_script() {
-    let bytes = perfdata_with_records_and_attrs(
-        [file_attr_bytes_with_regs(
-            PERF_SAMPLE_IP
-                | PERF_SAMPLE_TID
-                | PERF_SAMPLE_PERIOD
-                | PERF_SAMPLE_REGS_USER
-                | PERF_SAMPLE_STACK_USER,
-            (1 << 6) | (1 << 7) | (1 << 8),
-        )],
-        [record_bytes(
-            9,
-            &sample_payload_with_period_and_user_stack_no_callchain(
-                0x4000,
-                11,
-                12,
-                7,
-                1,
-                [0x7fff_0008, 0x7fff_0000, 0x4000],
-                [
-                    0, 0, 0, 0, 0, 0, 0, 0, //
-                    0x40, 0, 0, 0, 0, 0, 0, 0, //
-                    0x34, 0x12, 0, 0, 0, 0, 0, 0,
-                ],
-            ),
-        )],
-    );
-
-    let folded = fold_perfdata_callchains_with_options(
-        &bytes,
-        FoldOptions {
-            count_periods: true,
-            inline: false,
-        },
-    )
-    .expect("folded");
-
-    assert_eq!(folded, ":12;[unknown] 7\n");
-}
-
-#[test]
-fn folded_no_callchain_sample_ip_uses_base_symbol_even_when_inline_is_enabled_like_perf_script() {
+fn sample_ip_uses_base_symbol_with_inline_enabled_but_needs_time_for_inferno() {
     // builtin-script.c process_event() only resolves a callchain cursor when
     // sample->callchain exists. Without PERF_SAMPLE_CALLCHAIN, the event-line
     // IP is printed through machine__resolve()/map__find_symbol(), even if
     // inline output is otherwise enabled.
-    let bytes = perfdata_with_records_and_attrs(
-        [file_attr_bytes(
-            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD,
-            0,
-            0,
-        )],
-        [
-            record_bytes(1, &mmap_payload(11, 12, 0x1000, 0x100, 0, "/bin/app")),
-            record_bytes(
-                9,
-                &sample_payload_with_period_no_callchain(0x1010, 11, 12, 7),
-            ),
-        ],
-    );
-    let resolver = SampleIpInlineSymbolResolver;
+    for timed in [false, true] {
+        let bytes = perfdata_with_records_and_attrs(
+            [file_attr_bytes(
+                PERF_SAMPLE_IP
+                    | PERF_SAMPLE_TID
+                    | PERF_SAMPLE_PERIOD
+                    | if timed { PERF_SAMPLE_TIME } else { 0 },
+                0,
+                0,
+            )],
+            [
+                record_bytes(1, &mmap_payload(11, 12, 0x1000, 0x100, 0, "/bin/app")),
+                record_bytes(
+                    9,
+                    &sample_payload_with_optional_timestamp(
+                        sample_payload_with_period_no_callchain(0x1010, 11, 12, 7),
+                        timed,
+                    ),
+                ),
+            ],
+        );
+        let resolver = SampleIpInlineSymbolResolver;
 
-    let folded = fold_perfdata_callchains_with_symbols(
-        &bytes,
-        FoldOptions {
-            count_periods: true,
-            inline: true,
-        },
-        &resolver,
-    )
-    .expect("folded");
+        let folded = fold_perfdata_callchains_with_symbols(
+            &bytes,
+            FoldOptions {
+                count_periods: true,
+                inline: true,
+            },
+            &resolver,
+        )
+        .expect("folded");
 
-    assert_eq!(folded, ":12;app::main 7\n");
+        assert_eq!(folded, if timed { ":12;app::main 7\n" } else { "" });
+    }
 }
 
 #[test]
-fn selects_sample_layout_by_identifier() {
+fn selects_untimed_sample_layout_by_identifier_without_using_period_as_weight() {
     let attr1 = file_attr_bytes_with_ids(
         PERF_SAMPLE_IDENTIFIER | PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
         392,
@@ -2541,11 +2748,11 @@ fn selects_sample_layout_by_identifier() {
     )
     .expect("folded");
 
-    assert_eq!(folded, ":12;[unknown] 7\n");
+    assert_eq!(folded, ":12;[unknown] 1\n");
 }
 
 #[test]
-fn selects_sample_layout_by_id_field() {
+fn selects_untimed_sample_layout_by_id_without_using_period_as_weight() {
     let attr1 = file_attr_bytes_with_ids(
         PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_ID | PERF_SAMPLE_CALLCHAIN,
         392,
@@ -2578,12 +2785,11 @@ fn selects_sample_layout_by_id_field() {
     )
     .expect("folded");
 
-    assert_eq!(folded, ":12;[unknown] 7\n");
+    assert_eq!(folded, ":12;[unknown] 1\n");
 }
 
 #[test]
-fn folds_samples_from_multiple_attrs_when_generated_perf_script_event_name_matches_inferno_filter()
-{
+fn folds_untimed_samples_from_multiple_attrs_with_infernos_empty_event_filter() {
     let attr1 = file_attr_bytes_with_ids(
         PERF_SAMPLE_IDENTIFIER
             | PERF_SAMPLE_IP
@@ -2626,11 +2832,11 @@ fn folds_samples_from_multiple_attrs_when_generated_perf_script_event_name_match
     )
     .expect("folded");
 
-    assert_eq!(folded, ":12;[unknown] 3\n");
+    assert_eq!(folded, ":12;[unknown] 2\n");
 }
 
 #[test]
-fn folds_perfdata_from_file_path() {
+fn folds_untimed_perfdata_from_file_with_infernos_unit_weights() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
     let bytes = perfdata_with_records_and_attrs(
@@ -2655,7 +2861,7 @@ fn folds_perfdata_from_file_path() {
     )
     .expect("folded");
 
-    assert_eq!(folded, ":12;[unknown] 10\n");
+    assert_eq!(folded, ":12;[unknown] 2\n");
 }
 
 #[test]
@@ -2742,7 +2948,7 @@ fn file_backed_folding_matches_in_memory_folding_across_finished_rounds() {
 }
 
 #[test]
-fn folds_perfdata_from_multiple_finished_rounds_into_one_total() {
+fn folds_untimed_perfdata_across_finished_rounds_with_infernos_unit_weights() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
     let bytes = perfdata_with_records_and_attrs(
@@ -2769,7 +2975,7 @@ fn folds_perfdata_from_multiple_finished_rounds_into_one_total() {
     )
     .expect("folded");
 
-    assert_eq!(folded, ":12;[unknown] 10\n");
+    assert_eq!(folded, ":12;[unknown] 2\n");
 }
 
 #[test]
@@ -2799,7 +3005,7 @@ fn folds_later_rounds_with_updated_mappings_after_cacheable_rounds() {
 }
 
 #[test]
-fn folds_identical_rendered_stacks_across_pids_into_one_line() {
+fn folds_identical_untimed_stacks_across_pids_using_unit_weights() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
             PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN,
@@ -2823,7 +3029,7 @@ fn folds_identical_rendered_stacks_across_pids_into_one_line() {
     )
     .expect("folded");
 
-    assert_eq!(folded, "pyroclast;[unknown] 10\n");
+    assert_eq!(folded, "pyroclast;[unknown] 2\n");
 }
 
 #[test]
@@ -2850,7 +3056,7 @@ fn forked_process_inherits_parent_mappings_like_perf_script() {
     )
     .expect("folded");
 
-    assert_eq!(folded, ":22;[app] 7\n");
+    assert_eq!(folded, ":22;[app] 1\n");
 }
 
 #[test]
@@ -2881,7 +3087,7 @@ fn synthesized_fork_does_not_clone_parent_mappings_like_perf_script() {
     )
     .expect("folded");
 
-    assert_eq!(folded, ":22;[unknown] 7\n");
+    assert_eq!(folded, ":22;[unknown] 1\n");
 }
 
 #[test]
@@ -3047,7 +3253,7 @@ proptest! {
     }
 
     #[test]
-    fn property_folds_generated_periods_for_user_callchains(
+    fn property_untimed_callchains_use_unit_weights_for_arbitrary_periods(
         frames in prop::collection::vec(0x1000_u64..0x0001_0000_0000_u64, 1..12),
         periods in prop::collection::vec(1_u64..10_000, 1..16),
     ) {
@@ -3074,13 +3280,13 @@ proptest! {
             FoldOptions { count_periods: true, inline: false },
         )
         .expect("folded");
-        let expected = render_unknown_folded_callchain(&frames, periods.iter().sum());
+        let expected = render_unknown_folded_callchain(&frames, periods.len() as u64);
 
         prop_assert_eq!(folded, expected);
     }
 
     #[test]
-    fn property_selects_sample_layout_by_identifier(
+    fn property_selects_untimed_identifier_layout_with_unit_weight(
         base_id in 1_u64..u64::MAX,
         period in 1_u64..10_000,
         frame in 0x1000_u64..0x0001_0000_0000_u64,
@@ -3114,11 +3320,11 @@ proptest! {
         )
         .expect("folded");
 
-        prop_assert_eq!(folded, render_unknown_folded_callchain(&[frame], period));
+        prop_assert_eq!(folded, render_unknown_folded_callchain(&[frame], 1));
     }
 
     #[test]
-    fn property_selects_sample_layout_by_id_field(
+    fn property_selects_untimed_id_layout_with_unit_weight(
         base_id in 1_u64..u64::MAX,
         period in 1_u64..10_000,
         frame in 0x1000_u64..0x0001_0000_0000_u64,
@@ -3152,7 +3358,7 @@ proptest! {
         )
         .expect("folded");
 
-        prop_assert_eq!(folded, render_unknown_folded_callchain(&[frame], period));
+        prop_assert_eq!(folded, render_unknown_folded_callchain(&[frame], 1));
     }
 }
 
@@ -4183,6 +4389,13 @@ fn sample_payload_with_period<const N: usize>(
     payload.extend((callchain.len() as u64).to_le_bytes());
     for frame in callchain {
         payload.extend(frame.to_le_bytes());
+    }
+    payload
+}
+
+fn sample_payload_with_optional_timestamp(mut payload: Vec<u8>, timed: bool) -> Vec<u8> {
+    if timed {
+        payload.splice(16..16, 1_000_000_000_u64.to_le_bytes());
     }
     payload
 }

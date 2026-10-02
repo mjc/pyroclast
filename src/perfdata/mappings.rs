@@ -74,7 +74,7 @@ pub(crate) enum ModuleFallbackKind {
 pub(crate) struct MappingPathLayout {
     pub(crate) basename_start: usize,
     pub(crate) last_space: Option<usize>,
-    pub(crate) basename_has_parentheses: bool,
+    pub(crate) text_row_boundary: Option<usize>,
     pub(crate) basename_needs_escaping: bool,
     pub(crate) fallback: ModuleFallbackKind,
     bracketed: bool,
@@ -87,7 +87,7 @@ impl MappingPathLayout {
             bracketed: path.starts_with('['),
             basename_start,
             last_space: memchr::memrchr(b' ', path.as_bytes()),
-            basename_has_parentheses: path[basename_start..].contains('('),
+            text_row_boundary: memchr::memchr3(b' ', b'\r', b'\n', path.as_bytes()),
             basename_needs_escaping: memchr::memchr3(
                 b';',
                 b'\r',
@@ -107,7 +107,7 @@ impl MappingPathLayout {
             } else {
                 ModuleFallbackKind::Skip
             }
-        } else if layout.basename_has_parentheses {
+        } else if path[basename_start..].contains('(') {
             ModuleFallbackKind::Normalized
         } else if layout.basename_needs_escaping {
             ModuleFallbackKind::Escaped
@@ -1187,7 +1187,7 @@ mod tests {
             let basename = &path[path.rfind('/').map_or(0, |index| index + 1)..];
             assert_eq!(&path[layout.basename_start..], basename);
             assert_eq!(layout.last_space, path.rfind(' '));
-            assert_eq!(layout.basename_has_parentheses, basename.contains('('));
+            assert_eq!(layout.text_row_boundary, path.find([' ', '\r', '\n']));
             assert_eq!(
                 layout.basename_needs_escaping,
                 basename.contains([';', '\r', '\n'])

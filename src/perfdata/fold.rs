@@ -837,9 +837,20 @@ where
     let header = parse_header(bytes)?;
     let layouts = sample_layouts(bytes, header)?;
     let arch = perf_arch_from_header(parse_header_arch(bytes, &header)?.as_deref());
+    let state = SessionState::new(header_build_ids_by_filename(bytes)?).with_arch(arch);
+    if layouts_require_stream_parser(&layouts) {
+        return collect_stream_fold_counts(
+            &mut SliceSource(bytes),
+            header,
+            &layouts,
+            state,
+            options,
+            symbol_cache,
+        );
+    }
     let mut sink = SampleSink::new(
-        SessionState::new(header_build_ids_by_filename(bytes)?).with_arch(arch),
-        FoldedOutput::new(symbol_cache, options.inline),
+        state,
+        FoldedOutput::new(symbol_cache, options, layouts.event_name_width),
     );
     replay_records(
         &mut SliceSource(bytes),
@@ -849,6 +860,68 @@ where
         &mut sink,
     )?;
     Ok(sink.output.buffers.counts)
+}
+
+fn layouts_require_stream_parser(layouts: &SampleLayouts) -> bool {
+    layouts
+        .fallback
+        .iter()
+        .chain(layouts.by_identifier.values())
+        .any(|event| event.layout.sample_type & PERF_SAMPLE_CALLCHAIN == 0)
+}
+
+fn collect_stream_fold_counts<R: SymbolResolver>(
+    source: &mut impl RecordSource,
+    header: PerfHeader,
+    layouts: &SampleLayouts,
+    state: SessionState,
+    options: FoldOptions,
+    symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+) -> Result<FoldCounts, String> {
+    use inferno::collapse::Collapse as _;
+    // Inferno process_single_stack can stay in_event after an event-line IP
+    // (missing TIME/frames or embedded DSO newlines). Subsequent sample headers
+    // then become stack rows, so per-sample parser resets are incorrect.
+    // Preserve the complete stream grammar without buffering it all in RAM.
+    let mut script = tempfile::tempfile().map_err(|error| error.to_string())?;
+    {
+        let mut writer = std::io::BufWriter::new(&mut script);
+        let mut sink = SampleSink::new(
+            state,
+            PerfScriptOutput {
+                symbol_cache,
+                writer: &mut writer,
+                event_name_width: layouts.event_name_width,
+                inline: options.inline,
+            },
+        );
+        replay_records(source, header, layouts, options, &mut sink)?;
+        writer.flush().map_err(|error| error.to_string())?;
+    }
+    script
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| error.to_string())?;
+    let mut settings = inferno::collapse::perf::Options::default();
+    settings.nthreads = 1;
+    let mut folded = Vec::new();
+    inferno::collapse::perf::Folder::from(settings)
+        .collapse(std::io::BufReader::new(script), &mut folded)
+        .map_err(|error| format!("failed to fold perf text: {error}"))?;
+    let mut counts = FoldCounts::default();
+    add_inferno_counts(&mut counts, &folded)?;
+    Ok(counts)
+}
+
+fn add_inferno_counts(counts: &mut FoldCounts, folded: &[u8]) -> Result<(), String> {
+    let folded = std::str::from_utf8(folded).map_err(|error| error.to_string())?;
+    for line in folded.lines() {
+        let (stack, count) = line
+            .rsplit_once(' ')
+            .ok_or_else(|| "Inferno output lacks a stack count".to_string())?;
+        let count = count.parse::<u64>().map_err(|error| error.to_string())?;
+        counts.add_stack(stack, count);
+    }
+    Ok(())
 }
 
 fn replay_records<O: SampleOutput>(
@@ -940,7 +1013,21 @@ where
     W: IoWrite + ?Sized,
 {
     let (header, layouts, state) = file_replay_state(file)?;
-    let mut sink = SampleSink::new(state, FoldedOutput::new(symbol_cache, options.inline));
+    if layouts_require_stream_parser(&layouts) {
+        let counts = collect_stream_fold_counts(
+            &mut FileSource::new(file)?,
+            header,
+            &layouts,
+            state,
+            options,
+            symbol_cache,
+        )?;
+        return write_fold_counts(counts, writer);
+    }
+    let mut sink = SampleSink::new(
+        state,
+        FoldedOutput::new(symbol_cache, options, layouts.event_name_width),
+    );
     replay_records(
         &mut FileSource::new(file)?,
         header,
@@ -984,16 +1071,53 @@ where
 struct FoldedOutput<'a, 'cache, R> {
     symbol_cache: Option<&'a mut SymbolFrameCache<'cache, R>>,
     inline: bool,
+    count_periods: bool,
+    event_name_width: usize,
+    event_filter: Option<Box<str>>,
     buffers: FoldedRenderBuffers,
 }
 
 impl<'a, 'cache, R: SymbolResolver> FoldedOutput<'a, 'cache, R> {
-    fn new(symbol_cache: Option<&'a mut SymbolFrameCache<'cache, R>>, inline: bool) -> Self {
+    fn new(
+        symbol_cache: Option<&'a mut SymbolFrameCache<'cache, R>>,
+        options: FoldOptions,
+        event_name_width: usize,
+    ) -> Self {
         Self {
             symbol_cache,
-            inline,
+            inline: options.inline,
+            count_periods: options.count_periods,
+            event_name_width,
+            event_filter: None,
             buffers: FoldedRenderBuffers::default(),
         }
+    }
+
+    fn fold_perf_text(
+        &mut self,
+        accumulator: &SessionState,
+        sample: &PreparedFoldSample,
+    ) -> Result<(), String> {
+        use inferno::collapse::Collapse as _;
+        // map.c:map__fprintf_dsoname emits paths verbatim. A DSO can alter
+        // stack-row parsing or event boundaries, so parse the whole event
+        // with Inferno rather than rewriting or dropping individual names.
+        let mut script = Vec::new();
+        PerfScriptOutput {
+            symbol_cache: self.symbol_cache.as_deref_mut(),
+            writer: &mut script,
+            event_name_width: self.event_name_width,
+            inline: self.inline,
+        }
+        .write_sample_event(accumulator, sample)?;
+        let mut options = inferno::collapse::perf::Options::default();
+        options.nthreads = 1;
+        options.event_filter = self.event_filter.as_deref().map(str::to_owned);
+        let mut folded = Vec::new();
+        inferno::collapse::perf::Folder::from(options)
+            .collapse(std::io::Cursor::new(script), &mut folded)
+            .map_err(|error| format!("failed to fold perf text: {error}"))?;
+        add_inferno_counts(&mut self.buffers.counts, &folded)
     }
 }
 
@@ -1003,6 +1127,39 @@ impl<R: SymbolResolver> SampleOutput for FoldedOutput<'_, '_, R> {
         accumulator: &SessionState,
         sample: &PreparedFoldSample,
     ) -> Result<(), String> {
+        // perf builtin-script.c:process_event prints the padded evname after
+        // the period. Inferno perf.rs:on_event_line selects the first event
+        // token and reads the immediately preceding space-delimited word.
+        let mut parts = sample.event_name.split(':');
+        let name = if sample.time.is_some() {
+            parts.next().unwrap()
+        } else {
+            // Without TIME, the first colon is the event-name separator,
+            // so Inferno reads the following fragment, not the event name.
+            parts.nth(1).unwrap_or("")
+        };
+        let (event, count) = if let Some((prefix, token)) = name.rsplit_once(' ') {
+            let count = prefix.rsplit(' ').next().unwrap().parse().unwrap_or(1);
+            (token, count)
+        } else {
+            let count = if sample.time.is_none() || self.event_name_width > sample.event_name.len()
+            {
+                1
+            } else {
+                sample.count
+            };
+            (name, count)
+        };
+        if let Some(selected) = self.event_filter.as_deref() {
+            if selected != event {
+                return Ok(());
+            }
+        } else {
+            self.event_filter = Some(event.into());
+        }
+        if sample.time.is_none() && !sample.has_callchain {
+            return self.fold_perf_text(accumulator, sample);
+        }
         let frames = sample
             .frames
             .iter()
@@ -1010,7 +1167,7 @@ impl<R: SymbolResolver> SampleOutput for FoldedOutput<'_, '_, R> {
             .copied()
             .filter(|frame| !is_perf_context_marker(frame.address()));
         let comm = comm_for_ids(&accumulator.thread_comms, sample.tid);
-        FoldFrameResolver::new(&accumulator.mmap_table, self.inline)
+        let status = FoldFrameResolver::new(&accumulator.mmap_table, self.inline)
             .render_folded_stack_for_stack(
                 sample.pid,
                 comm,
@@ -1018,10 +1175,18 @@ impl<R: SymbolResolver> SampleOutput for FoldedOutput<'_, '_, R> {
                 self.symbol_cache.as_deref_mut(),
                 &mut self.buffers,
             )?;
+        if matches!(status, FoldedRenderStatus::RequiresPerfText) {
+            return self.fold_perf_text(accumulator, sample);
+        }
         if !self.buffers.current.is_empty() {
-            self.buffers
-                .counts
-                .add_stack(&self.buffers.current, sample.count);
+            self.buffers.counts.add_stack(
+                &self.buffers.current,
+                if self.count_periods {
+                    count
+                } else {
+                    sample.count
+                },
+            );
         }
         Ok(())
     }
@@ -1229,10 +1394,13 @@ where
         // header line ends with the event-name colon, a space, then a newline.
         writeln!(
             self.writer,
-            "{:>10} {:>width$}: ",
+            "{:>10} {:>padding$}{}: ",
             sample.count,
+            "",
             sample.event_name,
-            width = self.event_name_width,
+            padding = self
+                .event_name_width
+                .saturating_sub(sample.event_name.len()),
         )
         .map_err(|error| format!("failed to write perf script output: {error}"))
     }
@@ -1243,7 +1411,16 @@ where
         sample: &PreparedFoldSample,
     ) -> Result<(), String> {
         let comm = perf_script_comm(&accumulator.thread_comms, sample);
-        write!(self.writer, "{comm:>16} ")
+        // perf's %16s pads byte lengths; Rust string widths count characters.
+        let padding = match comm {
+            SampleComm::Name(name) => 16_usize.saturating_sub(name.len()),
+            SampleComm::Tid(tid) => 16_usize
+                .saturating_sub(usize::try_from(tid.checked_ilog10().unwrap_or(0) + 2).unwrap()),
+        };
+        self.writer
+            .write_all(&[b' '; 16][..padding])
+            .map_err(|error| format!("failed to write perf script output: {error}"))?;
+        write!(self.writer, "{comm} ")
             .map_err(|error| format!("failed to write perf script output: {error}"))?;
         if let Some(tid) = sample.tid.or(sample.pid) {
             write!(self.writer, "{tid:>7} ")
@@ -1264,10 +1441,13 @@ where
         // is present, so the inline event-line IP starts after two spaces.
         write!(
             self.writer,
-            "{:>10} {:>width$}:  ",
+            "{:>10} {:>padding$}{}:  ",
             sample.count,
+            "",
             sample.event_name,
-            width = self.event_name_width,
+            padding = self
+                .event_name_width
+                .saturating_sub(sample.event_name.len()),
         )
         .map_err(|error| format!("failed to write perf script output: {error}"))
     }
@@ -2079,13 +2259,47 @@ fn resolve_frame_in_context<'a>(
 #[derive(Default)]
 struct FoldedRenderBuffers {
     current: String,
+    has_comm: bool,
     counts: FoldCounts,
     render_scratch: String,
     module_scratch: String,
     mapping_cache: MappingResolveCache,
 }
 
+enum FoldedRenderStatus {
+    Rendered,
+    RequiresPerfText,
+}
+
+fn mapping_requires_perf_text(mapping: &MappedFrame<'_>) -> bool {
+    mapping.path_layout().text_row_boundary.is_some()
+}
+
 impl FoldedRenderBuffers {
+    fn start_stack(&mut self, comm: Option<SampleComm<'_>>) -> Result<(), String> {
+        self.current.clear();
+        self.has_comm = false;
+        if let Some(SampleComm::Name(comm)) = comm {
+            // Inferno perf.rs:event_line_parts trims the comm; on_event_line
+            // replaces only literal spaces. after_event copies pname verbatim.
+            let comm = comm.trim();
+            self.current.reserve(comm.len());
+            let mut start = 0;
+            for index in memchr::memchr_iter(b' ', comm.as_bytes()) {
+                self.current.push_str(&comm[start..index]);
+                self.current.push('_');
+                start = index + 1;
+            }
+            self.current.push_str(&comm[start..]);
+        } else if let Some(SampleComm::Tid(tid)) = comm {
+            write!(self.current, ":{tid}").map_err(|error| error.to_string())?;
+        } else {
+            append_cached_inferno_perf_folded_label_to_buffers(self, UNKNOWN_FRAME);
+        }
+        self.has_comm = true;
+        Ok(())
+    }
+
     #[cfg(test)]
     fn rendered(&self) -> String {
         self.current.clone()
@@ -2139,29 +2353,12 @@ impl<'a> FoldFrameResolver<'a> {
         callchain: I,
         mut symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
         buffers: &mut FoldedRenderBuffers,
-    ) -> Result<(), String>
+    ) -> Result<FoldedRenderStatus, String>
     where
         R: SymbolResolver,
         I: IntoIterator<Item = FoldFrame>,
     {
-        buffers.current.clear();
-        if let Some(SampleComm::Name(comm)) = comm {
-            // Inferno perf.rs:event_line_parts trims the comm; on_event_line
-            // replaces only literal spaces. after_event copies pname verbatim.
-            let comm = comm.trim();
-            buffers.current.reserve(comm.len());
-            let mut start = 0;
-            for index in memchr::memchr_iter(b' ', comm.as_bytes()) {
-                buffers.current.push_str(&comm[start..index]);
-                buffers.current.push('_');
-                start = index + 1;
-            }
-            buffers.current.push_str(&comm[start..]);
-        } else if let Some(SampleComm::Tid(tid)) = comm {
-            write!(buffers.current, ":{tid}").map_err(|error| error.to_string())?;
-        } else {
-            append_cached_inferno_perf_folded_label_to_buffers(buffers, UNKNOWN_FRAME);
-        }
+        buffers.start_stack(comm)?;
         let comm_prefix_len = buffers.current.len();
 
         let context = pid.map(|pid| {
@@ -2189,6 +2386,9 @@ impl<'a> FoldFrameResolver<'a> {
             );
             match decision {
                 FrameMappingDecision::Mapped(mapping) => {
+                    if mapping_requires_perf_text(&mapping) {
+                        return Ok(FoldedRenderStatus::RequiresPerfText);
+                    }
                     if let Some(cache) = symbol_cache.as_deref_mut() {
                         // Event-line IPs use machine__resolve(), not append_inlines().
                         let expand = self.inline && !matches!(frame, FoldFrame::SampleIp { .. });
@@ -2219,6 +2419,14 @@ impl<'a> FoldFrameResolver<'a> {
                             );
                             (frame, decision)
                         }));
+                        if pending.iter().any(|(_, decision)| {
+                            matches!(
+                                decision, FrameMappingDecision::Mapped(mapping)
+                                    if mapping_requires_perf_text(mapping)
+                            )
+                        }) {
+                            return Ok(FoldedRenderStatus::RequiresPerfText);
+                        }
                         prefetch_sample_symbols(&pending, cache, self.inline)?;
                         for (frame, decision) in pending {
                             append_prefetched_folded_frame(
@@ -2244,7 +2452,7 @@ impl<'a> FoldFrameResolver<'a> {
         if buffers.current.len() == comm_prefix_len {
             buffers.current.clear();
         }
-        Ok(())
+        Ok(FoldedRenderStatus::Rendered)
     }
 
     fn write_script_frames_for_stack<R, W>(
@@ -2538,7 +2746,7 @@ fn append_resolved_folded_frames(
 }
 
 fn append_folded_address_label(buffers: &mut FoldedRenderBuffers, address: u64) {
-    append_separator(&mut buffers.current);
+    append_separator(&mut buffers.current, buffers.has_comm);
     write!(buffers.current, "0x{address:x}").expect("writing to a string cannot fail");
 }
 
@@ -2546,7 +2754,12 @@ fn append_cached_inferno_perf_raw_function_to_buffers(
     buffers: &mut FoldedRenderBuffers,
     frame: &str,
 ) {
-    append_inferno_perf_raw_function(&mut buffers.current, frame, &mut buffers.render_scratch);
+    append_inferno_perf_raw_function(
+        &mut buffers.current,
+        frame,
+        &mut buffers.render_scratch,
+        buffers.has_comm,
+    );
 }
 
 fn append_cached_inferno_perf_folded_label_to_buffers(
@@ -2554,7 +2767,7 @@ fn append_cached_inferno_perf_folded_label_to_buffers(
     label: &str,
 ) {
     if !label.is_empty() {
-        append_inferno_perf_folded_label(&mut buffers.current, label);
+        append_inferno_perf_folded_label(&mut buffers.current, label, buffers.has_comm);
     }
 }
 
@@ -2580,7 +2793,7 @@ fn append_frame_mapping_fallback(buffers: &mut FoldedRenderBuffers, mapping: &Ma
     if path.len() == raw_path.len() {
         append_module_fallback(buffers, path, mapping.path_layout(), kernel);
     } else {
-        append_literal_module(&mut buffers.current, path, false);
+        append_literal_module(&mut buffers.current, path, false, buffers.has_comm);
     }
 }
 
@@ -2609,6 +2822,7 @@ fn append_module_fallback(
             &mut buffers.current,
             &buffers.module_scratch,
             &mut buffers.render_scratch,
+            buffers.has_comm,
         );
         return;
     }
@@ -2623,20 +2837,21 @@ fn append_module_fallback(
         // on_stack_line() expands arrows before with_module_fallback(), so
         // synthetic module labels go through tidy_generic only.
         tidy_inferno_perf_generic_into(&mut buffers.render_scratch, &buffers.module_scratch);
-        append_separator(&mut buffers.current);
+        append_separator(&mut buffers.current, buffers.has_comm);
         escape_frame_into(&mut buffers.current, &buffers.render_scratch);
     } else {
         append_literal_module(
             &mut buffers.current,
             name,
             layout.fallback == ModuleFallbackKind::Escaped,
+            buffers.has_comm,
         );
     }
 }
 
-fn append_literal_module(output: &mut String, name: &str, escape: bool) {
+fn append_literal_module(output: &mut String, name: &str, escape: bool, has_prefix: bool) {
     output.reserve(name.len() + 2 + usize::from(!output.is_empty()));
-    append_separator(output);
+    append_separator(output, has_prefix);
     output.push('[');
     if escape {
         append_escaped_spans(output, name, ":");
@@ -4207,7 +4422,14 @@ mod tests {
             };
             let mut sink = super::SampleSink::new(
                 super::SessionState::new(std::collections::BTreeMap::new()),
-                super::FoldedOutput::<super::NoopSymbolResolver>::new(None, false),
+                super::FoldedOutput::<super::NoopSymbolResolver>::new(
+                    None,
+                    super::FoldOptions {
+                        inline: false,
+                        ..Default::default()
+                    },
+                    0,
+                ),
             );
             let result = super::replay_records(
                 &mut source,
@@ -5443,7 +5665,14 @@ mod tests {
         let mut state = super::SessionState::new(std::collections::BTreeMap::new());
         state.thread_comms.insert(7, "worker task".into());
         let sample = prepared_sample(&[super::FoldFrame::UserUnwind(0x1010)]);
-        let mut output = super::FoldedOutput::<super::NoopSymbolResolver>::new(None, false);
+        let mut output = super::FoldedOutput::<super::NoopSymbolResolver>::new(
+            None,
+            super::FoldOptions {
+                inline: false,
+                ..Default::default()
+            },
+            0,
+        );
         output.write_sample_event(&state, &sample).unwrap();
         assert_eq!(output.buffers.rendered(), "worker_task;[unknown]");
         let capacity = output.buffers.current.capacity();
@@ -5479,6 +5708,13 @@ mod tests {
         }
     }
 
+    #[test]
+    fn empty_comms_keep_the_separator_before_the_first_frame_like_native_inferno() {
+        for comm in ["", "   ", "\t"] {
+            assert_comm_matches_native_inferno(comm);
+        }
+    }
+
     fn assert_comm_matches_native_inferno(comm: &str) {
         use super::SampleOutput as _;
         use inferno::collapse::Collapse as _;
@@ -5488,7 +5724,14 @@ mod tests {
         let mut state = super::SessionState::new(std::collections::BTreeMap::new());
         state.thread_comms.insert(7, comm.into());
         let sample = prepared_sample(&[super::FoldFrame::UserUnwind(0x1010)]);
-        let mut output = super::FoldedOutput::<super::NoopSymbolResolver>::new(None, false);
+        let mut output = super::FoldedOutput::<super::NoopSymbolResolver>::new(
+            None,
+            super::FoldOptions {
+                inline: false,
+                ..Default::default()
+            },
+            0,
+        );
         output.write_sample_event(&state, &sample).unwrap();
         let mut actual = Vec::new();
         super::write_fold_counts(output.buffers.counts, &mut actual).unwrap();
@@ -5501,6 +5744,106 @@ mod tests {
             .unwrap();
         assert!(!expected.is_empty(), "comm {comm:?}");
         assert_eq!(actual, expected, "comm {comm:?}");
+    }
+
+    #[test]
+    fn direct_folding_filters_distinct_event_names_like_native_inferno() {
+        assert_events_match_native_inferno(&[
+            ("cycles", 2, true),
+            ("instructions", 100, true),
+            ("cycles", 3, true),
+        ]);
+    }
+
+    #[test]
+    fn direct_folding_selects_the_first_event_even_without_stack_frames() {
+        assert_events_match_native_inferno(&[
+            ("cycles", 2, false),
+            ("instructions", 100, true),
+            ("cycles", 3, true),
+        ]);
+    }
+
+    #[test]
+    fn direct_folding_uses_infernos_event_token_for_modifiers_and_tracepoints() {
+        for names in [
+            ["cycles:u", "cycles:k", "instructions:u"],
+            [
+                "syscalls:sys_enter_write",
+                "syscalls:sys_enter_read",
+                "cycles",
+            ],
+        ] {
+            assert_events_match_native_inferno(&[
+                (names[0], 2, true),
+                (names[1], 3, true),
+                (names[2], 100, true),
+            ]);
+        }
+    }
+
+    #[test]
+    fn untimed_events_use_infernos_empty_filter_and_unit_weight() {
+        assert_events_match_native_inferno_with_time(
+            &[
+                ("cycles", 2, true),
+                ("instructions", 100, true),
+                ("cycles", 3, true),
+            ],
+            None,
+        );
+    }
+
+    fn assert_events_match_native_inferno(events: &[(&str, u64, bool)]) {
+        assert_events_match_native_inferno_with_time(events, Some(1_000_000_000));
+    }
+
+    fn assert_events_match_native_inferno_with_time(
+        events: &[(&str, u64, bool)],
+        time: Option<u64>,
+    ) {
+        use super::SampleOutput as _;
+        use inferno::collapse::Collapse as _;
+        // builtin-script.c:perf_sample__fprintf_start prints evname verbatim.
+        // Inferno perf.rs:on_event_line selects its first event token even
+        // without frames, ignoring modifiers/tracepoint suffixes after ':'.
+        let mut state = super::SessionState::new(std::collections::BTreeMap::new());
+        state.thread_comms.insert(7, "worker".into());
+        let width = events.iter().map(|(name, _, _)| name.len()).max().unwrap();
+        let mut direct = super::FoldedOutput::<super::NoopSymbolResolver>::new(
+            None,
+            super::FoldOptions {
+                count_periods: true,
+                inline: false,
+            },
+            width,
+        );
+        let frames = [super::FoldFrame::UserUnwind(0x1010)];
+        let mut script = Vec::new();
+        let mut text = super::PerfScriptOutput::<super::NoopSymbolResolver, _> {
+            symbol_cache: None,
+            writer: &mut script,
+            event_name_width: width,
+            inline: false,
+        };
+        for &(name, count, has_frames) in events {
+            let mut sample = prepared_sample(if has_frames { &frames } else { &[] });
+            sample.time = time;
+            sample.event_name = name;
+            sample.count = count;
+            direct.write_sample_event(&state, &sample).unwrap();
+            text.write_sample_event(&state, &sample).unwrap();
+        }
+        let mut options = inferno::collapse::perf::Options::default();
+        options.nthreads = 1;
+        let mut expected = Vec::new();
+        inferno::collapse::perf::Folder::from(options)
+            .collapse(std::io::Cursor::new(script), &mut expected)
+            .unwrap();
+        let mut actual = Vec::new();
+        super::write_fold_counts(direct.buffers.counts, &mut actual).unwrap();
+        assert!(!expected.is_empty());
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -5741,7 +6084,14 @@ mod tests {
         }
         let sample = prepared_sample(&frames);
         let original = sample.frames.to_vec();
-        let mut output = super::FoldedOutput::<super::NoopSymbolResolver>::new(None, false);
+        let mut output = super::FoldedOutput::<super::NoopSymbolResolver>::new(
+            None,
+            super::FoldOptions {
+                inline: false,
+                ..Default::default()
+            },
+            0,
+        );
         output.write_sample_event(&state, &sample).unwrap();
         let expected = (1..=40)
             .rev()
@@ -5776,7 +6126,14 @@ mod tests {
         }
         let resolver = RecordingFrameResolver::default();
         let mut cache = SymbolFrameCache::new(&resolver);
-        let mut output = super::FoldedOutput::new(Some(&mut cache), true);
+        let mut output = super::FoldedOutput::new(
+            Some(&mut cache),
+            super::FoldOptions {
+                inline: true,
+                ..Default::default()
+            },
+            0,
+        );
         let sample = prepared_sample(&[
             super::FoldFrame::UserUnwind(0x1010),
             super::FoldFrame::UserUnwind(0x2010),
@@ -5944,7 +6301,14 @@ mod tests {
             super::FoldFrame::UserUnwind(0x1020),
             super::FoldFrame::UserUnwind(0x1020),
         ]);
-        let mut output = super::FoldedOutput::new(Some(&mut cache), true);
+        let mut output = super::FoldedOutput::new(
+            Some(&mut cache),
+            super::FoldOptions {
+                inline: true,
+                ..Default::default()
+            },
+            0,
+        );
         for _ in 0..2 {
             output.write_sample_event(&state, &sample).unwrap();
         }
@@ -5965,7 +6329,14 @@ mod tests {
             let mut state = super::SessionState::new(std::collections::BTreeMap::new());
             let resolver = RecordingFrameResolver::default();
             let mut cache = SymbolFrameCache::new(&resolver);
-            let mut output = super::FoldedOutput::new(Some(&mut cache), inline);
+            let mut output = super::FoldedOutput::new(
+                Some(&mut cache),
+                super::FoldOptions {
+                    inline,
+                    ..Default::default()
+                },
+                0,
+            );
             let sample = prepared_sample(&[super::FoldFrame::UserUnwind(0x1010)]);
             for path in ["/bin/first", "/bin/replacement"] {
                 state
@@ -6133,6 +6504,50 @@ mod tests {
     }
 
     #[test]
+    fn perf_script_header_padding_counts_utf8_bytes_like_perf_printf() {
+        // builtin-script.c:perf_sample__fprintf_start uses %16s for comm;
+        // process_event uses %*s for evname. Both widths count bytes, not chars.
+        for (comm, event) in [
+            ("worker", "\u{e9}"),
+            ("\u{e9}", "cycles"),
+            ("\u{4e2d}\u{6587}", "\u{4e2d}\u{6587}"),
+        ] {
+            let mut state = super::SessionState::new(std::collections::BTreeMap::new());
+            state.thread_comms.insert(7, comm.into());
+            let mut sample = prepared_sample(&[]);
+            sample.time = Some(1_000_000_000);
+            sample.event_name = event;
+            sample.count = 5;
+            let mut actual = Vec::new();
+            let mut output = super::PerfScriptOutput::<super::NoopSymbolResolver, _> {
+                symbol_cache: None,
+                writer: &mut actual,
+                event_name_width: event.len(),
+                inline: false,
+            };
+            output.write_sample_inline_header(&state, &sample).unwrap();
+            let expected = format!(
+                "{}{comm} {:>7} {:>5}.000000: {:>10} {event}:  ",
+                " ".repeat(16_usize.saturating_sub(comm.len())),
+                7,
+                1,
+                5
+            );
+            assert_eq!(actual, expected.as_bytes());
+            actual.clear();
+            let mut output = super::PerfScriptOutput::<super::NoopSymbolResolver, _> {
+                symbol_cache: None,
+                writer: &mut actual,
+                event_name_width: event.len(),
+                inline: false,
+            };
+            output.write_sample_header(&state, &sample).unwrap();
+            let expected = format!("{comm} {:>7} {:>5}.000000: {:>10} {event}: \n", 7, 1, 5);
+            assert_eq!(actual, expected.as_bytes());
+        }
+    }
+
+    #[test]
     fn prepared_samples_borrow_event_names_until_deferred_ownership_is_needed() {
         let layouts = metadata_test_layouts();
         let stored_name = &layouts.fallback.as_ref().unwrap().event_name;
@@ -6205,7 +6620,14 @@ mod tests {
         // Inferno after_event() counts final normalized stacks. Distinct raw
         // addresses that all print [unknown] must not build a raw-IP arena.
         let state = super::SessionState::new(std::collections::BTreeMap::new());
-        let mut output = super::FoldedOutput::<super::NoopSymbolResolver>::new(None, false);
+        let mut output = super::FoldedOutput::<super::NoopSymbolResolver>::new(
+            None,
+            super::FoldOptions {
+                inline: false,
+                ..Default::default()
+            },
+            0,
+        );
         for _ in 0..2 {
             for address in 1..=4096 {
                 output
@@ -6237,7 +6659,14 @@ mod tests {
         use super::SampleOutput as _;
         let mut state = super::SessionState::new(std::collections::BTreeMap::new());
         state.thread_comms.insert(7, "pyroclast".into());
-        let mut output = super::FoldedOutput::<super::NoopSymbolResolver>::new(None, false);
+        let mut output = super::FoldedOutput::<super::NoopSymbolResolver>::new(
+            None,
+            super::FoldOptions {
+                inline: false,
+                ..Default::default()
+            },
+            0,
+        );
         for path in ["/tmp/perf.data", "/bin/demo"] {
             state
                 .mmap_table
@@ -7534,6 +7963,91 @@ mod tests {
     }
 
     #[test]
+    fn newline_dso_rows_match_native_inferno_instead_of_sanitizing_paths() {
+        for path in [
+            "/tmp/a\r\nb.so",
+            "/tmp/a\n0010 injected (/bin/n)",
+            "/tmp/a\n\nworker 7 1.000000: 2 cpu-clock:\n 1000 injected (/x)",
+        ] {
+            assert_path_rows_match_native_inferno(path, false);
+        }
+    }
+
+    #[test]
+    fn resolved_symbols_in_space_containing_dso_paths_follow_infernos_row_parser() {
+        for path in ["/tmp/a b.so", "/tmp/a (nested)", "/tmp/a\nb.so"] {
+            assert_path_rows_match_native_inferno(path, true);
+        }
+    }
+
+    fn assert_path_rows_match_native_inferno(path: &str, has_symbol: bool) {
+        use super::SampleOutput as _;
+        use inferno::collapse::Collapse as _;
+        // perf map.c:map__fprintf_dsoname prints path verbatim. Inferno
+        // process_single_stack reads lines, then stack_line_parts uses the
+        // final literal space, even when that space came from the DSO name.
+        let mut state = super::SessionState::new(std::collections::BTreeMap::new());
+        state.thread_comms.insert(7, "worker".into());
+        for (start, path) in [(0x1000, path), (0x2000, "/bin/normal")] {
+            state
+                .mmap_table
+                .insert_mmap(crate::perfdata::records::MmapRecord {
+                    pid: 7,
+                    tid: 7,
+                    start,
+                    len: 0x100,
+                    pgoff: 0,
+                    path: path.into(),
+                });
+        }
+        let resolver = StaticFrameResolver {
+            frames: if has_symbol {
+                vec!["entry".into()]
+            } else {
+                Vec::new()
+            },
+            has_base_symbol: has_symbol,
+            has_inline_frames: false,
+            has_non_inline_base_frame: has_symbol,
+            base_offset: has_symbol.then_some(0x10),
+        };
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let mut direct = super::FoldedOutput::new(
+            Some(&mut cache),
+            super::FoldOptions {
+                count_periods: true,
+                inline: false,
+            },
+            9,
+        );
+        let frames = [
+            super::FoldFrame::UserUnwind(0x1010),
+            super::FoldFrame::UserUnwind(0x2010),
+        ];
+        let mut sample = prepared_sample(&frames);
+        sample.time = Some(1_000_000_000);
+        direct.write_sample_event(&state, &sample).unwrap();
+        let mut script = Vec::new();
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let mut text = super::PerfScriptOutput {
+            symbol_cache: Some(&mut cache),
+            writer: &mut script,
+            event_name_width: 9,
+            inline: false,
+        };
+        text.write_sample_event(&state, &sample).unwrap();
+        let mut options = inferno::collapse::perf::Options::default();
+        options.nthreads = 1;
+        let mut expected = Vec::new();
+        inferno::collapse::perf::Folder::from(options)
+            .collapse(std::io::Cursor::new(script), &mut expected)
+            .unwrap();
+        let mut actual = Vec::new();
+        super::write_fold_counts(direct.buffers.counts, &mut actual).unwrap();
+        assert_eq!(actual, expected, "path {path:?}, has_symbol {has_symbol}");
+    }
+
+    #[test]
     fn module_fallback_uses_literal_basename_and_normalization_like_native_inferno() {
         use super::SampleOutput as _;
         use inferno::collapse::Collapse as _;
@@ -7543,7 +8057,14 @@ mod tests {
         state.thread_comms.insert(7, "worker".into());
         let resolver = super::NoopSymbolResolver;
         let mut cache = SymbolFrameCache::new(&resolver);
-        let mut output = super::FoldedOutput::new(Some(&mut cache), true);
+        let mut output = super::FoldedOutput::new(
+            Some(&mut cache),
+            super::FoldOptions {
+                inline: true,
+                ..Default::default()
+            },
+            0,
+        );
         for path in [
             "/usr/lib/demo.so",
             "/tmp/demo/",

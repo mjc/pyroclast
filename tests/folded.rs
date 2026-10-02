@@ -35,6 +35,21 @@ fn renders_inferno_perf_inlined_arrow_suffixes() {
 }
 
 #[test]
+fn leading_empty_inline_segment_is_preserved_like_infernos_stack_join() {
+    // Inferno perf.rs:on_stack_line pushes the empty first arrow segment;
+    // after_event joins by position, not by testing serialized text length.
+    assert_eq!(
+        render_inferno_perf_folded_stack(["->inner"], 1),
+        ";inner_[i] 1"
+    );
+}
+
+#[test]
+fn renders_empty_folded_segments_by_position() {
+    assert_eq!(render_folded_stack(["", "leaf", ""], 7), ";leaf; 7");
+}
+
+#[test]
 fn renders_inferno_perf_tidy_generic_names() {
     let stack = render_inferno_perf_folded_stack(
         [
@@ -175,8 +190,8 @@ proptest! {
         let rendered = render_folded_stack(frames.iter().map(String::as_str), count);
         let (stack, rendered_count) = rendered.rsplit_once(' ').expect("count suffix");
         let mut expected_stack = String::new();
-        for frame in &frames {
-            if !expected_stack.is_empty() {
+        for (index, frame) in frames.iter().enumerate() {
+            if index != 0 {
                 expected_stack.push(';');
             }
             expected_stack.push_str(&escape_frame(frame));

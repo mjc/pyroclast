@@ -43,7 +43,7 @@ fn fold_benchmark_reports_folded_output_size() {
 }
 
 #[test]
-fn fold_benchmark_weights_perf_sample_periods() {
+fn fold_benchmark_uses_infernos_unit_weight_for_untimed_period_samples() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
     std::fs::write(
@@ -64,7 +64,7 @@ fn fold_benchmark_weights_perf_sample_periods() {
 
     let report = run_fold_benchmark(&perfdata).expect("benchmark");
 
-    assert_eq!(report.folded_bytes, ":2;[unknown] 144\n".len());
+    assert_eq!(report.folded_bytes, ":2;[unknown] 1\n".len());
 }
 
 #[test]

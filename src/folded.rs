@@ -51,8 +51,9 @@ pub(crate) fn render_inferno_perf_raw_stack_into<'a>(
     scratch: &mut String,
 ) {
     rendered.clear();
+    let mut has_segment = false;
     for frame in frames {
-        append_inferno_perf_raw_function(rendered, frame, scratch);
+        has_segment |= append_inferno_perf_raw_function(rendered, frame, scratch, has_segment);
     }
 }
 
@@ -60,7 +61,8 @@ pub(crate) fn append_inferno_perf_raw_function(
     rendered: &mut String,
     mut frame: &str,
     scratch: &mut String,
-) {
+    has_prefix: bool,
+) -> bool {
     if let Some(offset) = memchr::memrchr(b'+', frame.as_bytes())
         && frame[offset..].starts_with("+0x")
     {
@@ -70,7 +72,7 @@ pub(crate) fn append_inferno_perf_raw_function(
         }
     }
     if frame.starts_with('(') {
-        return;
+        return false;
     }
     // Inferno perf.rs:on_stack_line fixes Rust hashes before any tidy fast path.
     let fixed_frame = fix_partially_demangled_rust_symbol(frame);
@@ -79,18 +81,19 @@ pub(crate) fn append_inferno_perf_raw_function(
         && memchr::memchr2(b'\n', b'\r', frame.as_bytes()).is_none()
         && !frame.contains("->")
     {
-        append_separator(rendered);
+        append_separator(rendered, has_prefix);
         rendered.push_str(frame);
-        return;
+        return true;
     }
     for (index, part) in frame.split("->").enumerate() {
-        append_separator(rendered);
+        append_separator(rendered, has_prefix || index != 0);
         tidy_inferno_perf_generic_into(scratch, part);
         if index > 0 && !scratch.contains("_[i]") {
             scratch.push_str("_[i]");
         }
         escape_frame_into(rendered, scratch);
     }
+    true
 }
 
 fn fix_partially_demangled_rust_symbol(symbol: &str) -> Cow<'_, str> {
@@ -170,15 +173,19 @@ fn rust_symbol_escape(rest: &str) -> Option<(&'static str, &'static str)> {
     .find(|(encoded, _)| rest.starts_with(encoded))
 }
 
-pub(crate) fn append_inferno_perf_folded_label(rendered: &mut String, frame: &str) {
-    append_separator(rendered);
+pub(crate) fn append_inferno_perf_folded_label(
+    rendered: &mut String,
+    frame: &str,
+    has_prefix: bool,
+) {
+    append_separator(rendered, has_prefix);
     escape_frame_into(rendered, frame);
 }
 
 fn render_folded_stack_into<'a>(rendered: &mut String, frames: impl IntoIterator<Item = &'a str>) {
     rendered.clear();
-    for frame in frames {
-        append_separator(rendered);
+    for (index, frame) in frames.into_iter().enumerate() {
+        append_separator(rendered, index != 0);
         escape_frame_into(rendered, frame);
     }
 }
@@ -239,8 +246,9 @@ pub(crate) fn append_escaped_spans(escaped: &mut String, frame: &str, semicolon:
     escaped.push_str(&frame[start..]);
 }
 
-pub(crate) fn append_separator(rendered: &mut String) {
-    if !rendered.is_empty() {
+pub(crate) fn append_separator(rendered: &mut String, has_prefix: bool) {
+    // Inferno after_event joins logical segments, including empty strings.
+    if has_prefix || !rendered.is_empty() {
         rendered.push(';');
     }
 }

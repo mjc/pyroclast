@@ -922,7 +922,7 @@ fn flamegraph_command_folds_perfdata_without_perf_script() {
 }
 
 #[test]
-fn flamegraph_command_weights_perf_sample_periods() {
+fn flamegraph_command_uses_infernos_unit_weight_for_untimed_period_samples() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
     let output_svg = root.path().join("flamegraph.svg");
@@ -940,7 +940,7 @@ fn flamegraph_command_weights_perf_sample_periods() {
 
     pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("flamegraph command");
 
-    assert_eq!(runner.stdins(), vec![Some(b":2;[unknown] 144\n".to_vec())]);
+    assert_eq!(runner.stdins(), vec![Some(b":2;[unknown] 1\n".to_vec())]);
 }
 
 #[test]
