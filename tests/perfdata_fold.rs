@@ -2705,6 +2705,87 @@ fn without_sample_id_all_metadata_and_timed_samples_follow_native_input_order() 
 
 #[cfg(target_os = "linux")]
 #[test]
+fn comment_comm_headers_follow_native_inferno_line_skipping() {
+    for name in ["#worker", " #worker", "worker#task"] {
+        assert_structural_comm_matches_native_stream(name);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn newline_comm_headers_follow_native_inferno_line_boundaries() {
+    assert_structural_comm_matches_native_stream("worker\ntask");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn blank_lines_in_comm_headers_follow_native_inferno_event_boundaries() {
+    assert_structural_comm_matches_native_stream("worker\n\ntask");
+}
+
+#[cfg(target_os = "linux")]
+fn assert_structural_comm_matches_native_stream(name: &str) {
+    // builtin-script.c:perf_sample__fprintf_start prints comm with %s.
+    // Inferno process_single_stack ignores # lines and splits at newlines;
+    // after_event does not clear pname, so the preceding header matters.
+    for (time, sample_id_all) in [
+        (0_u64, false),
+        (0, true),
+        (1_000_000_000, false),
+        (1_000_000_000, true),
+    ] {
+        let mut records = Vec::new();
+        for (comm, period) in [("before", 3), (name, 7), ("after", 11)] {
+            let mut payload = comm_payload(11, 12, comm);
+            payload.resize(payload.len().next_multiple_of(8), 0);
+            if sample_id_all {
+                payload.extend_from_slice(&11_u32.to_le_bytes());
+                payload.extend_from_slice(&12_u32.to_le_bytes());
+                payload.extend_from_slice(&time.to_le_bytes());
+            }
+            records.push(record_bytes(3, &payload));
+            let mut sample = sample_payload_with_optional_timestamp(
+                sample_payload_with_period(0x2000, 11, 12, period, [0x2000]),
+                true,
+            );
+            put_u64(&mut sample, 16, time);
+            records.push(record_bytes_with_misc(
+                PERF_RECORD_SAMPLE,
+                PERF_RECORD_MISC_CPUMODE_USER,
+                &sample,
+            ));
+        }
+        let bytes = perfdata_with_records_and_attrs_vec(
+            vec![file_attr_bytes_with_flags(
+                PERF_SAMPLE_IP
+                    | PERF_SAMPLE_TID
+                    | PERF_SAMPLE_TIME
+                    | PERF_SAMPLE_PERIOD
+                    | PERF_SAMPLE_CALLCHAIN,
+                if sample_id_all { 1 << 18 } else { 0 },
+            )],
+            records,
+        );
+        let (script, expected) = native_script_and_fold(&bytes);
+        let options = FoldOptions {
+            count_periods: true,
+            inline: false,
+        };
+        let actual = fold_perfdata_callchains_with_options(&bytes, options).expect("fold");
+        assert_eq!(actual, expected, "comm={name:?}; native script={script}");
+        let root = tempfile::tempdir().expect("tempdir");
+        let input = root.path().join("perf.data");
+        std::fs::write(&input, bytes).expect("write fixture");
+        assert_eq!(
+            fold_perfdata_file_with_options(&input, options).expect("fold file"),
+            expected,
+            "comm={name:?}; native script={script}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn timed_sample_ip_with_a_newline_dso_preserves_inferno_state_across_samples() {
     use inferno::collapse::Collapse as _;
     // Inferno process_single_stack doesn't reset in_event at sample boundaries;

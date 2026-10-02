@@ -840,27 +840,43 @@ where
     let layouts = sample_layouts(bytes, header)?;
     let arch = perf_arch_from_header(parse_header_arch(bytes, &header)?.as_deref());
     let state = SessionState::new(header_build_ids_by_filename(bytes)?).with_arch(arch);
-    if layouts_require_stream_parser(&layouts) {
-        return collect_stream_fold_counts(
-            &mut SliceSource(bytes),
-            header,
-            &layouts,
-            state,
-            options,
-            symbol_cache,
-        );
+    collect_fold_counts_from_source(
+        &mut SliceSource(bytes),
+        header,
+        &layouts,
+        state,
+        options,
+        symbol_cache,
+    )
+}
+
+fn collect_fold_counts_from_source<R: SymbolResolver>(
+    source: &mut impl RecordSource,
+    header: PerfHeader,
+    layouts: &SampleLayouts,
+    state: SessionState,
+    options: FoldOptions,
+    symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+) -> Result<FoldCounts, String> {
+    if layouts_require_stream_parser(layouts) {
+        return collect_stream_fold_counts(source, header, layouts, state, options, symbol_cache);
     }
     let mut sink = SampleSink::new(
         state,
         FoldedOutput::new(symbol_cache, options, layouts.event_name_width),
     );
-    replay_records(
-        &mut SliceSource(bytes),
-        header,
-        &layouts,
-        options,
-        &mut sink,
-    )?;
+    replay_records(source, header, layouts, options, &mut sink)?;
+    if sink.output.requires_stream_parser {
+        // No counts have been emitted yet. Replay with fresh metadata and one
+        // Inferno parser so a structural header cannot leak per-event state.
+        let cache = sink.output.symbol_cache.take();
+        let state = {
+            let previous = sink.accumulator;
+            SessionState::new(previous.header_build_ids).with_arch(previous.arch)
+        };
+        drop(sink.output);
+        return collect_stream_fold_counts(source, header, layouts, state, options, cache);
+    }
     Ok(sink.output.buffers.counts)
 }
 
@@ -1027,29 +1043,15 @@ where
     W: IoWrite + ?Sized,
 {
     let (header, layouts, state) = file_replay_state(file)?;
-    if layouts_require_stream_parser(&layouts) {
-        let counts = collect_stream_fold_counts(
-            &mut FileSource::new(file)?,
-            header,
-            &layouts,
-            state,
-            options,
-            symbol_cache,
-        )?;
-        return write_fold_counts(counts, writer);
-    }
-    let mut sink = SampleSink::new(
-        state,
-        FoldedOutput::new(symbol_cache, options, layouts.event_name_width),
-    );
-    replay_records(
+    let counts = collect_fold_counts_from_source(
         &mut FileSource::new(file)?,
         header,
         &layouts,
+        state,
         options,
-        &mut sink,
+        symbol_cache,
     )?;
-    write_fold_counts(sink.output.buffers.counts, writer)
+    write_fold_counts(counts, writer)
 }
 
 fn write_inferno_perf_script_from_file<R, W>(
@@ -1088,6 +1090,7 @@ struct FoldedOutput<'a, 'cache, R> {
     count_periods: bool,
     event_name_width: usize,
     event_filter: Option<Box<str>>,
+    requires_stream_parser: bool,
     header_scratch: Vec<u8>,
     buffers: FoldedRenderBuffers,
 }
@@ -1104,6 +1107,7 @@ impl<'a, 'cache, R: SymbolResolver> FoldedOutput<'a, 'cache, R> {
             count_periods: options.count_periods,
             event_name_width,
             event_filter: None,
+            requires_stream_parser: false,
             header_scratch: Vec::new(),
             buffers: FoldedRenderBuffers::default(),
         }
@@ -1234,7 +1238,19 @@ impl<R: SymbolResolver> SampleOutput for FoldedOutput<'_, '_, R> {
         accumulator: &SessionState,
         sample: &PreparedFoldSample,
     ) -> Result<(), String> {
+        if self.requires_stream_parser {
+            return Ok(());
+        }
         let mut comm = comm_for_ids(&accumulator.thread_comms, sample.tid);
+        // perf_sample__fprintf_start prints comm verbatim. Inferno's
+        // process_single_stack skips # lines and read_until splits at LF.
+        // These are stream syntax, not characters in a folded comm label.
+        if let Some(SampleComm::Name(name)) = comm
+            && (name.starts_with('#') || name.contains('\n'))
+        {
+            self.requires_stream_parser = true;
+            return Ok(());
+        }
         let (event, count, combined_frame) = if let Some(SampleComm::Name(name)) = comm
             && inferno_numeric_header_word(name).is_some()
         {
