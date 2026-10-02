@@ -466,7 +466,6 @@ struct PerfDwarfFrameRange {
     frames: Arc<[PerfDwarfNameId]>,
     has_inline_frames: bool,
     has_source_line: bool,
-    has_inline_children: bool,
     order: usize,
 }
 
@@ -2607,6 +2606,7 @@ struct PerfSymbolCandidate {
     name: String,
     address: u64,
     size: u64,
+    elf_type: Option<u8>,
     scope: PerfSymbolScope,
     binding: PerfSymbolBinding,
     bfd_function_like: bool,
@@ -2636,6 +2636,23 @@ fn perf_symbol_is_candidate(object: &object::File<'_>, symbol: &object::Symbol<'
             SymbolKind::Text | SymbolKind::Data | SymbolKind::Label | SymbolKind::Unknown
         );
     };
+    // perf rejects mapping markers before inserting them into the symbol tree.
+    let name = symbol.name().unwrap_or_default().as_bytes();
+    if let [b'$', marker, suffix @ ..] = name {
+        let is_mapping_marker = match object.architecture() {
+            object::Architecture::Arm | object::Architecture::Aarch64 => {
+                matches!(marker, b'a' | b'd' | b't' | b'x')
+                    && (suffix.is_empty() || suffix.first() == Some(&b'.'))
+            }
+            object::Architecture::Riscv32 | object::Architecture::Riscv64 => {
+                matches!(marker, b'd' | b'x')
+            }
+            _ => false,
+        };
+        if is_mapping_marker {
+            return false;
+        }
+    }
     // perf util/symbol-elf.c:elf_sym__is_label/elf_sym__filter and dso__load_sym:
     // FUNC/IFUNC/OBJECT may be hidden, but NOTYPE labels may not. All require
     // an allocated section; labels additionally need a text/data section name.
@@ -2685,13 +2702,23 @@ fn perf_best_duplicate_symbol<'a>(
     current: &'a PerfSymbolCandidate,
     candidate: &'a PerfSymbolCandidate,
 ) -> &'a PerfSymbolCandidate {
-    // tools/perf/util/symbol.c choose_best_symbol(): size, non-weak, global,
-    // fewer leading underscores, then longest name.
+    // tools/perf/util/symbol.c choose_best_symbol(): size, typed, non-weak,
+    // global, fewer leading underscores, then longest name.
     if current.size == 0 && candidate.size > 0 {
         return candidate;
     }
     if candidate.size == 0 && current.size > 0 {
         return current;
+    }
+    if let (Some(current_type), Some(candidate_type)) = (current.elf_type, candidate.elf_type)
+        && current_type != candidate_type
+    {
+        if current_type == object::elf::STT_NOTYPE {
+            return candidate;
+        }
+        if candidate_type == object::elf::STT_NOTYPE {
+            return current;
+        }
     }
     if candidate.binding == PerfSymbolBinding::Weak && current.binding != PerfSymbolBinding::Weak {
         return current;
@@ -2971,6 +2998,7 @@ fn perf_synthesized_plt_symbols(
             name: ".plt".to_string(),
             address: plt.file_range().map_or(plt.address(), |(offset, _)| offset),
             size: X86_64_PLT_ENTRY_SIZE,
+            elf_type: Some(object::elf::STT_FUNC),
             scope: PerfSymbolScope::Global,
             binding: PerfSymbolBinding::Global,
             bfd_function_like: true,
@@ -2994,6 +3022,7 @@ fn perf_synthesized_plt_symbols(
             name,
             address: plt_offset,
             size: X86_64_PLT_ENTRY_SIZE,
+            elf_type: Some(object::elf::STT_FUNC),
             scope: PerfSymbolScope::Global,
             binding: PerfSymbolBinding::Global,
             bfd_function_like: true,
@@ -3096,6 +3125,10 @@ fn perf_symbol_candidate_from_object_symbol(
         )),
         address: symbol.address(),
         size: symbol.size(),
+        elf_type: match symbol.flags() {
+            object::SymbolFlags::Elf { st_info, .. } => Some(st_info & 0xf),
+            _ => None,
+        },
         scope: if symbol.is_global() {
             PerfSymbolScope::Global
         } else {
@@ -3511,12 +3544,6 @@ fn perf_dwarf_ranges_contain(ranges: &[PerfAddressRange], address: u64) -> bool 
         .any(|range| range.begin <= address && address < range.end)
 }
 
-fn perf_dwarf_ranges_overlap(ranges: &[PerfAddressRange], range: &PerfAddressRange) -> bool {
-    ranges
-        .iter()
-        .any(|other| other.begin < range.end && range.begin < other.end)
-}
-
 fn perf_dwarf_frame_ranges_from_roots(
     roots: &[PerfDwarfDieNode],
     source_line_ranges: &[PerfAddressRange],
@@ -3548,10 +3575,6 @@ fn perf_dwarf_collect_frame_ranges(
 ) -> Vec<PerfAddressRange> {
     let frames = perf_dwarf_node_frames(parent_frames, node.name);
     let has_inline_frames = parent_has_inline_frames || node.kind == PerfDwarfDieKind::Inline;
-    let has_inline_children = node
-        .children
-        .iter()
-        .any(|child| child.kind == PerfDwarfDieKind::Inline);
     let mut child_coverage = Vec::new();
     for child in &node.children {
         if child.kind == PerfDwarfDieKind::Subprogram {
@@ -3571,14 +3594,30 @@ fn perf_dwarf_collect_frame_ranges(
         for range in perf_dwarf_subtract_ranges(&node.ranges, &child_coverage) {
             let order = *next_order;
             *next_order += 1;
-            out.push(PerfDwarfFrameRange {
-                range,
-                frames: frames.clone(),
-                has_inline_frames,
-                has_source_line: perf_dwarf_ranges_overlap(source_line_ranges, &range),
-                has_inline_children,
-                order,
-            });
+            // libdw requires a source line at the queried address, not merely
+            // somewhere in this DIE. Split coverage once during preparation.
+            let first_line = source_line_ranges.partition_point(|line| line.end <= range.begin);
+            let covered = source_line_ranges[first_line..]
+                .iter()
+                .take_while(|line| line.begin < range.end)
+                .map(|line| PerfAddressRange {
+                    begin: line.begin.max(range.begin),
+                    end: line.end.min(range.end),
+                })
+                .collect::<Vec<_>>();
+            for (range, has_source_line) in perf_dwarf_subtract_ranges(&[range], &covered)
+                .into_iter()
+                .map(|range| (range, false))
+                .chain(covered.into_iter().map(|range| (range, true)))
+            {
+                out.push(PerfDwarfFrameRange {
+                    range,
+                    frames: frames.clone(),
+                    has_inline_frames,
+                    has_source_line,
+                    order,
+                });
+            }
         }
     }
 
@@ -3687,7 +3726,6 @@ fn perf_dwarf_frame_names_from_index(
     let mut has_inline_frames = segment.has_inline_frames;
     if !has_inline_frames {
         let replaces_base_symbol = segment.has_source_line
-            && segment.has_inline_children
             && base_symbol.is_some_and(|base_symbol| {
                 frames
                     .last()
@@ -4364,6 +4402,7 @@ mod tests {
             name: "__read".to_string(),
             address: 0x1000,
             size: 128,
+            elf_type: Some(object::elf::STT_FUNC),
             scope: PerfSymbolScope::Global,
             binding: PerfSymbolBinding::Global,
             bfd_function_like: true,
@@ -4374,6 +4413,7 @@ mod tests {
             name: "read".to_string(),
             address: 0x1000,
             size: 128,
+            elf_type: Some(object::elf::STT_FUNC),
             scope: PerfSymbolScope::Global,
             binding: PerfSymbolBinding::Global,
             bfd_function_like: true,
@@ -4393,6 +4433,7 @@ mod tests {
             name: "__libc_read".to_string(),
             address: 0x1000,
             size: 128,
+            elf_type: Some(object::elf::STT_FUNC),
             scope: PerfSymbolScope::Local,
             binding: PerfSymbolBinding::Global,
             bfd_function_like: true,
@@ -4403,6 +4444,7 @@ mod tests {
             name: "read".to_string(),
             address: 0x1000,
             size: 128,
+            elf_type: Some(object::elf::STT_FUNC),
             scope: PerfSymbolScope::Global,
             binding: PerfSymbolBinding::Global,
             bfd_function_like: true,
@@ -4425,6 +4467,7 @@ mod tests {
             name: "__libc_recv".to_string(),
             address: 0x1000,
             size: 47,
+            elf_type: Some(object::elf::STT_FUNC),
             scope: PerfSymbolScope::Local,
             binding: PerfSymbolBinding::Global,
             bfd_function_like: true,
@@ -4435,6 +4478,7 @@ mod tests {
             name: "recv".to_string(),
             address: 0x1000,
             size: 47,
+            elf_type: Some(object::elf::STT_FUNC),
             scope: PerfSymbolScope::Global,
             binding: PerfSymbolBinding::Weak,
             bfd_function_like: true,
@@ -4448,6 +4492,273 @@ mod tests {
         );
     }
 
+    fn elf_with_text_symbol_fixtures(
+        machine: u16,
+        symbols: &[(&'static [u8], u64, u64, u8, u8)],
+    ) -> Vec<u8> {
+        let mut builder =
+            build::elf::Builder::new(object::Endianness::Little, machine != elf::EM_ARM);
+        builder.header.e_type = elf::ET_EXEC;
+        builder.header.e_machine = machine;
+        let section = builder.sections.add();
+        section.name = b".shstrtab"[..].into();
+        section.sh_type = elf::SHT_STRTAB;
+        section.data = build::elf::SectionData::SectionString;
+        let section = builder.sections.add();
+        section.name = b".text"[..].into();
+        section.sh_type = elf::SHT_PROGBITS;
+        section.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_EXECINSTR);
+        section.sh_addr = 0x1000;
+        section.sh_addralign = 16;
+        section.data = build::elf::SectionData::Data(vec![0; 64].into());
+        let text = section.id();
+        let section = builder.sections.add();
+        section.name = b".symtab"[..].into();
+        section.sh_type = elf::SHT_SYMTAB;
+        section.sh_addralign = 8;
+        section.data = build::elf::SectionData::Symbol;
+        let section = builder.sections.add();
+        section.name = b".strtab"[..].into();
+        section.sh_type = elf::SHT_STRTAB;
+        section.data = build::elf::SectionData::String;
+        for &(name, address, size, binding, symbol_type) in symbols {
+            let symbol = builder.symbols.add();
+            symbol.name = name.into();
+            symbol.st_value = address;
+            symbol.st_size = size;
+            symbol.set_st_info(binding, symbol_type);
+            symbol.section = Some(text);
+        }
+        builder.set_section_sizes();
+        let mut bytes = Vec::new();
+        builder.write(&mut bytes).expect("write symbol fixture ELF");
+        bytes
+    }
+
+    #[test]
+    fn symbol_parity_typed_alias_precedes_binding_and_name_ties() {
+        // perf symbol.c:choose_best_symbol prefers typed symbols even when
+        // they are weak, local, shorter, or more heavily underscored.
+        for symbol_type in [elf::STT_FUNC, elf::STT_GNU_IFUNC, elf::STT_OBJECT] {
+            for binding in [elf::STB_LOCAL, elf::STB_GLOBAL, elf::STB_WEAK] {
+                let bytes = elf_with_text_symbol_fixtures(
+                    elf::EM_X86_64,
+                    &[
+                        (b"__f", 0x1000, 16, binding, symbol_type),
+                        (b"long_label", 0x1000, 16, elf::STB_GLOBAL, elf::STT_NOTYPE),
+                    ],
+                );
+                let object = object::File::parse(bytes.as_slice()).unwrap();
+                let candidates: Vec<_> = object
+                    .symbols()
+                    .filter_map(|symbol| {
+                        super::perf_symbol_candidate_from_object_symbol(&object, &symbol)
+                    })
+                    .collect();
+                assert_eq!(candidates.len(), 2);
+                for (left, right) in [(0, 1), (1, 0)] {
+                    assert_eq!(
+                        perf_best_duplicate_symbol(&candidates[left], &candidates[right]).name,
+                        "__f",
+                        "type {symbol_type}, binding {binding}"
+                    );
+                }
+                let index = PerfObjectSymbolIndex::from_object_bytes(&bytes);
+                assert_eq!(index.symbol_name(0x1000), Some("__f"));
+                assert_eq!(index.symbol_name(0x1008), Some("__f"));
+            }
+        }
+    }
+
+    #[test]
+    fn symbol_parity_duplicate_size_precedes_type_and_equal_types_keep_tie_rules() {
+        for (left_size, right_size, left_binding, right_binding, left_type, right_type, expected) in [
+            (
+                0,
+                16,
+                elf::STB_GLOBAL,
+                elf::STB_GLOBAL,
+                elf::STT_FUNC,
+                elf::STT_NOTYPE,
+                "bbb",
+            ),
+            (
+                16,
+                0,
+                elf::STB_GLOBAL,
+                elf::STB_GLOBAL,
+                elf::STT_NOTYPE,
+                elf::STT_FUNC,
+                "aaa",
+            ),
+            (
+                16,
+                16,
+                elf::STB_LOCAL,
+                elf::STB_WEAK,
+                elf::STT_FUNC,
+                elf::STT_FUNC,
+                "aaa",
+            ),
+            (
+                16,
+                16,
+                elf::STB_LOCAL,
+                elf::STB_GLOBAL,
+                elf::STT_NOTYPE,
+                elf::STT_NOTYPE,
+                "bbb",
+            ),
+            (
+                16,
+                16,
+                elf::STB_WEAK,
+                elf::STB_LOCAL,
+                elf::STT_NOTYPE,
+                elf::STT_NOTYPE,
+                "bbb",
+            ),
+        ] {
+            let bytes = elf_with_text_symbol_fixtures(
+                elf::EM_X86_64,
+                &[
+                    (b"aaa", 0x1000, left_size, left_binding, left_type),
+                    (b"bbb", 0x1000, right_size, right_binding, right_type),
+                ],
+            );
+            let object = object::File::parse(bytes.as_slice()).unwrap();
+            let candidates: Vec<_> = object
+                .symbols()
+                .filter_map(|symbol| {
+                    super::perf_symbol_candidate_from_object_symbol(&object, &symbol)
+                })
+                .collect();
+            for (left, right) in [(0, 1), (1, 0)] {
+                assert_eq!(
+                    perf_best_duplicate_symbol(&candidates[left], &candidates[right]).name,
+                    expected
+                );
+            }
+        }
+        let bytes = elf_with_text_symbol_fixtures(
+            elf::EM_X86_64,
+            &[
+                (b"aaa", 0x1000, 16, elf::STB_GLOBAL, elf::STT_FUNC),
+                (b"bbb", 0x1000, 16, elf::STB_GLOBAL, elf::STT_FUNC),
+            ],
+        );
+        assert_eq!(
+            PerfObjectSymbolIndex::from_object_bytes(&bytes).symbol_name(0x1008),
+            Some("aaa")
+        );
+    }
+
+    #[test]
+    fn symbol_parity_duplicate_size_preference_uses_native_end_fixup_order() {
+        // symbol-elf.c fixes ends before duplicates. The earlier zero-sized
+        // alias stays empty; the later one extends to the next start/page.
+        let function = (
+            b"function".as_slice(),
+            0x1000,
+            0,
+            elf::STB_GLOBAL,
+            elf::STT_FUNC,
+        );
+        let label = (
+            b"label".as_slice(),
+            0x1000,
+            16,
+            elf::STB_GLOBAL,
+            elf::STT_NOTYPE,
+        );
+        for with_next_symbol in [false, true] {
+            for (aliases, expected) in [
+                ([function, label], "label"),
+                ([label, function], "function"),
+            ] {
+                let mut fixtures = aliases.to_vec();
+                if with_next_symbol {
+                    fixtures.push((b"next", 0x1020, 16, elf::STB_GLOBAL, elf::STT_FUNC));
+                }
+                let bytes = elf_with_text_symbol_fixtures(elf::EM_X86_64, &fixtures);
+                let index = PerfObjectSymbolIndex::from_object_bytes(&bytes);
+                for address in [0x1000, 0x1008, 0x100f] {
+                    assert_eq!(
+                        index.symbol_name(address),
+                        Some(expected),
+                        "next symbol {with_next_symbol}, address {address:#x}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn symbol_parity_arm_mapping_markers_do_not_displace_functions() {
+        for machine in [elf::EM_ARM, elf::EM_AARCH64] {
+            for name in [b"$a".as_slice(), b"$d", b"$t", b"$x", b"$x.0", b"$d.123"] {
+                let bytes = elf_with_text_symbol_fixtures(
+                    machine,
+                    &[
+                        (b"function", 0x1000, 64, elf::STB_GLOBAL, elf::STT_FUNC),
+                        (name, 0x1010, 0, elf::STB_LOCAL, elf::STT_NOTYPE),
+                    ],
+                );
+                assert_eq!(
+                    PerfObjectSymbolIndex::from_object_bytes(&bytes).symbol_name(0x1014),
+                    Some("function"),
+                    "machine {machine}, name {name:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn symbol_parity_riscv_mapping_markers_do_not_displace_functions() {
+        for name in [b"$d".as_slice(), b"$x", b"$d.0", b"$xrv64i", b"$data"] {
+            let bytes = elf_with_text_symbol_fixtures(
+                elf::EM_RISCV,
+                &[
+                    (b"function", 0x1000, 64, elf::STB_GLOBAL, elf::STT_FUNC),
+                    (name, 0x1010, 0, elf::STB_LOCAL, elf::STT_NOTYPE),
+                ],
+            );
+            assert_eq!(
+                PerfObjectSymbolIndex::from_object_bytes(&bytes).symbol_name(0x1014),
+                Some("function"),
+                "name {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn symbol_parity_mapping_marker_filter_keeps_other_labels_and_architectures() {
+        for (machine, names) in [
+            (elf::EM_ARM, [b"$xLong".as_slice(), b"$aLong", b"$q", b"$"]),
+            (
+                elf::EM_AARCH64,
+                [b"$xLong".as_slice(), b"$dLong", b"$q", b"$"],
+            ),
+            (elf::EM_RISCV, [b"$a".as_slice(), b"$t", b"$q", b"$"]),
+            (
+                elf::EM_X86_64,
+                [b"$x".as_slice(), b"$d.0", b"$a", b"$xrv64i"],
+            ),
+        ] {
+            for name in names {
+                let bytes = elf_with_text_symbol_fixtures(
+                    machine,
+                    &[(name, 0x1000, 16, elf::STB_GLOBAL, elf::STT_NOTYPE)],
+                );
+                assert_eq!(
+                    PerfObjectSymbolIndex::from_object_bytes(&bytes).symbol_name(0x1008),
+                    Some(std::str::from_utf8(name).unwrap()),
+                    "machine {machine}, name {name:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn object_symbol_index_keeps_earlier_overlapping_symbol_candidates() {
         let symbols = PerfObjectSymbolIndex {
@@ -4456,6 +4767,7 @@ mod tests {
                     name: "large".to_string(),
                     address: 0x1000,
                     size: 0x1000,
+                    elf_type: Some(object::elf::STT_FUNC),
                     scope: PerfSymbolScope::Global,
                     binding: PerfSymbolBinding::Global,
                     bfd_function_like: true,
@@ -4466,6 +4778,7 @@ mod tests {
                     name: "small".to_string(),
                     address: 0x1800,
                     size: 0x10,
+                    elf_type: Some(object::elf::STT_FUNC),
                     scope: PerfSymbolScope::Global,
                     binding: PerfSymbolBinding::Global,
                     bfd_function_like: true,
@@ -4499,6 +4812,7 @@ mod tests {
             name: name.to_string(),
             address,
             size: 0x100,
+            elf_type: Some(object::elf::STT_FUNC),
             scope: PerfSymbolScope::Global,
             binding: PerfSymbolBinding::Global,
             bfd_function_like: true,
@@ -4541,6 +4855,7 @@ mod tests {
                     name: "recv".to_string(),
                     address: 0x1000,
                     size: 47,
+                    elf_type: Some(object::elf::STT_FUNC),
                     scope: PerfSymbolScope::Global,
                     binding: PerfSymbolBinding::Weak,
                     bfd_function_like: true,
@@ -4551,6 +4866,7 @@ mod tests {
                     name: "__libc_recv".to_string(),
                     address: 0x1000,
                     size: 47,
+                    elf_type: Some(object::elf::STT_FUNC),
                     scope: PerfSymbolScope::Local,
                     binding: PerfSymbolBinding::Global,
                     bfd_function_like: true,
@@ -4561,6 +4877,7 @@ mod tests {
                     name: "write".to_string(),
                     address: 0x2000,
                     size: 46,
+                    elf_type: Some(object::elf::STT_FUNC),
                     scope: PerfSymbolScope::Global,
                     binding: PerfSymbolBinding::Weak,
                     bfd_function_like: true,
@@ -4571,6 +4888,7 @@ mod tests {
                     name: "__GI___libc_write".to_string(),
                     address: 0x2000,
                     size: 46,
+                    elf_type: Some(object::elf::STT_FUNC),
                     scope: PerfSymbolScope::Local,
                     binding: PerfSymbolBinding::Global,
                     bfd_function_like: true,
@@ -4674,6 +4992,7 @@ mod tests {
                 name: "__syscall_cancel_arch".to_string(),
                 address: 0xa68f0,
                 size: 51,
+                elf_type: Some(object::elf::STT_FUNC),
                 scope: PerfSymbolScope::Local,
                 binding: PerfSymbolBinding::Global,
                 bfd_function_like: true,
@@ -4684,6 +5003,7 @@ mod tests {
                 name: "__syscall_cancel_arch_start".to_string(),
                 address: 0xa68f4,
                 size: 0,
+                elf_type: Some(object::elf::STT_NOTYPE),
                 scope: PerfSymbolScope::Local,
                 binding: PerfSymbolBinding::Global,
                 bfd_function_like: true,
@@ -4694,6 +5014,7 @@ mod tests {
                 name: "__syscall_cancel_arch_end".to_string(),
                 address: 0xa6922,
                 size: 0,
+                elf_type: Some(object::elf::STT_NOTYPE),
                 scope: PerfSymbolScope::Local,
                 binding: PerfSymbolBinding::Global,
                 bfd_function_like: true,
@@ -5209,6 +5530,67 @@ mod tests {
                 has_inline_frames: true,
             })
         );
+    }
+
+    #[test]
+    fn symbol_parity_single_function_die_with_line_replaces_base_without_children() {
+        let mut names = PerfDwarfNameInterner::default();
+        let segments = perf_dwarf_frame_ranges_from_roots(
+            &[PerfDwarfDieNode {
+                kind: PerfDwarfDieKind::Subprogram,
+                ranges: vec![test_range(0, 100)],
+                name: Some(names.intern("f".to_string())),
+                children: Vec::new(),
+            }],
+            &[test_range(0, 100)],
+        );
+        assert_eq!(
+            perf_dwarf_frame_names_from_index(&segments, &names.names, 15, Some("float")),
+            Some(PerfDwarfFrameNames {
+                frames: vec!["f".to_string()],
+                has_inline_frames: true,
+            })
+        );
+        assert_eq!(
+            perf_dwarf_frame_names_from_index(&segments, &names.names, 15, Some("f")),
+            None
+        );
+    }
+
+    #[test]
+    fn symbol_parity_realfunc_line_guard_checks_the_lookup_address() {
+        let mut names = PerfDwarfNameInterner::default();
+        let segments = perf_dwarf_frame_ranges_from_roots(
+            &[PerfDwarfDieNode {
+                kind: PerfDwarfDieKind::Subprogram,
+                ranges: vec![test_range(0, 100)],
+                name: Some(names.intern("f".to_string())),
+                children: vec![PerfDwarfDieNode {
+                    kind: PerfDwarfDieKind::Inline,
+                    ranges: vec![test_range(70, 80)],
+                    name: Some(names.intern("child".to_string())),
+                    children: Vec::new(),
+                }],
+            }],
+            &[test_range(20, 30), test_range(50, 60)],
+        );
+        for address in [0, 19, 30, 49, 60, 69, 80, 99, 100] {
+            assert_eq!(
+                perf_dwarf_frame_names_from_index(&segments, &names.names, address, Some("float")),
+                None,
+                "address {address}"
+            );
+        }
+        for address in [20, 29, 50, 59] {
+            assert_eq!(
+                perf_dwarf_frame_names_from_index(&segments, &names.names, address, Some("float")),
+                Some(PerfDwarfFrameNames {
+                    frames: vec!["f".to_string()],
+                    has_inline_frames: true,
+                }),
+                "address {address}"
+            );
+        }
     }
 
     #[test]

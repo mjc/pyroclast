@@ -739,18 +739,34 @@ fn perf_dwarf_frame_names_keep_fn0_die_name() {
 
 #[test]
 #[cfg(target_os = "linux")]
-fn perf_dwarf_frame_names_keep_symtab_alias_without_inline_die_like_perf_script() {
-    // perf/util/machine.c append_inlines() only substitutes inline_node
-    // entries. This object has symtab name `float` and DWARF name `f`, but
-    // no inlined-subroutine DIE at the address.
+fn symbol_parity_source_lined_function_replaces_symtab_alias_without_inline_children() {
+    // libdw.c:libdw__addr2line and dwarf-aux.c:cu_walk_functions_at visit
+    // the real function even without inlined-subroutine children.
     let (_root, binary, bytes) =
         compiled_c_fixture("void f(void) __asm__(\"float\"); void f(void) {}");
     let address = text_symbol_addresses_matching_name(&bytes, |name| name == "float")[0];
 
     assert_eq!(
         perf_dwarf_frame_names_from_object(&binary, address),
-        Some(vec!["float".to_string()])
+        Some(vec!["f".to_string()])
     );
+
+    let request = SymbolRequest {
+        path: binary,
+        relative_address: address,
+        kernel_mapping_range: None,
+        build_id: None,
+        file_identity: None,
+        kernel_relocation: None,
+    };
+    let resolver = RustAddr2lineResolver::new();
+    let frames = resolver
+        .resolve_frame_batch_with_metadata(&[request])
+        .unwrap();
+    assert_eq!(frames[0].frames, ["f"]);
+    assert!(frames[0].has_inline_frames);
+    assert!(!frames[0].has_non_inline_base_frame);
+    assert_eq!(frames[0].base_offset, Some(0));
 }
 
 #[test]
