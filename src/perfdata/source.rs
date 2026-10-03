@@ -244,6 +244,10 @@ impl RecordSource for BufferedDelivery<'_> {
             .ranges
             .get_mut(&start)
             .expect("queued record backing remains mapped until delivery");
+        debug_assert!(
+            range.pending > 0,
+            "released record must have a matching retain"
+        );
         range.pending -= 1;
         if range.pending == 0 && self.scan_current != Some(start) {
             self.recycle_range(start);
