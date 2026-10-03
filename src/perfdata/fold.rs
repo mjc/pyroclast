@@ -62,6 +62,23 @@ type FoldFrameStack = SmallVec<[FoldFrame; 16]>;
 type LabelId = usize;
 type LabelSpan = SmallVec<[LabelId; 4]>;
 
+fn append_projection_ids(stack: &mut Vec<LabelId>, labels: &[LabelId]) {
+    match labels {
+        [] => {}
+        [id] => stack.push(*id),
+        _ => {
+            #[cfg(test)]
+            PROJECTION_BULK_COPIES.with(|copies| copies.set(copies.get() + 1));
+            stack.extend_from_slice(labels);
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PROJECTION_BULK_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Default)]
 struct FoldCounts {
     names: Vec<Arc<str>>,
@@ -2498,6 +2515,55 @@ fn resolve_frame_in_context<'a>(
 }
 
 #[derive(Default)]
+struct ModuleProjections {
+    by_key: HashMap<(usize, bool), usize, FxBuildHasher>,
+    labels: Vec<LabelSpan>,
+    last: std::cell::Cell<Option<ModuleProjectionHint>>,
+    #[cfg(test)]
+    searches: std::cell::Cell<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct ModuleProjectionHint {
+    key: (usize, bool),
+    slot: usize,
+}
+
+impl ModuleProjections {
+    #[inline]
+    fn get(&self, key: &(usize, bool)) -> Option<&LabelSpan> {
+        if let Some(last) = self.last.get()
+            && last.key == *key
+        {
+            return Some(&self.labels[last.slot]);
+        }
+        #[cfg(test)]
+        self.searches.set(self.searches.get() + 1);
+        let slot = *self.by_key.get(key)?;
+        self.last
+            .set(Some(ModuleProjectionHint { key: *key, slot }));
+        Some(&self.labels[slot])
+    }
+
+    fn insert(&mut self, key: (usize, bool), labels: LabelSpan) {
+        let next = self.labels.len();
+        let slot = *self.by_key.entry(key).or_insert(next);
+        if slot == next {
+            self.labels.push(labels);
+        } else {
+            self.labels[slot] = labels;
+        }
+        self.last.set(Some(ModuleProjectionHint { key, slot }));
+    }
+
+    #[cfg(test)]
+    fn storage_bytes(&self) -> usize {
+        self.by_key.capacity() * std::mem::size_of::<((usize, bool), usize)>()
+            + self.labels.capacity() * std::mem::size_of::<LabelSpan>()
+    }
+}
+
+#[derive(Default)]
 struct FoldedRenderBuffers {
     current: String,
     has_comm: bool,
@@ -2506,13 +2572,15 @@ struct FoldedRenderBuffers {
     module_scratch: String,
     mapping_cache: MappingResolveCache,
     projecting: bool,
-    module_labels: HashMap<(usize, bool), LabelSpan, FxBuildHasher>,
+    module_labels: ModuleProjections,
     symbol_labels: [Vec<Option<LabelSpan>>; 2],
     unknown_label: Option<LabelId>,
     #[cfg(test)]
     raw_function_normalizations: usize,
     #[cfg(test)]
     segment_copy_entries: usize,
+    #[cfg(test)]
+    repeat_helper_entries: usize,
 }
 
 enum FoldedRenderStatus {
@@ -2541,7 +2609,7 @@ fn mapping_requires_perf_text(mapping: &MappedFrame<'_>) -> bool {
 impl FoldedRenderBuffers {
     #[cfg(test)]
     fn module_projection_storage_bytes(&self) -> usize {
-        self.module_labels.capacity() * std::mem::size_of::<((usize, bool), LabelSpan)>()
+        self.module_labels.storage_bytes()
     }
 
     fn stack_len(&self) -> usize {
@@ -2576,6 +2644,10 @@ impl FoldedRenderBuffers {
 
     #[inline]
     fn repeat_segment(&mut self, start: usize, repeats: usize) {
+        #[cfg(test)]
+        {
+            self.repeat_helper_entries += 1;
+        }
         if repeats <= 1 {
             return;
         }
@@ -2637,7 +2709,7 @@ impl FoldedRenderBuffers {
         if projecting {
             let labels = self.counts.append_serialized_labels(&self.current);
             self.counts.scratch_stack.clear();
-            self.counts.scratch_stack.extend_from_slice(&labels);
+            append_projection_ids(&mut self.counts.scratch_stack, &labels);
             self.current.clear();
         }
         Ok(())
@@ -2768,7 +2840,9 @@ impl<'a> FoldFrameResolver<'a> {
                             append_projected_resolved_frames(
                                 buffers, &mapping, frame, expand, identity, cached,
                             );
-                            buffers.repeat_segment(segment_start, repeats);
+                            if repeats > 1 {
+                                buffers.repeat_segment(segment_start, repeats);
+                            }
                             continue;
                         }
                         // Keep decisions only on a cold miss. Warm samples stream
@@ -2785,28 +2859,10 @@ impl<'a> FoldFrameResolver<'a> {
                             );
                             (frame, decision, repeats)
                         }));
-                        if pending.iter().any(|(_, decision, _)| {
-                            matches!(
-                                decision, FrameMappingDecision::Mapped(mapping)
-                                    if mapping_requires_perf_text(mapping)
-                            )
-                        }) {
-                            return Ok(FoldedRenderStatus::RequiresPerfText);
-                        }
-                        prefetch_sample_symbols(&pending, cache, self.inline)?;
-                        for (frame, decision, repeats) in pending {
-                            let segment_start = buffers.stack_len();
-                            let status = append_prefetched_folded_frame(
-                                buffers,
-                                frame,
-                                decision,
-                                cache,
-                                self.inline,
-                            )?;
-                            if matches!(status, FoldedRenderStatus::RequiresPerfText) {
-                                return Ok(status);
-                            }
-                            buffers.repeat_segment(segment_start, repeats);
+                        let status =
+                            append_pending_folded_frames(&pending, buffers, cache, self.inline)?;
+                        if matches!(status, FoldedRenderStatus::RequiresPerfText) {
+                            return Ok(status);
                         }
                         break;
                     }
@@ -2819,7 +2875,9 @@ impl<'a> FoldFrameResolver<'a> {
                     append_cached_inferno_perf_folded_label_to_buffers(buffers, UNKNOWN_FRAME);
                 }
             }
-            buffers.repeat_segment(segment_start, repeats);
+            if repeats > 1 {
+                buffers.repeat_segment(segment_start, repeats);
+            }
         }
         buffers.finish_stack(comm_prefix_len);
         Ok(FoldedRenderStatus::Rendered)
@@ -3057,6 +3115,31 @@ impl<'a> FoldFrameResolver<'a> {
     }
 }
 
+fn append_pending_folded_frames<R: SymbolResolver>(
+    pending: &[(FoldFrame, FrameMappingDecision<'_>, usize)],
+    buffers: &mut FoldedRenderBuffers,
+    cache: &mut SymbolFrameCache<'_, R>,
+    inline: bool,
+) -> Result<FoldedRenderStatus, String> {
+    if pending.iter().any(|(_, decision, _)| {
+        matches!(decision, FrameMappingDecision::Mapped(mapping) if mapping_requires_perf_text(mapping))
+    }) {
+        return Ok(FoldedRenderStatus::RequiresPerfText);
+    }
+    prefetch_sample_symbols(pending, cache, inline)?;
+    for &(frame, decision, repeats) in pending {
+        let segment_start = buffers.stack_len();
+        let status = append_prefetched_folded_frame(buffers, frame, decision, cache, inline)?;
+        if matches!(status, FoldedRenderStatus::RequiresPerfText) {
+            return Ok(status);
+        }
+        if repeats > 1 {
+            buffers.repeat_segment(segment_start, repeats);
+        }
+    }
+    Ok(FoldedRenderStatus::Rendered)
+}
+
 fn append_prefetched_folded_frame<R: SymbolResolver>(
     buffers: &mut FoldedRenderBuffers,
     frame: FoldFrame,
@@ -3116,12 +3199,12 @@ fn append_projected_resolved_frames(
     let identity = identity.expect("nonnegative cached frames have a projection identity");
     let (namespace, index) = identity.projection_index();
     if let Some(Some(labels)) = buffers.symbol_labels[namespace].get(index) {
-        buffers.counts.scratch_stack.extend_from_slice(labels);
+        append_projection_ids(&mut buffers.counts.scratch_stack, labels);
         return;
     }
     append_resolved_folded_frames(buffers, mapping, frame, expand, cached);
     let labels = buffers.take_frame_projection();
-    buffers.counts.scratch_stack.extend_from_slice(&labels);
+    append_projection_ids(&mut buffers.counts.scratch_stack, &labels);
     let slots = &mut buffers.symbol_labels[namespace];
     if slots.len() <= index {
         slots.resize_with(index + 1, || None);
@@ -3223,14 +3306,14 @@ fn append_frame_mapping_fallback(buffers: &mut FoldedRenderBuffers, mapping: &Ma
         // projections by the actual path and address-dependent kernel class.
         let key = (mapping.display_path_id(), mapping.is_kernel());
         if let Some(labels) = buffers.module_labels.get(&key) {
-            buffers.counts.scratch_stack.extend_from_slice(labels);
+            append_projection_ids(&mut buffers.counts.scratch_stack, labels);
             return;
         }
         buffers.projecting = false;
         render_frame_mapping_fallback(buffers, mapping);
         buffers.projecting = true;
         let labels = buffers.take_frame_projection();
-        buffers.counts.scratch_stack.extend_from_slice(&labels);
+        append_projection_ids(&mut buffers.counts.scratch_stack, &labels);
         buffers.module_labels.insert(key, labels);
     } else {
         render_frame_mapping_fallback(buffers, mapping);
@@ -6772,6 +6855,38 @@ mod tests {
     }
 
     #[test]
+    fn fold_frame_is_sixteen_bytes() {
+        assert_eq!(std::mem::size_of::<super::FoldFrame>(), 16);
+    }
+
+    #[test]
+    fn fold_frame_preserves_full_address_and_cpu_mode() {
+        use super::FoldFrame;
+
+        for address in [0, 1, 0x8000_0000_0000_0000, u64::MAX] {
+            for frame in [
+                FoldFrame::Callchain(address),
+                FoldFrame::UserCallchain(address),
+                FoldFrame::UserUnwind(address),
+                FoldFrame::InlineCurrentIp(address),
+            ] {
+                assert_eq!(frame.address(), address);
+            }
+            for cpumode in 0..=u16::MAX {
+                let frame = FoldFrame::SampleIp { address, cpumode };
+                assert_eq!(frame.address(), address);
+                let FoldFrame::SampleIp {
+                    cpumode: stored, ..
+                } = frame
+                else {
+                    unreachable!("constructed a sample IP frame");
+                };
+                assert_eq!(stored, cpumode);
+            }
+        }
+    }
+
+    #[test]
     fn recursive_run_identity_includes_frame_variant_cpu_mode_and_order() {
         use super::FoldFrame;
         let a = FoldFrame::UserUnwind(0x1010);
@@ -7103,6 +7218,97 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn module_projection_slots_survive_growth_replacement_and_kernel_class_changes() {
+        let mut projections = super::ModuleProjections::default();
+        let key = (usize::MAX, false);
+        projections.insert(key, super::LabelSpan::from_slice(&[7]));
+        projections.insert((usize::MAX, true), super::LabelSpan::new());
+        for id in 0..1024 {
+            projections.insert((id, false), super::LabelSpan::from_slice(&[id, id + 1]));
+        }
+        assert_eq!(projections.get(&key).unwrap().as_slice(), [7]);
+        assert!(projections.get(&(usize::MAX, true)).unwrap().is_empty());
+        assert_eq!(
+            projections.get(&(128, false)).unwrap().as_slice(),
+            [128, 129]
+        );
+        assert!(projections.get(&(128, true)).is_none());
+        let slots = projections.labels.len();
+        projections.insert(key, super::LabelSpan::from_slice(&[9, 8]));
+        assert_eq!(projections.labels.len(), slots);
+        assert_eq!(projections.get(&key).unwrap().as_slice(), [9, 8]);
+        assert!(projections.get(&(2048, false)).is_none());
+        assert_eq!(projections.get(&key).unwrap().as_slice(), [9, 8]);
+        let before = projections.searches.get();
+        for _ in 0..512 {
+            assert_eq!(projections.get(&key).unwrap().as_slice(), [9, 8]);
+        }
+        assert_eq!(projections.searches.get(), before);
+    }
+
+    #[test]
+    fn projection_id_append_preserves_empty_single_and_expanded_segments() {
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        for labels in [&[][..], &[0][..], &[4, 3][..], &[7, 8, 9, 10, 11][..]] {
+            for _ in 0..3 {
+                super::append_projection_ids(&mut actual, labels);
+                expected.extend_from_slice(labels);
+            }
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn single_label_projections_push_ids_without_entering_bulk_copy() {
+        let mut ids = Vec::with_capacity(512);
+        let before = super::PROJECTION_BULK_COPIES.with(std::cell::Cell::get);
+        for _ in 0..512 {
+            super::append_projection_ids(&mut ids, &[13]);
+        }
+        assert_eq!(ids, vec![13; 512]);
+        assert_eq!(
+            super::PROJECTION_BULK_COPIES.with(std::cell::Cell::get) - before,
+            0
+        );
+    }
+
+    #[test]
+    fn singleton_projected_frames_do_not_enter_the_repeat_helper() {
+        use super::SampleOutput as _;
+        let mut state = super::SessionState::new(std::collections::BTreeMap::new());
+        state.thread_comms.insert(7, "worker".into());
+        let mut output = super::FoldedOutput::<super::NoopSymbolResolver>::new(
+            None,
+            super::FoldOptions::default(),
+            0,
+        );
+        for address in 1..=512 {
+            let frames = [super::FoldFrame::Callchain(address)];
+            output
+                .write_sample_event(&state, &prepared_sample(&frames))
+                .unwrap();
+        }
+        assert_eq!(output.buffers.rendered(), "worker;[unknown]");
+        assert_eq!(output.buffers.repeat_helper_entries, 0);
+    }
+
+    #[test]
+    fn warm_module_projection_reuses_its_slot_without_reprobing_the_table() {
+        let mut projections = super::ModuleProjections::default();
+        let key = (9, false);
+        projections.insert(key, super::LabelSpan::from_slice(&[3, 4]));
+        for _ in 0..512 {
+            assert_eq!(projections.get(&key).unwrap().as_slice(), [3, 4]);
+        }
+        assert_eq!(
+            projections.searches.get(),
+            0,
+            "a warm module projection must reuse its stable slot, not rehash the key each time"
+        );
     }
 
     #[test]
