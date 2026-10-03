@@ -2528,6 +2528,42 @@ fn perf_symbol_resolver_uses_live_vdso_copy_without_build_id_like_perf_script() 
 }
 
 #[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn perf_symbol_resolver_does_not_use_native_vdso_for_compat_requests() {
+    // perf util/map.c:map__new only special-cases vdso.h:is_vdso_map's
+    // "[vdso]" map name. The compat DSO names are not native map names.
+    let object_resolver = FixedRecordingResolver::new(None);
+    let resolver = pyroclast::symbols::PerfSymbolResolver::from_object_resolver(&object_resolver);
+    let requests: Vec<_> = ["[vdso]", "[vdso32]", "[vdsox32]"]
+        .into_iter()
+        .map(|path| SymbolRequest {
+            path: PathBuf::from(path),
+            relative_address: 0x100,
+            kernel_mapping_range: None,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        })
+        .collect();
+    resolver.resolve_batch(&requests).expect("symbols");
+    let calls = object_resolver.batch_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].len(), 3);
+    let native_elf = std::fs::read(&calls[0][0].path).expect("native vDSO positive control");
+    let native_image = object::File::parse(native_elf.as_slice()).expect("native vDSO ELF");
+    assert!(object::Object::is_64(&native_image));
+    for (request, delegated) in requests[1..].iter().zip(&calls[0][1..]) {
+        let path = &request.path;
+        let delegated = &delegated.path;
+        assert_eq!(
+            delegated,
+            Path::new(path),
+            "compat DSO used native vDSO image"
+        );
+    }
+}
+
+#[test]
 fn perf_symbol_resolver_accepts_pluggable_object_resolver() {
     let object_resolver = RecordingResolver::with_symbols([(
         SymbolRequest {

@@ -2395,7 +2395,10 @@ where
         request: &SymbolRequest,
         address_cache: &mut ObjectAddressCache,
     ) -> Option<SymbolRequest> {
-        if !is_perf_vdso_dso_path(&request.path) {
+        // perf map.c:map__new uses vdso.h:is_vdso_map, which accepts only
+        // "[vdso]". Compat DSO names do not identify this process's vDSO.
+        // Build-id cached compat images are handled before this fallback.
+        if request.path != Path::new("[vdso]") {
             return None;
         }
         let live_vdso = self
