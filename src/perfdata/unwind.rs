@@ -681,17 +681,31 @@ fn push_unwind_range(ranges: &mut Vec<Range<u64>>, base: u64, start: u64, end: u
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static CFI_RANGE_ROWS_MOVED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn normalize_ranges(ranges: &mut Vec<Range<u64>>) {
     ranges.sort_unstable_by_key(|range| (range.start, range.end));
-    let mut index = 0;
-    while index + 1 < ranges.len() {
-        if ranges[index].end >= ranges[index + 1].start {
-            ranges[index].end = ranges[index].end.max(ranges[index + 1].end);
-            ranges.remove(index + 1);
+    if ranges.is_empty() {
+        return;
+    }
+
+    let mut write = 0;
+    for read in 1..ranges.len() {
+        if ranges[write].end >= ranges[read].start {
+            ranges[write].end = ranges[write].end.max(ranges[read].end);
         } else {
-            index += 1;
+            write += 1;
+            if write != read {
+                #[cfg(test)]
+                CFI_RANGE_ROWS_MOVED.with(|rows| rows.set(rows.get() + 1));
+                ranges[write] = ranges[read].clone();
+            }
         }
     }
+    ranges.truncate(write + 1);
 }
 
 fn module_memory_segments<'a>(
@@ -1043,6 +1057,100 @@ where
 mod tests {
     use framehop::x86_64::Reg;
     use object::read::{Object, ObjectSegment};
+
+    fn normalize_cfi_ranges_with_work_count(ranges: &mut Vec<std::ops::Range<u64>>) -> usize {
+        super::CFI_RANGE_ROWS_MOVED.with(|rows| rows.set(0));
+        super::normalize_ranges(ranges);
+        super::CFI_RANGE_ROWS_MOVED.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn cfi_range_normalization_merges_touching_ranges() {
+        let mut ranges = vec![30..40, 10..20, 20..30, 0..10];
+        normalize_cfi_ranges_with_work_count(&mut ranges);
+        assert_eq!(ranges, vec![0..40]);
+    }
+
+    #[test]
+    fn cfi_range_normalization_preserves_outer_extent_of_nested_ranges() {
+        let mut ranges = vec![20..30, 0..100, 10..90, 0..80, 50..60];
+        normalize_cfi_ranges_with_work_count(&mut ranges);
+        assert_eq!(ranges, vec![0..100]);
+    }
+
+    #[test]
+    fn cfi_range_normalization_coalesces_duplicate_ranges() {
+        let mut ranges = vec![10..20, 0..5, 10..20, 0..5, 10..20];
+        normalize_cfi_ranges_with_work_count(&mut ranges);
+        assert_eq!(ranges, vec![0..5, 10..20]);
+    }
+
+    #[test]
+    fn cfi_range_normalization_preserves_disjoint_ranges_without_moving_rows() {
+        let mut ranges = vec![30..40, 0..10, 15..20];
+        let rows_moved = normalize_cfi_ranges_with_work_count(&mut ranges);
+        assert_eq!(ranges, vec![0..10, 15..20, 30..40]);
+        assert_eq!(rows_moved, 0);
+    }
+
+    #[test]
+    fn cfi_range_normalization_preserves_half_open_coverage_and_gaps() {
+        // This is our auxiliary CFI coverage index, not perf's unwind algorithm.
+        let original = vec![12..16, 0..4, 2..6, 6..8, 13..15, 12..16];
+        let mut ranges = original.clone();
+        let rows_moved = normalize_cfi_ranges_with_work_count(&mut ranges);
+        assert_eq!(ranges, vec![0..8, 12..16]);
+        assert_eq!(rows_moved, 1);
+        for ip in 0..=17 {
+            assert_eq!(
+                ranges.iter().any(|range| range.contains(&ip)),
+                original.iter().any(|range| range.contains(&ip)),
+                "coverage changed at {ip}"
+            );
+        }
+
+        let mut ranges = vec![u64::MAX - 2..u64::MAX, u64::MAX - 4..u64::MAX - 2];
+        normalize_cfi_ranges_with_work_count(&mut ranges);
+        assert_eq!(ranges, vec![u64::MAX - 4..u64::MAX]);
+        assert!(!ranges[0].contains(&u64::MAX));
+    }
+
+    #[test]
+    fn cfi_range_normalization_merging_moves_at_most_linear_range_rows() {
+        for len in [0_usize, 1, 2, 16, 64, 512] {
+            for shape in ["touching", "nested", "duplicate", "disjoint"] {
+                let mut ranges: Vec<_> = (0..len as u64)
+                    .rev()
+                    .map(|index| match shape {
+                        "touching" => index..index + 1,
+                        "nested" => index..2 * len as u64 - index,
+                        "duplicate" => 0..1,
+                        "disjoint" => 2 * index..2 * index + 1,
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                let rows_moved = normalize_cfi_ranges_with_work_count(&mut ranges);
+                let expected = if len == 0 {
+                    Vec::new()
+                } else {
+                    match shape {
+                        "touching" => std::iter::once(0..len as u64).collect(),
+                        "nested" => std::iter::once(0..2 * len as u64).collect(),
+                        "duplicate" => std::iter::once(0..1).collect(),
+                        "disjoint" => (0..len as u64)
+                            .map(|index| 2 * index..2 * index + 1)
+                            .collect(),
+                        _ => unreachable!(),
+                    }
+                };
+                assert_eq!(ranges, expected, "{shape}, {len} input ranges");
+                assert!(
+                    rows_moved <= len,
+                    "{shape}, {len} input ranges moved {rows_moved} range rows; linear bound is {len}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn object_mapping_range_matches_dwfl_report_elf_load_span() {
