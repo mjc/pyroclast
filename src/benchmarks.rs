@@ -214,7 +214,9 @@ where
             )
         })
     } else {
-        run_fold_benchmark(input)
+        run_fold_benchmark_with_writer(input, |writer| {
+            write_folded_perfdata_file_with_options(input, benchmark_fold_options(inline), writer)
+        })
     }
 }
 

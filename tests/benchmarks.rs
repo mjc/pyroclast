@@ -43,6 +43,40 @@ fn fold_benchmark_reports_folded_output_size() {
 }
 
 #[test]
+fn unsymbolized_fold_benchmark_keeps_module_fallback_with_either_inline_setting() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    let missing_object = root.path().join("app");
+    std::fs::write(
+        &perfdata,
+        perfdata_with_records_and_attrs(
+            [file_attr_bytes(
+                PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+                0,
+                0,
+            )],
+            [
+                record_bytes(
+                    1,
+                    &mmap_payload(11, 11, 0x1000, 0x100, 0, missing_object.to_str().unwrap()),
+                ),
+                record_bytes(9, &sample_payload(0x1000, 11, 12, [0x1010])),
+            ],
+        ),
+    )
+    .expect("write perfdata");
+    let runner = Addr2lineRunner::default();
+    for inline in [false, true] {
+        let report =
+            run_fold_benchmark_with_runner(&perfdata, &runner, false, inline).expect("benchmark");
+        assert_eq!(report.folded_bytes, ":12;[app] 1\n".len());
+        assert_eq!(report.folded_lines, 1);
+        assert_eq!(report.input, perfdata);
+        assert!(runner.programs().is_empty());
+    }
+}
+
+#[test]
 fn fold_benchmark_uses_infernos_unit_weight_for_untimed_period_samples() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
