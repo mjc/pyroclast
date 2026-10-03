@@ -90,3 +90,7 @@ shell supplies them. Native-oracle tests compile ELF fixtures and compare agains
 `perf script`; missing tools fail the tests rather than silently skipping parity
 checks. When running outside the development shell, install a C toolchain,
 binutils, and perf first.
+
+Process completed recordings: keep the input file unchanged until analysis
+finishes. Like native `perf script`, ordered file delivery uses a read-only
+file mapping, not a snapshot protected against concurrent writes or truncation.
