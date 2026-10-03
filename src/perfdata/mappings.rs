@@ -18,6 +18,7 @@ pub struct MmapTable {
     mappings: Vec<Mapping>,
     mappings_by_pid: HashMap<u32, Vec<IndexedMapping>, FxBuildHasher>,
     symbol_source_ids: HashMap<SymbolSourceKey, usize, FxBuildHasher>,
+    display_path_ids: HashMap<String, usize, FxBuildHasher>,
     pids_with_mappings: HashSet<u32, FxBuildHasher>,
     executable_pids: HashSet<u32, FxBuildHasher>,
     has_global_mappings: bool,
@@ -74,6 +75,7 @@ pub(crate) enum ModuleFallbackKind {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MappingPathLayout {
+    display_path_id: usize,
     pub(crate) basename_start: usize,
     pub(crate) last_space: Option<usize>,
     pub(crate) text_row_boundary: Option<usize>,
@@ -86,6 +88,7 @@ impl MappingPathLayout {
     pub(crate) fn new(path: &str) -> Self {
         let basename_start = memchr::memrchr(b'/', path.as_bytes()).map_or(0, |index| index + 1);
         let mut layout = Self {
+            display_path_id: 0,
             bracketed: path.starts_with('['),
             basename_start,
             last_space: memchr::memrchr(b' ', path.as_bytes()),
@@ -131,6 +134,9 @@ impl<'a> MappedFrame<'a> {
 
     pub(crate) fn symbol_source_id(self) -> usize {
         self.mapping.symbol_source_id
+    }
+    pub(crate) fn display_path_id(self) -> usize {
+        self.mapping.path_layout.display_path_id
     }
     pub(crate) fn path(self) -> &'a str {
         &self.mapping.path
@@ -591,6 +597,11 @@ impl MmapTable {
 
     fn insert_mapping(&mut self, mut mapping: Mapping) {
         mapping.path_layout = MappingPathLayout::new(&mapping.path);
+        let next_id = self.display_path_ids.len();
+        mapping.path_layout.display_path_id = *self
+            .display_path_ids
+            .entry_ref(mapping.path.as_str())
+            .or_insert(next_id);
         // Common case: the new mapping does not overlap any existing mapping for
         // its pid. Detect this in O(log n + matches) using the per-pid interval
         // index and take a pure incremental insert, skipping the whole-table
@@ -1210,6 +1221,98 @@ fn is_perf_data_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn display_path_identity_preserves_names_aliased_by_symbol_source_identity() {
+        // perf symbol.c:maps__split_kallsyms names individual maps [kernel].N.
+        let mut table = super::MmapTable::default();
+        for (start, path) in [
+            (0xffff_ffff_8100_0000, "[kernel].0"),
+            (0xffff_ffff_8200_0000, "[kernel].1"),
+        ] {
+            table.insert_mmap(super::MmapRecord {
+                pid: u32::MAX,
+                tid: u32::MAX,
+                start,
+                len: 0x1000,
+                pgoff: 0,
+                path: path.into(),
+            });
+        }
+        let mut hint = super::MappingResolveCache::default();
+        let first = table
+            .resolve_frame_cached(7, 0xffff_ffff_8100_0010, &mut hint)
+            .unwrap();
+        let second = table
+            .resolve_frame_cached(7, 0xffff_ffff_8200_0010, &mut hint)
+            .unwrap();
+        assert_eq!(first.symbol_source_id(), second.symbol_source_id());
+        assert_ne!(first.display_path_id(), second.display_path_id());
+    }
+
+    #[test]
+    fn display_path_identity_survives_overlap_splits_forks_and_replacement() {
+        let mut table = super::MmapTable::default();
+        let insert = |table: &mut super::MmapTable, start, len, path: &str| {
+            table.insert_mmap(super::MmapRecord {
+                pid: 7,
+                tid: 7,
+                start,
+                len,
+                pgoff: 0,
+                path: path.into(),
+            });
+        };
+        insert(&mut table, 0x1000, 0x1000, "/bin/old");
+        let mut hint = super::MappingResolveCache::default();
+        let old = table
+            .resolve_frame_cached(7, 0x1010, &mut hint)
+            .unwrap()
+            .display_path_id();
+        insert(&mut table, 0x1400, 0x100, "/bin/new");
+        hint = super::MappingResolveCache::default();
+        for address in [0x1010, 0x1510] {
+            assert_eq!(
+                table
+                    .resolve_frame_cached(7, address, &mut hint)
+                    .unwrap()
+                    .display_path_id(),
+                old
+            );
+        }
+        let new = table
+            .resolve_frame_cached(7, 0x1410, &mut hint)
+            .unwrap()
+            .display_path_id();
+        assert_ne!(new, old);
+        table.clone_pid_mappings(7, 8);
+        hint = super::MappingResolveCache::default();
+        assert_eq!(
+            table
+                .resolve_frame_cached(8, 0x1410, &mut hint)
+                .unwrap()
+                .display_path_id(),
+            new
+        );
+        insert(&mut table, 0x1000, 0x1000, "/bin/new");
+        insert(&mut table, 0x3000, 0x1000, "/bin/old");
+        hint = super::MappingResolveCache::default();
+        assert_eq!(
+            table
+                .resolve_frame_cached(7, 0x1010, &mut hint)
+                .unwrap()
+                .display_path_id(),
+            new
+        );
+        assert_eq!(
+            table
+                .resolve_frame_cached(7, 0x3010, &mut hint)
+                .unwrap()
+                .display_path_id(),
+            old
+        );
+        assert_eq!(table.display_path_ids.len(), 2);
+    }
+
     #[test]
     fn mapped_frame_views_borrow_paths_and_preserve_resolved_metadata() {
         assert!(std::mem::size_of::<super::MappedFrame<'_>>() <= 2 * std::mem::size_of::<usize>());

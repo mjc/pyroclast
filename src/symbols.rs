@@ -250,6 +250,15 @@ pub(crate) struct CachedMappingFrames {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct MappingFramesIdentity(u64);
 
+impl MappingFramesIdentity {
+    pub(crate) fn projection_index(self) -> (usize, usize) {
+        let namespace = usize::from(self.0 & 1 != 0);
+        let index =
+            usize::try_from((self.0 >> 1) - 1).expect("symbol projection identity exceeds usize");
+        (namespace, index)
+    }
+}
+
 pub(crate) enum SymbolFrameRenderMode {
     Direct,
     PerfScript,
