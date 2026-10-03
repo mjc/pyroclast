@@ -114,6 +114,8 @@ struct BufferedDelivery<'a> {
     file: &'a File,
     len: usize,
     ranges: BTreeMap<usize, QueuedRange>,
+    // Refill scratch owns one released allocation, never queued records.
+    refill_buffer: Option<Vec<u8>>,
     current: Option<usize>,
     scan_current: Option<usize>,
     #[cfg(test)]
@@ -122,11 +124,40 @@ struct BufferedDelivery<'a> {
     bytes_read: usize,
     #[cfg(test)]
     range_requests: usize,
+    #[cfg(test)]
+    backing_allocations: usize,
+    #[cfg(test)]
+    backing_bytes_zeroed: usize,
 }
 
 impl BufferedDelivery<'_> {
     fn range_start(offset: usize) -> usize {
         offset / DELIVERY_RANGE_SIZE * DELIVERY_RANGE_SIZE
+    }
+
+    fn recycle_range(&mut self, start: usize) {
+        if let Some(range) = self.ranges.remove(&start) {
+            debug_assert_eq!(range.pending, 0);
+            debug_assert_ne!(self.scan_current, Some(start));
+            self.refill_buffer = Some(range.bytes);
+        }
+    }
+
+    fn read_backing(&mut self, bytes: &mut [u8], start: usize) -> Result<(), String> {
+        #[cfg(unix)]
+        self.file
+            .read_exact_at(bytes, start as u64)
+            .map_err(|error| format!("failed to read perf record backing: {error}"))?;
+        #[cfg(not(unix))]
+        {
+            self.file
+                .seek(SeekFrom::Start(start as u64))
+                .map_err(|error| format!("failed to seek perf record backing: {error}"))?;
+            self.file
+                .read_exact(bytes)
+                .map_err(|error| format!("failed to read perf record backing: {error}"))?;
+        }
+        Ok(())
     }
 }
 
@@ -159,19 +190,16 @@ impl RecordSource for BufferedDelivery<'_> {
             let size = (DELIVERY_RANGE_SIZE + usize::from(u16::MAX))
                 .max(end - start)
                 .min(self.len - start);
-            let mut bytes = vec![0; size];
-            #[cfg(unix)]
-            self.file
-                .read_exact_at(&mut bytes, start as u64)
-                .map_err(|error| format!("failed to read perf record backing: {error}"))?;
-            #[cfg(not(unix))]
+            let mut bytes = self.refill_buffer.take().unwrap_or_default();
+            #[cfg(test)]
             {
-                self.file
-                    .seek(SeekFrom::Start(start as u64))
-                    .map_err(|error| format!("failed to seek perf record backing: {error}"))?;
-                self.file
-                    .read_exact(&mut bytes)
-                    .map_err(|error| format!("failed to read perf record backing: {error}"))?;
+                self.backing_allocations += usize::from(size > bytes.capacity());
+                self.backing_bytes_zeroed += size.saturating_sub(bytes.len());
+            }
+            bytes.resize(size, 0);
+            if let Err(error) = self.read_backing(&mut bytes, start) {
+                self.refill_buffer = Some(bytes);
+                return Err(error);
             }
             let pending = self.ranges.get(&start).map_or(0, |range| range.pending);
             self.ranges.insert(start, QueuedRange { bytes, pending });
@@ -188,7 +216,7 @@ impl RecordSource for BufferedDelivery<'_> {
                 .get(&previous)
                 .is_some_and(|range| range.pending == 0)
         {
-            self.ranges.remove(&previous);
+            self.recycle_range(previous);
         }
         Ok(&self.ranges[&start].bytes[offset - start..end - start])
     }
@@ -218,7 +246,7 @@ impl RecordSource for BufferedDelivery<'_> {
             .expect("queued record backing remains mapped until delivery");
         range.pending -= 1;
         if range.pending == 0 && self.scan_current != Some(start) {
-            self.ranges.remove(&start);
+            self.recycle_range(start);
             if self.current == Some(start) {
                 self.current = None;
             }
@@ -243,6 +271,7 @@ impl<'a> FileSource<'a> {
                 file,
                 len,
                 ranges: BTreeMap::new(),
+                refill_buffer: None,
                 current: None,
                 scan_current: None,
                 #[cfg(test)]
@@ -251,6 +280,10 @@ impl<'a> FileSource<'a> {
                 bytes_read: 0,
                 #[cfg(test)]
                 range_requests: 0,
+                #[cfg(test)]
+                backing_allocations: 0,
+                #[cfg(test)]
+                backing_bytes_zeroed: 0,
             },
         })
     }
@@ -284,7 +317,7 @@ impl RecordSource for FileSource<'_> {
                 .get(&previous)
                 .is_some_and(|range| range.pending == 0)
         {
-            self.delivery.ranges.remove(&previous);
+            self.delivery.recycle_range(previous);
         }
         self.delivery.bytes_at(offset, len)
     }
@@ -398,6 +431,217 @@ mod tests {
             initial_read,
             "small scan windows reread the same delivery range"
         );
+    }
+
+    #[test]
+    fn sequential_range_rollover_reuses_one_initialized_backing() {
+        // perf session.c:reader__mmap releases the replaced backing before
+        // mapping the next window. This tests allocation, not fewer reads:
+        // every distinct input range still needs its own complete file read.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let range_size = super::DELIVERY_RANGE_SIZE;
+        let backing_size = range_size + usize::from(u16::MAX);
+        file.as_file().set_len((8 * range_size) as u64).unwrap();
+        let mut source = FileSource::new(file.as_file()).unwrap();
+        let mut backing_pointer = None;
+        for index in 0..6 {
+            assert_eq!(source.bytes_at(index * range_size, 8).unwrap(), [0; 8]);
+            let actual_pointer = source.delivery.ranges[&(index * range_size)].bytes.as_ptr();
+            assert_eq!(
+                *backing_pointer.get_or_insert(actual_pointer),
+                actual_pointer
+            );
+            assert_eq!(source.delivery.ranges.len(), 1);
+            assert!(source.delivery.refill_buffer.is_none());
+            assert_eq!(source.delivery.ranges_loaded, index + 1);
+            assert_eq!(source.bytes_read(), (index + 1) * backing_size);
+            assert_eq!(
+                (
+                    source.delivery.backing_allocations,
+                    source.delivery.backing_bytes_zeroed,
+                ),
+                (1, backing_size),
+                "released backing was allocated or zero-initialized again on rollover {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn last_queued_delivery_recycles_only_unpinned_backing_for_the_scanner() {
+        use std::io::{Seek, SeekFrom, Write};
+        let range_size = super::DELIVERY_RANGE_SIZE;
+        let backing_size = range_size + usize::from(u16::MAX);
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len((5 * range_size) as u64).unwrap();
+        for (offset, payload) in [(0, &b"pinned"[..]), (range_size, &b"scanner"[..])] {
+            file.seek(SeekFrom::Start(offset as u64)).unwrap();
+            file.write_all(&record(payload)).unwrap();
+        }
+        let mut source = FileSource::new(file.as_file()).unwrap();
+        let pinned_pointer = source.record_at(0, source.len()).unwrap().payload.as_ptr();
+        source.retain_record(0).unwrap();
+        source.retain_record(0).unwrap();
+        let scanner_pointer = source
+            .record_at(range_size, source.len())
+            .unwrap()
+            .payload
+            .as_ptr();
+        source.retain_record(range_size).unwrap();
+        assert_eq!(source.delivery.backing_allocations, 2);
+        let before_delivery = source.bytes_read();
+        for remaining in [1, 0] {
+            let delivered = source.delivered_record_at(0, source.len()).unwrap();
+            assert_eq!(delivered.payload, b"pinned");
+            assert_eq!(delivered.payload.as_ptr(), pinned_pointer);
+            source.release_record(0);
+            assert_eq!(source.delivery.ranges.contains_key(&0), remaining != 0);
+            assert_eq!(source.delivery.refill_buffer.is_some(), remaining == 0);
+        }
+        assert_eq!(source.bytes_read(), before_delivery);
+        source.bytes_at(2 * range_size, 8).unwrap();
+        assert_eq!(
+            (
+                source.delivery.backing_allocations,
+                source.delivery.backing_bytes_zeroed,
+            ),
+            (2, 2 * backing_size),
+            "last delivery discarded backing instead of reusing it for the scanner"
+        );
+        assert_eq!(source.delivery.ranges.len(), 2);
+        assert!(source.delivery.refill_buffer.is_none());
+        let delivered = source
+            .delivered_record_at(range_size, source.len())
+            .unwrap();
+        assert_eq!(delivered.payload, b"scanner");
+        assert_eq!(delivered.payload.as_ptr(), scanner_pointer);
+        source.release_record(range_size);
+        assert_eq!(source.delivery.ranges.len(), 1);
+        source.bytes_at(3 * range_size, 8).unwrap();
+        assert_eq!(source.delivery.backing_allocations, 2);
+        assert_eq!(source.delivery.ranges.len(), 1);
+    }
+
+    #[test]
+    fn released_ranges_leave_only_one_refill_allocation() {
+        let range_size = super::DELIVERY_RANGE_SIZE;
+        let backing_size = range_size + usize::from(u16::MAX);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len((8 * range_size) as u64).unwrap();
+        let mut source = FileSource::new(file.as_file()).unwrap();
+        for index in 0..6 {
+            source.retain_record(index * range_size).unwrap();
+            assert_eq!(source.delivery.ranges.len(), index + 1);
+            assert!(source.delivery.refill_buffer.is_none());
+        }
+        assert_eq!(source.delivery.backing_allocations, 6);
+        for index in (0..6).rev() {
+            let offset = index * range_size;
+            let released_pointer = source.delivery.ranges[&offset].bytes.as_ptr();
+            source.release_record(offset);
+            assert_eq!(source.delivery.ranges.len(), index);
+            let scratch = source.delivery.refill_buffer.as_ref().unwrap();
+            assert_eq!(scratch.as_ptr(), released_pointer);
+            assert_eq!(scratch.len(), backing_size);
+            assert!(
+                source
+                    .delivery
+                    .ranges
+                    .values()
+                    .all(|range| range.pending == 1)
+            );
+        }
+        assert!(source.delivery.current.is_none());
+        source.bytes_at(6 * range_size, 8).unwrap();
+        assert_eq!(source.delivery.backing_allocations, 6);
+        assert_eq!(source.delivery.backing_bytes_zeroed, 6 * backing_size);
+        assert_eq!(source.delivery.ranges.len(), 1);
+        assert!(source.delivery.refill_buffer.is_none());
+    }
+
+    #[test]
+    fn refill_buffer_growth_counts_only_newly_initialized_bytes() {
+        let range_size = super::DELIVERY_RANGE_SIZE;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len((5 * range_size) as u64).unwrap();
+        let mut source = FileSource::new(file.as_file()).unwrap();
+        source.bytes_at(0, 8).unwrap();
+        source.bytes_at(range_size, 2 * range_size).unwrap();
+        assert_eq!(source.delivery.backing_allocations, 2);
+        assert_eq!(source.delivery.backing_bytes_zeroed, 2 * range_size);
+        assert_eq!(source.delivery.ranges.len(), 1);
+        source.bytes_at(2 * range_size, 8).unwrap();
+        assert_eq!(source.delivery.backing_allocations, 2);
+        assert_eq!(source.delivery.backing_bytes_zeroed, 2 * range_size);
+        assert_eq!(source.delivery.ranges.len(), 1);
+    }
+
+    #[test]
+    fn recycled_backing_preserves_short_tail_and_backward_boundary_records() {
+        use std::io::{Seek, SeekFrom, Write};
+        let range_size = super::DELIVERY_RANGE_SIZE;
+        let boundary = range_size - 4;
+        let large = record(&vec![7; usize::from(u16::MAX) - 8]);
+        let tail = 2 * range_size;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.seek(SeekFrom::Start(boundary as u64)).unwrap();
+        file.write_all(&large).unwrap();
+        file.seek(SeekFrom::Start(tail as u64)).unwrap();
+        file.write_all(&record(b"short tail")).unwrap();
+        let mut source = FileSource::new(file.as_file()).unwrap();
+        for (offset, expected) in [
+            (boundary, &large[8..]),
+            (tail, &b"short tail"[..]),
+            (boundary, &large[8..]),
+            (tail, &b"short tail"[..]),
+        ] {
+            assert_eq!(
+                source.record_at(offset, source.len()).unwrap().payload,
+                expected
+            );
+            assert_eq!(source.delivery.ranges.len(), 1);
+        }
+        assert!(source.bytes_at(tail + 8, usize::from(u16::MAX)).is_err());
+        assert_eq!(
+            source.record_at(boundary, source.len()).unwrap().payload,
+            &large[8..]
+        );
+    }
+
+    #[test]
+    fn failed_recycled_read_preserves_pinned_records_and_retry_payloads() {
+        use std::io::{Seek, SeekFrom, Write};
+        let range_size = super::DELIVERY_RANGE_SIZE;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len((4 * range_size) as u64).unwrap();
+        for (offset, payload) in [(0, &b"retained"[..]), (2 * range_size, &b"retry"[..])] {
+            file.seek(SeekFrom::Start(offset as u64)).unwrap();
+            file.write_all(&record(payload)).unwrap();
+        }
+        let mut source = FileSource::new(file.as_file()).unwrap();
+        source.record_at(0, source.len()).unwrap();
+        source.retain_record(0).unwrap();
+        source.bytes_at(range_size, 8).unwrap();
+        file.as_file()
+            .set_len((2 * range_size + 16) as u64)
+            .unwrap();
+        assert!(source.bytes_at(2 * range_size, 8).is_err());
+        assert!(!source.delivery.ranges.contains_key(&(2 * range_size)));
+        assert_eq!(source.delivery.ranges.len(), 1);
+        assert_eq!(
+            source.delivered_record_at(0, source.len()).unwrap().payload,
+            b"retained"
+        );
+        source.release_record(0);
+        assert!(source.delivery.ranges.is_empty());
+        file.as_file().set_len((4 * range_size) as u64).unwrap();
+        assert_eq!(
+            source
+                .record_at(2 * range_size, source.len())
+                .unwrap()
+                .payload,
+            b"retry"
+        );
+        assert_eq!(source.delivery.ranges.len(), 1);
     }
 
     #[test]
