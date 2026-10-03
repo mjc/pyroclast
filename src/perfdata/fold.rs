@@ -4072,46 +4072,35 @@ fn extend_recorded_callchain_frames_like_perf(
     // maps and normally prints as [unknown], not fall into kernel maps by
     // address alone.
     let mut cpumode = PERF_RECORD_MISC_CPUMODE_USER;
-    let mut invalid_context = false;
     let mut addresses = 0;
-    frames.extend(callchain.into_iter().map_while(|ip| {
+    let callchain = callchain.into_iter();
+    frames.reserve(callchain.size_hint().0.min(max_stack));
+    for ip in callchain {
         // machine.c:__thread__resolve_callchain_sample tests nr_entries before
         // each iteration and increments it only for IPs below PERF_CONTEXT_MAX.
         if addresses == max_stack {
-            return None;
+            break;
         }
-        if !is_perf_context_marker(ip) {
-            addresses += 1;
+        if is_perf_context_marker(ip) {
+            // machine.c:2171-2198 consumes supported contexts without adding
+            // cursor nodes; an unsupported context discards the whole cursor.
+            cpumode = match ip {
+                PERF_CONTEXT_HV => PERF_RECORD_MISC_CPUMODE_HYPERVISOR,
+                PERF_CONTEXT_KERNEL => PERF_RECORD_MISC_CPUMODE_KERNEL,
+                PERF_CONTEXT_USER | PERF_CONTEXT_USER_DEFERRED => PERF_RECORD_MISC_CPUMODE_USER,
+                _ => {
+                    frames.clear();
+                    break;
+                }
+            };
+            continue;
         }
-        Some(match ip {
-            PERF_CONTEXT_HV => {
-                cpumode = PERF_RECORD_MISC_CPUMODE_HYPERVISOR;
-                FoldFrame::Callchain(ip)
-            }
-            PERF_CONTEXT_KERNEL => {
-                cpumode = PERF_RECORD_MISC_CPUMODE_KERNEL;
-                FoldFrame::Callchain(ip)
-            }
-            PERF_CONTEXT_USER | PERF_CONTEXT_USER_DEFERRED => {
-                cpumode = PERF_RECORD_MISC_CPUMODE_USER;
-                FoldFrame::Callchain(ip)
-            }
-            _ if is_perf_context_marker(ip) => {
-                // machine.c:add_callchain_ip resets the whole recorded cursor
-                // and stops at the first unsupported context. User unwinding
-                // runs afterwards in __thread__resolve_callchain.
-                invalid_context = true;
-                return None;
-            }
-            _ if cpumode == PERF_RECORD_MISC_CPUMODE_USER => FoldFrame::UserCallchain(ip),
-            _ if cpumode == PERF_RECORD_MISC_CPUMODE_HYPERVISOR => {
-                FoldFrame::HypervisorCallchain(ip)
-            }
+        addresses += 1;
+        frames.push(match cpumode {
+            PERF_RECORD_MISC_CPUMODE_USER => FoldFrame::UserCallchain(ip),
+            PERF_RECORD_MISC_CPUMODE_HYPERVISOR => FoldFrame::HypervisorCallchain(ip),
             _ => FoldFrame::Callchain(ip),
-        })
-    }));
-    if invalid_context {
-        frames.clear();
+        });
     }
 }
 
@@ -7863,8 +7852,10 @@ mod tests {
     }
 
     #[test]
-    fn recorded_frame_bulk_insertion_preserves_context_transitions_and_raw_deferred_cookie() {
+    fn recorded_frame_extension_consumes_context_markers_and_preserves_deferred_cookie() {
         use super::FoldFrame;
+        // perf util/machine.c:2171-2198 updates cpumode and returns before
+        // appending a cursor node; USER_DEFERRED is handled as USER here.
         let mut frames = super::FoldFrameStack::new();
         super::extend_recorded_callchain_frames_like_perf(
             &mut frames,
@@ -7883,15 +7874,106 @@ mod tests {
             frames.as_slice(),
             [
                 FoldFrame::UserCallchain(0xffff_8000_0000_0010),
-                FoldFrame::Callchain(super::PERF_CONTEXT_KERNEL),
                 FoldFrame::Callchain(0x1010),
-                FoldFrame::Callchain(super::PERF_CONTEXT_USER),
                 FoldFrame::UserCallchain(0x2020),
-                FoldFrame::Callchain(super::PERF_CONTEXT_USER_DEFERRED),
                 FoldFrame::UserCallchain(73),
             ]
         );
         assert_eq!(frames.last(), Some(&FoldFrame::UserCallchain(73)));
+    }
+
+    #[test]
+    fn prepared_marker_only_samples_have_an_empty_resolved_callchain_like_perf() {
+        // perf util/machine.c:add_callchain_ip consumes mode markers without
+        // cursor nodes. Preparing the sample must not mistake them for frames.
+        let (layouts, mut payload) = event_test_sample("cycles", 3, Some(1_000_000_000), false);
+        payload.truncate(payload.len() - 8);
+        payload.extend(4_u64.to_le_bytes());
+        for marker in [
+            super::PERF_CONTEXT_HV,
+            super::PERF_CONTEXT_KERNEL,
+            super::PERF_CONTEXT_USER,
+            super::PERF_CONTEXT_USER_DEFERRED,
+        ] {
+            payload.extend(marker.to_le_bytes());
+        }
+        let mut state = super::SessionState::new(std::collections::BTreeMap::new());
+        let mut frames = super::FoldFrameStack::new();
+        let sample = super::prepare_sample_for_fold(
+            &mut state,
+            super::PERF_RECORD_MISC_CPUMODE_USER,
+            &payload,
+            &layouts,
+            super::FoldOptions {
+                count_periods: true,
+                inline: true,
+            },
+            &mut frames,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (sample.pid, sample.tid, sample.count),
+            (Some(7), Some(7), 3)
+        );
+        assert!(sample.has_callchain);
+        assert!(
+            sample.frames.is_empty(),
+            "resolved cursor contains markers: {:?}",
+            sample.frames
+        );
+    }
+
+    #[test]
+    fn recorded_frame_extension_marker_only_input_has_no_cursor_nodes_like_perf() {
+        // perf util/machine.c:2171-2198 takes goto out for every context.
+        let mut frames = super::FoldFrameStack::new();
+        super::extend_recorded_callchain_frames_like_perf(
+            &mut frames,
+            [
+                super::PERF_CONTEXT_HV,
+                super::PERF_CONTEXT_KERNEL,
+                super::PERF_CONTEXT_USER,
+                super::PERF_CONTEXT_USER_DEFERRED,
+            ],
+            super::PERF_SCRIPT_MAX_STACK,
+        );
+        assert!(
+            frames.is_empty(),
+            "markers are mode changes, not frames: {frames:?}"
+        );
+    }
+
+    #[test]
+    fn recorded_frame_extension_consumes_markers_without_spending_the_address_budget() {
+        use super::FoldFrame;
+        // perf util/machine.c:2899-2914 checks the limit before each entry
+        // and increments nr_entries only for non-marker addresses.
+        let mut frames = super::FoldFrameStack::new();
+        super::extend_recorded_callchain_frames_like_perf(
+            &mut frames,
+            [
+                super::PERF_CONTEXT_HV,
+                0x1000,
+                super::PERF_CONTEXT_KERNEL,
+                0x2000,
+                super::PERF_CONTEXT_USER,
+                0x3000,
+                u64::MAX,
+            ],
+            3,
+        );
+        assert_eq!(
+            frames.as_slice(),
+            [
+                FoldFrame::HypervisorCallchain(0x1000),
+                FoldFrame::Callchain(0x2000),
+                FoldFrame::UserCallchain(0x3000),
+            ]
+        );
+        frames.clear();
+        super::extend_recorded_callchain_frames_like_perf(&mut frames, [0x1000, u64::MAX], 3);
+        assert!(frames.is_empty(), "unsupported context resets the cursor");
     }
 
     #[test]
