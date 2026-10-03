@@ -40,7 +40,7 @@ use crate::perfdata::samples::{
     PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_ID,
     PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID,
     PERF_SAMPLE_TIME, SampleLayout, is_kernel_space_frame, is_perf_context_marker,
-    is_perf_user_deferred_context_marker, parse_sample_record_callchain,
+    parse_sample_record_callchain,
 };
 use crate::perfdata::source::{FileSource, RecordSource, SliceSource};
 use crate::perfdata::unwind::{
@@ -56,8 +56,13 @@ use crate::symbols::{
 const UNKNOWN_FRAME: &str = "[unknown]";
 const PROT_EXEC: u32 = 4;
 const PERF_CONTEXT_KERNEL: u64 = 0xffff_ffff_ffff_ff80;
+const PERF_CONTEXT_HV: u64 = 0xffff_ffff_ffff_ffe0;
+const PERF_RECORD_MISC_CPUMODE_HYPERVISOR: u16 = 3;
 const PERF_CONTEXT_USER: u64 = 0xffff_ffff_ffff_fe00;
 const PERF_CONTEXT_USER_DEFERRED: u64 = 0xffff_ffff_ffff_fd80;
+// tools/perf/util/trace-event-scripting.c:24 initializes scripting_max_stack
+// to include/uapi/linux/perf_event.h's PERF_MAX_STACK_DEPTH.
+const PERF_SCRIPT_MAX_STACK: usize = 127;
 type FoldFrameStack = SmallVec<[FoldFrame; 16]>;
 type LabelId = usize;
 type LabelSpan = SmallVec<[LabelId; 4]>;
@@ -230,15 +235,12 @@ struct OrderedRecordQueue {
 
 struct DeferredFoldSample {
     cookie: u64,
-    pid: Option<u32>,
     tid: Option<u32>,
-    time: Option<u64>,
-    cpu: Option<u32>,
-    event_name: Arc<str>,
-    event_fields: InfernoSampleEventFields,
-    count: u64,
-    frames: FoldFrameStack,
-    has_callchain: bool,
+    misc: u16,
+    event: Arc<SampleEventLayout>,
+    options: FoldOptions,
+    payload: Vec<u8>,
+    cookie_to_suppress: Option<u64>,
 }
 
 struct PreparedFoldSample<'layout, 'frames> {
@@ -250,7 +252,7 @@ struct PreparedFoldSample<'layout, 'frames> {
     event_fields: &'layout InfernoSampleEventFields,
     count: u64,
     frames: &'frames [FoldFrame],
-    deferred_cookie: Option<u64>,
+    cookie_to_suppress: Option<u64>,
     has_callchain: bool,
 }
 
@@ -269,6 +271,7 @@ struct UnwindMappingRequest<'a> {
 enum FoldFrame {
     Callchain(u64),
     UserCallchain(u64),
+    HypervisorCallchain(u64),
     SampleIp { address: u64, cpumode: u16 },
     UserUnwind(u64),
     InlineCurrentIp(u64),
@@ -331,6 +334,7 @@ impl FoldFrame {
         match self {
             Self::Callchain(address)
             | Self::UserCallchain(address)
+            | Self::HypervisorCallchain(address)
             | Self::SampleIp { address, .. }
             | Self::UserUnwind(address)
             | Self::InlineCurrentIp(address) => address,
@@ -348,6 +352,7 @@ struct SampleLayouts {
 #[derive(Clone, Debug)]
 struct SampleEventLayout {
     layout: SampleLayout,
+    defer_callchain: bool,
     default_period: u64,
     event_name: Arc<str>,
     event_fields: InfernoSampleEventFields,
@@ -428,10 +433,18 @@ impl SampleEventLayout {
             InfernoSampleEventFields::new(&event_name, layout.sample_type & PERF_SAMPLE_TIME != 0);
         Self {
             layout,
+            defer_callchain: false,
             default_period,
             event_name,
             event_fields,
             offsets: SampleOffsets::new(layout.sample_type),
+        }
+    }
+
+    fn from_attr(attr: &PerfFileAttr, event_name: impl Into<Arc<str>>) -> Self {
+        Self {
+            defer_callchain: attr.defer_callchain,
+            ..Self::new(layout_from_attr(attr), event_name, attr.sample_period)
         }
     }
 }
@@ -1345,15 +1358,18 @@ impl<R: SymbolResolver> SampleOutput for FoldedOutput<'_, '_, R> {
                 self.event_filter = Some(event.into());
             }
         }
-        if combined_frame || (sample.time.is_none() && !sample.has_callchain) {
+        // evsel_fprintf.c prints the DSO and inline rows even when the symbol
+        // is (cookie). Inferno splits physical lines before omitting that row.
+        if combined_frame
+            || (sample.time.is_none() && !sample.has_callchain)
+            || sample.cookie_to_suppress.is_some()
+        {
             return self.fold_perf_text(accumulator, sample);
         }
-        let frames = sample
-            .frames
-            .iter()
-            .rev()
-            .copied()
-            .filter(|frame| !is_perf_context_marker(frame.address()));
+        let frames = sample.frames.iter().rev().copied().filter(|frame| {
+            let address = frame.address();
+            !is_perf_context_marker(address)
+        });
         self.buffers.projecting = true;
         let status = FoldFrameResolver::new(&accumulator.mmap_table, self.inline)
             .render_folded_stack_for_stack(
@@ -1438,32 +1454,38 @@ impl<O: SampleOutput> SampleSink<O> {
         sample_layouts: &SampleLayouts,
         options: FoldOptions,
     ) -> Result<(), String> {
-        let Some(sample) = prepare_sample_for_fold(
-            &mut self.accumulator,
-            misc,
-            payload,
-            sample_layouts,
-            options,
-            &mut self.sample_frames,
-        )?
-        else {
+        let Some(event) = sample_layouts.layout_for_payload(payload)? else {
             return Ok(());
         };
-        if let Some(cookie) = sample.deferred_cookie {
+        let Some(sample) = parse_sample_record_callchain(payload, event.layout)? else {
+            return Ok(());
+        };
+        // perf evsel.c:3391 and session.c:1486 recognize and queue deferred
+        // samples before callchain resolution, not after preparing frames.
+        if let Some(cookie) = event
+            .defer_callchain
+            .then(|| sample.frames.deferred_cookie())
+            .flatten()
+        {
             self.accumulator.deferred_samples.push(DeferredFoldSample {
                 cookie,
-                pid: sample.pid,
                 tid: sample.tid,
-                time: sample.time,
-                cpu: sample.cpu,
-                event_name: Arc::from(sample.event_name),
-                event_fields: sample.event_fields.clone(),
-                count: sample.count,
-                has_callchain: sample.has_callchain,
-                frames: std::mem::take(&mut self.sample_frames),
+                misc,
+                event: sample_layouts.owned_event_for_payload(payload)?,
+                options,
+                payload: payload.to_vec(),
+                cookie_to_suppress: Some(cookie),
             });
             return Ok(());
         }
+        let sample = prepare_parsed_sample_for_fold(
+            &mut self.accumulator,
+            misc,
+            event,
+            &sample,
+            options,
+            &mut self.sample_frames,
+        );
         self.output.write_sample_event(&self.accumulator, &sample)
     }
 
@@ -1475,22 +1497,9 @@ impl<O: SampleOutput> SampleSink<O> {
     ) -> Result<(), String> {
         for deferred in self
             .accumulator
-            .take_resolved_deferred_samples(cookie, tid, ips)
+            .take_resolved_deferred_samples(cookie, tid, ips)?
         {
-            let sample = PreparedFoldSample {
-                pid: deferred.pid,
-                tid: deferred.tid,
-                time: deferred.time,
-                cpu: deferred.cpu,
-                event_name: &deferred.event_name,
-                event_fields: &deferred.event_fields,
-                count: deferred.count,
-                frames: &deferred.frames,
-                deferred_cookie: None,
-                has_callchain: deferred.has_callchain,
-            };
-            self.output.write_sample_event(&self.accumulator, &sample)?;
-            self.sample_frames = deferred.frames;
+            self.deliver_deferred_sample(&deferred)?;
         }
         Ok(())
     }
@@ -1498,22 +1507,29 @@ impl<O: SampleOutput> SampleSink<O> {
     fn flush_deferred_samples(&mut self) -> Result<(), String> {
         let samples = self.accumulator.take_deferred_samples();
         for deferred in samples {
-            let sample = PreparedFoldSample {
-                pid: deferred.pid,
-                tid: deferred.tid,
-                time: deferred.time,
-                cpu: deferred.cpu,
-                event_name: &deferred.event_name,
-                event_fields: &deferred.event_fields,
-                count: deferred.count,
-                frames: &deferred.frames,
-                deferred_cookie: None,
-                has_callchain: deferred.has_callchain,
-            };
-            self.output.write_sample_event(&self.accumulator, &sample)?;
-            self.sample_frames = deferred.frames;
+            self.deliver_deferred_sample(&deferred)?;
         }
         Ok(())
+    }
+
+    fn deliver_deferred_sample(&mut self, deferred: &DeferredFoldSample) -> Result<(), String> {
+        let Some(raw_sample) =
+            parse_sample_record_callchain(&deferred.payload, deferred.event.layout)?
+        else {
+            return Ok(());
+        };
+        let mut sample = prepare_parsed_sample_for_fold(
+            &mut self.accumulator,
+            deferred.misc,
+            &deferred.event,
+            &raw_sample,
+            deferred.options,
+            &mut self.sample_frames,
+        );
+        // evsel_fprintf.c:171 prints (cookie) for every equal-IP node while
+        // deferred metadata is set. Inferno perf.rs:507 omits those names.
+        sample.cookie_to_suppress = deferred.cookie_to_suppress;
+        self.output.write_sample_event(&self.accumulator, &sample)
     }
 }
 
@@ -1527,9 +1543,10 @@ where
         accumulator: &SessionState,
         sample: &PreparedFoldSample,
     ) -> Result<(), String> {
+        let mut frame_resolver = FoldFrameResolver::new(&accumulator.mmap_table, self.inline);
+        frame_resolver.cookie_to_suppress = sample.cookie_to_suppress;
         if sample.has_callchain {
             self.write_sample_header(accumulator, sample)?;
-            let frame_resolver = FoldFrameResolver::new(&accumulator.mmap_table, self.inline);
             frame_resolver.write_script_frames_for_stack(
                 sample.pid,
                 sample.frames,
@@ -1538,7 +1555,6 @@ where
             )?;
         } else {
             self.write_sample_inline_header(accumulator, sample)?;
-            let frame_resolver = FoldFrameResolver::new(&accumulator.mmap_table, self.inline);
             frame_resolver.write_inline_sample_frame_for_stack(
                 sample.pid,
                 sample.frames,
@@ -1765,21 +1781,16 @@ fn sample_layouts_from_file(
         .unwrap_or_default();
     let mut layouts = SampleLayouts {
         fallback: attrs.first().map(|attr| {
-            Arc::new(SampleEventLayout::new(
-                layout_from_attr(attr),
+            Arc::new(SampleEventLayout::from_attr(
+                attr,
                 event_names.first().cloned().unwrap_or_default(),
-                attr.sample_period,
             ))
         }),
         by_identifier: BTreeMap::new(),
         event_name_width,
     };
     for ((attr, event_name), ids) in attrs.iter().zip(event_names).zip(attr_ids) {
-        let event = Arc::new(SampleEventLayout::new(
-            layout_from_attr(attr),
-            event_name,
-            attr.sample_period,
-        ));
+        let event = Arc::new(SampleEventLayout::from_attr(attr, event_name));
         for id in ids {
             layouts.by_identifier.insert(id, Arc::clone(&event));
         }
@@ -2277,9 +2288,8 @@ impl SessionState {
         cookie: u64,
         tid: Option<u32>,
         ips: &[u64],
-    ) -> Vec<DeferredFoldSample> {
+    ) -> Result<Vec<DeferredFoldSample>, String> {
         let samples = std::mem::take(&mut self.deferred_samples);
-        let deferred_frames = ips.iter().copied().map(FoldFrame::UserCallchain);
         let mut matched = Vec::new();
         let mut unmatched = Vec::new();
         for mut sample in samples {
@@ -2288,12 +2298,16 @@ impl SessionState {
                 continue;
             }
             if sample.cookie == cookie {
-                sample.frames.extend(deferred_frames.clone());
+                merge_deferred_sample_payload(&mut sample, ips)?;
+            } else {
+                // session.c:1399 clears deferred_callchain on same-TID
+                // mismatches, so the original cookie renders as an address.
+                sample.cookie_to_suppress = None;
             }
             matched.push(sample);
         }
         self.deferred_samples = unmatched;
-        matched
+        Ok(matched)
     }
 
     fn has_loaded_unwind_mapping_for_ip(&self, pid: Option<u32>, ip: u64) -> bool {
@@ -2483,6 +2497,7 @@ fn prefetch_sample_symbols<R: SymbolResolver>(
 struct FoldFrameResolver<'a> {
     mmap_table: &'a MmapTable,
     inline: bool,
+    cookie_to_suppress: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -2502,6 +2517,7 @@ fn resolve_frame_in_context<'a>(
     let address = frame.address();
     match frame {
         FoldFrame::Callchain(_) => context.resolve(address, mapping_cache),
+        FoldFrame::HypervisorCallchain(_) => None,
         FoldFrame::SampleIp { cpumode, .. }
             if cpumode & PERF_RECORD_MISC_CPUMODE_MASK == PERF_RECORD_MISC_CPUMODE_KERNEL =>
         {
@@ -2751,7 +2767,11 @@ impl SymbolResolver for NoopSymbolResolver {
 
 impl<'a> FoldFrameResolver<'a> {
     fn new(mmap_table: &'a MmapTable, inline: bool) -> Self {
-        Self { mmap_table, inline }
+        Self {
+            mmap_table,
+            inline,
+            cookie_to_suppress: None,
+        }
     }
 
     fn mapping_decision(
@@ -2900,6 +2920,7 @@ impl<'a> FoldFrameResolver<'a> {
                 continue;
             }
             if symbol_cache.is_none()
+                && self.cookie_to_suppress != Some(frame.address())
                 && !is_valid_unwound_user_frame(pid, frame, self.mmap_table, &mut mapping_cache)
             {
                 continue;
@@ -2910,7 +2931,7 @@ impl<'a> FoldFrameResolver<'a> {
                 // in inline-capable mode the leaf expands its inline chain just
                 // like a caller frame. Only base-only mode renders the single
                 // base symtab symbol for the leaf.
-                if self.inline {
+                if self.inline || self.cookie_to_suppress == Some(address) {
                     self.write_regular_script_frame(
                         pid,
                         FoldFrame::UserUnwind(address),
@@ -2988,12 +3009,20 @@ impl<'a> FoldFrameResolver<'a> {
         W: IoWrite + ?Sized,
     {
         let address = frame.address();
-        match self.mapping_decision(pid, frame, mapping_cache) {
+        let is_cookie = self.cookie_to_suppress == Some(address);
+        let decision = if is_cookie {
+            let context = pid.map(|pid| self.mmap_table.frame_context(pid, mapping_cache));
+            resolve_frame_in_context(context.as_ref(), frame, mapping_cache)
+                .map_or(FrameMappingDecision::Unknown, FrameMappingDecision::Mapped)
+        } else {
+            self.mapping_decision(pid, frame, mapping_cache)
+        };
+        match decision {
             FrameMappingDecision::Mapped(mapping) => {
                 write_perf_script_mapped_decision_frame(
                     writer,
                     address,
-                    frame,
+                    is_cookie,
                     &mapping.resolved_ref(),
                     symbol_cache,
                     self.inline,
@@ -3003,7 +3032,16 @@ impl<'a> FoldFrameResolver<'a> {
                 write_perf_script_address_frame(writer, address)?;
             }
             FrameMappingDecision::Unknown => {
-                write_perf_script_unknown_frame(writer, address)?;
+                if is_cookie {
+                    write_perf_script_mapped_symbol_frame(
+                        writer,
+                        address,
+                        "(cookie)",
+                        UNKNOWN_FRAME,
+                    )?;
+                } else {
+                    write_perf_script_unknown_frame(writer, address)?;
+                }
             }
         }
         Ok(())
@@ -3445,7 +3483,7 @@ where
 fn write_perf_script_mapped_decision_frame<R, W>(
     writer: &mut W,
     address: u64,
-    _frame: FoldFrame,
+    is_cookie: bool,
     mapping: &ResolvedMappingRef<'_>,
     symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
     inline: bool,
@@ -3455,13 +3493,26 @@ where
     W: IoWrite + ?Sized,
 {
     let Some(cache) = symbol_cache else {
-        write_perf_script_mapped_unknown_symbol_frame(writer, address, mapping.path)?;
+        if is_cookie {
+            write_perf_script_mapped_symbol_frame(writer, address, "(cookie)", mapping.path)?;
+        } else {
+            write_perf_script_mapped_unknown_symbol_frame(writer, address, mapping.path)?;
+        }
         return Ok(());
     };
     // Base-only mode resolves one object symbol and prints it with the mapping's
     // full DSO name (map__fprintf_dsoname). The CLI parity path keeps inline on
     // so DWARF data can emit the inline rows that real perf prints.
     if !inline {
+        if is_cookie {
+            let _ = cache.resolve_mapping_ref_with_base_symbol(mapping)?;
+            return write_perf_script_mapped_symbol_frame(
+                writer,
+                address,
+                "(cookie)",
+                mapping.path,
+            );
+        }
         return match cache.resolve_mapping_ref_with_base_symbol(mapping)? {
             Some([label, ..]) => {
                 write_perf_script_mapped_symbol_frame(writer, address, label, mapping.path)
@@ -3472,17 +3523,29 @@ where
     let (frames, base_offset, has_inline_frames, has_non_inline_base_frame) =
         cache.resolve_mapping_ref_with_offset(mapping)?;
     if frames.is_empty() {
-        write_perf_script_mapped_unknown_symbol_frame(writer, address, mapping.path)?;
+        if is_cookie {
+            write_perf_script_mapped_symbol_frame(writer, address, "(cookie)", mapping.path)?;
+        } else {
+            write_perf_script_mapped_unknown_symbol_frame(writer, address, mapping.path)?;
+        }
     } else if frames.len() == 1 && !has_inline_frames && !is_kernel_space_frame(address) {
         // A single non-inline base frame already carries its +0x<off> baked in
         // by perf_frames_with_object_alias_and_offset (the symtab with_offset
         // form), so print it verbatim with the DSO path.
-        write_perf_script_mapped_symbol_frame(writer, address, &frames[0], mapping.path)?;
+        let label = if is_cookie { "(cookie)" } else { &frames[0] };
+        write_perf_script_mapped_symbol_frame(writer, address, label, mapping.path)?;
     } else {
         let last = frames.len() - 1;
         for (printed_index, label) in frames.iter().rev().enumerate() {
             let is_inlined = has_inline_frames
                 && (frames.len() == 1 || printed_index != last || !has_non_inline_base_frame);
+            // evsel_fprintf.c:171 changes only the symbol text after cursor
+            // expansion; lines 185 and 195 preserve each node's inline suffix.
+            let (label, base_offset) = if is_cookie {
+                ("(cookie)", None)
+            } else {
+                (label.as_str(), base_offset)
+            };
             write_perf_script_inline_chain_frame(
                 writer,
                 address,
@@ -3786,6 +3849,7 @@ fn perf_user_reg_value(mask: u64, values: &[u64], register: u32) -> Option<u64> 
     values.get(index).copied()
 }
 
+#[cfg(test)]
 fn prepare_sample_for_fold<'layout, 'frames>(
     accumulator: &mut SessionState,
     misc: u16,
@@ -3800,18 +3864,39 @@ fn prepare_sample_for_fold<'layout, 'frames>(
     let Some(sample) = parse_sample_record_callchain(payload, event.layout)? else {
         return Ok(None);
     };
+    Ok(Some(prepare_parsed_sample_for_fold(
+        accumulator,
+        misc,
+        event,
+        &sample,
+        options,
+        frames,
+    )))
+}
+
+fn prepare_parsed_sample_for_fold<'layout, 'frames>(
+    accumulator: &mut SessionState,
+    misc: u16,
+    event: &'layout SampleEventLayout,
+    sample: &crate::perfdata::samples::SampleCallchain<'_>,
+    options: FoldOptions,
+    frames: &'frames mut FoldFrameStack,
+) -> PreparedFoldSample<'layout, 'frames> {
     let count = sample_fold_count(sample.period, event.default_period, options);
     frames.clear();
     frames.reserve(sample.frames.len());
     let has_callchain = event.layout.sample_type & PERF_SAMPLE_CALLCHAIN != 0;
     if has_callchain {
-        extend_recorded_callchain_frames_like_perf(frames, sample.frames.clone());
+        extend_recorded_callchain_frames_like_perf(
+            frames,
+            sample.frames.clone(),
+            PERF_SCRIPT_MAX_STACK,
+        );
     } else {
         extend_sample_ip_frame_like_perf_machine_resolve(frames, misc, sample.frames.clone());
     }
-    let deferred_cookie = take_deferred_cookie(frames);
-    append_perf_user_unwind_frames(accumulator, misc, event, &sample, frames);
-    Ok(Some(PreparedFoldSample {
+    append_perf_user_unwind_frames(accumulator, misc, event, sample, frames);
+    PreparedFoldSample {
         pid: sample.pid,
         tid: sample.tid,
         time: sample.time,
@@ -3820,9 +3905,9 @@ fn prepare_sample_for_fold<'layout, 'frames>(
         event_fields: &event.event_fields,
         count,
         frames,
-        deferred_cookie,
+        cookie_to_suppress: None,
         has_callchain,
-    }))
+    }
 }
 
 fn extend_sample_ip_frame_like_perf_machine_resolve(
@@ -3844,6 +3929,7 @@ fn extend_sample_ip_frame_like_perf_machine_resolve(
 fn extend_recorded_callchain_frames_like_perf(
     frames: &mut FoldFrameStack,
     callchain: impl IntoIterator<Item = u64>,
+    max_stack: usize,
 ) {
     // tools/perf/util/machine.c add_callchain_ip() switches cpumode only when
     // it encounters PERF_CONTEXT_* markers. A kernel-looking address that is
@@ -3851,8 +3937,21 @@ fn extend_recorded_callchain_frames_like_perf(
     // maps and normally prints as [unknown], not fall into kernel maps by
     // address alone.
     let mut cpumode = PERF_RECORD_MISC_CPUMODE_USER;
+    let mut addresses = 0;
     for ip in callchain {
+        // machine.c:__thread__resolve_callchain_sample tests nr_entries before
+        // each iteration and increments it only for IPs below PERF_CONTEXT_MAX.
+        if addresses == max_stack {
+            break;
+        }
+        if !is_perf_context_marker(ip) {
+            addresses += 1;
+        }
         match ip {
+            PERF_CONTEXT_HV => {
+                cpumode = PERF_RECORD_MISC_CPUMODE_HYPERVISOR;
+                frames.push(FoldFrame::Callchain(ip));
+            }
             PERF_CONTEXT_KERNEL => {
                 cpumode = PERF_RECORD_MISC_CPUMODE_KERNEL;
                 frames.push(FoldFrame::Callchain(ip));
@@ -3861,8 +3960,18 @@ fn extend_recorded_callchain_frames_like_perf(
                 cpumode = PERF_RECORD_MISC_CPUMODE_USER;
                 frames.push(FoldFrame::Callchain(ip));
             }
+            _ if is_perf_context_marker(ip) => {
+                // machine.c:add_callchain_ip resets the whole recorded cursor
+                // and stops at the first unsupported context. User unwinding
+                // runs afterwards in __thread__resolve_callchain.
+                frames.clear();
+                return;
+            }
             _ if cpumode == PERF_RECORD_MISC_CPUMODE_USER => {
                 frames.push(FoldFrame::UserCallchain(ip));
+            }
+            _ if cpumode == PERF_RECORD_MISC_CPUMODE_HYPERVISOR => {
+                frames.push(FoldFrame::HypervisorCallchain(ip));
             }
             _ => frames.push(FoldFrame::Callchain(ip)),
         }
@@ -4397,19 +4506,31 @@ fn is_recorded_kernel_callchain_frame(frame: u64) -> bool {
     !is_perf_context_marker(frame) && is_kernel_space_frame(frame)
 }
 
-fn take_deferred_cookie(frames: &mut FoldFrameStack) -> Option<u64> {
-    match frames.as_slice() {
-        [
-            ..,
-            FoldFrame::Callchain(marker),
-            FoldFrame::Callchain(cookie) | FoldFrame::UserCallchain(cookie),
-        ] if is_perf_user_deferred_context_marker(*marker) => {
-            let cookie = *cookie;
-            frames.pop();
-            Some(cookie)
-        }
-        _ => None,
-    }
+fn merge_deferred_sample_payload(
+    sample: &mut DeferredFoldSample,
+    ips: &[u64],
+) -> Result<(), String> {
+    // perf callchain.c:1919 copies the original including USER_DEFERRED,
+    // replacing only its cookie with the deferred addresses. Keep all
+    // remaining sample fields intact for the shared parser and unwinder.
+    let parsed = parse_sample_record_callchain(&sample.payload, sample.event.layout)?
+        .ok_or_else(|| "deferred sample has no callchain".to_string())?;
+    let range = parsed
+        .callchain_range
+        .ok_or_else(|| "deferred sample has no recorded callchain".to_string())?;
+    let count = parsed
+        .frames
+        .len()
+        .checked_sub(1)
+        .and_then(|count| count.checked_add(ips.len()))
+        .and_then(|count| u64::try_from(count).ok())
+        .ok_or_else(|| "merged deferred callchain length overflows".to_string())?;
+    sample.payload[range.start..range.start + 8].copy_from_slice(&count.to_le_bytes());
+    sample.payload.splice(
+        range.end - 8..range.end,
+        ips.iter().flat_map(|ip| ip.to_le_bytes()),
+    );
+    Ok(())
 }
 
 fn has_perf_captured_user_stack(stack: &crate::perfdata::samples::SampleUserStack<'_>) -> bool {
@@ -4587,21 +4708,16 @@ fn sample_layouts(
         .unwrap_or_default();
     let mut layouts = SampleLayouts {
         fallback: attrs.first().map(|attr| {
-            Arc::new(SampleEventLayout::new(
-                layout_from_attr(attr),
+            Arc::new(SampleEventLayout::from_attr(
+                attr,
                 event_names.first().cloned().unwrap_or_default(),
-                attr.sample_period,
             ))
         }),
         by_identifier: BTreeMap::new(),
         event_name_width,
     };
     for ((attr, event_name), ids) in attrs.iter().zip(event_names).zip(attr_ids) {
-        let event = Arc::new(SampleEventLayout::new(
-            layout_from_attr(attr),
-            event_name,
-            attr.sample_period,
-        ));
+        let event = Arc::new(SampleEventLayout::from_attr(attr, event_name));
         for id in ids {
             layouts.by_identifier.insert(id, Arc::clone(&event));
         }
@@ -4776,10 +4892,20 @@ fn software_event_name(config: u64) -> &'static str {
 
 impl SampleLayouts {
     fn layout_for_payload(&self, payload: &[u8]) -> Result<Option<&SampleEventLayout>, String> {
+        Ok(self.event_for_payload(payload)?.map(Arc::as_ref))
+    }
+
+    fn owned_event_for_payload(&self, payload: &[u8]) -> Result<Arc<SampleEventLayout>, String> {
+        self.event_for_payload(payload)?
+            .cloned()
+            .ok_or_else(|| "deferred sample has no event layout".to_string())
+    }
+
+    fn event_for_payload(&self, payload: &[u8]) -> Result<Option<&Arc<SampleEventLayout>>, String> {
         if self.by_identifier.is_empty() {
-            return Ok(self.fallback.as_deref());
+            return Ok(self.fallback.as_ref());
         }
-        let Some(fallback) = self.fallback.as_deref() else {
+        let Some(fallback) = self.fallback.as_ref() else {
             return Ok(None);
         };
         if let Some(identifier) = fallback
@@ -4788,11 +4914,7 @@ impl SampleLayouts {
             .map(|offset| read_sample_u64(payload, offset))
             .transpose()?
         {
-            return Ok(self
-                .by_identifier
-                .get(&identifier)
-                .map(Arc::as_ref)
-                .or(Some(fallback)));
+            return Ok(self.by_identifier.get(&identifier).or(Some(fallback)));
         }
         Ok(Some(fallback))
     }
@@ -5956,6 +6078,190 @@ mod tests {
             .expect("render folded stack");
 
         assert_eq!(buffers.rendered(), "burn-00;fn124;fn0;mix");
+    }
+
+    #[test]
+    fn cookie_script_frames_preserve_inline_nodes_and_base_symbol_metadata_like_perf() {
+        // machine.c:append_inlines appends each expanded node with the same IP.
+        // evsel_fprintf.c:171 substitutes (cookie) per node, without offsets;
+        // lines 185 and 195 still select the DSO or (inlined) suffix per node.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x1000,
+            len: 0x1000,
+            pgoff: 0,
+            path: "/missing/inline-cookie".to_string(),
+        });
+        for has_non_inline_base_frame in [true, false] {
+            let resolver = StaticFrameResolver {
+                frames: vec!["base_symbol".to_string(), "inline_leaf".to_string()],
+                has_base_symbol: true,
+                has_inline_frames: true,
+                has_non_inline_base_frame,
+                base_offset: Some(0x27),
+            };
+            let base_suffix = if has_non_inline_base_frame {
+                "/missing/inline-cookie"
+            } else {
+                "inlined"
+            };
+            for frame in [
+                super::FoldFrame::UserCallchain(0x1427),
+                super::FoldFrame::UserUnwind(0x1427),
+                super::FoldFrame::InlineCurrentIp(0x1427),
+            ] {
+                let mut symbol_cache = SymbolFrameCache::new(&resolver);
+                let mut written = Vec::new();
+                let mut frame_resolver = super::FoldFrameResolver::new(&mmap_table, true);
+                frame_resolver.cookie_to_suppress = Some(0x1427);
+                frame_resolver
+                    .write_script_frames_for_stack(
+                        Some(11),
+                        &[frame],
+                        Some(&mut symbol_cache),
+                        &mut written,
+                    )
+                    .expect("write cookie inline nodes");
+                assert_eq!(
+                    String::from_utf8(written).expect("utf-8"),
+                    format!(
+                        "\t            1427 (cookie) (inlined)\n\
+                         \t            1427 (cookie) ({base_suffix})\n"
+                    ),
+                    "frame={frame:?}, has_non_inline_base_frame={has_non_inline_base_frame}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cookie_script_frame_preserves_a_single_fake_inline_node_like_perf() {
+        // machine.c:append_inlines can emit one fake inline symbol; its node
+        // retains sym->inlined even when the expanded chain has length one.
+        // evsel_fprintf.c:171 and 195 print (cookie) (inlined), never an offset.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x1000,
+            len: 0x1000,
+            pgoff: 0,
+            path: "/missing/single-inline-cookie".to_string(),
+        });
+        let resolver = StaticFrameResolver {
+            frames: vec!["inline_leaf".to_string()],
+            has_base_symbol: true,
+            has_inline_frames: true,
+            has_non_inline_base_frame: false,
+            base_offset: Some(0x27),
+        };
+        let mut symbol_cache = SymbolFrameCache::new(&resolver);
+        let mut written = Vec::new();
+        let mut frame_resolver = super::FoldFrameResolver::new(&mmap_table, true);
+        frame_resolver.cookie_to_suppress = Some(0x1427);
+        frame_resolver
+            .write_script_frames_for_stack(
+                Some(11),
+                &[super::FoldFrame::UserCallchain(0x1427)],
+                Some(&mut symbol_cache),
+                &mut written,
+            )
+            .expect("write single cookie inline node");
+        assert_eq!(written, b"\t            1427 (cookie) (inlined)\n");
+    }
+
+    #[test]
+    fn cookie_script_frames_without_symbols_preserve_mapping_domains_like_perf() {
+        // evsel_fprintf.c:171 substitutes the cookie even without a symbol.
+        // event.c:thread__find_map leaves hypervisor nodes unmapped.
+        let address = 0xffff_ffff_8100_0010;
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: address - 0x10,
+            len: 0x100,
+            pgoff: 0,
+            path: "/missing/cookie-source".to_string(),
+        });
+        for (frame, path) in [
+            (
+                super::FoldFrame::UserCallchain(address),
+                "/missing/cookie-source",
+            ),
+            (super::FoldFrame::HypervisorCallchain(address), "[unknown]"),
+            (super::FoldFrame::UserUnwind(0x1040), "[unknown]"),
+        ] {
+            let mut frame_resolver = super::FoldFrameResolver::new(&mmap_table, true);
+            frame_resolver.cookie_to_suppress = Some(frame.address());
+            let mut written = Vec::new();
+            frame_resolver
+                .write_script_frames_for_stack(
+                    Some(11),
+                    &[frame],
+                    None::<&mut SymbolFrameCache<'_, super::NoopSymbolResolver>>,
+                    &mut written,
+                )
+                .expect("write unsymbolized cookie frame");
+            assert_eq!(
+                String::from_utf8(written).expect("utf-8"),
+                format!("\t{:16x} (cookie) ({path})\n", frame.address()),
+                "frame={frame:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cookie_script_base_only_and_negative_symbols_keep_one_cookie_row_like_perf() {
+        // machine.c:append_inlines bypasses expansion with inline_name=false;
+        // evsel_fprintf.c:171 still replaces unknown and base-symbol names.
+        let mut mmap_table = super::MmapTable::default();
+        mmap_table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start: 0x1000,
+            len: 0x1000,
+            pgoff: 0,
+            path: "/missing/base-cookie".to_string(),
+        });
+        for inline in [false, true] {
+            for has_base_symbol in [false, true] {
+                let resolver = StaticFrameResolver {
+                    frames: if has_base_symbol {
+                        vec!["base_symbol+0x27".to_string()]
+                    } else {
+                        Vec::new()
+                    },
+                    has_base_symbol,
+                    has_non_inline_base_frame: has_base_symbol,
+                    base_offset: Some(0x27),
+                    ..StaticFrameResolver::default()
+                };
+                let mut symbol_cache = SymbolFrameCache::new(&resolver);
+                let mut frame_resolver = super::FoldFrameResolver::new(&mmap_table, inline);
+                frame_resolver.cookie_to_suppress = Some(0x1427);
+                for frame in [
+                    super::FoldFrame::UserCallchain(0x1427),
+                    super::FoldFrame::InlineCurrentIp(0x1427),
+                ] {
+                    let mut written = Vec::new();
+                    frame_resolver
+                        .write_script_frames_for_stack(
+                            Some(11),
+                            &[frame],
+                            Some(&mut symbol_cache),
+                            &mut written,
+                        )
+                        .expect("write base-only or unresolved cookie frame");
+                    assert_eq!(
+                        written, b"\t            1427 (cookie) (/missing/base-cookie)\n",
+                        "frame={frame:?}, inline={inline}, has_base_symbol={has_base_symbol}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -8113,7 +8419,7 @@ mod tests {
             event_fields: &event.event_fields,
             count: 1,
             frames,
-            deferred_cookie: None,
+            cookie_to_suppress: None,
             has_callchain: true,
         }
     }
@@ -9789,6 +10095,79 @@ mod tests {
         );
     }
 
+    fn queued_deferred_sample(
+        cookie: u64,
+        tid: u32,
+        time: u64,
+        ip: u64,
+    ) -> super::DeferredFoldSample {
+        let event = super::SampleEventLayout::new(
+            crate::perfdata::samples::SampleLayout {
+                sample_type: super::PERF_SAMPLE_IP
+                    | super::PERF_SAMPLE_TID
+                    | super::PERF_SAMPLE_TIME
+                    | super::PERF_SAMPLE_CALLCHAIN,
+                read_format: 0,
+                branch_sample_type: 0,
+                sample_regs_user: 0,
+                sample_regs_intr: 0,
+                sample_id_all: false,
+            },
+            "cpu-clock",
+            1,
+        );
+        let mut payload = ip.to_le_bytes().to_vec();
+        payload.extend(11_u32.to_le_bytes());
+        payload.extend(tid.to_le_bytes());
+        payload.extend(time.to_le_bytes());
+        payload.extend(3_u64.to_le_bytes());
+        for address in [ip, super::PERF_CONTEXT_USER_DEFERRED, cookie] {
+            payload.extend(address.to_le_bytes());
+        }
+        super::DeferredFoldSample {
+            cookie,
+            tid: Some(tid),
+            misc: super::PERF_RECORD_MISC_CPUMODE_USER,
+            event: std::sync::Arc::new(event),
+            options: super::FoldOptions::default(),
+            payload,
+            cookie_to_suppress: Some(cookie),
+        }
+    }
+
+    #[test]
+    fn deferred_merge_preserves_registers_and_stack_bytes_after_the_callchain() {
+        use crate::perfdata::samples::{PERF_SAMPLE_REGS_USER, PERF_SAMPLE_STACK_USER};
+
+        let mut queued = queued_deferred_sample(u64::MAX, 21, 100, 0x2000);
+        let event = std::sync::Arc::make_mut(&mut queued.event);
+        event.layout.sample_type |= PERF_SAMPLE_REGS_USER | PERF_SAMPLE_STACK_USER;
+        event.layout.sample_regs_user = 1 << 8;
+        let mut tail = 2_u64.to_le_bytes().to_vec();
+        tail.extend(0xabcd_u64.to_le_bytes());
+        tail.extend(3_u64.to_le_bytes());
+        tail.extend([1, 2, 3, 0, 0, 0, 0, 0]);
+        tail.extend(3_u64.to_le_bytes());
+        queued.payload.extend_from_slice(&tail);
+
+        super::merge_deferred_sample_payload(&mut queued, &[0x3000, 0x4000]).unwrap();
+        let parsed = super::parse_sample_record_callchain(&queued.payload, queued.event.layout)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.pid, Some(11));
+        assert_eq!(parsed.tid, Some(21));
+        assert_eq!(parsed.time, Some(100));
+        assert_eq!(
+            parsed.frames.collect::<Vec<_>>(),
+            [0x2000, super::PERF_CONTEXT_USER_DEFERRED, 0x3000, 0x4000]
+        );
+        assert_eq!(parsed.user_regs.unwrap().values, [0xabcd]);
+        let stack = parsed.user_stack.unwrap();
+        assert_eq!(stack.bytes, [1, 2, 3]);
+        assert_eq!(stack.dynamic_size, 3);
+        assert!(queued.payload.ends_with(&tail));
+    }
+
     #[test]
     fn deferred_sample_final_flush_preserves_insertion_order_like_perf_ordered_events() {
         // tools/perf/util/ordered-events.c queue_event() inserts events by
@@ -9797,32 +10176,10 @@ mod tests {
         let mut accumulator = super::SessionState::new(std::collections::BTreeMap::new());
         accumulator
             .deferred_samples
-            .push(super::DeferredFoldSample {
-                cookie: 2,
-                pid: Some(11),
-                tid: Some(21),
-                time: Some(100),
-                cpu: None,
-                event_name: std::sync::Arc::from("cpu-clock"),
-                event_fields: super::InfernoSampleEventFields::new("cpu-clock", true),
-                count: 1,
-                frames: smallvec::smallvec![super::FoldFrame::Callchain(0x2000)],
-                has_callchain: true,
-            });
+            .push(queued_deferred_sample(2, 21, 100, 0x2000));
         accumulator
             .deferred_samples
-            .push(super::DeferredFoldSample {
-                cookie: 1,
-                pid: Some(11),
-                tid: Some(22),
-                time: Some(100),
-                cpu: None,
-                event_name: std::sync::Arc::from("cpu-clock"),
-                event_fields: super::InfernoSampleEventFields::new("cpu-clock", true),
-                count: 1,
-                frames: smallvec::smallvec![super::FoldFrame::Callchain(0x1000)],
-                has_callchain: true,
-            });
+            .push(queued_deferred_sample(1, 22, 100, 0x1000));
 
         let tids = accumulator
             .take_deferred_samples()
@@ -9883,48 +10240,17 @@ mod tests {
         let mut accumulator = super::SessionState::new(std::collections::BTreeMap::new());
         accumulator
             .deferred_samples
-            .push(super::DeferredFoldSample {
-                cookie: 2,
-                pid: Some(11),
-                tid: Some(20),
-                time: Some(100),
-                cpu: None,
-                event_name: std::sync::Arc::from("cpu-clock"),
-                event_fields: super::InfernoSampleEventFields::new("cpu-clock", true),
-                count: 1,
-                frames: smallvec::smallvec![super::FoldFrame::Callchain(0x2000)],
-                has_callchain: true,
-            });
+            .push(queued_deferred_sample(2, 20, 100, 0x2000));
         accumulator
             .deferred_samples
-            .push(super::DeferredFoldSample {
-                cookie: 7,
-                pid: Some(11),
-                tid: Some(30),
-                time: Some(150),
-                cpu: None,
-                event_name: std::sync::Arc::from("cpu-clock"),
-                event_fields: super::InfernoSampleEventFields::new("cpu-clock", true),
-                count: 1,
-                frames: smallvec::smallvec![super::FoldFrame::Callchain(0x3000)],
-                has_callchain: true,
-            });
+            .push(queued_deferred_sample(7, 30, 150, 0x3000));
         accumulator
             .deferred_samples
-            .push(super::DeferredFoldSample {
-                cookie: 7,
-                pid: Some(11),
-                tid: Some(20),
-                time: Some(200),
-                cpu: None,
-                event_name: std::sync::Arc::from("cpu-clock"),
-                event_fields: super::InfernoSampleEventFields::new("cpu-clock", true),
-                count: 1,
-                frames: smallvec::smallvec![super::FoldFrame::Callchain(0x7000)],
-                has_callchain: true,
-            });
+            .push(queued_deferred_sample(7, 20, 200, 0x7000));
 
-        let samples = accumulator.take_resolved_deferred_samples(7, Some(20), &[0x4000]);
+        let samples = accumulator
+            .take_resolved_deferred_samples(7, Some(20), &[0x4000])
+            .unwrap();
 
         assert_eq!(
             samples.iter().map(|sample| sample.tid).collect::<Vec<_>>(),
@@ -9933,16 +10259,22 @@ mod tests {
         assert_eq!(
             samples
                 .iter()
-                .map(|sample| sample.frames.as_slice())
+                .map(|sample| super::parse_sample_record_callchain(
+                    &sample.payload,
+                    sample.event.layout
+                )
+                .unwrap()
+                .unwrap()
+                .frames
+                .collect::<Vec<_>>())
                 .collect::<Vec<_>>(),
             vec![
-                &[super::FoldFrame::Callchain(0x2000)][..],
-                &[
-                    super::FoldFrame::Callchain(0x7000),
-                    super::FoldFrame::UserCallchain(0x4000)
-                ][..],
+                vec![0x2000, super::PERF_CONTEXT_USER_DEFERRED, 2],
+                vec![0x7000, super::PERF_CONTEXT_USER_DEFERRED, 0x4000],
             ]
         );
+        assert_eq!(samples[0].cookie_to_suppress, None);
+        assert_eq!(samples[1].cookie_to_suppress, Some(7));
         assert_eq!(accumulator.deferred_samples.len(), 1);
         assert_eq!(accumulator.deferred_samples[0].tid, Some(30));
     }

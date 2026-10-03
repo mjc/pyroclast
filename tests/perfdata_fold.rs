@@ -1989,11 +1989,9 @@ fn drops_perf_context_marker_frames_when_folding() {
 }
 
 #[test]
-fn does_not_merge_deferred_user_callchain_without_tid_sample_id_like_perf_script() {
-    // evsel.c initializes PERF_RECORD_CALLCHAIN_DEFERRED sample tids to -1.
-    // Without sample_id_all TID data, session.c evlist__deliver_deferred_callchain()
-    // does not match a normal original sample tid, so EOF flush emits the
-    // original callchain before the deferred marker.
+fn disabled_deferral_retains_cookie_without_tid_sample_id_like_perf_script() {
+    // evsel.c:3391 requires attr.defer_callchain before treating the final
+    // address as a cookie. This fixture leaves bit38 disabled.
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
             PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
@@ -2017,11 +2015,13 @@ fn does_not_merge_deferred_user_callchain_without_tid_sample_id_like_perf_script
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown];[unknown] 1\n");
 }
 
 #[test]
-fn merges_deferred_user_callchains_with_matching_tid_sample_id_like_perf_script() {
+fn disabled_deferral_does_not_merge_even_with_matching_tid_sample_id_like_perf_script() {
+    // evsel.c:3391 and session.c:1486 require attr.defer_callchain; a matching
+    // TID/cookie cannot merge a sample that was never queued for deferral.
     let mut deferred = callchain_deferred_payload(0x4444, [0x5000, 0x6000]);
     deferred.extend(11_u32.to_le_bytes());
     deferred.extend(12_u32.to_le_bytes());
@@ -2047,14 +2047,13 @@ fn merges_deferred_user_callchains_with_matching_tid_sample_id_like_perf_script(
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown];[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown];[unknown] 1\n");
 }
 
 #[test]
-fn flushes_original_deferred_sample_when_deferred_record_tid_differs_like_perf_script() {
-    // perf leaves the original deferred sample queued when a deferred-callchain
-    // record has the right cookie but a different tid. session__flush_deferred_samples()
-    // then delivers the original unmerged callchain at EOF.
+fn disabled_deferral_retains_cookie_when_a_different_tid_record_arrives_like_perf_script() {
+    // evsel.c:3391 requires bit38. No deferral occurs in this fixture, so the
+    // original cookie is an address regardless of the later record's TID.
     let mut deferred = callchain_deferred_payload(0x4444, [0x5000, 0x6000]);
     deferred.extend(11_u32.to_le_bytes());
     deferred.extend(99_u32.to_le_bytes());
@@ -2080,14 +2079,13 @@ fn flushes_original_deferred_sample_when_deferred_record_tid_differs_like_perf_s
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown];[unknown] 1\n");
 }
 
 #[test]
-fn flushes_unmatched_deferred_user_callchains_like_perf_script() {
-    // A missing matching cookie follows the same perf flush path: the original
-    // sample is eventually delivered with its recorded frames before the
-    // PERF_CONTEXT_USER_DEFERRED marker.
+fn disabled_deferral_retains_cookie_when_a_different_cookie_record_arrives_like_perf_script() {
+    // evsel.c:3391 requires bit38. Without it, the cookie is a normal frame
+    // and the sample is delivered without waiting for a matching record.
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
             PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
@@ -2111,7 +2109,7 @@ fn flushes_unmatched_deferred_user_callchains_like_perf_script() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -2461,6 +2459,277 @@ fn native_script_and_fold(bytes: &[u8]) -> (String, String) {
         String::from_utf8(perf.stdout).expect("native script"),
         String::from_utf8(folded).expect("native fold"),
     )
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn hypervisor_callchain_context_does_not_resolve_host_user_mappings_like_perf() {
+    // tools/perf/util/machine.c:add_callchain_ip switches PERF_CONTEXT_HV to
+    // PERF_RECORD_MISC_HYPERVISOR. util/event.c:thread__find_map returns NULL
+    // for that mode; Inferno perf.rs:with_module_fallback keeps [unknown].
+    let bytes = callchain_context_fixture(&[
+        0xffff_ffff_ffff_fe00,
+        0x1010,
+        0xffff_ffff_ffff_ffe0,
+        0x1020,
+        0xffff_ffff_ffff_fe00,
+        0x1030,
+    ]);
+    let (script, expected) = native_script_and_fold(&bytes);
+    assert_eq!(expected, "worker;[app];[unknown];[app] 1\n", "{script}");
+    assert_eq!(
+        fold_perfdata_callchains(&bytes).expect("fold"),
+        expected,
+        "native script={script}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn invalid_callchain_context_discards_all_recorded_frames_like_perf() {
+    // tools/perf/util/machine.c:add_callchain_ip resets the entire cursor and
+    // returns 1 on unsupported PERF_CONTEXT_* values; its caller stops then.
+    for marker in [0xffff_ffff_ffff_f001, 0xffff_ffff_ffff_f800, u64::MAX] {
+        let bytes = callchain_context_fixture(&[0x1010, marker, 0x1020]);
+        let (script, expected) = native_script_and_fold(&bytes);
+        assert_eq!(
+            fold_perfdata_callchains(&bytes).expect("fold"),
+            expected,
+            "marker={marker:x}; native script={script}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn address_immediately_below_perf_context_max_remains_a_frame_like_perf() {
+    // include/uapi/linux/perf_event.h defines PERF_CONTEXT_MAX as (u64)-4095,
+    // not -4096. machine.c:add_callchain_ip treats the latter as a real IP.
+    let bytes = callchain_context_fixture(&[0x1010, 0xffff_ffff_ffff_f000, 0x1020]);
+    let (script, expected) = native_script_and_fold(&bytes);
+    assert_eq!(expected, "worker;[app];[unknown];[app] 1\n", "{script}");
+    assert_eq!(
+        fold_perfdata_callchains(&bytes).expect("fold"),
+        expected,
+        "native script={script}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn invalid_context_beyond_perf_default_stack_depth_does_not_discard_the_prefix() {
+    // trace-event-scripting.c:24 initializes scripting_max_stack to
+    // PERF_MAX_STACK_DEPTH (127). machine.c:2899 counts addresses, not markers.
+    let mut frames = [0x1010; 128];
+    frames[127] = u64::MAX;
+    let bytes = callchain_context_fixture(&frames);
+    let (script, expected) = native_script_and_fold(&bytes);
+    assert_eq!(
+        expected,
+        format!("worker{} 1\n", ";[app]".repeat(127)),
+        "{script}"
+    );
+    assert_eq!(
+        fold_perfdata_callchains(&bytes).expect("fold"),
+        expected,
+        "{script}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn context_markers_do_not_consume_perf_default_recorded_stack_depth() {
+    let mut frames = [0x1010; 256];
+    for marker in frames.iter_mut().step_by(2) {
+        *marker = 0xffff_ffff_ffff_fe00;
+    }
+    let bytes = callchain_context_fixture(&frames);
+    let (script, expected) = native_script_and_fold(&bytes);
+    assert_eq!(
+        expected,
+        format!("worker{} 1\n", ";[app]".repeat(127)),
+        "{script}"
+    );
+    assert_eq!(
+        fold_perfdata_callchains(&bytes).expect("fold"),
+        expected,
+        "{script}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn callchain_context_fixture<const N: usize>(frames: &[u64; N]) -> Vec<u8> {
+    let mut comm = comm_payload(11, 12, "worker");
+    comm.resize(comm.len().next_multiple_of(8), 0);
+    let mut mmap = mmap_payload(11, 11, 0x1000, 0x100, 0, "/pyroclast-missing-context/app");
+    mmap.resize(mmap.len().next_multiple_of(8), 0);
+    perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_TIME
+                | PERF_SAMPLE_PERIOD
+                | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(3, &comm),
+            record_bytes_with_misc(1, PERF_RECORD_MISC_CPUMODE_USER, &mmap),
+            record_bytes_with_misc(
+                PERF_RECORD_SAMPLE,
+                PERF_RECORD_MISC_CPUMODE_USER,
+                &sample_payload_with_optional_timestamp(
+                    sample_payload_with_period(0x1010, 11, 12, 1, *frames),
+                    true,
+                ),
+            ),
+        ],
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn deferred_markers_without_attr_flag_leave_the_cookie_as_a_recorded_frame() {
+    assert_deferred_context_matches_native(false, 0x1040, None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn deferred_cookie_eof_preserves_native_context_validation_and_cookie_suppression() {
+    for cookie in [0x1040, 0x1010, u64::MAX, 0xffff_ffff_ffff_ffe0] {
+        assert_deferred_context_matches_native(true, cookie, None);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn matching_deferred_records_merge_before_context_validation_like_perf() {
+    for cookie in [0x1040, u64::MAX, 0xffff_ffff_ffff_ffe0] {
+        assert_deferred_context_matches_native(true, cookie, Some((cookie, 12)));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn same_tid_deferred_cookie_mismatch_delivers_original_cookie_as_an_address_like_perf() {
+    assert_deferred_context_matches_native(true, 0x1040, Some((0x5555, 12)));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn different_tid_deferred_record_leaves_original_metadata_for_eof_like_perf() {
+    assert_deferred_context_matches_native(true, 0x1040, Some((0x1040, 99)));
+}
+
+#[cfg(target_os = "linux")]
+fn assert_deferred_context_matches_native(
+    enabled: bool,
+    cookie: u64,
+    deferred: Option<(u64, u32)>,
+) {
+    assert_deferred_context_with_cookie_mapping_matches_native(enabled, cookie, deferred, None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn deferred_cookie_dso_preserves_physical_stream_rows_like_perf_and_inferno() {
+    // evsel_fprintf.c prints the DSO even for a (cookie) row. map.c writes
+    // the name verbatim; Inferno reads physical lines before omitting cookies.
+    assert_deferred_context_with_cookie_mapping_matches_native(
+        true,
+        0x1040,
+        None,
+        Some("/missing/a\n0010 injected (/bin/n)"),
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn assert_deferred_context_with_cookie_mapping_matches_native(
+    enabled: bool,
+    cookie: u64,
+    deferred: Option<(u64, u32)>,
+    cookie_mapping: Option<&str>,
+) {
+    // evsel.c:3391 gates deferred metadata on attr.defer_callchain (bit38).
+    // session.c:1392 and callchain.c:1897 deliver mismatches unchanged and
+    // remove the original cookie only on a matching merge, before resolution.
+    let mut comm = comm_payload(11, 12, "worker");
+    comm.resize(comm.len().next_multiple_of(8), 0);
+    let mut mmap = mmap_payload(11, 11, 0x1000, 0x100, 0, "/pyroclast-missing-context/app");
+    mmap.resize(mmap.len().next_multiple_of(8), 0);
+    for payload in [&mut comm, &mut mmap] {
+        payload.extend(11_u32.to_le_bytes());
+        payload.extend(12_u32.to_le_bytes());
+        payload.extend(1_000_000_000_u64.to_le_bytes());
+    }
+    let mut records = vec![
+        record_bytes(3, &comm),
+        record_bytes_with_misc(1, PERF_RECORD_MISC_CPUMODE_USER, &mmap),
+        record_bytes_with_misc(
+            PERF_RECORD_SAMPLE,
+            PERF_RECORD_MISC_CPUMODE_USER,
+            &sample_payload_with_optional_timestamp(
+                sample_payload_with_period(
+                    0x1010,
+                    11,
+                    12,
+                    1,
+                    [0x1010, 0x1020, 0xffff_ffff_ffff_fd80, cookie],
+                ),
+                true,
+            ),
+        ),
+    ];
+    if let Some(path) = cookie_mapping {
+        let mut payload = mmap_payload(11, 11, cookie, 16, 0, path);
+        payload.resize(payload.len().next_multiple_of(8), 0);
+        payload.extend(11_u32.to_le_bytes());
+        payload.extend(12_u32.to_le_bytes());
+        payload.extend(1_000_000_000_u64.to_le_bytes());
+        records.insert(
+            2,
+            record_bytes_with_misc(1, PERF_RECORD_MISC_CPUMODE_USER, &payload),
+        );
+    }
+    if let Some((record_cookie, tid)) = deferred {
+        let mut payload = callchain_deferred_payload(record_cookie, [0x1030]);
+        payload.extend(11_u32.to_le_bytes());
+        payload.extend(tid.to_le_bytes());
+        payload.extend(1_000_000_001_u64.to_le_bytes());
+        records.push(record_bytes(22, &payload));
+    }
+    let bytes = perfdata_with_records_and_attrs_vec(
+        vec![file_attr_bytes_with_flags(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_TIME
+                | PERF_SAMPLE_PERIOD
+                | PERF_SAMPLE_CALLCHAIN,
+            (1 << 18) | if enabled { 1 << 38 } else { 0 },
+        )],
+        records,
+    );
+    let (script, expected) = native_script_and_fold(&bytes);
+    if cookie_mapping.is_some() {
+        assert!(
+            expected.contains("injected"),
+            "native script={script}; folded={expected}"
+        );
+    }
+    assert_eq!(
+        fold_perfdata_callchains(&bytes).expect("fold"),
+        expected,
+        "enabled={enabled}, cookie={cookie:x}, deferred={deferred:?}; native script={script}"
+    );
+    let root = tempfile::tempdir().expect("tempdir");
+    let input = root.path().join("perf.data");
+    std::fs::write(&input, bytes).expect("write fixture");
+    assert_eq!(
+        fold_perfdata_file_with_options(&input, FoldOptions::default()).expect("file fold"),
+        expected,
+        "native script={script}"
+    );
 }
 
 #[cfg(target_os = "linux")]

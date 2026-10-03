@@ -1268,7 +1268,9 @@ mod tests {
     }
 
     #[test]
-    fn mapped_frame_bracketed_paths_preserve_numeric_kernel_boundaries() {
+    fn mapped_frame_bracketed_paths_keep_kernel_ips_below_perf_context_max() {
+        // linux/include/uapi/linux/perf_event.h defines PERF_CONTEXT_MAX as
+        // -4095. The preceding address (-4096) is not a context marker.
         for path in ["[", "[vdso]", "[kernel].0", "[unknown]"] {
             for (relative_address, expected) in [
                 (0, false),
@@ -1276,7 +1278,7 @@ mod tests {
                 (0xffff_8000_0000_0000, true),
                 (0xffff_8000_0000_0001, true),
                 (0xffff_ffff_ffff_efff, true),
-                (0xffff_ffff_ffff_f000, false),
+                (0xffff_ffff_ffff_f000, true),
                 (0xffff_ffff_ffff_f001, false),
                 (0xffff_ffff_ffff_fd80, false),
                 (0xffff_ffff_ffff_fe00, false),

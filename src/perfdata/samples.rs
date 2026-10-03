@@ -88,6 +88,7 @@ pub struct SampleCallchain<'a> {
     pub cpu: Option<u32>,
     pub period: Option<u64>,
     pub frames: SampleCallchainFrames<'a>,
+    pub(crate) callchain_range: Option<std::ops::Range<usize>>,
     pub user_regs: Option<SampleUserRegs>,
     pub user_stack: Option<SampleUserStack<'a>>,
 }
@@ -271,18 +272,7 @@ pub fn parse_sample_record_callchain(
         cursor.skip_read_format(layout.read_format)?;
     }
     if !layout.has(PERF_SAMPLE_CALLCHAIN) {
-        if layout.has(PERF_SAMPLE_RAW) {
-            cursor.skip_sized_u32_payload()?;
-        }
-        if layout.has(PERF_SAMPLE_BRANCH_STACK) {
-            cursor.skip_branch_stack(layout.branch_sample_type)?;
-        }
-        if layout.has(PERF_SAMPLE_REGS_USER) {
-            cursor.skip_regs(layout.sample_regs_user)?;
-        }
-        if layout.has(PERF_SAMPLE_STACK_USER) {
-            cursor.skip_user_stack()?;
-        }
+        cursor.skip_non_callchain_tail(layout)?;
         return Ok(sample_ip.map(|ip| SampleCallchain {
             pid,
             tid,
@@ -293,17 +283,20 @@ pub fn parse_sample_record_callchain(
                 payload: &[],
                 single_ip: Some(ip),
             },
+            callchain_range: None,
             user_regs: None,
             user_stack: None,
         }));
     }
 
+    let callchain_start = cursor.offset;
     let callchain_len = usize::try_from(cursor.read_u64()?)
         .map_err(|_| "perf sample callchain length does not fit in usize".to_string())?;
     let callchain_bytes = callchain_len
         .checked_mul(8)
         .ok_or_else(|| "perf sample callchain byte length overflows usize".to_string())?;
     let frames = cursor.read_bytes(callchain_bytes)?;
+    let callchain_range = Some(callchain_start..cursor.offset);
     let mut user_regs = None;
     let mut user_stack = None;
 
@@ -330,6 +323,7 @@ pub fn parse_sample_record_callchain(
             payload: frames,
             single_ip: None,
         },
+        callchain_range,
         user_regs,
         user_stack,
     }))
@@ -337,7 +331,8 @@ pub fn parse_sample_record_callchain(
 
 #[must_use]
 pub fn is_perf_context_marker(frame: u64) -> bool {
-    frame >= 0xffff_ffff_ffff_f000
+    // linux/include/uapi/linux/perf_event.h: PERF_CONTEXT_MAX = (__u64)-4095.
+    frame >= 0xffff_ffff_ffff_f001
 }
 
 #[must_use]
@@ -378,6 +373,13 @@ fn supported_perf_sample_mask() -> u64 {
 }
 
 impl SampleCallchainFrames<'_> {
+    pub(crate) fn deferred_cookie(&self) -> Option<u64> {
+        let tail = self.payload.get(self.payload.len().checked_sub(16)?..)?;
+        let marker = u64::from_le_bytes(tail[..8].try_into().ok()?);
+        is_perf_user_deferred_context_marker(marker)
+            .then(|| u64::from_le_bytes(tail[8..].try_into().unwrap()))
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.payload.len() / 8 + usize::from(self.single_ip.is_some())
@@ -453,6 +455,22 @@ impl<'a> SampleCursor<'a> {
         } else {
             Err("perf sample payload has trailing bytes".to_string())
         }
+    }
+
+    fn skip_non_callchain_tail(&mut self, layout: SampleLayout) -> Result<(), String> {
+        if layout.has(PERF_SAMPLE_RAW) {
+            self.skip_sized_u32_payload()?;
+        }
+        if layout.has(PERF_SAMPLE_BRANCH_STACK) {
+            self.skip_branch_stack(layout.branch_sample_type)?;
+        }
+        if layout.has(PERF_SAMPLE_REGS_USER) {
+            self.skip_regs(layout.sample_regs_user)?;
+        }
+        if layout.has(PERF_SAMPLE_STACK_USER) {
+            self.skip_user_stack()?;
+        }
+        Ok(())
     }
 
     fn skip_sized_u32_payload(&mut self) -> Result<(), String> {
