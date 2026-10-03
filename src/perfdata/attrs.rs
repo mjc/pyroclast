@@ -12,11 +12,14 @@ pub struct PerfFileAttr {
     pub sample_regs_user: u64,
     pub sample_regs_intr: u64,
     pub sample_id_all: bool,
+    // perf_event.h:467 declares flags bit 38; evsel.c:3391 gates cookie recognition.
+    pub defer_callchain: bool,
     pub ids_offset: u64,
     pub ids_size: u64,
 }
 
 const PERF_ATTR_FLAG_SAMPLE_ID_ALL: u64 = 1 << 18;
+const PERF_ATTR_FLAG_DEFER_CALLCHAIN: u64 = 1 << 38;
 
 /// Parses the `perf_file_attr` records from the attr section.
 ///
@@ -54,6 +57,7 @@ pub fn parse_file_attrs(bytes: &[u8], header: PerfHeader) -> Result<Vec<PerfFile
             return Err("perf file attr extends past attr section".to_string());
         }
 
+        let flags = read_optional_attr_u64(bytes, cursor, attr_size, 40)?;
         attrs.push(PerfFileAttr {
             event_type: read_u32(bytes, cursor)?,
             config: read_u64(bytes, cursor + 8)?,
@@ -63,9 +67,8 @@ pub fn parse_file_attrs(bytes: &[u8], header: PerfHeader) -> Result<Vec<PerfFile
             branch_sample_type: read_optional_attr_u64(bytes, cursor, attr_size, 72)?,
             sample_regs_user: read_optional_attr_u64(bytes, cursor, attr_size, 80)?,
             sample_regs_intr: read_optional_attr_u64(bytes, cursor, attr_size, 96)?,
-            sample_id_all: read_optional_attr_u64(bytes, cursor, attr_size, 40)?
-                & PERF_ATTR_FLAG_SAMPLE_ID_ALL
-                != 0,
+            sample_id_all: flags & PERF_ATTR_FLAG_SAMPLE_ID_ALL != 0,
+            defer_callchain: flags & PERF_ATTR_FLAG_DEFER_CALLCHAIN != 0,
             ids_offset: read_u64(bytes, cursor + attr_size)?,
             ids_size: read_u64(bytes, cursor + attr_size + 8)?,
         });

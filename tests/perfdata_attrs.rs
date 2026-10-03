@@ -29,6 +29,7 @@ fn parses_sample_type_from_file_attr_section() {
             sample_regs_user: 0,
             sample_regs_intr: 0,
             sample_id_all: false,
+            defer_callchain: false,
             ids_offset: 512,
             ids_size: 24,
         }]
@@ -54,6 +55,82 @@ fn parses_branch_sample_type_from_file_attr_section() {
 }
 
 #[test]
+fn defer_callchain_flag_is_preserved_in_parsed_file_attrs() {
+    // include/uapi/linux/perf_event.h:418-469 puts defer_callchain at bit 38
+    // of the flags word at offset 40. tools/perf/util/evsel.c:3391 uses it
+    // to gate deferred-cookie recognition, so parsing must retain the flag.
+    let disabled = file_attr_bytes(PERF_SAMPLE_IP, 512, 24);
+    let mut enabled = disabled;
+    put_u64(&mut enabled, 40, 1_u64 << 38);
+    let bytes = perfdata_with_attrs([disabled, enabled]);
+    let header = PerfHeader {
+        header_size: 104,
+        attr_offset: 104,
+        attr_size: 288,
+        data_offset: 392,
+        data_size: 0,
+    };
+
+    let attrs = parse_file_attrs(&bytes, header).expect("attrs");
+
+    assert_ne!(
+        attrs[0], attrs[1],
+        "parsing discarded the defer_callchain flag at bit 38"
+    );
+    assert!(!attrs[0].defer_callchain);
+    assert!(attrs[1].defer_callchain);
+}
+
+#[test]
+fn parses_enabled_defer_callchain_from_flags_bit_38() {
+    // include/uapi/linux/perf_event.h:467, tools/perf/util/evsel.c:3391.
+    for attr_size in [48, 64, 128] {
+        let mut attr = file_attr_bytes_with_attr_size(PERF_SAMPLE_IP, attr_size, 512, 24);
+        put_u64(&mut attr, 40, 1_u64 << 38);
+
+        let parsed = parse_single_file_attr(attr);
+
+        assert!(parsed.defer_callchain, "attr size {attr_size}");
+        assert!(!parsed.sample_id_all);
+        assert_eq!(parsed.ids_offset, 512);
+        assert_eq!(parsed.ids_size, 24);
+    }
+}
+
+#[test]
+fn leaves_defer_callchain_disabled_when_bit_38_is_clear() {
+    // sigtrap (37), defer_output (39), and sample_id_all (18) are independent.
+    for flags in [0, 1_u64 << 37, 1_u64 << 39, 1_u64 << 18, !(1_u64 << 38)] {
+        let mut attr = file_attr_bytes_with_attr_size(PERF_SAMPLE_IP, 128, 512, 24);
+        put_u64(&mut attr, 40, flags);
+
+        let parsed = parse_single_file_attr(attr);
+
+        assert!(!parsed.defer_callchain, "flags {flags:#x}");
+        assert_eq!(parsed.sample_id_all, flags & (1_u64 << 18) != 0);
+    }
+}
+
+#[test]
+fn defaults_defer_callchain_to_false_when_attr_has_no_complete_flags_word() {
+    // A short attr must not read flags from its following ID section descriptor.
+    for attr_size in [32, 40, 47] {
+        let mut attr =
+            file_attr_bytes_with_attr_size(PERF_SAMPLE_IP, attr_size, 1_u64 << 38, 1_u64 << 38);
+        if attr_size == 47 {
+            attr[40..47].copy_from_slice(&(1_u64 << 38).to_le_bytes()[..7]);
+        }
+
+        let parsed = parse_single_file_attr(attr);
+
+        assert!(!parsed.defer_callchain, "attr size {attr_size}");
+        assert!(!parsed.sample_id_all);
+        assert_eq!(parsed.ids_offset, 1_u64 << 38);
+        assert_eq!(parsed.ids_size, 1_u64 << 38);
+    }
+}
+
+#[test]
 fn defaults_newer_attr_fields_when_file_attr_is_older() {
     let bytes = perfdata_with_old_attr(file_attr_bytes_with_attr_size(PERF_SAMPLE_IP, 64, 512, 24));
     let header = PerfHeader {
@@ -70,6 +147,7 @@ fn defaults_newer_attr_fields_when_file_attr_is_older() {
     assert_eq!(attrs[0].branch_sample_type, 0);
     assert_eq!(attrs[0].sample_regs_user, 0);
     assert_eq!(attrs[0].sample_regs_intr, 0);
+    assert!(!attrs[0].defer_callchain);
 }
 
 #[test]
@@ -109,6 +187,7 @@ fn parses_file_attr_id_lists() {
         sample_regs_user: 0,
         sample_regs_intr: 0,
         sample_id_all: false,
+        defer_callchain: false,
         ids_offset: 200,
         ids_size: 16,
     };
@@ -150,6 +229,21 @@ fn perfdata_with_old_attr(attr: Vec<u8>) -> Vec<u8> {
     let mut bytes = vec![0; 104];
     bytes.extend(attr);
     bytes
+}
+
+fn parse_single_file_attr(attr: Vec<u8>) -> PerfFileAttr {
+    let attr_size = u64::try_from(attr.len()).expect("attr size fits u64");
+    let header = PerfHeader {
+        header_size: 104,
+        attr_offset: 104,
+        attr_size,
+        data_offset: 104 + attr_size,
+        data_size: 0,
+    };
+    let bytes = perfdata_with_old_attr(attr);
+    let mut attrs = parse_file_attrs(&bytes, header).expect("attrs");
+    assert_eq!(attrs.len(), 1);
+    attrs.pop().expect("one attr")
 }
 
 fn file_attr_bytes(sample_type: u64, ids_offset: u64, ids_size: u64) -> [u8; 144] {
@@ -197,6 +291,7 @@ proptest! {
         sample_regs_user in any::<u64>(),
         sample_regs_intr in any::<u64>(),
         sample_id_all in any::<bool>(),
+        defer_callchain in any::<bool>(),
         ids_offset in any::<u64>(),
         ids_size in any::<u64>(),
     ) {
@@ -206,7 +301,8 @@ proptest! {
         put_u64(
             &mut attr,
             40,
-            if sample_id_all { 1 << 18 } else { 0 },
+            (if sample_id_all { 1 << 18 } else { 0 })
+                | (if defer_callchain { 1 << 38 } else { 0 }),
         );
         put_u64(&mut attr, 72, branch_sample_type);
         put_u64(&mut attr, 80, sample_regs_user);
@@ -232,6 +328,7 @@ proptest! {
                 sample_regs_user,
                 sample_regs_intr,
                 sample_id_all,
+                defer_callchain,
                 ids_offset,
                 ids_size,
             }]
@@ -254,6 +351,7 @@ proptest! {
             sample_regs_user: 0,
             sample_regs_intr: 0,
             sample_id_all: false,
+            defer_callchain: false,
             ids_offset: 32,
             ids_size: (ids.len() * 8) as u64,
         };
