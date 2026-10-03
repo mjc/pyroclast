@@ -62,6 +62,46 @@ impl RecordSource for SliceSource<'_> {
 
 const DELIVERY_RANGE_SIZE: usize = 4 * 1024 * 1024;
 
+fn record_from_window(
+    source: &mut impl RecordSource,
+    offset: usize,
+    end: usize,
+) -> Result<PerfRecord<'_>, String> {
+    let header_end = offset
+        .checked_add(8)
+        .filter(|next| *next <= end)
+        .ok_or_else(|| format!("truncated perf record header at offset {offset}"))?;
+    // session.c:prefetch_event checks header and payload in one backing.
+    // Delivery ranges already overlap by a maximum u16-sized record, so
+    // borrowing this window neither reads again nor copies the payload.
+    let window_end = offset
+        .saturating_add(usize::from(u16::MAX))
+        .min(end)
+        .min(source.len())
+        .max(header_end);
+    let bytes = source.bytes_at(offset, window_end - offset)?;
+    let header = parse_record_header(bytes)?;
+    let size = usize::from(header.size);
+    if size < 8 {
+        return Err(format!(
+            "invalid perf record size {size} at offset {offset}"
+        ));
+    }
+    if size > end - offset {
+        return Err(format!(
+            "perf record overruns data section at offset {offset}"
+        ));
+    }
+    let payload = bytes
+        .get(8..size)
+        .ok_or_else(|| format!("truncated perf record at offset {offset}"))?;
+    Ok(PerfRecord {
+        offset,
+        header,
+        payload,
+    })
+}
+
 struct QueuedRange {
     bytes: Vec<u8>,
     pending: usize,
@@ -80,6 +120,8 @@ struct BufferedDelivery<'a> {
     ranges_loaded: usize,
     #[cfg(test)]
     bytes_read: usize,
+    #[cfg(test)]
+    range_requests: usize,
 }
 
 impl BufferedDelivery<'_> {
@@ -93,7 +135,15 @@ impl RecordSource for BufferedDelivery<'_> {
         self.len
     }
 
+    fn record_at(&mut self, offset: usize, end: usize) -> Result<PerfRecord<'_>, String> {
+        record_from_window(self, offset, end)
+    }
+
     fn bytes_at(&mut self, offset: usize, len: usize) -> Result<&[u8], String> {
+        #[cfg(test)]
+        {
+            self.range_requests += 1;
+        }
         let end = offset
             .checked_add(len)
             .filter(|end| *end <= self.len)
@@ -144,9 +194,17 @@ impl RecordSource for BufferedDelivery<'_> {
     }
 
     fn retain_record(&mut self, offset: usize) -> Result<(), String> {
+        let start = Self::range_start(offset);
+        if let Some(range) = self.ranges.get_mut(&start)
+            && offset - start <= range.bytes.len().saturating_sub(8)
+            && range.bytes.len() >= 8
+        {
+            range.pending += 1;
+            return Ok(());
+        }
         self.bytes_at(offset, 8)?;
         self.ranges
-            .get_mut(&Self::range_start(offset))
+            .get_mut(&start)
             .expect("record backing was just mapped")
             .pending += 1;
         Ok(())
@@ -191,6 +249,8 @@ impl<'a> FileSource<'a> {
                 ranges_loaded: 0,
                 #[cfg(test)]
                 bytes_read: 0,
+                #[cfg(test)]
+                range_requests: 0,
             },
         })
     }
@@ -204,6 +264,10 @@ impl<'a> FileSource<'a> {
 impl RecordSource for FileSource<'_> {
     fn len(&self) -> usize {
         self.delivery.len()
+    }
+
+    fn record_at(&mut self, offset: usize, end: usize) -> Result<PerfRecord<'_>, String> {
+        record_from_window(self, offset, end)
     }
 
     fn bytes_at(&mut self, offset: usize, len: usize) -> Result<&[u8], String> {
@@ -249,6 +313,55 @@ mod tests {
         bytes.extend(u16::try_from(payload.len() + 8).unwrap().to_le_bytes());
         bytes.extend(payload);
         bytes
+    }
+
+    #[test]
+    fn scanning_records_acquires_one_contiguous_window() {
+        // perf session.c:prefetch_event (2180) validates the header and payload
+        // in the same backing; reader__read_event (2387) advances by its size.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let bytes = record(b"shared");
+        std::fs::write(file.path(), &bytes).unwrap();
+        let mut source = FileSource::new(file.as_file()).unwrap();
+        source.record_at(0, bytes.len()).unwrap();
+        assert_eq!(
+            source.delivery.range_requests, 1,
+            "scanner repeats backing lookup"
+        );
+    }
+
+    #[test]
+    fn delivering_records_acquires_one_contiguous_window() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let bytes = record(b"shared");
+        std::fs::write(file.path(), &bytes).unwrap();
+        let mut source = FileSource::new(file.as_file()).unwrap();
+        source.retain_record(0).unwrap();
+        let requests = source.delivery.range_requests;
+        source.delivered_record_at(0, bytes.len()).unwrap();
+        assert_eq!(
+            source.delivery.range_requests - requests,
+            1,
+            "delivery repeats backing lookup"
+        );
+        source.release_record(0);
+    }
+
+    #[test]
+    fn retaining_scanned_records_does_not_reacquire_their_backing() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let bytes = record(b"shared");
+        std::fs::write(file.path(), &bytes).unwrap();
+        let mut source = FileSource::new(file.as_file()).unwrap();
+        source.record_at(0, bytes.len()).unwrap();
+        let requests = source.delivery.range_requests;
+        for _ in 0..512 {
+            source.retain_record(0).unwrap();
+        }
+        assert_eq!(source.delivery.range_requests, requests);
+        for _ in 0..512 {
+            source.release_record(0);
+        }
     }
 
     #[test]
@@ -581,6 +694,35 @@ mod tests {
             "perf record overruns data section at offset 0"
         );
         assert!(source.bytes_at(usize::MAX, 8).is_err());
+    }
+
+    #[test]
+    fn buffered_record_windows_preserve_slice_validation_and_payloads() {
+        let valid = record(b"payload");
+        let mut short_header = valid.clone();
+        short_header.truncate(4);
+        let mut bad_size = valid.clone();
+        bad_size[6..8].copy_from_slice(&4_u16.to_le_bytes());
+        let mut short_payload = valid.clone();
+        short_payload.truncate(10);
+        for bytes in [&valid, &short_header, &bad_size, &short_payload] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), bytes).unwrap();
+            let mut memory = SliceSource(bytes);
+            let mut disk = FileSource::new(file.as_file()).unwrap();
+            for (offset, end) in [
+                (0, bytes.len()),
+                (0, 4),
+                (0, 8),
+                (0, valid.len()),
+                (0, usize::MAX),
+                (usize::MAX, usize::MAX),
+            ] {
+                let expected = memory.record_at(offset, end);
+                let actual = disk.record_at(offset, end);
+                assert_eq!(actual, expected, "offset {offset}, end {end}, {bytes:?}");
+            }
+        }
     }
 
     #[test]
