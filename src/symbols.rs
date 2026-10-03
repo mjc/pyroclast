@@ -6,6 +6,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::Write;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Seek, SeekFrom, Write as IoWrite};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -248,13 +249,14 @@ pub(crate) struct CachedMappingFrames {
 /// Opaque projection key scoped to one `SymbolFrameCache` session.
 /// The low bit distinguishes inline from base frames; replacements get a new revision.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct MappingFramesIdentity(u64);
+pub(crate) struct MappingFramesIdentity(NonZeroU64);
 
 impl MappingFramesIdentity {
     pub(crate) fn projection_index(self) -> (usize, usize) {
-        let namespace = usize::from(self.0 & 1 != 0);
+        let identity = self.0.get();
+        let namespace = usize::from(identity & 1 != 0);
         let index =
-            usize::try_from((self.0 >> 1) - 1).expect("symbol projection identity exceeds usize");
+            usize::try_from((identity >> 1) - 1).expect("symbol projection identity exceeds usize");
         (namespace, index)
     }
 }
@@ -1821,8 +1823,12 @@ where
         inline: bool,
     ) -> Option<(Option<MappingFramesIdentity>, &CachedMappingFrames)> {
         let cached = self.cached_mapping_frames(mapping, inline)?;
-        let identity = (cached.revision != 0)
-            .then(|| MappingFramesIdentity((cached.revision << 1) | u64::from(inline)));
+        let identity = (cached.revision != 0).then(|| {
+            MappingFramesIdentity(
+                NonZeroU64::new((cached.revision << 1) | u64::from(inline))
+                    .expect("symbol projection identity is nonzero"),
+            )
+        });
         Some((identity, cached))
     }
 
@@ -6257,6 +6263,22 @@ mod tests {
             });
         }
         mappings
+    }
+
+    #[test]
+    fn mapping_projection_identity_optional_result_layout() {
+        assert_eq!(
+            (
+                std::mem::size_of::<Option<super::MappingFramesIdentity>>(),
+                std::mem::size_of::<
+                    Option<(
+                        Option<super::MappingFramesIdentity>,
+                        &super::CachedMappingFrames
+                    )>,
+                >(),
+            ),
+            (8, 16),
+        );
     }
 
     #[test]
