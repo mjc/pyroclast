@@ -13,6 +13,11 @@ use std::path::Path;
 
 const PROT_EXEC: u32 = 4;
 
+#[cfg(test)]
+thread_local! {
+    static MAPPED_FRAME_KERNEL_CLASSIFICATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MmapTable {
     mappings: Vec<Mapping>,
@@ -146,8 +151,11 @@ impl<'a> MappedFrame<'a> {
             .then(|| (self.mapping.start, self.mapping.end()))
     }
     pub(crate) fn is_kernel(self) -> bool {
-        crate::perfdata::samples::is_kernel_space_frame(self.relative_address)
-            && self.mapping.path_layout.bracketed
+        self.mapping.path_layout.bracketed && {
+            #[cfg(test)]
+            MAPPED_FRAME_KERNEL_CLASSIFICATIONS.with(|count| count.set(count.get() + 1));
+            crate::perfdata::samples::is_kernel_space_frame(self.relative_address)
+        }
     }
     pub(crate) fn path_layout(self) -> &'a MappingPathLayout {
         &self.mapping.path_layout
@@ -1221,6 +1229,122 @@ fn is_perf_data_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mapped_frame_unbracketed_paths_skip_numeric_kernel_classification() {
+        for path in ["", "/usr/bin/demo", "/tmp/[kernel]", "demo.so", " /[vdso]"] {
+            for relative_address in [
+                0,
+                0x1000,
+                0xffff_7fff_ffff_ffff,
+                0xffff_8000_0000_0000,
+                0xffff_8000_0000_0001,
+                0xffff_ffff_ffff_efff,
+                0xffff_ffff_ffff_f000,
+                0xffff_ffff_ffff_fe00,
+                u64::MAX,
+            ] {
+                let mut table = super::MmapTable::default();
+                table.insert_mmap(super::MmapRecord {
+                    pid: 7,
+                    tid: 7,
+                    start: 0x1000,
+                    len: 1,
+                    pgoff: relative_address,
+                    path: path.into(),
+                });
+                let frame = super::MappedFrame::new(&table.mappings[0], 0x1000);
+                assert_eq!(frame.relative_address, relative_address);
+                super::MAPPED_FRAME_KERNEL_CLASSIFICATIONS.with(|count| count.set(0));
+                assert!(!frame.is_kernel(), "{path:?} at {relative_address:#x}");
+                super::MAPPED_FRAME_KERNEL_CLASSIFICATIONS.with(|count| {
+                    assert_eq!(
+                        count.get(),
+                        0,
+                        "unbracketed {path:?} at {relative_address:#x} must skip numeric classification"
+                    );
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn mapped_frame_bracketed_paths_preserve_numeric_kernel_boundaries() {
+        for path in ["[", "[vdso]", "[kernel].0", "[unknown]"] {
+            for (relative_address, expected) in [
+                (0, false),
+                (0xffff_7fff_ffff_ffff, false),
+                (0xffff_8000_0000_0000, true),
+                (0xffff_8000_0000_0001, true),
+                (0xffff_ffff_ffff_efff, true),
+                (0xffff_ffff_ffff_f000, false),
+                (0xffff_ffff_ffff_f001, false),
+                (0xffff_ffff_ffff_fd80, false),
+                (0xffff_ffff_ffff_fe00, false),
+                (u64::MAX, false),
+            ] {
+                let mut table = super::MmapTable::default();
+                table.insert_mmap(super::MmapRecord {
+                    pid: 7,
+                    tid: 7,
+                    start: 0x1000,
+                    len: 1,
+                    pgoff: relative_address,
+                    path: path.into(),
+                });
+                let frame = super::MappedFrame::new(&table.mappings[0], 0x1000);
+                assert_eq!(frame.relative_address, relative_address);
+                super::MAPPED_FRAME_KERNEL_CLASSIFICATIONS.with(|count| count.set(0));
+                assert_eq!(
+                    frame.is_kernel(),
+                    expected,
+                    "{path} at {relative_address:#x}"
+                );
+                super::MAPPED_FRAME_KERNEL_CLASSIFICATIONS.with(|count| {
+                    assert_eq!(count.get(), 1, "bracketed paths still classify numerically");
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn mapped_frame_kernel_classification_uses_relative_not_absolute_addresses() {
+        for (pid, start, pgoff, relative_address, expected) in [
+            (7, 0xffff_8000_0000_0000, 0x20, 0x30, false),
+            (
+                7,
+                0x1000,
+                0xffff_8000_0000_0000,
+                0xffff_8000_0000_0010,
+                true,
+            ),
+            (
+                u32::MAX,
+                0xffff_8000_0000_0000,
+                0,
+                0xffff_8000_0000_0010,
+                true,
+            ),
+            (u32::MAX, 0x1000, 0xffff_8000_0000_0000, 0x1010, false),
+        ] {
+            let mut table = super::MmapTable::default();
+            table.insert_mmap(super::MmapRecord {
+                pid,
+                tid: pid,
+                start,
+                len: 0x100,
+                pgoff,
+                path: "[kernel]".into(),
+            });
+            let frame = super::MappedFrame::new(&table.mappings[0], start + 0x10);
+            assert_eq!(frame.relative_address, relative_address);
+            assert_eq!(frame.is_kernel(), expected, "pid {pid}, start {start:#x}");
+            assert_eq!(
+                frame.kernel_range(),
+                expected.then_some((start, start + 0x100))
+            );
+        }
+    }
+
     #[test]
     fn display_path_identity_preserves_names_aliased_by_symbol_source_identity() {
         // perf symbol.c:maps__split_kallsyms names individual maps [kernel].N.
