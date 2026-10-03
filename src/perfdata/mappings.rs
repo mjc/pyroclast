@@ -18,6 +18,7 @@ thread_local! {
     static MAPPED_FRAME_KERNEL_CLASSIFICATIONS: Cell<usize> = const { Cell::new(0) };
     static FRAME_MAPPING_TRANSLATION_CLASSIFICATIONS: Cell<usize> = const { Cell::new(0) };
     static FRAME_MAPPING_USER_CLASSIFICATIONS: Cell<usize> = const { Cell::new(0) };
+    static FRAME_MAPPING_HINT_LOADS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -226,20 +227,25 @@ struct FrameMappingHint<'a> {
     index: usize,
     start: u64,
     end: u64,
-    pgoff: u64,
-    identity_translation: bool,
+    translation_bias: u64,
     user_cpumode: bool,
 }
 
 impl<'a> FrameMappingHint<'a> {
+    #[inline]
+    fn load(hint: &Cell<Option<Self>>) -> Option<Self> {
+        #[cfg(test)]
+        FRAME_MAPPING_HINT_LOADS.with(|count| count.set(count.get() + 1));
+        hint.get()
+    }
+
     fn new(index: usize, mapping: &'a Mapping) -> Self {
         Self {
             mapping,
             index,
             start: mapping.start,
             end: mapping.end(),
-            pgoff: mapping.pgoff,
-            identity_translation: mapping.is_kernel_symbol_mapping(),
+            translation_bias: mapping.translation_bias(),
             user_cpumode: mapping.is_user_cpumode(),
         }
     }
@@ -248,17 +254,13 @@ impl<'a> FrameMappingHint<'a> {
         // Perf map__map_ip: reuse translation metadata for this borrowed map.
         MappedFrame {
             mapping: self.mapping,
-            relative_address: if self.identity_translation {
-                ip
-            } else {
-                // perf util/map.h:107-125 translates with unsigned u64 arithmetic.
-                ip.wrapping_sub(self.start).wrapping_add(self.pgoff)
-            },
+            relative_address: ip.wrapping_add(self.translation_bias),
         }
     }
 }
 
 impl<'a> FrameMappingContext<'a> {
+    #[inline]
     pub(crate) fn resolve_user(
         &self,
         ip: u64,
@@ -270,10 +272,10 @@ impl<'a> FrameMappingContext<'a> {
             &mut cache.pid_index,
             &self.user_hint,
             &self.user_miss,
-        )?;
-        self.user_hint.get().map(|found| found.mapped_frame(ip))
+        )
     }
 
+    #[inline]
     pub(crate) fn resolve(
         &self,
         ip: u64,
@@ -286,9 +288,8 @@ impl<'a> FrameMappingContext<'a> {
             &self.global_hint,
             &self.global_miss,
         );
-        let hint = if self.pid == u32::MAX {
-            global?;
-            &self.global_hint
+        if self.pid == u32::MAX {
+            global
         } else {
             let user = self.resolve_bucket::<false>(
                 self.user,
@@ -299,20 +300,19 @@ impl<'a> FrameMappingContext<'a> {
             );
             match (user, global) {
                 (Some(left), Some(right)) => {
-                    if left.start >= right.start {
-                        &self.user_hint
+                    if left.mapping.start >= right.mapping.start {
+                        Some(left)
                     } else {
-                        &self.global_hint
+                        Some(right)
                     }
                 }
-                (Some(_), None) => &self.user_hint,
-                (None, Some(_)) => &self.global_hint,
-                (None, None) => return None,
+                (Some(found), None) | (None, Some(found)) => Some(found),
+                (None, None) => None,
             }
-        };
-        hint.get().map(|found| found.mapped_frame(ip))
+        }
     }
 
+    #[inline]
     fn resolve_bucket<const USER_ONLY: bool>(
         &self,
         bucket: &[IndexedMapping],
@@ -320,10 +320,14 @@ impl<'a> FrameMappingContext<'a> {
         cached_index: &mut Option<usize>,
         hint: &Cell<Option<FrameMappingHint<'a>>>,
         miss: &Cell<Option<FrameMappingMiss>>,
-    ) -> Option<&'a Mapping> {
+    ) -> Option<MappedFrame<'a>> {
+        if bucket.is_empty() {
+            *cached_index = None;
+            return None;
+        }
         // The context borrows the table for one delivered sample: map edits
         // cannot invalidate these references until that sample is finished.
-        if let Some(found) = hint.get()
+        if let Some(found) = FrameMappingHint::load(hint)
             && found.start <= ip
             && ip < found.end
         {
@@ -334,12 +338,24 @@ impl<'a> FrameMappingContext<'a> {
                 return None;
             }
             *cached_index = Some(found.index);
-            return Some(found.mapping);
+            return Some(found.mapped_frame(ip));
         }
-        if bucket.is_empty() || miss.get().is_some_and(|range| range.contains(ip)) {
+        if miss.get().is_some_and(|range| range.contains(ip)) {
             *cached_index = None;
             return None;
         }
+        self.resolve_bucket_miss::<USER_ONLY>(bucket, ip, cached_index, hint, miss)
+    }
+
+    #[inline(never)]
+    fn resolve_bucket_miss<const USER_ONLY: bool>(
+        &self,
+        bucket: &[IndexedMapping],
+        ip: u64,
+        cached_index: &mut Option<usize>,
+        hint: &Cell<Option<FrameMappingHint<'a>>>,
+        miss: &Cell<Option<FrameMappingMiss>>,
+    ) -> Option<MappedFrame<'a>> {
         let index = match self.table.search_bucket(bucket, ip) {
             Ok(index) => index,
             Err(insertion) => {
@@ -361,7 +377,7 @@ impl<'a> FrameMappingContext<'a> {
             *cached_index = None;
             return None;
         }
-        Some(found.mapping)
+        Some(found.mapped_frame(ip))
     }
 }
 
@@ -1348,11 +1364,15 @@ impl Mapping {
     }
 
     fn relative_address(&self, ip: u64) -> u64 {
+        ip.wrapping_add(self.translation_bias())
+    }
+
+    fn translation_bias(&self) -> u64 {
+        // perf util/map.h:107-125: unsigned DSO translation, identity otherwise.
         if self.is_kernel_symbol_mapping() {
-            ip
+            0
         } else {
-            // perf util/map.h:107-125 translates with unsigned u64 arithmetic.
-            ip.wrapping_sub(self.start).wrapping_add(self.pgoff)
+            self.pgoff.wrapping_sub(self.start)
         }
     }
 
@@ -3137,7 +3157,7 @@ mod tests {
     }
 
     #[test]
-    fn sample_context_translates_only_the_precedence_winner() {
+    fn sample_context_preserves_precedence_with_overflowing_loser_translation() {
         for (loser_pid, loser_path, winner_pid, winner_path, expected) in [
             (u32::MAX, "/global-file", 7, "/user", 0x510),
             (7, "/user", u32::MAX, "[global]", 0x1090),
@@ -3175,7 +3195,7 @@ mod tests {
     }
 
     #[test]
-    fn sample_context_bucket_returns_only_the_borrowed_mapping_layout() {
+    fn sample_context_bucket_returns_the_translated_borrowed_frame() {
         let mut table = MmapTable::default();
         table.insert_mmap(MmapRecord {
             pid: 7,
@@ -3195,16 +3215,126 @@ mod tests {
                 &context.user_hint,
                 &context.user_miss,
             );
+            assert_eq!(result.is_some(), ip < 0x1100);
             assert_eq!(
                 std::mem::size_of_val(&result),
-                std::mem::size_of::<Option<&super::Mapping>>(),
-                "bucket results must carry only the borrowed mapping, not cached hint metadata"
+                2 * std::mem::size_of::<usize>()
             );
+            if let Some(frame) = result {
+                assert_eq!(frame.mapping.start, 0x1000);
+                assert_eq!(frame.mapping.end(), 0x1100);
+                assert_eq!(frame.mapping.pgoff, 0x500);
+                assert!(frame.mapping.is_user_cpumode());
+                assert!(!frame.mapping.is_kernel_symbol_mapping());
+                assert_eq!(cache.pid_index, Some(table.bucket(7)[0].index));
+                assert_eq!(frame.path(), "/user");
+                assert_eq!(frame.relative_address, ip - 0x1000 + 0x500);
+            } else {
+                assert_eq!(cache.pid_index, None);
+            }
         }
         assert_eq!(
             std::mem::size_of::<Option<super::MappedFrame<'_>>>(),
             std::mem::size_of::<super::MappedFrame<'_>>(),
             "the borrowed mapping provides the Option niche"
+        );
+    }
+
+    #[test]
+    fn sample_context_user_hit_loads_the_validated_hint_once() {
+        let mut table = MmapTable::default();
+        table.insert_mmap(MmapRecord {
+            pid: 7,
+            tid: 7,
+            start: 0x1000,
+            len: 0x100,
+            pgoff: 0x800,
+            path: "/user".into(),
+        });
+        let mut cache = MappingResolveCache::default();
+        let context = table.frame_context(7, &mut cache);
+        context.resolve_user(0x1000, &mut cache).unwrap();
+        let searches = table.index_search_count();
+        super::FRAME_MAPPING_HINT_LOADS.with(|count| count.set(0));
+        for offset in 0..64 {
+            let frame = context.resolve_user(0x1000 + offset, &mut cache).unwrap();
+            assert_eq!(frame.path(), "/user");
+            assert_eq!(frame.relative_address, 0x800 + offset);
+        }
+        assert_eq!(table.index_search_count(), searches);
+        assert_eq!(
+            super::FRAME_MAPPING_HINT_LOADS.with(Cell::get),
+            64,
+            "one validated hint load must provide both containment and translation"
+        );
+    }
+
+    #[test]
+    fn sample_context_general_hits_do_not_reload_the_selected_hint() {
+        let mut table = MmapTable::default();
+        for (pid, start, len, pgoff, path) in [
+            (7, 0x1000, 0x200, 0x800, "/user"),
+            (u32::MAX, 0x1080, 0x100, 0, "[global]"),
+        ] {
+            table.insert_mmap(MmapRecord {
+                pid,
+                tid: pid,
+                start,
+                len,
+                pgoff,
+                path: path.into(),
+            });
+        }
+        let mut cache = MappingResolveCache::default();
+        let context = table.frame_context(7, &mut cache);
+        context.resolve(0x1080, &mut cache).unwrap();
+        context.resolve(0x1000, &mut cache).unwrap();
+        let searches = table.index_search_count();
+        super::FRAME_MAPPING_HINT_LOADS.with(|count| count.set(0));
+        for offset in 0..64 {
+            let global = context.resolve(0x1080 + offset, &mut cache).unwrap();
+            assert_eq!(global.path(), "[global]");
+            assert_eq!(global.relative_address, 0x1080 + offset);
+            let user = context.resolve(0x1000 + offset, &mut cache).unwrap();
+            assert_eq!(user.path(), "/user");
+            assert_eq!(user.relative_address, 0x800 + offset);
+            assert_eq!(cache.global_index, None);
+        }
+        assert_eq!(table.index_search_count(), searches);
+        assert_eq!(
+            super::FRAME_MAPPING_HINT_LOADS.with(Cell::get),
+            256,
+            "two participating buckets need two hint loads, not a third selected-hint reload"
+        );
+    }
+
+    #[test]
+    fn sample_context_general_hits_skip_absent_global_hint_reads() {
+        let mut table = MmapTable::default();
+        table.insert_mmap(MmapRecord {
+            pid: 7,
+            tid: 7,
+            start: 0x1000,
+            len: 0x100,
+            pgoff: 0x800,
+            path: "/user".into(),
+        });
+        let mut cache = MappingResolveCache::default();
+        let context = table.frame_context(7, &mut cache);
+        context.resolve(0x1000, &mut cache).unwrap();
+        let searches = table.index_search_count();
+        super::FRAME_MAPPING_HINT_LOADS.with(|count| count.set(0));
+        for offset in 0..64 {
+            let frame = context.resolve(0x1000 + offset, &mut cache).unwrap();
+            assert_eq!(frame.path(), "/user");
+            assert_eq!(frame.relative_address, 0x800 + offset);
+            assert_eq!(cache.global_index, None);
+        }
+        assert_eq!(table.index_search_count(), searches);
+        assert_eq!(
+            super::FRAME_MAPPING_HINT_LOADS.with(Cell::get),
+            64,
+            "an absent global bucket needs no hint load, and the USER result needs no reload"
         );
     }
 
