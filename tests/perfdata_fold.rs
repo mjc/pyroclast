@@ -2462,6 +2462,389 @@ fn native_script_and_fold(bytes: &[u8]) -> (String, String) {
 }
 
 #[cfg(target_os = "linux")]
+fn assert_native_module_kallsyms_parity(
+    kallsyms: &str,
+    sampled_ip: u64,
+    expected_native_frame: &str,
+    expected_ends: &[(&str, u64)],
+) {
+    let mut expected_rows = [
+        "worker;_stext 1\n".to_string(),
+        format!("worker;{expected_native_frame} 1\n"),
+    ];
+    expected_rows.sort();
+    assert_native_module_kallsyms_queries_parity(
+        kallsyms,
+        &[sampled_ip],
+        Some(&expected_rows.concat()),
+        expected_ends,
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn write_native_module_kallsyms_fixture(
+    kallsyms: &str,
+    sampled_ips: &[u64],
+    distinct_queries: bool,
+) -> (tempfile::TempDir, Vec<u8>) {
+    const KERNEL_START: u64 = 0xffff_ffff_8100_0000;
+    const MODULE_START: u64 = 0xffff_ffff_c100_0000;
+
+    let fixture_parent =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/native-kallsyms-fixtures");
+    std::fs::create_dir_all(&fixture_parent).expect("fixture parent");
+    let root = tempfile::Builder::new()
+        .prefix("module-symbols-")
+        .tempdir_in(&fixture_parent)
+        .expect("fixture directory");
+    let symfs = root.path().join("symfs");
+    std::fs::create_dir(&symfs).expect("empty symfs");
+    let kallsyms_path = root.path().join("kallsyms");
+    std::fs::write(&kallsyms_path, kallsyms).expect("synthetic kallsyms");
+
+    let mut comm = comm_payload(11, 12, "worker");
+    comm.resize(comm.len().next_multiple_of(8), 0);
+    let mut records = vec![record_bytes(3, &comm)];
+    // machine.c:machine__process_kernel_mmap_event creates module maps by
+    // name. The broad initial kernel map also contains the synthetic core
+    // boundary; symbol.c:maps__split_kallsyms therefore keeps it in that DSO.
+    for (start, len, pgoff, path) in [
+        (
+            KERNEL_START,
+            MODULE_START + 0x4000 - KERNEL_START,
+            KERNEL_START,
+            "[kernel.kallsyms]_stext",
+        ),
+        (MODULE_START, 0x4000, 0, "[a]"),
+        (MODULE_START + 0x1_0000, 0x4000, 0, "[b]"),
+    ] {
+        let mut payload = mmap_payload(u32::MAX, u32::MAX, start, len, pgoff, path);
+        payload.resize(payload.len().next_multiple_of(8), 0);
+        records.push(record_bytes_with_misc(
+            1,
+            PERF_RECORD_MISC_CPUMODE_KERNEL,
+            &payload,
+        ));
+    }
+    // Resolve _stext first: dso__load_kernel_sym honors --kallsyms, and
+    // __dso__load_kallsyms fixes the complete tree before splitting modules.
+    for (index, ip) in std::iter::once(KERNEL_START + 0x10)
+        .chain(sampled_ips.iter().copied())
+        .enumerate()
+    {
+        if distinct_queries {
+            // Distinct comms keep each query separate in the folded oracle,
+            // so swapped lookup results cannot cancel in aggregate counts.
+            let mut payload = comm_payload(11, 12, &format!("query_{index:02}"));
+            payload.resize(payload.len().next_multiple_of(8), 0);
+            records.push(record_bytes(3, &payload));
+        }
+        records.push(record_bytes_with_misc(
+            PERF_RECORD_SAMPLE,
+            PERF_RECORD_MISC_CPUMODE_KERNEL,
+            &sample_payload_with_time(
+                ip,
+                11,
+                12,
+                1_000_000_000 + u64::try_from(index).expect("sample index"),
+                [0xffff_ffff_ffff_ff80, ip],
+            ),
+        ));
+    }
+    let mut attr = file_attr_bytes(
+        PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CALLCHAIN,
+        0,
+        0,
+    );
+    // evsel.c:3232 uses attr.sample_period when PERF_SAMPLE_PERIOD is absent.
+    put_u64(&mut attr, 16, 1);
+    let mut bytes = perfdata_with_records_and_attrs_vec(vec![attr], records);
+    put_u64(&mut bytes, 16, 144);
+    let input = root.path().join("perf.data");
+    std::fs::write(&input, &bytes).expect("synthetic perf.data");
+    (root, bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn query_native_module_kallsyms(
+    root: &std::path::Path,
+    expected_ends: &[(&str, u64)],
+) -> (String, String, Vec<u8>) {
+    use inferno::collapse::Collapse as _;
+
+    let perf = Command::new("perf")
+        .args(["script", "--force", "-vvvv", "--kallsyms"])
+        .arg(root.join("kallsyms"))
+        .arg("--symfs")
+        .arg(root.join("symfs"))
+        .arg("-i")
+        .arg(root.join("perf.data"))
+        .output()
+        .expect("native perf kallsyms oracle");
+    let stderr = String::from_utf8_lossy(&perf.stderr);
+    assert!(perf.status.success(), "native perf failed: {stderr}");
+    let script = String::from_utf8(perf.stdout).expect("native script UTF-8");
+    // util/symbol.c:symbols__fixup_end, lines 276-298, logs each nonterminal
+    // extent before duplicate removal. Include the module suffix so aliases
+    // in different DSOs cannot accidentally satisfy the same assertion.
+    for &(name, end) in expected_ends {
+        let expected = format!("symbols__fixup_end sym:{name} end:{end:#x}");
+        assert!(
+            stderr.lines().any(|line| line.ends_with(&expected)),
+            "missing native extent {expected:?}\nscript={script}\nstderr={stderr}"
+        );
+    }
+    let mut native = Vec::new();
+    inferno::collapse::perf::Folder::default()
+        .collapse(std::io::Cursor::new(script.as_bytes()), &mut native)
+        .expect("collapse native script");
+    (script, stderr.into_owned(), native)
+}
+
+#[cfg(target_os = "linux")]
+fn assert_native_module_kallsyms_queries_parity(
+    kallsyms: &str,
+    sampled_ips: &[u64],
+    expected_native: Option<&str>,
+    expected_ends: &[(&str, u64)],
+) {
+    let (root, bytes) =
+        write_native_module_kallsyms_fixture(kallsyms, sampled_ips, expected_native.is_none());
+    let (script, stderr, native) = query_native_module_kallsyms(root.path(), expected_ends);
+    // Establish the native result independently before checking Pyroclast.
+    if let Some(expected) = expected_native {
+        assert_eq!(
+            native,
+            expected.as_bytes(),
+            "native fixture did not exercise the intended case\nscript={script}\nstderr={stderr}"
+        );
+    } else {
+        let native_text = std::str::from_utf8(&native).expect("native folded UTF-8");
+        let allowed_frames = kallsyms
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                fields.next()?;
+                fields.next()?;
+                let name = fields.next()?;
+                (fields.next() == Some("[a]")).then_some(name)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            native_text.lines().count(),
+            sampled_ips.len() + 1,
+            "native query loss\nscript={script}"
+        );
+        assert!(native_text.lines().any(|line| line == "query_00;_stext 1"));
+        for index in 1..=sampled_ips.len() {
+            let prefix = format!("query_{index:02};");
+            let frame = native_text
+                .lines()
+                .find_map(|line| line.strip_prefix(&prefix))
+                .and_then(|line| line.strip_suffix(" 1"))
+                .expect("native unit-weight query row");
+            assert!(
+                frame == "[[a]]" || allowed_frames.contains(&frame),
+                "native query {index} escaped the module fixture: {frame}\nscript={script}"
+            );
+        }
+    }
+
+    let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+        StaticSymbolResolver,
+        &root.path().join("perf.data"),
+        root.path(),
+        [],
+        &root.path().join("kallsyms"),
+    );
+    let actual = fold_perfdata_callchains_with_symbols(
+        &bytes,
+        FoldOptions {
+            count_periods: true,
+            inline: false,
+        },
+        &resolver,
+    )
+    .expect("fold synthetic module kallsyms");
+    assert_eq!(actual.as_bytes(), native, "native script={script}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn module_kallsyms_ignores_dollar_symbols_before_global_end_fixup_like_native_perf() {
+    // tools/perf/util/symbol.c:774 rejects '$' names before tree insertion;
+    // symbols__fixup_end:295 consequently ends first[a] at next[a], not a
+    // page boundary. symbols__find:414 treats that end as exclusive.
+    assert_native_module_kallsyms_queries_parity(
+        "ffffffff81000000 T _stext\n\
+         ffffffff81000100 T _etext\n\
+         ffffffffc1000000 T first\t[a]\n\
+         ffffffffc1000100 t $x\n\
+         ffffffffc1000200 T next\t[a]\n\
+         ffffffffc1010000 T sentinel\t[b]\n",
+        &[0xffff_ffff_c100_0180, 0xffff_ffff_c100_0200],
+        Some("worker;_stext 1\nworker;first 1\nworker;next 1\n"),
+        &[("first\t[a]", 0xffff_ffff_c100_0200)],
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn module_kallsyms_core_boundary_limits_extent_before_partition_like_native_perf() {
+    // symbol.c:1512-1513 fixes ends then duplicates on ALL accepted symbols.
+    // The core entry makes first[a] end at c1001000, not next[a] at c1002000.
+    assert_native_module_kallsyms_parity(
+        "ffffffff81000000 T _stext\n\
+         ffffffff81000100 T _etext\n\
+         ffffffffc1000000 T first\t[a]\n\
+         ffffffffc1000100 T core_boundary\n\
+         ffffffffc1002000 T next\t[a]\n\
+         ffffffffc1010000 T sentinel\t[b]\n",
+        0xffff_ffff_c100_1800,
+        "[[a]]",
+        &[("first\t[a]", 0xffff_ffff_c100_1000)],
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn module_kallsyms_equal_address_alias_keeps_native_nonweak_module_owner() {
+    // symbol.c:__symbols__insert preserves ties; fixup_end gives both owners
+    // nonzero lengths. choose_best_symbol then prefers T over weak W, even
+    // though the W entry was inserted later. Split only the surviving owner.
+    assert_native_module_kallsyms_parity(
+        "ffffffff81000000 T _stext\n\
+         ffffffff81000100 T _etext\n\
+         ffffffffc1000000 T strong\t[a]\n\
+         ffffffffc1000000 W weak\t[b]\n\
+         ffffffffc1000100 T next\t[a]\n\
+         ffffffffc1010000 T sentinel\t[b]\n",
+        0xffff_ffff_c100_0020,
+        "strong",
+        &[
+            ("strong\t[a]", 0xffff_ffff_c100_1000),
+            ("weak\t[b]", 0xffff_ffff_c100_1000),
+        ],
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn module_kallsyms_discarded_alias_preserves_native_predecessor_extent_and_lookup() {
+    // End fixup precedes duplicate removal, so weak[b] changes previous[a]'s
+    // extent even though winner[a] removes it. Native symbols__find searches
+    // the split DSO's RB tree; with these two entries, previous is its root
+    // and contains the sampled IP despite winner starting before that IP.
+    assert_native_module_kallsyms_parity(
+        "ffffffff81000000 T _stext\n\
+         ffffffff81000100 T _etext\n\
+         ffffffffc1000000 T previous\t[a]\n\
+         ffffffffc1000100 W weak\t[b]\n\
+         ffffffffc1000100 T winner\t[a]\n\
+         ffffffffc1010000 T sentinel\t[b]\n",
+        0xffff_ffff_c100_0180,
+        "previous",
+        &[
+            ("previous\t[a]", 0xffff_ffff_c100_1000),
+            ("weak\t[b]", 0xffff_ffff_c100_2000),
+            ("winner\t[a]", 0xffff_ffff_c100_2000),
+        ],
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn overlapping_module_kallsyms_fixture(row_count: usize) -> (String, Vec<(String, u64)>) {
+    use std::fmt::Write as _;
+
+    const START: u64 = 0xffff_ffff_c100_0000;
+    let mut text = "ffffffff81000000 T _stext\nffffffff81000100 T _etext\n".to_string();
+    let mut ends = Vec::new();
+    for index in 0..row_count {
+        let address = START + u64::try_from(index).expect("row index") * 0x100;
+        let name = format!("row_{index:02}");
+        writeln!(text, "{address:016x} T {name}\t[a]").expect("module row");
+        writeln!(text, "{:016x} T core_{index:02}", address + 0x80).expect("core boundary");
+        // symbol.c:symbols__fixup_end rounds a module-to-core transition to
+        // roundup(start + 4096, 4096), before maps__split_kallsyms partitions.
+        ends.push((format!("{name}\t[a]"), (address + 0x1fff) & !0xfff));
+    }
+    text.push_str("ffffffffc1010000 T sentinel\t[b]\n");
+    (text, ends)
+}
+
+#[cfg(target_os = "linux")]
+fn assert_native_overlapping_module_tree_parity(row_count: usize) {
+    const START: u64 = 0xffff_ffff_c100_0000;
+    let (text, ends) = overlapping_module_kallsyms_fixture(row_count);
+    let expected_ends = ends
+        .iter()
+        .map(|(name, end)| (name.as_str(), *end))
+        .collect::<Vec<_>>();
+    let mut queries = vec![START + 0xf80];
+    for index in 0..row_count {
+        let start = START + u64::try_from(index).expect("row index") * 0x100;
+        // Start-minus-one and start probe left-subtree descent; start-plus-one
+        // also catches the erroneous greatest-start/predecessor preference.
+        if start > START {
+            queries.push(start - 1);
+        }
+        queries.extend([start, start + 1]);
+    }
+    // Probe both fixed extents on each side of their half-open boundary,
+    // including right-subtree descent and the unmapped symbol gap in [a].
+    queries.extend([
+        START + 0xfff,
+        START + 0x1000,
+        START + 0x1001,
+        START + 0x1fff,
+        START + 0x2000,
+        START + 0x2001,
+        START + 0x3000,
+    ]);
+    queries.sort_unstable();
+    queries.dedup();
+    assert_native_module_kallsyms_queries_parity(&text, &queries, None, &expected_ends);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn module_kallsyms_two_overlapping_rows_match_native_tree_boundaries() {
+    assert_native_overlapping_module_tree_parity(2);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn module_kallsyms_three_overlapping_rows_return_native_middle_root_not_lowest_start() {
+    // Linux tools/lib/rbtree.c:__rb_insert rotates three ascending insertions
+    // to root row_01. All three extents contain c1000f80; lowest-start is wrong.
+    let (text, ends) = overlapping_module_kallsyms_fixture(3);
+    let expected_ends = ends
+        .iter()
+        .map(|(name, end)| (name.as_str(), *end))
+        .collect::<Vec<_>>();
+    assert_native_module_kallsyms_parity(&text, 0xffff_ffff_c100_0f80, "row_01", &expected_ends);
+    assert_native_overlapping_module_tree_parity(3);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn module_kallsyms_four_overlapping_rows_match_native_tree_boundaries() {
+    assert_native_overlapping_module_tree_parity(4);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn module_kallsyms_eight_overlapping_rows_match_native_tree_boundaries() {
+    assert_native_overlapping_module_tree_parity(8);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn module_kallsyms_sixteen_overlapping_rows_match_native_tree_boundaries() {
+    assert_native_overlapping_module_tree_parity(16);
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn hypervisor_callchain_context_does_not_resolve_host_user_mappings_like_perf() {
     // tools/perf/util/machine.c:add_callchain_ip switches PERF_CONTEXT_HV to

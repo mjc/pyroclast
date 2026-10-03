@@ -697,6 +697,112 @@ impl FileKernelCache {
 pub struct Kallsyms {
     symbols: BTreeMap<u64, KallsymsSymbol>,
     addresses_by_name: BTreeMap<String, u64>,
+    module_indexes: FxHashMap<String, ModuleKallsymsIndex>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ModuleKallsymsIndex {
+    nodes: Vec<ModuleKallsymsNode>,
+    root: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ModuleKallsymsNode {
+    address: u64,
+    end: u64,
+    parent: Option<usize>,
+    left: Option<usize>,
+    right: Option<usize>,
+    red: bool,
+}
+
+impl ModuleKallsymsIndex {
+    fn insert_ascending(&mut self, address: u64, end: u64) {
+        // symbol.c:878-991 moves ascending survivors into fresh module trees;
+        // __symbols__insert:361 + tools/lib/rbtree.c:90 balance each insertion.
+        // The previous row is the rightmost node, so no insertion search or
+        // left-right zigzag is needed. Core kernel trees are NOT rebuilt here.
+        let new = self.nodes.len();
+        let parent = new.checked_sub(1);
+        self.nodes.push(ModuleKallsymsNode {
+            address,
+            end,
+            parent,
+            left: None,
+            right: None,
+            red: true,
+        });
+        if let Some(parent) = parent {
+            debug_assert!(self.nodes[parent].address < address);
+            self.nodes[parent].right = Some(new);
+        }
+        let mut node = new;
+        loop {
+            let Some(parent) = self.nodes[node].parent else {
+                self.root = Some(node);
+                self.nodes[node].red = false;
+                break;
+            };
+            if !self.nodes[parent].red {
+                break;
+            }
+            let grandparent = self.nodes[parent]
+                .parent
+                .expect("a red parent cannot be the black root");
+            debug_assert_eq!(self.nodes[grandparent].right, Some(parent));
+            if let Some(uncle) = self.nodes[grandparent].left
+                && self.nodes[uncle].red
+            {
+                self.nodes[uncle].red = false;
+                self.nodes[parent].red = false;
+                self.nodes[grandparent].red = true;
+                node = grandparent;
+                continue;
+            }
+            self.rotate_left(grandparent, parent);
+            break;
+        }
+    }
+
+    fn rotate_left(&mut self, grandparent: usize, parent: usize) {
+        let middle = self.nodes[parent].left;
+        self.nodes[grandparent].right = middle;
+        if let Some(middle) = middle {
+            self.nodes[middle].parent = Some(grandparent);
+        }
+        self.nodes[parent].left = Some(grandparent);
+        let ancestor = self.nodes[grandparent].parent;
+        self.nodes[parent].parent = ancestor;
+        self.nodes[parent].red = self.nodes[grandparent].red;
+        self.nodes[grandparent].parent = Some(parent);
+        self.nodes[grandparent].red = true;
+        if let Some(ancestor) = ancestor {
+            if self.nodes[ancestor].left == Some(grandparent) {
+                self.nodes[ancestor].left = Some(parent);
+            } else {
+                self.nodes[ancestor].right = Some(parent);
+            }
+        } else {
+            self.root = Some(parent);
+        }
+    }
+
+    fn find(&self, address: u64) -> Option<&ModuleKallsymsNode> {
+        // symbol.c:401 symbols__find returns the FIRST containing node in
+        // the root walk, including an exact match to a zero-length symbol.
+        let mut cursor = self.root;
+        while let Some(index) = cursor {
+            let node = &self.nodes[index];
+            if address < node.address {
+                cursor = node.left;
+            } else if address > node.end || (address == node.end && node.end != node.address) {
+                cursor = node.right;
+            } else {
+                return Some(node);
+            }
+        }
+        None
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -714,12 +820,24 @@ impl KallsymsSymbol {
             module: None,
         }
     }
+}
 
-    fn module(name: String, _symbol_type: char, module: String) -> Self {
-        Self {
-            name,
-            end: None,
-            module: Some(module),
+#[derive(Clone, Copy, Debug)]
+struct BorrowedKallsymsRow<'a> {
+    address: u64,
+    end: u64,
+    name: &'a str,
+    full_name: &'a str,
+    module: Option<&'a str>,
+    symbol_type: char,
+}
+
+impl BorrowedKallsymsRow<'_> {
+    fn into_module_symbol(self, module: &str) -> KallsymsSymbol {
+        KallsymsSymbol {
+            name: self.name.to_owned(),
+            end: Some(self.end),
+            module: Some(module.to_owned()),
         }
     }
 }
@@ -1320,6 +1438,7 @@ impl Kallsyms {
         Ok(Self {
             symbols,
             addresses_by_name,
+            module_indexes: FxHashMap::default(),
         })
     }
 
@@ -1329,28 +1448,27 @@ impl Kallsyms {
     ///
     /// Returns an error when no valid module symbols are present.
     pub fn parse_modules(text: &str) -> Result<Self, String> {
-        let mut symbols = BTreeMap::new();
         let mut addresses_by_name = BTreeMap::new();
-        for (address, symbol, symbol_type, module) in text
-            .lines()
-            .filter_map(parse_module_kallsyms_line)
-            .filter(|(address, _, _, _)| *address != 0)
-        {
-            insert_kallsyms_symbol(
-                &mut symbols,
-                &mut addresses_by_name,
-                address,
-                KallsymsSymbol::module(symbol, symbol_type, module),
-            );
-        }
+        let symbols = Self::parse_module_symbols(text)
+            .into_iter()
+            .filter_map(|row| {
+                let module = row.module?;
+                addresses_by_name
+                    .entry(row.name.to_owned())
+                    .or_insert(row.address);
+                Some((row.address, row.into_module_symbol(module)))
+            })
+            .collect::<BTreeMap<_, _>>();
         if symbols.is_empty() {
             return Err("kallsyms did not contain any parseable module symbols".to_string());
         }
-        fixup_kallsyms_symbol_ends_like_perf(&mut symbols);
-        Ok(Self {
+        let mut result = Self {
             symbols,
             addresses_by_name,
-        })
+            module_indexes: FxHashMap::default(),
+        };
+        result.build_module_indexes();
+        Ok(result)
     }
 
     /// Parses only `/proc/kallsyms` lines for a specific module path like `[zfs]`.
@@ -1359,45 +1477,77 @@ impl Kallsyms {
     ///
     /// Returns an error when no valid module symbols are present for that module.
     pub fn parse_modules_for_path(text: &str, module_path: &str) -> Result<Self, String> {
-        let mut symbols = BTreeMap::new();
+        let symbols = Self::parse_module_symbols(text)
+            .into_iter()
+            .filter(|row| row.module == Some(module_path))
+            .map(|row| (row.address, row.into_module_symbol(module_path)))
+            .collect::<BTreeMap<_, _>>();
+        if symbols.is_empty() {
+            return Err(format!(
+                "kallsyms did not contain any parseable module symbols for {module_path}"
+            ));
+        }
         let mut addresses_by_name = BTreeMap::new();
-        for (address, symbol, symbol_type, module) in text
-            .lines()
-            .filter_map(parse_module_kallsyms_line)
-            .filter(|(address, _, _, _)| *address != 0)
-        {
-            insert_kallsyms_symbol(
-                &mut symbols,
-                &mut addresses_by_name,
-                address,
-                KallsymsSymbol::module(symbol, symbol_type, module),
-            );
-        }
-        if symbols.is_empty() {
-            return Err(format!(
-                "kallsyms did not contain any parseable module symbols for {module_path}"
-            ));
-        }
-        // perf runs symbols__fixup_end() on the full kallsyms tree before
-        // maps__split_kallsyms() moves symbols into per-module DSOs, so symbols
-        // can be capped by the next global kallsyms entry from another module.
-        fixup_kallsyms_symbol_ends_like_perf(&mut symbols);
-        symbols.retain(|_, symbol| symbol.module.as_deref() == Some(module_path));
-        if symbols.is_empty() {
-            return Err(format!(
-                "kallsyms did not contain any parseable module symbols for {module_path}"
-            ));
-        }
-        addresses_by_name.clear();
         for (address, symbol) in &symbols {
             addresses_by_name
                 .entry(symbol.name.clone())
                 .or_insert(*address);
         }
-        Ok(Self {
+        let mut result = Self {
             symbols,
             addresses_by_name,
-        })
+            module_indexes: FxHashMap::default(),
+        };
+        result.build_module_indexes();
+        Ok(result)
+    }
+
+    fn parse_module_symbols(text: &str) -> Vec<BorrowedKallsymsRow<'_>> {
+        let mut symbols = Vec::new();
+        for row in text
+            .lines()
+            .filter_map(parse_module_kallsyms_line)
+            .filter(|row| row.address != 0)
+        {
+            symbols.push(row);
+        }
+        // symbol.c:1512-1523: fix all accepted core/module ends, then remove
+        // duplicates, then split DSOs. Stable order matches equal-IP insertion
+        // to the right in __symbols__insert (361). Own only module survivors.
+        symbols.sort_by_key(|row| row.address);
+        if !symbols.is_empty() {
+            fixup_kallsyms_symbol_ends_like_perf(&mut symbols);
+        }
+        symbols.dedup_by(|next, current| {
+            if next.address != current.address {
+                return false;
+            }
+            if kallsyms_next_alias_is_better(current, next) {
+                *current = *next;
+            }
+            true
+        });
+        symbols
+    }
+
+    fn build_module_indexes(&mut self) {
+        for (&address, symbol) in &self.symbols {
+            let Some(module) = symbol.module.as_deref() else {
+                continue;
+            };
+            let index = match self.module_indexes.raw_entry_mut().from_key(module) {
+                RawEntryMut::Occupied(entry) => entry.into_mut(),
+                RawEntryMut::Vacant(entry) => {
+                    entry
+                        .insert(module.to_owned(), ModuleKallsymsIndex::default())
+                        .1
+                }
+            };
+            index.insert_ascending(
+                address,
+                symbol.end.expect("module ends were fixed globally"),
+            );
+        }
     }
 
     #[must_use]
@@ -1447,23 +1597,30 @@ impl Kallsyms {
         address: u64,
         range: Option<(u64, u64)>,
     ) -> Option<String> {
-        self.symbols
+        let module = self
+            .symbols
             .range(..=address)
-            .next_back()
-            .and_then(|(start, symbol)| {
-                let mut end = symbol.end?;
-                if let Some((range_start, range_end)) = range {
-                    if *start < range_start || range_end <= address {
-                        return None;
-                    }
-                    end = end.min(range_end);
-                }
-                // perf's map__find_symbol() calls symbols__find(), which
-                // requires start <= ip < end. kallsyms keeps T/W/D/B symbols
-                // before maps__split_kallsyms(), so data/BSS module symbols
-                // are valid anchors too.
-                (address < end).then(|| format!("{}+0x{:x}", symbol.name, address - start))
-            })
+            .next_back()?
+            .1
+            .module
+            .as_deref()?;
+        self.resolve_module_with_offset_for_path(address, range, module)
+    }
+
+    fn resolve_module_with_offset_for_path(
+        &self,
+        address: u64,
+        range: Option<(u64, u64)>,
+        module: &str,
+    ) -> Option<String> {
+        let node = self.module_indexes.get(module)?.find(address)?;
+        if let Some((range_start, range_end)) = range
+            && (node.address < range_start || range_end <= address)
+        {
+            return None;
+        }
+        let symbol = self.symbols.get(&node.address)?;
+        Some(format!("{}+0x{:x}", symbol.name, address - node.address))
     }
 
     #[must_use]
@@ -4271,8 +4428,11 @@ fn resolve_kernel_kallsyms(kallsyms: &Kallsyms, request: &SymbolRequest) -> Opti
 }
 
 fn resolve_module_kallsyms(kallsyms: &Kallsyms, request: &SymbolRequest) -> Option<String> {
-    kallsyms
-        .resolve_module_with_offset_in_range(request.relative_address, request.kernel_mapping_range)
+    kallsyms.resolve_module_with_offset_for_path(
+        request.relative_address,
+        request.kernel_mapping_range,
+        request.path.to_str()?,
+    )
 }
 
 fn kernel_mapping_range_from_ref(mapping: &ResolvedMappingRef<'_>) -> Option<(u64, u64)> {
@@ -4350,32 +4510,60 @@ fn insert_kallsyms_symbol(
     addresses_by_name.entry(symbol.name).or_insert(address);
 }
 
-fn fixup_kallsyms_symbol_ends_like_perf(symbols: &mut BTreeMap<u64, KallsymsSymbol>) {
-    let addresses = symbols.keys().copied().collect::<Vec<_>>();
-    for pair in addresses.windows(2) {
-        let [prev_addr, curr_addr] = pair else {
-            continue;
-        };
-        let curr_module = symbols
-            .get(curr_addr)
-            .and_then(|symbol| symbol.module.clone());
-        let Some(prev) = symbols.get_mut(prev_addr) else {
-            continue;
-        };
-        if prev.end.is_some() {
-            continue;
-        }
-        prev.end = if prev.module == curr_module {
-            Some(*curr_addr)
+fn fixup_kallsyms_symbol_ends_like_perf(symbols: &mut [BorrowedKallsymsRow<'_>]) {
+    for index in 1..symbols.len() {
+        let current = symbols[index];
+        let previous = &mut symbols[index - 1];
+        // symbol.c:246 compares the raw '[' suffix before stripping module
+        // names. Losing aliases and intervening core rows still set ends.
+        let previous_module = previous
+            .full_name
+            .find('[')
+            .map(|i| &previous.full_name[i..]);
+        let current_module = current.full_name.find('[').map(|i| &current.full_name[i..]);
+        previous.end = if previous_module == current_module {
+            current.address
         } else {
-            Some(round_up_to_page(prev_addr.saturating_add(4096)))
+            round_up_to_page(previous.address.saturating_add(4096))
         };
     }
-    if let Some((addr, symbol)) = symbols.iter_mut().next_back()
-        && symbol.end.is_none()
-    {
-        symbol.end = Some(round_up_to_page(addr.saturating_add(4096)));
+    if let Some(last) = symbols.last_mut() {
+        last.end = round_up_to_page(last.address.saturating_add(4096));
     }
+}
+
+fn kallsyms_next_alias_is_better(
+    current: &BorrowedKallsymsRow<'_>,
+    next: &BorrowedKallsymsRow<'_>,
+) -> bool {
+    // symbol.c:152 choose_best_symbol, using the unstripped name. All accepted
+    // T/W/D/B rows have FUNC/OBJECT type, never NOTYPE (tools/lib/symbol/kallsyms.c:8).
+    let current_nonzero = current.end != current.address;
+    let next_nonzero = next.end != next.address;
+    if current_nonzero != next_nonzero {
+        return next_nonzero;
+    }
+    // kallsyms.h:13 treats only uppercase W as STB_WEAK; lowercase w is local.
+    let current_weak = current.symbol_type == 'W';
+    let next_weak = next.symbol_type == 'W';
+    if current_weak != next_weak {
+        return !next_weak;
+    }
+    let current_global = current.symbol_type.is_ascii_uppercase() && !current_weak;
+    let next_global = next.symbol_type.is_ascii_uppercase() && !next_weak;
+    if current_global != next_global {
+        return next_global;
+    }
+    let current_underscores = leading_underscore_count(current.full_name);
+    let next_underscores = leading_underscore_count(next.full_name);
+    if current_underscores != next_underscores {
+        return next_underscores < current_underscores;
+    }
+    if current.full_name.len() != next.full_name.len() {
+        return next.full_name.len() > current.full_name.len();
+    }
+    // symbol.c:140 arch__choose_best_symbol's generic fallback.
+    current.full_name.starts_with("SyS") || current.full_name.starts_with("compat_SyS")
 }
 
 fn round_up_to_page(address: u64) -> u64 {
@@ -4395,17 +4583,34 @@ fn parse_kallsyms_line(line: &str) -> Option<(u64, String)> {
     Some((address, symbol.to_string()))
 }
 
-fn parse_module_kallsyms_line(line: &str) -> Option<(u64, String, char, String)> {
-    let mut fields = line.split_whitespace();
-    let address = u64::from_str_radix(fields.next()?, 16).ok()?;
-    let symbol_type = fields.next()?.chars().next()?;
+fn parse_module_kallsyms_line(line: &str) -> Option<BorrowedKallsymsRow<'_>> {
+    let (address, rest) = line.trim_start().split_once(char::is_whitespace)?;
+    let address = u64::from_str_radix(address, 16).ok()?;
+    let (symbol_type, full_name) = rest.trim_start().split_once(char::is_whitespace)?;
+    let symbol_type = symbol_type.chars().next()?;
     if !perf_kallsyms_type_is_kept(symbol_type) {
         return None;
     }
-    let symbol = fields.next()?;
-    let module = fields.next()?;
-    (module.starts_with('[') && module.ends_with(']'))
-        .then(|| (address, symbol.to_string(), symbol_type, module.to_string()))
+    let full_name = full_name.trim_start();
+    let mut fields = full_name.split_whitespace();
+    let name = fields.next()?;
+    // tools/perf/util/symbol.c:774 rejects these before global insertion,
+    // so they must not influence end-fixup, duplicate selection, or tree shape.
+    if name.starts_with('$') {
+        return None;
+    }
+    let module = fields.next();
+    if module.is_some_and(|module| !module.starts_with('[') || !module.ends_with(']')) {
+        return None;
+    }
+    Some(BorrowedKallsymsRow {
+        address,
+        end: address,
+        name,
+        full_name,
+        module,
+        symbol_type,
+    })
 }
 
 fn perf_kallsyms_type_is_kept(symbol_type: char) -> bool {
@@ -5243,6 +5448,95 @@ mod tests {
             symbols.symbol_name_with_offset(0xa691b),
             Some("__syscall_cancel_arch_start+0x27".to_string())
         );
+    }
+
+    #[test]
+    fn module_kallsyms_rejects_dollar_core_and_module_rows_before_global_end_fixup() {
+        // map__process_kallsym_symbol (symbol.c:774) applies the same name
+        // filter to core and module rows before symbols__fixup_end (1512).
+        let rejected = [
+            "0000000000001100 T $core",
+            "0000000000001150 T $module [b]",
+            "0000000000001200 T $alias [a]",
+        ];
+        for line in rejected {
+            assert!(super::parse_module_kallsyms_line(line).is_none(), "{line}");
+        }
+        let text = "0000000000001000 T first [a]\n\
+                    0000000000001100 T $core\n\
+                    0000000000001150 T $module [b]\n\
+                    0000000000001200 T next [a]\n\
+                    0000000000001200 T $alias [a]\n";
+        let rows = Kallsyms::parse_module_symbols(text);
+        // symbol.c:305: terminal end = roundup(start, 4096) + 4096.
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.address, row.end))
+                .collect::<Vec<_>>(),
+            [(0x1000, 0x1200), (0x1200, 0x3000)]
+        );
+        let view = Kallsyms::parse_modules_for_path(text, "[a]").unwrap();
+        assert_eq!(
+            view.resolve_module_with_offset(0x11ff).as_deref(),
+            Some("first+0x1ff")
+        );
+        assert_eq!(
+            view.resolve_module_with_offset(0x1200).as_deref(),
+            Some("next+0x0")
+        );
+        assert!(Kallsyms::parse_modules_for_path(text, "[b]").is_err());
+    }
+
+    #[test]
+    fn module_kallsyms_core_rows_determine_ends_before_module_views_are_split() {
+        // tools/perf/util/symbol.c:1512 runs symbols__fixup_end over accepted
+        // core and module rows before maps__split_kallsyms (1523). Filtering
+        // the intervening core row first would incorrectly set end to 0x1200.
+        let view = Kallsyms::parse_modules_for_path(
+            "0000000000001000 T first [a]\n\
+             0000000000001100 T core\n\
+             0000000000001200 T next [a]\n",
+            "[a]",
+        )
+        .unwrap();
+        assert_eq!(view.symbols[&0x1000].end, Some(0x2000));
+        assert_eq!(view.address_of("core"), None);
+    }
+
+    #[test]
+    fn module_kallsyms_cross_module_aliases_prefer_nonweak_after_global_end_fixup() {
+        // tools/perf/util/symbol.c:246 gives both cross-module aliases nonzero
+        // ends; choose_best_symbol:173 then prefers nonweak over STB_WEAK.
+        // Duplicate removal (1513) happens before the DSO split (1523).
+        let text = "0000000000001000 T strong [a]\n\
+                    0000000000001000 W weak [b]\n\
+                    0000000000001100 T next [b]\n";
+        let strong = Kallsyms::parse_modules_for_path(text, "[a]").unwrap();
+        assert_eq!(strong.symbols[&0x1000].name, "strong");
+        assert_eq!(strong.symbols[&0x1000].end, Some(0x2000));
+        let other = Kallsyms::parse_modules_for_path(text, "[b]").unwrap();
+        assert_eq!(other.address_of("weak"), None);
+        assert_eq!(other.resolve_module_with_offset(0x1000), None);
+        assert_eq!(other.address_of("next"), Some(0x1100));
+    }
+
+    #[test]
+    fn module_kallsyms_duplicate_removal_does_not_recompute_preceding_symbol_ends() {
+        // tools/perf/util/symbol.c:1512-1523 fixes ends, removes duplicates,
+        // then splits without recomputing ends. The losing [b] alias still
+        // establishes the preceding [a] symbol's page-boundary end.
+        let view = Kallsyms::parse_modules_for_path(
+            "0000000000001000 T preceding [a]\n\
+             0000000000001100 W losing [b]\n\
+             0000000000001100 T winner [a]\n\
+             0000000000001200 T next [a]\n",
+            "[a]",
+        )
+        .unwrap();
+        assert_eq!(view.symbols[&0x1000].end, Some(0x2000));
+        assert_eq!(view.symbols[&0x1100].name, "winner");
+        assert_eq!(view.symbols[&0x1100].end, Some(0x1200));
+        assert_eq!(view.address_of("losing"), None);
     }
 
     #[test]
