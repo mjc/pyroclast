@@ -339,15 +339,16 @@ struct MmapRange {
 /// # Errors
 ///
 /// Returns an error when fewer than eight bytes are available.
+#[inline]
 pub fn parse_record_header(bytes: &[u8]) -> Result<PerfRecordHeader, String> {
-    if bytes.len() < 8 {
-        return Err("perf record header is shorter than 8 bytes".to_string());
-    }
-
+    // include/uapi/linux/perf_event.h:840: type, misc, size occupy one header.
+    let header = bytes
+        .first_chunk::<8>()
+        .ok_or_else(|| "perf record header is shorter than 8 bytes".to_string())?;
     Ok(PerfRecordHeader {
-        record_type: read_u32(bytes, 0)?,
-        misc: read_u16(bytes, 4)?,
-        size: read_u16(bytes, 6)?,
+        record_type: u32::from_le_bytes([header[0], header[1], header[2], header[3]]),
+        misc: u16::from_le_bytes([header[4], header[5]]),
+        size: u16::from_le_bytes([header[6], header[7]]),
     })
 }
 
@@ -1083,4 +1084,47 @@ fn has_misc_flag(misc: u16, flag: u16) -> bool {
 
 fn to_usize(value: u64, name: &str) -> Result<usize, String> {
     usize::try_from(value).map_err(|_| format!("{name} does not fit in usize"))
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::{PerfRecordHeader, parse_record_header};
+
+    #[test]
+    fn record_headers_decode_all_fields_at_unaligned_offsets_with_trailing_bytes() {
+        // Linux include/uapi/linux/perf_event.h:840 defines one eight-byte
+        // header: u32 type, u16 misc, u16 size. Alignment is not required.
+        for offset in 0..8 {
+            for (record_type, misc, size) in [
+                (0_u32, 0_u16, 0_u16),
+                (9, 2, 8),
+                (u32::MAX, u16::MAX, u16::MAX),
+                (0x7654_3210, 0xfedc, 0x9876),
+            ] {
+                let mut bytes = vec![0xcc; offset];
+                bytes.extend_from_slice(&record_type.to_le_bytes());
+                bytes.extend_from_slice(&misc.to_le_bytes());
+                bytes.extend_from_slice(&size.to_le_bytes());
+                bytes.extend_from_slice(&[0x55; 16]);
+                assert_eq!(
+                    parse_record_header(&bytes[offset..]).unwrap(),
+                    PerfRecordHeader {
+                        record_type,
+                        misc,
+                        size,
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_record_headers_return_the_short_header_error() {
+        for len in 0..8 {
+            assert_eq!(
+                parse_record_header(&[0xff; 8][..len]).unwrap_err(),
+                "perf record header is shorter than 8 bytes"
+            );
+        }
+    }
 }
