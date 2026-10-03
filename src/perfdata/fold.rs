@@ -219,6 +219,7 @@ struct DeferredFoldSample {
     time: Option<u64>,
     cpu: Option<u32>,
     event_name: Arc<str>,
+    event_fields: InfernoSampleEventFields,
     count: u64,
     frames: FoldFrameStack,
     has_callchain: bool,
@@ -230,6 +231,7 @@ struct PreparedFoldSample<'layout, 'frames> {
     time: Option<u64>,
     cpu: Option<u32>,
     event_name: &'layout str,
+    event_fields: &'layout InfernoSampleEventFields,
     count: u64,
     frames: &'frames [FoldFrame],
     deferred_cookie: Option<u64>,
@@ -332,7 +334,44 @@ struct SampleEventLayout {
     layout: SampleLayout,
     default_period: u64,
     event_name: Arc<str>,
+    event_fields: InfernoSampleEventFields,
     offsets: SampleOffsets,
+}
+
+#[derive(Clone, Debug)]
+struct InfernoSampleEventFields {
+    name: std::ops::Range<usize>,
+    period_override: Option<u64>,
+}
+
+impl InfernoSampleEventFields {
+    fn new(event_name: &str, timed: bool) -> Self {
+        #[cfg(test)]
+        EVENT_NAME_PARSES.with(|parses| parses.set(parses.get() + 1));
+        // perf builtin-script.c:process_event (2442-2452) prints period then
+        // "%*s: ". Inferno perf.rs:on_event_line (385-393) skips the first
+        // colon field, selecting time's successor or, without time, the
+        // event-name suffix. The preceding literal-space word is its period.
+        let (start, field) = if timed {
+            (0, event_name.split(':').next().unwrap())
+        } else if let Some((prefix, suffix)) = event_name.split_once(':') {
+            (prefix.len() + 1, suffix.split(':').next().unwrap())
+        } else {
+            (0, "")
+        };
+        if let Some((prefix, token)) = field.rsplit_once(' ') {
+            let start = start + prefix.len() + 1;
+            Self {
+                name: start..start + token.len(),
+                period_override: Some(prefix.rsplit(' ').next().unwrap().parse().unwrap_or(1)),
+            }
+        } else {
+            Self {
+                name: start..start + field.len(),
+                period_override: if timed { None } else { Some(1) },
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -368,10 +407,14 @@ impl SampleOffsets {
 
 impl SampleEventLayout {
     fn new(layout: SampleLayout, event_name: impl Into<Arc<str>>, default_period: u64) -> Self {
+        let event_name = event_name.into();
+        let event_fields =
+            InfernoSampleEventFields::new(&event_name, layout.sample_type & PERF_SAMPLE_TIME != 0);
         Self {
             layout,
             default_period,
-            event_name: event_name.into(),
+            event_name,
+            event_fields,
             offsets: SampleOffsets::new(layout.sample_type),
         }
     }
@@ -887,11 +930,21 @@ fn layouts_require_stream_parser(layouts: &SampleLayouts) -> bool {
         .iter()
         .chain(layouts.by_identifier.values())
         .any(|event| {
+            let post_event = if event.layout.sample_type & PERF_SAMPLE_TIME != 0 {
+                event.event_name.split_once(':').map(|(_, suffix)| suffix)
+            } else {
+                event.event_name.splitn(3, ':').nth(2)
+            };
             event.layout.sample_type & (PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_TID)
                 != PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_TID
                 // builtin-script.c:process_event prints evname verbatim;
                 // Inferno process_single_stack splits LF before event parsing.
                 || event.event_name.contains('\n')
+                // Inferno on_event_line (405-428) skips the first space/colon
+                // in the post-event field. An embedded separator leaves the
+                // literal ": " that perf appends, hence a combined frame.
+                // This changes parser state for the following stack lines.
+                || post_event.is_some_and(|suffix| suffix.contains([' ', ':']))
         })
 }
 
@@ -1149,30 +1202,16 @@ fn inferno_sample_event_fields<'a>(
     sample: &PreparedFoldSample<'a, '_>,
     width: usize,
 ) -> (&'a str, u64) {
-    // perf builtin-script.c:process_event prints the padded evname after
-    // the period. Inferno perf.rs:on_event_line selects the first event
-    // token and reads the immediately preceding space-delimited word.
-    let mut parts = sample.event_name.split(':');
-    let name = if sample.time.is_some() {
-        parts.next().unwrap()
-    } else {
-        parts.nth(1).unwrap_or("")
-    };
-    if let Some((prefix, token)) = name.rsplit_once(' ') {
-        (
-            token,
-            prefix.rsplit(' ').next().unwrap().parse().unwrap_or(1),
-        )
-    } else {
-        (
-            name,
-            if sample.time.is_none() || width > sample.event_name.len() {
+    (
+        &sample.event_name[sample.event_fields.name.clone()],
+        sample.event_fields.period_override.unwrap_or({
+            if width > sample.event_name.len() {
                 1
             } else {
                 sample.count
-            },
-        )
-    }
+            }
+        }),
+    )
 }
 
 fn inferno_numeric_header_word(line: &str) -> Option<(usize, usize)> {
@@ -1209,6 +1248,7 @@ fn inferno_numeric_header_word(line: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 thread_local! {
     static COMM_SYNTAX_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static EVENT_NAME_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 struct InfernoFoldHeader<'a> {
@@ -1403,6 +1443,7 @@ impl<O: SampleOutput> SampleSink<O> {
                 time: sample.time,
                 cpu: sample.cpu,
                 event_name: Arc::from(sample.event_name),
+                event_fields: sample.event_fields.clone(),
                 count: sample.count,
                 has_callchain: sample.has_callchain,
                 frames: std::mem::take(&mut self.sample_frames),
@@ -1428,6 +1469,7 @@ impl<O: SampleOutput> SampleSink<O> {
                 time: deferred.time,
                 cpu: deferred.cpu,
                 event_name: &deferred.event_name,
+                event_fields: &deferred.event_fields,
                 count: deferred.count,
                 frames: &deferred.frames,
                 deferred_cookie: None,
@@ -1448,6 +1490,7 @@ impl<O: SampleOutput> SampleSink<O> {
                 time: deferred.time,
                 cpu: deferred.cpu,
                 event_name: &deferred.event_name,
+                event_fields: &deferred.event_fields,
                 count: deferred.count,
                 frames: &deferred.frames,
                 deferred_cookie: None,
@@ -2065,16 +2108,22 @@ fn update_comm_tables(
     thread_comms: &mut BTreeMap<u32, ThreadComm>,
     record: &crate::perfdata::records::CommRecord,
 ) {
+    use std::collections::btree_map::Entry;
+
     let comm = record.comm.as_ref();
     if record.is_exec {
         upsert_comm(exec_process_comms, record.pid, comm);
     }
     upsert_comm(process_comms, record.pid, comm);
-    if thread_comms
-        .get(&record.tid)
-        .is_none_or(|stored| stored.name != comm)
-    {
-        thread_comms.insert(record.tid, comm.into());
+    match thread_comms.entry(record.tid) {
+        Entry::Vacant(entry) => {
+            entry.insert(comm.into());
+        }
+        Entry::Occupied(mut entry) => {
+            if entry.get().name != comm {
+                entry.insert(comm.into());
+            }
+        }
     }
 }
 
@@ -3543,6 +3592,7 @@ fn prepare_sample_for_fold<'layout, 'frames>(
         time: sample.time,
         cpu: sample.cpu,
         event_name: &event.event_name,
+        event_fields: &event.event_fields,
         count,
         frames,
         deferred_cookie,
@@ -6066,6 +6116,196 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prepared_event_fields_preserve_inferno_spaces_modifiers_tracepoints_and_padding() {
+        // perf builtin-script.c:process_event prints "%*s: ", while Inferno
+        // perf.rs:on_event_line splits at colons and then literal spaces.
+        for time in [Some(1_000_000_000), None] {
+            for names in [
+                ["cycles", "instructions", "cycles"],
+                ["cycles:u", "cycles:k", "instructions:u"],
+                [
+                    "syscalls:sys_enter_write",
+                    "syscalls:sys_enter_read",
+                    "cycles",
+                ],
+                ["17 cycles", "23 cycles", "a much longer cycles"],
+                ["cpu clock", "other clock", "trailing "],
+                ["trailing ", "trailing ", "longer "],
+                ["7 \u{e9}v:u", "9 \u{e9}v:k", "a longer \u{e9}v:u"],
+            ] {
+                assert_events_match_native_inferno_with_time(
+                    &[
+                        (names[0], 2, true),
+                        (names[1], 3, true),
+                        (names[2], 100, true),
+                    ],
+                    time,
+                );
+            }
+        }
+        assert_events_match_native_inferno_with_time(
+            &[
+                ("cycles:7 task", 2, true),
+                ("cycles:9 task", 3, true),
+                ("instructions:7 other", 100, true),
+            ],
+            None,
+        );
+    }
+
+    #[test]
+    fn repeated_prepared_samples_borrow_event_fields_without_reparsing_names() {
+        use super::SampleOutput as _;
+        for (name, time) in [
+            ("cycles", Some(1_000_000_000)),
+            ("17 cycles", Some(1_000_000_000)),
+            ("cycles:7 task", None),
+        ] {
+            super::EVENT_NAME_PARSES.with(|parses| parses.set(0));
+            let (layouts, payload) = event_test_sample(name, 3, time, true);
+            super::EVENT_NAME_PARSES.with(|parses| assert_eq!(parses.get(), 1, "{name:?}"));
+            let mut state = super::SessionState::new(std::collections::BTreeMap::new());
+            state.thread_comms.insert(7, "worker".into());
+            let mut frames = super::FoldFrameStack::new();
+            let mut output = super::FoldedOutput::<super::NoopSymbolResolver>::new(
+                None,
+                super::FoldOptions {
+                    count_periods: true,
+                    inline: false,
+                },
+                name.len(),
+            );
+            super::EVENT_NAME_PARSES.with(|parses| parses.set(0));
+            for _ in 0..512 {
+                let sample = super::prepare_sample_for_fold(
+                    &mut state,
+                    super::PERF_RECORD_MISC_CPUMODE_USER,
+                    &payload,
+                    &layouts,
+                    super::FoldOptions {
+                        count_periods: true,
+                        inline: false,
+                    },
+                    &mut frames,
+                )
+                .unwrap()
+                .unwrap();
+                assert!(std::ptr::eq(
+                    std::ptr::from_ref(sample.event_fields),
+                    std::ptr::from_ref(&layouts.fallback.as_ref().unwrap().event_fields),
+                ));
+                output.write_sample_event(&state, &sample).unwrap();
+            }
+            assert!(!output.buffers.current.is_empty());
+            super::EVENT_NAME_PARSES.with(|parses| assert_eq!(parses.get(), 0, "{name:?}"));
+        }
+    }
+
+    #[test]
+    fn structural_event_name_suffixes_preserve_inferno_stream_state() {
+        // perf process_event prints the event name verbatim, followed by ": ".
+        // Inferno perf.rs:on_event_line (405-428) can treat a suffix as an
+        // event-line frame and then parse subsequent lines as new headers.
+        for (name, time) in [
+            ("cycles:7 task", Some(1_000_000_000)),
+            ("cycles:u handler", Some(1_000_000_000)),
+            ("cycles:u:7 task", Some(1_000_000_000)),
+            ("cycles:u:7 task", None),
+            ("cycles:u", Some(1_000_000_000)),
+        ] {
+            let (mut layouts, payload) = event_test_sample(name, 2, time, true);
+            layouts.event_name_width = name.len();
+            let mut bytes = Vec::new();
+            for _ in 0..2 {
+                bytes.extend(crate::perfdata::records::PERF_RECORD_SAMPLE.to_le_bytes());
+                bytes.extend(super::PERF_RECORD_MISC_CPUMODE_USER.to_le_bytes());
+                bytes.extend(u16::try_from(payload.len() + 8).unwrap().to_le_bytes());
+                bytes.extend_from_slice(&payload);
+            }
+            let header = crate::perfdata::header::PerfHeader {
+                header_size: 104,
+                attr_offset: 0,
+                attr_size: 0,
+                data_offset: 0,
+                data_size: u64::try_from(bytes.len()).unwrap(),
+            };
+            let state = || {
+                let mut state = super::SessionState::new(std::collections::BTreeMap::new());
+                state.thread_comms.insert(7, "worker".into());
+                state
+            };
+            let options = super::FoldOptions {
+                count_periods: true,
+                inline: false,
+            };
+            let actual = super::collect_fold_counts_from_source::<super::NoopSymbolResolver>(
+                &mut super::SliceSource(&bytes),
+                header,
+                &layouts,
+                state(),
+                options,
+                None,
+            )
+            .unwrap();
+            let expected = super::collect_stream_fold_counts::<super::NoopSymbolResolver>(
+                &mut super::SliceSource(&bytes),
+                header,
+                &layouts,
+                state(),
+                options,
+                None,
+            )
+            .unwrap();
+            let mut actual_text = Vec::new();
+            let mut expected_text = Vec::new();
+            super::write_fold_counts(actual, &mut actual_text).unwrap();
+            super::write_fold_counts(expected, &mut expected_text).unwrap();
+            assert_eq!(actual_text, expected_text, "{name:?}, time {time:?}");
+        }
+    }
+
+    fn event_test_sample(
+        name: &str,
+        count: u64,
+        time: Option<u64>,
+        has_frames: bool,
+    ) -> (super::SampleLayouts, Vec<u8>) {
+        let layout = crate::perfdata::samples::SampleLayout {
+            sample_type: super::PERF_SAMPLE_TID
+                | crate::perfdata::samples::PERF_SAMPLE_PERIOD
+                | super::PERF_SAMPLE_CALLCHAIN
+                | if time.is_some() {
+                    super::PERF_SAMPLE_TIME
+                } else {
+                    0
+                },
+            read_format: 0,
+            branch_sample_type: 0,
+            sample_regs_user: 0,
+            sample_regs_intr: 0,
+            sample_id_all: false,
+        };
+        let layouts = super::SampleLayouts {
+            fallback: Some(std::sync::Arc::new(super::SampleEventLayout::new(
+                layout, name, 1,
+            ))),
+            ..Default::default()
+        };
+        let mut payload = Vec::new();
+        payload.extend(7_u32.to_le_bytes());
+        payload.extend(7_u32.to_le_bytes());
+        if let Some(time) = time {
+            payload.extend(time.to_le_bytes());
+        }
+        payload.extend(count.to_le_bytes());
+        payload.extend(u64::from(has_frames).to_le_bytes());
+        if has_frames {
+            payload.extend(0x1010_u64.to_le_bytes());
+        }
+        (layouts, payload)
+    }
+
     fn assert_events_match_native_inferno(events: &[(&str, u64, bool)]) {
         assert_events_match_native_inferno_with_time(events, Some(1_000_000_000));
     }
@@ -6090,7 +6330,7 @@ mod tests {
             },
             width,
         );
-        let frames = [super::FoldFrame::UserUnwind(0x1010)];
+        let mut frames = super::FoldFrameStack::new();
         let mut script = Vec::new();
         let mut text = super::PerfScriptOutput::<super::NoopSymbolResolver, _> {
             symbol_cache: None,
@@ -6099,10 +6339,20 @@ mod tests {
             inline: false,
         };
         for &(name, count, has_frames) in events {
-            let mut sample = prepared_sample(if has_frames { &frames } else { &[] });
-            sample.time = time;
-            sample.event_name = name;
-            sample.count = count;
+            let (layouts, payload) = event_test_sample(name, count, time, has_frames);
+            let sample = super::prepare_sample_for_fold(
+                &mut state,
+                super::PERF_RECORD_MISC_CPUMODE_USER,
+                &payload,
+                &layouts,
+                super::FoldOptions {
+                    count_periods: true,
+                    inline: false,
+                },
+                &mut frames,
+            )
+            .unwrap()
+            .unwrap();
             direct.write_sample_event(&state, &sample).unwrap();
             text.write_sample_event(&state, &sample).unwrap();
         }
@@ -6114,8 +6364,8 @@ mod tests {
             .unwrap();
         let mut actual = Vec::new();
         super::write_fold_counts(direct.buffers.counts, &mut actual).unwrap();
-        assert!(!expected.is_empty());
-        assert_eq!(actual, expected);
+        assert!(!expected.is_empty(), "events {events:?}, time {time:?}");
+        assert_eq!(actual, expected, "events {events:?}, time {time:?}");
     }
 
     #[test]
@@ -6556,8 +6806,8 @@ mod tests {
             9,
         );
         let frames = [super::FoldFrame::Callchain(0x1010)];
-        let mut sample = prepared_sample(&frames);
-        sample.time = Some(1_000_000_000);
+        let (layouts, _) = event_test_sample("cpu-clock", 17, Some(1_000_000_000), true);
+        let mut sample = prepared_sample_for_event(&frames, layouts.fallback.as_ref().unwrap());
         sample.count = 17;
         let mut script = Vec::new();
         for comm in [
@@ -7221,9 +7471,8 @@ mod tests {
         ] {
             let mut state = super::SessionState::new(std::collections::BTreeMap::new());
             state.thread_comms.insert(7, comm.into());
-            let mut sample = prepared_sample(&[]);
-            sample.time = Some(1_000_000_000);
-            sample.event_name = event;
+            let (layouts, _) = event_test_sample(event, 5, Some(1_000_000_000), false);
+            let mut sample = prepared_sample_for_event(&[], layouts.fallback.as_ref().unwrap());
             sample.count = 5;
             let mut actual = Vec::new();
             let mut output = super::PerfScriptOutput::<super::NoopSymbolResolver, _> {
@@ -7308,12 +7557,29 @@ mod tests {
     }
 
     fn prepared_sample(frames: &[super::FoldFrame]) -> super::PreparedFoldSample<'static, '_> {
+        static EVENT: std::sync::OnceLock<std::sync::Arc<super::SampleEventLayout>> =
+            std::sync::OnceLock::new();
+        let event = EVENT.get_or_init(|| {
+            event_test_sample("cpu-clock", 1, None, true)
+                .0
+                .fallback
+                .unwrap()
+        });
+        prepared_sample_for_event(frames, event)
+    }
+
+    fn prepared_sample_for_event<'layout, 'frames>(
+        frames: &'frames [super::FoldFrame],
+        event: &'layout super::SampleEventLayout,
+    ) -> super::PreparedFoldSample<'layout, 'frames> {
         super::PreparedFoldSample {
             pid: Some(7),
             tid: Some(7),
-            time: None,
+            time: (event.layout.sample_type & super::PERF_SAMPLE_TIME != 0)
+                .then_some(1_000_000_000),
             cpu: None,
-            event_name: "cpu-clock",
+            event_name: &event.event_name,
+            event_fields: &event.event_fields,
             count: 1,
             frames,
             deferred_cookie: None,
@@ -8747,8 +9013,8 @@ mod tests {
             super::FoldFrame::UserUnwind(0x1010),
             super::FoldFrame::UserUnwind(0x2010),
         ];
-        let mut sample = prepared_sample(&frames);
-        sample.time = Some(1_000_000_000);
+        let (layouts, _) = event_test_sample("cpu-clock", 1, Some(1_000_000_000), true);
+        let sample = prepared_sample_for_event(&frames, layouts.fallback.as_ref().unwrap());
         direct.write_sample_event(&state, &sample).unwrap();
         let mut script = Vec::new();
         let mut cache = SymbolFrameCache::new(&resolver);
@@ -9007,6 +9273,7 @@ mod tests {
                 time: Some(100),
                 cpu: None,
                 event_name: std::sync::Arc::from("cpu-clock"),
+                event_fields: super::InfernoSampleEventFields::new("cpu-clock", true),
                 count: 1,
                 frames: smallvec::smallvec![super::FoldFrame::Callchain(0x2000)],
                 has_callchain: true,
@@ -9020,6 +9287,7 @@ mod tests {
                 time: Some(100),
                 cpu: None,
                 event_name: std::sync::Arc::from("cpu-clock"),
+                event_fields: super::InfernoSampleEventFields::new("cpu-clock", true),
                 count: 1,
                 frames: smallvec::smallvec![super::FoldFrame::Callchain(0x1000)],
                 has_callchain: true,
@@ -9091,6 +9359,7 @@ mod tests {
                 time: Some(100),
                 cpu: None,
                 event_name: std::sync::Arc::from("cpu-clock"),
+                event_fields: super::InfernoSampleEventFields::new("cpu-clock", true),
                 count: 1,
                 frames: smallvec::smallvec![super::FoldFrame::Callchain(0x2000)],
                 has_callchain: true,
@@ -9104,6 +9373,7 @@ mod tests {
                 time: Some(150),
                 cpu: None,
                 event_name: std::sync::Arc::from("cpu-clock"),
+                event_fields: super::InfernoSampleEventFields::new("cpu-clock", true),
                 count: 1,
                 frames: smallvec::smallvec![super::FoldFrame::Callchain(0x3000)],
                 has_callchain: true,
@@ -9117,6 +9387,7 @@ mod tests {
                 time: Some(200),
                 cpu: None,
                 event_name: std::sync::Arc::from("cpu-clock"),
+                event_fields: super::InfernoSampleEventFields::new("cpu-clock", true),
                 count: 1,
                 frames: smallvec::smallvec![super::FoldFrame::Callchain(0x7000)],
                 has_callchain: true,
