@@ -66,6 +66,81 @@ const PERF_SCRIPT_MAX_STACK: usize = 127;
 type FoldFrameStack = SmallVec<[FoldFrame; 16]>;
 type LabelId = usize;
 type LabelSpan = SmallVec<[LabelId; 4]>;
+enum LabelProjection {
+    Empty,
+    Single(LabelId),
+    Expanded(LabelSpan),
+}
+
+impl From<LabelSpan> for LabelProjection {
+    fn from(labels: LabelSpan) -> Self {
+        match labels.as_slice() {
+            [] => Self::Empty,
+            [id] => Self::Single(*id),
+            _ => Self::Expanded(labels),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ProjectionRef<'a> {
+    Empty,
+    Single(LabelId),
+    Expanded(&'a [LabelId]),
+}
+
+impl LabelProjection {
+    #[inline]
+    fn view(&self) -> ProjectionRef<'_> {
+        match self {
+            Self::Empty => ProjectionRef::Empty,
+            Self::Single(id) => ProjectionRef::Single(*id),
+            Self::Expanded(labels) => {
+                #[cfg(test)]
+                PROJECTION_SPAN_READS.with(|reads| reads.set(reads.get() + 1));
+                ProjectionRef::Expanded(labels.as_slice())
+            }
+        }
+    }
+
+    fn hint(&self, slot: usize) -> ModuleProjectionValue {
+        match self {
+            Self::Empty => ModuleProjectionValue::Empty,
+            Self::Single(id) => ModuleProjectionValue::Single(*id),
+            Self::Expanded(_) => ModuleProjectionValue::Expanded(slot),
+        }
+    }
+}
+
+impl ProjectionRef<'_> {
+    #[inline]
+    fn append_to(self, stack: &mut Vec<LabelId>) {
+        match self {
+            Self::Empty => {}
+            Self::Single(id) => stack.push(id),
+            Self::Expanded(ids) => append_projection_ids(stack, ids),
+        }
+    }
+
+    #[cfg(test)]
+    fn as_slice(&self) -> &[LabelId] {
+        match self {
+            Self::Empty => &[],
+            Self::Single(id) => std::slice::from_ref(id),
+            Self::Expanded(ids) => ids,
+        }
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+}
+
+#[inline]
+fn append_label_projection(stack: &mut Vec<LabelId>, projection: &LabelProjection) {
+    projection.view().append_to(stack);
+}
 
 fn append_projection_ids(stack: &mut Vec<LabelId>, labels: &[LabelId]) {
     match labels {
@@ -83,6 +158,7 @@ fn append_projection_ids(stack: &mut Vec<LabelId>, labels: &[LabelId]) {
 thread_local! {
     static PROJECTION_BULK_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FOLD_FRAME_ADDRESS_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PROJECTION_SPAN_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Default)]
@@ -2511,6 +2587,7 @@ enum FrameMappingDecision<'a> {
     Address,
 }
 
+#[inline]
 fn resolve_frame_in_context<'a>(
     context: Option<&FrameMappingContext<'a>>,
     frame: FoldFrame,
@@ -2536,49 +2613,74 @@ fn resolve_frame_in_context<'a>(
 #[derive(Default)]
 struct ModuleProjections {
     by_key: HashMap<(usize, bool), usize, FxBuildHasher>,
-    labels: Vec<LabelSpan>,
+    labels: Vec<LabelProjection>,
     last: std::cell::Cell<Option<ModuleProjectionHint>>,
     #[cfg(test)]
     searches: std::cell::Cell<usize>,
+    #[cfg(test)]
+    slot_reads: std::cell::Cell<usize>,
 }
 
 #[derive(Clone, Copy)]
 struct ModuleProjectionHint {
     key: (usize, bool),
-    slot: usize,
+    value: ModuleProjectionValue,
+}
+
+#[derive(Clone, Copy)]
+enum ModuleProjectionValue {
+    Empty,
+    Single(LabelId),
+    Expanded(usize),
 }
 
 impl ModuleProjections {
     #[inline]
-    fn get(&self, key: &(usize, bool)) -> Option<&LabelSpan> {
+    fn labels_at(&self, slot: usize) -> &LabelProjection {
+        #[cfg(test)]
+        self.slot_reads.set(self.slot_reads.get() + 1);
+        &self.labels[slot]
+    }
+
+    #[inline]
+    fn get(&self, key: &(usize, bool)) -> Option<ProjectionRef<'_>> {
         if let Some(last) = self.last.get()
             && last.key == *key
         {
-            return Some(&self.labels[last.slot]);
+            return Some(match last.value {
+                ModuleProjectionValue::Empty => ProjectionRef::Empty,
+                ModuleProjectionValue::Single(id) => ProjectionRef::Single(id),
+                ModuleProjectionValue::Expanded(slot) => self.labels_at(slot).view(),
+            });
         }
         #[cfg(test)]
         self.searches.set(self.searches.get() + 1);
         let slot = *self.by_key.get(key)?;
-        self.last
-            .set(Some(ModuleProjectionHint { key: *key, slot }));
-        Some(&self.labels[slot])
+        let labels = self.labels_at(slot);
+        self.last.set(Some(ModuleProjectionHint {
+            key: *key,
+            value: labels.hint(slot),
+        }));
+        Some(labels.view())
     }
 
     fn insert(&mut self, key: (usize, bool), labels: LabelSpan) {
+        let labels = LabelProjection::from(labels);
         let next = self.labels.len();
         let slot = *self.by_key.entry(key).or_insert(next);
+        let value = labels.hint(slot);
         if slot == next {
             self.labels.push(labels);
         } else {
             self.labels[slot] = labels;
         }
-        self.last.set(Some(ModuleProjectionHint { key, slot }));
+        self.last.set(Some(ModuleProjectionHint { key, value }));
     }
 
     #[cfg(test)]
     fn storage_bytes(&self) -> usize {
         self.by_key.capacity() * std::mem::size_of::<((usize, bool), usize)>()
-            + self.labels.capacity() * std::mem::size_of::<LabelSpan>()
+            + self.labels.capacity() * std::mem::size_of::<LabelProjection>()
     }
 }
 
@@ -2592,7 +2694,7 @@ struct FoldedRenderBuffers {
     mapping_cache: MappingResolveCache,
     projecting: bool,
     module_labels: ModuleProjections,
-    symbol_labels: [Vec<Option<LabelSpan>>; 2],
+    symbol_labels: [Vec<Option<LabelProjection>>; 2],
     unknown_label: Option<LabelId>,
     #[cfg(test)]
     raw_function_normalizations: usize,
@@ -3216,6 +3318,7 @@ fn append_prefetched_folded_frame<R: SymbolResolver>(
     Ok(FoldedRenderStatus::Rendered)
 }
 
+#[inline]
 fn append_projected_resolved_frames(
     buffers: &mut FoldedRenderBuffers,
     mapping: &MappedFrame<'_>,
@@ -3244,12 +3347,26 @@ fn append_projected_resolved_frames(
     let identity = identity.expect("nonnegative cached frames have a projection identity");
     let (namespace, index) = identity.projection_index();
     if let Some(Some(labels)) = buffers.symbol_labels[namespace].get(index) {
-        append_projection_ids(&mut buffers.counts.scratch_stack, labels);
+        append_label_projection(&mut buffers.counts.scratch_stack, labels);
         return;
     }
+    cache_resolved_frame_projection(buffers, mapping, frame, expand, namespace, index, cached);
+}
+
+#[cold]
+#[inline(never)]
+fn cache_resolved_frame_projection(
+    buffers: &mut FoldedRenderBuffers,
+    mapping: &MappedFrame<'_>,
+    frame: FoldFrame,
+    expand: bool,
+    namespace: usize,
+    index: usize,
+    cached: &CachedMappingFrames,
+) {
     append_resolved_folded_frames(buffers, mapping, frame, expand, cached);
-    let labels = buffers.take_frame_projection();
-    append_projection_ids(&mut buffers.counts.scratch_stack, &labels);
+    let labels = LabelProjection::from(buffers.take_frame_projection());
+    append_label_projection(&mut buffers.counts.scratch_stack, &labels);
     let slots = &mut buffers.symbol_labels[namespace];
     if slots.len() <= index {
         slots.resize_with(index + 1, || None);
@@ -3344,6 +3461,7 @@ fn append_mapping_fallback(buffers: &mut FoldedRenderBuffers, mapping: &Resolved
     append_module_fallback(buffers, path, &MappingPathLayout::new(path), kernel);
 }
 
+#[inline]
 fn append_frame_mapping_fallback(buffers: &mut FoldedRenderBuffers, mapping: &MappedFrame<'_>) {
     if buffers.projecting {
         // Symbol source aliases can share debuginfo while perf still prints
@@ -3351,18 +3469,28 @@ fn append_frame_mapping_fallback(buffers: &mut FoldedRenderBuffers, mapping: &Ma
         // projections by the actual path and address-dependent kernel class.
         let key = (mapping.display_path_id(), mapping.is_kernel());
         if let Some(labels) = buffers.module_labels.get(&key) {
-            append_projection_ids(&mut buffers.counts.scratch_stack, labels);
+            labels.append_to(&mut buffers.counts.scratch_stack);
             return;
         }
-        buffers.projecting = false;
-        render_frame_mapping_fallback(buffers, mapping);
-        buffers.projecting = true;
-        let labels = buffers.take_frame_projection();
-        append_projection_ids(&mut buffers.counts.scratch_stack, &labels);
-        buffers.module_labels.insert(key, labels);
+        cache_frame_mapping_fallback(buffers, mapping, key);
     } else {
         render_frame_mapping_fallback(buffers, mapping);
     }
+}
+
+#[cold]
+#[inline(never)]
+fn cache_frame_mapping_fallback(
+    buffers: &mut FoldedRenderBuffers,
+    mapping: &MappedFrame<'_>,
+    key: (usize, bool),
+) {
+    buffers.projecting = false;
+    render_frame_mapping_fallback(buffers, mapping);
+    buffers.projecting = true;
+    let labels = buffers.take_frame_projection();
+    append_projection_ids(&mut buffers.counts.scratch_stack, &labels);
+    buffers.module_labels.insert(key, labels);
 }
 
 fn render_frame_mapping_fallback(buffers: &mut FoldedRenderBuffers, mapping: &MappedFrame<'_>) {
@@ -7565,6 +7693,78 @@ mod tests {
     }
 
     #[test]
+    fn warm_empty_and_single_module_projections_do_not_reread_backing_slots() {
+        // Inferno perf.rs:on_stack_line can omit a row or emit one label;
+        // neither case needs an inline-frame span on repeated lookups.
+        let key = (19, false);
+        let mut projections = super::ModuleProjections::default();
+        let mut reads = Vec::new();
+        for ids in [&[][..], &[0][..], &[37][..]] {
+            projections.insert(key, super::LabelSpan::from_slice(ids));
+            assert_eq!(projections.get(&key).unwrap().as_slice(), ids);
+            let before = projections.slot_reads.get();
+            for _ in 0..512 {
+                assert_eq!(projections.get(&key).unwrap().as_slice(), ids);
+            }
+            reads.push(projections.slot_reads.get() - before);
+        }
+        assert_eq!(reads, [0, 0, 0]);
+    }
+
+    #[test]
+    fn empty_and_single_label_projections_do_not_decode_smallvec_spans() {
+        let mut reads = Vec::new();
+        for ids in [&[][..], &[0][..], &[41][..]] {
+            let projection: super::LabelProjection = super::LabelSpan::from_slice(ids).into();
+            let mut actual = Vec::with_capacity(512);
+            let before = super::PROJECTION_SPAN_READS.with(std::cell::Cell::get);
+            for _ in 0..512 {
+                super::append_label_projection(&mut actual, &projection);
+            }
+            assert_eq!(actual, ids.repeat(512));
+            reads.push(super::PROJECTION_SPAN_READS.with(std::cell::Cell::get) - before);
+        }
+        assert_eq!(reads, [0, 0, 0]);
+    }
+
+    #[test]
+    fn expanded_label_projections_preserve_all_inline_ids_and_read_the_span() {
+        for ids in [&[0, 1][..], &[3, 7, 2, 8, 11][..]] {
+            let projection: super::LabelProjection = super::LabelSpan::from_slice(ids).into();
+            let mut actual = Vec::new();
+            let before = super::PROJECTION_SPAN_READS.with(std::cell::Cell::get);
+            for _ in 0..7 {
+                super::append_label_projection(&mut actual, &projection);
+            }
+            assert_eq!(actual, ids.repeat(7));
+            assert_eq!(
+                super::PROJECTION_SPAN_READS.with(std::cell::Cell::get) - before,
+                7
+            );
+        }
+    }
+
+    #[test]
+    fn module_projection_hints_follow_scalar_span_replacements_and_display_classes() {
+        let mut projections = super::ModuleProjections::default();
+        let mut stack = Vec::new();
+        let mut expected = Vec::new();
+        for ids in [&[0][..], &[3, 4, 7, 8, 9][..], &[][..], &[11][..]] {
+            projections.insert((17, false), super::LabelSpan::from_slice(ids));
+            projections.insert((17, true), super::LabelSpan::from_slice(&[91, 92]));
+            for key in [(17, false), (17, true), (17, false), (17, false)] {
+                let wanted = if key.1 { &[91, 92][..] } else { ids };
+                projections.get(&key).unwrap().append_to(&mut stack);
+                expected.extend_from_slice(wanted);
+                assert_eq!(stack, expected);
+                assert!(projections.get(&(usize::MAX, false)).is_none());
+                assert_eq!(projections.get(&key).unwrap().as_slice(), wanted);
+            }
+        }
+        assert_eq!(projections.labels.len(), 2);
+    }
+
+    #[test]
     fn projection_id_append_preserves_empty_single_and_expanded_segments() {
         let mut actual = Vec::new();
         let mut expected = Vec::new();
@@ -7575,6 +7775,11 @@ mod tests {
             }
         }
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn prepared_fold_frames_fit_address_and_domain_in_two_words() {
+        assert!(std::mem::size_of::<super::FoldFrame>() <= 16);
     }
 
     #[test]
@@ -7754,6 +7959,7 @@ mod tests {
             };
             for _ in 0..2 {
                 let before = buffers.stack_len_reads.get();
+                let span_reads = super::PROJECTION_SPAN_READS.with(std::cell::Cell::get);
                 super::FoldFrameResolver::new(&maps, true)
                     .render_folded_stack_for_stack(
                         Some(7),
@@ -7764,6 +7970,11 @@ mod tests {
                     )
                     .unwrap();
                 assert_eq!(buffers.stack_len_reads.get() - before, 2);
+                assert_eq!(
+                    super::PROJECTION_SPAN_READS.with(std::cell::Cell::get) - span_reads,
+                    0,
+                    "singleton symbol projections must not decode cached spans"
+                );
                 let mut expected = String::from("worker");
                 for offset in 1..=40 {
                     write!(expected, ";symbol_{offset:x}").unwrap();
