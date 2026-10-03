@@ -3008,6 +3008,7 @@ struct PerfSymbolCandidate {
     name: String,
     address: u64,
     size: u64,
+    bfd_size: u64,
     elf_type: Option<u8>,
     scope: PerfSymbolScope,
     binding: PerfSymbolBinding,
@@ -3300,11 +3301,10 @@ impl PerfObjectSymbolIndex {
 }
 
 fn bfd_function_record_size(candidate: &PerfSymbolCandidate) -> u64 {
-    if candidate.size == 0 {
-        1
-    } else {
-        candidate.size
-    }
+    // bfd/elf.c:_bfd_elf_maybe_function_sym reads the unmodified ELF size,
+    // treating zero (including synthetic symbols) as one. Perf's end fixup
+    // must affect only candidate.size, not BFD's independent lookup extent.
+    candidate.bfd_size.max(1)
 }
 
 fn bfd_function_record_better_fit(
@@ -3400,6 +3400,7 @@ fn perf_synthesized_plt_symbols(
             name: ".plt".to_string(),
             address: plt.file_range().map_or(plt.address(), |(offset, _)| offset),
             size: X86_64_PLT_ENTRY_SIZE,
+            bfd_size: 0,
             elf_type: Some(object::elf::STT_FUNC),
             scope: PerfSymbolScope::Global,
             binding: PerfSymbolBinding::Global,
@@ -3424,6 +3425,7 @@ fn perf_synthesized_plt_symbols(
             name,
             address: plt_offset,
             size: X86_64_PLT_ENTRY_SIZE,
+            bfd_size: 0,
             elf_type: Some(object::elf::STT_FUNC),
             scope: PerfSymbolScope::Global,
             binding: PerfSymbolBinding::Global,
@@ -3527,6 +3529,7 @@ fn perf_symbol_candidate_from_object_symbol(
         )),
         address: symbol.address(),
         size: symbol.size(),
+        bfd_size: symbol.size(),
         elf_type: match symbol.flags() {
             object::SymbolFlags::Elf { st_info, .. } => Some(st_info & 0xf),
             _ => None,
@@ -4852,6 +4855,7 @@ mod tests {
             name: "__read".to_string(),
             address: 0x1000,
             size: 128,
+            bfd_size: 128,
             elf_type: Some(object::elf::STT_FUNC),
             scope: PerfSymbolScope::Global,
             binding: PerfSymbolBinding::Global,
@@ -4863,6 +4867,7 @@ mod tests {
             name: "read".to_string(),
             address: 0x1000,
             size: 128,
+            bfd_size: 128,
             elf_type: Some(object::elf::STT_FUNC),
             scope: PerfSymbolScope::Global,
             binding: PerfSymbolBinding::Global,
@@ -4883,6 +4888,7 @@ mod tests {
             name: "__libc_read".to_string(),
             address: 0x1000,
             size: 128,
+            bfd_size: 128,
             elf_type: Some(object::elf::STT_FUNC),
             scope: PerfSymbolScope::Local,
             binding: PerfSymbolBinding::Global,
@@ -4894,6 +4900,7 @@ mod tests {
             name: "read".to_string(),
             address: 0x1000,
             size: 128,
+            bfd_size: 128,
             elf_type: Some(object::elf::STT_FUNC),
             scope: PerfSymbolScope::Global,
             binding: PerfSymbolBinding::Global,
@@ -4917,6 +4924,7 @@ mod tests {
             name: "__libc_recv".to_string(),
             address: 0x1000,
             size: 47,
+            bfd_size: 47,
             elf_type: Some(object::elf::STT_FUNC),
             scope: PerfSymbolScope::Local,
             binding: PerfSymbolBinding::Global,
@@ -4928,6 +4936,7 @@ mod tests {
             name: "recv".to_string(),
             address: 0x1000,
             size: 47,
+            bfd_size: 47,
             elf_type: Some(object::elf::STT_FUNC),
             scope: PerfSymbolScope::Global,
             binding: PerfSymbolBinding::Weak,
@@ -5248,6 +5257,34 @@ mod tests {
     }
 
     #[test]
+    fn bfd_function_record_lookup_uses_raw_elf_sizes_before_perf_zero_size_fixup() {
+        // bfd/elf.c:_bfd_elf_maybe_function_sym reads st_size (zero means
+        // one), and bfd/dwarf2.c:better_fit compares those raw extents.
+        // perf symbol-elf.c:dso__load_sym_internal instead fixes zero-sized
+        // ends before choosing duplicate winners. These sizes must not leak
+        // into the independent BFD lookup.
+        let bytes = elf_with_text_symbol_fixtures(
+            elf::EM_X86_64,
+            &[
+                (b"unit.c", 0, 0, elf::STB_LOCAL, elf::STT_FILE),
+                (b"local_function", 0x1000, 16, elf::STB_LOCAL, elf::STT_FUNC),
+                (b"global_alias", 0x1000, 0, elf::STB_GLOBAL, elf::STT_FUNC),
+                (b"next", 0x1020, 16, elf::STB_GLOBAL, elf::STT_FUNC),
+            ],
+        );
+        let index = PerfObjectSymbolIndex::from_object_bytes(&bytes);
+        assert_eq!(index.symbol_name(0x1018), Some("global_alias"));
+        for (address, expected) in [
+            (0x1018, "local_function"),
+            (0x1008, "local_function"),
+            (0x1000, "global_alias"),
+            (0x1020, "next"),
+        ] {
+            assert_eq!(index.bfd_function_record_name(address), Some(expected));
+        }
+    }
+
+    #[test]
     fn object_symbol_index_keeps_earlier_overlapping_symbol_candidates() {
         let symbols = PerfObjectSymbolIndex {
             symbols: vec![
@@ -5255,6 +5292,7 @@ mod tests {
                     name: "large".to_string(),
                     address: 0x1000,
                     size: 0x1000,
+                    bfd_size: 0x1000,
                     elf_type: Some(object::elf::STT_FUNC),
                     scope: PerfSymbolScope::Global,
                     binding: PerfSymbolBinding::Global,
@@ -5266,6 +5304,7 @@ mod tests {
                     name: "small".to_string(),
                     address: 0x1800,
                     size: 0x10,
+                    bfd_size: 0x10,
                     elf_type: Some(object::elf::STT_FUNC),
                     scope: PerfSymbolScope::Global,
                     binding: PerfSymbolBinding::Global,
@@ -5300,6 +5339,7 @@ mod tests {
             name: name.to_string(),
             address,
             size: 0x100,
+            bfd_size: 0x100,
             elf_type: Some(object::elf::STT_FUNC),
             scope: PerfSymbolScope::Global,
             binding: PerfSymbolBinding::Global,
@@ -5343,6 +5383,7 @@ mod tests {
                     name: "recv".to_string(),
                     address: 0x1000,
                     size: 47,
+                    bfd_size: 47,
                     elf_type: Some(object::elf::STT_FUNC),
                     scope: PerfSymbolScope::Global,
                     binding: PerfSymbolBinding::Weak,
@@ -5354,6 +5395,7 @@ mod tests {
                     name: "__libc_recv".to_string(),
                     address: 0x1000,
                     size: 47,
+                    bfd_size: 47,
                     elf_type: Some(object::elf::STT_FUNC),
                     scope: PerfSymbolScope::Local,
                     binding: PerfSymbolBinding::Global,
@@ -5365,6 +5407,7 @@ mod tests {
                     name: "write".to_string(),
                     address: 0x2000,
                     size: 46,
+                    bfd_size: 46,
                     elf_type: Some(object::elf::STT_FUNC),
                     scope: PerfSymbolScope::Global,
                     binding: PerfSymbolBinding::Weak,
@@ -5376,6 +5419,7 @@ mod tests {
                     name: "__GI___libc_write".to_string(),
                     address: 0x2000,
                     size: 46,
+                    bfd_size: 46,
                     elf_type: Some(object::elf::STT_FUNC),
                     scope: PerfSymbolScope::Local,
                     binding: PerfSymbolBinding::Global,
@@ -5480,6 +5524,7 @@ mod tests {
                 name: "__syscall_cancel_arch".to_string(),
                 address: 0xa68f0,
                 size: 51,
+                bfd_size: 51,
                 elf_type: Some(object::elf::STT_FUNC),
                 scope: PerfSymbolScope::Local,
                 binding: PerfSymbolBinding::Global,
@@ -5491,6 +5536,7 @@ mod tests {
                 name: "__syscall_cancel_arch_start".to_string(),
                 address: 0xa68f4,
                 size: 0,
+                bfd_size: 0,
                 elf_type: Some(object::elf::STT_NOTYPE),
                 scope: PerfSymbolScope::Local,
                 binding: PerfSymbolBinding::Global,
@@ -5502,6 +5548,7 @@ mod tests {
                 name: "__syscall_cancel_arch_end".to_string(),
                 address: 0xa6922,
                 size: 0,
+                bfd_size: 0,
                 elf_type: Some(object::elf::STT_NOTYPE),
                 scope: PerfSymbolScope::Local,
                 binding: PerfSymbolBinding::Global,

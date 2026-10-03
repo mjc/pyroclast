@@ -814,6 +814,87 @@ fn rust_addr2line_resolver_keeps_perf_symtab_alias_without_source_lines() {
 }
 
 #[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn rust_addr2line_bfd_fallback_uses_raw_zero_sized_alias_extent_like_binutils() {
+    // addr2line.c:find_address_in_section calls BFD's nearest-line lookup.
+    // bfd/elf.c:_bfd_elf_maybe_function_sym reads raw st_size, and
+    // bfd/dwarf2.c:better_fit keeps the larger raw extent when neither alias
+    // reaches the queried address. The C function supplies unrelated DWARF;
+    // the assembly aliases have no source line, forcing function fallback.
+    let (_root, binary, bytes) = compiled_c_fixture(
+        r#"
+        int with_source_line(void) { return 7; }
+        __asm__(
+            ".pushsection .text.alias_fixture,\"ax\",@progbits\n"
+            ".type local_function,@function\n"
+            "local_function:\n"
+            ".fill 16,1,0x90\n"
+            ".size local_function,16\n"
+            ".globl global_alias\n"
+            ".type global_alias,@function\n"
+            ".set global_alias,local_function\n"
+            ".size global_alias,0\n"
+            ".fill 16,1,0x90\n"
+            ".globl next_function\n"
+            ".type next_function,@function\n"
+            "next_function:\n"
+            ".fill 16,1,0x90\n"
+            ".size next_function,16\n"
+            ".popsection\n"
+        );
+        "#,
+    );
+    let object = object::File::parse(bytes.as_slice()).expect("fixture ELF");
+    let local = object
+        .symbols()
+        .find(|symbol| symbol.name() == Ok("local_function"))
+        .expect("local function");
+    let alias = object
+        .symbols()
+        .find(|symbol| symbol.name() == Ok("global_alias"))
+        .expect("global alias");
+    assert_eq!(local.size(), 16);
+    assert_eq!(alias.size(), 0);
+    assert_eq!(alias.address(), local.address());
+    let address = local.address() + 24;
+    let native = Command::new("addr2line")
+        .args(["-f", "-e"])
+        .arg(&binary)
+        .arg(format!("{address:x}"))
+        .output()
+        .expect("run native addr2line");
+    assert!(
+        native.status.success(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout).lines().next(),
+        Some("local_function")
+    );
+    assert!(
+        String::from_utf8_lossy(&native.stdout)
+            .lines()
+            .nth(1)
+            // addr2line.c prints '?' for line == 0 with a fallback filename.
+            .is_some_and(|line| line.ends_with(":?") || line.ends_with(":0")),
+        "the queried assembly address must have no source line: {}",
+        String::from_utf8_lossy(&native.stdout)
+    );
+    let frames = RustAddr2lineResolver::new()
+        .resolve_frame_batch(&[SymbolRequest {
+            path: binary,
+            relative_address: address,
+            kernel_mapping_range: None,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        }])
+        .expect("resolve fallback frames");
+    assert_eq!(frames, vec![vec!["local_function".to_string()]]);
+}
+
+#[test]
 fn rust_addr2line_resolver_uses_libdw_inline_die_name_for_cargo_read_to_end() {
     // Reference fixture:
     //   perf script --inline -i /tmp/backend768.perf.data
