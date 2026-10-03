@@ -16,11 +16,25 @@ const PROT_EXEC: u32 = 4;
 #[cfg(test)]
 thread_local! {
     static MAPPED_FRAME_KERNEL_CLASSIFICATIONS: Cell<usize> = const { Cell::new(0) };
+    static FRAME_MAPPING_TRANSLATION_CLASSIFICATIONS: Cell<usize> = const { Cell::new(0) };
+    static FRAME_MAPPING_USER_CLASSIFICATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct MappingMutationRowWork {
+    overlap_rows: usize,
+    rebuild_rows: usize,
+    index_writes: usize,
+    index_tail_moves: usize,
+    fork_remove_rows: usize,
+    fork_select_rows: usize,
+    fork_cloned_rows: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MmapTable {
-    mappings: Vec<Mapping>,
+    mappings: MappingArena,
     mappings_by_pid: HashMap<u32, Vec<IndexedMapping>, FxBuildHasher>,
     symbol_source_ids: HashMap<SymbolSourceKey, usize, FxBuildHasher>,
     display_path_ids: HashMap<String, usize, FxBuildHasher>,
@@ -36,6 +50,8 @@ pub struct MmapTable {
     cache_index_probes: std::cell::Cell<usize>,
     #[cfg(test)]
     gap_computations: std::cell::Cell<usize>,
+    #[cfg(test)]
+    mutation_row_work: std::cell::RefCell<HashMap<u32, MappingMutationRowWork, FxBuildHasher>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -210,6 +226,9 @@ struct FrameMappingHint<'a> {
     index: usize,
     start: u64,
     end: u64,
+    pgoff: u64,
+    identity_translation: bool,
+    user_cpumode: bool,
 }
 
 impl<'a> FrameMappingHint<'a> {
@@ -219,6 +238,21 @@ impl<'a> FrameMappingHint<'a> {
             index,
             start: mapping.start,
             end: mapping.end(),
+            pgoff: mapping.pgoff,
+            identity_translation: mapping.is_kernel_symbol_mapping(),
+            user_cpumode: mapping.is_user_cpumode(),
+        }
+    }
+
+    fn mapped_frame(self, ip: u64) -> MappedFrame<'a> {
+        // Perf map__map_ip: reuse translation metadata for this borrowed map.
+        MappedFrame {
+            mapping: self.mapping,
+            relative_address: if self.identity_translation {
+                ip
+            } else {
+                ip - self.start + self.pgoff
+            },
         }
     }
 }
@@ -229,14 +263,14 @@ impl<'a> FrameMappingContext<'a> {
         ip: u64,
         cache: &mut MappingResolveCache,
     ) -> Option<MappedFrame<'a>> {
-        let mapping = self.resolve_bucket::<true>(
+        self.resolve_bucket::<true>(
             self.user,
             ip,
             &mut cache.pid_index,
             &self.user_hint,
             &self.user_miss,
         )?;
-        Some(MappedFrame::new(mapping, ip))
+        self.user_hint.get().map(|found| found.mapped_frame(ip))
     }
 
     pub(crate) fn resolve(
@@ -251,8 +285,9 @@ impl<'a> FrameMappingContext<'a> {
             &self.global_hint,
             &self.global_miss,
         );
-        let mapping = if self.pid == u32::MAX {
-            global?
+        let hint = if self.pid == u32::MAX {
+            global?;
+            &self.global_hint
         } else {
             let user = self.resolve_bucket::<false>(
                 self.user,
@@ -264,16 +299,17 @@ impl<'a> FrameMappingContext<'a> {
             match (user, global) {
                 (Some(left), Some(right)) => {
                     if left.start >= right.start {
-                        left
+                        &self.user_hint
                     } else {
-                        right
+                        &self.global_hint
                     }
                 }
-                (Some(mapping), None) | (None, Some(mapping)) => mapping,
+                (Some(_), None) => &self.user_hint,
+                (None, Some(_)) => &self.global_hint,
                 (None, None) => return None,
             }
         };
-        Some(MappedFrame::new(mapping, ip))
+        hint.get().map(|found| found.mapped_frame(ip))
     }
 
     fn resolve_bucket<const USER_ONLY: bool>(
@@ -292,7 +328,7 @@ impl<'a> FrameMappingContext<'a> {
         {
             // Perf overlap fixup leaves disjoint ranges per PID, so this
             // containing non-USER map also proves that USER lookup misses.
-            if USER_ONLY && !found.mapping.is_user_cpumode() {
+            if USER_ONLY && !found.user_cpumode {
                 *cached_index = None;
                 return None;
             }
@@ -320,7 +356,7 @@ impl<'a> FrameMappingContext<'a> {
         *cached_index = Some(index);
         let found = FrameMappingHint::new(index, &self.table.mappings[index]);
         hint.set(Some(found));
-        if USER_ONLY && !found.mapping.is_user_cpumode() {
+        if USER_ONLY && !found.user_cpumode {
             *cached_index = None;
             return None;
         }
@@ -412,6 +448,95 @@ struct Mapping {
     file_identity: Option<FileIdentity>,
     prot: Option<u32>,
     cpumode: u16,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct MappingArena {
+    slots: Vec<MappingSlot>,
+    free: Vec<usize>,
+    first: Option<usize>,
+    last: Option<usize>,
+    next_insertion_id: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MappingSlot {
+    mapping: Option<Mapping>,
+    previous: Option<usize>,
+    next: Option<usize>,
+    insertion_id: usize,
+}
+
+impl MappingArena {
+    fn insert(&mut self, mapping: Mapping) -> usize {
+        let insertion_id = self.next_insertion_id;
+        self.next_insertion_id = insertion_id
+            .checked_add(1)
+            .expect("mapping insertion ID overflow");
+        let slot = MappingSlot {
+            mapping: Some(mapping),
+            previous: self.last,
+            next: None,
+            insertion_id,
+        };
+        let index = if let Some(index) = self.free.pop() {
+            self.slots[index] = slot;
+            index
+        } else {
+            let index = self.slots.len();
+            self.slots.push(slot);
+            index
+        };
+        if let Some(previous) = self.last {
+            self.slots[previous].next = Some(index);
+        } else {
+            self.first = Some(index);
+        }
+        self.last = Some(index);
+        index
+    }
+
+    fn remove(&mut self, index: usize) -> Mapping {
+        let slot = &mut self.slots[index];
+        let mapping = slot.mapping.take().expect("indexed mapping slot is live");
+        let previous = slot.previous.take();
+        let next = slot.next.take();
+        if let Some(previous) = previous {
+            self.slots[previous].next = next;
+        } else {
+            self.first = next;
+        }
+        if let Some(next) = next {
+            self.slots[next].previous = previous;
+        } else {
+            self.last = previous;
+        }
+        self.free.push(index);
+        mapping
+    }
+
+    fn get(&self, index: usize) -> Option<&Mapping> {
+        self.slots.get(index)?.mapping.as_ref()
+    }
+
+    fn insertion_id(&self, index: usize) -> usize {
+        self.slots[index].insertion_id
+    }
+
+    // Preserve the flat table's insertion order without moving live mappings
+    // or allocating an ordering node for each map. Free slots are not visited.
+    fn iter(&self) -> impl Iterator<Item = &Mapping> {
+        std::iter::successors(self.first, move |&index| self.slots[index].next)
+            .map(move |index| &self[index])
+    }
+}
+
+impl std::ops::Index<usize> for MappingArena {
+    type Output = Mapping;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index).expect("indexed mapping slot is live")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -585,21 +710,67 @@ impl MmapTable {
             return;
         }
 
-        self.mappings.retain(|mapping| mapping.pid != child_pid);
-        let cloned_mappings = self
-            .mappings
+        let mut child_bucket = self.bucket(parent_pid).to_vec();
+        // perf maps.c:maps__copy_from copies the already sorted parent arrays.
+        // Keep their interval augmentation while cloning arena entries in
+        // insertion order, then replace each copied slot index exactly once.
+        let mut parent_slots = child_bucket
             .iter()
-            .filter(|mapping| mapping.pid == parent_pid)
-            .cloned()
-            .map(|mut mapping| {
-                mapping.pid = child_pid;
-                mapping.symbol_source_id = 0;
-                mapping
+            .enumerate()
+            .map(|(position, indexed)| {
+                #[cfg(test)]
+                {
+                    self.mutation_row_work
+                        .borrow_mut()
+                        .entry(self.mappings[indexed.index].pid)
+                        .or_default()
+                        .fork_select_rows += 1;
+                }
+                (position, indexed.index)
             })
             .collect::<Vec<_>>();
-        self.rebuild_pid_indexes();
-        for mapping in cloned_mappings {
-            self.insert_mapping(mapping);
+        parent_slots.sort_unstable_by_key(|&(_, index)| self.mappings.insertion_id(index));
+        if let Some(child) = self.mappings_by_pid.remove(&child_pid) {
+            for indexed in child {
+                #[cfg(test)]
+                {
+                    self.mutation_row_work
+                        .get_mut()
+                        .entry(self.mappings[indexed.index].pid)
+                        .or_default()
+                        .fork_remove_rows += 1;
+                }
+                self.mappings.remove(indexed.index);
+            }
+        }
+        self.update_pid_presence(child_pid, false, false);
+        let mut may_execute = false;
+        for (position, index) in parent_slots {
+            #[cfg(test)]
+            {
+                self.mutation_row_work
+                    .get_mut()
+                    .entry(self.mappings[index].pid)
+                    .or_default()
+                    .fork_cloned_rows += 1;
+            }
+            let mut mapping = self.mappings[index].clone();
+            mapping.pid = child_pid;
+            mapping.symbol_source_id = self.intern_symbol_source(&mapping);
+            may_execute |= mapping.may_execute();
+            child_bucket[position].index = self.mappings.insert(mapping);
+            #[cfg(test)]
+            {
+                self.mutation_row_work
+                    .get_mut()
+                    .entry(child_pid)
+                    .or_default()
+                    .index_writes += 1;
+            }
+        }
+        if !child_bucket.is_empty() {
+            self.mappings_by_pid.insert(child_pid, child_bucket);
+            self.update_pid_presence(child_pid, true, may_execute);
         }
     }
 
@@ -612,10 +783,8 @@ impl MmapTable {
             .or_insert(next_id);
         // Common case: the new mapping does not overlap any existing mapping for
         // its pid. Detect this in O(log n + matches) using the per-pid interval
-        // index and take a pure incremental insert, skipping the whole-table
-        // `mem::take` and global index rebuild. Only an actual overlap (a split)
-        // falls back to the rebuild-based path, which preserves perf's exact
-        // retained-mapping ordering and split semantics.
+        // index and take a pure incremental insert. Splitting an overlap
+        // updates only this PID's index and leaves foreign slots unchanged.
         if !self.has_overlapping_mapping_for_pid(mapping.pid, mapping.start, mapping.end()) {
             self.insert_mapping_without_overlap_fix(mapping);
             return;
@@ -628,13 +797,29 @@ impl MmapTable {
     }
 
     fn remove_overlapping_mappings_like_perf(&mut self, new_mapping: &Mapping) -> Vec<Mapping> {
-        let mut kept = Vec::with_capacity(self.mappings.len());
-        let mut split_mappings = Vec::new();
-        for mapping in std::mem::take(&mut self.mappings) {
-            if mapping.pid != new_mapping.pid || !mapping.overlaps(new_mapping) {
-                kept.push(mapping);
-                continue;
+        let pid = new_mapping.pid;
+        let mut bucket = self.mappings_by_pid.remove(&pid).unwrap_or_default();
+        let mut removed = Vec::new();
+        bucket.retain(|indexed| {
+            #[cfg(test)]
+            {
+                self.mutation_row_work
+                    .get_mut()
+                    .entry(self.mappings[indexed.index].pid)
+                    .or_default()
+                    .overlap_rows += 1;
             }
+            if self.mappings[indexed.index].overlaps(new_mapping) {
+                removed.push(indexed.index);
+                false
+            } else {
+                true
+            }
+        });
+        removed.sort_unstable_by_key(|&index| self.mappings.insertion_id(index));
+        let mut split_mappings = Vec::new();
+        for index in removed {
+            let mapping = self.mappings.remove(index);
             if mapping.start < new_mapping.start {
                 let mut before = mapping.clone();
                 before.len = new_mapping.start - mapping.start;
@@ -650,8 +835,8 @@ impl MmapTable {
                 split_mappings.push(after);
             }
         }
-        self.mappings = kept;
-        self.rebuild_pid_indexes();
+        self.mappings_by_pid.insert(pid, bucket);
+        self.rebuild_pid_index(pid);
         split_mappings
     }
 
@@ -700,9 +885,8 @@ impl MmapTable {
         let start = mapping.start;
         let may_execute = mapping.may_execute();
         mapping.symbol_source_id = self.intern_symbol_source(&mapping);
-        let index = self.mappings.len();
         let end = mapping.end();
-        self.mappings.push(mapping);
+        let index = self.mappings.insert(mapping);
         let bucket = self.mappings_by_pid.entry(pid).or_default();
         let position = bucket.partition_point(|indexed| indexed.start <= start);
         let max_end = if position == 0 {
@@ -710,6 +894,12 @@ impl MmapTable {
         } else {
             bucket[position - 1].max_end.max(end)
         };
+        #[cfg(test)]
+        {
+            let work = self.mutation_row_work.get_mut().entry(pid).or_default();
+            work.index_writes += 1;
+            work.index_tail_moves += bucket.len() - position;
+        }
         bucket.insert(
             position,
             IndexedMapping {
@@ -737,53 +927,50 @@ impl MmapTable {
         }
     }
 
-    fn rebuild_pid_indexes(&mut self) {
-        self.mappings_by_pid.clear();
-        self.pids_with_mappings.clear();
-        self.executable_pids.clear();
-        self.has_global_mappings = false;
-        self.has_global_executable_mappings = false;
-
-        let indexed_mappings = self
-            .mappings
-            .iter()
-            .enumerate()
-            .map(|(index, mapping)| (index, mapping.pid, mapping.start, mapping.end()))
-            .collect::<Vec<_>>();
-        for (index, pid, start, end) in indexed_mappings {
-            let bucket = self.mappings_by_pid.entry(pid).or_default();
-            let position = bucket.partition_point(|indexed| indexed.start <= start);
-            let max_end = if position == 0 {
-                end
-            } else {
-                bucket[position - 1].max_end.max(end)
-            };
-            bucket.insert(
-                position,
-                IndexedMapping {
-                    start,
-                    max_end,
-                    index,
-                },
-            );
-            for bucket_index in position + 1..bucket.len() {
-                let mapping_end = self.mappings[bucket[bucket_index].index].end();
-                let updated_max_end = bucket[bucket_index - 1].max_end.max(mapping_end);
-                if bucket[bucket_index].max_end == updated_max_end {
-                    break;
-                }
-                bucket[bucket_index].max_end = updated_max_end;
+    fn rebuild_pid_index(&mut self, pid: u32) {
+        let bucket = self
+            .mappings_by_pid
+            .get_mut(&pid)
+            .expect("PID bucket exists");
+        let mut max_end = 0;
+        let mut may_execute = false;
+        for indexed in bucket.iter_mut() {
+            let mapping = &self.mappings[indexed.index];
+            #[cfg(test)]
+            {
+                let work = self
+                    .mutation_row_work
+                    .get_mut()
+                    .entry(mapping.pid)
+                    .or_default();
+                work.rebuild_rows += 1;
+                work.index_writes += 1;
             }
+            max_end = max_end.max(mapping.end());
+            indexed.max_end = max_end;
+            may_execute |= mapping.may_execute();
+        }
+        let has_mappings = !bucket.is_empty();
+        if !has_mappings {
+            self.mappings_by_pid.remove(&pid);
+        }
+        self.update_pid_presence(pid, has_mappings, may_execute);
+    }
 
-            let may_execute = self.mappings[index].may_execute();
-            if pid == u32::MAX {
-                self.has_global_mappings = true;
-                self.has_global_executable_mappings |= may_execute;
-            } else {
+    fn update_pid_presence(&mut self, pid: u32, has_mappings: bool, may_execute: bool) {
+        if pid == u32::MAX {
+            self.has_global_mappings = has_mappings;
+            self.has_global_executable_mappings = may_execute;
+        } else {
+            if has_mappings {
                 self.pids_with_mappings.insert(pid);
-                if may_execute {
-                    self.executable_pids.insert(pid);
-                }
+            } else {
+                self.pids_with_mappings.remove(&pid);
+            }
+            if may_execute {
+                self.executable_pids.insert(pid);
+            } else {
+                self.executable_pids.remove(&pid);
             }
         }
     }
@@ -1022,7 +1209,13 @@ impl MmapTable {
             let index = indexed.index;
             let mapping = &self.mappings[index];
             if ip < mapping.end() {
-                latest_matching_index = latest_matching_index.max(Some(index));
+                latest_matching_index = Some(latest_matching_index.map_or(index, |latest| {
+                    if self.mappings.insertion_id(index) > self.mappings.insertion_id(latest) {
+                        index
+                    } else {
+                        latest
+                    }
+                }));
             }
         }
         latest_matching_index
@@ -1063,8 +1256,8 @@ impl MmapTable {
         self.cache_index_probes
             .set(self.cache_index_probes.get() + 1);
         // maps.c:__maps__fixup_overlap_and_insert leaves disjoint ranges per
-        // PID. Check the current entry, not a stored mapping: splits and fork
-        // rebuilds can move indices, and callers share a cache across modes.
+        // PID. Check the live entry, not a stored mapping: a released slot can
+        // belong to a new PID, range, or CPU mode, with new translation data.
         if let Some(index) = cached_index
             && self.mappings.get(index).is_some_and(|mapping| {
                 mapping.pid == pid
@@ -1175,6 +1368,8 @@ impl Mapping {
     }
 
     fn is_user_cpumode(&self) -> bool {
+        #[cfg(test)]
+        FRAME_MAPPING_USER_CLASSIFICATIONS.with(|count| count.set(count.get() + 1));
         self.cpumode == PERF_RECORD_MISC_CPUMODE_USER
     }
 
@@ -1187,6 +1382,8 @@ impl Mapping {
     }
 
     fn is_kernel_symbol_mapping(&self) -> bool {
+        #[cfg(test)]
+        FRAME_MAPPING_TRANSLATION_CLASSIFICATIONS.with(|count| count.set(count.get() + 1));
         self.pid == u32::MAX && self.path.starts_with('[')
     }
 
@@ -1229,6 +1426,1127 @@ fn is_perf_data_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct ChurnMapping {
+        pid: u32,
+        start: u64,
+        len: u64,
+        pgoff: u64,
+        path: String,
+        cpumode: u16,
+        prot: u32,
+        file_identity: super::FileIdentity,
+    }
+
+    impl ChurnMapping {
+        fn end(&self) -> u64 {
+            self.start.saturating_add(self.len)
+        }
+
+        fn resolved(&self, ip: u64) -> super::ResolvedMapping {
+            super::ResolvedMapping {
+                path: self.path.clone(),
+                relative_address: if self.pid == u32::MAX && self.path.starts_with('[') {
+                    ip
+                } else {
+                    ip - self.start + self.pgoff
+                },
+                start: self.start,
+                end: self.end(),
+                build_id: None,
+                file_identity: Some(self.file_identity),
+                kernel_relocation: None,
+            }
+        }
+
+        fn insert_into(&self, table: &mut super::MmapTable) {
+            table.insert_mmap2_with_misc(
+                super::Mmap2Record {
+                    pid: self.pid,
+                    tid: self.pid,
+                    start: self.start,
+                    len: self.len,
+                    pgoff: self.pgoff,
+                    major: self.file_identity.major,
+                    minor: self.file_identity.minor,
+                    inode: self.file_identity.inode,
+                    inode_generation: self.file_identity.inode_generation,
+                    prot: self.prot,
+                    flags: 2,
+                    path: self.path.clone(),
+                },
+                self.cpumode,
+            );
+        }
+    }
+
+    fn churn_mapping(pid: u32, start: u64, len: u64, pgoff: u64, path: &str) -> ChurnMapping {
+        ChurnMapping {
+            pid,
+            start,
+            len,
+            pgoff,
+            path: path.into(),
+            cpumode: super::PERF_RECORD_MISC_CPUMODE_USER,
+            prot: 5,
+            file_identity: super::FileIdentity {
+                major: 8,
+                minor: 1,
+                inode: 99,
+                inode_generation: 7,
+            },
+        }
+    }
+
+    #[derive(Debug)]
+    enum ChurnOperation {
+        Insert(ChurnMapping),
+        Fork(u32, u32),
+    }
+
+    // Independent flat-vector model: perf maps.c:844 clones uncovered pieces
+    // and adjusts the right piece's pgoff; maps.c:1032 clones parent values.
+    // No arena, index, cache, or production overlap/translation helpers.
+    #[derive(Default)]
+    struct FlatMappingOracle {
+        rows: Vec<ChurnMapping>,
+    }
+
+    impl FlatMappingOracle {
+        fn apply(&mut self, operation: &ChurnOperation) {
+            match operation {
+                ChurnOperation::Insert(new) => {
+                    let mut survivors = Vec::new();
+                    let mut fragments = Vec::new();
+                    for old in std::mem::take(&mut self.rows) {
+                        if old.pid != new.pid || old.end() <= new.start || new.end() <= old.start {
+                            survivors.push(old);
+                            continue;
+                        }
+                        if old.start < new.start {
+                            let mut left = old.clone();
+                            left.len = new.start - old.start;
+                            fragments.push(left);
+                        }
+                        if new.end() < old.end() {
+                            let mut right = old.clone();
+                            right.start = new.end();
+                            right.len = old.end() - right.start;
+                            right.pgoff += right.start - old.start;
+                            fragments.push(right);
+                        }
+                    }
+                    survivors.extend(fragments);
+                    survivors.push(new.clone());
+                    self.rows = survivors;
+                }
+                ChurnOperation::Fork(parent, child) if parent != child => {
+                    let inherited = self
+                        .rows
+                        .iter()
+                        .filter(|row| row.pid == *parent)
+                        .cloned()
+                        .map(|mut row| {
+                            row.pid = *child;
+                            row
+                        })
+                        .collect::<Vec<_>>();
+                    self.rows.retain(|row| row.pid != *child);
+                    self.rows.extend(inherited);
+                }
+                ChurnOperation::Fork(_, _) => {}
+            }
+        }
+
+        fn resolve(&self, pid: u32, ip: u64, user_only: bool) -> Option<super::ResolvedMapping> {
+            let containing = |wanted_pid| {
+                self.rows.iter().rev().find(|row| {
+                    row.pid == wanted_pid
+                        && row.start <= ip
+                        && ip < row.end()
+                        && (!user_only || row.cpumode == super::PERF_RECORD_MISC_CPUMODE_USER)
+                })
+            };
+            let local = containing(pid);
+            let winner = if user_only || pid == u32::MAX {
+                local
+            } else {
+                match (local, containing(u32::MAX)) {
+                    (Some(left), Some(right)) if left.start >= right.start => Some(left),
+                    (_, Some(right)) => Some(right),
+                    (Some(left), None) => Some(left),
+                    (None, None) => None,
+                }
+            };
+            winner.map(|row| row.resolved(ip))
+        }
+    }
+
+    fn owned_frame_metadata(frame: super::MappedFrame<'_>) -> super::ResolvedMapping {
+        let resolved = frame.resolved_ref();
+        super::ResolvedMapping {
+            path: resolved.path.into(),
+            relative_address: resolved.relative_address,
+            start: resolved.start,
+            end: resolved.end,
+            build_id: resolved.build_id.map(<[u8]>::to_vec),
+            file_identity: resolved.file_identity,
+            kernel_relocation: resolved.kernel_relocation,
+        }
+    }
+
+    fn apply_churn_operation(
+        table: &mut super::MmapTable,
+        oracle: &mut FlatMappingOracle,
+        operation: &ChurnOperation,
+    ) {
+        match operation {
+            ChurnOperation::Insert(mapping) => mapping.insert_into(table),
+            ChurnOperation::Fork(parent, child) => table.clone_pid_mappings(*parent, *child),
+        }
+        oracle.apply(operation);
+    }
+
+    fn assert_churn_state(
+        table: &super::MmapTable,
+        oracle: &FlatMappingOracle,
+        cache: &mut super::MappingResolveCache,
+        user_cache: &mut super::MappingResolveCache,
+    ) {
+        assert_mapping_arena_invariants(table);
+        let actual = table
+            .mappings
+            .iter()
+            .map(|row| ChurnMapping {
+                pid: row.pid,
+                start: row.start,
+                len: row.len,
+                pgoff: row.pgoff,
+                path: row.path.clone(),
+                cpumode: row.cpumode,
+                prot: row.prot.expect("churn uses MMAP2"),
+                file_identity: row.file_identity.expect("churn uses inode-form MMAP2"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, oracle.rows, "live rows or insertion order differ");
+        let expected_user = oracle
+            .rows
+            .iter()
+            .filter(|row| row.pid != u32::MAX && !row.path.starts_with('['))
+            .map(|row| super::UserMapping {
+                pid: row.pid,
+                start: row.start,
+                len: row.len,
+                pgoff: row.pgoff,
+                prot: Some(row.prot),
+                path: &row.path,
+                build_id: None,
+                file_identity: Some(row.file_identity),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(table.user_mappings().collect::<Vec<_>>(), expected_user);
+        let mut addresses = vec![0, 0xfff, 0x1000, 0x1800, u64::MAX - 1, u64::MAX];
+        for row in &oracle.rows {
+            addresses.extend([
+                row.start.saturating_sub(1),
+                row.start,
+                row.start.saturating_add(1),
+                row.end().saturating_sub(1),
+                row.end(),
+            ]);
+        }
+        addresses.sort_unstable();
+        addresses.dedup();
+        for pid in [7, 8, 9, 101, 404, u32::MAX] {
+            let present = oracle
+                .rows
+                .iter()
+                .any(|row| row.pid == pid || row.pid == u32::MAX);
+            let executable = oracle
+                .rows
+                .iter()
+                .any(|row| (row.pid == pid || row.pid == u32::MAX) && row.prot & 4 != 0);
+            assert_eq!(table.has_mappings_for_pid(pid), present);
+            assert_eq!(table.has_executable_mappings_for_pid(pid), executable);
+            let context = table.frame_context(pid, cache);
+            let user_context = table.frame_context(pid, user_cache);
+            // Alternate ascending and descending probes to exercise warm hints
+            // and cached gap proofs in both directions within a sample.
+            for &ip in addresses.iter().chain(addresses.iter().rev()) {
+                let expected = oracle.resolve(pid, ip, false);
+                assert_eq!(
+                    table.resolve(pid, ip),
+                    expected,
+                    "uncached PID {pid} IP {ip:x}"
+                );
+                assert_eq!(
+                    table
+                        .resolve_frame_cached(pid, ip, cache)
+                        .map(owned_frame_metadata),
+                    expected,
+                    "cached PID {pid} IP {ip:x}"
+                );
+                assert_eq!(
+                    context.resolve(ip, cache).map(owned_frame_metadata),
+                    expected,
+                    "context PID {pid} IP {ip:x}"
+                );
+                let expected_user = oracle.resolve(pid, ip, true);
+                assert_eq!(
+                    table
+                        .resolve_user_frame_cached(pid, ip, user_cache)
+                        .map(owned_frame_metadata),
+                    expected_user,
+                    "USER cached PID {pid} IP {ip:x}"
+                );
+                assert_eq!(
+                    user_context
+                        .resolve_user(ip, user_cache)
+                        .map(owned_frame_metadata),
+                    expected_user,
+                    "USER context PID {pid} IP {ip:x}"
+                );
+            }
+        }
+    }
+
+    fn churn_operation_strategy() -> impl Strategy<Value = ChurnOperation> {
+        let pid = prop::sample::select(vec![7_u32, 8, 9, 101, u32::MAX]);
+        let insert = (
+            pid.clone(),
+            0_u64..16,
+            0_u64..12,
+            0_u64..16,
+            any::<bool>(),
+            any::<bool>(),
+            any::<bool>(),
+            0_u8..4,
+        )
+            .prop_map(
+                |(pid, address, len, offset, high, user, executable, path)| {
+                    let start = if high {
+                        u64::MAX - 0x200 + address * 0x20
+                    } else {
+                        0x1000 + address * 0x20
+                    };
+                    let path = match path {
+                        0 => "/first",
+                        1 => "/second",
+                        2 => "[module]",
+                        _ => "/third",
+                    };
+                    let mut mapping = churn_mapping(pid, start, len * 0x20, offset * 0x20, path);
+                    mapping.cpumode = if user {
+                        super::PERF_RECORD_MISC_CPUMODE_USER
+                    } else {
+                        crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_KERNEL
+                    };
+                    mapping.prot = if executable { 5 } else { 1 };
+                    ChurnOperation::Insert(mapping)
+                },
+            );
+        prop_oneof![3 => insert, 1 => (pid.clone(), pid).prop_map(|(parent, child)| ChurnOperation::Fork(parent, child))]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 32, ..ProptestConfig::default() })]
+
+        #[test]
+        fn arena_churn_cached_frames_match_independent_flat_vector_oracle(
+            operations in prop::collection::vec(churn_operation_strategy(), 1..65),
+        ) {
+            let mut table = super::MmapTable::default();
+            let mut oracle = FlatMappingOracle::default();
+            let mut cache = super::MappingResolveCache::default();
+            let mut user_cache = super::MappingResolveCache::default();
+            for operation in &operations {
+                let pid = match operation {
+                    ChurnOperation::Insert(mapping) => mapping.pid,
+                    ChurnOperation::Fork(_, child) => *child,
+                };
+                let warm_address = oracle.rows.iter().rev().find(|row| {
+                    (row.pid == pid || row.pid == u32::MAX) && row.start < row.end()
+                }).map(|row| row.start);
+                if let Some(ip) = warm_address {
+                    prop_assert_eq!(
+                        table.resolve_frame_cached(pid, ip, &mut cache).map(owned_frame_metadata),
+                        oracle.resolve(pid, ip, false)
+                    );
+                    prop_assert_eq!(
+                        table.resolve_user_frame_cached(pid, ip, &mut user_cache).map(owned_frame_metadata),
+                        oracle.resolve(pid, ip, true)
+                    );
+                }
+                apply_churn_operation(&mut table, &mut oracle, operation);
+                if let Some(ip) = warm_address {
+                    prop_assert_eq!(
+                        table.resolve_frame_cached(pid, ip, &mut cache).map(owned_frame_metadata),
+                        oracle.resolve(pid, ip, false),
+                        "warm cache after {:?}", operation
+                    );
+                    prop_assert_eq!(
+                        table.resolve_user_frame_cached(pid, ip, &mut user_cache).map(owned_frame_metadata),
+                        oracle.resolve(pid, ip, true),
+                        "warm USER cache after {:?}", operation
+                    );
+                }
+                assert_churn_state(&table, &oracle, &mut cache, &mut user_cache);
+            }
+        }
+    }
+
+    #[test]
+    fn warm_child_fork_chains_preserve_inherited_identity_after_parent_churn() {
+        let mut table = super::MmapTable::default();
+        let mut oracle = FlatMappingOracle::default();
+        let mut cache = super::MappingResolveCache::default();
+        let mut user_cache = super::MappingResolveCache::default();
+        for mapping in [
+            churn_mapping(7, 0x1000, 0x1000, 0x100, "/parent-a"),
+            churn_mapping(7, 0x3000, 0x100, 0x300, "/parent-tail"),
+            churn_mapping(101, 0x1000, 0x1000, 0x900, "/parent-b"),
+            churn_mapping(8, 0x1000, 0x1000, 0x700, "/old-child"),
+        ] {
+            apply_churn_operation(&mut table, &mut oracle, &ChurnOperation::Insert(mapping));
+        }
+        let mut child_cache = super::MappingResolveCache::default();
+        let mut grandchild_cache = super::MappingResolveCache::default();
+        let old_child = mapping_identity_snapshot(&table, 8, 0x1010, &mut child_cache);
+        for (generation, parent) in [7, 101, 7, 101, 7, 101].into_iter().enumerate() {
+            let mut parent_cache = super::MappingResolveCache::default();
+            let inherited = mapping_identity_snapshot(&table, parent, 0x1010, &mut parent_cache);
+            apply_churn_operation(&mut table, &mut oracle, &ChurnOperation::Fork(parent, 8));
+            let child = mapping_identity_snapshot(&table, 8, 0x1010, &mut child_cache);
+            assert_eq!(child, inherited);
+            assert_ne!(child.source_id, old_child.source_id);
+            apply_churn_operation(&mut table, &mut oracle, &ChurnOperation::Fork(8, 9));
+            assert_eq!(
+                mapping_identity_snapshot(&table, 9, 0x1010, &mut grandchild_cache),
+                inherited
+            );
+            let offset = u64::try_from(generation).unwrap() * 0x100 + 0x2000;
+            apply_churn_operation(
+                &mut table,
+                &mut oracle,
+                &ChurnOperation::Insert(churn_mapping(
+                    parent,
+                    0x1000,
+                    0x1000,
+                    offset,
+                    "/replaced-parent",
+                )),
+            );
+            for (pid, hint) in [(8, &mut child_cache), (9, &mut grandchild_cache)] {
+                assert_eq!(
+                    mapping_identity_snapshot(&table, pid, 0x1010, hint),
+                    inherited
+                );
+            }
+            apply_churn_operation(&mut table, &mut oracle, &ChurnOperation::Fork(8, 8));
+            assert_eq!(
+                mapping_identity_snapshot(&table, 8, 0x1010, &mut child_cache),
+                inherited
+            );
+            assert_churn_state(&table, &oracle, &mut cache, &mut user_cache);
+
+            let mut vacant_cache = child_cache;
+            apply_churn_operation(&mut table, &mut oracle, &ChurnOperation::Fork(505, 8));
+            assert!(
+                table
+                    .resolve_frame_cached(8, 0x1010, &mut vacant_cache)
+                    .is_none()
+            );
+            apply_churn_operation(
+                &mut table,
+                &mut oracle,
+                &ChurnOperation::Insert(churn_mapping(404, 0x1000, 0x1000, offset, "/foreign")),
+            );
+            assert!(
+                table
+                    .resolve_frame_cached(8, 0x1010, &mut child_cache)
+                    .is_none()
+            );
+            assert_eq!(
+                mapping_identity_snapshot(&table, 9, 0x1010, &mut grandchild_cache),
+                inherited
+            );
+            assert_churn_state(&table, &oracle, &mut cache, &mut user_cache);
+        }
+    }
+
+    #[test]
+    fn global_precedence_churn_revalidates_warm_slots_ties_modes_and_boundaries() {
+        let mut table = super::MmapTable::default();
+        let mut oracle = FlatMappingOracle::default();
+        let mut cache = super::MappingResolveCache::default();
+        let mut user_cache = super::MappingResolveCache::default();
+        let mut warm = super::MappingResolveCache::default();
+        let mut local = churn_mapping(7, 0x1000, 0x1000, 0x100, "/local");
+        let global = churn_mapping(u32::MAX, 0x1800, 0x800, 0x900, "[module]");
+        for mapping in [local.clone(), global] {
+            apply_churn_operation(&mut table, &mut oracle, &ChurnOperation::Insert(mapping));
+        }
+        assert_eq!(
+            mapping_identity_snapshot(&table, 7, 0x1810, &mut warm)
+                .resolved
+                .path,
+            "[module]"
+        );
+        let removed_global = warm.global_index.unwrap();
+        apply_churn_operation(
+            &mut table,
+            &mut oracle,
+            &ChurnOperation::Fork(505, u32::MAX),
+        );
+        apply_churn_operation(
+            &mut table,
+            &mut oracle,
+            &ChurnOperation::Insert(churn_mapping(101, 0x1800, 0x800, 0x500, "/foreign")),
+        );
+        assert_eq!(
+            table.mappings[removed_global].pid, 101,
+            "must exercise actual slot reuse"
+        );
+        assert_eq!(
+            mapping_identity_snapshot(&table, 7, 0x1810, &mut warm)
+                .resolved
+                .path,
+            "/local"
+        );
+        assert_churn_state(&table, &oracle, &mut cache, &mut user_cache);
+
+        for path in ["[global-tie]", "/global-file"] {
+            apply_churn_operation(
+                &mut table,
+                &mut oracle,
+                &ChurnOperation::Insert(churn_mapping(u32::MAX, 0x1000, 0x1000, 0x700, path)),
+            );
+            assert_eq!(
+                mapping_identity_snapshot(&table, 7, 0x1010, &mut warm)
+                    .resolved
+                    .path,
+                "/local"
+            );
+            local.cpumode = crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_KERNEL;
+            apply_churn_operation(
+                &mut table,
+                &mut oracle,
+                &ChurnOperation::Insert(local.clone()),
+            );
+            assert!(
+                table
+                    .resolve_user_frame_cached(7, 0x1010, &mut user_cache)
+                    .is_none()
+            );
+            assert_churn_state(&table, &oracle, &mut cache, &mut user_cache);
+            apply_churn_operation(&mut table, &mut oracle, &ChurnOperation::Fork(505, 7));
+            assert_eq!(
+                mapping_identity_snapshot(&table, 7, 0x1010, &mut warm)
+                    .resolved
+                    .path,
+                path
+            );
+            assert_churn_state(&table, &oracle, &mut cache, &mut user_cache);
+            local.cpumode = super::PERF_RECORD_MISC_CPUMODE_USER;
+            apply_churn_operation(
+                &mut table,
+                &mut oracle,
+                &ChurnOperation::Insert(local.clone()),
+            );
+        }
+        for mapping in [
+            churn_mapping(u32::MAX, 0x1400, 0x100, 0x200, "[split]"),
+            churn_mapping(7, 0x1400, 0x100, 0x300, "/equal-split"),
+            churn_mapping(7, 0x1450, 0, 0x400, "/zero"),
+            churn_mapping(u32::MAX, u64::MAX - 0x30, 0x100, 0x500, "[saturated]"),
+            churn_mapping(7, u64::MAX - 0x20, 0x100, 0x600, "/saturated-local"),
+        ] {
+            apply_churn_operation(&mut table, &mut oracle, &ChurnOperation::Insert(mapping));
+            assert_churn_state(&table, &oracle, &mut cache, &mut user_cache);
+        }
+    }
+
+    #[test]
+    fn bulk_fork_preserves_sorted_prefix_bounds_for_zero_lengths_and_saturated_ends() {
+        let mut table = super::MmapTable::default();
+        for (start, len, path) in [
+            (u64::MAX - 0x30, 0x100, "/saturated"),
+            (0x3000, 0, "/empty"),
+            (0x1000, 0x100, "/first"),
+            (0, 0, "/zero"),
+        ] {
+            table.insert_mmap(mutation_record(7, start, len, 0x20, path));
+        }
+        table.insert_mmap(mutation_record(8, 0x1000, 0x100, 0x900, "/old-child"));
+        let mut parent_cache = super::MappingResolveCache::default();
+        let mut child_cache = super::MappingResolveCache::default();
+        table
+            .resolve_frame_cached(8, 0x1010, &mut child_cache)
+            .unwrap();
+        table.clone_pid_mappings(7, 8);
+        assert_mapping_arena_invariants(&table);
+        for address in [
+            0,
+            0xfff,
+            0x1000,
+            0x10ff,
+            0x1100,
+            0x3000,
+            u64::MAX - 1,
+            u64::MAX,
+        ] {
+            assert_eq!(table.resolve(8, address), table.resolve(7, address));
+            assert_eq!(
+                table
+                    .resolve_frame_cached(8, address, &mut child_cache)
+                    .map(super::MappedFrame::resolved_ref),
+                table
+                    .resolve_frame_cached(7, address, &mut parent_cache)
+                    .map(super::MappedFrame::resolved_ref)
+            );
+        }
+        let before = table
+            .user_mappings()
+            .map(|mapping| (mapping.pid, mapping.start))
+            .collect::<Vec<_>>();
+        table.clone_pid_mappings(7, 7);
+        assert_eq!(
+            table
+                .user_mappings()
+                .map(|mapping| (mapping.pid, mapping.start))
+                .collect::<Vec<_>>(),
+            before
+        );
+        assert_mapping_arena_invariants(&table);
+    }
+
+    #[test]
+    fn bulk_fork_reinterns_source_identity_when_cloning_between_pid_domains() {
+        let mut table = super::MmapTable::default();
+        let start = 0xffff_ffff_8100_0000;
+        let address = start + 0x10;
+        table.insert_mmap(mutation_record(
+            7,
+            start,
+            0x100,
+            0x500,
+            "[kernel.kallsyms]_text",
+        ));
+        let mut cache = super::MappingResolveCache::default();
+        let local = mapping_identity_snapshot(&table, 7, address, &mut cache);
+        assert_eq!(local.resolved.relative_address, 0x510);
+        table.clone_pid_mappings(7, u32::MAX);
+        let global = mapping_identity_snapshot(&table, u32::MAX, address, &mut cache);
+        assert_eq!(global.resolved.relative_address, address);
+        assert_ne!(global.source_id, local.source_id);
+        assert_eq!(global.display_id, local.display_id);
+        assert_eq!(
+            global.resolved.kernel_relocation,
+            local.resolved.kernel_relocation
+        );
+        assert_mapping_arena_invariants(&table);
+        table.clone_pid_mappings(u32::MAX, 8);
+        let child = mapping_identity_snapshot(&table, 8, address, &mut cache);
+        assert_eq!(child, local);
+        assert_mapping_arena_invariants(&table);
+    }
+
+    #[test]
+    fn reverse_address_insertions_count_actual_pid_index_tail_moves() {
+        let mut table = super::MmapTable::default();
+        for index in (0..8).rev() {
+            table.insert_mmap(mutation_record(
+                7,
+                0x1000 + index * 0x100,
+                0x80,
+                index * 0x10,
+                "/reverse",
+            ));
+        }
+        let work = table.mutation_row_work.borrow();
+        assert_eq!(work[&7].index_writes, 8);
+        assert_eq!(work[&7].index_tail_moves, 8 * 7 / 2);
+        assert_mapping_arena_invariants(&table);
+    }
+
+    #[test]
+    fn fork_bulk_clones_reverse_address_parent_without_child_index_tail_moves() {
+        // perf maps.c:maps__copy_from's empty-dest branch clones the parent
+        // arrays directly and preserves their sorted flag, without inserting
+        // each child map into a growing sorted vector.
+        let mut table = super::MmapTable::default();
+        for index in (0..64).rev() {
+            table.insert_mmap(mutation_record(
+                7,
+                0x1000 + index * 0x100,
+                0x80,
+                index * 0x10,
+                &format!("/reverse-{index}"),
+            ));
+        }
+        let expected_order = table
+            .user_mappings()
+            .map(|mapping| mapping.start)
+            .collect::<Vec<_>>();
+        table.mutation_row_work.get_mut().clear();
+        table.clone_pid_mappings(7, 8);
+        assert_mapping_arena_invariants(&table);
+        assert_eq!(
+            table
+                .user_mappings()
+                .filter(|mapping| mapping.pid == 8)
+                .map(|mapping| mapping.start)
+                .collect::<Vec<_>>(),
+            expected_order
+        );
+        let mut parent_cache = super::MappingResolveCache::default();
+        let mut child_cache = super::MappingResolveCache::default();
+        for index in 0..64 {
+            let address = 0x1010 + index * 0x100;
+            assert_eq!(
+                mapping_identity_snapshot(&table, 8, address, &mut child_cache),
+                mapping_identity_snapshot(&table, 7, address, &mut parent_cache)
+            );
+        }
+        let work = table.mutation_row_work.borrow();
+        assert_eq!(work[&7].fork_select_rows, 64);
+        assert_eq!(work[&7].fork_cloned_rows, 64);
+        assert_eq!(work[&8].index_writes, 64);
+        assert_eq!(
+            work[&8].index_tail_moves, 0,
+            "fork inserted child maps one at a time"
+        );
+    }
+
+    fn assert_mapping_arena_invariants(table: &super::MmapTable) {
+        let arena = &table.mappings;
+        let mut live = super::HashSet::<_, super::FxBuildHasher>::default();
+        let mut next = arena.first;
+        let mut previous = None;
+        while let Some(index) = next {
+            assert!(live.insert(index), "arena order contains a cycle");
+            let slot = &arena.slots[index];
+            assert!(slot.mapping.is_some());
+            assert_eq!(slot.previous, previous);
+            previous = Some(index);
+            next = slot.next;
+        }
+        assert_eq!(previous, arena.last);
+        let free = arena
+            .free
+            .iter()
+            .copied()
+            .collect::<super::HashSet<_, super::FxBuildHasher>>();
+        assert_eq!(free.len(), arena.free.len(), "a slot was freed twice");
+        assert_eq!(free.len() + live.len(), arena.slots.len());
+        assert!(free.is_disjoint(&live));
+        assert!(free.iter().all(|&index| arena.get(index).is_none()));
+        let mut indexed_slots = super::HashSet::<_, super::FxBuildHasher>::default();
+        for (&pid, bucket) in &table.mappings_by_pid {
+            let mut max_end = 0;
+            let mut last_start = 0;
+            assert!(!bucket.is_empty());
+            for indexed in bucket {
+                assert!(indexed_slots.insert(indexed.index), "slot indexed twice");
+                let mapping = &arena[indexed.index];
+                assert_eq!(mapping.pid, pid);
+                assert_eq!(mapping.start, indexed.start);
+                assert!(indexed.start >= last_start);
+                last_start = indexed.start;
+                max_end = max_end.max(mapping.end());
+                assert_eq!(indexed.max_end, max_end);
+            }
+        }
+        assert_eq!(indexed_slots, live);
+        let mut present = super::HashSet::<_, super::FxBuildHasher>::default();
+        let mut executable = super::HashSet::<_, super::FxBuildHasher>::default();
+        let mut global_present = false;
+        let mut global_executable = false;
+        for mapping in arena.iter() {
+            if mapping.pid == u32::MAX {
+                global_present = true;
+                global_executable |= mapping.may_execute();
+            } else {
+                present.insert(mapping.pid);
+                if mapping.may_execute() {
+                    executable.insert(mapping.pid);
+                }
+            }
+        }
+        assert_eq!(table.pids_with_mappings, present);
+        assert_eq!(table.executable_pids, executable);
+        assert_eq!(table.has_global_mappings, global_present);
+        assert_eq!(table.has_global_executable_mappings, global_executable);
+    }
+
+    #[test]
+    fn arena_reuse_preserves_insertion_order_and_storage_tracks_peak_live_maps() {
+        let mut table = super::MmapTable::default();
+        for (pid, start, path) in [
+            (7, 0x3000, "/late-address"),
+            (7, 0x1000, "/early-address"),
+            (8, 0x1000, "/foreign"),
+            (7, 0x1000, "/patch"),
+        ] {
+            table.insert_mmap(mutation_record(pid, start, 0x100, 0, path));
+            assert_mapping_arena_invariants(&table);
+        }
+        assert_eq!(
+            table
+                .user_mappings()
+                .map(|mapping| mapping.path)
+                .collect::<Vec<_>>(),
+            ["/late-address", "/foreign", "/patch"]
+        );
+        table.clone_pid_mappings(7, 9);
+        assert_mapping_arena_invariants(&table);
+        assert_eq!(
+            table
+                .user_mappings()
+                .filter(|mapping| mapping.pid == 9)
+                .map(|mapping| mapping.path)
+                .collect::<Vec<_>>(),
+            ["/late-address", "/patch"]
+        );
+        let peak_slots = table.mappings.slots.len();
+        assert_eq!(peak_slots, 5);
+        for pid in [8, 7] {
+            table.clone_pid_mappings(999, pid);
+            assert_mapping_arena_invariants(&table);
+            assert!(!table.has_mappings_for_pid(pid));
+            assert!(!table.has_executable_mappings_for_pid(pid));
+        }
+        for pgoff in 0..128 {
+            table.insert_mmap(mutation_record(9, 0x1000, 0x3000, pgoff, "/replacement"));
+            assert_mapping_arena_invariants(&table);
+            assert_eq!(table.mappings.slots.len(), peak_slots);
+            assert_eq!(table.user_mappings().count(), 1);
+            assert_eq!(
+                table.resolve(9, 0x1010).unwrap().relative_address,
+                pgoff + 0x10
+            );
+        }
+    }
+
+    #[test]
+    fn cached_slots_revalidate_vacancy_foreign_pid_and_new_range_after_reuse() {
+        let mut table = super::MmapTable::default();
+        let mut cache = super::MappingResolveCache::default();
+        table.insert_mmap(mutation_record(7, 0x1000, 0x100, 0x50, "/first"));
+        table.resolve_frame_cached(7, 0x1010, &mut cache).unwrap();
+        let old_slot = cache.pid_index.unwrap();
+        let mut vacant_cache = cache;
+        table.clone_pid_mappings(999, 7);
+        assert_mapping_arena_invariants(&table);
+        assert!(table.mappings.get(old_slot).is_none());
+        assert!(
+            table
+                .resolve_frame_cached(7, 0x1010, &mut vacant_cache)
+                .is_none()
+        );
+        assert!(vacant_cache.pid_index.is_none());
+        table.insert_mmap(mutation_record(8, 0x1000, 0x100, 0x900, "/foreign-reuse"));
+        assert_eq!(table.bucket(8)[0].index, old_slot);
+        assert!(table.resolve_frame_cached(7, 0x1010, &mut cache).is_none());
+        let context = table.frame_context(7, &mut vacant_cache);
+        assert!(context.resolve_user(0x1010, &mut vacant_cache).is_none());
+        table.clone_pid_mappings(999, 8);
+        table.insert_mmap(mutation_record(7, 0x2000, 0x100, 0x500, "/new-range"));
+        assert_eq!(table.bucket(7)[0].index, old_slot);
+        cache.pid_index = Some(old_slot);
+        assert!(table.resolve_frame_cached(7, 0x1010, &mut cache).is_none());
+        let frame = table.resolve_frame_cached(7, 0x2010, &mut cache).unwrap();
+        assert_eq!(
+            (frame.path(), frame.relative_address),
+            ("/new-range", 0x510)
+        );
+        assert_mapping_arena_invariants(&table);
+    }
+
+    #[test]
+    fn reused_global_slot_does_not_leak_mapping_or_executable_presence() {
+        let mut table = super::MmapTable::default();
+        let mut cache = super::MappingResolveCache::default();
+        table.insert_mmap(mutation_record(u32::MAX, 0x1000, 0x100, 0x50, "/code"));
+        table.resolve_frame_cached(7, 0x1010, &mut cache).unwrap();
+        let global_slot = cache.global_index.unwrap();
+        table.clone_pid_mappings(999, u32::MAX);
+        table.insert_mmap(mutation_record(8, 0x1000, 0x100, 0x90, "/foreign"));
+        assert_eq!(table.bucket(8)[0].index, global_slot);
+        assert!(!table.has_mappings_for_pid(7));
+        assert!(!table.has_executable_mappings_for_pid(7));
+        assert!(table.resolve_frame_cached(7, 0x1010, &mut cache).is_none());
+        assert!(cache.global_index.is_none());
+        table.insert_mmap(mutation_record(u32::MAX, 0x1000, 0x100, 0x70, "/perf.data"));
+        assert!(table.has_mappings_for_pid(7));
+        assert!(!table.has_executable_mappings_for_pid(7));
+        let frame = table.resolve_frame_cached(7, 0x1010, &mut cache).unwrap();
+        assert_eq!((frame.path(), frame.relative_address), ("/perf.data", 0x80));
+        table.insert_mmap(mutation_record(u32::MAX, 0x1040, 0x20, 0x900, "/new-code"));
+        assert_mapping_arena_invariants(&table);
+        assert!(table.has_executable_mappings_for_pid(7));
+        assert_eq!(table.resolve(7, 0x1030).unwrap().path, "/perf.data");
+        assert_eq!(table.resolve(7, 0x1040).unwrap().path, "/new-code");
+        assert_eq!(table.resolve(7, 0x1060).unwrap().relative_address, 0xd0);
+    }
+
+    fn mutation_record(
+        pid: u32,
+        start: u64,
+        len: u64,
+        pgoff: u64,
+        path: &str,
+    ) -> super::MmapRecord {
+        super::MmapRecord {
+            pid,
+            tid: pid,
+            start,
+            len,
+            pgoff,
+            path: path.into(),
+        }
+    }
+
+    fn mapping_mutation_locality_fixture() -> super::MmapTable {
+        let mut table = super::MmapTable::default();
+        for (pid, start, len, path) in [
+            (7, 0x1000, 0x1000, "/parent"),
+            (7, 0x4000, 0x200, "/parent-tail"),
+            (8, 0x1000, 0x1000, "/old-child"),
+            (8, 0x9000, 0x100, "/child-only"),
+        ] {
+            table.insert_mmap(mutation_record(pid, start, len, 0x100, path));
+        }
+        for pid in 100..132 {
+            table.insert_mmap(mutation_record(
+                pid,
+                0x1000,
+                0x1000,
+                u64::from(pid),
+                &format!("/foreign-{pid}"),
+            ));
+        }
+        table.insert_mmap(mutation_record(u32::MAX, 0x8000, 0x100, 0, "/global"));
+        table.mutation_row_work.get_mut().clear();
+        table
+    }
+
+    #[test]
+    fn nonoverlapping_insert_records_only_its_actual_pid_index_write() {
+        let mut table = mapping_mutation_locality_fixture();
+        table.insert_mmap(mutation_record(7, 0x6000, 0x100, 0, "/disjoint"));
+        let work = table.mutation_row_work.borrow();
+        assert_eq!(work.len(), 1);
+        assert_eq!(
+            work[&7],
+            super::MappingMutationRowWork {
+                index_writes: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(table.resolve(7, 0x6010).unwrap().path, "/disjoint");
+    }
+
+    #[test]
+    fn overlap_split_visits_and_reindexes_only_the_affected_pid() {
+        // perf maps.c:__maps__fixup_overlap_and_insert visits one maps object,
+        // clones its surviving fragments, and never rebuilds other processes.
+        let mut table = mapping_mutation_locality_fixture();
+        table.insert_mmap(mutation_record(7, 0x1400, 0x100, 0x900, "/patch"));
+        for (address, path, offset) in [
+            (0x1010, "/parent", 0x110),
+            (0x1410, "/patch", 0x910),
+            (0x1510, "/parent", 0x610),
+            (0x4010, "/parent-tail", 0x110),
+        ] {
+            let mapping = table.resolve(7, address).unwrap();
+            assert_eq!(
+                (mapping.path.as_str(), mapping.relative_address),
+                (path, offset)
+            );
+        }
+        let work = table.mutation_row_work.borrow();
+        assert!(
+            work[&7].overlap_rows > 0,
+            "real overlap traversal was not counted"
+        );
+        assert!(
+            work[&7].index_writes >= 3,
+            "fragment index writes were not counted"
+        );
+        let foreign = work.iter().filter(|(pid, _)| **pid != 7).fold(
+            (0, 0, 0),
+            |(overlap, rebuild, writes), (_, row)| {
+                (
+                    overlap + row.overlap_rows,
+                    rebuild + row.rebuild_rows,
+                    writes + row.index_writes,
+                )
+            },
+        );
+        assert_eq!(
+            foreign,
+            (0, 0, 0),
+            "overlap removal touched foreign mapping rows"
+        );
+    }
+
+    #[test]
+    fn fork_removal_selection_and_indexing_touch_only_parent_and_child_rows() {
+        // perf maps.c:maps__copy_from clones parent_maps_by_address[0..n],
+        // not a global array filtered across every process in the recording.
+        let mut table = mapping_mutation_locality_fixture();
+        table.clone_pid_mappings(7, 8);
+        assert!(table.resolve(8, 0x9000).is_none());
+        for address in [0x1010, 0x4010] {
+            assert_eq!(table.resolve(8, address), table.resolve(7, address));
+        }
+        let work = table.mutation_row_work.borrow();
+        assert_eq!(work[&7].fork_select_rows, 2);
+        assert_eq!(
+            work[&7].fork_cloned_rows, 2,
+            "actual parent clones were not counted"
+        );
+        assert_eq!(
+            work[&8].fork_remove_rows, 2,
+            "actual child removals were not counted"
+        );
+        assert_eq!(work[&8].index_writes, 2);
+        let foreign = work
+            .iter()
+            .filter(|(pid, _)| **pid != 7 && **pid != 8)
+            .fold(
+                (0, 0, 0, 0),
+                |(remove, select, rebuild, writes), (_, row)| {
+                    (
+                        remove + row.fork_remove_rows,
+                        select + row.fork_select_rows,
+                        rebuild + row.rebuild_rows,
+                        writes + row.index_writes,
+                    )
+                },
+            );
+        assert_eq!(
+            foreign,
+            (0, 0, 0, 0),
+            "fork scanned or rebuilt unrelated processes"
+        );
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct MappingIdentitySnapshot {
+        source_id: usize,
+        display_id: usize,
+        resolved: super::ResolvedMapping,
+    }
+
+    fn mapping_identity_snapshot(
+        table: &super::MmapTable,
+        pid: u32,
+        address: u64,
+        cache: &mut super::MappingResolveCache,
+    ) -> MappingIdentitySnapshot {
+        let frame = table.resolve_frame_cached(pid, address, cache).unwrap();
+        MappingIdentitySnapshot {
+            source_id: frame.symbol_source_id(),
+            display_id: frame.display_path_id(),
+            resolved: owned_frame_metadata(frame),
+        }
+    }
+
+    #[test]
+    fn foreign_mapping_slots_and_cache_identity_survive_other_pid_splits_and_forks() {
+        let mut table = mapping_mutation_locality_fixture();
+        let mut cache = super::MappingResolveCache::default();
+        let before = mapping_identity_snapshot(&table, 100, 0x1010, &mut cache);
+        let foreign_slot = cache.pid_index;
+        table.insert_mmap(mutation_record(7, 0x1400, 0x100, 0x900, "/patch"));
+        assert_eq!(
+            mapping_identity_snapshot(&table, 100, 0x1010, &mut cache),
+            before
+        );
+        assert_eq!(
+            cache.pid_index, foreign_slot,
+            "overlap removal relocated a foreign slot"
+        );
+        table.clone_pid_mappings(7, 8);
+        assert_eq!(
+            mapping_identity_snapshot(&table, 100, 0x1010, &mut cache),
+            before
+        );
+        assert_eq!(
+            cache.pid_index, foreign_slot,
+            "fork removal relocated a foreign slot"
+        );
+    }
+
+    #[test]
+    fn reused_same_pid_mapping_slot_revalidates_source_display_offset_and_mode() {
+        let mut table = super::MmapTable::default();
+        let mut cache = super::MappingResolveCache::default();
+        let mut user_cache = super::MappingResolveCache::default();
+        table.insert_mmap(mutation_record(7, 0x1000, 0x1000, 0x100, "/old"));
+        let old = mapping_identity_snapshot(&table, 7, 0x1010, &mut cache);
+        assert!(
+            table
+                .resolve_user_frame_cached(7, 0x1010, &mut user_cache)
+                .is_some()
+        );
+        for (path, pgoff, mode) in [
+            (
+                "/kernel",
+                0x900,
+                crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_KERNEL,
+            ),
+            ("/new", 0x500, super::PERF_RECORD_MISC_CPUMODE_USER),
+            ("/old", 0x100, super::PERF_RECORD_MISC_CPUMODE_USER),
+        ] {
+            table.insert_mmap_with_misc(mutation_record(7, 0x1000, 0x1000, pgoff, path), mode);
+            let current = mapping_identity_snapshot(&table, 7, 0x1010, &mut cache);
+            assert_eq!(current.resolved.path, path);
+            assert_eq!(current.resolved.relative_address, pgoff + 0x10);
+            if path == "/old" {
+                assert_eq!(current, old);
+            } else {
+                assert_ne!(current.source_id, old.source_id);
+                assert_ne!(current.display_id, old.display_id);
+            }
+            let context = table.frame_context(7, &mut user_cache);
+            let user = context.resolve_user(0x1010, &mut user_cache);
+            assert_eq!(user.is_some(), mode == super::PERF_RECORD_MISC_CPUMODE_USER);
+            if let Some(frame) = user {
+                assert_eq!(frame.resolved_ref(), table.resolve_ref(7, 0x1010).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn split_projection_identity_and_cached_offsets_survive_foreign_slot_replacement() {
+        let mut table = mapping_mutation_locality_fixture();
+        let mut cache = super::MappingResolveCache::default();
+        let parent = mapping_identity_snapshot(&table, 7, 0x1010, &mut cache);
+        table.insert_mmap(mutation_record(7, 0x1400, 0x100, 0x900, "/patch"));
+        for (address, offset) in [(0x1010, 0x110), (0x1510, 0x610)] {
+            let fragment = mapping_identity_snapshot(&table, 7, address, &mut cache);
+            assert_eq!(fragment.source_id, parent.source_id);
+            assert_eq!(fragment.display_id, parent.display_id);
+            assert_eq!(fragment.resolved.relative_address, offset);
+        }
+        let old_foreign = mapping_identity_snapshot(&table, 100, 0x1010, &mut cache);
+        table.clone_pid_mappings(7, 100);
+        let inherited = mapping_identity_snapshot(&table, 100, 0x1510, &mut cache);
+        assert_ne!(inherited.source_id, old_foreign.source_id);
+        assert_eq!(inherited.source_id, parent.source_id);
+        assert_eq!(inherited.display_id, parent.display_id);
+        assert_eq!(inherited.resolved.relative_address, 0x610);
+        assert_eq!(
+            mapping_identity_snapshot(&table, 100, 0x1410, &mut cache),
+            mapping_identity_snapshot(&table, 7, 0x1410, &mut cache)
+        );
+    }
+
     #[test]
     fn mapped_frame_unbracketed_paths_skip_numeric_kernel_classification() {
         for path in ["", "/usr/bin/demo", "/tmp/[kernel]", "demo.so", " /[vdso]"] {
@@ -1499,6 +2817,7 @@ mod tests {
     use crate::perfdata::records::{
         MmapRecord, PERF_RECORD_MISC_CPUMODE_KERNEL, PERF_RECORD_MISC_CPUMODE_USER,
     };
+    use std::cell::Cell;
 
     #[test]
     fn broad_new_mapping_replaces_covered_old_mapping_like_perf_maps_fixup() {
@@ -1662,6 +2981,157 @@ mod tests {
                 .is_none()
         );
         assert_eq!(cache.pid_index, None);
+    }
+
+    #[test]
+    fn sample_context_translates_only_the_precedence_winner() {
+        for (loser_pid, loser_path, winner_pid, winner_path, expected) in [
+            (u32::MAX, "/global-file", 7, "/user", 0x510),
+            (7, "/user", u32::MAX, "[global]", 0x1090),
+        ] {
+            let mut table = MmapTable::default();
+            for (pid, start, pgoff, path) in [
+                (loser_pid, 0x1000, u64::MAX, loser_path),
+                (winner_pid, 0x1080, 0x500, winner_path),
+            ] {
+                table.insert_mmap(MmapRecord {
+                    pid,
+                    tid: pid,
+                    start,
+                    len: 0x100,
+                    pgoff,
+                    path: path.into(),
+                });
+            }
+            assert_eq!(
+                table.resolve_ref(7, 0x1090).unwrap().relative_address,
+                expected
+            );
+            let mut cache = MappingResolveCache::default();
+            let context = table.frame_context(7, &mut cache);
+            for _ in 0..2 {
+                assert_eq!(
+                    context
+                        .resolve(0x1090, &mut cache)
+                        .unwrap()
+                        .relative_address,
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sample_context_bucket_returns_only_the_borrowed_mapping_layout() {
+        let mut table = MmapTable::default();
+        table.insert_mmap(MmapRecord {
+            pid: 7,
+            tid: 7,
+            start: 0x1000,
+            len: 0x100,
+            pgoff: 0x500,
+            path: "/user".into(),
+        });
+        let mut cache = MappingResolveCache::default();
+        let context = table.frame_context(7, &mut cache);
+        for ip in [0x1000, 0x1010, 0x1100] {
+            let result = context.resolve_bucket::<true>(
+                context.user,
+                ip,
+                &mut cache.pid_index,
+                &context.user_hint,
+                &context.user_miss,
+            );
+            assert_eq!(
+                std::mem::size_of_val(&result),
+                std::mem::size_of::<Option<&super::Mapping>>(),
+                "bucket results must carry only the borrowed mapping, not cached hint metadata"
+            );
+        }
+        assert_eq!(
+            std::mem::size_of::<Option<super::MappedFrame<'_>>>(),
+            std::mem::size_of::<super::MappedFrame<'_>>(),
+            "the borrowed mapping provides the Option niche"
+        );
+    }
+
+    #[test]
+    fn sample_context_hint_hits_skip_translation_and_user_reclassification() {
+        let mut table = MmapTable::default();
+        for (pid, start, pgoff, path, mode) in [
+            (7, 0x1000, 0x500, "/user", PERF_RECORD_MISC_CPUMODE_USER),
+            (
+                u32::MAX,
+                0x2000,
+                0x900,
+                "[global]",
+                PERF_RECORD_MISC_CPUMODE_KERNEL,
+            ),
+            (7, 0x3000, 0x700, "[local]", PERF_RECORD_MISC_CPUMODE_KERNEL),
+        ] {
+            table.insert_mmap_with_misc(
+                MmapRecord {
+                    pid,
+                    tid: pid,
+                    start,
+                    len: 0x100,
+                    pgoff,
+                    path: path.into(),
+                },
+                mode,
+            );
+        }
+        let mut cache = MappingResolveCache::default();
+        let context = table.frame_context(7, &mut cache);
+        context.resolve_user(0x1000, &mut cache).unwrap();
+        context.resolve(0x2000, &mut cache).unwrap();
+        super::FRAME_MAPPING_TRANSLATION_CLASSIFICATIONS.with(|count| count.set(0));
+        super::FRAME_MAPPING_USER_CLASSIFICATIONS.with(|count| count.set(0));
+        for offset in 0..0x100 {
+            assert_eq!(
+                context
+                    .resolve_user(0x1000 + offset, &mut cache)
+                    .unwrap()
+                    .relative_address,
+                0x500 + offset
+            );
+            assert_eq!(
+                context
+                    .resolve(0x2000 + offset, &mut cache)
+                    .unwrap()
+                    .relative_address,
+                0x2000 + offset
+            );
+        }
+        let translations = super::FRAME_MAPPING_TRANSLATION_CLASSIFICATIONS.with(Cell::get);
+        let user_checks = super::FRAME_MAPPING_USER_CLASSIFICATIONS.with(Cell::get);
+        assert_eq!(
+            (translations, user_checks),
+            (0, 0),
+            "validated hint hits must skip mapping translation and USER classification"
+        );
+
+        assert!(context.resolve_user(0x3000, &mut cache).is_none());
+        super::FRAME_MAPPING_TRANSLATION_CLASSIFICATIONS.with(|count| count.set(0));
+        super::FRAME_MAPPING_USER_CLASSIFICATIONS.with(|count| count.set(0));
+        for offset in 0..0x100 {
+            assert!(context.resolve_user(0x3000 + offset, &mut cache).is_none());
+            assert_eq!(cache.pid_index, None);
+            assert_eq!(
+                context
+                    .resolve(0x3000 + offset, &mut cache)
+                    .unwrap()
+                    .relative_address,
+                0x700 + offset
+            );
+        }
+        let translations = super::FRAME_MAPPING_TRANSLATION_CLASSIFICATIONS.with(Cell::get);
+        let user_checks = super::FRAME_MAPPING_USER_CLASSIFICATIONS.with(Cell::get);
+        assert_eq!(
+            (translations, user_checks),
+            (0, 0),
+            "non-USER hints must retain their validated rejection and translation"
+        );
     }
 
     #[test]
@@ -2144,6 +3614,18 @@ mod tests {
                 "[global-tie]",
                 crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_KERNEL,
             ),
+            (
+                u32::MAX,
+                0x3000,
+                "/global-file",
+                crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_KERNEL,
+            ),
+            (
+                7,
+                0x4000,
+                "[local-user]",
+                crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_USER,
+            ),
         ] {
             table.insert_mmap_with_misc(
                 MmapRecord {
@@ -2151,7 +3633,7 @@ mod tests {
                     tid: pid,
                     start,
                     len: 0x100,
-                    pgoff: 0,
+                    pgoff: 0x500,
                     path: path.into(),
                 },
                 mode,
@@ -2160,17 +3642,32 @@ mod tests {
         let mut cache = MappingResolveCache::default();
         let context = table.frame_context(7, &mut cache);
         for _ in 0..3 {
+            let global = context.resolve(0x1090, &mut cache).unwrap();
             assert_eq!(
-                context.resolve(0x1090, &mut cache).unwrap().path(),
-                "[global]"
+                (global.path(), global.relative_address),
+                ("[global]", 0x1090)
+            );
+            let user = context.resolve_user(0x1090, &mut cache).unwrap();
+            assert_eq!((user.path(), user.relative_address), ("/user", 0x590));
+            let local = context.resolve(0x2010, &mut cache).unwrap();
+            assert_eq!(
+                (local.path(), local.relative_address),
+                ("[local-kernel]", 0x510)
             );
             assert_eq!(
-                context.resolve_user(0x1090, &mut cache).unwrap().path(),
-                "/user"
+                context
+                    .resolve(0x3010, &mut cache)
+                    .unwrap()
+                    .relative_address,
+                0x510
             );
+            assert!(context.resolve_user(0x3010, &mut cache).is_none());
             assert_eq!(
-                context.resolve(0x2010, &mut cache).unwrap().path(),
-                "[local-kernel]"
+                context
+                    .resolve_user(0x4010, &mut cache)
+                    .unwrap()
+                    .relative_address,
+                0x510
             );
             assert!(context.resolve_user(0x2010, &mut cache).is_none());
             assert_eq!(cache.pid_index, None);
@@ -2189,7 +3686,7 @@ mod tests {
             tid: 7,
             start: u64::MAX - 0x100,
             len: 0x200,
-            pgoff: 0,
+            pgoff: u64::MAX - 0xff,
             path: "/end".into(),
         });
         let mut cache = MappingResolveCache::default();
@@ -2208,6 +3705,160 @@ mod tests {
                     .map(super::MappedFrame::resolved_ref),
                 table.resolve_ref(7, ip)
             );
+            assert_eq!(
+                context
+                    .resolve_user(ip, &mut cache)
+                    .map(super::MappedFrame::resolved_ref),
+                table.resolve_ref(7, ip)
+            );
+        }
+        assert_eq!(
+            context
+                .resolve_user(u64::MAX - 1, &mut cache)
+                .unwrap()
+                .relative_address,
+            u64::MAX
+        );
+        assert!(context.resolve_user(u64::MAX, &mut cache).is_none());
+    }
+
+    fn assert_context_translation_matches_table(
+        table: &MmapTable,
+        cache: &mut MappingResolveCache,
+        user_cache: &mut MappingResolveCache,
+    ) {
+        for pid in [8, 9, u32::MAX, 7] {
+            let context = table.frame_context(pid, cache);
+            // Repeat the endpoint to exercise freshly validated metadata and hint hits.
+            for ip in [
+                0xfff, 0x1000, 0x16ff, 0x1700, 0x18ff, 0x1900, 0x1fff, 0x2000, 0x1fff, 0x1fff,
+            ] {
+                assert_eq!(
+                    context
+                        .resolve(ip, cache)
+                        .map(super::MappedFrame::resolved_ref),
+                    table.resolve_ref(pid, ip)
+                );
+                assert_eq!(
+                    context
+                        .resolve_user(ip, cache)
+                        .map(super::MappedFrame::resolved_ref),
+                    table.resolve_user_pid_ref_cached(pid, ip, user_cache)
+                );
+            }
+        }
+    }
+
+    fn assert_split_translation(table: &MmapTable, pid: u32, cache: &mut MappingResolveCache) {
+        let context = table.frame_context(pid, cache);
+        assert_eq!(
+            context
+                .resolve_user(0x16ff, cache)
+                .unwrap()
+                .relative_address,
+            0xbff
+        );
+        assert!(context.resolve_user(0x1700, cache).is_none());
+        assert!(context.resolve_user(0x18ff, cache).is_none());
+        assert_eq!(
+            context.resolve(0x1700, cache).unwrap().relative_address,
+            0x2000
+        );
+        assert_eq!(
+            context
+                .resolve_user(0x1900, cache)
+                .unwrap()
+                .relative_address,
+            0xe00
+        );
+    }
+
+    #[test]
+    fn sample_context_translation_metadata_revalidates_after_splits_replacement_and_fork() {
+        let mut table = MmapTable::default();
+        for (pid, pgoff, path) in [
+            (7, 0x500, "/old"),
+            (8, 0x900, "/other"),
+            (9, 0x100, "/old-child"),
+            (u32::MAX, 0x600, "[global]"),
+        ] {
+            table.insert_mmap(MmapRecord {
+                pid,
+                tid: pid,
+                start: 0x1000,
+                len: 0x1000,
+                pgoff,
+                path: path.into(),
+            });
+        }
+        let mut cache = MappingResolveCache::default();
+        let mut user_cache = MappingResolveCache::default();
+        assert_context_translation_matches_table(&table, &mut cache, &mut user_cache);
+        for (step, (pid, start, len, pgoff, path, mode)) in [
+            (
+                7,
+                0x1700,
+                0x200,
+                0x2000,
+                "/patch",
+                PERF_RECORD_MISC_CPUMODE_KERNEL,
+            ),
+            (
+                u32::MAX,
+                0x1000,
+                0x1000,
+                0x700,
+                "/global-file",
+                PERF_RECORD_MISC_CPUMODE_KERNEL,
+            ),
+            (
+                7,
+                0x1000,
+                0x1000,
+                0x900,
+                "[local-user]",
+                PERF_RECORD_MISC_CPUMODE_USER,
+            ),
+            (
+                u32::MAX,
+                0x1000,
+                0x1000,
+                0x300,
+                "[global-new]",
+                PERF_RECORD_MISC_CPUMODE_KERNEL,
+            ),
+            (
+                7,
+                0x1000,
+                0x1000,
+                0xa00,
+                "[local-kernel]",
+                PERF_RECORD_MISC_CPUMODE_KERNEL,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            table.insert_mmap_with_misc(
+                MmapRecord {
+                    pid,
+                    tid: pid,
+                    start,
+                    len,
+                    pgoff,
+                    path: path.into(),
+                },
+                mode,
+            );
+            assert_context_translation_matches_table(&table, &mut cache, &mut user_cache);
+            if step == 0 {
+                assert_split_translation(&table, 7, &mut cache);
+            }
+            table.clone_pid_mappings(7, 9);
+            assert_context_translation_matches_table(&table, &mut cache, &mut user_cache);
+            if step == 0 {
+                assert_split_translation(&table, 9, &mut cache);
+            }
         }
     }
 
