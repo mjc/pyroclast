@@ -2225,7 +2225,7 @@ ffffffffc0e17dae t zfs_read [zfs]
 }
 
 #[test]
-fn perf_symbol_resolver_rejects_live_module_kallsyms_outside_recorded_map_like_perf_script() {
+fn perf_symbol_resolver_rejects_live_module_symbol_start_before_recorded_map_like_perf_script() {
     let root = tempfile::tempdir().expect("root");
     let live_kallsyms = root.path().join("kallsyms");
     std::fs::write(
@@ -2238,7 +2238,7 @@ ffffffffc1800000 T later_nf_tables_symbol [nf_tables]
     .expect("kallsyms");
     std::fs::write(
         root.path().join("modules"),
-        "nf_tables 401408 201 nft_compat,nft_chain_nat, Live 0xffffffffc2f8b000\n",
+        "nf_tables 401408 201 nft_compat,nft_chain_nat, Live 0xffffffffc11dc000\n",
     )
     .expect("modules");
 
@@ -2246,18 +2246,32 @@ ffffffffc1800000 T later_nf_tables_symbol [nf_tables]
     let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
         .with_system_kallsyms_from_path(&live_kallsyms);
 
+    let request = SymbolRequest {
+        path: PathBuf::from("[nf_tables]"),
+        relative_address: 0xffff_ffff_c11d_c2c0,
+        kernel_mapping_range: None,
+        build_id: None,
+        file_identity: None,
+        kernel_relocation: None,
+    };
+    // perf util/maps.c:maps__find and symbol.c:maps__split_kallsyms keep
+    // module symbols in their map. The address is in this recorded map, but
+    // the live symbol starts before it; neither module bounds nor a symbol
+    // gap may independently reject the positive control.
     let symbols = resolver
-        .resolve_batch(&[SymbolRequest {
-            path: PathBuf::from("[nf_tables]"),
-            relative_address: 0xffff_ffff_c179_61e4,
-            kernel_mapping_range: Some((0xffff_ffff_c179_6000, 0xffff_ffff_c179_7000)),
-            build_id: None,
-            file_identity: None,
-            kernel_relocation: None,
-        }])
+        .resolve_batch(&[
+            request.clone(),
+            SymbolRequest {
+                kernel_mapping_range: Some((0xffff_ffff_c11d_c2b8, 0xffff_ffff_c11d_c300)),
+                ..request
+            },
+        ])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![None]);
+    assert_eq!(
+        symbols,
+        vec![Some("nft_chain_route_init+0x10".to_string()), None]
+    );
     assert!(runner.commands().is_empty());
 }
 
