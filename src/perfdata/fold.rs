@@ -82,6 +82,7 @@ fn append_projection_ids(stack: &mut Vec<LabelId>, labels: &[LabelId]) {
 #[cfg(test)]
 thread_local! {
     static PROJECTION_BULK_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FOLD_FRAME_ADDRESS_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Default)]
@@ -331,6 +332,8 @@ struct UserUnwindContext {
 
 impl FoldFrame {
     fn address(self) -> u64 {
+        #[cfg(test)]
+        FOLD_FRAME_ADDRESS_READS.with(|reads| reads.set(reads.get() + 1));
         match self {
             Self::Callchain(address)
             | Self::UserCallchain(address)
@@ -2511,10 +2514,10 @@ enum FrameMappingDecision<'a> {
 fn resolve_frame_in_context<'a>(
     context: Option<&FrameMappingContext<'a>>,
     frame: FoldFrame,
+    address: u64,
     mapping_cache: &mut MappingResolveCache,
 ) -> Option<MappedFrame<'a>> {
     let context = context?;
-    let address = frame.address();
     match frame {
         FoldFrame::Callchain(_) => context.resolve(address, mapping_cache),
         FoldFrame::HypervisorCallchain(_) => None,
@@ -2597,6 +2600,8 @@ struct FoldedRenderBuffers {
     segment_copy_entries: usize,
     #[cfg(test)]
     repeat_helper_entries: usize,
+    #[cfg(test)]
+    stack_len_reads: std::cell::Cell<usize>,
 }
 
 enum FoldedRenderStatus {
@@ -2629,6 +2634,8 @@ impl FoldedRenderBuffers {
     }
 
     fn stack_len(&self) -> usize {
+        #[cfg(test)]
+        self.stack_len_reads.set(self.stack_len_reads.get() + 1);
         if self.projecting {
             self.counts.scratch_stack.len()
         } else {
@@ -2781,16 +2788,16 @@ impl<'a> FoldFrameResolver<'a> {
         mapping_cache: &mut MappingResolveCache,
     ) -> FrameMappingDecision<'a> {
         let context = pid.map(|pid| self.mmap_table.frame_context(pid, mapping_cache));
-        Self::mapping_decision_in_context(context.as_ref(), frame, mapping_cache)
+        Self::mapping_decision_in_context(context.as_ref(), frame, frame.address(), mapping_cache)
     }
 
     fn mapping_decision_in_context(
         context: Option<&FrameMappingContext<'a>>,
         frame: FoldFrame,
+        address: u64,
         mapping_cache: &mut MappingResolveCache,
     ) -> FrameMappingDecision<'a> {
-        let address = frame.address();
-        if let Some(mapping) = resolve_frame_in_context(context, frame, mapping_cache) {
+        if let Some(mapping) = resolve_frame_in_context(context, frame, address, mapping_cache) {
             if is_kernel_space_frame(address) && !mapping.is_kernel() {
                 FrameMappingDecision::KernelAddress
             } else {
@@ -2823,7 +2830,7 @@ impl<'a> FoldFrameResolver<'a> {
 
         let mut callchain = fold_frame_runs(callchain);
         while let Some((frame, repeats)) = callchain.next() {
-            let segment_start = buffers.stack_len();
+            let segment_start = if repeats > 1 { buffers.stack_len() } else { 0 };
             if symbol_cache.is_none()
                 && !is_valid_unwound_user_frame(
                     pid,
@@ -3012,7 +3019,7 @@ impl<'a> FoldFrameResolver<'a> {
         let is_cookie = self.cookie_to_suppress == Some(address);
         let decision = if is_cookie {
             let context = pid.map(|pid| self.mmap_table.frame_context(pid, mapping_cache));
-            resolve_frame_in_context(context.as_ref(), frame, mapping_cache)
+            resolve_frame_in_context(context.as_ref(), frame, address, mapping_cache)
                 .map_or(FrameMappingDecision::Unknown, FrameMappingDecision::Mapped)
         } else {
             self.mapping_decision(pid, frame, mapping_cache)
@@ -3132,12 +3139,12 @@ impl<'a> FoldFrameResolver<'a> {
         symbolizing: bool,
         mapping_cache: &mut MappingResolveCache,
     ) -> FrameMappingDecision<'a> {
+        let address = frame.address();
         if symbolizing && matches!(frame, FoldFrame::InlineCurrentIp(_)) {
-            return resolve_frame_in_context(context, frame, mapping_cache)
+            return resolve_frame_in_context(context, frame, address, mapping_cache)
                 .map_or(FrameMappingDecision::Unknown, FrameMappingDecision::Mapped);
         }
-        let address = frame.address();
-        let decision = Self::mapping_decision_in_context(context, frame, mapping_cache);
+        let decision = Self::mapping_decision_in_context(context, frame, address, mapping_cache);
         if !symbolizing
             && matches!(
                 frame,
@@ -3166,7 +3173,7 @@ fn append_pending_folded_frames<R: SymbolResolver>(
     }
     prefetch_sample_symbols(pending, cache, inline)?;
     for &(frame, decision, repeats) in pending {
-        let segment_start = buffers.stack_len();
+        let segment_start = if repeats > 1 { buffers.stack_len() } else { 0 };
         let status = append_prefetched_folded_frame(buffers, frame, decision, cache, inline)?;
         if matches!(status, FoldedRenderStatus::RequiresPerfText) {
             return Ok(status);
@@ -3937,44 +3944,46 @@ fn extend_recorded_callchain_frames_like_perf(
     // maps and normally prints as [unknown], not fall into kernel maps by
     // address alone.
     let mut cpumode = PERF_RECORD_MISC_CPUMODE_USER;
+    let mut invalid_context = false;
     let mut addresses = 0;
-    for ip in callchain {
+    frames.extend(callchain.into_iter().map_while(|ip| {
         // machine.c:__thread__resolve_callchain_sample tests nr_entries before
         // each iteration and increments it only for IPs below PERF_CONTEXT_MAX.
         if addresses == max_stack {
-            break;
+            return None;
         }
         if !is_perf_context_marker(ip) {
             addresses += 1;
         }
-        match ip {
+        Some(match ip {
             PERF_CONTEXT_HV => {
                 cpumode = PERF_RECORD_MISC_CPUMODE_HYPERVISOR;
-                frames.push(FoldFrame::Callchain(ip));
+                FoldFrame::Callchain(ip)
             }
             PERF_CONTEXT_KERNEL => {
                 cpumode = PERF_RECORD_MISC_CPUMODE_KERNEL;
-                frames.push(FoldFrame::Callchain(ip));
+                FoldFrame::Callchain(ip)
             }
             PERF_CONTEXT_USER | PERF_CONTEXT_USER_DEFERRED => {
                 cpumode = PERF_RECORD_MISC_CPUMODE_USER;
-                frames.push(FoldFrame::Callchain(ip));
+                FoldFrame::Callchain(ip)
             }
             _ if is_perf_context_marker(ip) => {
                 // machine.c:add_callchain_ip resets the whole recorded cursor
                 // and stops at the first unsupported context. User unwinding
                 // runs afterwards in __thread__resolve_callchain.
-                frames.clear();
-                return;
+                invalid_context = true;
+                return None;
             }
-            _ if cpumode == PERF_RECORD_MISC_CPUMODE_USER => {
-                frames.push(FoldFrame::UserCallchain(ip));
-            }
+            _ if cpumode == PERF_RECORD_MISC_CPUMODE_USER => FoldFrame::UserCallchain(ip),
             _ if cpumode == PERF_RECORD_MISC_CPUMODE_HYPERVISOR => {
-                frames.push(FoldFrame::HypervisorCallchain(ip));
+                FoldFrame::HypervisorCallchain(ip)
             }
-            _ => frames.push(FoldFrame::Callchain(ip)),
-        }
+            _ => FoldFrame::Callchain(ip),
+        })
+    }));
+    if invalid_context {
+        frames.clear();
     }
 }
 
@@ -7583,6 +7592,214 @@ mod tests {
     }
 
     #[test]
+    fn recorded_frame_extension_uses_iterator_bounds_for_bulk_reservation() {
+        use std::cell::Cell;
+        struct HintSpy<'a> {
+            iter: std::slice::Iter<'a, u64>,
+            queries: &'a Cell<usize>,
+        }
+        impl Iterator for HintSpy<'_> {
+            type Item = u64;
+            fn next(&mut self) -> Option<u64> {
+                self.iter.next().copied()
+            }
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                self.queries.set(self.queries.get() + 1);
+                self.iter.size_hint()
+            }
+        }
+        for depth in [0, 1, 16, 17, 64, 512] {
+            let input = (0..depth).map(|ip| 0x1000 + ip).collect::<Vec<_>>();
+            let queries = Cell::new(0);
+            let mut frames = super::FoldFrameStack::new();
+            super::extend_recorded_callchain_frames_like_perf(
+                &mut frames,
+                HintSpy {
+                    iter: input.iter(),
+                    queries: &queries,
+                },
+                usize::MAX,
+            );
+            assert_eq!(frames.len(), input.len());
+            assert_eq!(queries.get(), 1);
+            assert!(frames.capacity() >= input.len());
+            assert_eq!(
+                frames
+                    .iter()
+                    .map(|frame| frame.address())
+                    .collect::<Vec<_>>(),
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn recorded_frame_extension_preserves_prefixes_across_depth_and_storage_reuse() {
+        use super::FoldFrame;
+        let mut frames = super::FoldFrameStack::new();
+        for depth in [0, 1, 16, 17, 64, 512, 1, 64] {
+            frames.clear();
+            frames.push(FoldFrame::Callchain(0x999));
+            frames.reserve(depth);
+            super::extend_recorded_callchain_frames_like_perf(
+                &mut frames,
+                (0..depth).map(|index| 0x1000 + u64::try_from(index).unwrap()),
+                usize::MAX,
+            );
+            assert_eq!(frames.len(), depth + 1);
+            assert_eq!(frames[0], FoldFrame::Callchain(0x999));
+            for (index, frame) in frames[1..].iter().enumerate() {
+                assert_eq!(
+                    *frame,
+                    FoldFrame::UserCallchain(0x1000 + u64::try_from(index).unwrap())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recorded_frame_bulk_insertion_preserves_context_transitions_and_raw_deferred_cookie() {
+        use super::FoldFrame;
+        let mut frames = super::FoldFrameStack::new();
+        super::extend_recorded_callchain_frames_like_perf(
+            &mut frames,
+            [
+                0xffff_8000_0000_0010,
+                super::PERF_CONTEXT_KERNEL,
+                0x1010,
+                super::PERF_CONTEXT_USER,
+                0x2020,
+                super::PERF_CONTEXT_USER_DEFERRED,
+                73,
+            ],
+            super::PERF_SCRIPT_MAX_STACK,
+        );
+        assert_eq!(
+            frames.as_slice(),
+            [
+                FoldFrame::UserCallchain(0xffff_8000_0000_0010),
+                FoldFrame::Callchain(super::PERF_CONTEXT_KERNEL),
+                FoldFrame::Callchain(0x1010),
+                FoldFrame::Callchain(super::PERF_CONTEXT_USER),
+                FoldFrame::UserCallchain(0x2020),
+                FoldFrame::Callchain(super::PERF_CONTEXT_USER_DEFERRED),
+                FoldFrame::UserCallchain(73),
+            ]
+        );
+        assert_eq!(frames.last(), Some(&FoldFrame::UserCallchain(73)));
+    }
+
+    #[test]
+    fn folded_mapping_decisions_decode_frame_addresses_once() {
+        use super::FoldFrame;
+        let mut maps = super::MmapTable::default();
+        insert_test_mapping(&mut maps, 7, 0x1000, 0x100, "/user");
+        insert_test_mapping(&mut maps, u32::MAX, 0x1008, 0x80, "/global");
+        let mut cache = super::MappingResolveCache::default();
+        let context = maps.frame_context(7, &mut cache);
+        for (frame, path, offset) in [
+            (FoldFrame::Callchain(0x1010), "/global", 8),
+            (FoldFrame::UserCallchain(0x1010), "/user", 0x10),
+            (FoldFrame::UserUnwind(0x1010), "/user", 0x10),
+            (FoldFrame::InlineCurrentIp(0x1010), "/user", 0x10),
+            (
+                FoldFrame::SampleIp {
+                    address: 0x1010,
+                    cpumode: super::PERF_RECORD_MISC_CPUMODE_USER,
+                },
+                "/user",
+                0x10,
+            ),
+            (
+                FoldFrame::SampleIp {
+                    address: 0x1010,
+                    cpumode: super::PERF_RECORD_MISC_CPUMODE_KERNEL,
+                },
+                "/global",
+                8,
+            ),
+        ] {
+            for symbolizing in [false, true] {
+                let before = super::FOLD_FRAME_ADDRESS_READS.with(std::cell::Cell::get);
+                let decision = super::FoldFrameResolver::mapping_decision_for_folded_frame(
+                    Some(&context),
+                    frame,
+                    symbolizing,
+                    &mut cache,
+                );
+                let super::FrameMappingDecision::Mapped(mapping) = decision else {
+                    panic!("expected {path} at offset {offset:#x}");
+                };
+                assert_eq!(mapping.path(), path);
+                assert_eq!(mapping.relative_address, offset);
+                assert_eq!(
+                    super::FOLD_FRAME_ADDRESS_READS.with(std::cell::Cell::get) - before,
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn singleton_symbolized_frames_read_only_sample_boundaries_on_cold_and_warm_paths() {
+        use std::fmt::Write as _;
+        let mut maps = super::MmapTable::default();
+        insert_test_mapping(&mut maps, 7, 0x1000, 0x100, "/bin/demo");
+        for projecting in [false, true] {
+            let resolver = RecordingFrameResolver::default();
+            let mut cache = SymbolFrameCache::new(&resolver);
+            let mut buffers = super::FoldedRenderBuffers {
+                projecting,
+                ..Default::default()
+            };
+            for _ in 0..2 {
+                let before = buffers.stack_len_reads.get();
+                super::FoldFrameResolver::new(&maps, true)
+                    .render_folded_stack_for_stack(
+                        Some(7),
+                        Some(super::SampleComm::Name("worker")),
+                        (1..=40).map(|offset| super::FoldFrame::UserUnwind(0x1000 + offset)),
+                        Some(&mut cache),
+                        &mut buffers,
+                    )
+                    .unwrap();
+                assert_eq!(buffers.stack_len_reads.get() - before, 2);
+                let mut expected = String::from("worker");
+                for offset in 1..=40 {
+                    write!(expected, ";symbol_{offset:x}").unwrap();
+                }
+                assert_eq!(buffers.rendered(), expected);
+            }
+            assert_eq!(*resolver.full_batch_sizes.borrow(), [40]);
+        }
+    }
+
+    #[test]
+    fn singleton_frames_do_not_read_stack_lengths_for_unused_repeat_segments() {
+        let maps = super::MmapTable::default();
+        for projecting in [false, true] {
+            let mut buffers = super::FoldedRenderBuffers {
+                projecting,
+                ..Default::default()
+            };
+            super::FoldFrameResolver::new(&maps, true)
+                .render_folded_stack_for_stack::<super::NoopSymbolResolver, _>(
+                    Some(7),
+                    Some(super::SampleComm::Name("worker")),
+                    (1..=512).map(super::FoldFrame::Callchain),
+                    None,
+                    &mut buffers,
+                )
+                .unwrap();
+            assert_eq!(
+                buffers.rendered(),
+                format!("worker{}", ";[unknown]".repeat(512))
+            );
+            assert_eq!(buffers.stack_len_reads.get(), 2);
+        }
+    }
+
+    #[test]
     fn singleton_projected_frames_do_not_enter_the_repeat_helper() {
         use super::SampleOutput as _;
         let mut state = super::SessionState::new(std::collections::BTreeMap::new());
@@ -8519,6 +8736,7 @@ mod tests {
             super::resolve_frame_in_context(
                 Some(&table.frame_context(7, &mut super::MappingResolveCache::default())),
                 super::FoldFrame::UserUnwind(0x1010),
+                0x1010,
                 &mut super::MappingResolveCache::default()
             )
             .is_none()
