@@ -251,7 +251,8 @@ impl<'a> FrameMappingHint<'a> {
             relative_address: if self.identity_translation {
                 ip
             } else {
-                ip - self.start + self.pgoff
+                // perf util/map.h:107-125 translates with unsigned u64 arithmetic.
+                ip.wrapping_sub(self.start).wrapping_add(self.pgoff)
             },
         }
     }
@@ -830,7 +831,8 @@ impl MmapTable {
                 let old_start = after.start;
                 let old_end = after.end();
                 after.start = new_mapping.end();
-                after.pgoff = after.pgoff.saturating_add(after.start - old_start);
+                // perf util/maps.c:909 and util/map.h:280-282 use unsigned addition.
+                after.pgoff = after.pgoff.wrapping_add(after.start - old_start);
                 after.len = old_end - after.start;
                 split_mappings.push(after);
             }
@@ -1349,7 +1351,8 @@ impl Mapping {
         if self.is_kernel_symbol_mapping() {
             ip
         } else {
-            ip - self.start + self.pgoff
+            // perf util/map.h:107-125 translates with unsigned u64 arithmetic.
+            ip.wrapping_sub(self.start).wrapping_add(self.pgoff)
         }
     }
 
@@ -1451,7 +1454,7 @@ mod tests {
                 relative_address: if self.pid == u32::MAX && self.path.starts_with('[') {
                     ip
                 } else {
-                    ip - self.start + self.pgoff
+                    ip.wrapping_sub(self.start).wrapping_add(self.pgoff)
                 },
                 start: self.start,
                 end: self.end(),
@@ -1534,7 +1537,7 @@ mod tests {
                             let mut right = old.clone();
                             right.start = new.end();
                             right.len = old.end() - right.start;
-                            right.pgoff += right.start - old.start;
+                            right.pgoff = right.pgoff.wrapping_add(right.start - old.start);
                             fragments.push(right);
                         }
                     }
@@ -2981,6 +2984,156 @@ mod tests {
                 .is_none()
         );
         assert_eq!(cache.pid_index, None);
+    }
+
+    #[test]
+    fn ordinary_mapping_translation_wraps_like_perf_dso_map_ip() {
+        // perf util/map.h:107-110 uses unsigned u64 subtract/add, not saturation.
+        let mut table = MmapTable::default();
+        table.insert_mmap(mutation_record(7, 0x1000, 0x100, u64::MAX - 0xf, "/user"));
+        let mut cache = MappingResolveCache::default();
+        let mut user_cache = MappingResolveCache::default();
+        for (ip, expected) in [(0x1000, u64::MAX - 0xf), (0x1020, 0x10), (0x10ff, 0xef)] {
+            assert_eq!(table.resolve_ref(7, ip).unwrap().relative_address, expected);
+            assert_eq!(table.resolve(7, ip).unwrap().relative_address, expected);
+            assert_eq!(
+                table
+                    .resolve_frame_cached(7, ip, &mut cache)
+                    .unwrap()
+                    .relative_address,
+                expected
+            );
+            assert_eq!(
+                table
+                    .resolve_ref_cached(7, ip, &mut cache)
+                    .unwrap()
+                    .relative_address,
+                expected
+            );
+            assert_eq!(
+                table
+                    .resolve_user_frame_cached(7, ip, &mut user_cache)
+                    .unwrap()
+                    .relative_address,
+                expected
+            );
+            assert_eq!(
+                table
+                    .resolve_user_pid_ref_cached(7, ip, &mut user_cache)
+                    .unwrap()
+                    .relative_address,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn sample_context_cold_user_translation_wraps_like_perf_dso_map_ip() {
+        let mut table = MmapTable::default();
+        table.insert_mmap(mutation_record(7, 0x1000, 0x100, u64::MAX - 0xf, "/user"));
+        let mut cache = MappingResolveCache::default();
+        let context = table.frame_context(7, &mut cache);
+        assert_eq!(
+            context
+                .resolve_user(0x1020, &mut cache)
+                .unwrap()
+                .relative_address,
+            0x10
+        );
+    }
+
+    #[test]
+    fn sample_context_warm_user_translation_wraps_like_perf_dso_map_ip() {
+        let mut table = MmapTable::default();
+        table.insert_mmap(mutation_record(7, 0x1000, 0x100, u64::MAX - 0xf, "/user"));
+        let mut cache = MappingResolveCache::default();
+        let context = table.frame_context(7, &mut cache);
+        context.resolve_user(0x1000, &mut cache).unwrap();
+        let searches = table.index_search_count();
+        for _ in 0..2 {
+            assert_eq!(
+                context
+                    .resolve_user(0x1020, &mut cache)
+                    .unwrap()
+                    .relative_address,
+                0x10
+            );
+        }
+        assert_eq!(table.index_search_count(), searches);
+    }
+
+    #[test]
+    fn sample_context_overlapping_maps_preserve_wrapped_winner_translation() {
+        for (local_start, global_start, global_path, expected_path, expected) in [
+            (0x1080, 0x1000, "/global", "/user", 0xf),
+            (0x1000, 0x1080, "/global", "/global", 0xf),
+            (0x1000, 0x1080, "[global]", "[global]", 0x1090),
+        ] {
+            let mut table = MmapTable::default();
+            for (pid, start, path) in [
+                (7, local_start, "/user"),
+                (u32::MAX, global_start, global_path),
+            ] {
+                table.insert_mmap(mutation_record(pid, start, 0x100, u64::MAX, path));
+            }
+            let mut cache = MappingResolveCache::default();
+            let context = table.frame_context(7, &mut cache);
+            for _ in 0..2 {
+                let frame = context.resolve(0x1090, &mut cache).unwrap();
+                assert_eq!(
+                    (frame.path(), frame.relative_address),
+                    (expected_path, expected)
+                );
+            }
+            let resolved = table.resolve_ref(7, 0x1090).unwrap();
+            assert_eq!(
+                (resolved.path, resolved.relative_address),
+                (expected_path, expected)
+            );
+        }
+    }
+
+    #[test]
+    fn sample_context_non_user_translation_wraps_after_user_filter_rejection() {
+        let mut table = MmapTable::default();
+        table.insert_mmap_with_misc(
+            mutation_record(7, 0x1000, 0x100, u64::MAX, "/non-user"),
+            crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_KERNEL,
+        );
+        let mut cache = MappingResolveCache::default();
+        let context = table.frame_context(7, &mut cache);
+        assert!(context.resolve_user(0x1010, &mut cache).is_none());
+        assert_eq!(cache.pid_index, None);
+        let searches = table.index_search_count();
+        let frame = context.resolve(0x1010, &mut cache).unwrap();
+        assert_eq!((frame.path(), frame.relative_address), ("/non-user", 0xf));
+        assert!(context.resolve_user(0x1010, &mut cache).is_none());
+        assert_eq!(cache.pid_index, None);
+        assert_eq!(table.index_search_count(), searches);
+    }
+
+    #[test]
+    fn mapping_right_split_wraps_pgoff_like_perf_maps_fixup_overlappings() {
+        // perf util/maps.c:908-911 and util/map.h:280-282 preserve unsigned offset arithmetic.
+        let mut table = MmapTable::default();
+        table.insert_mmap(mutation_record(7, 0x1000, 0x300, u64::MAX - 0xff, "/old"));
+        table.insert_mmap(mutation_record(7, 0x1080, 0x100, 0, "/replacement"));
+        let after = table
+            .mappings
+            .iter()
+            .find(|mapping| mapping.start == 0x1180)
+            .unwrap();
+        assert_eq!(after.pgoff, 0x80);
+        assert_eq!(table.resolve_ref(7, 0x1190).unwrap().relative_address, 0x90);
+        let mut cache = MappingResolveCache::default();
+        let context = table.frame_context(7, &mut cache);
+        assert_eq!(
+            context
+                .resolve_user(0x1190, &mut cache)
+                .unwrap()
+                .relative_address,
+            0x90
+        );
     }
 
     #[test]
