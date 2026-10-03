@@ -84,3 +84,9 @@ scripts/pyroclast-bench [<perf.data>] [--perf-script <perf.script>] [--export-pe
 
 The pre-commit hook enters `devenv shell` and runs rustfmt, Clippy pedantic,
 `cargo nextest run`, and `nix flake check`.
+
+The Linux test suite requires `cc`, `objcopy`, and `perf` in `PATH`. The development
+shell supplies them. Native-oracle tests compile ELF fixtures and compare against
+`perf script`; missing tools fail the tests rather than silently skipping parity
+checks. When running outside the development shell, install a C toolchain,
+binutils, and perf first.
