@@ -31,6 +31,14 @@ type FxHashSet<T> = HashSet<T, FxBuildHasher>;
 const X86_64_PLT_ENTRY_SIZE: u64 = 16;
 const ELF64_RELA_ENTRY_SIZE: usize = 24;
 
+#[cfg(test)]
+thread_local! {
+    static MODULE_KALLSYMS_TREE_BUILDS: Cell<usize> = const { Cell::new(0) };
+    static MODULE_KALLSYMS_ROW_VISITS: Cell<usize> = const { Cell::new(0) };
+    static MODULE_KALLSYMS_SYMBOL_INSERTIONS: Cell<usize> = const { Cell::new(0) };
+    static MODULE_KALLSYMS_END_FIXUP_PASSES: Cell<usize> = const { Cell::new(0) };
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct KernelRelocation {
     pub reference_symbol: String,
@@ -269,6 +277,8 @@ pub(crate) enum SymbolFrameRenderMode {
 #[derive(Default)]
 struct UserFrameAddresses {
     by_address: FxHashMap<u64, usize>,
+    // Terminal object failure, not an individual unresolved address.
+    unavailable: bool,
     // A per-source hint survives intervening lookups in other objects.
     last_address: Cell<Option<(u64, Option<usize>)>>,
 }
@@ -283,8 +293,7 @@ struct UserFrameSourceHint {
 #[derive(Default)]
 struct UserFrameTable {
     by_source: FxHashMap<usize, usize>,
-    // None is a terminal unavailable object, not a per-address negative result.
-    sources: Vec<Option<UserFrameAddresses>>,
+    sources: Vec<UserFrameAddresses>,
     // A cached source with no index is terminal unavailable, including all IPs.
     last_source: Cell<Option<UserFrameSourceHint>>,
     #[cfg(test)]
@@ -292,13 +301,17 @@ struct UserFrameTable {
     #[cfg(test)]
     source_accesses: Cell<usize>,
     #[cfg(test)]
+    source_state_checks: Cell<usize>,
+    #[cfg(test)]
+    address_hint_checks: Cell<usize>,
+    #[cfg(test)]
     address_searches: Cell<usize>,
 }
 
 impl UserFrameTable {
     #[inline]
     fn slot(&self, source: usize, address: u64) -> Option<usize> {
-        let index = if let Some(hint) = self.last_source.get()
+        let (index, addresses, last_address) = if let Some(hint) = self.last_source.get()
             && hint.source == source
         {
             // perf util/symbol.c:dso__find_symbol (575-583) keys a hit by IP.
@@ -310,25 +323,39 @@ impl UserFrameTable {
                 return slot;
             }
             match hint.index {
-                Some(index) => index,
+                // The source hint establishes availability and rules out the
+                // per-source IP hint. Mutations reset both hints.
+                Some(index) => {
+                    #[cfg(test)]
+                    self.source_accesses.set(self.source_accesses.get() + 1);
+                    (index, &self.sources[index], None)
+                }
                 None => return Some(0),
             }
         } else {
             #[cfg(test)]
             self.source_searches.set(self.source_searches.get() + 1);
-            *self.by_source.get(&source)?
+            let index = *self.by_source.get(&source)?;
+            #[cfg(test)]
+            self.source_accesses.set(self.source_accesses.get() + 1);
+            let addresses = &self.sources[index];
+            #[cfg(test)]
+            self.source_state_checks
+                .set(self.source_state_checks.get() + 1);
+            if addresses.unavailable {
+                self.last_source.set(Some(UserFrameSourceHint {
+                    source,
+                    index: None,
+                    last_address: None,
+                }));
+                return Some(0);
+            }
+            #[cfg(test)]
+            self.address_hint_checks
+                .set(self.address_hint_checks.get() + 1);
+            (index, addresses, addresses.last_address.get())
         };
-        #[cfg(test)]
-        self.source_accesses.set(self.source_accesses.get() + 1);
-        let Some(addresses) = &self.sources[index] else {
-            self.last_source.set(Some(UserFrameSourceHint {
-                source,
-                index: None,
-                last_address: None,
-            }));
-            return Some(0);
-        };
-        let slot = if let Some((cached_address, slot)) = addresses.last_address.get()
+        let slot = if let Some((cached_address, slot)) = last_address
             && cached_address == address
         {
             slot
@@ -348,29 +375,32 @@ impl UserFrameTable {
     }
 
     fn source_index(&mut self, source: usize) -> usize {
-        let index = *self.by_source.entry(source).or_insert_with(|| {
+        *self.by_source.entry(source).or_insert_with(|| {
             let index = self.sources.len();
-            self.sources.push(Some(UserFrameAddresses::default()));
+            self.sources.push(UserFrameAddresses::default());
             index
-        });
+        })
+    }
+
+    fn insert(&mut self, source: usize, address: u64, slot: usize) {
+        let index = self.source_index(source);
+        let addresses = &mut self.sources[index];
+        addresses.unavailable = false;
+        addresses.by_address.insert(address, slot);
+        addresses.last_address.set(None);
         self.last_source.set(Some(UserFrameSourceHint {
             source,
             index: Some(index),
             last_address: None,
         }));
-        index
-    }
-
-    fn insert(&mut self, source: usize, address: u64, slot: usize) {
-        let index = self.source_index(source);
-        let addresses = self.sources[index].get_or_insert_with(UserFrameAddresses::default);
-        addresses.by_address.insert(address, slot);
-        addresses.last_address.set(None);
     }
 
     fn mark_unavailable(&mut self, source: usize) {
         let index = self.source_index(source);
-        self.sources[index] = None;
+        self.sources[index] = UserFrameAddresses {
+            unavailable: true,
+            ..UserFrameAddresses::default()
+        };
         self.last_source.set(Some(UserFrameSourceHint {
             source,
             index: None,
@@ -382,7 +412,6 @@ impl UserFrameTable {
     fn len(&self) -> usize {
         self.sources
             .iter()
-            .flatten()
             .map(|addresses| addresses.by_address.len())
             .sum()
     }
@@ -647,8 +676,7 @@ pub struct PerfSymbolResolver<O> {
     live_kallsyms: Option<Kallsyms>,
     live_kallsyms_path: Option<PathBuf>,
     live_kallsyms_cache: OnceLock<Option<Kallsyms>>,
-    live_module_kallsyms_text_cache: OnceLock<Option<Arc<String>>>,
-    live_module_kallsyms_cache: Mutex<FxHashMap<String, Option<Arc<Kallsyms>>>>,
+    live_module_kallsyms_cache: OnceLock<FxHashMap<String, Arc<Kallsyms>>>,
     system_map_kallsyms: Option<Kallsyms>,
     system_map_candidates: Vec<PathBuf>,
     system_map_kallsyms_cache: OnceLock<Option<Kallsyms>>,
@@ -1243,8 +1271,7 @@ where
             live_kallsyms: None,
             live_kallsyms_path: None,
             live_kallsyms_cache: OnceLock::new(),
-            live_module_kallsyms_text_cache: OnceLock::new(),
-            live_module_kallsyms_cache: Mutex::new(FxHashMap::default()),
+            live_module_kallsyms_cache: OnceLock::new(),
             system_map_kallsyms: None,
             system_map_candidates: Vec::new(),
             system_map_kallsyms_cache: OnceLock::new(),
@@ -1427,7 +1454,7 @@ impl Kallsyms {
         {
             insert_kallsyms_symbol(
                 &mut symbols,
-                &mut addresses_by_name,
+                Some(&mut addresses_by_name),
                 address,
                 KallsymsSymbol::kernel(symbol),
             );
@@ -1503,12 +1530,16 @@ impl Kallsyms {
     }
 
     fn parse_module_symbols(text: &str) -> Vec<BorrowedKallsymsRow<'_>> {
+        #[cfg(test)]
+        MODULE_KALLSYMS_TREE_BUILDS.with(|count| count.set(count.get() + 1));
         let mut symbols = Vec::new();
         for row in text
             .lines()
             .filter_map(parse_module_kallsyms_line)
             .filter(|row| row.address != 0)
         {
+            #[cfg(test)]
+            MODULE_KALLSYMS_SYMBOL_INSERTIONS.with(|count| count.set(count.get() + 1));
             symbols.push(row);
         }
         // symbol.c:1512-1523: fix all accepted core/module ends, then remove
@@ -1528,6 +1559,33 @@ impl Kallsyms {
             true
         });
         symbols
+    }
+
+    fn parse_module_views(text: &str) -> FxHashMap<String, Arc<Self>> {
+        let mut modules = FxHashMap::<String, Self>::default();
+        for row in Self::parse_module_symbols(text) {
+            let Some(module) = row.module else {
+                continue;
+            };
+            let view = match modules.raw_entry_mut().from_key(module) {
+                RawEntryMut::Occupied(entry) => entry.into_mut(),
+                RawEntryMut::Vacant(entry) => entry.insert(module.to_owned(), Self::default()).1,
+            };
+            // Ascending global addresses preserve the path API's first-by-IP
+            // name index, even when the input rows were not address ordered.
+            view.addresses_by_name
+                .entry(row.name.to_owned())
+                .or_insert(row.address);
+            view.symbols
+                .insert(row.address, row.into_module_symbol(module));
+        }
+        modules
+            .into_iter()
+            .map(|(module, mut symbols)| {
+                symbols.build_module_indexes();
+                (module, Arc::new(symbols))
+            })
+            .collect()
     }
 
     fn build_module_indexes(&mut self) {
@@ -2369,35 +2427,16 @@ where
         if !is_kernel_module_symbol_path_str(module_path) {
             return None;
         }
-        if let Some(cached) = self
-            .live_module_kallsyms_cache
-            .lock()
-            .expect("live module kallsyms cache lock")
-            .get(module_path)
-            .cloned()
-        {
-            return cached;
-        }
-
-        let text = self
-            .live_module_kallsyms_text_cache
+        self.live_module_kallsyms_cache
             .get_or_init(|| {
                 self.live_kallsyms_path
                     .as_ref()
                     .and_then(|path| std::fs::read_to_string(path).ok())
-                    .map(Arc::new)
+                    .map(|text| Kallsyms::parse_module_views(&text))
+                    .unwrap_or_default()
             })
-            .clone();
-        let parsed = text.and_then(|text| {
-            Kallsyms::parse_modules_for_path(text.as_ref(), module_path)
-                .ok()
-                .map(Arc::new)
-        });
-        self.live_module_kallsyms_cache
-            .lock()
-            .expect("live module kallsyms cache lock")
-            .insert(module_path.to_string(), parsed.clone());
-        parsed
+            .get(module_path)
+            .cloned()
     }
 
     fn system_map_kallsyms_ref(&self) -> Option<&Kallsyms> {
@@ -4491,26 +4530,24 @@ fn is_kernel_module_symbol_path_str(path: &str) -> bool {
 
 fn insert_kallsyms_symbol(
     symbols: &mut BTreeMap<u64, KallsymsSymbol>,
-    addresses_by_name: &mut BTreeMap<String, u64>,
+    addresses_by_name: Option<&mut BTreeMap<String, u64>>,
     address: u64,
     symbol: KallsymsSymbol,
 ) {
-    match symbols.entry(address) {
-        std::collections::btree_map::Entry::Vacant(entry) => {
-            entry.insert(symbol.clone());
-        }
-        std::collections::btree_map::Entry::Occupied(mut entry) => {
-            // tools/perf/util/symbol.c __symbols__insert() inserts equal-start
-            // symbols to the rb-tree's right side. After symbols__fixup_end(),
-            // the last symbol at an address is the one with nonzero length to
-            // the next address, so symbols__fixup_duplicate() keeps it.
-            entry.insert(symbol.clone());
-        }
+    #[cfg(test)]
+    MODULE_KALLSYMS_SYMBOL_INSERTIONS.with(|count| count.set(count.get() + 1));
+    if let Some(addresses_by_name) = addresses_by_name {
+        addresses_by_name
+            .entry(symbol.name.clone())
+            .or_insert(address);
     }
-    addresses_by_name.entry(symbol.name).or_insert(address);
+    // Preserve the existing last-at-address selection while moving the symbol.
+    symbols.insert(address, symbol);
 }
 
 fn fixup_kallsyms_symbol_ends_like_perf(symbols: &mut [BorrowedKallsymsRow<'_>]) {
+    #[cfg(test)]
+    MODULE_KALLSYMS_END_FIXUP_PASSES.with(|count| count.set(count.get() + 1));
     for index in 1..symbols.len() {
         let current = symbols[index];
         let previous = &mut symbols[index - 1];
@@ -4584,6 +4621,8 @@ fn parse_kallsyms_line(line: &str) -> Option<(u64, String)> {
 }
 
 fn parse_module_kallsyms_line(line: &str) -> Option<BorrowedKallsymsRow<'_>> {
+    #[cfg(test)]
+    MODULE_KALLSYMS_ROW_VISITS.with(|count| count.set(count.get() + 1));
     let (address, rest) = line.trim_start().split_once(char::is_whitespace)?;
     let address = u64::from_str_radix(address, 16).ok()?;
     let (symbol_type, full_name) = rest.trim_start().split_once(char::is_whitespace)?;
@@ -5448,6 +5487,145 @@ mod tests {
             symbols.symbol_name_with_offset(0xa691b),
             Some("__syscall_cancel_arch_start+0x27".to_string())
         );
+    }
+
+    const MULTI_MODULE_KALLSYMS: &str = "not a kallsyms row\n\
+        0000000000000800 T accepted_core\n\
+        0000000000000000 T zero [alpha]\n\
+        0000000000000990 R excluded [alpha]\n\
+        0000000000001040 T shared [alpha]\n\
+        0000000000005000 T gamma_tail [gamma]\n\
+        0000000000001000 T alias_first [alpha]\n\
+        0000000000001000 T alias_last [alpha]\n\
+        0000000000001010 W weak [alpha]\n\
+        0000000000001020 t shared [alpha]\n\
+        0000000000001030 D data [alpha]\n\
+        0000000000001800 B gamma_head [gamma]\n\
+        0000000000002010 T shared [beta]\n\
+        0000000000002020 T beta_tail [beta]\n\
+        0000000000004000 T alpha_tail [alpha]\n";
+
+    fn live_module_kallsyms_fixture(text: &str) -> (tempfile::TempDir, PathBuf) {
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-fixtures");
+        std::fs::create_dir_all(&fixtures).unwrap();
+        let root = tempfile::tempdir_in(fixtures).unwrap();
+        let path = root.path().join("kallsyms");
+        std::fs::write(&path, text).unwrap();
+        (root, path)
+    }
+
+    fn assert_multi_module_kallsyms_views(alpha: &Kallsyms, beta: &Kallsyms, gamma: &Kallsyms) {
+        // tools/perf/util/symbol.c:1512-1523 fixes global ends and duplicates
+        // before splitting DSOs. Same-module aliases get zero length except
+        // for the last entry; module transitions end at a page boundary.
+        for (view, start, end, name) in [
+            (alpha, 0x1000, 0x1010, "alias_last"),
+            (alpha, 0x1010, 0x1020, "weak"),
+            (alpha, 0x1020, 0x1030, "shared"),
+            (alpha, 0x1030, 0x1040, "data"),
+            (alpha, 0x1040, 0x3000, "shared"),
+            (alpha, 0x4000, 0x5000, "alpha_tail"),
+            (beta, 0x2010, 0x2020, "shared"),
+            (beta, 0x2020, 0x4000, "beta_tail"),
+            (gamma, 0x1800, 0x3000, "gamma_head"),
+            (gamma, 0x5000, 0x6000, "gamma_tail"),
+        ] {
+            let symbol = &view.symbols[&start];
+            assert_eq!(symbol.name, name);
+            assert_eq!(symbol.end, Some(end), "{name} at {start:#x}");
+            assert_eq!(
+                view.resolve_module_with_offset(start + 1),
+                Some(format!("{name}+0x1"))
+            );
+        }
+        for (view, end) in [(alpha, 0x3000), (beta, 0x4000), (gamma, 0x6000)] {
+            assert_eq!(view.resolve_module_with_offset(end), None);
+            assert_eq!(view.address_of("accepted_core"), None);
+            assert_eq!(view.address_of("alias_first"), None);
+            assert_eq!(view.address_of("zero"), None);
+            assert_eq!(view.address_of("excluded"), None);
+        }
+        assert_eq!(alpha.address_of("shared"), Some(0x1020));
+        assert_eq!(beta.address_of("shared"), Some(0x2010));
+        assert_eq!(gamma.address_of("shared"), None);
+        assert_eq!(beta.resolve_module_with_offset(0x1000), None);
+        assert_eq!(
+            alpha.resolve_module_with_offset_in_range(0x100f, Some((0x1000, 0x1010))),
+            Some("alias_last+0xf".into())
+        );
+        assert_eq!(
+            alpha.resolve_module_with_offset_in_range(0x100f, Some((0x1000, 0x100f))),
+            None
+        );
+    }
+
+    #[test]
+    fn live_module_kallsyms_builds_the_global_tree_once_for_all_module_views() {
+        let (_root, path) = live_module_kallsyms_fixture(MULTI_MODULE_KALLSYMS);
+        let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
+            .with_system_kallsyms_from_path(&path);
+        super::MODULE_KALLSYMS_TREE_BUILDS.with(|count| count.set(0));
+        super::MODULE_KALLSYMS_ROW_VISITS.with(|count| count.set(0));
+        super::MODULE_KALLSYMS_SYMBOL_INSERTIONS.with(|count| count.set(0));
+        super::MODULE_KALLSYMS_END_FIXUP_PASSES.with(|count| count.set(0));
+
+        let alpha = resolver.live_module_kallsyms_for_path("[alpha]").unwrap();
+        // The source lifetime already retains its first successful read.
+        // New module views must not reread or reparse that source snapshot.
+        std::fs::write(&path, "0000000000001000 T replacement [alpha]\n").unwrap();
+        let beta = resolver.live_module_kallsyms_for_path("[beta]").unwrap();
+        let gamma = resolver.live_module_kallsyms_for_path("[gamma]").unwrap();
+        assert_multi_module_kallsyms_views(&alpha, &beta, &gamma);
+        for module in ["[missing-one]", "[missing-two]", "[missing-one]"] {
+            assert!(resolver.live_module_kallsyms_for_path(module).is_none());
+        }
+        assert!(Arc::ptr_eq(
+            &alpha,
+            &resolver.live_module_kallsyms_for_path("[alpha]").unwrap()
+        ));
+        assert_eq!(
+            (
+                super::MODULE_KALLSYMS_TREE_BUILDS.with(Cell::get),
+                super::MODULE_KALLSYMS_ROW_VISITS.with(Cell::get),
+                super::MODULE_KALLSYMS_SYMBOL_INSERTIONS.with(Cell::get),
+                super::MODULE_KALLSYMS_END_FIXUP_PASSES.with(Cell::get),
+            ),
+            (1, MULTI_MODULE_KALLSYMS.lines().count(), 12, 1),
+            "one global build, one visit per physical row, one insertion per accepted row, one end-fixup pass"
+        );
+    }
+
+    #[test]
+    fn module_kallsyms_views_preserve_global_ends_aliases_and_address_ordered_names() {
+        let alpha = Kallsyms::parse_modules_for_path(MULTI_MODULE_KALLSYMS, "[alpha]").unwrap();
+        let beta = Kallsyms::parse_modules_for_path(MULTI_MODULE_KALLSYMS, "[beta]").unwrap();
+        let gamma = Kallsyms::parse_modules_for_path(MULTI_MODULE_KALLSYMS, "[gamma]").unwrap();
+        assert_multi_module_kallsyms_views(&alpha, &beta, &gamma);
+    }
+
+    #[test]
+    fn live_module_kallsyms_source_snapshots_remain_isolated_between_resolvers() {
+        let (_root, path) = live_module_kallsyms_fixture(MULTI_MODULE_KALLSYMS);
+        let first = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
+            .with_system_kallsyms_from_path(&path);
+        let first_alpha = first.live_module_kallsyms_for_path("[alpha]").unwrap();
+        std::fs::write(&path, "0000000000001000 T replacement [alpha]\n").unwrap();
+        let second = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
+            .with_system_kallsyms_from_path(&path);
+        let second_alpha = second.live_module_kallsyms_for_path("[alpha]").unwrap();
+        assert_eq!(first_alpha.address_of("alias_last"), Some(0x1000));
+        assert_eq!(first_alpha.address_of("replacement"), None);
+        assert_eq!(second_alpha.address_of("replacement"), Some(0x1000));
+        assert_eq!(second_alpha.address_of("alias_last"), None);
+        assert!(!Arc::ptr_eq(&first_alpha, &second_alpha));
+        assert_eq!(
+            first
+                .live_module_kallsyms_for_path("[beta]")
+                .unwrap()
+                .address_of("shared"),
+            Some(0x2010)
+        );
+        assert!(second.live_module_kallsyms_for_path("[beta]").is_none());
     }
 
     #[test]
@@ -7006,6 +7184,90 @@ mod tests {
     }
 
     #[test]
+    fn warm_user_frame_lookups_skip_source_state_and_duplicate_ip_checks() {
+        let mut table = super::UserFrameTable::default();
+        table.insert(usize::MAX, 0, 11);
+        table.insert(usize::MAX, u64::MAX, 0);
+        table.insert(7, 0, 22);
+        assert_eq!(table.slot(usize::MAX, 0), Some(11));
+        let state_checks = table.source_state_checks.get();
+        let hint_checks = table.address_hint_checks.get();
+        let source_searches = table.source_searches.get();
+        let address_searches = table.address_searches.get();
+        for (address, expected) in [(u64::MAX, Some(0)), (42, None), (0, Some(11))] {
+            assert_eq!(table.slot(usize::MAX, address), expected);
+        }
+        assert_eq!(table.source_state_checks.get(), state_checks);
+        assert_eq!(table.address_hint_checks.get(), hint_checks);
+        assert_eq!(table.source_searches.get(), source_searches);
+        assert_eq!(table.address_searches.get() - address_searches, 3);
+
+        // A source switch still validates availability and reuses its saved IP.
+        assert_eq!(table.slot(7, 0), Some(22));
+        let address_searches = table.address_searches.get();
+        assert_eq!(table.slot(usize::MAX, 0), Some(11));
+        assert_eq!(table.source_state_checks.get() - state_checks, 2);
+        assert_eq!(table.address_hint_checks.get() - hint_checks, 2);
+        assert_eq!(table.address_searches.get(), address_searches);
+    }
+
+    #[test]
+    fn warm_user_frame_lookups_invalidate_mutations_and_survive_table_growth() {
+        let mut table = super::UserFrameTable::default();
+        table.insert(usize::MAX, 0, 11);
+        table.insert(usize::MAX, u64::MAX, 0);
+        assert_eq!(table.slot(usize::MAX, 0), Some(11));
+        assert_eq!(table.slot(usize::MAX, 42), None);
+
+        // A cached miss must become visible at a different IP on the warm path.
+        table.insert(usize::MAX, 42, 12);
+        assert_eq!(table.slot(usize::MAX, 0), Some(11));
+        assert_eq!(table.slot(usize::MAX, 42), Some(12));
+        table.insert(usize::MAX, 42, 0);
+        assert_eq!(table.slot(usize::MAX, u64::MAX), Some(0));
+        assert_eq!(table.slot(usize::MAX, 42), Some(0));
+        table.insert(usize::MAX, u64::MAX, 13);
+        assert_eq!(table.slot(usize::MAX, 0), Some(11));
+        assert_eq!(table.slot(usize::MAX, u64::MAX), Some(13));
+
+        let index = table.by_source[&usize::MAX];
+        let source_capacity = table.sources.capacity();
+        let address_capacity = table.sources[index].by_address.capacity();
+        for source in 0..256 {
+            table.insert(source, 0, source + 1);
+            table.insert(usize::MAX, u64::try_from(source).unwrap() + 100, source + 1);
+        }
+        assert!(table.sources.capacity() > source_capacity);
+        assert!(table.sources[index].by_address.capacity() > address_capacity);
+        assert_eq!(table.by_source[&usize::MAX], index);
+        assert_eq!(table.slot(usize::MAX, 0), Some(11));
+        assert_eq!(table.slot(usize::MAX, u64::MAX), Some(13));
+        assert_eq!(table.slot(7, 0), Some(8));
+        assert_eq!(table.slot(usize::MAX, 42), Some(0));
+        assert_eq!(table.slot(usize::MAX, 100), Some(1));
+
+        // Clearing an unavailable source drops every old IP and both hints.
+        table.mark_unavailable(usize::MAX);
+        assert_eq!(table.slot(usize::MAX, 0), Some(0));
+        assert_eq!(table.slot(usize::MAX, u64::MAX), Some(0));
+        assert_eq!(table.slot(7, 0), Some(8));
+        assert_eq!(table.slot(usize::MAX, 42), Some(0));
+        let source_count = table.sources.len();
+        for slot in [0, 14, 15] {
+            table.insert(usize::MAX, 42, slot);
+            assert_eq!(table.slot(usize::MAX, 0), None);
+            assert_eq!(table.slot(usize::MAX, 42), Some(slot));
+            assert_eq!(table.slot(usize::MAX, u64::MAX), None);
+            assert_eq!(table.slot(usize::MAX, 100), None);
+            assert_eq!(table.slot(7, 0), Some(8));
+            assert_eq!(table.slot(usize::MAX, 42), Some(slot));
+            table.mark_unavailable(usize::MAX);
+        }
+        assert_eq!(table.sources.len(), source_count);
+        assert_eq!(table.by_source[&usize::MAX], index);
+    }
+
+    #[test]
     fn repeated_user_frame_lookups_skip_source_storage_for_hits_negatives_and_misses() {
         // perf util/symbol.c:dso__find_symbol (575-583) reuses exact last hits.
         // Source identity and mutation invalidation must also remain explicit.
@@ -7104,6 +7366,108 @@ mod tests {
         assert_eq!(table.slot(usize::MAX, u64::MAX), None);
         table.mark_unavailable(usize::MAX);
         assert_eq!(table.slot(usize::MAX, 42), Some(0));
+    }
+
+    #[test]
+    fn warm_mapping_frame_lookups_keep_inline_base_and_kernel_namespaces_separate() {
+        let mappings = identity_test_mappings();
+        let mut hint = crate::perfdata::mappings::MappingResolveCache::default();
+        let resolver = CountingFrameResolver::new(Vec::new());
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let first = mappings.resolve_frame_cached(1, 42, &mut hint).unwrap();
+        let negative = mappings.resolve_frame_cached(1, 43, &mut hint).unwrap();
+        let kernel = mappings
+            .resolve_frame_cached(1, 0xffff_ffff_8000_002a, &mut hint)
+            .unwrap();
+        let first_key = super::mapping_frame_key(&first.resolved_ref());
+        let negative_key = super::mapping_frame_key(&negative.resolved_ref());
+        let kernel_key = super::mapping_frame_key(&kernel.resolved_ref());
+        for (inline, label, offset) in [(false, "base", 7), (true, "inline", 8)] {
+            let table = if inline {
+                &mut cache.resolved_by_mapping
+            } else {
+                &mut cache.resolved_base_by_mapping
+            };
+            let mut frames = cached_table_frames(label.into(), offset);
+            frames.has_inline_frames = inline;
+            frames.has_non_inline_base_frame = !inline;
+            table.insert(first_key, frames);
+            table.insert(negative_key, empty_cached_table_frames());
+            table.insert(kernel_key, cached_table_frames("kernel".into(), 9));
+        }
+        let base_identity = cache
+            .cached_mapping_frames_with_identity(&first, false)
+            .unwrap()
+            .0
+            .unwrap();
+        let inline_identity = cache
+            .cached_mapping_frames_with_identity(&first, true)
+            .unwrap()
+            .0
+            .unwrap();
+        assert_ne!(base_identity, inline_identity);
+        for (inline, label, offset, identity) in [
+            (false, "base", 7, base_identity),
+            (true, "inline", 8, inline_identity),
+            (false, "base", 7, base_identity),
+        ] {
+            let (negative_identity, frames) = cache
+                .cached_mapping_frames_with_identity(&negative, inline)
+                .unwrap();
+            assert_eq!(negative_identity, None);
+            assert!(frames.is_fully_unresolved());
+            let (actual, frames) = cache
+                .cached_mapping_frames_with_identity(&first, inline)
+                .unwrap();
+            assert_eq!(actual, Some(identity));
+            assert_eq!(identity.projection_index().0, usize::from(inline));
+            assert_eq!(frames.frames, [label]);
+            assert_eq!(frames.literal_ends, [Some(label.len())]);
+            assert_eq!(frames.base_offset, Some(offset));
+            assert!(frames.has_base_symbol);
+            assert_eq!(frames.has_inline_frames, inline);
+            assert_eq!(frames.has_non_inline_base_frame, !inline);
+            assert_eq!(
+                cache.cached_mapping_frames(&kernel, inline).unwrap().frames,
+                ["kernel"]
+            );
+        }
+
+        cache
+            .resolved_by_mapping
+            .user
+            .mark_unavailable(first_key.symbol_source_id);
+        let unavailable = cache.cached_mapping_frames(&first, true).unwrap();
+        assert!(unavailable.is_fully_unresolved());
+        assert_eq!(
+            cache.cached_mapping_frames(&first, false).unwrap().frames,
+            ["base"]
+        );
+        let mut metadata = empty_cached_table_frames();
+        metadata.has_inline_frames = true;
+        metadata.base_offset = Some(0);
+        cache.resolved_by_mapping.insert(negative_key, metadata);
+        assert!(cache.cached_mapping_frames(&first, true).is_none());
+        let (identity, frames) = cache
+            .cached_mapping_frames_with_identity(&negative, true)
+            .unwrap();
+        assert!(identity.is_some());
+        assert!(frames.frames.is_empty());
+        assert!(frames.has_inline_frames);
+        assert_eq!(frames.base_offset, Some(0));
+        assert!(
+            cache
+                .cached_mapping_frames(&negative, false)
+                .unwrap()
+                .is_fully_unresolved()
+        );
+        for inline in [false, true] {
+            assert_eq!(
+                cache.cached_mapping_frames(&kernel, inline).unwrap().frames,
+                ["kernel"]
+            );
+        }
+        assert_eq!(resolver.calls.get(), 0);
     }
 
     #[test]
