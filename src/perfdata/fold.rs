@@ -2538,6 +2538,12 @@ fn mapping_requires_perf_text(mapping: &MappedFrame<'_>) -> bool {
 }
 
 impl FoldedRenderBuffers {
+    fn finish_stack(&mut self, comm_prefix_len: usize) {
+        if self.current.len() == comm_prefix_len {
+            self.current.clear();
+        }
+    }
+
     #[inline]
     fn repeat_segment(&mut self, start: usize, repeats: usize) {
         if repeats <= 1 {
@@ -2693,7 +2699,9 @@ impl<'a> FoldFrameResolver<'a> {
                     if let Some(cache) = symbol_cache.as_deref_mut() {
                         // Event-line IPs use machine__resolve(), not append_inlines().
                         let expand = self.inline && !matches!(frame, FoldFrame::SampleIp { .. });
-                        if let Some(cached) = cache.cached_mapping_frames(&mapping, expand) {
+                        if let Some((_, cached)) =
+                            cache.cached_mapping_frames_with_identity(&mapping, expand)
+                        {
                             if matches!(
                                 cached.render_mode,
                                 crate::symbols::SymbolFrameRenderMode::PerfScript
@@ -2754,9 +2762,7 @@ impl<'a> FoldFrameResolver<'a> {
             }
             buffers.repeat_segment(segment_start, repeats);
         }
-        if buffers.current.len() == comm_prefix_len {
-            buffers.current.clear();
-        }
+        buffers.finish_stack(comm_prefix_len);
         Ok(FoldedRenderStatus::Rendered)
     }
 
@@ -3002,8 +3008,8 @@ fn append_prefetched_folded_frame<R: SymbolResolver>(
     match decision {
         FrameMappingDecision::Mapped(mapping) => {
             let expand = inline && !matches!(frame, FoldFrame::SampleIp { .. });
-            let cached = cache
-                .cached_mapping_frames(&mapping, expand)
+            let (_, cached) = cache
+                .cached_mapping_frames_with_identity(&mapping, expand)
                 .ok_or_else(|| "symbol frame cache lookup missed after resolution".to_string())?;
             if matches!(
                 cached.render_mode,

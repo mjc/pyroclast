@@ -235,6 +235,7 @@ struct MappingFrameKey {
 }
 
 pub(crate) struct CachedMappingFrames {
+    revision: u64,
     pub(crate) frames: Vec<String>,
     pub(crate) literal_ends: Vec<Option<usize>>,
     pub(crate) has_base_symbol: bool,
@@ -243,6 +244,11 @@ pub(crate) struct CachedMappingFrames {
     has_non_inline_base_frame: bool,
     base_offset: Option<u64>,
 }
+
+/// Opaque projection key scoped to one `SymbolFrameCache` session.
+/// The low bit distinguishes inline from base frames; replacements get a new revision.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct MappingFramesIdentity(u64);
 
 pub(crate) enum SymbolFrameRenderMode {
     Direct,
@@ -372,6 +378,7 @@ impl UserFrameTable {
 }
 
 static UNRESOLVED_MAPPING_FRAMES: CachedMappingFrames = CachedMappingFrames {
+    revision: 0,
     frames: Vec::new(),
     literal_ends: Vec::new(),
     has_base_symbol: false,
@@ -396,6 +403,7 @@ struct MappingFrameTable {
     user: UserFrameTable,
     kernel: FxHashMap<MappingFrameKey, usize>,
     frames: Vec<CachedMappingFrames>,
+    last_revision: u64,
     #[cfg(test)]
     lookups: Cell<usize>,
 }
@@ -453,17 +461,28 @@ impl MappingFrameTable {
         slot.map(|slot| self.at_slot(slot))
     }
 
-    fn insert(&mut self, key: MappingFrameKey, frames: CachedMappingFrames) {
+    fn insert(&mut self, key: MappingFrameKey, mut frames: CachedMappingFrames) {
+        let fully_unresolved = frames.is_fully_unresolved();
+        frames.revision = if fully_unresolved {
+            0
+        } else {
+            self.last_revision = self
+                .last_revision
+                .checked_add(1)
+                .filter(|revision| *revision <= u64::MAX >> 1)
+                .expect("symbol frame cache revision exhausted");
+            self.last_revision
+        };
         if let Some(slot) = self.slot(&key) {
             if slot != 0 {
                 self.frames[slot - 1] = frames;
                 return;
             }
-            if frames.is_fully_unresolved() {
+            if fully_unresolved {
                 return;
             }
         }
-        let slot = if frames.is_fully_unresolved() {
+        let slot = if fully_unresolved {
             0
         } else {
             self.frames.push(frames);
@@ -1784,6 +1803,20 @@ where
         table.get_frame(mapping)
     }
 
+    /// Returns a session-local projection identity and borrowed frames in one lookup.
+    /// A miss is outer `None`; fully unresolved frames have no identity.
+    #[inline]
+    pub(crate) fn cached_mapping_frames_with_identity(
+        &self,
+        mapping: &MappedFrame<'_>,
+        inline: bool,
+    ) -> Option<(Option<MappingFramesIdentity>, &CachedMappingFrames)> {
+        let cached = self.cached_mapping_frames(mapping, inline)?;
+        let identity = (cached.revision != 0)
+            .then(|| MappingFramesIdentity((cached.revision << 1) | u64::from(inline)));
+        Some((identity, cached))
+    }
+
     pub(crate) fn prefetch_mapping_refs_with_mode<'mapping, M>(
         &mut self,
         mappings: impl IntoIterator<Item = M>,
@@ -1832,6 +1865,7 @@ where
             for (key, frames) in keys.drain(..).zip(resolved) {
                 let unavailable = frames.source_state == SymbolSourceState::Unavailable;
                 let frames = CachedMappingFrames {
+                    revision: 0,
                     literal_ends: frames
                         .frames
                         .iter()
@@ -6173,6 +6207,7 @@ mod tests {
     fn cached_table_frames(label: String, offset: u64) -> super::CachedMappingFrames {
         let literal_end = crate::folded::inferno_perf_raw_function_literal_end(&label);
         super::CachedMappingFrames {
+            revision: 0,
             frames: vec![label],
             literal_ends: vec![literal_end],
             has_base_symbol: true,
@@ -6185,6 +6220,7 @@ mod tests {
 
     fn empty_cached_table_frames() -> super::CachedMappingFrames {
         super::CachedMappingFrames {
+            revision: 0,
             frames: Vec::new(),
             literal_ends: Vec::new(),
             has_base_symbol: false,
@@ -6193,6 +6229,291 @@ mod tests {
             has_non_inline_base_frame: false,
             base_offset: None,
         }
+    }
+
+    fn identity_test_mappings() -> crate::perfdata::mappings::MmapTable {
+        let mut mappings = crate::perfdata::mappings::MmapTable::default();
+        for (start, path) in [
+            (0, "/bin/demo"),
+            (0x1_0000, "/bin/other"),
+            (0xffff_ffff_8000_0000, "[kernel.kallsyms]"),
+        ] {
+            mappings.insert_mmap(crate::perfdata::records::MmapRecord {
+                pid: 1,
+                tid: 1,
+                start,
+                len: 0x1_0000,
+                pgoff: 0,
+                path: path.into(),
+            });
+        }
+        mappings
+    }
+
+    #[test]
+    fn mapping_projection_identity_survives_frame_vector_growth() {
+        assert_eq!(std::mem::size_of::<super::MappingFramesIdentity>(), 8);
+        let mappings = identity_test_mappings();
+        let mut hint = crate::perfdata::mappings::MappingResolveCache::default();
+        let resolver = CountingFrameResolver::new(Vec::new());
+        for inline in [false, true] {
+            let mut cache = SymbolFrameCache::new(&resolver);
+            let mapping = mappings.resolve_frame_cached(1, 42, &mut hint).unwrap();
+            let key = super::mapping_frame_key(&mapping.resolved_ref());
+            let table = if inline {
+                &mut cache.resolved_by_mapping
+            } else {
+                &mut cache.resolved_base_by_mapping
+            };
+            table.insert(key, cached_table_frames("first".into(), 1));
+            let capacity = table.frames.capacity();
+            let identity = cache
+                .cached_mapping_frames_with_identity(&mapping, inline)
+                .unwrap()
+                .0
+                .unwrap();
+            let mut identities = super::FxHashSet::default();
+            identities.insert(identity);
+            for address in 43..4096 {
+                let next = mappings
+                    .resolve_frame_cached(1, address, &mut hint)
+                    .unwrap();
+                let table = if inline {
+                    &mut cache.resolved_by_mapping
+                } else {
+                    &mut cache.resolved_base_by_mapping
+                };
+                table.insert(
+                    super::mapping_frame_key(&next.resolved_ref()),
+                    cached_table_frames("next".into(), address),
+                );
+                assert!(
+                    identities.insert(
+                        cache
+                            .cached_mapping_frames_with_identity(&next, inline)
+                            .unwrap()
+                            .0
+                            .unwrap()
+                    )
+                );
+            }
+            let table = if inline {
+                &cache.resolved_by_mapping
+            } else {
+                &cache.resolved_base_by_mapping
+            };
+            assert!(table.frames.capacity() > capacity);
+            let lookups = cache.mapping_frame_lookup_count();
+            let (after, frames) = cache
+                .cached_mapping_frames_with_identity(&mapping, inline)
+                .unwrap();
+            assert_eq!(after, Some(identity));
+            assert_eq!(frames.frames, ["first"]);
+            assert!(std::ptr::eq(
+                frames,
+                cache.cached_mapping_frames(&mapping, inline).unwrap()
+            ));
+            assert_eq!(cache.mapping_frame_lookup_count() - lookups, 2);
+        }
+    }
+
+    #[test]
+    fn mapping_projection_identity_separates_inline_base_and_mapping_keys() {
+        let mappings = identity_test_mappings();
+        let mut hint = crate::perfdata::mappings::MappingResolveCache::default();
+        let resolver = CountingFrameResolver::new(Vec::new());
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let mut identities = super::FxHashSet::default();
+        for inline in [false, true] {
+            for address in [42, 43, 0x1_002a, 0xffff_ffff_8000_002a] {
+                let mapping = mappings
+                    .resolve_frame_cached(1, address, &mut hint)
+                    .unwrap();
+                assert!(
+                    cache
+                        .cached_mapping_frames_with_identity(&mapping, inline)
+                        .is_none()
+                );
+                let table = if inline {
+                    &mut cache.resolved_by_mapping
+                } else {
+                    &mut cache.resolved_base_by_mapping
+                };
+                table.insert(
+                    super::mapping_frame_key(&mapping.resolved_ref()),
+                    cached_table_frames("same-label".into(), 0),
+                );
+                assert!(
+                    identities.insert(
+                        cache
+                            .cached_mapping_frames_with_identity(&mapping, inline)
+                            .unwrap()
+                            .0
+                            .unwrap()
+                    )
+                );
+            }
+        }
+        assert_eq!(identities.len(), 8);
+    }
+
+    #[test]
+    fn mapping_projection_identity_changes_on_overwrite_and_negative_transitions() {
+        let mappings = identity_test_mappings();
+        let mut hint = crate::perfdata::mappings::MappingResolveCache::default();
+        let resolver = CountingFrameResolver::new(Vec::new());
+        for inline in [false, true] {
+            for address in [42, 0xffff_ffff_8000_002a] {
+                let mut cache = SymbolFrameCache::new(&resolver);
+                let mapping = mappings
+                    .resolve_frame_cached(1, address, &mut hint)
+                    .unwrap();
+                let key = super::mapping_frame_key(&mapping.resolved_ref());
+                let mut identities = super::FxHashSet::default();
+                for label in ["first", "replacement", "replacement", "revived"] {
+                    let table = if inline {
+                        &mut cache.resolved_by_mapping
+                    } else {
+                        &mut cache.resolved_base_by_mapping
+                    };
+                    table.insert(key, cached_table_frames(label.into(), 1));
+                    assert_eq!(table.frames.len(), 1);
+                    let (identity, frames) = cache
+                        .cached_mapping_frames_with_identity(&mapping, inline)
+                        .unwrap();
+                    assert!(identities.insert(identity.unwrap()));
+                    assert_eq!(frames.frames, [label]);
+                    if label == "first" || label == "revived" {
+                        let table = if inline {
+                            &mut cache.resolved_by_mapping
+                        } else {
+                            &mut cache.resolved_base_by_mapping
+                        };
+                        table.insert(key, empty_cached_table_frames());
+                        let (identity, frames) = cache
+                            .cached_mapping_frames_with_identity(&mapping, inline)
+                            .unwrap();
+                        assert_eq!(identity, None);
+                        assert!(frames.is_fully_unresolved());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mapping_projection_identity_preserves_each_empty_frame_metadata_field() {
+        let mappings = identity_test_mappings();
+        let mut hint = crate::perfdata::mappings::MappingResolveCache::default();
+        let resolver = CountingFrameResolver::new(Vec::new());
+        let mut cache = SymbolFrameCache::new(&resolver);
+        for inline in [false, true] {
+            for address in 0..4 {
+                let mapping = mappings
+                    .resolve_frame_cached(1, address, &mut hint)
+                    .unwrap();
+                let mut metadata = empty_cached_table_frames();
+                match address {
+                    0 => metadata.has_base_symbol = true,
+                    1 => metadata.has_inline_frames = true,
+                    2 => metadata.has_non_inline_base_frame = true,
+                    _ => metadata.base_offset = Some(0),
+                }
+                let table = if inline {
+                    &mut cache.resolved_by_mapping
+                } else {
+                    &mut cache.resolved_base_by_mapping
+                };
+                table.insert(super::mapping_frame_key(&mapping.resolved_ref()), metadata);
+                let (identity, frames) = cache
+                    .cached_mapping_frames_with_identity(&mapping, inline)
+                    .unwrap();
+                assert!(identity.is_some());
+                assert!(frames.frames.is_empty());
+                assert!(!std::ptr::eq(
+                    frames,
+                    &raw const super::UNRESOLVED_MAPPING_FRAMES
+                ));
+                assert_eq!(frames.has_base_symbol, address == 0);
+                assert_eq!(frames.has_inline_frames, address == 1);
+                assert_eq!(frames.has_non_inline_base_frame, address == 2);
+                assert_eq!(frames.base_offset, (address == 3).then_some(0));
+            }
+        }
+    }
+
+    #[test]
+    fn mapping_projection_identity_canonicalizes_terminal_sources_and_address_gaps() {
+        let mappings = identity_test_mappings();
+        let mut hint = crate::perfdata::mappings::MappingResolveCache::default();
+        let resolver = UnavailableObjectResolver;
+        let mut cache = SymbolFrameCache::new(&resolver);
+        for address in [42, 0x1_002a] {
+            let mapping = mappings
+                .resolve_frame_cached(1, address, &mut hint)
+                .unwrap();
+            cache.resolve_mapping_ref(&mapping.resolved_ref()).unwrap();
+        }
+        for inline in [false, true] {
+            for address in [0, 42, 4096, 0x1_0000, 0x1_002a, 0x1_1000] {
+                let mapping = mappings
+                    .resolve_frame_cached(1, address, &mut hint)
+                    .unwrap();
+                let (identity, frames) = cache
+                    .cached_mapping_frames_with_identity(&mapping, inline)
+                    .unwrap();
+                assert_eq!(identity, None);
+                assert!(std::ptr::eq(
+                    frames,
+                    &raw const super::UNRESOLVED_MAPPING_FRAMES
+                ));
+            }
+            let table = if inline {
+                &mut cache.resolved_by_mapping
+            } else {
+                &mut cache.resolved_base_by_mapping
+            };
+            assert_eq!(table.user.len(), 0);
+            assert_eq!(table.frames.capacity(), 0);
+            let mapping = mappings
+                .resolve_frame_cached(1, 0xffff_ffff_8000_002a, &mut hint)
+                .unwrap();
+            table.insert(
+                super::mapping_frame_key(&mapping.resolved_ref()),
+                empty_cached_table_frames(),
+            );
+            let (identity, frames) = cache
+                .cached_mapping_frames_with_identity(&mapping, inline)
+                .unwrap();
+            assert_eq!(identity, None);
+            assert!(std::ptr::eq(
+                frames,
+                &raw const super::UNRESOLVED_MAPPING_FRAMES
+            ));
+            let unseen = mappings
+                .resolve_frame_cached(1, 0xffff_ffff_8000_002b, &mut hint)
+                .unwrap();
+            assert!(
+                cache
+                    .cached_mapping_frames_with_identity(&unseen, inline)
+                    .is_none()
+            );
+        }
+        let gap_resolver = CountingFrameResolver::new(vec![Vec::new()]);
+        let mut gaps = SymbolFrameCache::new(&gap_resolver);
+        let mapping = mappings.resolve_frame_cached(1, 42, &mut hint).unwrap();
+        gaps.resolve_mapping_ref(&mapping.resolved_ref()).unwrap();
+        assert_eq!(
+            gaps.cached_mapping_frames_with_identity(&mapping, true)
+                .unwrap()
+                .0,
+            None
+        );
+        let unseen = mappings.resolve_frame_cached(1, 43, &mut hint).unwrap();
+        assert!(
+            gaps.cached_mapping_frames_with_identity(&unseen, true)
+                .is_none()
+        );
     }
 
     #[test]
