@@ -3251,20 +3251,20 @@ impl PerfObjectSymbolIndex {
             if self.max_end_by_index[index] <= address {
                 break;
             }
-            let candidate = &self.symbols[index];
+            let mut candidate = &self.symbols[index];
+            // perf symbol.c:symbols__fixup_duplicate selects the winner
+            // before address lookup, not only among aliases covering the IP.
+            // Keep the raw candidates for BFD's independent function lookup.
+            while index > 0 && self.symbols[index - 1].address == candidate.address {
+                index -= 1;
+                // In-order perf insertion prefers the earlier alias on ties.
+                candidate = perf_best_duplicate_symbol(&self.symbols[index], candidate);
+            }
             if !perf_symbol_candidate_contains_address(candidate, address) {
                 continue;
             }
             best = Some(match best {
                 Some(current) if current.address > candidate.address => current,
-                Some(current) if current.address == candidate.address => {
-                    // perf inserts equal-start symbols to the right side of the
-                    // rb-tree and symbols__fixup_duplicate() walks in-order, so
-                    // the earlier inserted symbol is syma. This reverse scan
-                    // sees the later symbol first; pass the earlier candidate as
-                    // the first argument to preserve perf's final arch fallback.
-                    perf_best_duplicate_symbol(candidate, current)
-                }
                 _ => candidate,
             });
         }
@@ -5204,6 +5204,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn object_symbol_index_does_not_resurrect_discarded_alias_past_winner_end() {
+        // perf symbol-elf.c:dso__load_sym_internal fixes ends, then
+        // symbol.c:symbols__fixup_duplicate removes equal-start losers.
+        let bytes = elf_with_text_symbol_fixtures(
+            elf::EM_X86_64,
+            &[
+                (b"function", 0x1000, 16, elf::STB_GLOBAL, elf::STT_FUNC),
+                (b"label", 0x1000, 0, elf::STB_GLOBAL, elf::STT_NOTYPE),
+                (b"next", 0x1020, 16, elf::STB_GLOBAL, elf::STT_FUNC),
+            ],
+        );
+        let index = PerfObjectSymbolIndex::from_object_bytes(&bytes);
+        assert_eq!(index.symbol_name(0x1008), Some("function"));
+        assert_eq!(index.symbol_name(0x1010), None);
+        assert_eq!(index.symbol_name(0x1018), None);
+        assert_eq!(index.symbol_name(0x1020), Some("next"));
+    }
+
+    #[test]
+    fn discarded_perf_alias_remains_available_for_bfd_function_record_lookup() {
+        // Binutils bfd/dwarf2.c:_bfd_elf_find_function retains its own
+        // canonical candidates; perf's duplicate removal must not erase them.
+        let bytes = elf_with_text_symbol_fixtures(
+            elf::EM_X86_64,
+            &[
+                (b"unit.c", 0, 0, elf::STB_LOCAL, elf::STT_FILE),
+                (b"global", 0x1000, 16, elf::STB_GLOBAL, elf::STT_FUNC),
+                (b"local_alias", 0x1000, 48, elf::STB_LOCAL, elf::STT_FUNC),
+                (b"next", 0x1030, 16, elf::STB_GLOBAL, elf::STT_FUNC),
+            ],
+        );
+        let index = PerfObjectSymbolIndex::from_object_bytes(&bytes);
+        assert_eq!(index.symbol_name(0x1008), Some("global"));
+        assert_eq!(index.symbol_name(0x1018), None);
+        assert_eq!(index.bfd_function_record_name(0x1018), Some("local_alias"));
     }
 
     #[test]
