@@ -16,6 +16,12 @@ pub(super) trait RecordSource {
 
     fn release_record(&mut self, _offset: usize) {}
 
+    // Called after delivery borrows end. All pending and unscanned records
+    // start at or after this offset; retirement must not discard file bytes.
+    fn retire_before(&mut self, _offset: usize) -> Result<(), String> {
+        Ok(())
+    }
+
     fn delivered_record_at(&mut self, offset: usize, end: usize) -> Result<PerfRecord<'_>, String> {
         self.record_at(offset, end)
     }
@@ -185,6 +191,10 @@ impl RecordSource for BufferedScanner<'_> {
 struct MappedDelivery {
     mapping: Option<memmap2::Mmap>,
     len: usize,
+    #[cfg(target_os = "linux")]
+    page_size: usize,
+    #[cfg(target_os = "linux")]
+    retired_until: usize,
     #[cfg(test)]
     range_requests: usize,
 }
@@ -209,6 +219,39 @@ impl RecordSource for MappedDelivery {
     fn record_at(&mut self, offset: usize, end: usize) -> Result<PerfRecord<'_>, String> {
         record_from_window(self, offset, end)
     }
+
+    fn retire_before(&mut self, offset: usize) -> Result<(), String> {
+        if offset > self.len {
+            return Err(format!(
+                "retirement offset {offset} exceeds perf.data length"
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let end = offset - offset % self.page_size;
+            if end > self.retired_until {
+                if let Some(mapping) = &self.mapping {
+                    // SAFETY: The mapping is read-only, shared original-file
+                    // backing, not anonymous/private modified data. No borrowed
+                    // record outlives this mutable source call. Both boundaries
+                    // are page-aligned and within the mapping. DONTNEED drops
+                    // translations, not file bytes; future reads can refault.
+                    unsafe {
+                        mapping.unchecked_advise_range(
+                            memmap2::UncheckedAdvice::DontNeed,
+                            self.retired_until,
+                            end - self.retired_until,
+                        )
+                    }
+                    .map_err(|error| {
+                        format!("failed to retire consumed perf.data pages: {error}")
+                    })?;
+                }
+                self.retired_until = end;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Buffered scanning with original-file-backed ordered delivery.
@@ -229,6 +272,12 @@ impl<'a> FileSource<'a> {
                 .len(),
         )
         .map_err(|_| "perf.data size exceeds usize".to_string())?;
+        #[cfg(target_os = "linux")]
+        // SAFETY: sysconf takes no pointers and queries the running kernel.
+        let page_size = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+            .ok()
+            .filter(|size| *size != 0)
+            .ok_or_else(|| "failed to query system page size".to_string())?;
         let mapping = if len == 0 {
             None
         } else {
@@ -262,6 +311,10 @@ impl<'a> FileSource<'a> {
             delivery: MappedDelivery {
                 mapping,
                 len,
+                #[cfg(target_os = "linux")]
+                page_size,
+                #[cfg(target_os = "linux")]
+                retired_until: 0,
                 #[cfg(test)]
                 range_requests: 0,
             },
@@ -300,11 +353,124 @@ impl RecordSource for FileSource<'_> {
             .map(|_| ())
             .ok_or_else(|| format!("truncated perf record at offset {offset}"))
     }
+
+    fn retire_before(&mut self, offset: usize) -> Result<(), String> {
+        self.delivery.retire_before(offset)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{FileSource, RecordSource, SliceSource};
+
+    #[cfg(target_os = "linux")]
+    fn page_is_mapped(address: usize) -> bool {
+        use std::os::unix::fs::FileExt;
+        // SAFETY: sysconf takes no pointers and queries the running kernel.
+        let page_size = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+        let mut entry = [0; 8];
+        std::fs::File::open("/proc/self/pagemap")
+            .unwrap()
+            .read_exact_at(&mut entry, u64::try_from(address / page_size * 8).unwrap())
+            .unwrap();
+        u64::from_ne_bytes(entry) & (1 << 63) != 0
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retiring_consumed_pages_drops_residency_but_preserves_pending_boundary_pages() {
+        let range_size = super::DELIVERY_RANGE_SIZE;
+        // SAFETY: sysconf takes no pointers and queries the running kernel.
+        let page_size = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len((3 * range_size) as u64).unwrap();
+        let mut source = FileSource::new(file.as_file()).unwrap();
+        let mapping = source.delivery.mapping.as_ref().unwrap();
+        let pointer = mapping.as_ptr() as usize;
+        for offset in [0, range_size, range_size + page_size] {
+            std::hint::black_box(mapping[offset]);
+            assert!(page_is_mapped(pointer + offset));
+        }
+
+        source.retire_before(range_size + page_size / 2).unwrap();
+        assert!(
+            !page_is_mapped(pointer),
+            "consumed input page remains resident"
+        );
+        assert!(
+            page_is_mapped(pointer + range_size),
+            "pending boundary page was retired"
+        );
+        assert!(page_is_mapped(pointer + range_size + page_size));
+        source.retire_before(0).unwrap();
+        assert!(page_is_mapped(pointer + range_size));
+
+        source.retire_before(source.len()).unwrap();
+        assert!(!page_is_mapped(pointer + range_size));
+        assert!(!page_is_mapped(pointer + range_size + page_size));
+        // Retirement discards page-table residency, not file bytes or the VMA.
+        assert_eq!(source.delivery.bytes_at(0, 8).unwrap(), [0; 8]);
+        assert!(page_is_mapped(pointer));
+    }
+
+    #[test]
+    fn retirement_validates_empty_and_short_files_without_changing_record_bytes() {
+        for bytes in [Vec::new(), record(b"short")] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), &bytes).unwrap();
+            let mut source = FileSource::new(file.as_file()).unwrap();
+            source.retire_before(0).unwrap();
+            assert!(source.retire_before(bytes.len() + 1).is_err());
+            assert!(source.retire_before(usize::MAX).is_err());
+            source.retire_before(bytes.len()).unwrap();
+            assert_eq!(source.delivery.bytes_at(0, bytes.len()).unwrap(), bytes);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retirement_preserves_split_headers_and_maximum_pending_record_payloads() {
+        use std::io::{Seek, SeekFrom, Write};
+        let file_size = 3 * super::DELIVERY_RANGE_SIZE;
+        // SAFETY: sysconf takes no pointers and queries the running kernel.
+        let page_size = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+        let offset = super::DELIVERY_RANGE_SIZE + page_size - 4;
+        let payload = vec![37; usize::from(u16::MAX) - 8];
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(file_size as u64).unwrap();
+        file.seek(SeekFrom::Start(offset as u64)).unwrap();
+        file.write_all(&record(&payload)).unwrap();
+        let mut source = FileSource::new(file.as_file()).unwrap();
+        source.record_at(offset, file_size).unwrap();
+        source.retain_record(offset).unwrap();
+        assert_eq!(
+            source
+                .delivered_record_at(offset, file_size)
+                .unwrap()
+                .payload,
+            payload
+        );
+        source.retire_before(offset).unwrap();
+        assert_eq!(
+            source
+                .delivered_record_at(offset, file_size)
+                .unwrap()
+                .payload,
+            payload
+        );
+        source.release_record(offset);
+        source
+            .retire_before(offset + usize::from(u16::MAX))
+            .unwrap();
+        // Even retired records remain accessible through their original file.
+        assert_eq!(
+            source
+                .delivered_record_at(offset, file_size)
+                .unwrap()
+                .payload,
+            payload
+        );
+    }
 
     fn record(payload: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::new();

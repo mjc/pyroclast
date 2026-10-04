@@ -1140,6 +1140,16 @@ fn replay_records<O: SampleOutput>(
             ordered.flush_round_with(|offset| {
                 deliver_record(source, offset, end, layouts, options, sink)
             })?;
+            // ordered-events.c:do_flush leaves newer timestamps queued.
+            // Their file offsets are not timestamp ordered. Retire only the
+            // consumed prefix, without touching the pending boundary page.
+            let oldest_pending = ordered
+                .pending_records
+                .iter()
+                .map(|record| record.offset)
+                .min()
+                .unwrap_or(next);
+            source.retire_before(oldest_pending.min(next))?;
         } else if ordered_events
             && let Some(time) =
                 record_time(record, layouts)?.filter(|time| *time != 0 && *time != u64::MAX)
@@ -1155,6 +1165,7 @@ fn replay_records<O: SampleOutput>(
     }
     ordered
         .flush_final_with(|offset| deliver_record(source, offset, end, layouts, options, sink))?;
+    source.retire_before(end)?;
     sink.flush_deferred_samples()
 }
 
@@ -5137,6 +5148,7 @@ mod tests {
         source: super::SliceSource<'a>,
         pending: std::collections::BTreeSet<usize>,
         delivered: Vec<usize>,
+        retired: Vec<usize>,
     }
 
     impl super::RecordSource for RetentionCheckedSource<'_> {
@@ -5172,10 +5184,16 @@ mod tests {
                 "release must balance retention"
             );
         }
+
+        fn retire_before(&mut self, offset: usize) -> Result<(), String> {
+            assert!(self.pending.iter().all(|pending| *pending >= offset));
+            self.retired.push(offset);
+            Ok(())
+        }
     }
 
     #[test]
-    fn replay_retains_backing_until_ordered_delivery_and_releases_on_parse_errors() {
+    fn replay_retires_consumed_backing_after_delivery_but_not_after_parse_errors() {
         let layouts = super::SampleLayouts {
             fallback: Some(std::sync::Arc::new(super::SampleEventLayout::new(
                 crate::perfdata::samples::SampleLayout {
@@ -5214,6 +5232,7 @@ mod tests {
                 source: super::SliceSource(&bytes),
                 pending: std::collections::BTreeSet::new(),
                 delivered: Vec::new(),
+                retired: Vec::new(),
             };
             let mut sink = super::SampleSink::new(
                 super::SessionState::new(std::collections::BTreeMap::new()),
@@ -5241,13 +5260,85 @@ mod tests {
                 );
                 assert_eq!(source.delivered, [32]);
                 assert_eq!(source.pending, std::collections::BTreeSet::from([0]));
+                assert!(source.retired.is_empty());
             } else {
                 result.unwrap();
                 assert_eq!(source.delivered, [32, 0]);
                 assert!(source.pending.is_empty());
+                assert_eq!(source.retired, [bytes.len()]);
                 assert_eq!(sink.accumulator.thread_comms[&12].name, "later");
             }
         }
+    }
+
+    #[test]
+    fn replay_round_retirement_uses_oldest_file_offset_not_first_timestamp() {
+        let layouts = super::SampleLayouts {
+            fallback: Some(std::sync::Arc::new(super::SampleEventLayout::new(
+                crate::perfdata::samples::SampleLayout {
+                    sample_type: crate::perfdata::samples::PERF_SAMPLE_TIME,
+                    sample_id_all: true,
+                    read_format: 0,
+                    branch_sample_type: 0,
+                    sample_regs_user: 0,
+                    sample_regs_intr: 0,
+                },
+                "cycles",
+                1,
+            ))),
+            ..super::SampleLayouts::default()
+        };
+        let mut bytes = Vec::new();
+        let mut rounds = Vec::new();
+        for times in [[50_u64, 10], [70, 60]] {
+            for time in times {
+                bytes.extend(3_u32.to_le_bytes());
+                bytes.extend(0_u16.to_le_bytes());
+                bytes.extend(32_u16.to_le_bytes());
+                bytes.extend(11_u32.to_le_bytes());
+                bytes.extend(12_u32.to_le_bytes());
+                bytes.extend(b"command\0");
+                bytes.extend(time.to_le_bytes());
+            }
+            bytes.extend(super::PERF_RECORD_FINISHED_ROUND.to_le_bytes());
+            bytes.extend(0_u16.to_le_bytes());
+            bytes.extend(8_u16.to_le_bytes());
+            rounds.push(bytes.len());
+        }
+        let header = super::PerfHeader {
+            header_size: 0,
+            attr_offset: 0,
+            attr_size: 0,
+            data_offset: 0,
+            data_size: u64::try_from(bytes.len()).unwrap(),
+        };
+        let mut source = RetentionCheckedSource {
+            source: super::SliceSource(&bytes),
+            pending: std::collections::BTreeSet::new(),
+            delivered: Vec::new(),
+            retired: Vec::new(),
+        };
+        let mut sink = super::SampleSink::new(
+            super::SessionState::new(std::collections::BTreeMap::new()),
+            super::FoldedOutput::<super::NoopSymbolResolver>::new(
+                None,
+                super::FoldOptions::default(),
+                0,
+            ),
+        );
+        super::replay_records(
+            &mut source,
+            header,
+            &layouts,
+            super::FoldOptions::default(),
+            &mut sink,
+        )
+        .unwrap();
+        // ordered-events.c:OE_FLUSH__ROUND uses the preceding round's maximum.
+        // The timestamp-first pending record is at 104; offset 72 is still live.
+        assert_eq!(source.delivered, [32, 0, 104, 72]);
+        assert_eq!(source.retired, [0, rounds[0], bytes.len()]);
+        assert!(source.pending.is_empty());
     }
 
     #[test]

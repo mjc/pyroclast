@@ -747,6 +747,7 @@ dependencies = [
  "gimli",
  "hashbrown 0.17.1",
  "inferno",
+ "libc",
  "memchr",
  "memmap2",
  "object",
