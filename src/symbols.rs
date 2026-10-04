@@ -3068,7 +3068,9 @@ fn perf_symbol_is_candidate(object: &object::File<'_>, symbol: &object::Symbol<'
     let name = symbol.name().unwrap_or_default().as_bytes();
     if let [b'$', marker, suffix @ ..] = name {
         let is_mapping_marker = match object.architecture() {
-            object::Architecture::Arm | object::Architecture::Aarch64 => {
+            object::Architecture::Arm
+            | object::Architecture::Aarch64
+            | object::Architecture::Aarch64_Ilp32 => {
                 matches!(marker, b'a' | b'd' | b't' | b'x')
                     && (suffix.is_empty() || suffix.first() == Some(&b'.'))
             }
@@ -3782,12 +3784,21 @@ fn symbol_candidate_from_object_symbol(
         object::SymbolFlags::Elf { st_info, .. } => Some(st_info & 0xf),
         _ => None,
     };
+    // perf util/symbol-elf.c:dso__load_sym_internal and BFD
+    // elf32-arm.c:elf32_arm_swap_symbol_in both clear Thumb's STT_FUNC bit.
+    // Perf keeps IFUNC's raw address; ARM BFD's maybe_function_sym rejects it.
+    let address =
+        if architecture == object::Architecture::Arm && elf_type == Some(object::elf::STT_FUNC) {
+            symbol.address() & !1
+        } else {
+            symbol.address()
+        };
     PerfSymbolCandidate {
         name: perf_symbol_name(&addr2line::demangle_auto(
             Cow::Borrowed(symbol.name().unwrap_or_default()),
             None,
         )),
-        address: symbol.address(),
+        address,
         size: symbol.size(),
         bfd_size: symbol.size(),
         elf_type,
@@ -3802,7 +3813,11 @@ fn symbol_candidate_from_object_symbol(
             PerfSymbolBinding::Global
         },
         bfd_function_like: bfd_symbol_is_function_like(architecture, symbol),
-        bfd_function: elf_type == Some(object::elf::STT_FUNC),
+        // BFD's ARM swap-in hook promotes TFUNC before elfcode.h assigns
+        // BSF_FUNCTION. Keep perf's independent raw ELF type unchanged.
+        bfd_function: elf_type == Some(object::elf::STT_FUNC)
+            || (architecture == object::Architecture::Arm
+                && elf_type == Some(object::elf::STT_ARM_TFUNC)),
         bfd_has_filename: false,
     }
 }
@@ -5212,8 +5227,15 @@ mod tests {
         machine: u16,
         symbols: &[(&'static [u8], u64, u64, u8, u8)],
     ) -> Vec<u8> {
-        let mut builder =
-            build::elf::Builder::new(object::Endianness::Little, machine != elf::EM_ARM);
+        elf_with_text_symbol_fixtures_for_class(machine, machine != elf::EM_ARM, symbols)
+    }
+
+    fn elf_with_text_symbol_fixtures_for_class(
+        machine: u16,
+        is_64: bool,
+        symbols: &[(&'static [u8], u64, u64, u8, u8)],
+    ) -> Vec<u8> {
+        let mut builder = build::elf::Builder::new(object::Endianness::Little, is_64);
         builder.header.e_type = elf::ET_EXEC;
         builder.header.e_machine = machine;
         let section = builder.sections.add();
@@ -5537,6 +5559,111 @@ mod tests {
             PerfObjectSymbolIndex::from_object_bytes(&bytes).bfd_function_record_name(0x1014),
             Some("function")
         );
+    }
+
+    #[test]
+    fn bfd_lookup_clears_arm_thumb_function_address_bit_like_binutils() {
+        // bfd/elf32-arm.c:elf32_arm_swap_symbol_in clears STT_FUNC's low bit
+        // before dwarf2.c:better_fit compares canonical symbol offsets.
+        let bytes = elf_with_text_symbol_fixtures(
+            elf::EM_ARM,
+            &[
+                (b"fixture.c", 0, 0, elf::STB_LOCAL, elf::STT_FILE),
+                (b"thumb", 0x1001, 16, elf::STB_LOCAL, elf::STT_FUNC),
+                (b"base", 0x1000, 32, elf::STB_GLOBAL, elf::STT_FUNC),
+            ],
+        );
+        assert_eq!(
+            PerfObjectSymbolIndex::from_object_bytes(&bytes).bfd_function_record_name(0x1000),
+            Some("thumb")
+        );
+    }
+
+    #[test]
+    fn bfd_lookup_treats_arm_tfunc_as_function_like_binutils() {
+        // elf32_arm_swap_symbol_in converts STT_ARM_TFUNC to STT_FUNC;
+        // elfcode.h:elf_slurp_symbol_table then assigns BSF_FUNCTION.
+        let bytes = elf_with_text_symbol_fixtures(
+            elf::EM_ARM,
+            &[
+                (b"fixture.c", 0, 0, elf::STB_LOCAL, elf::STT_FILE),
+                (b"ordinary", 0x1000, 32, elf::STB_LOCAL, elf::STT_FUNC),
+                (
+                    b"thumb_alias",
+                    0x1000,
+                    16,
+                    elf::STB_LOCAL,
+                    elf::STT_ARM_TFUNC,
+                ),
+            ],
+        );
+        assert_eq!(
+            PerfObjectSymbolIndex::from_object_bytes(&bytes).bfd_function_record_name(0x1008),
+            Some("thumb_alias")
+        );
+    }
+
+    #[test]
+    fn perf_lookup_clears_arm_thumb_function_address_bit() {
+        // tools/perf/util/symbol-elf.c:dso__load_sym_internal removes the
+        // low address bit only for EM_ARM STT_FUNC, before symbol insertion.
+        let bytes = elf_with_text_symbol_fixtures(
+            elf::EM_ARM,
+            &[(b"thumb", 0x1001, 16, elf::STB_LOCAL, elf::STT_FUNC)],
+        );
+        assert_eq!(
+            PerfObjectSymbolIndex::from_object_bytes(&bytes).symbol_name(0x1000),
+            Some("thumb")
+        );
+    }
+
+    #[test]
+    fn perf_lookup_rejects_aarch64_ilp32_mapping_symbols() {
+        // dso__load_sym_internal filters EM_AARCH64 mapping symbols without
+        // an ELFCLASS restriction, so ELF32 follows the same rule as ELF64.
+        let bytes = elf_with_text_symbol_fixtures_for_class(
+            elf::EM_AARCH64,
+            false,
+            &[
+                (b"function", 0x1000, 64, elf::STB_LOCAL, elf::STT_FUNC),
+                (b"$x", 0x1010, 0, elf::STB_LOCAL, elf::STT_NOTYPE),
+            ],
+        );
+        assert_eq!(
+            object::File::parse(bytes.as_slice())
+                .unwrap()
+                .architecture(),
+            object::Architecture::Aarch64_Ilp32
+        );
+        assert_eq!(
+            PerfObjectSymbolIndex::from_object_bytes(&bytes).symbol_name(0x1014),
+            Some("function")
+        );
+    }
+
+    #[test]
+    fn arm_symbol_normalization_preserves_non_func_addresses() {
+        // Perf strips the low bit only on FUNC; BFD's TFUNC branch changes
+        // its type but not its address (elf32_arm_swap_symbol_in).
+        for symbol_type in [elf::STT_NOTYPE, elf::STT_GNU_IFUNC] {
+            let bytes = elf_with_text_symbol_fixtures(
+                elf::EM_ARM,
+                &[(b"symbol", 0x1001, 16, elf::STB_LOCAL, symbol_type)],
+            );
+            let index = PerfObjectSymbolIndex::from_object_bytes(&bytes);
+            assert_eq!(index.symbol_name(0x1000), None);
+            assert_eq!(index.symbol_name(0x1001), Some("symbol"));
+        }
+        let bytes = elf_with_text_symbol_fixtures(
+            elf::EM_ARM,
+            &[
+                (b"fixture.c", 0, 0, elf::STB_LOCAL, elf::STT_FILE),
+                (b"thumb", 0x1001, 16, elf::STB_LOCAL, elf::STT_ARM_TFUNC),
+            ],
+        );
+        let index = PerfObjectSymbolIndex::from_object_bytes(&bytes);
+        assert_eq!(index.bfd_function_record_name(0x1000), None);
+        assert_eq!(index.bfd_function_record_name(0x1001), Some("thumb"));
     }
 
     #[test]
