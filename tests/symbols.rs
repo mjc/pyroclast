@@ -1012,7 +1012,11 @@ fn bfd_fallback_preserves_native_function_cache_across_address_order() {
     let native_text = String::from_utf8_lossy(&native.stdout);
     let native_frames: Vec<_> = native_text.lines().step_by(2).map(str::to_string).collect();
     assert_eq!(native_frames.len(), 3, "{native_text}");
-    assert_eq!(&native_frames[..2], ["short", "medium"]);
+    assert_eq!(
+        native_frames,
+        ["short", "medium", "medium"],
+        "native BFD must reuse its cached winner: {native_text}"
+    );
     assert!(
         native_text
             .lines()
