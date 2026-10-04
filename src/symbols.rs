@@ -3416,7 +3416,7 @@ fn object_symbol_candidates(
             symbol_seen = true;
             let perf_candidate = perf_symbol_candidate_from_object_symbol(object, &symbol);
             let bfd_function_like = perf_candidate.as_ref().map_or_else(
-                || bfd_symbol_is_function_like(&symbol),
+                || bfd_symbol_is_function_like(object.architecture(), &symbol),
                 |candidate| candidate.bfd_function_like,
             );
             let bfd_section = (dynamic == bfd_dynamic && bfd_function_like)
@@ -3430,8 +3430,9 @@ fn object_symbol_candidates(
                 continue;
             }
             let is_perf_candidate = perf_candidate.is_some();
-            let mut candidate =
-                perf_candidate.unwrap_or_else(|| symbol_candidate_from_object_symbol(&symbol));
+            let mut candidate = perf_candidate.unwrap_or_else(|| {
+                symbol_candidate_from_object_symbol(object.architecture(), &symbol)
+            });
             candidate.bfd_has_filename = dynamic == bfd_dynamic
                 && file_seen
                 && (matches!(symbol.flags(), object::SymbolFlags::Elf { st_info, .. }
@@ -3685,16 +3686,21 @@ fn perf_symbol_candidate_from_object_symbol(
     object: &object::File<'_>,
     symbol: &object::Symbol<'_, '_>,
 ) -> Option<PerfSymbolCandidate> {
-    perf_symbol_is_candidate(object, symbol).then(|| symbol_candidate_from_object_symbol(symbol))
+    perf_symbol_is_candidate(object, symbol)
+        .then(|| symbol_candidate_from_object_symbol(object.architecture(), symbol))
 }
 
-fn bfd_symbol_is_function_like(symbol: &object::Symbol<'_, '_>) -> bool {
+fn bfd_symbol_is_function_like(
+    architecture: object::Architecture,
+    symbol: &object::Symbol<'_, '_>,
+) -> bool {
     let object::SymbolFlags::Elf { st_info, st_other } = symbol.flags() else {
         return false;
     };
     let symbol_type = st_info & 0xf;
     // elfcode.h assigns the flags excluded by elf.c:maybe_function_sym for
-    // these types. IFUNC is eligible, but does not carry BSF_FUNCTION.
+    // these types. Generic ELF accepts IFUNC without BSF_FUNCTION; target
+    // hooks below may reject it entirely.
     if matches!(
         symbol_type,
         object::elf::STT_SECTION
@@ -3707,13 +3713,71 @@ fn bfd_symbol_is_function_like(symbol: &object::Symbol<'_, '_>) -> bool {
     ) {
         return false;
     }
-    !(symbol.size() == 0
-        && st_info >> 4 == object::elf::STB_LOCAL
+    let local = st_info >> 4 == object::elf::STB_LOCAL;
+    if symbol.size() == 0
+        && local
         && symbol_type == object::elf::STT_NOTYPE
-        && st_other & 3 == object::elf::STV_HIDDEN)
+        && st_other & 3 == object::elf::STV_HIDDEN
+    {
+        return false;
+    }
+    // elf32-arm.c/elfnn-aarch64.c:maybe_function_sym have explicit type
+    // whitelists, then reject local special names using cpu-*.c's TYPE_ANY.
+    match architecture {
+        object::Architecture::Arm
+            if !matches!(
+                symbol_type,
+                object::elf::STT_NOTYPE | object::elf::STT_FUNC | object::elf::STT_ARM_TFUNC
+            ) =>
+        {
+            return false;
+        }
+        object::Architecture::Aarch64 | object::Architecture::Aarch64_Ilp32
+            if !matches!(symbol_type, object::elf::STT_NOTYPE | object::elf::STT_FUNC) =>
+        {
+            return false;
+        }
+        _ => {}
+    }
+    if !local {
+        return true;
+    }
+    let name = symbol.name().unwrap_or_default().as_bytes();
+    let special = match architecture {
+        object::Architecture::Arm => {
+            matches!(name, [b'$', letter, suffix @ ..]
+                if letter.is_ascii_lowercase() && (suffix.is_empty() || suffix[0] == b'.'))
+        }
+        object::Architecture::Aarch64 | object::Architecture::Aarch64_Ilp32 => {
+            matches!(name, [b'$', b'x' | b'd' | b'm' | b'f' | b'p', suffix @ ..]
+                if suffix.is_empty() || suffix[0] == b'.')
+        }
+        // cpu-riscv.c accepts exact $d/$x and the $xrv prefix; unlike perf
+        // it does not classify $d.0 or $x.0 as mapping symbols.
+        object::Architecture::Riscv32 | object::Architecture::Riscv64 => {
+            matches!(name, b"$d" | b"$x")
+                || name.starts_with(b"$xrv")
+                || bfd_elf_is_local_label_name(name)
+        }
+        _ => false,
+    };
+    !special
 }
 
-fn symbol_candidate_from_object_symbol(symbol: &object::Symbol<'_, '_>) -> PerfSymbolCandidate {
+fn bfd_elf_is_local_label_name(name: &[u8]) -> bool {
+    // elf.c:_bfd_elf_is_local_label_name recognizes these prefixes and
+    // L<digit>\x01 fake symbols. Its numeric-label loop rejects other
+    // control-character forms when its non-digit check runs.
+    name.starts_with(b".L")
+        || name.starts_with(b"..")
+        || name.starts_with(b"_.L_")
+        || matches!(name, [b'L', digit, 1, ..] if digit.is_ascii_digit())
+}
+
+fn symbol_candidate_from_object_symbol(
+    architecture: object::Architecture,
+    symbol: &object::Symbol<'_, '_>,
+) -> PerfSymbolCandidate {
     let elf_type = match symbol.flags() {
         object::SymbolFlags::Elf { st_info, .. } => Some(st_info & 0xf),
         _ => None,
@@ -3737,7 +3801,7 @@ fn symbol_candidate_from_object_symbol(symbol: &object::Symbol<'_, '_>) -> PerfS
         } else {
             PerfSymbolBinding::Global
         },
-        bfd_function_like: bfd_symbol_is_function_like(symbol),
+        bfd_function_like: bfd_symbol_is_function_like(architecture, symbol),
         bfd_function: elf_type == Some(object::elf::STT_FUNC),
         bfd_has_filename: false,
     }
@@ -5408,6 +5472,162 @@ mod tests {
                     "machine {machine}, name {name:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn bfd_lookup_rejects_local_target_special_symbols_like_binutils() {
+        // Native maybe_function_sym hooks use cpu-arm.c/cpu-aarch64.c's
+        // SPECIAL_SYM_TYPE_ANY, and cpu-riscv.c's exact mapping predicate
+        // plus elf.c:_bfd_elf_is_local_label_name. These differ from perf.
+        for (machine, names) in [
+            (
+                elf::EM_ARM,
+                vec![b"$a".as_slice(), b"$t", b"$d", b"$x", b"$q", b"$f.1"],
+            ),
+            (
+                elf::EM_AARCH64,
+                vec![b"$x".as_slice(), b"$d", b"$m", b"$p", b"$f.1"],
+            ),
+            (
+                elf::EM_RISCV,
+                vec![
+                    b"$x".as_slice(),
+                    b"$d",
+                    b"$xrv64i",
+                    b".Linternal",
+                    b"..internal",
+                    b"_.L_internal",
+                    b"L0\x01symbol",
+                ],
+            ),
+        ] {
+            for name in names {
+                let bytes = elf_with_text_symbol_fixtures(
+                    machine,
+                    &[
+                        (b"fixture.c", 0, 0, elf::STB_LOCAL, elf::STT_FILE),
+                        (b"function", 0x1000, 64, elf::STB_LOCAL, elf::STT_FUNC),
+                        (name, 0x1010, 0, elf::STB_LOCAL, elf::STT_NOTYPE),
+                    ],
+                );
+                assert_eq!(
+                    PerfObjectSymbolIndex::from_object_bytes(&bytes)
+                        .bfd_function_record_name(0x1014),
+                    Some("function"),
+                    "machine {machine}, name {name:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bfd_lookup_rejects_aarch64_local_mapping_symbols_like_binutils() {
+        // elfnn-aarch64.c:elfNN_aarch64_maybe_function_sym delegates to
+        // cpu-aarch64.c:bfd_is_aarch64_special_symbol_name with TYPE_ANY.
+        let bytes = elf_with_text_symbol_fixtures(
+            elf::EM_AARCH64,
+            &[
+                (b"fixture.c", 0, 0, elf::STB_LOCAL, elf::STT_FILE),
+                (b"function", 0x1000, 64, elf::STB_LOCAL, elf::STT_FUNC),
+                (b"$x", 0x1010, 0, elf::STB_LOCAL, elf::STT_NOTYPE),
+            ],
+        );
+        assert_eq!(
+            PerfObjectSymbolIndex::from_object_bytes(&bytes).bfd_function_record_name(0x1014),
+            Some("function")
+        );
+    }
+
+    #[test]
+    fn bfd_lookup_rejects_riscv_local_mapping_symbols_like_binutils() {
+        // elfnn-riscv.c:riscv_maybe_function_sym rejects the exact $x/$d
+        // names and $xrv prefix recognized by cpu-riscv.c.
+        let bytes = elf_with_text_symbol_fixtures(
+            elf::EM_RISCV,
+            &[
+                (b"fixture.c", 0, 0, elf::STB_LOCAL, elf::STT_FILE),
+                (b"function", 0x1000, 64, elf::STB_LOCAL, elf::STT_FUNC),
+                (b"$x", 0x1010, 0, elf::STB_LOCAL, elf::STT_NOTYPE),
+            ],
+        );
+        assert_eq!(
+            PerfObjectSymbolIndex::from_object_bytes(&bytes).bfd_function_record_name(0x1014),
+            Some("function")
+        );
+    }
+
+    #[test]
+    fn bfd_lookup_rejects_aarch64_ifunc_records_like_binutils() {
+        // elfnn-aarch64.c:elfNN_aarch64_maybe_function_sym accepts only
+        // NOTYPE/FUNC for nonsynthetic symbols, explicitly excluding IFUNC.
+        let bytes = elf_with_text_symbol_fixtures(
+            elf::EM_AARCH64,
+            &[
+                (b"fixture.c", 0, 0, elf::STB_LOCAL, elf::STT_FILE),
+                (b"function", 0x1000, 64, elf::STB_LOCAL, elf::STT_FUNC),
+                (b"ifunc", 0x1008, 16, elf::STB_LOCAL, elf::STT_GNU_IFUNC),
+            ],
+        );
+        assert_eq!(
+            PerfObjectSymbolIndex::from_object_bytes(&bytes).bfd_function_record_name(0x100c),
+            Some("function")
+        );
+    }
+
+    #[test]
+    fn bfd_lookup_preserves_global_special_symbols_and_nonmapping_labels() {
+        for (machine, name, binding) in [
+            (elf::EM_ARM, b"$a".as_slice(), elf::STB_GLOBAL),
+            (elf::EM_AARCH64, b"$x".as_slice(), elf::STB_GLOBAL),
+            (elf::EM_RISCV, b"$d".as_slice(), elf::STB_GLOBAL),
+            (elf::EM_ARM, b"$aLong".as_slice(), elf::STB_LOCAL),
+            (elf::EM_AARCH64, b"$xLong".as_slice(), elf::STB_LOCAL),
+            (elf::EM_RISCV, b"$d.0".as_slice(), elf::STB_LOCAL),
+            (elf::EM_RISCV, b"$x.0".as_slice(), elf::STB_LOCAL),
+            (elf::EM_RISCV, b"L12\x01suffix".as_slice(), elf::STB_LOCAL),
+            (elf::EM_X86_64, b"$x".as_slice(), elf::STB_LOCAL),
+            (elf::EM_X86_64, b".Linternal".as_slice(), elf::STB_LOCAL),
+        ] {
+            let bytes = elf_with_text_symbol_fixtures(
+                machine,
+                &[
+                    (b"fixture.c", 0, 0, elf::STB_LOCAL, elf::STT_FILE),
+                    (b"function", 0x1000, 64, elf::STB_LOCAL, elf::STT_FUNC),
+                    (name, 0x1010, 0, binding, elf::STT_NOTYPE),
+                ],
+            );
+            assert_eq!(
+                PerfObjectSymbolIndex::from_object_bytes(&bytes).bfd_function_record_name(0x1014),
+                Some(std::str::from_utf8(name).unwrap()),
+                "machine {machine}, name {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bfd_lookup_applies_arm_type_whitelists_without_restricting_x86() {
+        // elf32-arm.c/elfnn-aarch64.c:maybe_function_sym explicitly reject
+        // IFUNC, unlike the generic hook used by x86 and RISC-V.
+        for (machine, expected) in [
+            (elf::EM_ARM, "function"),
+            (elf::EM_AARCH64, "function"),
+            (elf::EM_X86_64, "ifunc"),
+            (elf::EM_RISCV, "ifunc"),
+        ] {
+            let bytes = elf_with_text_symbol_fixtures(
+                machine,
+                &[
+                    (b"fixture.c", 0, 0, elf::STB_LOCAL, elf::STT_FILE),
+                    (b"function", 0x1000, 64, elf::STB_LOCAL, elf::STT_FUNC),
+                    (b"ifunc", 0x1008, 16, elf::STB_LOCAL, elf::STT_GNU_IFUNC),
+                ],
+            );
+            assert_eq!(
+                PerfObjectSymbolIndex::from_object_bytes(&bytes).bfd_function_record_name(0x100c),
+                Some(expected),
+                "machine {machine}"
+            );
         }
     }
 
