@@ -895,6 +895,200 @@ fn rust_addr2line_bfd_fallback_uses_raw_zero_sized_alias_extent_like_binutils() 
 }
 
 #[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn bfd_fallback_accepts_nonzero_hidden_notype_symbols_rejected_by_perf() {
+    // bfd/elf.c:_bfd_elf_maybe_function_sym rejects hidden local NOTYPE
+    // only with zero st_size; perf symbol-elf.c filters all hidden labels.
+    assert_bfd_fallback_assembly_matches_native(
+        r#"
+        ".globl outer_function\n"
+        ".type outer_function,@function\n"
+        "outer_function:\n"
+        ".fill 8,1,0x90\n"
+        ".hidden inner_label\n"
+        ".type inner_label,@notype\n"
+        "inner_label:\n"
+        ".fill 24,1,0x90\n"
+        ".size outer_function,32\n"
+        ".size inner_label,8\n"
+        "#,
+        "outer_function",
+        9,
+        "inner_label",
+    );
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn bfd_fallback_shortens_extents_in_canonical_order_before_alias_selection() {
+    // bfd/dwarf2.c:_bfd_elf_find_function shortens its cached best extent
+    // when a later canonical symbol starts beyond the queried address.
+    assert_bfd_fallback_assembly_matches_native(
+        r#"
+        ".type local_function,@function\n"
+        "local_function:\n"
+        ".fill 8,1,0x90\n"
+        ".type next_local,@function\n"
+        "next_local:\n"
+        ".fill 24,1,0x90\n"
+        ".size local_function,32\n"
+        ".size next_local,8\n"
+        ".globl global_alias\n"
+        ".type global_alias,@function\n"
+        ".set global_alias,local_function\n"
+        ".size global_alias,16\n"
+        "#,
+        "local_function",
+        4,
+        "local_function",
+    );
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn bfd_fallback_prefers_ordinary_function_over_smaller_ifunc_alias() {
+    // bfd/elfcode.h gives IFUNC BSF_GNU_INDIRECT_FUNCTION, not
+    // BSF_FUNCTION. dwarf2.c:better_fit prefers FUNC before comparing size.
+    assert_bfd_fallback_assembly_matches_native(
+        r#"
+        ".type local_function,@function\n"
+        "local_function:\n"
+        ".fill 32,1,0x90\n"
+        ".size local_function,32\n"
+        ".globl ifunc_alias\n"
+        ".type ifunc_alias,@gnu_indirect_function\n"
+        ".set ifunc_alias,local_function\n"
+        ".size ifunc_alias,16\n"
+        "#,
+        "local_function",
+        8,
+        "local_function",
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn compiled_bfd_assembly_fixture(assembly: &str) -> (tempfile::TempDir, PathBuf, Vec<u8>) {
+    let source = format!(
+        "int with_source_line(void) {{ return 7; }}\n\
+         __asm__(\".pushsection .text.alias_fixture,\\\"ax\\\",@progbits\\n\"\n\
+         {assembly}\n\".popsection\\n\");"
+    );
+    compiled_c_fixture(&source)
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn bfd_fallback_preserves_native_function_cache_across_address_order() {
+    // bfd/dwarf2.c:_bfd_elf_find_function reuses its previous winner while
+    // the next address remains within the cached (possibly shortened) extent.
+    let (_root, binary, bytes) = compiled_bfd_assembly_fixture(
+        r#"
+        ".type long_function_name,@function\n"
+        "long_function_name:\n"
+        ".fill 48,1,0x90\n"
+        ".size long_function_name,48\n"
+        ".type medium,@function\n"
+        ".set medium,long_function_name\n"
+        ".size medium,32\n"
+        ".type short,@function\n"
+        ".set short,long_function_name\n"
+        ".size short,16\n"
+        "#,
+    );
+    let object = object::File::parse(bytes.as_slice()).expect("fixture ELF");
+    let base = object
+        .symbols()
+        .find(|symbol| symbol.name() == Ok("long_function_name"))
+        .expect("long function")
+        .address();
+    let addresses = [base + 4, base + 24, base + 8];
+    let native = Command::new("addr2line")
+        .args(["-f", "-i", "-e"])
+        .arg(&binary)
+        .args(addresses.map(|address| format!("{address:x}")))
+        .output()
+        .expect("run ordered native addr2line queries");
+    assert!(native.status.success());
+    let native_text = String::from_utf8_lossy(&native.stdout);
+    let native_frames: Vec<_> = native_text.lines().step_by(2).map(str::to_string).collect();
+    assert_eq!(native_frames.len(), 3, "{native_text}");
+    assert_eq!(&native_frames[..2], ["short", "medium"]);
+    assert!(
+        native_text
+            .lines()
+            .skip(1)
+            .step_by(2)
+            .all(|line| { line.ends_with(":?") || line.ends_with(":0") })
+    );
+    let requests = addresses.map(|address| SymbolRequest {
+        path: binary.clone(),
+        relative_address: address,
+        kernel_mapping_range: None,
+        build_id: None,
+        file_identity: None,
+        kernel_relocation: None,
+    });
+    let frames = RustAddr2lineResolver::new()
+        .resolve_frame_batch(&requests)
+        .expect("resolve ordered fallback frames");
+    assert_eq!(
+        frames,
+        native_frames
+            .into_iter()
+            .map(|name| vec![name])
+            .collect::<Vec<_>>()
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn assert_bfd_fallback_assembly_matches_native(
+    assembly: &str,
+    query_symbol: &str,
+    offset: u64,
+    expected: &str,
+) {
+    let (_root, binary, bytes) = compiled_bfd_assembly_fixture(assembly);
+    let object = object::File::parse(bytes.as_slice()).expect("fixture ELF");
+    let address = object
+        .symbols()
+        .find(|symbol| symbol.name() == Ok(query_symbol))
+        .expect("query symbol")
+        .address()
+        + offset;
+    let native = Command::new("addr2line")
+        .args(["-f", "-i", "-e"])
+        .arg(&binary)
+        .arg(format!("{address:x}"))
+        .output()
+        .expect("run native addr2line");
+    assert!(
+        native.status.success(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    let native_text = String::from_utf8_lossy(&native.stdout);
+    assert_eq!(native_text.lines().next(), Some(expected), "{native_text}");
+    assert!(
+        native_text
+            .lines()
+            .nth(1)
+            .is_some_and(|line| line.ends_with(":?") || line.ends_with(":0")),
+        "assembly address must have no source line: {native_text}"
+    );
+    let frames = RustAddr2lineResolver::new()
+        .resolve_frame_batch(&[SymbolRequest {
+            path: binary,
+            relative_address: address,
+            kernel_mapping_range: None,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        }])
+        .expect("resolve fallback frames");
+    assert_eq!(frames, vec![vec![expected.to_string()]]);
+}
+
+#[test]
 fn rust_addr2line_resolver_uses_libdw_inline_die_name_for_cargo_read_to_end() {
     // Reference fixture:
     //   perf script --inline -i /tmp/backend768.perf.data

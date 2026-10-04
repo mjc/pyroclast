@@ -30,6 +30,8 @@ type FxHashSet<T> = HashSet<T, FxBuildHasher>;
 
 const X86_64_PLT_ENTRY_SIZE: u64 = 16;
 const ELF64_RELA_ENTRY_SIZE: usize = 24;
+const ELF_STT_RELC: u8 = 8;
+const ELF_STT_SRELC: u8 = 9;
 
 #[cfg(test)]
 thread_local! {
@@ -663,6 +665,29 @@ struct PerfObjectSymbolNames<'a> {
 struct PerfObjectSymbolIndex {
     symbols: Vec<PerfSymbolCandidate>,
     max_end_by_index: Vec<u64>,
+    bfd_only_symbols: Vec<PerfSymbolCandidate>,
+    bfd_sections: Vec<BfdSymbolSection>,
+    bfd_function_cache: Mutex<Option<BfdFunctionRecordCache>>,
+}
+
+#[derive(Clone, Copy)]
+enum BfdSymbolIndex {
+    Perf(usize),
+    BfdOnly(usize),
+}
+
+struct BfdSymbolSection {
+    index: object::SectionIndex,
+    range: PerfAddressRange,
+    address_bias: u64,
+    symbols: Vec<BfdSymbolIndex>,
+}
+
+struct BfdFunctionRecordCache {
+    section: object::SectionIndex,
+    symbol: BfdSymbolIndex,
+    offset: u64,
+    size: u64,
 }
 
 pub struct PerfSymbolResolver<O> {
@@ -3186,32 +3211,29 @@ impl PerfObjectSymbolIndex {
         let Ok(object) = object::File::parse(object_bytes) else {
             return Self::default();
         };
-        let mut symbols =
-            Vec::with_capacity(object.symbols().count() + object.dynamic_symbols().count());
-        // bfd/dwarf2.c _bfd_elf_find_function() assigns the last STT_FILE
-        // name to eligible function symbols while scanning the symtab.
-        let (mut file_seen, mut symbol_seen, mut file_after_symbol) = (false, false, false);
-        for symbol in object.symbols() {
-            if symbol.kind() == SymbolKind::File {
-                file_seen = true;
-                file_after_symbol |= symbol_seen;
-                continue;
-            }
-            symbol_seen = true;
-            if let Some(mut candidate) = perf_symbol_candidate_from_object_symbol(&object, &symbol)
-            {
-                candidate.bfd_has_filename = file_seen
-                    && (symbol.scope() == object::SymbolScope::Compilation || !file_after_symbol);
-                symbols.push(candidate);
+        let mut bfd_sections = bfd_symbol_sections(&object);
+        let (mut symbols, bfd_only_symbols) = object_symbol_candidates(&object, &mut bfd_sections);
+        symbols.extend(perf_synthesized_plt_symbols(&object, &symbols));
+        // Remap BFD's references after perf sorting without sorting BFD's
+        // canonical per-section order or duplicating candidate metadata.
+        let mut sorted_symbols: Vec<_> = symbols.into_iter().enumerate().collect();
+        sorted_symbols.sort_by_key(|(_, symbol)| symbol.address);
+        let mut sorted_indexes = vec![0; sorted_symbols.len()];
+        let mut symbols: Vec<_> = sorted_symbols
+            .into_iter()
+            .enumerate()
+            .map(|(sorted, (original, symbol))| {
+                sorted_indexes[original] = sorted;
+                symbol
+            })
+            .collect();
+        for section in &mut bfd_sections {
+            for index in &mut section.symbols {
+                if let BfdSymbolIndex::Perf(index) = index {
+                    *index = sorted_indexes[*index];
+                }
             }
         }
-        symbols.extend(
-            object
-                .dynamic_symbols()
-                .filter_map(|symbol| perf_symbol_candidate_from_object_symbol(&object, &symbol)),
-        );
-        symbols.extend(perf_synthesized_plt_symbols(&object, &symbols));
-        symbols.sort_by_key(|symbol| symbol.address);
         fixup_object_symbol_ends_like_perf(&mut symbols);
         let mut max_end = 0_u64;
         let max_end_by_index = symbols
@@ -3224,6 +3246,9 @@ impl PerfObjectSymbolIndex {
         Self {
             symbols,
             max_end_by_index,
+            bfd_only_symbols,
+            bfd_sections,
+            bfd_function_cache: Mutex::default(),
         }
     }
 
@@ -3276,28 +3301,157 @@ impl PerfObjectSymbolIndex {
     }
 
     fn bfd_function_record_symbol(&self, address: u64) -> Option<&PerfSymbolCandidate> {
-        // binutils-gdb bfd/dwarf2.c _bfd_elf_find_function() walks BFD's
-        // canonical symbol array and applies better_fit(). bfd/elf.c sorts
-        // that array with local symbols before globals, so equal-start/equal-
-        // size aliases keep the earlier local entry rather than perf's normal
-        // choose_best_symbol() global preference.
-        let end = self
-            .symbols
-            .partition_point(|candidate| candidate.address <= address);
-        let mut best = None::<&PerfSymbolCandidate>;
-        for candidate in &self.symbols[..end] {
-            if !candidate.bfd_function_like {
+        let mut cache = self
+            .bfd_function_cache
+            .lock()
+            .expect("BFD function cache lock");
+        // addr2line.c:find_address_in_section walks allocated sections in
+        // object order. Function candidates must belong to that exact section.
+        for section in &self.bfd_sections {
+            if address < section.range.begin || address >= section.range.end {
                 continue;
             }
-            best = Some(match best {
-                Some(current) if !bfd_function_record_better_fit(current, candidate, address) => {
-                    current
+            let offset = address - section.range.begin;
+            if let Some(current) = cache.as_ref()
+                && current.section == section.index
+                && offset >= current.offset
+                && offset < current.offset.saturating_add(current.size)
+            {
+                return Some(self.bfd_symbol(current.symbol));
+            }
+            *cache = None;
+            // elfcode.h preserves canonical symtab order. Even starts beyond
+            // the query can shorten the best extent before a later alias wins.
+            for &index in &section.symbols {
+                let candidate = self.bfd_symbol(index);
+                let code_off = candidate.address.wrapping_sub(section.address_bias);
+                let better = cache.as_ref().map_or(code_off <= offset, |current| {
+                    bfd_function_record_better_fit(
+                        self.bfd_symbol(current.symbol),
+                        current.offset,
+                        current.size,
+                        candidate,
+                        code_off,
+                        offset,
+                    )
+                });
+                if better {
+                    *cache = Some(BfdFunctionRecordCache {
+                        section: section.index,
+                        symbol: index,
+                        offset: code_off,
+                        size: bfd_function_record_size(candidate),
+                    });
+                } else if let Some(current) = cache.as_mut()
+                    && code_off > offset
+                    && code_off > current.offset
+                    && code_off < current.offset.saturating_add(current.size)
+                {
+                    current.size = code_off - current.offset;
                 }
-                _ => candidate,
-            });
+            }
+            if let Some(current) = cache.as_ref() {
+                return Some(self.bfd_symbol(current.symbol));
+            }
         }
-        best
+        None
     }
+
+    fn bfd_symbol(&self, index: BfdSymbolIndex) -> &PerfSymbolCandidate {
+        match index {
+            BfdSymbolIndex::Perf(index) => &self.symbols[index],
+            BfdSymbolIndex::BfdOnly(index) => &self.bfd_only_symbols[index],
+        }
+    }
+}
+
+fn bfd_symbol_sections(object: &object::File<'_>) -> Vec<BfdSymbolSection> {
+    object
+        .sections()
+        .filter(|section| {
+            matches!(section.flags(), object::SectionFlags::Elf { sh_flags }
+                if sh_flags & u64::from(object::elf::SHF_ALLOC) != 0)
+        })
+        .map(|section| BfdSymbolSection {
+            index: section.index(),
+            range: PerfAddressRange {
+                begin: section.address(),
+                end: section.address().saturating_add(section.size()),
+            },
+            address_bias: if object.kind() == object::ObjectKind::Relocatable {
+                0
+            } else {
+                section.address()
+            },
+            symbols: Vec::new(),
+        })
+        .collect()
+}
+
+fn object_symbol_candidates(
+    object: &object::File<'_>,
+    bfd_sections: &mut [BfdSymbolSection],
+) -> (Vec<PerfSymbolCandidate>, Vec<PerfSymbolCandidate>) {
+    let mut symbols =
+        Vec::with_capacity(object.symbols().count() + object.dynamic_symbols().count());
+    let mut bfd_only_symbols = Vec::new();
+    let bfd_section_by_index: FxHashMap<_, _> = bfd_sections
+        .iter()
+        .enumerate()
+        .map(|(index, section)| (section.index, index))
+        .collect();
+    // addr2line.c:slurp_symtab selects dynsym only when canonical symtab
+    // has no entries, not when its entries fail candidate filtering.
+    let bfd_dynamic = object.symbols().next().is_none();
+    for (dynamic, table) in [(false, object.symbols()), (true, object.dynamic_symbols())] {
+        // dwarf2.c:_bfd_elf_find_function advances file association even
+        // for symbols in other sections or excluded by maybe_function_sym.
+        let (mut file_seen, mut symbol_seen, mut file_after_symbol) = (false, false, false);
+        for symbol in table {
+            if symbol.kind() == SymbolKind::File {
+                file_seen = true;
+                file_after_symbol |= symbol_seen;
+                continue;
+            }
+            symbol_seen = true;
+            let perf_candidate = perf_symbol_candidate_from_object_symbol(object, &symbol);
+            let bfd_function_like = perf_candidate.as_ref().map_or_else(
+                || bfd_symbol_is_function_like(&symbol),
+                |candidate| candidate.bfd_function_like,
+            );
+            let bfd_section = (dynamic == bfd_dynamic && bfd_function_like)
+                .then(|| {
+                    symbol
+                        .section_index()
+                        .and_then(|index| bfd_section_by_index.get(&index).copied())
+                })
+                .flatten();
+            if perf_candidate.is_none() && bfd_section.is_none() {
+                continue;
+            }
+            let is_perf_candidate = perf_candidate.is_some();
+            let mut candidate =
+                perf_candidate.unwrap_or_else(|| symbol_candidate_from_object_symbol(&symbol));
+            candidate.bfd_has_filename = dynamic == bfd_dynamic
+                && file_seen
+                && (matches!(symbol.flags(), object::SymbolFlags::Elf { st_info, .. }
+                    if st_info >> 4 == object::elf::STB_LOCAL)
+                    || !file_after_symbol);
+            let index = if is_perf_candidate {
+                let index = BfdSymbolIndex::Perf(symbols.len());
+                symbols.push(candidate);
+                index
+            } else {
+                let index = BfdSymbolIndex::BfdOnly(bfd_only_symbols.len());
+                bfd_only_symbols.push(candidate);
+                index
+            };
+            if let Some(section) = bfd_section {
+                bfd_sections[section].symbols.push(index);
+            }
+        }
+    }
+    (symbols, bfd_only_symbols)
 }
 
 fn bfd_function_record_size(candidate: &PerfSymbolCandidate) -> u64 {
@@ -3309,29 +3463,29 @@ fn bfd_function_record_size(candidate: &PerfSymbolCandidate) -> u64 {
 
 fn bfd_function_record_better_fit(
     current: &PerfSymbolCandidate,
+    current_offset: u64,
+    current_size: u64,
     candidate: &PerfSymbolCandidate,
-    address: u64,
+    candidate_offset: u64,
+    offset: u64,
 ) -> bool {
-    // Mirrors binutils-gdb bfd/dwarf2.c better_fit() for the tie-breakers we
-    // can represent from object::Symbol data: closest start, covering range,
-    // function over non-function, then smaller range. BFD's final equal case
-    // returns false, preserving the earlier canonical symbol.
-    if candidate.address > address {
+    // dwarf2.c:better_fit uses the mutable cached size, not the winner's raw
+    // st_size. Equal fits preserve the earlier canonical symbol.
+    if candidate_offset > offset {
         return false;
     }
-    if candidate.address < current.address {
+    if candidate_offset < current_offset {
         return false;
     }
-    if candidate.address > current.address {
+    if candidate_offset > current_offset {
         return true;
     }
 
-    let current_size = bfd_function_record_size(current);
     let candidate_size = bfd_function_record_size(candidate);
-    if current.address.saturating_add(current_size) <= address {
+    if current_offset.saturating_add(current_size) <= offset {
         return candidate_size > current_size;
     }
-    if candidate.address.saturating_add(candidate_size) <= address {
+    if candidate_offset.saturating_add(candidate_size) <= offset {
         return false;
     }
     if current.bfd_function && !candidate.bfd_function {
@@ -3339,6 +3493,16 @@ fn bfd_function_record_better_fit(
     }
     if candidate.bfd_function && !current.bfd_function {
         return true;
+    }
+    if current.elf_type == Some(object::elf::STT_NOTYPE)
+        && candidate.elf_type != Some(object::elf::STT_NOTYPE)
+    {
+        return true;
+    }
+    if current.elf_type != Some(object::elf::STT_NOTYPE)
+        && candidate.elf_type == Some(object::elf::STT_NOTYPE)
+    {
+        return false;
     }
     candidate_size < current_size
 }
@@ -3521,8 +3685,40 @@ fn perf_symbol_candidate_from_object_symbol(
     object: &object::File<'_>,
     symbol: &object::Symbol<'_, '_>,
 ) -> Option<PerfSymbolCandidate> {
-    let kind = symbol.kind();
-    perf_symbol_is_candidate(object, symbol).then(|| PerfSymbolCandidate {
+    perf_symbol_is_candidate(object, symbol).then(|| symbol_candidate_from_object_symbol(symbol))
+}
+
+fn bfd_symbol_is_function_like(symbol: &object::Symbol<'_, '_>) -> bool {
+    let object::SymbolFlags::Elf { st_info, st_other } = symbol.flags() else {
+        return false;
+    };
+    let symbol_type = st_info & 0xf;
+    // elfcode.h assigns the flags excluded by elf.c:maybe_function_sym for
+    // these types. IFUNC is eligible, but does not carry BSF_FUNCTION.
+    if matches!(
+        symbol_type,
+        object::elf::STT_SECTION
+            | object::elf::STT_FILE
+            | object::elf::STT_OBJECT
+            | object::elf::STT_COMMON
+            | object::elf::STT_TLS
+            | ELF_STT_RELC
+            | ELF_STT_SRELC
+    ) {
+        return false;
+    }
+    !(symbol.size() == 0
+        && st_info >> 4 == object::elf::STB_LOCAL
+        && symbol_type == object::elf::STT_NOTYPE
+        && st_other & 3 == object::elf::STV_HIDDEN)
+}
+
+fn symbol_candidate_from_object_symbol(symbol: &object::Symbol<'_, '_>) -> PerfSymbolCandidate {
+    let elf_type = match symbol.flags() {
+        object::SymbolFlags::Elf { st_info, .. } => Some(st_info & 0xf),
+        _ => None,
+    };
+    PerfSymbolCandidate {
         name: perf_symbol_name(&addr2line::demangle_auto(
             Cow::Borrowed(symbol.name().unwrap_or_default()),
             None,
@@ -3530,10 +3726,7 @@ fn perf_symbol_candidate_from_object_symbol(
         address: symbol.address(),
         size: symbol.size(),
         bfd_size: symbol.size(),
-        elf_type: match symbol.flags() {
-            object::SymbolFlags::Elf { st_info, .. } => Some(st_info & 0xf),
-            _ => None,
-        },
+        elf_type,
         scope: if symbol.is_global() {
             PerfSymbolScope::Global
         } else {
@@ -3544,10 +3737,10 @@ fn perf_symbol_candidate_from_object_symbol(
         } else {
             PerfSymbolBinding::Global
         },
-        bfd_function_like: !matches!(kind, SymbolKind::Data),
-        bfd_function: matches!(kind, SymbolKind::Text),
+        bfd_function_like: bfd_symbol_is_function_like(symbol),
+        bfd_function: elf_type == Some(object::elf::STT_FUNC),
         bfd_has_filename: false,
-    })
+    }
 }
 
 fn rust_addr2line_frame_name(loader: &addr2line::Loader, address: u64) -> Option<String> {
@@ -5257,12 +5450,13 @@ mod tests {
     }
 
     #[test]
-    fn bfd_function_record_lookup_uses_raw_elf_sizes_before_perf_zero_size_fixup() {
+    fn bfd_function_record_lookup_preserves_raw_extents_and_native_cached_alias() {
         // bfd/elf.c:_bfd_elf_maybe_function_sym reads st_size (zero means
         // one), and bfd/dwarf2.c:better_fit compares those raw extents.
         // perf symbol-elf.c:dso__load_sym_internal instead fixes zero-sized
         // ends before choosing duplicate winners. These sizes must not leak
-        // into the independent BFD lookup.
+        // into the independent BFD lookup. Queries inside the cached raw
+        // extent reuse the winner, even when a fresh scan would pick an alias.
         let bytes = elf_with_text_symbol_fixtures(
             elf::EM_X86_64,
             &[
@@ -5277,11 +5471,16 @@ mod tests {
         for (address, expected) in [
             (0x1018, "local_function"),
             (0x1008, "local_function"),
-            (0x1000, "global_alias"),
+            (0x1000, "local_function"),
             (0x1020, "next"),
         ] {
             assert_eq!(index.bfd_function_record_name(address), Some(expected));
         }
+        let fresh_index = PerfObjectSymbolIndex::from_object_bytes(&bytes);
+        assert_eq!(
+            fresh_index.bfd_function_record_name(0x1000),
+            Some("global_alias")
+        );
     }
 
     #[test]
@@ -5314,6 +5513,7 @@ mod tests {
                 },
             ],
             max_end_by_index: vec![0x2000, 0x2000],
+            ..PerfObjectSymbolIndex::default()
         };
 
         assert_eq!(symbols.symbol_name(0x1810), Some("large"));
@@ -5357,6 +5557,7 @@ mod tests {
                 candidate("clock_gettime@GLIBC_2.2.5", 0x3000),
             ],
             max_end_by_index: vec![0x1100, 0x1100, 0x2100, 0x2100, 0x3100, 0x3100],
+            ..PerfObjectSymbolIndex::default()
         };
 
         assert_eq!(
@@ -5429,6 +5630,7 @@ mod tests {
                 },
             ],
             max_end_by_index: vec![0x102f, 0x102f, 0x202e, 0x202e],
+            ..PerfObjectSymbolIndex::default()
         };
 
         assert_eq!(
@@ -5569,6 +5771,7 @@ mod tests {
         let symbols = PerfObjectSymbolIndex {
             symbols,
             max_end_by_index,
+            ..PerfObjectSymbolIndex::default()
         };
 
         assert_eq!(
