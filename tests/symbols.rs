@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 
-use object::{Object, ObjectSegment, ObjectSymbol, SymbolKind, build, elf};
+use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol, SymbolKind, build, elf};
 use proptest::prelude::*;
 use pyroclast::cli::SymbolizerKind;
 use pyroclast::perfdata::mappings::FileIdentity;
@@ -771,11 +771,11 @@ fn symbol_parity_source_lined_function_replaces_symtab_alias_without_inline_chil
 
 #[test]
 #[cfg(target_os = "linux")]
-fn rust_addr2line_resolver_keeps_perf_symtab_alias_without_source_lines() {
+fn rust_addr2line_resolver_keeps_perf_symtab_alias_without_debug_line() {
     // perf/util/symbol.c choose_best_symbol() selects the longer alias.
     // perf/util/libdw.c requires a source line before it can emit inline
-    // frames; bfd/dwarf2.c cannot supply a fallback filename without an
-    // STT_FILE record. This fixture has neither, so it keeps the base symbol.
+    // frames, and perf/util/addr2line.c:cmd__addr2line requires .debug_line
+    // before starting its subprocess. Stripping debug info keeps the base.
     let (_root, binary, bytes) = compiled_c_fixture(
         "void short_name(void) {} void preferred_alias(void) __attribute__((alias(\"short_name\")));",
     );
@@ -792,11 +792,12 @@ fn rust_addr2line_resolver_keeps_perf_symtab_alias_without_source_lines() {
     );
     let stripped = std::fs::read(&binary).expect("read stripped fixture");
     let object = object::File::parse(&stripped[..]).expect("parse stripped fixture");
+    assert!(object.section_by_name(".debug_line").is_none());
     assert!(
         object
             .symbols()
             .all(|symbol| symbol.kind() != SymbolKind::File),
-        "fixture must have no STT_FILE fallback filename"
+        "stripped fixture must have no STT_FILE records"
     );
 
     let frames = RustAddr2lineResolver::new()
@@ -813,15 +814,9 @@ fn rust_addr2line_resolver_keeps_perf_symtab_alias_without_source_lines() {
     assert_eq!(frames, vec![vec!["preferred_alias+0x0".to_string()]]);
 }
 
-#[test]
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn rust_addr2line_bfd_fallback_uses_raw_zero_sized_alias_extent_like_binutils() {
-    // addr2line.c:find_address_in_section calls BFD's nearest-line lookup.
-    // bfd/elf.c:_bfd_elf_maybe_function_sym reads raw st_size, and
-    // bfd/dwarf2.c:better_fit keeps the larger raw extent when neither alias
-    // reaches the queried address. The C function supplies unrelated DWARF;
-    // the assembly aliases have no source line, forcing function fallback.
-    let (_root, binary, bytes) = compiled_c_fixture(
+fn compiled_bfd_zero_sized_alias_fixture() -> (tempfile::TempDir, PathBuf, Vec<u8>) {
+    compiled_c_fixture(
         r#"
         int with_source_line(void) { return 7; }
         __asm__(
@@ -843,7 +838,18 @@ fn rust_addr2line_bfd_fallback_uses_raw_zero_sized_alias_extent_like_binutils() 
             ".popsection\n"
         );
         "#,
-    );
+    )
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn rust_addr2line_bfd_fallback_uses_raw_zero_sized_alias_extent_like_binutils() {
+    // addr2line.c:find_address_in_section calls BFD's nearest-line lookup.
+    // bfd/elf.c:_bfd_elf_maybe_function_sym reads raw st_size, and
+    // bfd/dwarf2.c:better_fit keeps the larger raw extent when neither alias
+    // reaches the queried address. The C function supplies unrelated DWARF;
+    // the assembly aliases have no source line, forcing function fallback.
+    let (_root, binary, bytes) = compiled_bfd_zero_sized_alias_fixture();
     let object = object::File::parse(bytes.as_slice()).expect("fixture ELF");
     let local = object
         .symbols()
@@ -891,6 +897,103 @@ fn rust_addr2line_bfd_fallback_uses_raw_zero_sized_alias_extent_like_binutils() 
             kernel_relocation: None,
         }])
         .expect("resolve fallback frames");
+    assert_eq!(frames, vec![vec!["local_function".to_string()]]);
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn bfd_fallback_without_file_symbols_preserves_debug_line_and_matches_native() {
+    // GNU addr2line accepts BFD's function-only success as "??:?"; perf's
+    // filename_split rejects only "??:0". Keep .debug_line so cmd__addr2line
+    // can start, while removing only the optional STT_FILE associations.
+    let (_root, binary, bytes) = compiled_bfd_zero_sized_alias_fixture();
+    let object = object::File::parse(bytes.as_slice()).expect("fixture ELF");
+    let debug_line = object
+        .section_by_name(".debug_line")
+        .expect("fixture debug line section")
+        .data()
+        .expect("fixture debug line data");
+    assert!(!debug_line.is_empty());
+    let mut file_symbols: Vec<_> = object
+        .symbols()
+        .filter(|symbol| symbol.kind() == SymbolKind::File)
+        .map(|symbol| symbol.name().expect("file symbol name").to_string())
+        .collect();
+    assert!(!file_symbols.is_empty());
+    file_symbols.sort_unstable();
+    file_symbols.dedup();
+    let mut command = Command::new("objcopy");
+    for name in file_symbols {
+        command.arg("--strip-symbol").arg(name);
+    }
+    let output = command
+        .arg(&binary)
+        .output()
+        .expect("strip only fixture file symbols");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stripped = std::fs::read(&binary).expect("read fixture without file symbols");
+    let object = object::File::parse(stripped.as_slice()).expect("stripped fixture ELF");
+    assert!(
+        object
+            .symbols()
+            .all(|symbol| symbol.kind() != SymbolKind::File)
+    );
+    assert_eq!(
+        object
+            .section_by_name(".debug_line")
+            .expect("preserved debug line section")
+            .data()
+            .expect("preserved debug line data"),
+        debug_line
+    );
+    let local = object
+        .symbols()
+        .find(|symbol| symbol.name() == Ok("local_function"))
+        .expect("preserved local function");
+    let alias = object
+        .symbols()
+        .find(|symbol| symbol.name() == Ok("global_alias"))
+        .expect("preserved global alias");
+    assert_eq!(local.size(), 16);
+    assert_eq!(alias.size(), 0);
+    assert_eq!(alias.address(), local.address());
+    let address = local.address() + 24;
+    let native = Command::new("addr2line")
+        .args(["-f", "-i", "-e"])
+        .arg(&binary)
+        .arg(format!("{address:x}"))
+        .output()
+        .expect("run native addr2line without file symbols");
+    assert!(
+        native.status.success(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    let native_text = String::from_utf8_lossy(&native.stdout);
+    assert_eq!(
+        native_text.lines().collect::<Vec<_>>(),
+        ["local_function", "??:?"]
+    );
+    let request = SymbolRequest {
+        path: binary,
+        relative_address: address,
+        kernel_mapping_range: None,
+        build_id: None,
+        file_identity: None,
+        kernel_relocation: None,
+    };
+    let resolver = RustAddr2lineResolver::new();
+    let base = resolver
+        .resolve_base_frame_batch_with_metadata(std::slice::from_ref(&request))
+        .expect("resolve preserved perf base alias");
+    assert_eq!(base[0].frames, ["global_alias+0x18"]);
+    let frames = resolver
+        .resolve_frame_batch(&[request])
+        .expect("resolve function-only fallback frames");
     assert_eq!(frames, vec![vec!["local_function".to_string()]]);
 }
 
