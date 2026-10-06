@@ -35,6 +35,21 @@ fn renders_inferno_perf_inlined_arrow_suffixes() {
 }
 
 #[test]
+fn leading_empty_inline_segment_is_preserved_like_infernos_stack_join() {
+    // Inferno perf.rs:on_stack_line pushes the empty first arrow segment;
+    // after_event joins by position, not by testing serialized text length.
+    assert_eq!(
+        render_inferno_perf_folded_stack(["->inner"], 1),
+        ";inner_[i] 1"
+    );
+}
+
+#[test]
+fn renders_empty_folded_segments_by_position() {
+    assert_eq!(render_folded_stack(["", "leaf", ""], 7), ";leaf; 7");
+}
+
+#[test]
 fn renders_inferno_perf_tidy_generic_names() {
     let stack = render_inferno_perf_folded_stack(
         [
@@ -48,6 +63,21 @@ fn renders_inferno_perf_tidy_generic_names() {
     assert_eq!(
         stack,
         "fn; core::option::Option<(u64, alloc::string::String)>_[i];method;java:semi 5",
+    );
+}
+
+#[test]
+fn renders_inferno_perf_split_return_type_with_unbalanced_generic_depth_like_inferno() {
+    let stack = render_inferno_perf_folded_stack(
+        [
+            "with<core::cell::RefCell<alloc::string::String>, tracing_subscriber::fmt::fmt_layer::{impl#12}::on_event::{closure_env#0}<tracing_subscriber::registry::sharded::Registry, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format<tracing_subscriber::fmt::format::Full, tracing_subscriber::fmt::time::SystemTime>, fn() -> std::io::stdio::Stdout>, ()>",
+        ],
+        1,
+    );
+
+    assert_eq!(
+        stack,
+        "with<core::cell::RefCell<alloc::string::String>, tracing_subscriber::fmt::fmt_layer::{impl#12}::on_event::{closure_env#0}<tracing_subscriber::registry::sharded::Registry, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format<tracing_subscriber::fmt::format::Full, tracing_subscriber::fmt::time::SystemTime>, fn() ; std::io::stdio::Stdout>, ()>_[i] 1",
     );
 }
 
@@ -67,7 +97,77 @@ fn renders_inferno_perf_partially_demangled_rust_symbols() {
     );
 }
 
+#[test]
+fn raw_function_normalization_preserves_native_inferno_text_through_fast_paths() {
+    // Inferno perf.rs:on_stack_line strips offsets and fixes Rust names before
+    // splitting inline arrows, regardless of whether the name needs tidying.
+    for symbol in [
+        "plain+0xdead",
+        "plain+0xdead+tail",
+        "plain+0xdead+0x2",
+        "plain-name",
+        "plain\rname",
+        "method(arg)+0x1a",
+        "root->inner",
+        "->inner",
+        "net/http.(*Client).Do",
+        "(anonymous namespace)::entry()",
+        "java;name",
+        "fn<closure(arg)>(u64)",
+    ] {
+        assert_function_matches_native_inferno(symbol);
+    }
+}
+
+#[test]
+fn empty_offset_suffix_is_stripped_like_native_inferno() {
+    assert_function_matches_native_inferno("plain+0x");
+}
+
+#[test]
+fn plain_function_fast_path_still_strips_trailing_rust_hashes_like_native_inferno() {
+    for symbol in [
+        "already_demangled::h0123456789abcdef",
+        "\u{e9}::h0123456789abcdef",
+    ] {
+        assert_function_matches_native_inferno(symbol);
+    }
+}
+
+fn assert_function_matches_native_inferno(symbol: &str) {
+    use inferno::collapse::Collapse as _;
+    let script = format!(
+        "worker 7 1.000000: 1 cycles:\n\t1020 {symbol} (/bin/app)\n\t1010 root (/bin/app)\n\n"
+    );
+    let mut options = inferno::collapse::perf::Options::default();
+    options.nthreads = 1;
+    let mut expected = Vec::new();
+    inferno::collapse::perf::Folder::from(options)
+        .collapse(std::io::Cursor::new(script), &mut expected)
+        .unwrap();
+    let actual = render_inferno_perf_folded_stack(["worker", "root", symbol], 1) + "\n";
+    assert_eq!(actual.as_bytes(), expected, "symbol: {symbol}");
+}
+
 proptest! {
+    #[test]
+    fn span_escaping_matches_character_reference_for_all_utf8(
+        characters in prop::collection::vec(
+            prop_oneof![any::<char>(), Just(';'), Just('\r'), Just('\n')], 0..256,
+        ),
+    ) {
+        let frame: String = characters.into_iter().collect();
+        let mut expected = String::new();
+        for character in frame.chars() {
+            match character {
+                ';' => expected.push_str("\\;"),
+                '\r' | '\n' => expected.push(' '),
+                _ => expected.push(character),
+            }
+        }
+        prop_assert_eq!(escape_frame(&frame), expected);
+    }
+
     #[test]
     fn escaping_frames_removes_newlines_and_only_keeps_escaped_semicolons(frame in arbitrary_frame()) {
         let escaped = escape_frame(&frame);
@@ -91,8 +191,8 @@ proptest! {
         let rendered = render_folded_stack(frames.iter().map(String::as_str), count);
         let (stack, rendered_count) = rendered.rsplit_once(' ').expect("count suffix");
         let mut expected_stack = String::new();
-        for frame in &frames {
-            if !expected_stack.is_empty() {
+        for (index, frame) in frames.iter().enumerate() {
+            if index != 0 {
                 expected_stack.push(';');
             }
             expected_stack.push_str(&escape_frame(frame));

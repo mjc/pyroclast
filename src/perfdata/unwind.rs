@@ -32,7 +32,7 @@ pub struct PerfX86_64Regs {
 }
 
 /// The architecture a perf.data file's user register samples were recorded on,
-/// from the HEADER_ARCH feature string.
+/// from the `HEADER_ARCH` feature string.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PerfArch {
     #[default]
@@ -59,10 +59,10 @@ pub struct PerfAarch64Regs {
     pub lr: u64,
 }
 
-/// Architecture-neutral user register sample, decoded from a perf REGS_USER
+/// Architecture-neutral user register sample, decoded from a perf `REGS_USER`
 /// payload according to the recording machine's arch.
 ///
-/// The fold path threads this through every unwind site so the x86_64 and
+/// The fold path threads this through every unwind site so the `x86_64` and
 /// aarch64 register layouts and frame-pointer fallbacks stay byte-faithful to
 /// perf/elfutils without forcing a fake bp/sp onto aarch64.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,7 +102,7 @@ impl PerfUserRegs {
         }
     }
 
-    /// The sampled instruction pointer (x86_64 IP / aarch64 PC).
+    /// The sampled instruction pointer (`x86_64` IP / aarch64 PC).
     #[must_use]
     pub fn ip(self) -> u64 {
         match self {
@@ -120,7 +120,7 @@ impl PerfUserRegs {
         }
     }
 
-    /// Whether the sample looks like an x86_64 syscall-return state, which perf
+    /// Whether the sample looks like an `x86_64` syscall-return state, which perf
     /// truncates after the first executable frame. aarch64 has no analogue, so
     /// this is always `false` there.
     #[must_use]
@@ -131,9 +131,9 @@ impl PerfUserRegs {
         }
     }
 
-    /// The x86_64 `ebl_unwind` frame-pointer precondition `bp >= sp`.
+    /// The `x86_64` `ebl_unwind` frame-pointer precondition `bp >= sp`.
     ///
-    /// elfutils' x86_64 backend only walks the rbp chain when the frame pointer
+    /// elfutils' `x86_64` backend only walks the rbp chain when the frame pointer
     /// sits at or above the stack pointer. aarch64's backend has no such
     /// precondition (its accept condition is internal to the walk), so this
     /// returns `false` there and the fallback is gated differently.
@@ -681,17 +681,31 @@ fn push_unwind_range(ranges: &mut Vec<Range<u64>>, base: u64, start: u64, end: u
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static CFI_RANGE_ROWS_MOVED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn normalize_ranges(ranges: &mut Vec<Range<u64>>) {
     ranges.sort_unstable_by_key(|range| (range.start, range.end));
-    let mut index = 0;
-    while index + 1 < ranges.len() {
-        if ranges[index].end >= ranges[index + 1].start {
-            ranges[index].end = ranges[index].end.max(ranges[index + 1].end);
-            ranges.remove(index + 1);
+    if ranges.is_empty() {
+        return;
+    }
+
+    let mut write = 0;
+    for read in 1..ranges.len() {
+        if ranges[write].end >= ranges[read].start {
+            ranges[write].end = ranges[write].end.max(ranges[read].end);
         } else {
-            index += 1;
+            write += 1;
+            if write != read {
+                #[cfg(test)]
+                CFI_RANGE_ROWS_MOVED.with(|rows| rows.set(rows.get() + 1));
+                ranges[write] = ranges[read].clone();
+            }
         }
     }
+    ranges.truncate(write + 1);
 }
 
 fn module_memory_segments<'a>(
@@ -954,11 +968,11 @@ impl PerfAarch64Regs {
 /// Walks an aarch64 frame-pointer chain the way elfutils' `ebl_unwind` backend
 /// does when no CFI covers the program counter.
 ///
-/// Faithful to elfutils backends/aarch64_unwind.c: the caller's pc is the
+/// Faithful to elfutils `backends/aarch64_unwind.c`: the caller's pc is the
 /// current lr (zero lr ends the walk before any caller is accepted), the next
 /// lr/fp load from `fp+8`/`fp+0` (zero on failed reads), the next sp is
 /// `fp+16`, and a step is accepted iff `fp == 0 || new_sp > sp`. Unlike the
-/// x86_64 backend there is no `fp >= sp` precondition, so a zero frame pointer
+/// `x86_64` backend there is no `fp >= sp` precondition, so a zero frame pointer
 /// still yields one lr-based caller.
 #[must_use]
 pub fn unwind_aarch64_frame_pointer_stack_like_elfutils(
@@ -982,14 +996,14 @@ pub fn unwind_aarch64_frame_pointer_stack_like_elfutils(
         }
         let new_lr = memory_reader.read_u64(fp.saturating_add(8)).unwrap_or(0);
         let new_fp = memory_reader.read_u64(fp).unwrap_or(0);
-        let new_sp = fp.saturating_add(16);
-        if fp != 0 && new_sp <= sp {
+        let caller_sp = fp.saturating_add(16);
+        if fp != 0 && caller_sp <= sp {
             break;
         }
         push_perf_unwind_address(&mut frames, lr);
         lr = new_lr;
         fp = new_fp;
-        sp = new_sp;
+        sp = caller_sp;
     }
     frames
 }
@@ -1043,6 +1057,100 @@ where
 mod tests {
     use framehop::x86_64::Reg;
     use object::read::{Object, ObjectSegment};
+
+    fn normalize_cfi_ranges_with_work_count(ranges: &mut Vec<std::ops::Range<u64>>) -> usize {
+        super::CFI_RANGE_ROWS_MOVED.with(|rows| rows.set(0));
+        super::normalize_ranges(ranges);
+        super::CFI_RANGE_ROWS_MOVED.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn cfi_range_normalization_merges_touching_ranges() {
+        let mut ranges = vec![30..40, 10..20, 20..30, 0..10];
+        normalize_cfi_ranges_with_work_count(&mut ranges);
+        assert_eq!(ranges, vec![0..40]);
+    }
+
+    #[test]
+    fn cfi_range_normalization_preserves_outer_extent_of_nested_ranges() {
+        let mut ranges = vec![20..30, 0..100, 10..90, 0..80, 50..60];
+        normalize_cfi_ranges_with_work_count(&mut ranges);
+        assert_eq!(ranges, vec![0..100]);
+    }
+
+    #[test]
+    fn cfi_range_normalization_coalesces_duplicate_ranges() {
+        let mut ranges = vec![10..20, 0..5, 10..20, 0..5, 10..20];
+        normalize_cfi_ranges_with_work_count(&mut ranges);
+        assert_eq!(ranges, vec![0..5, 10..20]);
+    }
+
+    #[test]
+    fn cfi_range_normalization_preserves_disjoint_ranges_without_moving_rows() {
+        let mut ranges = vec![30..40, 0..10, 15..20];
+        let rows_moved = normalize_cfi_ranges_with_work_count(&mut ranges);
+        assert_eq!(ranges, vec![0..10, 15..20, 30..40]);
+        assert_eq!(rows_moved, 0);
+    }
+
+    #[test]
+    fn cfi_range_normalization_preserves_half_open_coverage_and_gaps() {
+        // This is our auxiliary CFI coverage index, not perf's unwind algorithm.
+        let original = vec![12..16, 0..4, 2..6, 6..8, 13..15, 12..16];
+        let mut ranges = original.clone();
+        let rows_moved = normalize_cfi_ranges_with_work_count(&mut ranges);
+        assert_eq!(ranges, vec![0..8, 12..16]);
+        assert_eq!(rows_moved, 1);
+        for ip in 0..=17 {
+            assert_eq!(
+                ranges.iter().any(|range| range.contains(&ip)),
+                original.iter().any(|range| range.contains(&ip)),
+                "coverage changed at {ip}"
+            );
+        }
+
+        let mut ranges = vec![u64::MAX - 2..u64::MAX, u64::MAX - 4..u64::MAX - 2];
+        normalize_cfi_ranges_with_work_count(&mut ranges);
+        assert_eq!(ranges, vec![u64::MAX - 4..u64::MAX]);
+        assert!(!ranges[0].contains(&u64::MAX));
+    }
+
+    #[test]
+    fn cfi_range_normalization_merging_moves_at_most_linear_range_rows() {
+        for len in [0_usize, 1, 2, 16, 64, 512] {
+            for shape in ["touching", "nested", "duplicate", "disjoint"] {
+                let mut ranges: Vec<_> = (0..len as u64)
+                    .rev()
+                    .map(|index| match shape {
+                        "touching" => index..index + 1,
+                        "nested" => index..2 * len as u64 - index,
+                        "duplicate" => 0..1,
+                        "disjoint" => 2 * index..2 * index + 1,
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                let rows_moved = normalize_cfi_ranges_with_work_count(&mut ranges);
+                let expected = if len == 0 {
+                    Vec::new()
+                } else {
+                    match shape {
+                        "touching" => std::iter::once(0..len as u64).collect(),
+                        "nested" => std::iter::once(0..2 * len as u64).collect(),
+                        "duplicate" => std::iter::once(0..1).collect(),
+                        "disjoint" => (0..len as u64)
+                            .map(|index| 2 * index..2 * index + 1)
+                            .collect(),
+                        _ => unreachable!(),
+                    }
+                };
+                assert_eq!(ranges, expected, "{shape}, {len} input ranges");
+                assert!(
+                    rows_moved <= len,
+                    "{shape}, {len} input ranges moved {rows_moved} range rows; linear bound is {len}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn object_mapping_range_matches_dwfl_report_elf_load_span() {

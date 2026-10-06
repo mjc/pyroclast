@@ -43,7 +43,41 @@ fn fold_benchmark_reports_folded_output_size() {
 }
 
 #[test]
-fn fold_benchmark_weights_perf_sample_periods() {
+fn unsymbolized_fold_benchmark_keeps_module_fallback_with_either_inline_setting() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    let missing_object = root.path().join("app");
+    std::fs::write(
+        &perfdata,
+        perfdata_with_records_and_attrs(
+            [file_attr_bytes(
+                PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+                0,
+                0,
+            )],
+            [
+                record_bytes(
+                    1,
+                    &mmap_payload(11, 11, 0x1000, 0x100, 0, missing_object.to_str().unwrap()),
+                ),
+                record_bytes(9, &sample_payload(0x1000, 11, 12, [0x1010])),
+            ],
+        ),
+    )
+    .expect("write perfdata");
+    let runner = Addr2lineRunner::default();
+    for inline in [false, true] {
+        let report =
+            run_fold_benchmark_with_runner(&perfdata, &runner, false, inline).expect("benchmark");
+        assert_eq!(report.folded_bytes, ":12;[app] 1\n".len());
+        assert_eq!(report.folded_lines, 1);
+        assert_eq!(report.input, perfdata);
+        assert!(runner.programs().is_empty());
+    }
+}
+
+#[test]
+fn fold_benchmark_uses_infernos_unit_weight_for_untimed_period_samples() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
     std::fs::write(
@@ -64,7 +98,7 @@ fn fold_benchmark_weights_perf_sample_periods() {
 
     let report = run_fold_benchmark(&perfdata).expect("benchmark");
 
-    assert_eq!(report.folded_bytes, ":2;[unknown] 144\n".len());
+    assert_eq!(report.folded_bytes, ":2;[unknown] 1\n".len());
 }
 
 #[test]
@@ -94,9 +128,12 @@ fn inferno_collapse_benchmark_reports_folded_output_size() {
 }
 
 #[test]
-fn symbolized_fold_benchmark_uses_runner_addr2line() {
+fn symbolized_fold_benchmark_keeps_module_fallback_without_a_perf_base_symbol() {
+    // perf machine.c:append_inlines requires a loaded ELF symbol, not merely
+    // a name returned by an addr2line runner for a nonexistent object.
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
+    let missing_object = root.path().join("app");
     std::fs::write(
         &perfdata,
         perfdata_with_records_and_attrs(
@@ -106,7 +143,10 @@ fn symbolized_fold_benchmark_uses_runner_addr2line() {
                 0,
             )],
             [
-                record_bytes(1, &mmap_payload(11, 11, 0x1000, 0x100, 0, "/bin/app")),
+                record_bytes(
+                    1,
+                    &mmap_payload(11, 11, 0x1000, 0x100, 0, missing_object.to_str().unwrap()),
+                ),
                 record_bytes(9, &sample_payload(0x1000, 11, 12, [0x1010])),
             ],
         ),
@@ -114,12 +154,10 @@ fn symbolized_fold_benchmark_uses_runner_addr2line() {
     .expect("write perfdata");
     let runner = Addr2lineRunner::default();
 
-    // The external addr2line resolver only runs on the --inline path; the
-    // default base path resolves from the in-process ELF symtab.
     let report = run_fold_benchmark_with_runner(&perfdata, &runner, true, true).expect("benchmark");
 
-    assert_eq!(report.folded_bytes, ":12;app::main 1\n".len());
-    assert_eq!(runner.programs(), vec!["addr2line"]);
+    assert_eq!(report.folded_bytes, ":12;[app] 1\n".len());
+    assert!(runner.programs().is_empty());
 }
 
 #[test]
@@ -159,10 +197,13 @@ fn compares_pyroclast_folded_stacks_with_inferno_collapse() {
 }
 
 #[test]
-fn compares_symbolized_pyroclast_folded_stacks_with_inferno_collapse() {
+fn symbolized_comparison_reports_names_without_a_perf_base_symbol_as_mismatches() {
+    // An oracle claiming a symbol for an unreadable ELF must not make the
+    // comparison pass by reviving names perf's append_inlines would reject.
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
     let perf_script = root.path().join("perf-script.txt");
+    let missing_object = root.path().join("app");
     std::fs::write(
         &perfdata,
         perfdata_with_records_and_attrs(
@@ -172,7 +213,10 @@ fn compares_symbolized_pyroclast_folded_stacks_with_inferno_collapse() {
                 0,
             )],
             [
-                record_bytes(1, &mmap_payload(11, 11, 0x1000, 0x100, 0, "/bin/app")),
+                record_bytes(
+                    1,
+                    &mmap_payload(11, 11, 0x1000, 0x100, 0, missing_object.to_str().unwrap()),
+                ),
                 record_bytes(9, &sample_payload(0x1000, 11, 12, [0x1010])),
             ],
         ),
@@ -181,18 +225,17 @@ fn compares_symbolized_pyroclast_folded_stacks_with_inferno_collapse() {
     std::fs::write(&perf_script, "sample script\n").expect("write perf script");
     let runner = SymbolizedCompareRunner::default();
 
-    // Exercising the external addr2line resolver (and its inline frames)
-    // requires --inline; the default base path reads the in-process symtab.
     let report =
         compare_with_inferno_collapse_with_symbols(&perfdata, &perf_script, &runner, true, true)
             .expect("comparison");
 
-    assert!(report.matches);
-    assert!(report.svg_matches);
+    assert!(!report.matches);
+    assert!(!report.svg_matches);
+    assert_eq!(report.only_pyroclast, [":12;[app] 1"]);
+    assert_eq!(report.only_inferno, [":12;app::main 1"]);
     assert_eq!(
         runner.programs(),
         vec![
-            "addr2line",
             "inferno-collapse-perf",
             "inferno-flamegraph",
             "inferno-flamegraph"
@@ -285,9 +328,24 @@ fn parses_benchmark_inputs() {
 }
 
 #[test]
-fn benchmark_inline_flag_defaults_off() {
+fn benchmark_inline_defaults_on_like_perf_script() {
     let args = BenchArgs::parse(vec!["profile.perf.data".into(), "--symbols".into()]);
 
+    assert_eq!(args.perf_data, Some("profile.perf.data".into()));
+    assert!(args.symbols);
+    assert!(args.inline);
+}
+
+#[test]
+fn benchmark_no_inline_disables_inline_expansion_like_perf_script() {
+    let args = BenchArgs::parse(vec![
+        "profile.perf.data".into(),
+        "--symbols".into(),
+        "--no-inline".into(),
+    ]);
+
+    assert_eq!(args.perf_data, Some("profile.perf.data".into()));
+    assert!(args.symbols);
     assert!(!args.inline);
 }
 
@@ -309,7 +367,7 @@ fn bench_command_reports_missing_input() {
         perf_script: None,
         export_perf_script: None,
         symbols: false,
-        inline: false,
+        inline: true,
     };
 
     let error = run_bench_command(&args, &runner).expect_err("missing input should fail");
@@ -328,7 +386,7 @@ fn bench_command_reports_missing_perf_script_input() {
         perf_script: Some(root.path().join("missing.perf-script")),
         export_perf_script: None,
         symbols: false,
-        inline: false,
+        inline: true,
     };
 
     let error = run_bench_command(&args, &runner).expect_err("missing perf script should fail");
@@ -348,7 +406,7 @@ fn bench_command_exports_perf_script_and_compares_without_perf_runner() {
         perf_script: None,
         export_perf_script: Some(exported_perf_script.clone()),
         symbols: false,
-        inline: false,
+        inline: true,
     };
 
     let output = run_bench_command(&args, &runner).expect("bench command");
@@ -444,7 +502,7 @@ proptest! {
             perf_script: None,
             export_perf_script: None,
             symbols: false,
-            inline: false,
+            inline: true,
         };
 
         let expected = perf_data

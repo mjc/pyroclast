@@ -21,6 +21,8 @@ framehop = "0.16.0"
 framehop-object = "0.2.0"
 gimli = "0.33.0"
 hashbrown = "0.17.1"
+inferno = "0.12.6"
+memchr = "2"
 memmap2 = "0.9"
 object = "0.39.1"
 rustc-hash = "2.1.2"
@@ -29,13 +31,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [target.'cfg(unix)'.dependencies]
+libc = "0.2"
 signal-hook = "0.3"
+tempfile = "3"
 
 [dev-dependencies]
-inferno = "0.12.6"
 object = { version = "0.39.1", features = ["build"] }
 proptest = "1.11.0"
-tempfile = "3"
 
 [profile.release]
 debug = false

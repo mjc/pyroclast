@@ -106,6 +106,8 @@ fn resolves_user_ip_to_mapping_relative_address() {
         Some(ResolvedMapping {
             path: "/bin/app".to_string(),
             relative_address: 0x50,
+            start: 0x1000,
+            end: 0x1200,
             build_id: None,
             file_identity: None,
             kernel_relocation: None,
@@ -146,6 +148,8 @@ fn prefers_most_specific_mapping_for_overlapping_ranges() {
         Some(ResolvedMapping {
             path: "/bin/plugin.so".to_string(),
             relative_address: 0x30,
+            start: 0x1800,
+            end: 0x1900,
             build_id: None,
             file_identity: Some(FileIdentity {
                 major: 8,
@@ -195,6 +199,8 @@ fn resolves_perf_split_executable_mapping_over_initial_read_mapping_like_perf_ma
         Some(ResolvedMapping {
             path: "/home/mjc/projects/pyroclast/target/profiling/pyroclast".to_string(),
             relative_address: 0x0012_16de,
+            start: 0x5555_555d_6000,
+            end: 0x5555_5580_1000,
             build_id: None,
             file_identity: Some(FileIdentity {
                 major: 0,
@@ -232,6 +238,8 @@ fn prefers_newer_mapping_when_it_broadly_overlaps_older_mapping_like_perf() {
         Some(ResolvedMapping {
             path: "/bin/new-app".to_string(),
             relative_address: 0x810,
+            start: 0x1000,
+            end: 0x2000,
             build_id: None,
             file_identity: None,
             kernel_relocation: None,
@@ -256,6 +264,8 @@ fn resolves_wildcard_pid_kernel_mapping() {
         Some(ResolvedMapping {
             path: "[kernel.kallsyms]".to_string(),
             relative_address: 0xffff_ffff_8800_0010,
+            start: 0xffff_ffff_8800_0000,
+            end: 0xffff_ffff_8800_2000,
             build_id: None,
             file_identity: None,
             kernel_relocation: None,
@@ -280,6 +290,8 @@ fn resolves_kernel_relocation_from_suffixed_mapping_name() {
         Some(ResolvedMapping {
             path: "[kernel.kallsyms]_text".to_string(),
             relative_address: 0xffff_ffff_8800_1280,
+            start: 0xffff_ffff_8800_0000,
+            end: 0xffff_ffff_8800_2000,
             build_id: None,
             file_identity: None,
             kernel_relocation: Some(KernelRelocation {
@@ -307,6 +319,8 @@ fn resolves_kernel_module_mapping_as_absolute_kernel_address() {
         Some(ResolvedMapping {
             path: "[zfs]".to_string(),
             relative_address: 0xffff_ffff_c000_0123,
+            start: 0xffff_ffff_c000_0000,
+            end: 0xffff_ffff_c000_2000,
             build_id: None,
             file_identity: None,
             kernel_relocation: None,
@@ -335,6 +349,8 @@ fn resolves_build_id_from_mmap2_build_id_mapping() {
         Some(ResolvedMapping {
             path: "[igb]".to_string(),
             relative_address: 0x50,
+            start: 0x1000,
+            end: 0x1200,
             build_id: Some(vec![0xaa, 0xbb, 0xcc, 0xdd]),
             file_identity: None,
             kernel_relocation: None,
@@ -469,11 +485,13 @@ fn resolves_file_identity_from_mmap2_mapping() {
 // device numbers in PERF_RECORD_MMAP2 (tools/perf/util/dso.c __dso_id__cmp
 // compares maj/min/ino together, never the inode alone).
 fn device_major(device: u64) -> u32 {
-    (((device >> 8) & 0xfff) | ((device >> 32) & !0xfff)) as u32
+    u32::try_from(((device >> 8) & 0xfff) | ((device >> 32) & 0xffff_f000))
+        .expect("major device number fits u32")
 }
 
 fn device_minor(device: u64) -> u32 {
-    ((device & 0xff) | ((device >> 12) & !0xff)) as u32
+    u32::try_from((device & 0xff) | ((device >> 12) & 0xffff_ff00))
+        .expect("minor device number fits u32")
 }
 
 #[test]

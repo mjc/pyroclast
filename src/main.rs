@@ -1,16 +1,12 @@
 fn main() {
-    match pyroclast::run_cli(std::env::args_os()) {
-        Ok(output) => {
-            if let Err(error) =
-                pyroclast::write_cli_output(&output, std::io::stdout(), std::io::stderr())
-            {
-                eprintln!("error: {error}");
-                std::process::exit(1);
-            }
-        }
-        Err(error) => {
-            eprintln!("error: {error}");
-            std::process::exit(1);
-        }
+    let stdout = std::io::stdout();
+    let stderr = std::io::stderr();
+    if let Err(error) = pyroclast::run_cli_to_writers(
+        std::env::args_os(),
+        std::io::BufWriter::new(stdout.lock()),
+        stderr.lock(),
+    ) {
+        eprintln!("error: {error}");
+        std::process::exit(1);
     }
 }

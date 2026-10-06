@@ -614,15 +614,6 @@ impl NixFallbackRunner {
             })
             .count()
     }
-
-    fn matching_program(&self, program: &str) -> usize {
-        self.commands
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|command| command.program == program)
-            .count()
-    }
 }
 
 fn nix_resolution_output(path: &str) -> CommandOutput {

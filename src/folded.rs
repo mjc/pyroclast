@@ -51,66 +51,109 @@ pub(crate) fn render_inferno_perf_raw_stack_into<'a>(
     scratch: &mut String,
 ) {
     rendered.clear();
+    let mut has_segment = false;
     for frame in frames {
-        append_inferno_perf_raw_function(rendered, frame, scratch);
+        has_segment |= append_inferno_perf_raw_function(rendered, frame, scratch, has_segment);
+    }
+}
+
+fn raw_function_without_offset(frame: &str) -> &str {
+    if let Some(offset) = memchr::memrchr(b'+', frame.as_bytes())
+        && frame[offset..].starts_with("+0x")
+        && frame[offset + 3..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        &frame[..offset]
+    } else {
+        frame
+    }
+}
+
+pub(crate) fn inferno_perf_raw_function_literal_end(frame: &str) -> Option<usize> {
+    let frame = raw_function_without_offset(frame);
+    // Inferno perf.rs:on_stack_line (491-524): offsets, process labels,
+    // Rust fixups and Java arrows precede tidy_generic. Cache byte ranges,
+    // never another owned or normalized copy of the symbol text.
+    let frame = if let Some(hash_start) = partially_demangled_rust_hash_start(frame) {
+        let prefix = &frame[..hash_start];
+        if prefix.contains("..") {
+            return None;
+        }
+        prefix.strip_suffix("::").unwrap_or(prefix)
+    } else {
+        frame
+    };
+    if frame.starts_with('(')
+        || memchr::memchr3(b'$', b'(', b';', frame.as_bytes()).is_some()
+        || memchr::memchr2(b'\n', b'\r', frame.as_bytes()).is_some()
+        || frame.contains("->")
+    {
+        None
+    } else {
+        Some(frame.len())
     }
 }
 
 pub(crate) fn append_inferno_perf_raw_function(
     rendered: &mut String,
-    mut frame: &str,
+    frame: &str,
     scratch: &mut String,
-) {
-    if let Some(offset) = frame.rfind("+0x") {
-        let suffix = &frame[offset + 3..];
-        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_hexdigit()) {
-            frame = &frame[..offset];
-        }
-    }
+    has_prefix: bool,
+) -> bool {
+    let frame = raw_function_without_offset(frame);
     if frame.starts_with('(') {
-        return;
+        return false;
     }
-    if !frame.contains('$')
-        && !frame.contains("->")
-        && !frame.contains('(')
-        && !frame.contains(';')
-        && !frame.contains('\n')
-        && !frame.contains('\r')
-    {
-        append_separator(rendered);
-        rendered.push_str(frame);
-        return;
-    }
+    // Inferno perf.rs:on_stack_line fixes Rust hashes before any tidy fast path.
     let fixed_frame = fix_partially_demangled_rust_symbol(frame);
     let frame = fixed_frame.as_ref();
-
+    if memchr::memchr3(b'$', b'(', b';', frame.as_bytes()).is_none()
+        && memchr::memchr2(b'\n', b'\r', frame.as_bytes()).is_none()
+        && !frame.contains("->")
+    {
+        append_separator(rendered, has_prefix);
+        rendered.push_str(frame);
+        return true;
+    }
     for (index, part) in frame.split("->").enumerate() {
-        append_separator(rendered);
+        append_separator(rendered, has_prefix || index != 0);
         tidy_inferno_perf_generic_into(scratch, part);
         if index > 0 && !scratch.contains("_[i]") {
             scratch.push_str("_[i]");
         }
-        escape_frame_into(rendered, scratch);
+        // Inferno perf.rs:tidy_generic only replaces semicolons and removes
+        // parameters. It preserves interior CR; row boundaries are parsed
+        // before this normalization, not escaped into different labels.
+        rendered.push_str(scratch);
     }
+    true
+}
+
+fn partially_demangled_rust_hash_start(symbol: &str) -> Option<usize> {
+    const RUST_HASH_LENGTH: usize = 17;
+    let hash_start = symbol.len().checked_sub(RUST_HASH_LENGTH)?;
+    let hash = &symbol.as_bytes()[hash_start..];
+    (hash[0] == b'h' && hash[1..].iter().all(u8::is_ascii_hexdigit)).then_some(hash_start)
 }
 
 fn fix_partially_demangled_rust_symbol(symbol: &str) -> Cow<'_, str> {
-    const RUST_HASH_LENGTH: usize = 17;
-
-    let is_rust_hash =
-        |value: &str| value.starts_with('h') && value[1..].chars().all(|c| c.is_ascii_hexdigit());
-
-    if symbol.len() < RUST_HASH_LENGTH || !is_rust_hash(&symbol[symbol.len() - RUST_HASH_LENGTH..])
-    {
+    let Some(hash_start) = partially_demangled_rust_hash_start(symbol) else {
         return Cow::Borrowed(symbol);
-    }
+    };
 
-    let mut rest = &symbol[..symbol.len() - RUST_HASH_LENGTH];
+    let mut rest = &symbol[..hash_start];
     if rest.ends_with("::") {
         rest = &rest[..rest.len() - 2];
     }
     if rest.starts_with("_$") {
         rest = &rest[1..];
+    }
+
+    // Inferno collapse/common.rs:fix_partially_demangled_rust_symbol only
+    // rewrites dollar escapes and double dots after removing the hash.
+    if !rest.contains('$') && !rest.contains("..") {
+        return Cow::Borrowed(rest);
     }
 
     let mut demangled = String::new();
@@ -171,35 +214,32 @@ fn rust_symbol_escape(rest: &str) -> Option<(&'static str, &'static str)> {
     .find(|(encoded, _)| rest.starts_with(encoded))
 }
 
-pub(crate) fn append_inferno_perf_folded_label(rendered: &mut String, frame: &str) {
-    append_separator(rendered);
+pub(crate) fn append_inferno_perf_folded_label(
+    rendered: &mut String,
+    frame: &str,
+    has_prefix: bool,
+) {
+    append_separator(rendered, has_prefix);
     escape_frame_into(rendered, frame);
-}
-
-#[must_use]
-pub(crate) fn render_inferno_perf_folded_label(frame: &str) -> String {
-    let mut rendered = String::new();
-    append_inferno_perf_folded_label(&mut rendered, frame);
-    rendered
 }
 
 fn render_folded_stack_into<'a>(rendered: &mut String, frames: impl IntoIterator<Item = &'a str>) {
     rendered.clear();
-    for frame in frames {
-        append_separator(rendered);
+    for (index, frame) in frames.into_iter().enumerate() {
+        append_separator(rendered, index != 0);
         escape_frame_into(rendered, frame);
     }
 }
 
-fn tidy_inferno_perf_generic_into(scratch: &mut String, frame: &str) {
-    let mut bracket_depth = 0_u32;
+pub(crate) fn tidy_inferno_perf_generic_into(scratch: &mut String, frame: &str) {
+    let mut bracket_depth = 0_i32;
     let mut last_dot_index = None;
     let mut length_without_parameters = frame.len();
-    for (index, character) in frame.char_indices() {
-        match character {
-            '<' | '{' | '[' => bracket_depth += 1,
-            '>' | '}' | ']' | ')' => bracket_depth = bracket_depth.saturating_sub(1),
-            '(' => {
+    for (index, byte) in frame.bytes().enumerate() {
+        match byte {
+            b'<' | b'{' | b'[' => bracket_depth += 1,
+            b'>' | b'}' | b']' | b')' => bracket_depth -= 1,
+            b'(' => {
                 if bracket_depth == 0 {
                     let is_go_function = last_dot_index == Some(index);
                     let is_anonymous_namespace =
@@ -211,42 +251,155 @@ fn tidy_inferno_perf_generic_into(scratch: &mut String, frame: &str) {
                 }
                 bracket_depth += 1;
             }
-            '.' => last_dot_index = Some(index + 1),
+            b'.' => last_dot_index = Some(index + 1),
             _ => {}
         }
     }
     scratch.clear();
     scratch.reserve(length_without_parameters);
-    for character in frame[..length_without_parameters].chars() {
-        if character == ';' {
-            scratch.push(':');
-        } else {
-            scratch.push(character);
-        }
+    let frame = &frame[..length_without_parameters];
+    let mut start = 0;
+    for index in memchr::memchr_iter(b';', frame.as_bytes()) {
+        scratch.push_str(&frame[start..index]);
+        scratch.push(':');
+        start = index + 1;
     }
+    scratch.push_str(&frame[start..]);
 }
 
-fn escape_frame_into(escaped: &mut String, frame: &str) {
-    if frame
-        .bytes()
-        .all(|byte| !matches!(byte, b';' | b'\r' | b'\n'))
-    {
-        escaped.push_str(frame);
-        return;
-    }
+pub(crate) fn escape_frame_into(escaped: &mut String, frame: &str) {
+    append_escaped_spans(escaped, frame, "\\;");
+}
 
+pub(crate) fn append_escaped_spans(escaped: &mut String, frame: &str, semicolon: &str) {
     escaped.reserve(frame.len());
-    for character in frame.chars() {
-        match character {
-            ';' => escaped.push_str("\\;"),
-            '\r' | '\n' => escaped.push(' '),
-            _ => escaped.push(character),
+    let mut start = 0;
+    // ASCII delimiter matches are UTF-8 boundaries; copy unchanged spans whole.
+    for index in memchr::memchr3_iter(b';', b'\r', b'\n', frame.as_bytes()) {
+        escaped.push_str(&frame[start..index]);
+        if frame.as_bytes()[index] == b';' {
+            escaped.push_str(semicolon);
+        } else {
+            escaped.push(' ');
         }
+        start = index + 1;
+    }
+    escaped.push_str(&frame[start..]);
+}
+
+pub(crate) fn append_separator(rendered: &mut String, has_prefix: bool) {
+    // Inferno after_event joins logical segments, including empty strings.
+    if has_prefix || !rendered.is_empty() {
+        rendered.push(';');
     }
 }
 
-fn append_separator(rendered: &mut String) {
-    if !rendered.is_empty() {
-        rendered.push(';');
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn rust_hash_only_fixups_borrow_symbol_text() {
+        for (symbol, expected) in [
+            ("crate::name::h0123456789abcdef", "crate::name"),
+            ("crate::nameh0123456789abcdef", "crate::name"),
+            ("dot.name::h0123456789ABCDEF", "dot.name"),
+            ("unicode_\u{e9}::h0123456789abcdef", "unicode_\u{e9}"),
+            ("fn(params)::h0123456789abcdef", "fn(params)"),
+            ("outer->inner::h0123456789abcdef", "outer->inner"),
+            ("h0123456789abcdef", ""),
+        ] {
+            let fixed = super::fix_partially_demangled_rust_symbol(symbol);
+            assert_eq!(fixed, expected);
+            assert!(matches!(fixed, std::borrow::Cow::Borrowed(_)));
+        }
+        for (symbol, expected) in [
+            ("crate..name::h0123456789abcdef", "crate::name"),
+            ("_$LT$name$GT$::h0123456789abcdef", "<name>"),
+        ] {
+            assert_eq!(super::fix_partially_demangled_rust_symbol(symbol), expected);
+        }
+    }
+
+    #[test]
+    fn rust_hash_only_fixups_use_literal_source_ranges() {
+        // Inferno collapse/common.rs:fix_partially_demangled_rust_symbol strips
+        // the trailing hash and optional :: before decoding dollars/double dots.
+        for (symbol, expected) in [
+            ("crate::name::h0123456789abcdef", "crate::name"),
+            ("crate::nameh0123456789abcdef", "crate::name"),
+            ("crate::name::h0123456789abcdef+0x10", "crate::name"),
+            ("dot.name::h0123456789ABCDEF", "dot.name"),
+            ("unicode_\u{e9}::h0123456789abcdef", "unicode_\u{e9}"),
+            ("h0123456789abcdef", ""),
+            ("::h0123456789abcdef", ""),
+        ] {
+            assert_eq!(
+                super::inferno_perf_raw_function_literal_end(symbol),
+                Some(expected.len()),
+                "symbol {symbol:?}"
+            );
+            let mut rendered = String::new();
+            let mut scratch = String::new();
+            assert!(super::append_inferno_perf_raw_function(
+                &mut rendered,
+                symbol,
+                &mut scratch,
+                false
+            ));
+            assert_eq!(rendered, expected);
+        }
+        for symbol in [
+            "crate..name::h0123456789abcdef",
+            "_$LT$name$GT$::h0123456789abcdef",
+            "$unknown$name::h0123456789abcdef",
+            "outer->inner::h0123456789abcdef",
+            "function(param)::h0123456789abcdef",
+            "name;separator::h0123456789abcdef",
+        ] {
+            assert_eq!(super::inferno_perf_raw_function_literal_end(symbol), None);
+        }
+    }
+
+    #[test]
+    fn literal_source_ranges_match_full_normalization_without_owned_labels() {
+        for symbol in [
+            "",
+            "plain",
+            "plain+0x10",
+            "plain+0x",
+            "plain+0xGG",
+            "a+0x10+tail",
+            "a+0x10+0x20",
+            "unicode_\u{e9}+0x10",
+            "[unknown]",
+            "square[brackets]",
+            "with<angle>",
+            "raw$escape",
+            "outer->inner",
+            "semi;colon",
+            "fn(params)",
+            "(process)",
+            "line\nfeed",
+            "carriage\rreturn",
+            "name::h0123456789abcdef",
+            "h0123456789abcdef",
+            "_$LT$demo$GT$::h0123456789abcdef+0x10",
+            "not_a_hash_h0123456789abcdeg",
+            "\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}",
+        ] {
+            if let Some(end) = super::inferno_perf_raw_function_literal_end(symbol) {
+                assert!(symbol.is_char_boundary(end));
+                let mut rendered = String::new();
+                let mut scratch = String::new();
+                super::append_inferno_perf_raw_function(&mut rendered, symbol, &mut scratch, false);
+                assert_eq!(&symbol[..end], rendered, "symbol {symbol:?}");
+            }
+        }
+        assert_eq!(
+            super::inferno_perf_raw_function_literal_end("plain+0x10"),
+            Some(5)
+        );
+        for symbol in ["(process)", "outer->inner", "fn()", "semi;colon"] {
+            assert_eq!(super::inferno_perf_raw_function_literal_end(symbol), None);
+        }
     }
 }

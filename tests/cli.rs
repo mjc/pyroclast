@@ -375,7 +375,7 @@ fn parses_top_level_profiler_commands() {
 fn parses_plumbing_fold_and_summarize_commands() {
     let fold = Cli::parse_from(["pyroclast", "plumbing", "fold", "perf.data"]);
     assert!(
-        matches!(fold.command, CliCommand::Plumbing { command: PlumbingCommand::Fold(command) } if command.input == std::path::Path::new("perf.data") && !command.count_periods)
+        matches!(fold.command, CliCommand::Plumbing { command: PlumbingCommand::Fold(command) } if command.input == std::path::Path::new("perf.data") && command.count_periods)
     );
 
     let weighted_fold = Cli::parse_from([

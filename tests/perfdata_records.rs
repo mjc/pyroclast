@@ -290,7 +290,7 @@ fn dispatches_mmap2_build_id_record_when_misc_flag_is_set() {
 
     let parsed = parse_record(record).expect("parsed record");
 
-    assert!(matches!(parsed, ParsedRecord::Mmap2BuildId(_)));
+    assert!(matches!(parsed, ParsedRecord::Mmap2BuildId { .. }));
 }
 
 #[test]

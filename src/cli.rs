@@ -288,17 +288,33 @@ pub struct ProfileArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct InlineFrameArgs {
+    /// Show DWARF inline frames, matching `perf script`'s default.
+    #[arg(long, action = ArgAction::SetTrue, default_value_t = true)]
+    pub inline: bool,
+
+    /// Disable DWARF inline frames, matching `perf script --no-inline`.
+    #[arg(long = "no-inline", action = ArgAction::SetTrue)]
+    pub no_inline: bool,
+}
+
+impl InlineFrameArgs {
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.inline && !self.no_inline
+    }
+}
+
+#[derive(Debug, Args)]
 pub struct FoldArgs {
-    #[arg(long)]
+    #[arg(long, default_value_t = true)]
     pub count_periods: bool,
 
     #[arg(long = "no-symbols", action = ArgAction::SetFalse, default_value_t = true)]
     pub symbols: bool,
 
-    /// Expand each callchain entry into its DWARF inline frames, like
-    /// `perf script --inline`. Off by default, matching plain `perf script`.
-    #[arg(long)]
-    pub inline: bool,
+    #[command(flatten)]
+    pub inline_frames: InlineFrameArgs,
 
     #[arg(long, value_enum, default_value_t = SymbolizerKind::RustAddr2line)]
     pub symbolizer: SymbolizerKind,
@@ -311,10 +327,8 @@ pub struct PerfScriptArgs {
     #[arg(long = "no-symbols", action = ArgAction::SetFalse, default_value_t = true)]
     pub symbols: bool,
 
-    /// Expand each callchain entry into its DWARF inline frames, like
-    /// `perf script --inline`. Off by default, matching plain `perf script`.
-    #[arg(long)]
-    pub inline: bool,
+    #[command(flatten)]
+    pub inline_frames: InlineFrameArgs,
 
     #[arg(long, value_enum, default_value_t = SymbolizerKind::RustAddr2line)]
     pub symbolizer: SymbolizerKind,
@@ -340,10 +354,8 @@ pub struct FlamegraphArgs {
     #[arg(long = "no-symbols", action = ArgAction::SetFalse, default_value_t = true)]
     pub symbols: bool,
 
-    /// Expand each callchain entry into its DWARF inline frames, like
-    /// `perf script --inline`. Off by default, matching plain `perf script`.
-    #[arg(long)]
-    pub inline: bool,
+    #[command(flatten)]
+    pub inline_frames: InlineFrameArgs,
 
     #[arg(long, value_enum, default_value_t = SymbolizerKind::RustAddr2line)]
     pub symbolizer: SymbolizerKind,

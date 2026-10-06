@@ -9,15 +9,23 @@ use pyroclast::perfdata::fold::{
 use pyroclast::perfdata::mappings::FileIdentity;
 use pyroclast::perfdata::records::{
     PERF_RECORD_FINISHED_ROUND, PERF_RECORD_FORK, PERF_RECORD_MISC_COMM_EXEC,
-    PERF_RECORD_MISC_CPUMODE_KERNEL, PERF_RECORD_MISC_CPUMODE_USER,
+    PERF_RECORD_MISC_CPUMODE_KERNEL, PERF_RECORD_MISC_CPUMODE_USER, PERF_RECORD_MISC_MMAP_BUILD_ID,
+    PERF_RECORD_SAMPLE,
 };
 use pyroclast::perfdata::samples::{
     PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_ID, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP,
     PERF_SAMPLE_PERIOD, PERF_SAMPLE_REGS_USER, PERF_SAMPLE_STACK_USER, PERF_SAMPLE_TID,
     PERF_SAMPLE_TIME,
 };
-use pyroclast::symbols::{SymbolRequest, SymbolResolver};
+use pyroclast::symbols::{
+    ResolvedSymbolFrames, SymbolRequest, SymbolResolver,
+    perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources,
+};
 use std::cell::RefCell;
+#[cfg(target_os = "linux")]
+use std::io::Write as _;
+#[cfg(target_os = "linux")]
+use std::process::{Command, Stdio};
 
 fn render_unknown_folded_callchain(frames: &[u64], count: u64) -> String {
     if frames.is_empty() {
@@ -146,11 +154,9 @@ fn summarizes_dwarf_user_stack_payloads() {
 }
 
 #[test]
-fn keeps_unmapped_dwarf_user_stack_payloads_like_perf_libdw_ebl() {
-    // perf machine.c attempts thread__resolve_callchain_unwind() whenever the
-    // sample has user regs and a non-empty user stack. libdw
-    // __report_module() succeeds with no DSO, and elfutils frame_unwind.c can
-    // still fall back to x86_64_unwind() using frame pointers.
+fn skips_dwarf_unwind_when_sampled_ip_has_no_mapping_like_perf_libdw() {
+    // perf's libdw path produces no accepted frame callbacks without a module
+    // for the initial sampled IP, even when regs and stack bytes are present.
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -180,17 +186,13 @@ fn keeps_unmapped_dwarf_user_stack_payloads_like_perf_libdw_ebl() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
+    assert_eq!(folded, "");
 }
 
 #[test]
-fn folds_aarch64_dwarf_user_stack_with_frame_pointer_fallback_like_perf_libdw_ebl() {
-    // perf record --call-graph dwarf on arm64 captures x0-x30, sp, pc. The
-    // recording machine's HEADER_ARCH ("aarch64") tells the fold path to decode
-    // PerfAarch64Regs (fp=29, lr=30, sp=31, pc=32) and use elfutils'
-    // backends/aarch64_unwind.c frame-pointer fallback when no DSO/CFI covers
-    // the sampled pc: the caller pc comes from lr (taking the perf pc-1
-    // adjustment), and the walk ends on the zeroed next lr.
+fn skips_aarch64_dwarf_unwind_when_sampled_ip_has_no_mapping_like_perf_libdw() {
+    // With no mapping for the initial sampled IP, perf never reaches an
+    // accepted libdw frame callback; register contents cannot create frames.
     let mask = (1_u64 << 29) | (1_u64 << 30) | (1_u64 << 31) | (1_u64 << 32);
     let bytes = perfdata_with_records_attrs_and_arch_feature(
         [file_attr_bytes_with_regs(
@@ -222,7 +224,7 @@ fn folds_aarch64_dwarf_user_stack_with_frame_pointer_fallback_like_perf_libdw_eb
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
+    assert_eq!(folded, "");
 }
 
 #[test]
@@ -463,10 +465,9 @@ fn keeps_dwarf_user_stack_when_newer_mapping_overlaps_before_first_report_like_p
 }
 
 #[test]
-fn keeps_dwarf_user_stack_when_build_id_mapping_overlaps_before_first_report_like_perf_script() {
-    // Same lazy report_module() rule as plain MMAP: a build-id-backed mapping
-    // can only overlap a prior DWFL module after an earlier unwind report
-    // populated that module.
+fn skips_unwind_when_build_id_mapping_cannot_report_initial_module_like_perf_script() {
+    // The recorded build-id mappings do not let perf report this initial
+    // module, so libdw aborts before emitting an unwind entry.
     let current_exe = std::env::current_exe().expect("current exe");
     let current_exe = current_exe.to_string_lossy();
     let bytes = perfdata_with_records_and_attrs(
@@ -508,7 +509,7 @@ fn keeps_dwarf_user_stack_when_build_id_mapping_overlaps_before_first_report_lik
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
+    assert_eq!(folded, "");
 }
 
 #[test]
@@ -568,7 +569,7 @@ fn keeps_dwarf_user_stack_when_header_build_id_mmap2_overlaps_before_first_repor
 }
 
 #[test]
-fn folds_dwarf_user_stack_payloads_before_kernel_callchain_frames() {
+fn folds_recorded_callchain_only_without_initial_module_like_perf_script() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -598,11 +599,11 @@ fn folds_dwarf_user_stack_payloads_before_kernel_callchain_frames() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown];[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
 }
 
 #[test]
-fn keeps_unmapped_kernel_looking_user_unwind_frame_like_perf_libdw_entry() {
+fn skips_unmapped_user_unwind_frames_and_keeps_recorded_callchain_like_perf_script() {
     // perf's libdw entry path reports unwind frames with
     // thread__find_symbol(..., PERF_RECORD_MISC_USER, ip). If that lookup finds
     // no DSO, __report_module() returns success and unwind_entry() later keeps
@@ -636,11 +637,11 @@ fn keeps_unmapped_kernel_looking_user_unwind_frame_like_perf_libdw_entry() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;0xffffffff80ffffff;[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown] 1\n");
 }
 
 #[test]
-fn keeps_dwarf_user_stack_payloads_when_kernel_callchain_has_user_context_marker() {
+fn uses_recorded_kernel_callchain_only_without_initial_module_with_user_marker() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -674,11 +675,11 @@ fn keeps_dwarf_user_stack_payloads_when_kernel_callchain_has_user_context_marker
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown];[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
 }
 
 #[test]
-fn keeps_dwarf_user_stack_payloads_when_kernel_callchain_has_no_user_context_marker() {
+fn uses_recorded_callchain_only_without_initial_module_for_user_sample() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -713,12 +714,11 @@ fn keeps_dwarf_user_stack_payloads_when_kernel_callchain_has_no_user_context_mar
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown];[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
 }
 
 #[test]
-fn keeps_dwarf_user_stack_payloads_for_kernel_samples_without_user_context_marker_like_perf_script()
-{
+fn uses_recorded_kernel_callchain_only_without_initial_module_like_perf_script() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -753,7 +753,7 @@ fn keeps_dwarf_user_stack_payloads_for_kernel_samples_without_user_context_marke
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown];[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -867,10 +867,9 @@ fn keeps_recorded_user_frame_without_dwarf_callers_for_mixed_callchain_like_perf
 }
 
 #[test]
-fn keeps_dwarf_user_stack_for_kernel_sample_without_kernel_callchain_like_perf_libdw_ebl() {
-    // For ORDER_CALLEE, perf resolves the recorded callchain first and then
-    // calls thread__resolve_callchain_unwind(); an empty kernel callchain does
-    // not suppress the captured user-regs/user-stack unwind path.
+fn skips_kernel_sample_unwind_without_initial_module_like_perf_libdw() {
+    // A present-but-empty kernel callchain still cannot produce user unwind
+    // entries when the user sampled IP has no reportable module.
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -901,7 +900,7 @@ fn keeps_dwarf_user_stack_for_kernel_sample_without_kernel_callchain_like_perf_l
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
+    assert_eq!(folded, "");
 }
 
 #[test]
@@ -944,7 +943,7 @@ fn skips_dwarf_unwind_when_perf_user_stack_dynamic_size_is_zero_like_perf_script
 }
 
 #[test]
-fn limits_dwarf_unwind_to_perf_user_stack_dynamic_size_like_perf_script() {
+fn skips_unwind_with_short_stack_when_sampled_ip_is_unmapped() {
     let mut sample = sample_payload(
         0x4000,
         11,
@@ -984,7 +983,7 @@ fn limits_dwarf_unwind_to_perf_user_stack_dynamic_size_like_perf_script() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -1032,6 +1031,65 @@ fn keeps_current_ip_only_object_unwind_for_mapped_dwarf_user_stack_like_perf_lib
     let expected = format!(":12;[{}] 1\n", fixture.file_name());
 
     assert_eq!(folded, expected);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn keeps_unwind_frame_for_valid_elf_named_perf_data_like_perf_libdw_and_inferno() {
+    let fixture = SyntheticX86_64Object::create();
+    let object_path = fixture.dir.path().join("perf.data");
+    std::fs::copy(&fixture.path, &object_path).expect("copy fixture ELF as perf.data");
+    let object_path = object_path.to_str().expect("utf8 object path");
+    let mut bytes = x86_leaf_only_perfdata(
+        object_path,
+        [0x7ffe_ff00, 0x7fff_0000, 0x4000],
+        [
+            0, 0, 0, 0, 0, 0, 0, 0, //
+            0x40, 0, 0, 0, 0, 0, 0, 0, //
+            0x34, 0x12, 0, 0, 0, 0, 0, 0,
+        ],
+    );
+    put_u64(&mut bytes, 16, 144);
+    let perfdata = fixture.dir.path().join("recording.perf.data");
+    std::fs::write(&perfdata, bytes).expect("write recording");
+
+    let perf = Command::new("perf")
+        .args([
+            "script",
+            "--force",
+            "-i",
+            perfdata.to_str().expect("utf8 perfdata path"),
+        ])
+        .output()
+        .expect("run perf script");
+    assert!(
+        perf.status.success(),
+        "perf script failed: {}",
+        String::from_utf8_lossy(&perf.stderr)
+    );
+
+    let mut inferno = Command::new("inferno-collapse-perf")
+        .arg("-q")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("run Inferno");
+    inferno
+        .stdin
+        .take()
+        .expect("Inferno stdin")
+        .write_all(&perf.stdout)
+        .expect("send perf script output to Inferno");
+    let inferno = inferno.wait_with_output().expect("wait for Inferno");
+    assert!(inferno.status.success());
+
+    let folded = fold_perfdata_callchains(&std::fs::read(&perfdata).expect("read recording"))
+        .expect("fold recording");
+    assert_eq!(
+        folded,
+        String::from_utf8(inferno.stdout).expect("Inferno UTF-8 output")
+    );
+    assert_eq!(folded, ":12;[perf.data] 1\n");
 }
 
 #[test]
@@ -1186,11 +1244,15 @@ fn keeps_current_ip_only_object_unwind_from_pid_specific_modules_like_perf_libdw
     assert_eq!(folded, expected);
 }
 
-/// Build a `--call-graph dwarf` x86_64 perf.data with a single sample over the
+/// Build a `--call-graph dwarf` `x86_64` perf.data with a single sample over the
 /// synthetic fixture: one MMAP covering `[0, 0x1000_0000)` and one user-stack
 /// sample. `regs` are `[bp, sp, ip]` in perf's ascending register order
 /// (RBP=6, RSP=7, IP=8).
 fn x86_leaf_only_perfdata(fixture_path: &str, regs: [u64; 3], stack: [u8; 24]) -> Vec<u8> {
+    let mut mmap = mmap_payload(11, 11, 0, 0x1000_0000, 0, fixture_path);
+    while !(8 + mmap.len()).is_multiple_of(8) {
+        mmap.push(0);
+    }
     perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -1201,7 +1263,7 @@ fn x86_leaf_only_perfdata(fixture_path: &str, regs: [u64; 3], stack: [u8; 24]) -
             (1 << 6) | (1 << 7) | (1 << 8),
         )],
         [
-            record_bytes(1, &mmap_payload(11, 11, 0, 0x1000_0000, 0, fixture_path)),
+            record_bytes(1, &mmap),
             record_bytes(
                 9,
                 &sample_payload_with_user_stack(regs[2], 11, 12, [], 1, regs, stack),
@@ -1618,7 +1680,7 @@ fn drops_dwarf_user_stack_when_late_synthetic_mapping_cannot_be_loaded_like_perf
 }
 
 #[test]
-fn drops_dwarf_user_stack_frames_from_known_non_executable_mappings() {
+fn skips_object_unwind_when_sampled_ip_has_no_mapping_before_mmap2_frame() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -1654,11 +1716,11 @@ fn drops_dwarf_user_stack_frames_from_known_non_executable_mappings() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown] 1\n");
 }
 
 #[test]
-fn keeps_dwarf_user_stack_frames_from_mapped_non_executable_libraries_like_perf_script() {
+fn skips_unwind_when_sampled_ip_is_outside_mapped_library_like_perf_script() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -1694,11 +1756,11 @@ fn keeps_dwarf_user_stack_frames_from_mapped_non_executable_libraries_like_perf_
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[libc.so.6];[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown] 1\n");
 }
 
 #[test]
-fn drops_dwarf_user_stack_frames_from_stack_mappings_like_perf_script() {
+fn skips_unwind_when_sampled_ip_is_outside_stack_mapping_like_perf_script() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -1731,11 +1793,11 @@ fn drops_dwarf_user_stack_frames_from_stack_mappings_like_perf_script() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown] 1\n");
 }
 
 #[test]
-fn drops_dwarf_user_stack_frames_from_perf_data_file_mappings_without_prot() {
+fn skips_object_unwind_when_sampled_ip_has_no_mapping_before_mmap_frame() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -1768,12 +1830,17 @@ fn drops_dwarf_user_stack_frames_from_perf_data_file_mappings_without_prot() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown] 1\n");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
-fn drops_perf_data_file_frames_when_mapping_arrives_after_sample() {
-    let bytes = perfdata_with_records_and_attrs(
+fn mapping_arriving_after_sample_is_not_applied_retroactively_like_perf_script() {
+    let mut mmap = mmap_payload(11, 11, 0x1200, 0x100, 0, "/tmp/perf.data");
+    while !(8 + mmap.len()).is_multiple_of(8) {
+        mmap.push(0);
+    }
+    let mut bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
                 | PERF_SAMPLE_TID
@@ -1799,13 +1866,51 @@ fn drops_perf_data_file_frames_when_mapping_arrives_after_sample() {
                     ],
                 ),
             ),
-            record_bytes(1, &mmap_payload(11, 11, 0x1200, 0x100, 0, "/tmp/perf.data")),
+            record_bytes(1, &mmap),
         ],
     );
+    put_u64(&mut bytes, 16, 144);
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("recording.perf.data");
+    std::fs::write(&perfdata, &bytes).expect("write recording");
+    let perf = Command::new("perf")
+        .args([
+            "script",
+            "--force",
+            "-i",
+            perfdata.to_str().expect("utf8 perfdata path"),
+        ])
+        .output()
+        .expect("run perf script");
+    assert!(
+        perf.status.success(),
+        "perf script failed: {}",
+        String::from_utf8_lossy(&perf.stderr)
+    );
+
+    let mut inferno = Command::new("inferno-collapse-perf")
+        .arg("-q")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("run Inferno");
+    inferno
+        .stdin
+        .take()
+        .expect("Inferno stdin")
+        .write_all(&perf.stdout)
+        .expect("send perf script output to Inferno");
+    let inferno = inferno.wait_with_output().expect("wait for Inferno");
+    assert!(inferno.status.success());
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
-
-    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
+    assert_eq!(
+        folded,
+        String::from_utf8(inferno.stdout).expect("Inferno UTF-8 output"),
+        "perf script:\n{}",
+        String::from_utf8_lossy(&perf.stdout)
+    );
 }
 
 #[test]
@@ -1884,7 +1989,9 @@ fn drops_perf_context_marker_frames_when_folding() {
 }
 
 #[test]
-fn merges_deferred_user_callchains_like_perf_script() {
+fn disabled_deferral_retains_cookie_without_tid_sample_id_like_perf_script() {
+    // evsel.c:3391 requires attr.defer_callchain before treating the final
+    // address as a cookie. This fixture leaves bit38 disabled.
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
             PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
@@ -1908,14 +2015,45 @@ fn merges_deferred_user_callchains_like_perf_script() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown];[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown];[unknown] 1\n");
 }
 
 #[test]
-fn flushes_original_deferred_sample_when_deferred_record_tid_differs_like_perf_script() {
-    // perf leaves the original deferred sample queued when a deferred-callchain
-    // record has the right cookie but a different tid. session__flush_deferred_samples()
-    // then delivers the original unmerged callchain at EOF.
+fn disabled_deferral_does_not_merge_even_with_matching_tid_sample_id_like_perf_script() {
+    // evsel.c:3391 and session.c:1486 require attr.defer_callchain; a matching
+    // TID/cookie cannot merge a sample that was never queued for deferral.
+    let mut deferred = callchain_deferred_payload(0x4444, [0x5000, 0x6000]);
+    deferred.extend(11_u32.to_le_bytes());
+    deferred.extend(12_u32.to_le_bytes());
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_flags(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            1 << 18,
+        )],
+        [
+            record_bytes(3, &comm_payload(11, 11, "pyroclast")),
+            record_bytes(
+                9,
+                &sample_payload(
+                    0x1000,
+                    11,
+                    12,
+                    [0x2000, 0x3000, 0xffff_ffff_ffff_fd80, 0x4444],
+                ),
+            ),
+            record_bytes(22, &deferred),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, ":12;[unknown];[unknown];[unknown] 1\n");
+}
+
+#[test]
+fn disabled_deferral_retains_cookie_when_a_different_tid_record_arrives_like_perf_script() {
+    // evsel.c:3391 requires bit38. No deferral occurs in this fixture, so the
+    // original cookie is an address regardless of the later record's TID.
     let mut deferred = callchain_deferred_payload(0x4444, [0x5000, 0x6000]);
     deferred.extend(11_u32.to_le_bytes());
     deferred.extend(99_u32.to_le_bytes());
@@ -1941,14 +2079,13 @@ fn flushes_original_deferred_sample_when_deferred_record_tid_differs_like_perf_s
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown];[unknown] 1\n");
 }
 
 #[test]
-fn flushes_unmatched_deferred_user_callchains_like_perf_script() {
-    // A missing matching cookie follows the same perf flush path: the original
-    // sample is eventually delivered with its recorded frames before the
-    // PERF_CONTEXT_USER_DEFERRED marker.
+fn disabled_deferral_retains_cookie_when_a_different_cookie_record_arrives_like_perf_script() {
+    // evsel.c:3391 requires bit38. Without it, the cookie is a normal frame
+    // and the sample is delivered without waiting for a matching record.
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
             PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
@@ -1972,7 +2109,7 @@ fn flushes_unmatched_deferred_user_callchains_like_perf_script() {
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
 
-    assert_eq!(folded, ":12;[unknown];[unknown] 1\n");
+    assert_eq!(folded, ":12;[unknown];[unknown];[unknown] 1\n");
 }
 
 #[test]
@@ -2108,6 +2245,40 @@ fn process_exec_comm_is_fallback_when_sample_thread_has_no_comm() {
 }
 
 #[test]
+fn resolves_each_sample_before_later_remaps_like_perf_script() {
+    // perf util/session.c perf_session__deliver_event() invokes
+    // builtin-script.c process_sample_event()/machine__resolve() before the
+    // next ordered mmap is applied. Inferno counts the emitted label, not IPs.
+    let mapping = |path: &str, time: u64| {
+        let mut payload = mmap_payload(11, 12, 0x1000, 0x1000, 0, path);
+        payload.extend(11_u32.to_le_bytes());
+        payload.extend(12_u32.to_le_bytes());
+        payload.extend(time.to_le_bytes());
+        record_bytes(1, &payload)
+    };
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_flags(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CALLCHAIN,
+            1 << 18,
+        )],
+        [
+            mapping("/missing/first.so", 10),
+            record_bytes(9, &sample_payload_with_time(0x1010, 11, 12, 20, [0x1010])),
+            mapping("/missing/second.so", 30),
+            record_bytes(9, &sample_payload_with_time(0x1010, 11, 12, 40, [0x1010])),
+        ],
+    );
+    let expected = ":12;[first.so] 1\n:12;[second.so] 1\n";
+    assert_eq!(fold_perfdata_callchains(&bytes).unwrap(), expected);
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), &bytes).unwrap();
+    assert_eq!(
+        fold_perfdata_file_with_options(file.path(), FoldOptions::default()).unwrap(),
+        expected
+    );
+}
+
+#[test]
 fn applies_comm_records_by_perf_timestamp_like_perf_script() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_flags(
@@ -2153,7 +2324,10 @@ fn normalizes_comm_spaces_like_inferno() {
 }
 
 #[test]
-fn can_fold_samples_weighted_by_period() {
+fn untimed_samples_use_infernos_unit_weight_even_with_period_fields() {
+    // perf builtin-script.c:evsel__do_check_stype removes absent TIME.
+    // Inferno perf.rs:on_event_line parses after the first colon; without
+    // TIME it cannot recover the preceding period and after_event uses 1.
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
             PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN,
@@ -2175,11 +2349,1390 @@ fn can_fold_samples_weighted_by_period() {
     )
     .expect("folded");
 
-    assert_eq!(folded, ":12;[unknown] 10\n");
+    assert_eq!(folded, ":12;[unknown] 2\n");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn period_weights_with_and_without_timestamps_match_real_perf_script_and_inferno() {
+    use inferno::collapse::Collapse as _;
+
+    // builtin-script.c:evsel__check_attr checks TIME with
+    // evsel__do_check_stype, removing absent default fields. Compare the
+    // resulting native headers, not just our own script writer's grammar.
+    for timed in [false, true] {
+        for callchain in [false, true] {
+            let mut sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD;
+            if timed {
+                sample_type |= PERF_SAMPLE_TIME;
+            }
+            if callchain {
+                sample_type |= PERF_SAMPLE_CALLCHAIN;
+            }
+            let mut comm = comm_payload(11, 12, "worker");
+            comm.resize(comm.len().next_multiple_of(8), 0);
+            let mut records = vec![record_bytes(3, &comm)];
+            for period in [7, 3] {
+                let mut payload = if callchain {
+                    sample_payload_with_period(0x2000, 11, 12, period, [0x2000])
+                } else {
+                    sample_payload_with_period_no_callchain(0x2000, 11, 12, period)
+                };
+                if timed {
+                    payload.splice(16..16, 1_000_000_000_u64.to_le_bytes());
+                }
+                records.push(record_bytes_with_misc(
+                    PERF_RECORD_SAMPLE,
+                    PERF_RECORD_MISC_CPUMODE_USER,
+                    &payload,
+                ));
+            }
+            let mut bytes = perfdata_with_records_and_attrs_vec(
+                vec![file_attr_bytes(sample_type, 0, 0)],
+                records,
+            );
+            put_u64(&mut bytes, 16, 144);
+            let root = tempfile::tempdir().expect("tempdir");
+            let input = root.path().join("perf.data");
+            std::fs::write(&input, &bytes).expect("write fixture");
+            let perf = Command::new("perf")
+                .args(["script", "--force", "-i"])
+                .arg(&input)
+                .output()
+                .expect("run perf script");
+            assert!(
+                perf.status.success(),
+                "{}",
+                String::from_utf8_lossy(&perf.stderr)
+            );
+            let mut native = Vec::new();
+            inferno::collapse::perf::Folder::default()
+                .collapse(std::io::Cursor::new(&perf.stdout), &mut native)
+                .expect("native Inferno");
+            let folded = fold_perfdata_callchains_with_options(
+                &bytes,
+                FoldOptions {
+                    count_periods: true,
+                    inline: false,
+                },
+            )
+            .expect("fold fixture");
+            assert_eq!(
+                folded.as_bytes(),
+                native,
+                "timed={timed}, callchain={callchain}, native script={}",
+                String::from_utf8_lossy(&perf.stdout)
+            );
+            if timed || callchain {
+                assert_eq!(
+                    folded,
+                    format!("worker;[unknown] {}\n", if timed { 10 } else { 2 })
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn native_script_and_fold(bytes: &[u8]) -> (String, String) {
+    use inferno::collapse::Collapse as _;
+    let mut bytes = bytes.to_vec();
+    put_u64(&mut bytes, 16, 144);
+    let root = tempfile::tempdir().expect("tempdir");
+    let input = root.path().join("perf.data");
+    std::fs::write(&input, bytes).expect("write fixture");
+    let perf = Command::new("perf")
+        .args(["script", "--force", "-i"])
+        .arg(&input)
+        .output()
+        .expect("perf script");
+    assert!(
+        perf.status.success(),
+        "{}",
+        String::from_utf8_lossy(&perf.stderr)
+    );
+    let mut folded = Vec::new();
+    inferno::collapse::perf::Folder::default()
+        .collapse(std::io::Cursor::new(&perf.stdout), &mut folded)
+        .expect("native Inferno");
+    (
+        String::from_utf8(perf.stdout).expect("native script"),
+        String::from_utf8(folded).expect("native fold"),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn assert_native_module_kallsyms_parity(
+    kallsyms: &str,
+    sampled_ip: u64,
+    expected_native_frame: &str,
+    expected_ends: &[(&str, u64)],
+) {
+    let mut expected_rows = [
+        "worker;_stext 1\n".to_string(),
+        format!("worker;{expected_native_frame} 1\n"),
+    ];
+    expected_rows.sort();
+    assert_native_module_kallsyms_queries_parity(
+        kallsyms,
+        &[sampled_ip],
+        Some(&expected_rows.concat()),
+        expected_ends,
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn write_native_module_kallsyms_fixture(
+    kallsyms: &str,
+    sampled_ips: &[u64],
+    distinct_queries: bool,
+) -> (tempfile::TempDir, Vec<u8>) {
+    const KERNEL_START: u64 = 0xffff_ffff_8100_0000;
+    const MODULE_START: u64 = 0xffff_ffff_c100_0000;
+
+    let fixture_parent =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/native-kallsyms-fixtures");
+    std::fs::create_dir_all(&fixture_parent).expect("fixture parent");
+    let root = tempfile::Builder::new()
+        .prefix("module-symbols-")
+        .tempdir_in(&fixture_parent)
+        .expect("fixture directory");
+    let symfs = root.path().join("symfs");
+    std::fs::create_dir(&symfs).expect("empty symfs");
+    let kallsyms_path = root.path().join("kallsyms");
+    std::fs::write(&kallsyms_path, kallsyms).expect("synthetic kallsyms");
+
+    let mut comm = comm_payload(11, 12, "worker");
+    comm.resize(comm.len().next_multiple_of(8), 0);
+    let mut records = vec![record_bytes(3, &comm)];
+    // machine.c:machine__process_kernel_mmap_event creates module maps by
+    // name. The broad initial kernel map also contains the synthetic core
+    // boundary; symbol.c:maps__split_kallsyms therefore keeps it in that DSO.
+    for (start, len, pgoff, path) in [
+        (
+            KERNEL_START,
+            MODULE_START + 0x4000 - KERNEL_START,
+            KERNEL_START,
+            "[kernel.kallsyms]_stext",
+        ),
+        (MODULE_START, 0x4000, 0, "[a]"),
+        (MODULE_START + 0x1_0000, 0x4000, 0, "[b]"),
+    ] {
+        let mut payload = mmap_payload(u32::MAX, u32::MAX, start, len, pgoff, path);
+        payload.resize(payload.len().next_multiple_of(8), 0);
+        records.push(record_bytes_with_misc(
+            1,
+            PERF_RECORD_MISC_CPUMODE_KERNEL,
+            &payload,
+        ));
+    }
+    // Resolve _stext first: dso__load_kernel_sym honors --kallsyms, and
+    // __dso__load_kallsyms fixes the complete tree before splitting modules.
+    for (index, ip) in std::iter::once(KERNEL_START + 0x10)
+        .chain(sampled_ips.iter().copied())
+        .enumerate()
+    {
+        if distinct_queries {
+            // Distinct comms keep each query separate in the folded oracle,
+            // so swapped lookup results cannot cancel in aggregate counts.
+            let mut payload = comm_payload(11, 12, &format!("query_{index:02}"));
+            payload.resize(payload.len().next_multiple_of(8), 0);
+            records.push(record_bytes(3, &payload));
+        }
+        records.push(record_bytes_with_misc(
+            PERF_RECORD_SAMPLE,
+            PERF_RECORD_MISC_CPUMODE_KERNEL,
+            &sample_payload_with_time(
+                ip,
+                11,
+                12,
+                1_000_000_000 + u64::try_from(index).expect("sample index"),
+                [0xffff_ffff_ffff_ff80, ip],
+            ),
+        ));
+    }
+    let mut attr = file_attr_bytes(
+        PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CALLCHAIN,
+        0,
+        0,
+    );
+    // evsel.c:3232 uses attr.sample_period when PERF_SAMPLE_PERIOD is absent.
+    put_u64(&mut attr, 16, 1);
+    let mut bytes = perfdata_with_records_and_attrs_vec(vec![attr], records);
+    put_u64(&mut bytes, 16, 144);
+    let input = root.path().join("perf.data");
+    std::fs::write(&input, &bytes).expect("synthetic perf.data");
+    (root, bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn query_native_module_kallsyms(
+    root: &std::path::Path,
+    expected_ends: &[(&str, u64)],
+) -> (String, String, Vec<u8>) {
+    use inferno::collapse::Collapse as _;
+
+    let perf = Command::new("perf")
+        .args(["script", "--force", "-vvvv", "--kallsyms"])
+        .arg(root.join("kallsyms"))
+        .arg("--symfs")
+        .arg(root.join("symfs"))
+        .arg("-i")
+        .arg(root.join("perf.data"))
+        .output()
+        .expect("native perf kallsyms oracle");
+    let stderr = String::from_utf8_lossy(&perf.stderr);
+    assert!(perf.status.success(), "native perf failed: {stderr}");
+    let script = String::from_utf8(perf.stdout).expect("native script UTF-8");
+    // util/symbol.c:symbols__fixup_end, lines 276-298, logs each nonterminal
+    // extent before duplicate removal. Include the module suffix so aliases
+    // in different DSOs cannot accidentally satisfy the same assertion.
+    for &(name, end) in expected_ends {
+        let expected = format!("symbols__fixup_end sym:{name} end:{end:#x}");
+        assert!(
+            stderr.lines().any(|line| line.ends_with(&expected)),
+            "missing native extent {expected:?}\nscript={script}\nstderr={stderr}"
+        );
+    }
+    let mut native = Vec::new();
+    inferno::collapse::perf::Folder::default()
+        .collapse(std::io::Cursor::new(script.as_bytes()), &mut native)
+        .expect("collapse native script");
+    (script, stderr.into_owned(), native)
+}
+
+#[cfg(target_os = "linux")]
+fn assert_native_module_kallsyms_queries_parity(
+    kallsyms: &str,
+    sampled_ips: &[u64],
+    expected_native: Option<&str>,
+    expected_ends: &[(&str, u64)],
+) {
+    let (root, bytes) =
+        write_native_module_kallsyms_fixture(kallsyms, sampled_ips, expected_native.is_none());
+    let (script, stderr, native) = query_native_module_kallsyms(root.path(), expected_ends);
+    // Establish the native result independently before checking Pyroclast.
+    if let Some(expected) = expected_native {
+        assert_eq!(
+            native,
+            expected.as_bytes(),
+            "native fixture did not exercise the intended case\nscript={script}\nstderr={stderr}"
+        );
+    } else {
+        let native_text = std::str::from_utf8(&native).expect("native folded UTF-8");
+        let allowed_frames = kallsyms
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                fields.next()?;
+                fields.next()?;
+                let name = fields.next()?;
+                (fields.next() == Some("[a]")).then_some(name)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            native_text.lines().count(),
+            sampled_ips.len() + 1,
+            "native query loss\nscript={script}"
+        );
+        assert!(native_text.lines().any(|line| line == "query_00;_stext 1"));
+        for index in 1..=sampled_ips.len() {
+            let prefix = format!("query_{index:02};");
+            let frame = native_text
+                .lines()
+                .find_map(|line| line.strip_prefix(&prefix))
+                .and_then(|line| line.strip_suffix(" 1"))
+                .expect("native unit-weight query row");
+            assert!(
+                frame == "[[a]]" || allowed_frames.contains(&frame),
+                "native query {index} escaped the module fixture: {frame}\nscript={script}"
+            );
+        }
+    }
+
+    let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+        StaticSymbolResolver,
+        &root.path().join("perf.data"),
+        root.path(),
+        [],
+        &root.path().join("kallsyms"),
+    );
+    let actual = fold_perfdata_callchains_with_symbols(
+        &bytes,
+        FoldOptions {
+            count_periods: true,
+            inline: false,
+        },
+        &resolver,
+    )
+    .expect("fold synthetic module kallsyms");
+    assert_eq!(actual.as_bytes(), native, "native script={script}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn module_kallsyms_ignores_dollar_symbols_before_global_end_fixup_like_native_perf() {
+    // tools/perf/util/symbol.c:774 rejects '$' names before tree insertion;
+    // symbols__fixup_end:295 consequently ends first[a] at next[a], not a
+    // page boundary. symbols__find:414 treats that end as exclusive.
+    assert_native_module_kallsyms_queries_parity(
+        "ffffffff81000000 T _stext\n\
+         ffffffff81000100 T _etext\n\
+         ffffffffc1000000 T first\t[a]\n\
+         ffffffffc1000100 t $x\n\
+         ffffffffc1000200 T next\t[a]\n\
+         ffffffffc1010000 T sentinel\t[b]\n",
+        &[0xffff_ffff_c100_0180, 0xffff_ffff_c100_0200],
+        Some("worker;_stext 1\nworker;first 1\nworker;next 1\n"),
+        &[("first\t[a]", 0xffff_ffff_c100_0200)],
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn module_kallsyms_core_boundary_limits_extent_before_partition_like_native_perf() {
+    // symbol.c:1512-1513 fixes ends then duplicates on ALL accepted symbols.
+    // The core entry makes first[a] end at c1001000, not next[a] at c1002000.
+    assert_native_module_kallsyms_parity(
+        "ffffffff81000000 T _stext\n\
+         ffffffff81000100 T _etext\n\
+         ffffffffc1000000 T first\t[a]\n\
+         ffffffffc1000100 T core_boundary\n\
+         ffffffffc1002000 T next\t[a]\n\
+         ffffffffc1010000 T sentinel\t[b]\n",
+        0xffff_ffff_c100_1800,
+        "[[a]]",
+        &[("first\t[a]", 0xffff_ffff_c100_1000)],
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn module_kallsyms_equal_address_alias_keeps_native_nonweak_module_owner() {
+    // symbol.c:__symbols__insert preserves ties; fixup_end gives both owners
+    // nonzero lengths. choose_best_symbol then prefers T over weak W, even
+    // though the W entry was inserted later. Split only the surviving owner.
+    assert_native_module_kallsyms_parity(
+        "ffffffff81000000 T _stext\n\
+         ffffffff81000100 T _etext\n\
+         ffffffffc1000000 T strong\t[a]\n\
+         ffffffffc1000000 W weak\t[b]\n\
+         ffffffffc1000100 T next\t[a]\n\
+         ffffffffc1010000 T sentinel\t[b]\n",
+        0xffff_ffff_c100_0020,
+        "strong",
+        &[
+            ("strong\t[a]", 0xffff_ffff_c100_1000),
+            ("weak\t[b]", 0xffff_ffff_c100_1000),
+        ],
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn module_kallsyms_discarded_alias_preserves_native_predecessor_extent_and_lookup() {
+    // End fixup precedes duplicate removal, so weak[b] changes previous[a]'s
+    // extent even though winner[a] removes it. Native symbols__find searches
+    // the split DSO's RB tree; with these two entries, previous is its root
+    // and contains the sampled IP despite winner starting before that IP.
+    assert_native_module_kallsyms_parity(
+        "ffffffff81000000 T _stext\n\
+         ffffffff81000100 T _etext\n\
+         ffffffffc1000000 T previous\t[a]\n\
+         ffffffffc1000100 W weak\t[b]\n\
+         ffffffffc1000100 T winner\t[a]\n\
+         ffffffffc1010000 T sentinel\t[b]\n",
+        0xffff_ffff_c100_0180,
+        "previous",
+        &[
+            ("previous\t[a]", 0xffff_ffff_c100_1000),
+            ("weak\t[b]", 0xffff_ffff_c100_2000),
+            ("winner\t[a]", 0xffff_ffff_c100_2000),
+        ],
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn overlapping_module_kallsyms_fixture(row_count: usize) -> (String, Vec<(String, u64)>) {
+    use std::fmt::Write as _;
+
+    const START: u64 = 0xffff_ffff_c100_0000;
+    let mut text = "ffffffff81000000 T _stext\nffffffff81000100 T _etext\n".to_string();
+    let mut ends = Vec::new();
+    for index in 0..row_count {
+        let address = START + u64::try_from(index).expect("row index") * 0x100;
+        let name = format!("row_{index:02}");
+        writeln!(text, "{address:016x} T {name}\t[a]").expect("module row");
+        writeln!(text, "{:016x} T core_{index:02}", address + 0x80).expect("core boundary");
+        // symbol.c:symbols__fixup_end rounds a module-to-core transition to
+        // roundup(start + 4096, 4096), before maps__split_kallsyms partitions.
+        ends.push((format!("{name}\t[a]"), (address + 0x1fff) & !0xfff));
+    }
+    text.push_str("ffffffffc1010000 T sentinel\t[b]\n");
+    (text, ends)
+}
+
+#[cfg(target_os = "linux")]
+fn assert_native_overlapping_module_tree_parity(row_count: usize) {
+    const START: u64 = 0xffff_ffff_c100_0000;
+    let (text, ends) = overlapping_module_kallsyms_fixture(row_count);
+    let expected_ends = ends
+        .iter()
+        .map(|(name, end)| (name.as_str(), *end))
+        .collect::<Vec<_>>();
+    let mut queries = vec![START + 0xf80];
+    for index in 0..row_count {
+        let start = START + u64::try_from(index).expect("row index") * 0x100;
+        // Start-minus-one and start probe left-subtree descent; start-plus-one
+        // also catches the erroneous greatest-start/predecessor preference.
+        if start > START {
+            queries.push(start - 1);
+        }
+        queries.extend([start, start + 1]);
+    }
+    // Probe both fixed extents on each side of their half-open boundary,
+    // including right-subtree descent and the unmapped symbol gap in [a].
+    queries.extend([
+        START + 0xfff,
+        START + 0x1000,
+        START + 0x1001,
+        START + 0x1fff,
+        START + 0x2000,
+        START + 0x2001,
+        START + 0x3000,
+    ]);
+    queries.sort_unstable();
+    queries.dedup();
+    assert_native_module_kallsyms_queries_parity(&text, &queries, None, &expected_ends);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn module_kallsyms_two_overlapping_rows_match_native_tree_boundaries() {
+    assert_native_overlapping_module_tree_parity(2);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn module_kallsyms_three_overlapping_rows_return_native_middle_root_not_lowest_start() {
+    // Linux tools/lib/rbtree.c:__rb_insert rotates three ascending insertions
+    // to root row_01. All three extents contain c1000f80; lowest-start is wrong.
+    let (text, ends) = overlapping_module_kallsyms_fixture(3);
+    let expected_ends = ends
+        .iter()
+        .map(|(name, end)| (name.as_str(), *end))
+        .collect::<Vec<_>>();
+    assert_native_module_kallsyms_parity(&text, 0xffff_ffff_c100_0f80, "row_01", &expected_ends);
+    assert_native_overlapping_module_tree_parity(3);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn module_kallsyms_four_overlapping_rows_match_native_tree_boundaries() {
+    assert_native_overlapping_module_tree_parity(4);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn module_kallsyms_eight_overlapping_rows_match_native_tree_boundaries() {
+    assert_native_overlapping_module_tree_parity(8);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn module_kallsyms_sixteen_overlapping_rows_match_native_tree_boundaries() {
+    assert_native_overlapping_module_tree_parity(16);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn hypervisor_callchain_context_does_not_resolve_host_user_mappings_like_perf() {
+    // tools/perf/util/machine.c:add_callchain_ip switches PERF_CONTEXT_HV to
+    // PERF_RECORD_MISC_HYPERVISOR. util/event.c:thread__find_map returns NULL
+    // for that mode; Inferno perf.rs:with_module_fallback keeps [unknown].
+    let bytes = callchain_context_fixture(&[
+        0xffff_ffff_ffff_fe00,
+        0x1010,
+        0xffff_ffff_ffff_ffe0,
+        0x1020,
+        0xffff_ffff_ffff_fe00,
+        0x1030,
+    ]);
+    let (script, expected) = native_script_and_fold(&bytes);
+    assert_eq!(expected, "worker;[app];[unknown];[app] 1\n", "{script}");
+    assert_eq!(
+        fold_perfdata_callchains(&bytes).expect("fold"),
+        expected,
+        "native script={script}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn invalid_callchain_context_discards_all_recorded_frames_like_perf() {
+    // tools/perf/util/machine.c:add_callchain_ip resets the entire cursor and
+    // returns 1 on unsupported PERF_CONTEXT_* values; its caller stops then.
+    for marker in [0xffff_ffff_ffff_f001, 0xffff_ffff_ffff_f800, u64::MAX] {
+        let bytes = callchain_context_fixture(&[0x1010, marker, 0x1020]);
+        let (script, expected) = native_script_and_fold(&bytes);
+        assert_eq!(
+            fold_perfdata_callchains(&bytes).expect("fold"),
+            expected,
+            "marker={marker:x}; native script={script}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn address_immediately_below_perf_context_max_remains_a_frame_like_perf() {
+    // include/uapi/linux/perf_event.h defines PERF_CONTEXT_MAX as (u64)-4095,
+    // not -4096. machine.c:add_callchain_ip treats the latter as a real IP.
+    let bytes = callchain_context_fixture(&[0x1010, 0xffff_ffff_ffff_f000, 0x1020]);
+    let (script, expected) = native_script_and_fold(&bytes);
+    assert_eq!(expected, "worker;[app];[unknown];[app] 1\n", "{script}");
+    assert_eq!(
+        fold_perfdata_callchains(&bytes).expect("fold"),
+        expected,
+        "native script={script}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn invalid_context_beyond_perf_default_stack_depth_does_not_discard_the_prefix() {
+    // trace-event-scripting.c:24 initializes scripting_max_stack to
+    // PERF_MAX_STACK_DEPTH (127). machine.c:2899 counts addresses, not markers.
+    let mut frames = [0x1010; 128];
+    frames[127] = u64::MAX;
+    let bytes = callchain_context_fixture(&frames);
+    let (script, expected) = native_script_and_fold(&bytes);
+    assert_eq!(
+        expected,
+        format!("worker{} 1\n", ";[app]".repeat(127)),
+        "{script}"
+    );
+    assert_eq!(
+        fold_perfdata_callchains(&bytes).expect("fold"),
+        expected,
+        "{script}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn context_markers_do_not_consume_perf_default_recorded_stack_depth() {
+    let mut frames = [0x1010; 256];
+    for marker in frames.iter_mut().step_by(2) {
+        *marker = 0xffff_ffff_ffff_fe00;
+    }
+    let bytes = callchain_context_fixture(&frames);
+    let (script, expected) = native_script_and_fold(&bytes);
+    assert_eq!(
+        expected,
+        format!("worker{} 1\n", ";[app]".repeat(127)),
+        "{script}"
+    );
+    assert_eq!(
+        fold_perfdata_callchains(&bytes).expect("fold"),
+        expected,
+        "{script}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn callchain_context_fixture<const N: usize>(frames: &[u64; N]) -> Vec<u8> {
+    let mut comm = comm_payload(11, 12, "worker");
+    comm.resize(comm.len().next_multiple_of(8), 0);
+    let mut mmap = mmap_payload(11, 11, 0x1000, 0x100, 0, "/pyroclast-missing-context/app");
+    mmap.resize(mmap.len().next_multiple_of(8), 0);
+    perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_TIME
+                | PERF_SAMPLE_PERIOD
+                | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(3, &comm),
+            record_bytes_with_misc(1, PERF_RECORD_MISC_CPUMODE_USER, &mmap),
+            record_bytes_with_misc(
+                PERF_RECORD_SAMPLE,
+                PERF_RECORD_MISC_CPUMODE_USER,
+                &sample_payload_with_optional_timestamp(
+                    sample_payload_with_period(0x1010, 11, 12, 1, *frames),
+                    true,
+                ),
+            ),
+        ],
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn deferred_markers_without_attr_flag_leave_the_cookie_as_a_recorded_frame() {
+    assert_deferred_context_matches_native(false, 0x1040, None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn deferred_cookie_eof_preserves_native_context_validation_and_cookie_suppression() {
+    for cookie in [0x1040, 0x1010, u64::MAX, 0xffff_ffff_ffff_ffe0] {
+        assert_deferred_context_matches_native(true, cookie, None);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn matching_deferred_records_merge_before_context_validation_like_perf() {
+    for cookie in [0x1040, u64::MAX, 0xffff_ffff_ffff_ffe0] {
+        assert_deferred_context_matches_native(true, cookie, Some((cookie, 12)));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn same_tid_deferred_cookie_mismatch_delivers_original_cookie_as_an_address_like_perf() {
+    assert_deferred_context_matches_native(true, 0x1040, Some((0x5555, 12)));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn different_tid_deferred_record_leaves_original_metadata_for_eof_like_perf() {
+    assert_deferred_context_matches_native(true, 0x1040, Some((0x1040, 99)));
+}
+
+#[cfg(target_os = "linux")]
+fn assert_deferred_context_matches_native(
+    enabled: bool,
+    cookie: u64,
+    deferred: Option<(u64, u32)>,
+) {
+    assert_deferred_context_with_cookie_mapping_matches_native(enabled, cookie, deferred, None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn deferred_cookie_dso_preserves_physical_stream_rows_like_perf_and_inferno() {
+    // evsel_fprintf.c prints the DSO even for a (cookie) row. map.c writes
+    // the name verbatim; Inferno reads physical lines before omitting cookies.
+    assert_deferred_context_with_cookie_mapping_matches_native(
+        true,
+        0x1040,
+        None,
+        Some("/missing/a\n0010 injected (/bin/n)"),
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn assert_deferred_context_with_cookie_mapping_matches_native(
+    enabled: bool,
+    cookie: u64,
+    deferred: Option<(u64, u32)>,
+    cookie_mapping: Option<&str>,
+) {
+    // evsel.c:3391 gates deferred metadata on attr.defer_callchain (bit38).
+    // session.c:1392 and callchain.c:1897 deliver mismatches unchanged and
+    // remove the original cookie only on a matching merge, before resolution.
+    let mut comm = comm_payload(11, 12, "worker");
+    comm.resize(comm.len().next_multiple_of(8), 0);
+    let mut mmap = mmap_payload(11, 11, 0x1000, 0x100, 0, "/pyroclast-missing-context/app");
+    mmap.resize(mmap.len().next_multiple_of(8), 0);
+    for payload in [&mut comm, &mut mmap] {
+        payload.extend(11_u32.to_le_bytes());
+        payload.extend(12_u32.to_le_bytes());
+        payload.extend(1_000_000_000_u64.to_le_bytes());
+    }
+    let mut records = vec![
+        record_bytes(3, &comm),
+        record_bytes_with_misc(1, PERF_RECORD_MISC_CPUMODE_USER, &mmap),
+        record_bytes_with_misc(
+            PERF_RECORD_SAMPLE,
+            PERF_RECORD_MISC_CPUMODE_USER,
+            &sample_payload_with_optional_timestamp(
+                sample_payload_with_period(
+                    0x1010,
+                    11,
+                    12,
+                    1,
+                    [0x1010, 0x1020, 0xffff_ffff_ffff_fd80, cookie],
+                ),
+                true,
+            ),
+        ),
+    ];
+    if let Some(path) = cookie_mapping {
+        let mut payload = mmap_payload(11, 11, cookie, 16, 0, path);
+        payload.resize(payload.len().next_multiple_of(8), 0);
+        payload.extend(11_u32.to_le_bytes());
+        payload.extend(12_u32.to_le_bytes());
+        payload.extend(1_000_000_000_u64.to_le_bytes());
+        records.insert(
+            2,
+            record_bytes_with_misc(1, PERF_RECORD_MISC_CPUMODE_USER, &payload),
+        );
+    }
+    if let Some((record_cookie, tid)) = deferred {
+        let mut payload = callchain_deferred_payload(record_cookie, [0x1030]);
+        payload.extend(11_u32.to_le_bytes());
+        payload.extend(tid.to_le_bytes());
+        payload.extend(1_000_000_001_u64.to_le_bytes());
+        records.push(record_bytes(22, &payload));
+    }
+    let bytes = perfdata_with_records_and_attrs_vec(
+        vec![file_attr_bytes_with_flags(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_TIME
+                | PERF_SAMPLE_PERIOD
+                | PERF_SAMPLE_CALLCHAIN,
+            (1 << 18) | if enabled { 1 << 38 } else { 0 },
+        )],
+        records,
+    );
+    let (script, expected) = native_script_and_fold(&bytes);
+    if cookie_mapping.is_some() {
+        assert!(
+            expected.contains("injected"),
+            "native script={script}; folded={expected}"
+        );
+    }
+    assert_eq!(
+        fold_perfdata_callchains(&bytes).expect("fold"),
+        expected,
+        "enabled={enabled}, cookie={cookie:x}, deferred={deferred:?}; native script={script}"
+    );
+    let root = tempfile::tempdir().expect("tempdir");
+    let input = root.path().join("perf.data");
+    std::fs::write(&input, bytes).expect("write fixture");
+    assert_eq!(
+        fold_perfdata_file_with_options(&input, FoldOptions::default()).expect("file fold"),
+        expected,
+        "native script={script}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn callchains_without_tid_follow_native_inferno_header_parsing() {
+    // builtin-script.c:evsel__check_attr (TID check) removes PID/TID when
+    // PERF_SAMPLE_TID is absent. Inferno perf.rs:event_line_parts then finds
+    // any other numeric word, not a fixed TID column.
+    for timed in [false, true] {
+        let mut sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN;
+        let mut payload = 0x2000_u64.to_le_bytes().to_vec();
+        if timed {
+            sample_type |= PERF_SAMPLE_TIME;
+            payload.extend(1_000_000_000_u64.to_le_bytes());
+        }
+        payload.extend(7_u64.to_le_bytes());
+        payload.extend(1_u64.to_le_bytes());
+        payload.extend(0x2000_u64.to_le_bytes());
+        let bytes = perfdata_with_records_and_attrs(
+            [file_attr_bytes(sample_type, 0, 0)],
+            [record_bytes_with_misc(
+                PERF_RECORD_SAMPLE,
+                PERF_RECORD_MISC_CPUMODE_USER,
+                &payload,
+            )],
+        );
+        let (script, expected) = native_script_and_fold(&bytes);
+        let actual = fold_perfdata_callchains_with_options(
+            &bytes,
+            FoldOptions {
+                count_periods: true,
+                inline: false,
+            },
+        )
+        .expect("fold");
+        assert_eq!(actual, expected, "timed={timed}; native script={script}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn absent_sample_period_uses_event_attribute_default_like_real_perf() {
+    // tools/perf/util/evsel.c:evsel__parse_sample (3232) initializes period
+    // from attr.sample_period; only PERF_SAMPLE_PERIOD (3322) overrides it.
+    for default_period in [0, 1, 37] {
+        let mut attr = file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        );
+        put_u64(&mut attr, 16, default_period);
+        let mut comm = comm_payload(11, 12, "worker");
+        comm.resize(comm.len().next_multiple_of(8), 0);
+        let bytes = perfdata_with_records_and_attrs(
+            [attr],
+            [
+                record_bytes(3, &comm),
+                record_bytes_with_misc(
+                    PERF_RECORD_SAMPLE,
+                    PERF_RECORD_MISC_CPUMODE_USER,
+                    &sample_payload_with_time(0x2000, 11, 12, 1_000_000_000, [0x2000]),
+                ),
+            ],
+        );
+        let (script, expected) = native_script_and_fold(&bytes);
+        let actual = fold_perfdata_callchains_with_options(
+            &bytes,
+            FoldOptions {
+                count_periods: true,
+                inline: false,
+            },
+        )
+        .expect("fold");
+        assert_eq!(
+            actual, expected,
+            "default={default_period}; native script={script}"
+        );
+        let root = tempfile::tempdir().expect("tempdir");
+        let input = root.path().join("perf.data");
+        std::fs::write(&input, &bytes).expect("write fixture");
+        let file_folded = fold_perfdata_file_with_options(
+            &input,
+            FoldOptions {
+                count_periods: true,
+                inline: false,
+            },
+        )
+        .expect("fold file");
+        assert_eq!(file_folded, expected);
+        assert_eq!(
+            fold_perfdata_callchains(&bytes).expect("unweighted fold"),
+            "worker;[unknown] 1\n"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn absent_sample_period_uses_the_selected_identifier_events_default() {
+    let mask = PERF_SAMPLE_IDENTIFIER
+        | PERF_SAMPLE_IP
+        | PERF_SAMPLE_TID
+        | PERF_SAMPLE_TIME
+        | PERF_SAMPLE_CALLCHAIN;
+    let mut first = file_attr_bytes_with_ids(mask, 392, [111]);
+    let mut second = file_attr_bytes_with_ids(mask, 400, [222]);
+    put_u64(&mut first, 16, 37);
+    put_u64(&mut second, 16, 99);
+    let records = [222_u64, 111].map(|identifier| {
+        let mut payload = identifier.to_le_bytes().to_vec();
+        payload.extend(sample_payload_with_time(
+            0x2000,
+            11,
+            12,
+            1_000_000_000,
+            [0x2000],
+        ));
+        record_bytes_with_misc(PERF_RECORD_SAMPLE, PERF_RECORD_MISC_CPUMODE_USER, &payload)
+    });
+    let bytes = perfdata_with_attrs_ids_and_records([first, second], [111, 222], records);
+    let (script, expected) = native_script_and_fold(&bytes);
+    let weighted = FoldOptions {
+        count_periods: true,
+        inline: false,
+    };
+    let actual = fold_perfdata_callchains_with_options(&bytes, weighted).expect("fold");
+    assert_eq!(actual, expected, "native script={script}");
+    assert_eq!(actual, ":12;[unknown] 136\n");
+    let root = tempfile::tempdir().expect("tempdir");
+    let input = root.path().join("perf.data");
+    std::fs::write(&input, bytes).expect("write fixture");
+    assert_eq!(
+        fold_perfdata_file_with_options(&input, weighted).expect("fold file"),
+        actual
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn newline_elf_symbol_names_follow_native_perf_and_inferno_row_boundaries() {
+    assert_elf_symbol_text_matches_native_pipeline("entry");
+    assert_elf_symbol_text_matches_native_pipeline("entry\nsuffix");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn leading_whitespace_in_elf_symbols_follows_native_inferno_row_trimming() {
+    for name in [" \tentry", " ", "\tentry", "\u{2003}entry", "entry "] {
+        assert_elf_symbol_text_matches_native_pipeline(name);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn interior_carriage_returns_in_elf_symbols_are_preserved_like_native_inferno() {
+    assert_elf_symbol_text_matches_native_pipeline("entry\rsuffix");
+}
+
+#[cfg(target_os = "linux")]
+fn compiled_elf_with_symbol_text(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let root = tempfile::tempdir().expect("tempdir");
+    let source = root.path().join("fixture.c");
+    let original = root.path().join("original");
+    let elf = root.path().join("renamed");
+    std::fs::write(
+        &source,
+        "void entry(void) {} int main(void) { entry(); return 0; }",
+    )
+    .expect("write C");
+    let compiled = Command::new("cc")
+        .args(["-g0", "-O0", "-no-pie"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&original)
+        .output()
+        .expect("compile fixture");
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let renamed = Command::new("objcopy")
+        .arg("--redefine-sym")
+        .arg(format!("entry={name}"))
+        .arg(&original)
+        .arg(&elf)
+        .output()
+        .expect("rename ELF symbol");
+    assert!(
+        renamed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&renamed.stderr)
+    );
+    (root, elf)
+}
+
+#[cfg(target_os = "linux")]
+fn assert_elf_symbol_text_matches_native_pipeline(name: &str) {
+    // util/symbol_fprintf.c:__symbol__fprintf_symname_offs prints sym->name
+    // verbatim; Inferno reads physical lines before stack_line_parts trims.
+    let (root, elf) = compiled_elf_with_symbol_text(name);
+    let object_bytes = std::fs::read(&elf).expect("read ELF");
+    let object = object::File::parse(&object_bytes[..]).expect("parse ELF");
+    let symbol = object
+        .symbols()
+        .find(|symbol| symbol.name() == Ok(name))
+        .expect("renamed symbol");
+    let segment = object
+        .segments()
+        .find(|segment| {
+            segment.address() <= symbol.address()
+                && symbol.address() < segment.address() + segment.size()
+        })
+        .expect("symbol segment");
+    let (pgoff, len) = segment.file_range();
+    let start = 0x7000_0000 + pgoff;
+    let ip = start + symbol.address() - segment.address();
+    let mut mmap = mmap_payload(11, 12, start, len, pgoff, elf.to_str().expect("ELF path"));
+    mmap.resize(mmap.len().next_multiple_of(8), 0);
+    let sample = record_bytes_with_misc(
+        PERF_RECORD_SAMPLE,
+        PERF_RECORD_MISC_CPUMODE_USER,
+        &sample_payload_with_optional_timestamp(
+            sample_payload_with_period(ip, 11, 12, 7, [ip]),
+            true,
+        ),
+    );
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_TIME
+                | PERF_SAMPLE_PERIOD
+                | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes_with_misc(1, PERF_RECORD_MISC_CPUMODE_USER, &mmap),
+            sample.clone(),
+            sample,
+        ],
+    );
+    let (script, expected) = native_script_and_fold(&bytes);
+    assert!(
+        script.contains(name),
+        "native must resolve ELF symbol: {script}"
+    );
+    let input = root.path().join("perf.data");
+    std::fs::write(&input, &bytes).expect("write perf.data");
+    for inline in [false, true] {
+        let options = FoldOptions {
+            count_periods: true,
+            inline,
+        };
+        let resolver = pyroclast::symbols::PerfSymbolResolver::from_object_resolver(
+            pyroclast::symbols::RustAddr2lineResolver::new(),
+        );
+        let actual =
+            fold_perfdata_callchains_with_symbols(&bytes, options, &resolver).expect("fold");
+        assert_eq!(
+            actual, expected,
+            "symbol={name:?}, inline={inline}; native script={script}"
+        );
+        let file_backed =
+            pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(&input, options, &resolver)
+                .expect("fold file");
+        assert_eq!(
+            file_backed, expected,
+            "symbol={name:?}, inline={inline}; native script={script}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn multiline_event_names_preserve_native_infernos_first_event_filter() {
+    // util/header.c:read_event_desc retains the name; builtin-script.c:
+    // process_event prints it with %*s. Inferno process_single_stack splits LF
+    // before on_event_line chooses the first event token for the whole stream.
+    for name in ["cycles\nsuffix", "cycles\n\nsuffix", "cycles\n#comment"] {
+        let mask = PERF_SAMPLE_IDENTIFIER
+            | PERF_SAMPLE_IP
+            | PERF_SAMPLE_TID
+            | PERF_SAMPLE_TIME
+            | PERF_SAMPLE_PERIOD
+            | PERF_SAMPLE_CALLCHAIN;
+        let attrs = [
+            file_attr_bytes_with_ids(mask, 392, [111]),
+            file_attr_bytes_with_ids(mask, 400, [222]),
+        ];
+        let records = [111_u64, 222].map(|identifier| {
+            let mut payload = identifier.to_le_bytes().to_vec();
+            payload.extend(sample_payload_with_optional_timestamp(
+                sample_payload_with_period(0x2000, 11, 12, 7, [0x2000]),
+                true,
+            ));
+            record_bytes_with_misc(PERF_RECORD_SAMPLE, PERF_RECORD_MISC_CPUMODE_USER, &payload)
+        });
+        let mut bytes = perfdata_with_attrs_ids_and_records(attrs, [111, 222], records);
+        // HEADER_EVENT_DESC (12): nre, attr_sz, then attr, nr, name, ids.
+        let mut feature = Vec::new();
+        feature.extend_from_slice(&2_u32.to_le_bytes());
+        feature.extend_from_slice(&128_u32.to_le_bytes());
+        for (attr, event_name) in attrs.iter().zip([name, "cycles"]) {
+            feature.extend_from_slice(&attr[..128]);
+            feature.extend_from_slice(&0_u32.to_le_bytes());
+            let len = (event_name.len() + 1).next_multiple_of(64);
+            feature.extend_from_slice(&u32::try_from(len).unwrap().to_le_bytes());
+            let start = feature.len();
+            feature.extend_from_slice(event_name.as_bytes());
+            feature.resize(start + len, 0);
+        }
+        let table = bytes.len();
+        bytes.resize(table + 16, 0);
+        put_u64(&mut bytes, 72, 1 << 12);
+        put_u64(&mut bytes, table, (table + 16) as u64);
+        put_u64(&mut bytes, table + 8, feature.len() as u64);
+        bytes.extend(feature);
+        let (script, expected) = native_script_and_fold(&bytes);
+        assert!(
+            script.contains(name),
+            "native must use EVENT_DESC: {script}"
+        );
+        let options = FoldOptions {
+            count_periods: true,
+            inline: false,
+        };
+        let actual = fold_perfdata_callchains_with_options(&bytes, options).expect("fold");
+        assert_eq!(actual, expected, "event={name:?}; native script={script}");
+        let root = tempfile::tempdir().expect("tempdir");
+        let input = root.path().join("perf.data");
+        std::fs::write(&input, bytes).expect("write fixture");
+        assert_eq!(
+            fold_perfdata_file_with_options(&input, options).expect("fold file"),
+            expected,
+            "event={name:?}; native script={script}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn numeric_words_in_comms_follow_infernos_first_numeric_header_word() {
+    // perf prints comm verbatim (builtin-script.c:perf_sample__fprintf_start).
+    // Inferno event_line_parts recognizes digits/slashes after literal spaces.
+    for timed in [false, true] {
+        for name in [
+            "work 123 task",
+            "work 123",
+            "work 12/34 task",
+            "123 worker",
+            "work 123 tag:",
+            "work / task",
+            "work ١ task",
+            "work\t123 task",
+        ] {
+            let mut comm = comm_payload(11, 12, name);
+            comm.resize(comm.len().next_multiple_of(8), 0);
+            let bytes = perfdata_with_records_and_attrs(
+                [file_attr_bytes(
+                    PERF_SAMPLE_IP
+                        | PERF_SAMPLE_TID
+                        | PERF_SAMPLE_PERIOD
+                        | PERF_SAMPLE_CALLCHAIN
+                        | if timed { PERF_SAMPLE_TIME } else { 0 },
+                    0,
+                    0,
+                )],
+                [
+                    record_bytes(3, &comm),
+                    record_bytes_with_misc(
+                        PERF_RECORD_SAMPLE,
+                        PERF_RECORD_MISC_CPUMODE_USER,
+                        &sample_payload_with_optional_timestamp(
+                            sample_payload_with_period(0x2000, 11, 12, 7, [0x2000]),
+                            timed,
+                        ),
+                    ),
+                ],
+            );
+            let (script, expected) = native_script_and_fold(&bytes);
+            let actual = fold_perfdata_callchains_with_options(
+                &bytes,
+                FoldOptions {
+                    count_periods: true,
+                    inline: false,
+                },
+            )
+            .expect("fold");
+            assert_eq!(
+                actual, expected,
+                "name={name:?}, timed={timed}; native script={script}"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn without_sample_id_all_metadata_and_timed_samples_follow_native_input_order() {
+    // util/session.c:perf_session__new disables ordered_events when timestamps
+    // are required but evlist__sample_id_all is false.
+    let mut records = Vec::new();
+    for (name, period) in [("before", 3), ("after", 7)] {
+        let mut comm = comm_payload(11, 12, name);
+        comm.resize(comm.len().next_multiple_of(8), 0);
+        records.push(record_bytes(3, &comm));
+        records.push(record_bytes_with_misc(
+            PERF_RECORD_SAMPLE,
+            PERF_RECORD_MISC_CPUMODE_USER,
+            &sample_payload_with_optional_timestamp(
+                sample_payload_with_period(0x2000, 11, 12, period, [0x2000]),
+                true,
+            ),
+        ));
+    }
+    let bytes = perfdata_with_records_and_attrs_vec(
+        vec![file_attr_bytes(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_TIME
+                | PERF_SAMPLE_PERIOD
+                | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        records,
+    );
+    let (script, expected) = native_script_and_fold(&bytes);
+    let options = FoldOptions {
+        count_periods: true,
+        inline: false,
+    };
+    assert_eq!(expected, "after;[unknown] 7\nbefore;[unknown] 3\n");
+    let actual = fold_perfdata_callchains_with_options(&bytes, options).expect("fold");
+    assert_eq!(actual, expected, "native script={script}");
+    let root = tempfile::tempdir().expect("tempdir");
+    let input = root.path().join("perf.data");
+    std::fs::write(&input, bytes).expect("write fixture");
+    assert_eq!(
+        fold_perfdata_file_with_options(&input, options).expect("fold file"),
+        expected
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn comment_comm_headers_follow_native_inferno_line_skipping() {
+    for name in ["#worker", " #worker", "worker#task"] {
+        assert_structural_comm_matches_native_stream(name);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn newline_comm_headers_follow_native_inferno_line_boundaries() {
+    assert_structural_comm_matches_native_stream("worker\ntask");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn blank_lines_in_comm_headers_follow_native_inferno_event_boundaries() {
+    assert_structural_comm_matches_native_stream("worker\n\ntask");
+}
+
+#[cfg(target_os = "linux")]
+fn assert_structural_comm_matches_native_stream(name: &str) {
+    // builtin-script.c:perf_sample__fprintf_start prints comm with %s.
+    // Inferno process_single_stack ignores # lines and splits at newlines;
+    // after_event does not clear pname, so the preceding header matters.
+    for (time, sample_id_all) in [
+        (0_u64, false),
+        (0, true),
+        (1_000_000_000, false),
+        (1_000_000_000, true),
+    ] {
+        let mut records = Vec::new();
+        for (comm, period) in [("before", 3), (name, 7), ("after", 11)] {
+            let mut payload = comm_payload(11, 12, comm);
+            payload.resize(payload.len().next_multiple_of(8), 0);
+            if sample_id_all {
+                payload.extend_from_slice(&11_u32.to_le_bytes());
+                payload.extend_from_slice(&12_u32.to_le_bytes());
+                payload.extend_from_slice(&time.to_le_bytes());
+            }
+            records.push(record_bytes(3, &payload));
+            let mut sample = sample_payload_with_optional_timestamp(
+                sample_payload_with_period(0x2000, 11, 12, period, [0x2000]),
+                true,
+            );
+            put_u64(&mut sample, 16, time);
+            records.push(record_bytes_with_misc(
+                PERF_RECORD_SAMPLE,
+                PERF_RECORD_MISC_CPUMODE_USER,
+                &sample,
+            ));
+        }
+        let bytes = perfdata_with_records_and_attrs_vec(
+            vec![file_attr_bytes_with_flags(
+                PERF_SAMPLE_IP
+                    | PERF_SAMPLE_TID
+                    | PERF_SAMPLE_TIME
+                    | PERF_SAMPLE_PERIOD
+                    | PERF_SAMPLE_CALLCHAIN,
+                if sample_id_all { 1 << 18 } else { 0 },
+            )],
+            records,
+        );
+        let (script, expected) = native_script_and_fold(&bytes);
+        let options = FoldOptions {
+            count_periods: true,
+            inline: false,
+        };
+        let actual = fold_perfdata_callchains_with_options(&bytes, options).expect("fold");
+        assert_eq!(actual, expected, "comm={name:?}; native script={script}");
+        let root = tempfile::tempdir().expect("tempdir");
+        let input = root.path().join("perf.data");
+        std::fs::write(&input, bytes).expect("write fixture");
+        assert_eq!(
+            fold_perfdata_file_with_options(&input, options).expect("fold file"),
+            expected,
+            "comm={name:?}; native script={script}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn timed_sample_ip_with_a_newline_dso_preserves_inferno_state_across_samples() {
+    use inferno::collapse::Collapse as _;
+    // Inferno process_single_stack doesn't reset in_event at sample boundaries;
+    // map.c:map__fprintf_dsoname writes newlines in DSO paths verbatim.
+    let mut records = Vec::new();
+    for (kind, mut payload) in [
+        (3, comm_payload(11, 12, "worker")),
+        (
+            1,
+            mmap_payload(
+                11,
+                12,
+                0x1000,
+                0x100,
+                0,
+                "/tmp/a\nworker 12 1.000000: 2 cycles",
+            ),
+        ),
+        (1, mmap_payload(11, 12, 0x2000, 0x100, 0, "/tmp/normal")),
+    ] {
+        payload.resize(payload.len().next_multiple_of(8), 0);
+        records.push(record_bytes_with_misc(
+            kind,
+            PERF_RECORD_MISC_CPUMODE_USER,
+            &payload,
+        ));
+    }
+    for ip in [0x1010, 0x2010] {
+        records.push(record_bytes_with_misc(
+            PERF_RECORD_SAMPLE,
+            PERF_RECORD_MISC_CPUMODE_USER,
+            &sample_payload_with_optional_timestamp(
+                sample_payload_with_period_no_callchain(ip, 11, 12, 5),
+                true,
+            ),
+        ));
+    }
+    let mut bytes = perfdata_with_records_and_attrs_vec(
+        vec![file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_PERIOD,
+            0,
+            0,
+        )],
+        records,
+    );
+    put_u64(&mut bytes, 16, 144);
+    let root = tempfile::tempdir().expect("tempdir");
+    let input = root.path().join("perf.data");
+    std::fs::write(&input, &bytes).expect("write fixture");
+    let perf = Command::new("perf")
+        .args(["script", "--force", "-i"])
+        .arg(&input)
+        .output()
+        .expect("perf script");
+    assert!(
+        perf.status.success(),
+        "{}",
+        String::from_utf8_lossy(&perf.stderr)
+    );
+    let mut native = Vec::new();
+    inferno::collapse::perf::Folder::default()
+        .collapse(std::io::Cursor::new(&perf.stdout), &mut native)
+        .expect("Inferno");
+    let actual = fold_perfdata_callchains_with_options(
+        &bytes,
+        FoldOptions {
+            count_periods: true,
+            inline: false,
+        },
+    )
+    .expect("fold");
+    assert_eq!(
+        actual.as_bytes(),
+        native,
+        "native script={}",
+        String::from_utf8_lossy(&perf.stdout)
+    );
+    assert!(native.is_empty());
+    let file_backed = fold_perfdata_file_with_options(
+        &input,
+        FoldOptions {
+            count_periods: true,
+            inline: false,
+        },
+    )
+    .expect("fold file");
+    assert_eq!(file_backed, actual);
 }
 
 #[test]
-fn folds_sample_ip_when_callchain_is_absent_like_perf_script() {
+fn untimed_sample_ip_headers_without_callchains_form_one_inferno_stack() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
             PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD,
@@ -2207,52 +3760,167 @@ fn folds_sample_ip_when_callchain_is_absent_like_perf_script() {
     )
     .expect("folded");
 
-    assert_eq!(folded, ":12;[unknown] 10\n");
-}
-
-#[test]
-fn emits_sample_ip_when_callchain_field_is_absent_even_with_dwarf_payload_like_perf_script() {
-    let bytes = perfdata_with_records_and_attrs(
-        [file_attr_bytes_with_regs(
-            PERF_SAMPLE_IP
-                | PERF_SAMPLE_TID
-                | PERF_SAMPLE_PERIOD
-                | PERF_SAMPLE_REGS_USER
-                | PERF_SAMPLE_STACK_USER,
-            (1 << 6) | (1 << 7) | (1 << 8),
-        )],
-        [record_bytes(
-            9,
-            &sample_payload_with_period_and_user_stack_no_callchain(
-                0x4000,
-                11,
-                12,
-                7,
-                1,
-                [0x7fff_0008, 0x7fff_0000, 0x4000],
-                [
-                    0, 0, 0, 0, 0, 0, 0, 0, //
-                    0x40, 0, 0, 0, 0, 0, 0, 0, //
-                    0x34, 0x12, 0, 0, 0, 0, 0, 0,
-                ],
-            ),
-        )],
+    assert_eq!(
+        folded,
+        ":12;12          3 cycles:              2000 [unknown] 1\n"
     );
-
-    let folded = fold_perfdata_callchains_with_options(
-        &bytes,
-        FoldOptions {
-            count_periods: true,
-            inline: false,
-        },
-    )
-    .expect("folded");
-
-    assert_eq!(folded, ":12;[unknown] 7\n");
 }
 
 #[test]
-fn selects_sample_layout_by_identifier() {
+fn sample_ip_kernel_cpumode_folds_only_with_a_timestamp_like_native_pipeline() {
+    // perf builtin-script.c process_sample_event() resolves the event-line IP
+    // with machine__resolve(), and util/event.c machine__resolve() passes
+    // sample->cpumode into thread__find_map(). This is not the recorded
+    // callchain path, whose util/machine.c thread__resolve_callchain_sample()
+    // starts in PERF_RECORD_MISC_USER and switches only on PERF_CONTEXT_*.
+    for timed in [false, true] {
+        let bytes = perfdata_with_records_and_attrs(
+            [file_attr_bytes(
+                PERF_SAMPLE_IP
+                    | PERF_SAMPLE_TID
+                    | PERF_SAMPLE_PERIOD
+                    | if timed { PERF_SAMPLE_TIME } else { 0 },
+                0,
+                0,
+            )],
+            [
+                record_bytes_with_misc(
+                    1,
+                    PERF_RECORD_MISC_CPUMODE_KERNEL,
+                    &mmap_payload(
+                        u32::MAX,
+                        u32::MAX,
+                        0xffff_ffff_8800_0000,
+                        0x2000,
+                        0,
+                        "[kernel.kallsyms]",
+                    ),
+                ),
+                record_bytes_with_misc(
+                    9,
+                    PERF_RECORD_MISC_CPUMODE_KERNEL,
+                    &sample_payload_with_optional_timestamp(
+                        sample_payload_with_period_no_callchain(0xffff_ffff_8800_0010, 11, 12, 7),
+                        timed,
+                    ),
+                ),
+            ],
+        );
+        let resolver = StaticSymbolResolver;
+
+        let folded = fold_perfdata_callchains_with_symbols(
+            &bytes,
+            FoldOptions {
+                count_periods: true,
+                inline: false,
+            },
+            &resolver,
+        )
+        .expect("folded");
+
+        assert_eq!(
+            folded,
+            if timed {
+                ":12;asm_exc_page_fault 7\n"
+            } else {
+                ""
+            }
+        );
+    }
+}
+
+#[test]
+fn sample_ip_with_dwarf_payload_but_no_callchain_folds_only_with_a_timestamp() {
+    for timed in [false, true] {
+        let bytes = perfdata_with_records_and_attrs(
+            [file_attr_bytes_with_regs(
+                PERF_SAMPLE_IP
+                    | PERF_SAMPLE_TID
+                    | PERF_SAMPLE_PERIOD
+                    | PERF_SAMPLE_REGS_USER
+                    | PERF_SAMPLE_STACK_USER
+                    | if timed { PERF_SAMPLE_TIME } else { 0 },
+                (1 << 6) | (1 << 7) | (1 << 8),
+            )],
+            [record_bytes(
+                9,
+                &sample_payload_with_optional_timestamp(
+                    sample_payload_with_period_and_user_stack_no_callchain(
+                        0x4000,
+                        11,
+                        12,
+                        7,
+                        1,
+                        [0x7fff_0008, 0x7fff_0000, 0x4000],
+                        [
+                            0, 0, 0, 0, 0, 0, 0, 0, //
+                            0x40, 0, 0, 0, 0, 0, 0, 0, //
+                            0x34, 0x12, 0, 0, 0, 0, 0, 0,
+                        ],
+                    ),
+                    timed,
+                ),
+            )],
+        );
+
+        let folded = fold_perfdata_callchains_with_options(
+            &bytes,
+            FoldOptions {
+                count_periods: true,
+                inline: false,
+            },
+        )
+        .expect("folded");
+
+        assert_eq!(folded, if timed { ":12;[unknown] 7\n" } else { "" });
+    }
+}
+
+#[test]
+fn sample_ip_uses_base_symbol_with_inline_enabled_but_needs_time_for_inferno() {
+    // builtin-script.c process_event() only resolves a callchain cursor when
+    // sample->callchain exists. Without PERF_SAMPLE_CALLCHAIN, the event-line
+    // IP is printed through machine__resolve()/map__find_symbol(), even if
+    // inline output is otherwise enabled.
+    for timed in [false, true] {
+        let bytes = perfdata_with_records_and_attrs(
+            [file_attr_bytes(
+                PERF_SAMPLE_IP
+                    | PERF_SAMPLE_TID
+                    | PERF_SAMPLE_PERIOD
+                    | if timed { PERF_SAMPLE_TIME } else { 0 },
+                0,
+                0,
+            )],
+            [
+                record_bytes(1, &mmap_payload(11, 12, 0x1000, 0x100, 0, "/bin/app")),
+                record_bytes(
+                    9,
+                    &sample_payload_with_optional_timestamp(
+                        sample_payload_with_period_no_callchain(0x1010, 11, 12, 7),
+                        timed,
+                    ),
+                ),
+            ],
+        );
+        let resolver = SampleIpInlineSymbolResolver;
+
+        let folded = fold_perfdata_callchains_with_symbols(
+            &bytes,
+            FoldOptions {
+                count_periods: true,
+                inline: true,
+            },
+            &resolver,
+        )
+        .expect("folded");
+
+        assert_eq!(folded, if timed { ":12;app::main 7\n" } else { "" });
+    }
+}
+
+#[test]
+fn selects_untimed_sample_layout_by_identifier_without_using_period_as_weight() {
     let attr1 = file_attr_bytes_with_ids(
         PERF_SAMPLE_IDENTIFIER | PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
         392,
@@ -2285,11 +3953,11 @@ fn selects_sample_layout_by_identifier() {
     )
     .expect("folded");
 
-    assert_eq!(folded, ":12;[unknown] 7\n");
+    assert_eq!(folded, ":12;[unknown] 1\n");
 }
 
 #[test]
-fn selects_sample_layout_by_id_field() {
+fn selects_untimed_sample_layout_by_id_without_using_period_as_weight() {
     let attr1 = file_attr_bytes_with_ids(
         PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_ID | PERF_SAMPLE_CALLCHAIN,
         392,
@@ -2322,12 +3990,11 @@ fn selects_sample_layout_by_id_field() {
     )
     .expect("folded");
 
-    assert_eq!(folded, ":12;[unknown] 7\n");
+    assert_eq!(folded, ":12;[unknown] 1\n");
 }
 
 #[test]
-fn folds_samples_from_multiple_attrs_when_generated_perf_script_event_name_matches_inferno_filter()
-{
+fn folds_untimed_samples_from_multiple_attrs_with_infernos_empty_event_filter() {
     let attr1 = file_attr_bytes_with_ids(
         PERF_SAMPLE_IDENTIFIER
             | PERF_SAMPLE_IP
@@ -2370,11 +4037,11 @@ fn folds_samples_from_multiple_attrs_when_generated_perf_script_event_name_match
     )
     .expect("folded");
 
-    assert_eq!(folded, ":12;[unknown] 3\n");
+    assert_eq!(folded, ":12;[unknown] 2\n");
 }
 
 #[test]
-fn folds_perfdata_from_file_path() {
+fn folds_untimed_perfdata_from_file_with_infernos_unit_weights() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
     let bytes = perfdata_with_records_and_attrs(
@@ -2399,11 +4066,11 @@ fn folds_perfdata_from_file_path() {
     )
     .expect("folded");
 
-    assert_eq!(folded, ":12;[unknown] 10\n");
+    assert_eq!(folded, ":12;[unknown] 2\n");
 }
 
 #[test]
-fn file_path_folding_applies_late_untimed_mmaps_before_timed_samples_like_global_sort() {
+fn file_path_folding_without_sample_id_all_does_not_apply_future_mmaps_to_samples() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
     let mut records = Vec::new();
@@ -2430,11 +4097,11 @@ fn file_path_folding_applies_late_untimed_mmaps_before_timed_samples_like_global
     let folded =
         fold_perfdata_file_with_options(&perfdata, FoldOptions::default()).expect("folded");
 
-    assert_eq!(folded, ":12;[app] 10000\n");
+    assert_eq!(folded, ":12;[unknown] 10000\n");
 }
 
 #[test]
-fn file_path_folding_uses_finished_round_as_perf_ordered_event_watermark() {
+fn file_path_folding_without_sample_id_all_keeps_input_order_across_finished_rounds() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
     let bytes = perfdata_with_records_and_attrs(
@@ -2455,7 +4122,7 @@ fn file_path_folding_uses_finished_round_as_perf_ordered_event_watermark() {
     let folded =
         fold_perfdata_file_with_options(&perfdata, FoldOptions::default()).expect("folded");
 
-    assert_eq!(folded, ":12;[app] 1\n");
+    assert_eq!(folded, ":12;[unknown] 1\n");
 }
 
 #[test]
@@ -2486,7 +4153,7 @@ fn file_backed_folding_matches_in_memory_folding_across_finished_rounds() {
 }
 
 #[test]
-fn folds_perfdata_from_multiple_finished_rounds_into_one_total() {
+fn folds_untimed_perfdata_across_finished_rounds_with_infernos_unit_weights() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
     let bytes = perfdata_with_records_and_attrs(
@@ -2513,7 +4180,7 @@ fn folds_perfdata_from_multiple_finished_rounds_into_one_total() {
     )
     .expect("folded");
 
-    assert_eq!(folded, ":12;[unknown] 10\n");
+    assert_eq!(folded, ":12;[unknown] 2\n");
 }
 
 #[test]
@@ -2543,7 +4210,7 @@ fn folds_later_rounds_with_updated_mappings_after_cacheable_rounds() {
 }
 
 #[test]
-fn folds_identical_rendered_stacks_across_pids_into_one_line() {
+fn folds_identical_untimed_stacks_across_pids_using_unit_weights() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
             PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN,
@@ -2567,7 +4234,7 @@ fn folds_identical_rendered_stacks_across_pids_into_one_line() {
     )
     .expect("folded");
 
-    assert_eq!(folded, "pyroclast;[unknown] 10\n");
+    assert_eq!(folded, "pyroclast;[unknown] 2\n");
 }
 
 #[test]
@@ -2594,7 +4261,7 @@ fn forked_process_inherits_parent_mappings_like_perf_script() {
     )
     .expect("folded");
 
-    assert_eq!(folded, ":22;[app] 7\n");
+    assert_eq!(folded, ":22;[app] 1\n");
 }
 
 #[test]
@@ -2625,7 +4292,7 @@ fn synthesized_fork_does_not_clone_parent_mappings_like_perf_script() {
     )
     .expect("folded");
 
-    assert_eq!(folded, ":22;[unknown] 7\n");
+    assert_eq!(folded, ":22;[unknown] 1\n");
 }
 
 #[test]
@@ -2657,6 +4324,36 @@ fn applies_comm_records_by_perf_timestamp_from_file_path_like_perf_script() {
         fold_perfdata_file_with_options(&perfdata, FoldOptions::default()).expect("folded");
 
     assert_eq!(folded, "perf-exec;[unknown] 1\n");
+}
+
+#[test]
+fn file_and_slice_replay_apply_timestamp_order_across_distant_input_ranges() {
+    let mut records = vec![
+        record_bytes(3, &comm_payload_with_sample_id_time(11, 12, "before", 10)),
+        record_bytes(9, &sample_payload_with_time(0x1000, 11, 12, 30, [0x2000])),
+    ];
+    let padding = record_bytes(100, &vec![0; 65520]);
+    records.extend(std::iter::repeat_n(padding.clone(), 160));
+    records.extend([
+        record_bytes(3, &comm_payload_with_sample_id_time(11, 12, "after", 20)),
+        record_bytes(9, &sample_payload_with_time(0x1000, 11, 12, 15, [0x2000])),
+    ]);
+    records.extend(std::iter::repeat_n(padding, 80));
+    records.push(record_bytes(PERF_RECORD_FINISHED_ROUND, b""));
+    let bytes = perfdata_with_records_and_attrs_vec(
+        vec![file_attr_bytes_with_flags(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CALLCHAIN,
+            1 << 18,
+        )],
+        records,
+    );
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), &bytes).unwrap();
+    let options = FoldOptions::default();
+    let memory = fold_perfdata_callchains_with_options(&bytes, options).unwrap();
+    let disk = fold_perfdata_file_with_options(file.path(), options).unwrap();
+    assert_eq!(memory, "after;[unknown] 1\nbefore;[unknown] 1\n");
+    assert_eq!(disk, memory);
 }
 
 #[test]
@@ -2761,7 +4458,7 @@ proptest! {
     }
 
     #[test]
-    fn property_folds_generated_periods_for_user_callchains(
+    fn property_untimed_callchains_use_unit_weights_for_arbitrary_periods(
         frames in prop::collection::vec(0x1000_u64..0x0001_0000_0000_u64, 1..12),
         periods in prop::collection::vec(1_u64..10_000, 1..16),
     ) {
@@ -2788,13 +4485,13 @@ proptest! {
             FoldOptions { count_periods: true, inline: false },
         )
         .expect("folded");
-        let expected = render_unknown_folded_callchain(&frames, periods.iter().sum());
+        let expected = render_unknown_folded_callchain(&frames, periods.len() as u64);
 
         prop_assert_eq!(folded, expected);
     }
 
     #[test]
-    fn property_selects_sample_layout_by_identifier(
+    fn property_selects_untimed_identifier_layout_with_unit_weight(
         base_id in 1_u64..u64::MAX,
         period in 1_u64..10_000,
         frame in 0x1000_u64..0x0001_0000_0000_u64,
@@ -2828,11 +4525,11 @@ proptest! {
         )
         .expect("folded");
 
-        prop_assert_eq!(folded, render_unknown_folded_callchain(&[frame], period));
+        prop_assert_eq!(folded, render_unknown_folded_callchain(&[frame], 1));
     }
 
     #[test]
-    fn property_selects_sample_layout_by_id_field(
+    fn property_selects_untimed_id_layout_with_unit_weight(
         base_id in 1_u64..u64::MAX,
         period in 1_u64..10_000,
         frame in 0x1000_u64..0x0001_0000_0000_u64,
@@ -2866,7 +4563,7 @@ proptest! {
         )
         .expect("folded");
 
-        prop_assert_eq!(folded, render_unknown_folded_callchain(&[frame], period));
+        prop_assert_eq!(folded, render_unknown_folded_callchain(&[frame], 1));
     }
 }
 
@@ -2959,11 +4656,69 @@ fn symbolized_fold_carries_mmap2_build_ids_to_symbol_requests() {
         vec![vec![SymbolRequest {
             path: std::path::PathBuf::from("[igb]"),
             relative_address: 0x30,
+            kernel_mapping_range: None,
             build_id: Some("aabbccdd".to_string()),
             file_identity: None,
             kernel_relocation: None,
         }]]
     );
+}
+
+#[test]
+fn symbolized_fold_resolves_build_id_kernel_module_from_live_kallsyms_like_perf_script() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes_with_misc(
+                10,
+                PERF_RECORD_MISC_CPUMODE_KERNEL | PERF_RECORD_MISC_MMAP_BUILD_ID,
+                &mmap2_build_id_payload(
+                    u32::MAX,
+                    u32::MAX,
+                    0xffff_ffff_c0ed_5900,
+                    0x1000,
+                    0,
+                    "[zfs]",
+                ),
+            ),
+            record_bytes(
+                PERF_RECORD_SAMPLE,
+                &sample_payload(
+                    0xffff_ffff_c0ed_5ffa,
+                    11,
+                    12,
+                    [0xffff_ffff_ffff_ff80, 0xffff_ffff_c0ed_5ffa],
+                ),
+            ),
+        ],
+    );
+    let root = tempfile::tempdir().expect("root");
+    let perfdata = root.path().join("perf.data");
+    std::fs::write(&perfdata, &bytes).expect("perfdata");
+    let live_kallsyms = root.path().join("kallsyms");
+    std::fs::write(
+        &live_kallsyms,
+        "ffffffffc0ed5900 t arc_read [zfs]\nffffffffc0ed6100 t arc_read_next [zfs]\n",
+    )
+    .expect("kallsyms");
+    let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+        RecordingSymbolResolver::default(),
+        &perfdata,
+        root.path(),
+        [],
+        &live_kallsyms,
+    );
+
+    let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
+        .expect("folded");
+
+    // perf's tools/perf/util/symbol.c dso__find_kallsyms() falls through to
+    // /proc/kallsyms for kernel/module maps even when the DSO has a build-id.
+    assert_eq!(folded, ":12;arc_read 1\n");
 }
 
 #[test]
@@ -2993,6 +4748,7 @@ fn symbolized_fold_carries_mmap2_file_identity_to_symbol_requests() {
         vec![vec![SymbolRequest {
             path: std::path::PathBuf::from("/bin/app"),
             relative_address: 0x30,
+            kernel_mapping_range: None,
             build_id: None,
             file_identity: Some(FileIdentity {
                 major: 8,
@@ -3037,6 +4793,7 @@ fn symbolized_fold_carries_header_build_ids_to_mmap2_symbol_requests() {
         vec![vec![SymbolRequest {
             path: std::path::PathBuf::from("/tmp/stale-app"),
             relative_address: 0x30,
+            kernel_mapping_range: None,
             build_id: Some("aabbccddeeff102030405060708090a0b0c0d0e0".to_string()),
             file_identity: Some(FileIdentity {
                 major: 8,
@@ -3239,7 +4996,10 @@ fn symbolized_fold_uses_module_fallback_for_unresolved_user_frames_like_inferno(
 }
 
 #[test]
-fn symbolized_fold_omits_process_name_frames_like_inferno_collapse_perf() {
+fn symbolized_fold_drops_process_name_only_stacks_without_inventing_module_fallback() {
+    // Inferno src/collapse/perf.rs:on_stack_line returns immediately when
+    // rawfunc starts with '('. after_event emits only nonempty stacks. A
+    // resolved-but-suppressed name is not an unresolved [unknown] symbol.
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
             PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
@@ -3256,7 +5016,7 @@ fn symbolized_fold_omits_process_name_frames_like_inferno_collapse_perf() {
     let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
         .expect("folded");
 
-    assert_eq!(folded, ":12;[app] 1\n");
+    assert_eq!(folded, "");
 }
 
 #[test]
@@ -3304,7 +5064,7 @@ fn folds_unmapped_kernel_frames_as_unknown_like_inferno() {
 }
 
 #[test]
-fn keeps_kernel_frames_from_mmap2_records_without_exec_prot() {
+fn kernel_looking_user_callchain_without_kernel_context_stays_unknown_like_perf_script() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
             PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
@@ -3313,7 +5073,37 @@ fn keeps_kernel_frames_from_mmap2_records_without_exec_prot() {
         )],
         [
             record_bytes(
+                1,
+                &mmap_payload(
+                    u32::MAX,
+                    u32::MAX,
+                    0xffff_ffff_8800_0000,
+                    0x2000,
+                    0,
+                    "[kernel.kallsyms]",
+                ),
+            ),
+            record_bytes(9, &sample_payload(0x1000, 11, 12, [0xffff_ffff_8800_0010])),
+        ],
+    );
+
+    let folded = fold_perfdata_callchains(&bytes).expect("folded");
+
+    assert_eq!(folded, ":12;[unknown] 1\n");
+}
+
+#[test]
+fn keeps_kernel_frames_from_mmap2_records_without_exec_prot() {
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes_with_misc(
                 10,
+                PERF_RECORD_MISC_CPUMODE_KERNEL,
                 &mmap2_payload(
                     u32::MAX,
                     u32::MAX,
@@ -3324,7 +5114,15 @@ fn keeps_kernel_frames_from_mmap2_records_without_exec_prot() {
                     "[kernel.kallsyms]",
                 ),
             ),
-            record_bytes(9, &sample_payload(0x1000, 11, 12, [0xffff_ffff_8800_0010])),
+            record_bytes(
+                9,
+                &sample_payload(
+                    0x1000,
+                    11,
+                    12,
+                    [0xffff_ffff_ffff_ff80, 0xffff_ffff_8800_0010],
+                ),
+            ),
         ],
     );
 
@@ -3342,8 +5140,9 @@ fn symbolized_fold_uses_module_fallback_for_unresolved_kernel_frames_like_infern
             0,
         )],
         [
-            record_bytes(
+            record_bytes_with_misc(
                 1,
+                PERF_RECORD_MISC_CPUMODE_KERNEL,
                 &mmap_payload(
                     u32::MAX,
                     u32::MAX,
@@ -3353,7 +5152,15 @@ fn symbolized_fold_uses_module_fallback_for_unresolved_kernel_frames_like_infern
                     "[kernel.kallsyms]_text",
                 ),
             ),
-            record_bytes(9, &sample_payload(0x1000, 11, 12, [0xffff_ffff_8800_0010])),
+            record_bytes(
+                9,
+                &sample_payload(
+                    0x1000,
+                    11,
+                    12,
+                    [0xffff_ffff_ffff_ff80, 0xffff_ffff_8800_0010],
+                ),
+            ),
         ],
     );
     let resolver = RecordingSymbolResolver::default();
@@ -3373,8 +5180,9 @@ fn symbolized_fold_resolves_mapped_kernel_frames() {
             0,
         )],
         [
-            record_bytes(
+            record_bytes_with_misc(
                 1,
+                PERF_RECORD_MISC_CPUMODE_KERNEL,
                 &mmap_payload(
                     u32::MAX,
                     u32::MAX,
@@ -3384,7 +5192,15 @@ fn symbolized_fold_resolves_mapped_kernel_frames() {
                     "[kernel.kallsyms]",
                 ),
             ),
-            record_bytes(9, &sample_payload(0x1000, 11, 12, [0xffff_ffff_8800_0010])),
+            record_bytes(
+                9,
+                &sample_payload(
+                    0x1000,
+                    11,
+                    12,
+                    [0xffff_ffff_ffff_ff80, 0xffff_ffff_8800_0010],
+                ),
+            ),
         ],
     );
     let resolver = StaticSymbolResolver;
@@ -3404,8 +5220,9 @@ fn symbolized_fold_resolves_kernel_module_frames() {
             0,
         )],
         [
-            record_bytes(
+            record_bytes_with_misc(
                 1,
+                PERF_RECORD_MISC_CPUMODE_KERNEL,
                 &mmap_payload(
                     u32::MAX,
                     u32::MAX,
@@ -3415,7 +5232,15 @@ fn symbolized_fold_resolves_kernel_module_frames() {
                     "[zfs]",
                 ),
             ),
-            record_bytes(9, &sample_payload(0x1000, 11, 12, [0xffff_ffff_c000_0123])),
+            record_bytes(
+                9,
+                &sample_payload(
+                    0x1000,
+                    11,
+                    12,
+                    [0xffff_ffff_ffff_ff80, 0xffff_ffff_c000_0123],
+                ),
+            ),
         ],
     );
     let resolver = StaticSymbolResolver;
@@ -3427,7 +5252,7 @@ fn symbolized_fold_resolves_kernel_module_frames() {
 }
 
 #[test]
-fn prefetches_unique_symbol_requests_before_folding() {
+fn resolves_unique_addresses_once_per_delivered_sample() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
             PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
@@ -3456,6 +5281,7 @@ fn prefetches_unique_symbol_requests_before_folding() {
             SymbolRequest {
                 path: std::path::PathBuf::from("/bin/app"),
                 relative_address: 0x10,
+                kernel_mapping_range: None,
                 build_id: None,
                 file_identity: None,
                 kernel_relocation: None,
@@ -3463,6 +5289,7 @@ fn prefetches_unique_symbol_requests_before_folding() {
             SymbolRequest {
                 path: std::path::PathBuf::from("/bin/app"),
                 relative_address: 0x20,
+                kernel_mapping_range: None,
                 build_id: None,
                 file_identity: None,
                 kernel_relocation: None,
@@ -3472,7 +5299,7 @@ fn prefetches_unique_symbol_requests_before_folding() {
 }
 
 #[test]
-fn prefetches_symbol_requests_in_batches_before_folding() {
+fn resolves_samples_at_delivery_without_a_recording_sized_symbol_batch() {
     let mut records = vec![record_bytes(
         1,
         &mmap_payload(11, 11, 0x1000, 0x3000, 0, "/bin/app"),
@@ -3498,9 +5325,8 @@ fn prefetches_symbol_requests_in_batches_before_folding() {
 
     assert_eq!(folded, ":12;[app] 4097\n");
     let calls = resolver.calls();
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].len(), 4096);
-    assert_eq!(calls[1].len(), 1);
+    assert_eq!(calls.len(), 4097);
+    assert!(calls.iter().all(|batch| batch.len() == 1));
 }
 
 fn perfdata_with_records_and_attrs<const A: usize, const R: usize>(
@@ -3587,10 +5413,10 @@ fn perfdata_with_records_attrs_and_build_id_feature<const A: usize, const R: usi
     bytes
 }
 
-/// Builds a perf.data carrying a single HEADER_ARCH feature string (the
+/// Builds a perf.data carrying a single `HEADER_ARCH` feature string (the
 /// recording machine's `uname -m`). perf stores it as a `perf_header_string`:
 /// a u32 length followed by that many NUL-terminated bytes (util/header.c
-/// write_arch/do_write_string).
+/// `write_arch/do_write_string`).
 fn perfdata_with_records_attrs_and_arch_feature<const A: usize, const R: usize>(
     attrs: [[u8; 144]; A],
     records: [Vec<u8>; R],
@@ -3768,6 +5594,13 @@ fn sample_payload_with_period<const N: usize>(
     payload.extend((callchain.len() as u64).to_le_bytes());
     for frame in callchain {
         payload.extend(frame.to_le_bytes());
+    }
+    payload
+}
+
+fn sample_payload_with_optional_timestamp(mut payload: Vec<u8>, timed: bool) -> Vec<u8> {
+    if timed {
+        payload.splice(16..16, 1_000_000_000_u64.to_le_bytes());
     }
     payload
 }
@@ -4159,18 +5992,66 @@ impl SymbolResolver for InlineSymbolResolver {
     }
 }
 
+struct SampleIpInlineSymbolResolver;
+
+impl SymbolResolver for SampleIpInlineSymbolResolver {
+    fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
+        Ok(vec![None; requests.len()])
+    }
+
+    fn resolve_frame_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Vec<String>>, String> {
+        Ok(requests
+            .iter()
+            .map(|request| {
+                if request.path == std::path::Path::new("/bin/app")
+                    && request.relative_address == 0x10
+                {
+                    vec!["app::outer".to_string(), "app::inner".to_string()]
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect())
+    }
+
+    fn resolve_base_frame_batch_with_metadata(
+        &self,
+        requests: &[SymbolRequest],
+    ) -> Result<Vec<ResolvedSymbolFrames>, String> {
+        Ok(requests
+            .iter()
+            .map(|request| {
+                if request.path == std::path::Path::new("/bin/app")
+                    && request.relative_address == 0x10
+                {
+                    ResolvedSymbolFrames {
+                        frames: vec!["app::main".to_string()],
+                        source_state: pyroclast::symbols::SymbolSourceState::AddressDependent,
+                        has_base_symbol: true,
+                        has_inline_frames: false,
+                        has_non_inline_base_frame: true,
+                        base_offset: None,
+                    }
+                } else {
+                    ResolvedSymbolFrames::default()
+                }
+            })
+            .collect())
+    }
+}
+
 struct ArrowInlineSymbolResolver;
 
 struct SyntheticX86_64Object {
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     path: std::path::PathBuf,
 }
 
 impl SyntheticX86_64Object {
-    /// Minimal x86_64 ELF with one PT_LOAD covering [0, 0x10000) and no unwind
+    /// Minimal `x86_64` ELF with one `PT_LOAD` covering [0, 0x10000) and no unwind
     /// info. The current-IP-only tests previously mapped the host test binary,
     /// which made framehop's unwind host-dependent (a Mach-O/arm64 test binary
-    /// recovers callers through __unwind_info that a Linux x86_64 binary does
+    /// recovers callers through `__unwind_info` that a Linux `x86_64` binary does
     /// not have at these offsets). A synthetic ELF pins the libdw scenario the
     /// tests encode: module reports, framehop yields only the seeded IP.
     fn create() -> Self {
@@ -4235,15 +6116,18 @@ impl SyntheticX86_64Object {
         let dir = tempfile::tempdir().expect("fixture dir");
         let path = dir.path().join("fixture-x86-64");
         std::fs::write(&path, &bytes).expect("write fixture elf");
-        Self { _dir: dir, path }
+        Self { dir, path }
     }
 
     fn path_string(&self) -> String {
         self.path.to_string_lossy().into_owned()
     }
 
-    fn file_name(&self) -> &'static str {
-        "fixture-x86-64"
+    fn file_name(&self) -> &str {
+        self.path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("fixture file name")
     }
 }
 
@@ -4322,8 +6206,11 @@ impl SyntheticAarch64Object {
         self.path.to_string_lossy().into_owned()
     }
 
-    fn file_name(&self) -> &'static str {
-        "fixture-aarch64"
+    fn file_name(&self) -> &str {
+        self.path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("fixture file name")
     }
 }
 

@@ -21,7 +21,7 @@ use blake3::Hash;
 const PIPE_BUFFER_CAPACITY: usize = 1024 * 1024;
 pub const DEFAULT_BENCHMARK_INPUT: &str = "target/benchmarks/biggest.perf.data";
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BenchArgs {
     pub perf_data: Option<PathBuf>,
 
@@ -31,11 +31,19 @@ pub struct BenchArgs {
 
     pub symbols: bool,
 
-    /// Expand each callchain entry into its DWARF inline frames when folding,
-    /// like `perf script --inline`. The dwarf oracle's perf.script is recorded
-    /// with inline expansion, so the comparison must fold with inline on to
-    /// line up frame counts.
     pub inline: bool,
+}
+
+impl Default for BenchArgs {
+    fn default() -> Self {
+        Self {
+            perf_data: None,
+            perf_script: None,
+            export_perf_script: None,
+            symbols: false,
+            inline: true,
+        }
+    }
 }
 
 impl BenchArgs {
@@ -52,6 +60,8 @@ impl BenchArgs {
                 parsed.symbols = true;
             } else if arg.as_os_str() == "--inline" {
                 parsed.inline = true;
+            } else if arg.as_os_str() == "--no-inline" {
+                parsed.inline = false;
             } else {
                 parsed.perf_data = Some(arg);
             }
@@ -173,7 +183,7 @@ fn append_bench_report(name: &str, report: &FoldBenchmarkReport, output: &mut St
 /// Returns an error when the input file cannot be mapped or parsed.
 pub fn run_fold_benchmark(input: &Path) -> Result<FoldBenchmarkReport, String> {
     run_fold_benchmark_with_writer(input, |writer| {
-        write_folded_perfdata_file_with_options(input, benchmark_fold_options(false), writer)
+        write_folded_perfdata_file_with_options(input, benchmark_fold_options(true), writer)
     })
 }
 
@@ -204,7 +214,9 @@ where
             )
         })
     } else {
-        run_fold_benchmark(input)
+        run_fold_benchmark_with_writer(input, |writer| {
+            write_folded_perfdata_file_with_options(input, benchmark_fold_options(inline), writer)
+        })
     }
 }
 
@@ -301,7 +313,7 @@ pub fn compare_with_inferno_collapse<R>(
 where
     R: CommandRunner,
 {
-    compare_with_inferno_collapse_with_symbols(perf_data, perf_script, runner, false, false)
+    compare_with_inferno_collapse_with_symbols(perf_data, perf_script, runner, false, true)
 }
 
 /// Compares Pyroclast's direct folded stacks with the old
@@ -760,14 +772,14 @@ where
                             perf_symbol_resolver_for_current_home(runner, &export_perf_data);
                         write_inferno_perf_script_file_with_symbols(
                             &export_perf_data,
-                            benchmark_fold_options(false),
+                            benchmark_fold_options(true),
                             &resolver,
                             &mut stdin,
                         )
                     } else {
                         write_inferno_perf_script_file_with_options(
                             &export_perf_data,
-                            benchmark_fold_options(false),
+                            benchmark_fold_options(true),
                             &mut stdin,
                         )
                     }?;
@@ -1005,8 +1017,10 @@ fn join_result_thread<T>(
 }
 
 fn benchmark_fold_options(inline: bool) -> FoldOptions {
-    // The benchmark scoreboard compares against plain `perf | inferno`, which
-    // does not expand DWARF inline frames, so the parity path keeps inline off.
+    // Plain `perf script` decides from the recorded stack and debuginfo whether
+    // DWARF inline frames are printable. Keep Pyroclast's inline-capable path on:
+    // fp data naturally remains one frame per callchain entry, while DWARF data
+    // can match the `(inlined)` rows that perf emits.
     FoldOptions {
         count_periods: true,
         inline,

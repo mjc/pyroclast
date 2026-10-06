@@ -317,6 +317,7 @@ fn builds_batched_addr2line_command() {
             SymbolRequest {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x10,
+                kernel_mapping_range: None,
                 build_id: None,
                 file_identity: None,
                 kernel_relocation: None,
@@ -324,6 +325,7 @@ fn builds_batched_addr2line_command() {
             SymbolRequest {
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x20,
+                kernel_mapping_range: None,
                 build_id: None,
                 file_identity: None,
                 kernel_relocation: None,
@@ -688,6 +690,7 @@ proptest! {
             .map(|relative_address| SymbolRequest {
                 path: path.clone(),
                 relative_address: *relative_address,
+                kernel_mapping_range: None,
                 build_id: None,
                 file_identity: None,
                 kernel_relocation: None,

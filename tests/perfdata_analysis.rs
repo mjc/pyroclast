@@ -102,6 +102,28 @@ fn analyzes_sample_modes_and_user_stack_payloads() {
 }
 
 #[test]
+fn analysis_retains_the_real_ip_immediately_below_perf_context_max() {
+    // linux/include/uapi/linux/perf_event.h:1298 sets PERF_CONTEXT_MAX to
+    // (u64)-4095, so -4096 is an address, not a context marker.
+    let boundary_ip = 0xffff_ffff_ffff_f000;
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [record_bytes(
+            9,
+            &sample_payload(boundary_ip, 1, 11, 7, [boundary_ip, 0x2000]),
+        )],
+    );
+    let report = analyze_perfdata(&bytes, 10).expect("analysis");
+    assert_eq!(report.top_leaf_ips[0].ip, "0xfffffffffffff000");
+    assert_eq!(report.top_edges[0].callee, "0xfffffffffffff000");
+    assert_eq!(report.top_edges[0].caller, "0x0000000000002000");
+}
+
+#[test]
 fn analyzes_perfdata_from_file_without_requiring_a_byte_vec() {
     let root = tempfile::tempdir().expect("tempdir");
     let path = root.path().join("perf.data");
@@ -485,7 +507,8 @@ fn sample_mode_name(cpumode: u16) -> &'static str {
 }
 
 fn is_context_marker(ip: u64) -> bool {
-    ip >= 0xffff_ffff_ffff_f000
+    // linux/include/uapi/linux/perf_event.h: PERF_CONTEXT_MAX = (__u64)-4095.
+    ip >= 0xffff_ffff_ffff_f001
 }
 
 fn format_ip(ip: u64) -> String {

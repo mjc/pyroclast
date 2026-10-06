@@ -46,25 +46,21 @@ cargo build --quiet --release --bin pyroclast --example pyroclast-bench
 
 for name in ${ORACLE_NAMES:-fp dwarf}; do
     [ -f "$ORACLE_OUT/$name.perf.data" ] || continue
-    # The dwarf oracle was recorded on arm64 with `perf script` expanding DWARF
-    # inline frames by default; the fp oracle was recorded without inline. Fold
-    # the dwarf pair with --inline so the frame counts line up; leave fp plain.
-    inline_args=""
-    if [ "$name" = "dwarf" ]; then
-        inline_args="--inline"
-    fi
+    # Keep Pyroclast's inline-capable fold path on for every oracle. fp data
+    # naturally stays one frame per callchain entry, while DWARF data can match
+    # the `(inlined)` rows that modern `perf script` emits.
     timeout 600 "$CARGO_TARGET_DIR/release/examples/pyroclast-bench" \
         "$ORACLE_OUT/$name.perf.data" \
         --perf-script "$ORACLE_OUT/$name.perf.script" \
-        --symbols $inline_args \
+        --symbols \
         | tee "$ORACLE_OUT/$name.bench.txt" \
         || echo "pyroclast-bench failed for $name (continuing)" >&2
     # --count-periods matches the scoreboard (benchmark_fold_options) so the
     # printed folded diff lines up with inferno's period-weighted counts.
-    timeout 600 "$CARGO_TARGET_DIR/release/pyroclast" plumbing fold --count-periods $inline_args \
+    timeout 600 "$CARGO_TARGET_DIR/release/pyroclast" plumbing fold --count-periods \
         "$ORACLE_OUT/$name.perf.data" > "$ORACLE_OUT/$name.pyroclast.folded" \
         || echo "plumbing fold failed for $name (continuing)" >&2
-    timeout 600 "$CARGO_TARGET_DIR/release/pyroclast" plumbing perf-script $inline_args \
+    timeout 600 "$CARGO_TARGET_DIR/release/pyroclast" plumbing perf-script \
         "$ORACLE_OUT/$name.perf.data" > "$ORACLE_OUT/$name.pyroclast.script" \
         || echo "plumbing perf-script failed for $name (continuing)" >&2
 done

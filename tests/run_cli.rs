@@ -78,6 +78,93 @@ fn fold_command_reads_perfdata_directly() {
 }
 
 #[test]
+fn streaming_perf_commands_match_explicit_owned_output_adapters() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), tiny_perfdata()).unwrap();
+    for command in ["fold", "perf-script"] {
+        let args = [
+            "pyroclast",
+            "plumbing",
+            command,
+            "--no-symbols",
+            file.path().to_str().unwrap(),
+        ];
+        let expected = pyroclast::run_cli(args).unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        pyroclast::run_cli_to_writers(args, &mut stdout, &mut stderr).unwrap();
+        assert_eq!(stdout, expected.stdout.as_bytes());
+        assert_eq!(stderr, expected.stderr.as_bytes());
+    }
+}
+
+struct FailingStream(std::io::ErrorKind);
+
+impl std::io::Write for FailingStream {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::from(self.0))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::from(self.0))
+    }
+}
+
+#[test]
+fn streaming_perf_text_accepts_broken_pipe_but_reports_other_write_errors() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), tiny_perfdata()).unwrap();
+    let args = [
+        "pyroclast",
+        "plumbing",
+        "perf-script",
+        "--no-symbols",
+        file.path().to_str().unwrap(),
+    ];
+    assert!(
+        pyroclast::run_cli_to_writers(
+            args,
+            FailingStream(std::io::ErrorKind::BrokenPipe),
+            Vec::new()
+        )
+        .is_ok()
+    );
+    assert!(
+        pyroclast::run_cli_to_writers(
+            args,
+            FailingStream(std::io::ErrorKind::PermissionDenied),
+            Vec::new()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn perf_script_binary_streams_delivered_samples_before_a_later_parse_error() {
+    // perf session.c delivers an untimed sample immediately. A malformed
+    // later record must not make the CLI buffer and discard earlier text.
+    let mut bytes = tiny_perfdata();
+    let mut invalid = record_bytes(68, &[]);
+    invalid[6..8].copy_from_slice(&4_u16.to_le_bytes());
+    bytes.extend(invalid);
+    let data_offset = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
+    let data_size = bytes.len() as u64 - data_offset;
+    put_u64(&mut bytes, 48, data_size);
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), bytes).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pyroclast"))
+        .args(["plumbing", "perf-script", "--no-symbols"])
+        .arg(file.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid perf record size"));
+    assert!(
+        !output.stdout.is_empty(),
+        "delivered text must not be retained in CliOutput"
+    );
+}
+
+#[test]
 fn perf_script_command_exports_inferno_compatible_perf_script() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
@@ -127,6 +214,166 @@ fn perf_script_command_exports_inferno_compatible_perf_script() {
         output.stdout,
         "app       2 [003]     0.123456:        144 cycles: \n\t            2000 [unknown] (/bin/app)\n\n"
     );
+}
+
+#[test]
+fn perf_script_command_returns_empty_failure_for_zero_data_size_like_perf_script() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    let mut bytes = tiny_perfdata();
+    put_u64(&mut bytes, 16, 144);
+    put_u64(&mut bytes, 48, 0);
+    std::fs::write(&perfdata, bytes).expect("write perfdata");
+
+    #[cfg(target_os = "linux")]
+    {
+        let perf = std::process::Command::new("perf")
+            .args(["script", "--force", "-i", perfdata.to_str().unwrap()])
+            .output()
+            .expect("run reference perf script");
+        assert!(
+            !perf.status.success(),
+            "perf unexpectedly accepted a zero-sized data section"
+        );
+        assert!(
+            perf.stdout.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&perf.stdout)
+        );
+    }
+
+    let error = pyroclast::run_cli([
+        "pyroclast",
+        "plumbing",
+        "perf-script",
+        "--no-symbols",
+        perfdata.to_str().unwrap(),
+    ])
+    .expect_err("perf script cannot process a zero-sized event section");
+
+    assert!(!error.to_string().is_empty());
+}
+
+#[test]
+fn fold_command_processes_zero_data_size_like_perf_script_and_inferno() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    let mut bytes = tiny_perfdata();
+    put_u64(&mut bytes, 16, 144);
+    put_u64(&mut bytes, 48, 0);
+    std::fs::write(&perfdata, bytes).expect("write perfdata");
+
+    let output = pyroclast::run_cli([
+        "pyroclast",
+        "plumbing",
+        "fold",
+        "--no-symbols",
+        perfdata.to_str().unwrap(),
+    ])
+    .expect("empty perf script stream folds to empty output");
+
+    assert_eq!(output.stdout, "");
+}
+
+#[test]
+fn perf_script_command_keeps_unreadable_objects_unknown_and_zero_default_period_like_perf() {
+    // perf machine.c:append_inlines does not ask addr2line for names without
+    // a base symbol. This fixture has no ELF or DWARF inline chain.
+    // evsel.c:evsel__parse_sample uses attr.sample_period (zero here) without
+    // PERF_SAMPLE_PERIOD. Script output prints that value even without TIME.
+    let root = tempfile::tempdir().expect("tempdir");
+    let perfdata = root.path().join("perf.data");
+    let missing_object = root.path().join("app");
+    std::fs::write(
+        &perfdata,
+        perfdata_with_records_and_attrs(
+            [file_attr_bytes(
+                PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+                0,
+                0,
+            )],
+            [
+                record_bytes(3, &comm_payload(1, 2, "app")),
+                record_bytes(
+                    1,
+                    &mmap_payload(1, 2, 0x1000, 0x2000, 0, missing_object.to_str().unwrap()),
+                ),
+                record_bytes(9, &sample_payload(0x1000, 1, 2, [0x2000])),
+            ],
+        ),
+    )
+    .expect("write perfdata");
+    let runner = RecordingRunner::default();
+    let cli = pyroclast::cli::Cli::parse_from([
+        "pyroclast",
+        "plumbing",
+        "perf-script",
+        "--symbolizer",
+        "addr2line",
+        perfdata.to_str().unwrap(),
+    ]);
+
+    let output = pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("perf script command");
+
+    assert_eq!(
+        output.stdout,
+        format!(
+            "app       2          0 cycles: \n\t            2000 [unknown] ({})\n\n",
+            missing_object.display()
+        )
+    );
+    assert!(runner.programs().is_empty());
+    assert!(runner.stdins().is_empty());
+}
+
+#[test]
+fn perf_script_command_inline_option_defaults_on_like_perf_script() {
+    let cli = pyroclast::cli::Cli::parse_from([
+        "pyroclast",
+        "plumbing",
+        "perf-script",
+        "profile.perf.data",
+    ]);
+
+    let pyroclast::cli::CliCommand::Plumbing {
+        command: pyroclast::cli::PlumbingCommand::PerfScript(args),
+    } = cli.command
+    else {
+        panic!("expected plumbing perf-script command");
+    };
+
+    assert!(args.symbols);
+    assert!(args.inline_frames.enabled());
+
+    let cli = pyroclast::cli::Cli::parse_from([
+        "pyroclast",
+        "plumbing",
+        "perf-script",
+        "--inline",
+        "profile.perf.data",
+    ]);
+    let pyroclast::cli::CliCommand::Plumbing {
+        command: pyroclast::cli::PlumbingCommand::PerfScript(args),
+    } = cli.command
+    else {
+        panic!("expected plumbing perf-script command");
+    };
+    assert!(args.inline_frames.enabled());
+
+    let cli = pyroclast::cli::Cli::parse_from([
+        "pyroclast",
+        "plumbing",
+        "perf-script",
+        "--no-inline",
+        "profile.perf.data",
+    ]);
+    let pyroclast::cli::CliCommand::Plumbing {
+        command: pyroclast::cli::PlumbingCommand::PerfScript(args),
+    } = cli.command
+    else {
+        panic!("expected plumbing perf-script command");
+    };
+    assert!(!args.inline_frames.enabled());
 }
 
 #[test]
@@ -267,7 +514,7 @@ fn perf_script_command_writes_sample_ip_on_event_line_when_callchain_is_absent_l
 
     assert_eq!(
         output.stdout,
-        "              :2       2        144 cycles:             1000 [unknown] (/bin/app)\n"
+        "              :2       2        144 cycles:              1000 [unknown] (/bin/app)\n"
     );
 }
 
@@ -521,9 +768,12 @@ fn perf_script_command_keeps_perf_stack_order_and_skips_context_markers() {
 }
 
 #[test]
-fn fold_command_can_symbolize_mapped_frames() {
+fn fold_command_uses_module_fallback_without_a_perf_base_symbol() {
+    // Inferno perf.rs:with_module_fallback uses the module basename when
+    // perf's ELF loader cannot provide a symbol for append_inlines.
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
+    let missing_object = root.path().join("app");
     std::fs::write(
         &perfdata,
         perfdata_with_records_and_attrs(
@@ -534,20 +784,20 @@ fn fold_command_can_symbolize_mapped_frames() {
             )],
             [
                 record_bytes(3, &comm_payload(1, 2, "app")),
-                record_bytes(1, &mmap_payload(1, 2, 0x1000, 0x2000, 0, "/bin/app")),
+                record_bytes(
+                    1,
+                    &mmap_payload(1, 2, 0x1000, 0x2000, 0, missing_object.to_str().unwrap()),
+                ),
                 record_bytes(9, &sample_payload(0x1000, 1, 2, [0x2000])),
             ],
         ),
     )
     .expect("write perfdata");
     let runner = RecordingRunner::default();
-    // The base symbol comes from the in-process ELF symtab without --inline;
-    // exercising the external addr2line resolver requires the inline path.
     let cli = pyroclast::cli::Cli::parse_from([
         "pyroclast",
         "plumbing",
         "fold",
-        "--inline",
         "--symbolizer",
         "addr2line",
         perfdata.to_str().unwrap(),
@@ -555,9 +805,9 @@ fn fold_command_can_symbolize_mapped_frames() {
 
     let output = pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("fold command");
 
-    assert_eq!(output.stdout, "app;app::work 1\n");
-    assert_eq!(runner.programs(), vec!["addr2line"]);
-    assert_eq!(runner.stdins(), vec![Some(b"0x1000\n".to_vec())]);
+    assert_eq!(output.stdout, "app;[app] 1\n");
+    assert!(runner.programs().is_empty());
+    assert!(runner.stdins().is_empty());
 }
 
 #[test]
@@ -674,7 +924,7 @@ fn flamegraph_command_folds_perfdata_without_perf_script() {
 }
 
 #[test]
-fn flamegraph_command_weights_perf_sample_periods() {
+fn flamegraph_command_uses_infernos_unit_weight_for_untimed_period_samples() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
     let output_svg = root.path().join("flamegraph.svg");
@@ -692,7 +942,7 @@ fn flamegraph_command_weights_perf_sample_periods() {
 
     pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("flamegraph command");
 
-    assert_eq!(runner.stdins(), vec![Some(b":2;[unknown] 144\n".to_vec())]);
+    assert_eq!(runner.stdins(), vec![Some(b":2;[unknown] 1\n".to_vec())]);
 }
 
 #[test]
@@ -725,10 +975,13 @@ fn flamegraph_command_accepts_injected_renderer() {
 }
 
 #[test]
-fn flamegraph_command_can_symbolize_mapped_frames() {
+fn flamegraph_command_keeps_module_fallback_without_a_perf_base_symbol() {
+    // perf machine.c:append_inlines cannot revive a symbol from addr2line
+    // when the mapped ELF is unreadable; Inferno keeps the module fallback.
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
     let output_svg = root.path().join("flamegraph.svg");
+    let missing_object = root.path().join("app");
     std::fs::write(
         &perfdata,
         perfdata_with_records_and_attrs(
@@ -739,20 +992,20 @@ fn flamegraph_command_can_symbolize_mapped_frames() {
             )],
             [
                 record_bytes(3, &comm_payload(1, 2, "app")),
-                record_bytes(1, &mmap_payload(1, 2, 0x1000, 0x2000, 0, "/bin/app")),
+                record_bytes(
+                    1,
+                    &mmap_payload(1, 2, 0x1000, 0x2000, 0, missing_object.to_str().unwrap()),
+                ),
                 record_bytes(9, &sample_payload(0x1000, 1, 2, [0x2000])),
             ],
         ),
     )
     .expect("write perfdata");
     let runner = RecordingRunner::default();
-    // The base symbol comes from the in-process ELF symtab without --inline;
-    // exercising the external addr2line resolver requires the inline path.
     let cli = pyroclast::cli::Cli::parse_from([
         "pyroclast",
         "plumbing",
         "flamegraph",
-        "--inline",
         "--symbolizer",
         "addr2line",
         perfdata.to_str().expect("perfdata path"),
@@ -762,14 +1015,8 @@ fn flamegraph_command_can_symbolize_mapped_frames() {
 
     pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("flamegraph command");
 
-    assert_eq!(runner.programs(), vec!["addr2line", "inferno-flamegraph"]);
-    assert_eq!(
-        runner.stdins(),
-        vec![
-            Some(b"0x1000\n".to_vec()),
-            Some(b"app;app::work 1\n".to_vec()),
-        ]
-    );
+    assert_eq!(runner.programs(), vec!["inferno-flamegraph"]);
+    assert_eq!(runner.stdins(), vec![Some(b"app;[app] 1\n".to_vec())]);
 }
 
 #[test]

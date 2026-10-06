@@ -629,13 +629,17 @@ fn callchain_parser_accepts_empty_user_stack_without_dynamic_size() {
 }
 
 #[test]
-fn detects_perf_context_marker_addresses() {
+fn detects_perf_context_markers_at_the_uapi_minus_4095_boundary() {
+    // linux/include/uapi/linux/perf_event.h: PERF_CONTEXT_MAX = (__u64)-4095.
+    assert!(!is_perf_context_marker(0xffff_ffff_ffff_f000));
+    assert!(is_perf_context_marker(0xffff_ffff_ffff_f001));
     assert!(is_perf_context_marker(0xffff_ffff_ffff_fe00));
     assert!(!is_perf_context_marker(0x7fff_ffff_f000));
 }
 
 #[test]
 fn detects_kernel_space_frames() {
+    assert!(is_kernel_space_frame(0xffff_ffff_ffff_f000));
     assert!(is_kernel_space_frame(0xffff_ffff_8800_1280));
     assert!(!is_kernel_space_frame(0x0000_7fff_ffff_f000));
     assert!(!is_kernel_space_frame(0xffff_ffff_ffff_fe00));
@@ -738,11 +742,14 @@ proptest! {
     }
 
     #[test]
-    fn property_classifies_context_markers_and_kernel_frames(frame in any::<u64>()) {
-        prop_assert_eq!(is_perf_context_marker(frame), frame >= 0xffff_ffff_ffff_f000);
+    fn property_classifies_context_markers_using_the_perf_uapi_boundary(
+        frame in prop_oneof![any::<u64>(), Just(0xffff_ffff_ffff_f000), Just(0xffff_ffff_ffff_f001)]
+    ) {
+        // linux/include/uapi/linux/perf_event.h: PERF_CONTEXT_MAX = (__u64)-4095.
+        prop_assert_eq!(is_perf_context_marker(frame), frame >= 0xffff_ffff_ffff_f001);
         prop_assert_eq!(
             is_kernel_space_frame(frame),
-            (0xffff_8000_0000_0000..0xffff_ffff_ffff_f000).contains(&frame)
+            (0xffff_8000_0000_0000..0xffff_ffff_ffff_f001).contains(&frame)
         );
     }
 }
