@@ -86,7 +86,11 @@ fn offcpu_backend_bpftrace_method_writes_folded_stack_artifacts() {
     let runner = RecordingOffcpuRunner::default();
     let request = ProfileRequest {
         kind: ProfileKind::Offcpu,
-        command: vec!["target/release/app".to_string(), "--serve".to_string()],
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            "printf 'workload stdout\\n'; printf 'workload stderr\\n' >&2; exit 7".into(),
+        ],
         out_dir: out,
         name: None,
         json: false,
@@ -108,6 +112,19 @@ fn offcpu_backend_bpftrace_method_writes_folded_stack_artifacts() {
 
     assert!(result.layout.raw_profile("bpftrace").is_file());
     assert_eq!(
+        std::fs::read_to_string(result.layout.raw_profile("bpftrace")).unwrap(),
+        "@offcpu[\n    55 tokio::runtime::park+12 (/bin/app)\n    44 app::serve+7 (/bin/app)\n]: 1500\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(result.layout.stdout_log()).unwrap(),
+        "workload stdout\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(result.layout.stderr_log()).unwrap(),
+        "workload stderr\n"
+    );
+    assert_eq!(result.manifest.exit_status, Some(7));
+    assert_eq!(
         std::fs::read_to_string(result.layout.stacks_folded()).expect("folded"),
         "app::serve;tokio::runtime::park 1500\n"
     );
@@ -123,6 +140,8 @@ fn offcpu_backend_bpftrace_method_writes_folded_stack_artifacts() {
             .expect("summary json");
     assert_eq!(summary_json["method"], "bpftrace");
     assert_eq!(summary_json["folded_lines"], 1);
+    assert_eq!(summary_json["total_offcpu_ns"], 1500);
+    assert_eq!(summary_json["workload_outcome"], "completed");
     assert_eq!(result.manifest.duration_secs, Some(30));
     assert_eq!(
         result
@@ -141,7 +160,10 @@ fn offcpu_backend_bpftrace_method_writes_folded_stack_artifacts() {
     );
     assert_eq!(
         result.manifest.diagnostics,
-        vec!["offcpu method: bpftrace".to_string()]
+        vec![
+            "offcpu method: bpftrace".to_string(),
+            "workload outcome: completed".to_string()
+        ]
     );
     assert_eq!(runner.programs(), vec!["bpftrace"]);
 }
@@ -152,14 +174,8 @@ fn bpftrace_backend_captures_real_child_output_and_preserves_workload_arguments(
     struct FixtureBpftrace;
     impl CommandRunner for FixtureBpftrace {
         fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
-            let mut command = command.clone();
-            command.program = "sh".to_string();
-            command.args.splice(0..0, [
-                "-c".to_string(),
-                "while [ \"$1\" != '-c' ]; do shift; done; shift; $1; printf '@offcpu[\\n    55 kernel_wait+12 ([kernel.kallsyms])\\n    44 workload+7 ([kernel.kallsyms])\\n]: 1500\\n'".to_string(),
-                "fixture-bpftrace".to_string(),
-            ]);
-            pyroclast::process::RealCommandRunner::default().run(&command)
+            run_fixture_bpftrace(command,
+                b"@offcpu[\n    55 kernel_wait+12 ([kernel.kallsyms])\n    44 workload+7 ([kernel.kallsyms])\n]: 1500\n")
         }
     }
 
@@ -193,7 +209,16 @@ fn bpftrace_backend_captures_real_child_output_and_preserves_workload_arguments(
         .profile(&request)
         .unwrap();
     let raw = std::fs::read_to_string(result.layout.raw_profile("bpftrace")).unwrap();
-    assert!(raw.contains("argument with spaces\nembedded'quote\n$(printf must-stay-literal)\n"));
+    assert_eq!(
+        raw,
+        "@offcpu[\n    55 kernel_wait+12 ([kernel.kallsyms])\n    44 workload+7 ([kernel.kallsyms])\n]: 1500\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(result.layout.stdout_log()).unwrap(),
+        "argument with spaces\nembedded'quote\n$(printf must-stay-literal)\n"
+    );
+    assert_eq!(std::fs::read(result.layout.stderr_log()).unwrap(), b"");
+    assert_eq!(result.manifest.exit_status, Some(0));
     assert_eq!(
         std::fs::read_to_string(result.layout.stacks_folded()).unwrap(),
         "workload;kernel_wait 1500\n"
@@ -203,6 +228,35 @@ fn bpftrace_backend_captures_real_child_output_and_preserves_workload_arguments(
             .unwrap();
     assert_eq!(summary["weight_unit"], "nanoseconds");
     assert_eq!(summary["total_offcpu_ns"], 1500);
+    assert_eq!(summary["workload_outcome"], "completed");
+}
+
+// bpftrace splits -c on spaces, captures child status internally, and writes
+// only recorder data to -o. Run the actual launcher, not a fabricated status.
+fn run_fixture_bpftrace(command: &CommandSpec, data: &[u8]) -> std::io::Result<CommandOutput> {
+    let child = command
+        .args
+        .windows(2)
+        .find(|args| args[0] == "-c")
+        .expect("-c workload");
+    let output_path = command
+        .args
+        .windows(2)
+        .find(|args| args[0] == "-o")
+        .expect("-o recorder channel");
+    let argv: Vec<_> = child[1].split_whitespace().collect();
+    let mut launcher = command.clone();
+    launcher.program = argv[0].into();
+    launcher.args = argv[1..].iter().map(|arg| (*arg).into()).collect();
+    let mut output = pyroclast::process::RealCommandRunner::default().run(&launcher)?;
+    assert_eq!(
+        output.status_code,
+        Some(0),
+        "supervisor must finish successfully independently of workload status"
+    );
+    std::fs::write(&output_path[1], data)?;
+    output.status_code = Some(0); // Recorder success, not workload success.
+    Ok(output)
 }
 
 #[test]
@@ -343,6 +397,10 @@ impl CommandRunner for RecordingOffcpuRunner {
                 stderr: Vec::new(),
             });
         }
+        if command.program == "bpftrace" {
+            return run_fixture_bpftrace(command,
+                b"@offcpu[\n    55 tokio::runtime::park+12 (/bin/app)\n    44 app::serve+7 (/bin/app)\n]: 1500\n");
+        }
         for (key, value) in &command.env {
             if key == "PYROCLAST_OFFCPU_TARGET_PID" {
                 std::fs::write(value, "42\n")?;
@@ -361,9 +419,6 @@ impl CommandRunner for RecordingOffcpuRunner {
                 } else {
                     b"99.000000 [0000] sh[42] 0.000 0.000 0.000\n100.000000 [0000] app[42] 10.000 2.000 1.000\n100.001000 [0001] worker[43/42] 4.000 1.000 2.000\n100.002000 [0000] unrelated[99] 500.000 0.000 1.000\n".to_vec()
                 }
-            }
-            "bpftrace" => {
-                b"@offcpu[\n    55 tokio::runtime::park+12 (/bin/app)\n    44 app::serve+7 (/bin/app)\n]: 1500\n".to_vec()
             }
             _ => Vec::new(),
         };

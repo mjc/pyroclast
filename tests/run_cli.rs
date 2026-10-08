@@ -248,16 +248,27 @@ fn blocked_and_async_profiles_choose_available_native_tracing_automatically() {
     for kind in ["offcpu", "async"] {
         let root = tempfile::tempdir().unwrap();
         let runner = WithoutPerf(RecordingRunner::default());
-        let cli = pyroclast::cli::Cli::parse_from([
-            "pyroclast",
-            kind,
-            "--out",
-            root.path().to_str().unwrap(),
-            "--",
-            "native-service",
-        ]);
+        let workload = blocked_time_fixture_workload(root.path());
+        let cli = pyroclast::cli::Cli::parse_from(
+            [
+                "pyroclast",
+                kind,
+                "--out",
+                root.path().to_str().unwrap(),
+                "--",
+            ]
+            .into_iter()
+            .chain(workload.iter().map(String::as_str)),
+        );
         pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux").unwrap();
         assert_eq!(runner.0.programs(), vec!["bpftrace", "bpftrace"]);
+        let commands = runner.0.commands();
+        assert!(!commands[0].interactive);
+        assert!(!commands[0].args.iter().any(|arg| arg == "-c"));
+        assert!(commands[1].interactive);
+        assert!(commands[1].args.iter().any(|arg| arg == "-c"));
+        assert!(commands[1].args.iter().any(|arg| arg == "-o"));
+        assert_blocked_time_fixture_artifacts(root.path(), &workload);
         let summary: serde_json::Value =
             serde_json::from_slice(&std::fs::read(root.path().join("summary.json")).unwrap())
                 .unwrap();
@@ -330,15 +341,19 @@ fn automatic_blocked_time_selection_checks_permissions_before_launching_workload
         bpftrace_available: true,
         bpftrace_permitted: true,
     };
-    let cli = pyroclast::cli::Cli::parse_from([
-        "pyroclast",
-        "offcpu",
-        "--json",
-        "--out",
-        root.path().to_str().unwrap(),
-        "--",
-        "native-service",
-    ]);
+    let workload = blocked_time_fixture_workload(root.path());
+    let cli = pyroclast::cli::Cli::parse_from(
+        [
+            "pyroclast",
+            "offcpu",
+            "--json",
+            "--out",
+            root.path().to_str().unwrap(),
+            "--",
+        ]
+        .into_iter()
+        .chain(workload.iter().map(String::as_str)),
+    );
     let output = pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux")
         .expect("use bpftrace when installed perf lacks scheduler permissions");
     let commands = runner.recording.commands();
@@ -361,11 +376,53 @@ fn automatic_blocked_time_selection_checks_permissions_before_launching_workload
     assert!(!bpftrace_probe.interactive);
     assert!(!bpftrace_probe.args.iter().any(|arg| arg == "-c"));
     assert!(commands[2].args.iter().any(|arg| arg == "-c"));
+    assert!(commands[2].args.iter().any(|arg| arg == "-o"));
+    assert_eq!(commands.len(), 3);
+    assert_blocked_time_fixture_artifacts(root.path(), &workload);
     let manifest: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
-    assert_eq!(manifest["command"], serde_json::json!(["native-service"]));
+    assert_eq!(manifest["command"], serde_json::json!(workload));
+    assert_eq!(manifest["exit_status"], 7);
     let summary: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.path().join("summary.json")).unwrap()).unwrap();
     assert_eq!(summary["method"], "bpftrace");
+}
+
+fn blocked_time_fixture_workload(root: &std::path::Path) -> Vec<String> {
+    vec![
+        "sh".into(),
+        "-c".into(),
+        "printf x >> \"$1\"; printf 'native-service stdout\\n'; printf 'native-service stderr\\n' >&2; exit 7".into(),
+        "native-service".into(),
+        root.join("workload-launches").to_string_lossy().into_owned(),
+    ]
+}
+
+fn assert_blocked_time_fixture_artifacts(root: &std::path::Path, workload: &[String]) {
+    assert_eq!(std::fs::read(root.join("workload-launches")).unwrap(), b"x");
+    assert_eq!(
+        std::fs::read_to_string(root.join("stdout.log")).unwrap(),
+        "native-service stdout\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("stderr.log")).unwrap(),
+        "native-service stderr\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("profile.raw.bpftrace")).unwrap(),
+        "@offcpu[\n    55 tokio::runtime::park+12 (/bin/app)\n    44 app::serve+7 (/bin/app)\n]: 1500\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("stacks.folded")).unwrap(),
+        "app::serve;tokio::runtime::park 1500\n"
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("run.json")).unwrap()).unwrap();
+    assert_eq!(manifest["command"], serde_json::json!(workload));
+    assert_eq!(manifest["exit_status"], 7);
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("summary.json")).unwrap()).unwrap();
+    assert_eq!(summary["total_offcpu_ns"], 1500);
+    assert_eq!(summary["workload_outcome"], "completed");
 }
 
 #[test]
@@ -1868,6 +1925,39 @@ impl pyroclast::process::CommandRunner for RecordingRunner {
                 stderr: Vec::new(),
             });
         }
+        if command.program == "bpftrace" {
+            let Some(child) = command.args.windows(2).find(|args| args[0] == "-c") else {
+                assert!(
+                    !command.interactive,
+                    "capability probes must not launch a workload"
+                );
+                return Ok(pyroclast::process::CommandOutput {
+                    status_code: Some(0),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                });
+            };
+            let recorder_output = command
+                .args
+                .windows(2)
+                .find(|args| args[0] == "-o")
+                .expect("separate recorder channel");
+            let argv: Vec<_> = child[1].split_whitespace().collect();
+            let mut launcher = command.clone();
+            launcher.program = argv[0].into();
+            launcher.args = argv[1..].iter().map(|arg| (*arg).into()).collect();
+            let output = pyroclast::process::CommandRunner::run(
+                &pyroclast::process::RealCommandRunner::default(),
+                &launcher,
+            )?;
+            assert_eq!(
+                output.status_code,
+                Some(0),
+                "supervisor status is independent of workload status"
+            );
+            std::fs::write(&recorder_output[1], b"@offcpu[\n    55 tokio::runtime::park+12 (/bin/app)\n    44 app::serve+7 (/bin/app)\n]: 1500\n")?;
+            return Ok(output);
+        }
         for (name, path) in &command.env {
             if matches!(
                 name.as_str(),
@@ -1904,9 +1994,6 @@ impl pyroclast::process::CommandRunner for RecordingRunner {
                     && command.args.get(1).map(String::as_str) == Some("timehist") =>
             {
                 b"100.000000 [0000] app[42] 10.000 2.000 1.000\n".to_vec()
-            }
-            "bpftrace" => {
-                b"@offcpu[\n    55 tokio::runtime::park+12 (/bin/app)\n    44 app::serve+7 (/bin/app)\n]: 1500\n".to_vec()
             }
             "heaptrack_print" => {
                 b"total allocations: 42\npeak heap memory consumption: 1024 bytes\n".to_vec()

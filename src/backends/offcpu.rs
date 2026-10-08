@@ -70,9 +70,16 @@ pub const OFFCPU_PID_ENV: &str = "PYROCLAST_OFFCPU_TARGET_PID";
 
 #[must_use]
 pub fn build_bpftrace_offcpu_command(profiled_command: String, duration_secs: u32) -> CommandSpec {
+    bpftrace_command(
+        profiled_command,
+        offcpu_bpftrace_program(duration_secs, false),
+    )
+}
+
+fn bpftrace_command(profiled_command: String, program: String) -> CommandSpec {
     CommandSpec::new("bpftrace")
         .arg("-e")
-        .arg(offcpu_bpftrace_program(duration_secs))
+        .arg(program)
         .arg("-c")
         .arg(profiled_command)
         .arg("--unsafe")
@@ -121,12 +128,22 @@ pub fn build_perf_cpu_clock_command(
     )
 }
 
-fn offcpu_bpftrace_program(duration_secs: u32) -> String {
+fn offcpu_bpftrace_program(duration_secs: u32, supervised: bool) -> String {
+    let (setup, target, cleanup) = if supervised {
+        (
+            "tracepoint:sched:sched_process_fork /args->parent_pid == cpid/ { @workload_pid = args->child_pid; }",
+            "@workload_pid",
+            "clear(@workload_pid);",
+        )
+    } else {
+        ("", "cpid", "")
+    };
     format!(
         r"
+{setup}
 tracepoint:sched:sched_switch
 {{
-  if (pid == cpid && args->prev_state != 0) {{
+  if (pid == {target} && args->prev_state != 0) {{
     @start[args->prev_pid] = nsecs;
     @stack[args->prev_pid] = kstack(perf);
   }}
@@ -139,6 +156,7 @@ tracepoint:sched:sched_switch
 
 interval:s:{duration_secs}
 {{
+  @duration_limited = 1;
   exit();
 }}
 
@@ -146,6 +164,7 @@ END
 {{
   clear(@start);
   clear(@stack);
+  {cleanup}
 }}
 "
     )
@@ -243,7 +262,17 @@ where
                 }
                 artifacts
             },
-            diagnostics: vec![format!("offcpu method: {}", method.summary_label())],
+            diagnostics: {
+                let mut diagnostics = vec![format!("offcpu method: {}", method.summary_label())];
+                if let Some(outcome) = run
+                    .summary_json
+                    .get("workload_outcome")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    diagnostics.push(format!("workload outcome: {outcome}"));
+                }
+                diagnostics
+            },
         };
         std::fs::write(layout.run_json(), serde_json::to_string_pretty(&manifest)?)?;
 
@@ -325,37 +354,88 @@ where
     ) -> BackendResult<OffcpuRun> {
         use std::io::Write;
 
-        // bpftrace splits -c on spaces without recognizing shell quoting.
-        // A private launcher with a whitespace-free path preserves argv and
-        // exec keeps bpftrace's cpid equal to the actual workload's PID.
-        let mut launcher = tempfile::Builder::new()
+        // bpftrace's status describes the recorder, not its -c child. A private
+        // supervisor waits once for the workload, independently of recorder I/O.
+        let private = tempfile::Builder::new()
             .prefix("pyroclast-offcpu-")
-            .tempfile_in("/tmp")?;
-        writeln!(launcher, "exec {}", shell_command(&request.command))?;
+            .tempdir_in("/tmp")?;
+        let status_path = private.path().join("status");
+        let data_path = private.path().join("recorder");
+        let launcher_path = private.path().join("launch");
+        let mut launcher = std::fs::File::create(&launcher_path)?;
+        writeln!(
+            launcher,
+            "{}",
+            bpftrace_workload_launcher(&request.command, &status_path)
+        )?;
         launcher.flush()?;
-        let profiled_command = format!("/bin/sh {}", launcher.path().display());
-        let command = build_bpftrace_offcpu_command(profiled_command, request.duration_secs);
-        let output = self.runner.run(&command)?;
+        // -c does not recognize quoting, so its path must be whitespace-free.
+        let profiled_command = format!("/bin/sh {}", launcher_path.display());
+        let command = bpftrace_command(
+            profiled_command,
+            offcpu_bpftrace_program(request.duration_secs, true),
+        )
+        .arg("-o")
+        .arg(data_path.to_string_lossy());
+        let mut output = self.runner.run(&command)?;
         if !output.succeeded_or_interrupted() {
             return offcpu_command_error("bpftrace", &output, layout);
         }
+        std::fs::write(layout.stdout_log(), &output.stdout)?;
+        std::fs::write(layout.stderr_log(), &output.stderr)?;
 
+        // -o redirects bpftrace's Output stream, not the child's file descriptors.
+        // Never collapse stdout: it belongs to the workload, even if it looks
+        // exactly like a recorder map.
+        let data = std::fs::read(&data_path)?;
         let raw_bpftrace = layout.raw_profile("bpftrace");
-        std::fs::write(&raw_bpftrace, &output.stdout)?;
-        let folded_stacks = collapse_offcpu(&String::from_utf8_lossy(&output.stdout)).join("\n");
+        std::fs::write(&raw_bpftrace, &data)?;
+        let data = String::from_utf8_lossy(&data);
+        let duration_limited = data.lines().any(|line| line == "@duration_limited: 1");
+        let status = std::fs::read_to_string(&status_path);
+        let (exit_status, outcome) = match status.as_deref().map(str::trim) {
+            Ok("stopped") if duration_limited => (None, "duration_limited"),
+            Ok("stopped") => (None, "interrupted"),
+            Ok(status) => match status.parse::<i32>() {
+                Ok(status @ 0..=255) => (Some(status), "completed"),
+                _ => {
+                    return offcpu_command_error(
+                        "invalid workload completion status",
+                        &output,
+                        layout,
+                    );
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && duration_limited => {
+                (None, "duration_limited")
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && output.status_code != Some(0) =>
+            {
+                (None, "interrupted")
+            }
+            Err(_) => {
+                return offcpu_command_error("missing workload completion status", &output, layout);
+            }
+        };
+        output.status_code = exit_status;
+        let folded_stacks = collapse_offcpu(&data).join("\n");
         let folded_stacks = if folded_stacks.is_empty() {
             String::new()
         } else {
             format!("{folded_stacks}\n")
         };
-        folded_offcpu_run(
+        let mut run = folded_offcpu_run(
             OffcpuMethod::Bpftrace,
             output,
             raw_bpftrace,
             folded_stacks,
             request.event,
             Some(request.duration_secs),
-        )
+        )?;
+        run.summary_json["workload_outcome"] = outcome.into();
+        Ok(run)
     }
 
     #[cfg(not(unix))]
@@ -427,6 +507,35 @@ fn shell_command(command: &[String]) -> String {
         .map(|argument| format!("'{}'", argument.replace('\'', "'\\''")))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(unix)]
+fn bpftrace_workload_launcher(command: &[String], status_path: &Path) -> String {
+    let status = shell_command(&[status_path.to_string_lossy().into_owned()]);
+    let workload = shell_command(command);
+    format!(
+        r#"workload=
+stop() {{
+  trap '' INT TERM
+  printf 'stopped\n' > {status}
+  workload=${{workload:-$!}}
+  if [ -n "$workload" ]; then
+    kill -TERM "$workload" 2>/dev/null
+    wait "$workload"
+  fi
+  exit 0
+}}
+trap stop INT TERM
+exec 3<&0
+(exec 0<&3 3<&-; exec {workload}) &
+workload=$!
+exec 3<&-
+wait "$workload"
+status=$?
+trap '' INT TERM
+printf '%s\n' "$status" > {status}
+"#
+    )
 }
 
 fn summarize_perf_sched_timehist(
