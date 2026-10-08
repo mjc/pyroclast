@@ -4291,6 +4291,55 @@ fn absent_sample_period_uses_event_attribute_default_like_real_perf() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn aliased_overlapping_attribute_ids_select_the_latest_event_like_native_perf() {
+    // tools/lib/perf/evlist.c:perf_evlist__id_hash inserts at the hash-list
+    // head; util/evlist.c:evlist__id2sid returns the first matching ID.
+    let mask = PERF_SAMPLE_IDENTIFIER
+        | PERF_SAMPLE_IP
+        | PERF_SAMPLE_TID
+        | PERF_SAMPLE_TIME
+        | PERF_SAMPLE_CALLCHAIN;
+    let mut attrs = [
+        file_attr_bytes_with_ids(mask, 536, [111, 222]),
+        file_attr_bytes_with_ids(mask, 544, [222, 333]),
+        file_attr_bytes_with_ids(mask, 536, [111, 222]),
+    ];
+    for (attr, period) in attrs.iter_mut().zip([37, 99, 11]) {
+        put_u64(attr, 16, period);
+    }
+    let records = [111_u64, 222, 333].map(|identifier| {
+        let mut payload = identifier.to_le_bytes().to_vec();
+        payload.extend(sample_payload_with_time(
+            0x2000,
+            11,
+            12,
+            1_000_000_000,
+            [0x2000],
+        ));
+        record_bytes_with_misc(PERF_RECORD_SAMPLE, PERF_RECORD_MISC_CPUMODE_USER, &payload)
+    });
+    let mut bytes = perfdata_with_attrs_ids_and_records(attrs, [111, 222, 333], records);
+    put_u64(&mut bytes, 16, 144);
+    let (script, expected) = native_script_and_fold(&bytes);
+    assert_eq!(expected, ":12;[unknown] 121\n", "native script={script}");
+    let options = FoldOptions {
+        count_periods: true,
+        inline: false,
+    };
+    assert_eq!(
+        fold_perfdata_callchains_with_options(&bytes, options).unwrap(),
+        expected
+    );
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), &bytes).unwrap();
+    assert_eq!(
+        fold_perfdata_file_with_options(file.path(), options).unwrap(),
+        expected
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn absent_sample_period_uses_the_selected_identifier_events_default() {
     let mask = PERF_SAMPLE_IDENTIFIER
         | PERF_SAMPLE_IP

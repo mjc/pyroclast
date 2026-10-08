@@ -1979,33 +1979,70 @@ fn sample_layouts_from_file(
         },
     )?;
 
-    let attr_ids = attrs
-        .iter()
-        .map(|attr| file_attr_ids_from_file(file, attr))
-        .collect::<Result<Vec<_>, _>>()?;
     let event_desc = event_desc_entries_from_file(file, header, header_bytes)?;
-    let event_names = build_event_names(&attrs, &attr_ids, &event_desc);
-    let event_name_width = event_names
-        .iter()
-        .map(String::len)
-        .max()
-        .unwrap_or_default();
+    sample_layouts_from_attrs(&attrs, &event_desc, |attr| {
+        file_attr_ids_from_file(file, attr)
+    })
+}
+
+fn sample_layouts_from_attrs(
+    attrs: &[PerfFileAttr],
+    event_desc: &[EventDescEntry],
+    mut load_ids: impl FnMut(&PerfFileAttr) -> Result<Vec<u64>, String>,
+) -> Result<SampleLayouts, String> {
+    let mut ranges = BTreeMap::<(u64, u64), Vec<usize>>::new();
+    for (index, attr) in attrs.iter().enumerate() {
+        ranges
+            .entry((attr.ids_offset, attr.ids_size))
+            .or_default()
+            .push(index);
+    }
     let mut layouts = SampleLayouts {
-        fallback: attrs.first().map(|attr| {
-            Arc::new(SampleEventLayout::from_attr(
-                attr,
-                event_names.first().cloned().unwrap_or_default(),
-            ))
-        }),
+        fallback: None,
         by_identifier: BTreeMap::new(),
-        event_name_width,
+        event_name_width: 0,
     };
-    for ((attr, event_name), ids) in attrs.iter().zip(event_names).zip(attr_ids) {
-        let event = Arc::new(SampleEventLayout::from_attr(attr, event_name));
+    let mut selected = BTreeMap::<u64, (usize, Arc<SampleEventLayout>)>::new();
+    for indices in ranges.values() {
+        let first = indices[0];
+        let last = *indices.last().expect("each ID range has an attribute");
+        // Read each distinct region once and release its vector before the
+        // next. Aliases must not multiply retained metadata or ID-map work.
+        let ids = load_ids(&attrs[first])?;
+        let description = event_desc
+            .iter()
+            .find(|entry| entry.ids.iter().any(|id| ids.contains(id)));
+        let mut selected_event = None;
+        for &index in indices {
+            let name = description.or_else(|| event_desc.get(index)).map_or_else(
+                || perf_event_name(&attrs[index]),
+                |entry| entry.name.clone(),
+            );
+            layouts.event_name_width = layouts.event_name_width.max(name.len());
+            if index == 0 || index == last {
+                let event = Arc::new(SampleEventLayout::from_attr(&attrs[index], name));
+                if index == 0 {
+                    layouts.fallback = Some(Arc::clone(&event));
+                }
+                if index == last {
+                    selected_event = Some(event);
+                }
+            }
+        }
+        let event = selected_event.expect("each ID range has a selected event");
         for id in ids {
-            layouts.by_identifier.insert(id, Arc::clone(&event));
+            // perf tools/lib/perf/evlist.c:perf_evlist__id_hash adds at the
+            // hash-list head; util/evlist.c:evlist__id2sid picks the latest
+            // attribute. Preserve that ordering across overlapping ranges.
+            if selected.get(&id).is_none_or(|(index, _)| *index < last) {
+                selected.insert(id, (last, Arc::clone(&event)));
+            }
         }
     }
+    layouts.by_identifier = selected
+        .into_iter()
+        .map(|(id, (_, event))| (id, event))
+        .collect();
     Ok(layouts)
 }
 
@@ -5054,34 +5091,8 @@ fn sample_layouts(
     header: crate::perfdata::header::PerfHeader,
 ) -> Result<SampleLayouts, String> {
     let attrs = parse_file_attrs(bytes, header)?;
-    let attr_ids = attrs
-        .iter()
-        .map(|attr| parse_file_attr_ids(bytes, attr))
-        .collect::<Result<Vec<_>, _>>()?;
     let event_desc = event_desc_entries_from_bytes(bytes, header)?;
-    let event_names = build_event_names(&attrs, &attr_ids, &event_desc);
-    let event_name_width = event_names
-        .iter()
-        .map(String::len)
-        .max()
-        .unwrap_or_default();
-    let mut layouts = SampleLayouts {
-        fallback: attrs.first().map(|attr| {
-            Arc::new(SampleEventLayout::from_attr(
-                attr,
-                event_names.first().cloned().unwrap_or_default(),
-            ))
-        }),
-        by_identifier: BTreeMap::new(),
-        event_name_width,
-    };
-    for ((attr, event_name), ids) in attrs.iter().zip(event_names).zip(attr_ids) {
-        let event = Arc::new(SampleEventLayout::from_attr(attr, event_name));
-        for id in ids {
-            layouts.by_identifier.insert(id, Arc::clone(&event));
-        }
-    }
-    Ok(layouts)
+    sample_layouts_from_attrs(&attrs, &event_desc, |attr| parse_file_attr_ids(bytes, attr))
 }
 
 fn layout_from_attr(attr: &PerfFileAttr) -> SampleLayout {
@@ -5185,46 +5196,6 @@ fn event_desc_name_from_bytes(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
-/// Builds the per-attr event names `perf script` would print.
-///
-/// Prefers the verbatim evsel names from `HEADER_EVENT_DESC`, matched to each
-/// attr by shared sample id (and by event index as a fallback, which is how
-/// `process_event_desc` in `tools/perf/util/header.c` pairs descriptions with
-/// evsels). Falls back to reconstructing the name from the attr type/config
-/// when no description matches.
-fn build_event_names(
-    attrs: &[PerfFileAttr],
-    attr_ids: &[Vec<u64>],
-    event_desc: &[EventDescEntry],
-) -> Vec<String> {
-    attrs
-        .iter()
-        .enumerate()
-        .map(|(index, attr)| {
-            event_desc_name_for_attr(index, attr_ids.get(index), event_desc)
-                .unwrap_or_else(|| perf_event_name(attr))
-        })
-        .collect()
-}
-
-fn event_desc_name_for_attr(
-    index: usize,
-    attr_ids: Option<&Vec<u64>>,
-    event_desc: &[EventDescEntry],
-) -> Option<String> {
-    if event_desc.is_empty() {
-        return None;
-    }
-    if let Some(ids) = attr_ids.filter(|ids| !ids.is_empty())
-        && let Some(entry) = event_desc
-            .iter()
-            .find(|entry| entry.ids.iter().any(|id| ids.contains(id)))
-    {
-        return Some(entry.name.clone());
-    }
-    event_desc.get(index).map(|entry| entry.name.clone())
-}
-
 fn hardware_event_name(config: u64) -> &'static str {
     match config & 0xffff_ffff {
         0 => "cycles",
@@ -5309,6 +5280,65 @@ mod tests {
         PerfArch, PerfUserRegs, PerfX86_64Regs, UserStackUnwindResult, UserStackUnwinder,
     };
     use crate::symbols::{ResolvedSymbolFrames, SymbolFrameCache, SymbolRequest, SymbolResolver};
+
+    fn attr_with_id_range(offset: u64, size: u64, config: u64) -> super::PerfFileAttr {
+        super::PerfFileAttr {
+            event_type: 1,
+            config,
+            sample_period: 1,
+            sample_type: super::PERF_SAMPLE_IDENTIFIER,
+            read_format: 0,
+            branch_sample_type: 0,
+            sample_regs_user: 0,
+            sample_regs_intr: 0,
+            sample_id_all: false,
+            defer_callchain: false,
+            ids_offset: offset,
+            ids_size: size,
+        }
+    }
+
+    #[test]
+    fn shared_attribute_id_ranges_are_loaded_once_without_alias_amplification() {
+        let attrs = vec![attr_with_id_range(4096, 256, 0); 512];
+        let mut reads = 0;
+        let layouts = super::sample_layouts_from_attrs(&attrs, &[], |_| {
+            reads += 1;
+            Ok((0..32).collect())
+        })
+        .unwrap();
+        assert_eq!(reads, 1, "512 aliases must not load 512 owned ID vectors");
+        assert_eq!(layouts.by_identifier.len(), 32);
+        assert_eq!(layouts.fallback.unwrap().event_name.as_ref(), "cpu-clock");
+    }
+
+    #[test]
+    fn aliased_and_overlapping_id_ranges_preserve_last_attribute_selection() {
+        let attrs = [
+            attr_with_id_range(4096, 16, 0),
+            attr_with_id_range(4104, 16, 1),
+            attr_with_id_range(4096, 16, 2),
+        ];
+        let mut reads = 0;
+        let layouts = super::sample_layouts_from_attrs(&attrs, &[], |attr| {
+            reads += 1;
+            Ok(if attr.ids_offset == 4096 {
+                vec![1, 2]
+            } else {
+                vec![2, 3]
+            })
+        })
+        .unwrap();
+        assert_eq!(reads, 2);
+        for id in [1, 2] {
+            assert_eq!(
+                layouts.by_identifier[&id].event_name.as_ref(),
+                "page-faults"
+            );
+        }
+        assert_eq!(layouts.by_identifier[&3].event_name.as_ref(), "task-clock");
+        assert_eq!(layouts.fallback.unwrap().event_name.as_ref(), "cpu-clock");
+    }
 
     #[derive(Clone)]
     struct CountingCollisionHasher(std::rc::Rc<std::cell::Cell<usize>>);
@@ -5708,9 +5738,14 @@ mod tests {
                 ids: vec![20, 21],
             },
         ];
+        let layouts =
+            super::sample_layouts_from_attrs(&[attr_with_id_range(4096, 8, 0)], &entries, |_| {
+                Ok(vec![21])
+            })
+            .unwrap();
         assert_eq!(
-            super::event_desc_name_for_attr(0, Some(&vec![21]), &entries),
-            Some("task-clock:ppp".to_string())
+            layouts.fallback.unwrap().event_name.as_ref(),
+            "task-clock:ppp"
         );
     }
 
@@ -5720,9 +5755,14 @@ mod tests {
             name: "task-clock:ppp".to_string(),
             ids: Vec::new(),
         }];
+        let layouts =
+            super::sample_layouts_from_attrs(&[attr_with_id_range(0, 0, 0)], &entries, |_| {
+                Ok(Vec::new())
+            })
+            .unwrap();
         assert_eq!(
-            super::event_desc_name_for_attr(0, None, &entries),
-            Some("task-clock:ppp".to_string())
+            layouts.fallback.unwrap().event_name.as_ref(),
+            "task-clock:ppp"
         );
     }
 
