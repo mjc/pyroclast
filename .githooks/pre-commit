@@ -4,16 +4,18 @@ set -eu
 repo="$(git rev-parse --show-toplevel)"
 cd "$repo"
 
-exec devenv shell -- sh -eu -c '
-  echo "pre-commit: rustfmt" >&2
-  cargo fmt --check
-  echo "pre-commit: clippy pedantic" >&2
-  cargo clippy --all-targets -- -D warnings -W clippy::pedantic
-  echo "pre-commit: nextest" >&2
-  cargo nextest run
-  echo "pre-commit: independent native perf parity" >&2
-  cargo build --quiet --release --bin pyroclast
-  scripts/check-perf-parity
-  echo "pre-commit: flake check" >&2
-  nix flake check --no-build
-'
+if [ "${DEVENV_ROOT:-}" != "$repo" ]; then
+  exec devenv shell -- sh "$repo/.githooks/pre-commit"
+fi
+
+echo "pre-commit: rustfmt" >&2
+cargo fmt --check
+echo "pre-commit: clippy pedantic" >&2
+cargo clippy --all-targets -- -D warnings -W clippy::pedantic
+echo "pre-commit: nextest" >&2
+cargo nextest run
+echo "pre-commit: independent native perf parity" >&2
+cargo build --quiet --release --bin pyroclast
+scripts/check-perf-parity
+echo "pre-commit: flake check" >&2
+nix flake check --no-build

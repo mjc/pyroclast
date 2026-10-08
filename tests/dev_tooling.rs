@@ -41,3 +41,18 @@ fn agents_documents_nextest_for_local_tests() {
     assert!(agents.contains("devenv shell"));
     assert!(agents.contains("cargo nextest run"));
 }
+
+#[cfg(unix)]
+#[test]
+fn precommit_uses_current_project_environment_and_preserves_required_gates() {
+    let output = std::process::Command::new("bash")
+        .arg("scripts/tests/hook-environment.sh")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}

@@ -169,7 +169,8 @@ cargo nextest run
 scripts/pyroclast-bench [<perf.data>] [--perf-script <perf.script>] [--export-perf-script <out>] [--symbols]
 ```
 
-The pre-commit hook enters `devenv shell` and runs rustfmt, Clippy pedantic,
+The pre-commit hook uses the current project environment, entering `devenv shell`
+when necessary, and runs rustfmt, Clippy pedantic,
 `cargo nextest run`, the `perf script | Inferno` parity check, and `nix flake check`.
 The parity check uses `/mnt/downloads/inferno-slow-collapse.perf.data` by default;
 set `PERF_PARITY_DATA` to select another recording.

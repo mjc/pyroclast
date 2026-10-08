@@ -53,7 +53,7 @@
   };
 
   enterShell = ''
-    git config --local core.hooksPath .githooks
+    "$DEVENV_ROOT/scripts/install-hooks"
 
     if [ "$(uname -s)" = Darwin ]; then
       if ! /usr/bin/env -u DEVELOPER_DIR /usr/bin/xcrun --find xctrace >/dev/null 2>&1; then

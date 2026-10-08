@@ -1,0 +1,6 @@
+#!/usr/bin/env sh
+set -eu
+
+if [ "$(git config --local --get core.hooksPath || true)" != .githooks ]; then
+    git config --local core.hooksPath .githooks
+fi
