@@ -60,6 +60,11 @@ pyroclast plumbing parse flamegraph diff <before.svg> <after.svg>
 ```sh
 pyroclast analyze flamegraph.svg
 pyroclast analyze flamegraph.svg --json --limit 10 --min-percent 1
+pyroclast analyze flamegraph.svg top --self --limit 30
+pyroclast analyze flamegraph.svg search planner
+pyroclast analyze flamegraph.svg syscalls
+pyroclast analyze flamegraph.svg summary
+pyroclast analyze before.svg diff after.svg --self
 ```
 
 Reports inclusive hotspots, self samples, heuristic categories and syscall coverage.
@@ -68,7 +73,10 @@ supports normal, inverted and differential SVGs. Inclusive rows overlap; categor
 rows partition all samples. Self samples refer to the deepest visible frame, not
 children hidden by rendering thresholds. Counts are raw SVG sample weights, even
 when titles use scaled units. SVGs without exact Inferno ranges are rejected.
-Use the plumbing commands above for search and before/after comparisons.
+`--json`, `--limit` and `--min-percent` work before or after the analysis mode.
+Search is a case-insensitive substring match, including small functions by
+default. Diff defaults to a 0.01 percentage-point threshold; compare equivalent
+workloads, since coverage changes are not elapsed-time speedups.
 
 ## Outputs
 

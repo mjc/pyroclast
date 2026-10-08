@@ -350,16 +350,71 @@ pub struct SummarizeArgs {
 pub struct FlamegraphReportArgs {
     pub input: PathBuf,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub json: bool,
 
     /// Maximum rows per function table.
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, global = true, default_value_t = 10)]
     pub limit: usize,
 
-    /// Minimum function coverage percentage.
-    #[arg(long, default_value_t = 1.0)]
-    pub min_percent: f64,
+    /// Minimum coverage (default: report/top/syscalls 1, search 0, diff 0.01).
+    #[arg(long, global = true, value_parser = parse_coverage_percent)]
+    pub min_percent: Option<f64>,
+
+    #[command(subcommand)]
+    pub mode: Option<FlamegraphReportCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum FlamegraphReportCommand {
+    /// Rank functions by inclusive or self coverage.
+    Top {
+        #[arg(long = "self")]
+        self_samples: bool,
+    },
+    /// Find functions by case-insensitive substring.
+    Search {
+        pattern: String,
+        #[arg(long = "self")]
+        self_samples: bool,
+    },
+    /// Show syscall frame coverage.
+    Syscalls,
+    /// Show exclusive categories.
+    Summary,
+    /// Compare matched workloads; deltas are percentage points, not speedups.
+    Diff {
+        other: PathBuf,
+        #[arg(long = "self")]
+        self_samples: bool,
+    },
+}
+
+impl FlamegraphReportCommand {
+    #[must_use]
+    pub fn uses_self_samples(&self) -> bool {
+        matches!(
+            self,
+            Self::Top { self_samples: true }
+                | Self::Search {
+                    self_samples: true,
+                    ..
+                }
+                | Self::Diff {
+                    self_samples: true,
+                    ..
+                }
+        )
+    }
+}
+
+fn parse_coverage_percent(value: &str) -> Result<f64, String> {
+    let percent = value.parse::<f64>().map_err(|error| error.to_string())?;
+    if percent.is_finite() && (0.0..=100.0).contains(&percent) {
+        Ok(percent)
+    } else {
+        Err("percentage must be finite and between 0 and 100".to_owned())
+    }
 }
 
 #[derive(Debug, Args)]
