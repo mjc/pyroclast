@@ -207,6 +207,7 @@ pub trait UserStackUnwinder {
 
 #[derive(Clone, Debug)]
 struct ReportedModule {
+    // Module identity address, not necessarily its relocation bias.
     base: u64,
     range: Range<u64>,
     memory_segments: Vec<ModuleMemorySegment>,
@@ -349,11 +350,23 @@ impl FramehopUnwinder {
         } else {
             start.saturating_sub(pgoff)
         };
-        let Some(module_range) = object_load_range(&object)
-            .map(|range| base.saturating_add(range.start)..base.saturating_add(range.end))
-        else {
+        // perf util/unwind-libdw.c:98-115 passes start-pgoff to dwfl_report_elf.
+        // elfutils 0.195 libdwfl/dwfl_report_elf.c:170-174 overrides that bias
+        // to zero for ET_EXEC/ET_CORE: their PT_LOAD/FDE addresses are absolute.
+        let fixed_elf = object.format() == object::BinaryFormat::Elf
+            && matches!(
+                object.kind(),
+                object::ObjectKind::Executable | object::ObjectKind::Core
+            );
+        let load_bias = if fixed_elf { 0 } else { base };
+        let Some(module_range) = object_load_range(&object).map(|range| {
+            load_bias.saturating_add(range.start)..load_bias.saturating_add(range.end)
+        }) else {
             return Ok(false);
         };
+        // Distinct fixed images all have zero bias, but not the same identity.
+        // Use their linked start for duplicate/conflict handling, not that bias.
+        let base = if fixed_elf { module_range.start } else { base };
         let mapping_range = start..start.saturating_add(len);
         if self
             .reported_modules
@@ -371,12 +384,12 @@ impl FramehopUnwinder {
             return Ok(false);
         }
         let section_info = explicit_module_section_info(&mapped, &object);
-        let memory_segments = module_memory_segments(&mapped, &object, base);
-        let unwind_ranges = object_unwind_ranges(&object, base);
+        let memory_segments = module_memory_segments(&mapped, &object, load_bias);
+        let unwind_ranges = object_unwind_ranges(&object, load_bias);
         let module = Module::<ModuleBytes>::new(
             path.to_string_lossy().into_owned(),
             module_range.clone(),
-            base,
+            load_bias,
             section_info,
         );
         self.arch.add_module(module);

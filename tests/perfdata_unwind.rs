@@ -1,4 +1,6 @@
 use framehop::x86_64::Reg;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use object::ObjectSymbol;
 use object::{Object, ObjectSection, ObjectSegment};
 use proptest::prelude::*;
 use pyroclast::perfdata::unwind::{
@@ -96,6 +98,145 @@ fn loads_framehop_module_from_object_mapping() {
 
     assert!(loaded);
     assert_eq!(unwinder.module_count(), 1);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn compile_fixed_cfi_elf(root: &std::path::Path, base: u64) -> std::path::PathBuf {
+    let source = root.join("fixed.S");
+    let binary = root.join(format!("fixed-{base:x}"));
+    std::fs::write(
+        &source,
+        ".text\n.globl leaf\n.type leaf,@function\nleaf:\n.cfi_startproc\n\
+         .cfi_def_cfa %rsp,8\n.cfi_offset %rip,-8\n.fill 16,1,0x90\nret\n\
+         .cfi_endproc\n.size leaf,.-leaf\n.p2align 5\n\
+         .globl caller\n.type caller,@function\ncaller:\n.cfi_startproc\n\
+         .cfi_def_cfa %rsp,8\n.cfi_undefined %rip\n.fill 16,1,0x90\nret\n\
+         .cfi_endproc\n.size caller,.-caller\n.section .note.GNU-stack,\"\",@progbits\n",
+    )
+    .expect("write CFI assembly");
+    let output = std::process::Command::new("cc")
+        .args(["-nostdlib", "-no-pie", "-Wl,-e,leaf", "-Wl,--eh-frame-hdr"])
+        .arg(format!("-Wl,-Ttext-segment=0x{base:x}"))
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .expect("compile fixed-address CFI fixture");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    binary
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn assert_fixed_cfi_mapping(unwinder: &mut FramehopUnwinder, path: &std::path::Path, cfi: bool) {
+    let bytes = std::fs::read(path).expect("read fixed ELF");
+    let object = object::File::parse(&bytes[..]).expect("parse fixed ELF");
+    assert_eq!(object.kind(), object::ObjectKind::Executable);
+    let symbol = |name| {
+        object
+            .symbols()
+            .find(|s| s.name() == Ok(name))
+            .expect("symbol")
+            .address()
+    };
+    let ip = symbol("leaf") + 1;
+    let caller = symbol("caller");
+    let segment = object
+        .segments()
+        .find(|s| s.address() <= ip && ip < s.address() + s.size())
+        .expect("executable load segment");
+    let load_start = object
+        .segments()
+        .map(|s| s.address())
+        .min()
+        .expect("PT_LOAD");
+    // perf util/unwind-libdw.c:98-115 supplies start-pgoff; elfutils 0.195
+    // libdwfl/dwfl_report_elf.c:170-174 ignores that bias for ET_EXEC/ET_CORE.
+    assert!(
+        unwinder
+            .add_object_mapping(
+                path,
+                segment.address(),
+                segment.size(),
+                segment.file_range().0
+            )
+            .expect("load fixed ELF")
+    );
+    assert!(unwinder.has_reported_module_for_ip(ip), "real IP {ip:#x}");
+    assert_eq!(unwinder.has_unwind_info_for_ip(ip), cfi);
+    assert!(!unwinder.has_reported_module_for_ip(load_start + ip));
+    assert!(!unwinder.has_unwind_info_for_ip(load_start + ip));
+    let sp = 0x7000_0000;
+    let regs = PerfUserRegs::X86_64(PerfX86_64Regs {
+        ip,
+        sp,
+        bp: 0,
+        registers: registers_with_bp_sp(0, sp),
+    });
+    let mut stack = vec![0; 64];
+    stack[..8].copy_from_slice(&(caller + 1).to_le_bytes());
+    assert_eq!(
+        unwinder.unwind_stack(regs, &stack, 8),
+        if cfi { vec![ip, caller] } else { vec![ip] }
+    );
+    let (offset, size) = segment.file_range();
+    assert!(size >= 8);
+    let offset = usize::try_from(offset).expect("file offset");
+    assert_eq!(
+        unwinder.read_process_u64(segment.address()),
+        Some(u64::from_le_bytes(
+            bytes[offset..offset + 8].try_into().expect("mapped word")
+        ))
+    );
+    assert!(
+        !unwinder
+            .add_object_mapping(path, load_start, 0x10000, 0)
+            .expect("same ELF whole-object mapping")
+    );
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn fixed_elf_cfi_uses_linked_addresses_not_doubled_mapping_base() {
+    let root = tempfile::tempdir().expect("fixture directory");
+    let binary = compile_fixed_cfi_elf(root.path(), 0x0040_0000);
+    assert_fixed_cfi_mapping(&mut FramehopUnwinder::new(), &binary, true);
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn fixed_elf_without_cfi_cannot_unwind_with_zero_frame_pointer() {
+    let root = tempfile::tempdir().expect("fixture directory");
+    let binary = compile_fixed_cfi_elf(root.path(), 0x0040_0000);
+    let output = std::process::Command::new("objcopy")
+        .args([
+            "--remove-section=.eh_frame",
+            "--remove-section=.eh_frame_hdr",
+        ])
+        .arg(&binary)
+        .output()
+        .expect("strip CFI");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_fixed_cfi_mapping(&mut FramehopUnwinder::new(), &binary, false);
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn fixed_elf_distinct_images_do_not_share_zero_bias_identity() {
+    let root = tempfile::tempdir().expect("fixture directory");
+    let first = compile_fixed_cfi_elf(root.path(), 0x0040_0000);
+    let second = compile_fixed_cfi_elf(root.path(), 0x0060_0000);
+    let mut unwinder = FramehopUnwinder::new();
+    assert_fixed_cfi_mapping(&mut unwinder, &first, true);
+    assert_fixed_cfi_mapping(&mut unwinder, &second, true);
+    assert_eq!(unwinder.module_count(), 2);
 }
 
 #[test]
