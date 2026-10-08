@@ -10,6 +10,9 @@ set -euo pipefail
 ORACLE_OUT="${ORACLE_OUT:-/oracle-out}"
 REPO="${REPO:-/work}"
 export CARGO_TARGET_DIR="$ORACLE_OUT/target"
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/oracle/perf-env.sh
+source "$here/perf-env.sh"
 
 # The recorded perf.data references the workload at /tmp/oracle-workload (by
 # path) and the system DSOs that existed at record time. In a fresh compare
@@ -53,7 +56,7 @@ for name in ${ORACLE_NAMES:-fp dwarf}; do
         timeout 600 "$REPO/scripts/check-perf-parity" "$recording" \
         | tee "$ORACLE_OUT/$name.parity.txt"
     for mode in inline no-inline; do
-        perf script --force "--$mode" -i "$recording" > "$ORACLE_OUT/$name.$mode.perf.script"
+        "$PERF_BIN" script --force "--$mode" -i "$recording" > "$ORACLE_OUT/$name.$mode.perf.script"
         timeout 600 "$CARGO_TARGET_DIR/release/examples/pyroclast-bench" \
             "$recording" --perf-script "$ORACLE_OUT/$name.$mode.perf.script" \
             --symbols "--$mode" | tee "$ORACLE_OUT/$name.$mode.bench.txt"

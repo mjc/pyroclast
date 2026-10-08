@@ -10,14 +10,10 @@ ORACLE_OUT="${ORACLE_OUT:-/oracle-out}"
 REPO="${REPO:-/work}"
 
 mkdir -p "$ORACLE_OUT"
-# Ubuntu's /usr/bin/perf wrapper insists on a kernel-matched build; call the
-# packaged binary directly since any modern perf works for the oracle.
-if ! perf version >/dev/null 2>&1; then
-    PERF_BIN="$(find /usr/lib/linux-tools* -name perf -type f 2>/dev/null | head -n 1)"
-    [ -n "$PERF_BIN" ] || { echo "no perf binary found" >&2; exit 1; }
-    perf() { "$PERF_BIN" "$@"; }
-fi
-perf version | tee "$ORACLE_OUT/perf.version"
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/oracle/perf-env.sh
+source "$here/perf-env.sh"
+"$PERF_BIN" version | tee "$ORACLE_OUT/perf.version"
 
 rustc -O -Cdebuginfo=2 -o /tmp/oracle-workload "$REPO/scripts/oracle/workload.rs"
 
@@ -36,8 +32,8 @@ sysctl -w kernel.kptr_restrict=0 >/dev/null
 record() {
     local name="$1"
     shift
-    perf record -o "$ORACLE_OUT/$name.perf.data" "$@" -- /tmp/oracle-workload >/dev/null
-    perf script -i "$ORACLE_OUT/$name.perf.data" > "$ORACLE_OUT/$name.perf.script"
+    "$PERF_BIN" record -o "$ORACLE_OUT/$name.perf.data" "$@" -- /tmp/oracle-workload >/dev/null
+    "$PERF_BIN" script -i "$ORACLE_OUT/$name.perf.data" > "$ORACLE_OUT/$name.perf.script"
     inferno-collapse-perf "$ORACLE_OUT/$name.perf.script" > "$ORACLE_OUT/$name.inferno.folded"
 }
 

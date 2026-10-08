@@ -6,9 +6,10 @@ export LC_ALL=C
 
 recording=${1:-${PERF_PARITY_DATA:-/mnt/downloads/inferno-slow-collapse.perf.data}}
 pyroclast=${PYROCLAST_BIN:-${CARGO_TARGET_DIR:-target}/release/pyroclast}
+perf=${PERF_BIN:-perf}
 [ -f "$recording" ] || { echo "missing native parity recording: $recording" >&2; exit 1; }
 [ -x "$pyroclast" ] || { echo "missing release binary: $pyroclast (run cargo build --release --bin pyroclast)" >&2; exit 1; }
-for tool in perf inferno-collapse-perf inferno-flamegraph diff sort; do
+for tool in "$perf" inferno-collapse-perf inferno-flamegraph diff sort; do
     command -v "$tool" >/dev/null || { echo "missing parity tool: $tool" >&2; exit 1; }
 done
 
@@ -28,7 +29,7 @@ compare() {
 }
 for mode in inline no-inline; do
     mkdir -p "$scratch/$mode"
-    perf script --force "--$mode" -i "$recording" > "$scratch/$mode/native.script"
+    "$perf" script --force "--$mode" -i "$recording" > "$scratch/$mode/native.script"
     inferno-collapse-perf "$scratch/$mode/native.script" | sort > "$scratch/$mode/native.folded"
     [ -s "$scratch/$mode/native.folded" ] || { echo "native perf oracle produced no stacks ($mode)" >&2; exit 1; }
     inferno-flamegraph --title 'Native perf parity' - < "$scratch/$mode/native.folded" > "$scratch/$mode/native.svg"

@@ -6,5 +6,7 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/oracle/perf-env.sh
+source "$here/perf-env.sh"
 bash "$here/record-in-container.sh"
 bash "$here/compare-in-container.sh"
