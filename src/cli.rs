@@ -6,7 +6,7 @@ use std::path::PathBuf;
 pub use crate::symbols::SymbolizerKind;
 
 #[derive(Debug, Parser)]
-#[command(name = "pyroclast")]
+#[command(name = "pyroclast", version)]
 #[command(about = "Profile any application with the appropriate native OS tools")]
 pub struct Cli {
     #[command(subcommand)]

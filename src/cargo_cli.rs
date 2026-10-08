@@ -12,7 +12,7 @@ use crate::cli::{
 use crate::process::{CommandRunner, CommandSpec};
 
 #[derive(Debug, Clone, Parser)]
-#[command(bin_name = "cargo")]
+#[command(bin_name = "cargo", version, propagate_version = true)]
 pub struct CargoCli {
     #[command(subcommand)]
     pub command: CargoCommand,
@@ -825,6 +825,11 @@ mod tests {
             "cargo-pyroclast",
             "pyroclast",
             "cpu",
+            "--out",
+            root.path()
+                .join("profile-run")
+                .to_str()
+                .expect("utf8 output"),
             "--manifest-path",
             manifest_path.to_str().expect("utf8 path"),
             "--",
@@ -880,6 +885,11 @@ mod tests {
             "cargo-pyroclast",
             "pyroclast",
             "cpu",
+            "--out",
+            root.path()
+                .join("profile-run")
+                .to_str()
+                .expect("utf8 output"),
             "--manifest-path",
             manifest_path.to_str().expect("utf8 path"),
         ]));
@@ -891,6 +901,7 @@ mod tests {
             .expect("profile invocation");
 
         assert_eq!(invocation.command, vec![executable.display().to_string()]);
+        assert_eq!(invocation.out, Some(root.path().join("profile-run")));
     }
 
     #[test]
@@ -910,6 +921,11 @@ mod tests {
         let cli = CargoCli::parse_from(normalize_cargo_args([
             "cargo-pyroclast",
             "cpu",
+            "--out",
+            root.path()
+                .join("profile-run")
+                .to_str()
+                .expect("utf8 output"),
             "--manifest-path",
             manifest_path.to_str().expect("utf8 path"),
         ]));
@@ -969,6 +985,11 @@ mod tests {
         let cli = CargoCli::parse_from(normalize_cargo_args([
             "cargo-pyroclast",
             "cpu",
+            "--out",
+            root.path()
+                .join("profile-run")
+                .to_str()
+                .expect("utf8 output"),
             "--manifest-path",
             manifest_path.to_str().expect("utf8 path"),
             "--profile",
@@ -1009,6 +1030,11 @@ mod tests {
         let cli = CargoCli::parse_from(normalize_cargo_args([
             "cargo-pyroclast",
             "cpu",
+            "--out",
+            root.path()
+                .join("profile-run")
+                .to_str()
+                .expect("utf8 output"),
             "--manifest-path",
             manifest_path.to_str().expect("utf8 path"),
             "--example",
@@ -1062,6 +1088,11 @@ mod tests {
         let cli = CargoCli::parse_from(normalize_cargo_args([
             "cargo-pyroclast",
             "cpu",
+            "--out",
+            root.path()
+                .join("profile-run")
+                .to_str()
+                .expect("utf8 output"),
             "--manifest-path",
             manifest_path.to_str().expect("utf8 path"),
         ]));
@@ -1086,6 +1117,11 @@ mod tests {
         let cli = CargoCli::parse_from(normalize_cargo_args([
             "cargo-pyroclast",
             "cpu",
+            "--out",
+            root.path()
+                .join("profile-run")
+                .to_str()
+                .expect("utf8 output"),
             "--manifest-path",
             manifest_path.to_str().expect("utf8 path"),
         ]));
@@ -1114,6 +1150,11 @@ mod tests {
         let cli = CargoCli::parse_from(normalize_cargo_args([
             "cargo-pyroclast",
             "cpu",
+            "--out",
+            root.path()
+                .join("profile-run")
+                .to_str()
+                .expect("utf8 output"),
             "--manifest-path",
             manifest_path.to_str().expect("utf8 path"),
         ]));

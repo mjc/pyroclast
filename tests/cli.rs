@@ -1,6 +1,79 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+
+#[test]
+fn version_flags_report_package_version() {
+    for flag in ["--version", "-V"] {
+        let error = Cli::try_parse_from(["pyroclast", flag]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(
+            error.to_string(),
+            concat!("pyroclast ", env!("CARGO_PKG_VERSION"), "\n")
+        );
+        for args in [
+            vec!["cargo-pyroclast", flag],
+            vec!["cargo-pyroclast", "pyroclast", flag],
+        ] {
+            let error = pyroclast::cargo_cli::CargoCli::try_parse_from(
+                pyroclast::cargo_cli::normalize_cargo_args(args),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+            assert!(error.to_string().contains(env!("CARGO_PKG_VERSION")));
+        }
+    }
+}
+
+#[test]
+fn installed_binary_version_flags_report_package_version() {
+    for flag in ["--version", "-V"] {
+        for (binary, prefix) in [
+            (env!("CARGO_BIN_EXE_pyroclast"), vec![]),
+            (env!("CARGO_BIN_EXE_cargo-pyroclast"), vec![]),
+            (env!("CARGO_BIN_EXE_cargo-pyroclast"), vec!["pyroclast"]),
+        ] {
+            let output = std::process::Command::new(binary)
+                .args(prefix)
+                .arg(flag)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{binary} {flag}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.stderr.is_empty());
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(stdout.contains("pyroclast"));
+            assert!(stdout.contains(env!("CARGO_PKG_VERSION")));
+        }
+        let binary_dir = std::path::Path::new(env!("CARGO_BIN_EXE_cargo-pyroclast"))
+            .parent()
+            .unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(binary_dir.to_path_buf())
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let output = std::process::Command::new(env!("CARGO"))
+            .env("PATH", path)
+            .args(["pyroclast", flag])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cargo pyroclast {flag}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .contains(env!("CARGO_PKG_VERSION"))
+        );
+    }
+}
 use proptest::prelude::*;
 use proptest::string::string_regex;
 use pyroclast::cli::{
