@@ -752,6 +752,7 @@ dependencies = [
  "memmap2",
  "object",
  "proptest",
+ "quick-xml",
  "rustc-hash",
  "serde",
  "serde_json",

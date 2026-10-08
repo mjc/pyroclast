@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io;
 
+use quick_xml::Reader;
+use quick_xml::events::{BytesStart, Event};
 use serde::Serialize;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -22,23 +25,112 @@ pub struct FlamegraphDelta {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct FlamegraphCategory {
     pub name: String,
+    pub samples: u64,
     pub percent: f64,
 }
 
-#[must_use]
-pub fn parse_flamegraph_entries(svg: &str) -> Vec<FlamegraphEntry> {
-    let mut entries = svg
-        .split("<title>")
-        .filter_map(|chunk| chunk.find("</title>").map(|end| &chunk[..end]))
-        .filter_map(parse_title)
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct FlamegraphProfile {
+    pub total_samples: u64,
+    pub inclusive: Vec<FlamegraphEntry>,
+    pub self_samples: Vec<FlamegraphEntry>,
+    pub categories: Vec<FlamegraphCategory>,
+    pub syscalls: Vec<FlamegraphEntry>,
+    pub any_syscall_samples: u64,
+}
+
+struct Frame {
+    name: String,
+    start: u64,
+    end: u64,
+    y: f64,
+}
+
+#[derive(Default)]
+struct Container {
+    frame: bool,
+    title: Option<String>,
+}
+
+/// Analyzes Inferno's exact sample ranges, not rounded title percentages.
+///
+/// Self samples mean deepest *visible* frames: frames hidden by the renderer's
+/// minimum width cannot be recovered from an SVG.
+///
+/// # Errors
+///
+/// Rejects malformed XML, missing sample geometry and invalid sample ranges.
+pub fn parse_flamegraph(svg: &str) -> io::Result<FlamegraphProfile> {
+    let (mut frames, declared_total) = read_frames(svg)?;
+    let root_index = frames
+        .iter()
+        .position(|frame| {
+            frame.name == "all"
+                && frame.start == 0
+                && declared_total.is_none_or(|total| frame.end == total)
+        })
+        .ok_or_else(|| invalid_data("missing Inferno aggregate frame and sample ranges"))?;
+    let root = frames.remove(root_index);
+    let total_samples = declared_total.unwrap_or(root.end);
+    if total_samples == 0 || frames.iter().any(|frame| frame.end > total_samples) {
+        return Err(invalid_data(
+            "empty flamegraph or frame outside total_samples",
+        ));
+    }
+    // inferno/src/flamegraph/mod.rs:568,577-588,899-912: raw total_samples,
+    // direction-dependent y, and exact fg:x/fg:w (titles can be scaled).
+    let inverted = frames.iter().any(|frame| frame.y > root.y);
+    if inverted && frames.iter().any(|frame| frame.y < root.y) {
+        return Err(invalid_data("aggregate frame is not at the stack root"));
+    }
+    let mut by_name = BTreeMap::<&str, Vec<(u64, u64)>>::new();
+    let mut syscalls = BTreeMap::<&str, Vec<(u64, u64)>>::new();
+    let mut syscall_ranges = Vec::new();
+    for frame in &frames {
+        by_name
+            .entry(&frame.name)
+            .or_default()
+            .push((frame.start, frame.end));
+        if let Some(name) = syscall_name(&frame.name) {
+            syscalls
+                .entry(name)
+                .or_default()
+                .push((frame.start, frame.end));
+            syscall_ranges.push((frame.start, frame.end));
+        }
+    }
+    let inclusive = range_entries(by_name, total_samples);
+    let syscalls = range_entries(syscalls, total_samples);
+    let any_syscall_samples = covered_samples(&mut syscall_ranges);
+    let self_counts = deepest_samples(&frames, total_samples, inverted);
+    let mut categories = BTreeMap::<&str, u64>::new();
+    for (name, samples) in &self_counts {
+        *categories
+            .entry(categorize_flamegraph_frame(name))
+            .or_default() += samples;
+    }
+    let mut categories = categories
+        .into_iter()
+        .map(|(name, samples)| FlamegraphCategory {
+            name: name.to_owned(),
+            samples,
+            percent: percentage(samples, total_samples),
+        })
         .collect::<Vec<_>>();
-    entries.sort_by(|left, right| {
+    categories.sort_by(|left, right| {
         right
-            .percent
-            .total_cmp(&left.percent)
+            .samples
+            .cmp(&left.samples)
             .then_with(|| left.name.cmp(&right.name))
     });
-    entries
+    Ok(FlamegraphProfile {
+        total_samples,
+        inclusive,
+        self_samples: count_entries(self_counts, total_samples),
+        categories,
+        syscalls,
+        any_syscall_samples,
+    })
 }
 
 #[must_use]
@@ -70,49 +162,6 @@ pub fn search_entries(entries: &[FlamegraphEntry], pattern: &str) -> Vec<Flamegr
         .filter(|entry| entry.name.to_lowercase().contains(&pattern))
         .cloned()
         .collect()
-}
-
-#[must_use]
-pub fn syscall_breakdown(entries: &[FlamegraphEntry]) -> Vec<FlamegraphEntry> {
-    entries
-        .iter()
-        .filter_map(|entry| {
-            let name = entry
-                .name
-                .strip_prefix("__x64_sys_")
-                .or_else(|| entry.name.strip_prefix("__x86_sys_"))?;
-            Some(FlamegraphEntry {
-                name: name.to_string(),
-                samples: entry.samples,
-                percent: entry.percent,
-            })
-        })
-        .collect()
-}
-
-#[must_use]
-pub fn category_summary(entries: &[FlamegraphEntry]) -> Vec<FlamegraphCategory> {
-    let mut categories = BTreeMap::<&'static str, f64>::new();
-    for entry in entries {
-        *categories
-            .entry(categorize_flamegraph_frame(&entry.name))
-            .or_default() += entry.percent;
-    }
-
-    let mut categories = categories
-        .into_iter()
-        .map(|(name, percent)| FlamegraphCategory {
-            name: name.to_string(),
-            percent,
-        })
-        .collect::<Vec<_>>();
-    categories.sort_by(|left, right| {
-        right
-            .percent
-            .total_cmp(&left.percent)
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    categories
 }
 
 #[must_use]
@@ -228,8 +277,7 @@ pub fn categorize_flamegraph_frame(name: &str) -> &'static str {
         || lower.contains("jemalloc")
     {
         "Memory"
-    } else if name.starts_with("__x64_sys_")
-        || name.starts_with("__x86_sys_")
+    } else if syscall_name(name).is_some()
         || name.starts_with("syscall")
         || name.starts_with("do_syscall")
         || name.starts_with("entry_SYSCALL")
@@ -240,25 +288,210 @@ pub fn categorize_flamegraph_frame(name: &str) -> &'static str {
     }
 }
 
-fn parse_title(title: &str) -> Option<FlamegraphEntry> {
-    let paren_start = title.rfind('(')?;
-    let name = title[..paren_start].trim();
-    if name.is_empty() || name == "all" {
-        return None;
+fn read_frames(svg: &str) -> io::Result<(Vec<Frame>, Option<u64>)> {
+    let mut reader = Reader::from_str(svg);
+    let mut containers = Vec::<Container>::new();
+    let mut frames = Vec::new();
+    let mut total = None;
+    loop {
+        match reader.read_event().map_err(invalid_data)? {
+            Event::Start(element) if element.name().as_ref() == b"title" => {
+                let text = reader.read_text(element.name()).map_err(invalid_data)?;
+                let text = quick_xml::escape::unescape(&text).map_err(invalid_data)?;
+                if let Some(container) = containers.last_mut().filter(|container| container.frame)
+                    && let Some((name, metadata)) = text.rsplit_once(" (")
+                    && !name.is_empty()
+                    && metadata.ends_with(')')
+                    && metadata.contains('%')
+                {
+                    container.title = Some(name.to_owned());
+                }
+            }
+            event @ (Event::Start(_) | Event::Empty(_)) => {
+                let empty = matches!(event, Event::Empty(_));
+                let (Event::Start(element) | Event::Empty(element)) = event else {
+                    unreachable!()
+                };
+                if element.name().as_ref() == b"svg"
+                    && let Some(value) = attribute(&element, b"total_samples")?
+                {
+                    let value = value.parse().map_err(invalid_data)?;
+                    if total.replace(value).is_some() {
+                        return Err(invalid_data("multiple flamegraphs in one SVG"));
+                    }
+                }
+                if element.name().as_ref() == b"rect"
+                    && let Some(name) = containers
+                        .last_mut()
+                        .and_then(|container| container.title.take())
+                {
+                    let start = required_attribute(&element, b"fg:x")?
+                        .parse::<u64>()
+                        .map_err(invalid_data)?;
+                    let width = required_attribute(&element, b"fg:w")?
+                        .parse::<u64>()
+                        .map_err(invalid_data)?;
+                    let y = required_attribute(&element, b"y")?
+                        .parse::<f64>()
+                        .map_err(invalid_data)?;
+                    if !y.is_finite() {
+                        return Err(invalid_data("invalid frame y coordinate"));
+                    }
+                    let end = start
+                        .checked_add(width)
+                        .ok_or_else(|| invalid_data("sample range overflow"))?;
+                    frames.push(Frame {
+                        name,
+                        start,
+                        end,
+                        y,
+                    });
+                }
+                // Empty elements have no corresponding End event.
+                if !empty {
+                    containers.push(Container {
+                        frame: matches!(element.name().as_ref(), b"g" | b"a"),
+                        title: None,
+                    });
+                }
+            }
+            Event::End(_) => {
+                let container = containers
+                    .pop()
+                    .ok_or_else(|| invalid_data("unmatched XML end tag"))?;
+                if container.title.is_some() {
+                    return Err(invalid_data("flamegraph frame has no rectangle"));
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
     }
+    if !containers.is_empty() {
+        return Err(invalid_data("truncated SVG"));
+    }
+    Ok((frames, total))
+}
 
-    let meta = &title[paren_start + 1..];
-    let samples_end = meta.find(" samples")?;
-    let samples = meta[..samples_end].replace(',', "").parse().ok()?;
-    let percent_start = meta.rfind(", ")? + 2;
-    let percent_end = meta.rfind('%')?;
-    let percent = meta[percent_start..percent_end].parse().ok()?;
+fn attribute(element: &BytesStart<'_>, name: &[u8]) -> io::Result<Option<String>> {
+    element
+        .try_get_attribute(name)
+        .map_err(invalid_data)?
+        .map(|attribute| {
+            attribute
+                .unescape_value()
+                .map(std::borrow::Cow::into_owned)
+                .map_err(invalid_data)
+        })
+        .transpose()
+}
 
-    Some(FlamegraphEntry {
-        name: name.to_string(),
-        samples,
-        percent,
+fn required_attribute(element: &BytesStart<'_>, name: &[u8]) -> io::Result<String> {
+    attribute(element, name)?.ok_or_else(|| {
+        invalid_data(format!(
+            "missing {}: exact Inferno sample ranges are required",
+            String::from_utf8_lossy(name)
+        ))
     })
+}
+
+fn invalid_data(error: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+
+fn percentage(samples: u64, total: u64) -> f64 {
+    count_as_f64(samples) / count_as_f64(total) * 100.0
+}
+
+fn count_as_f64(value: u64) -> f64 {
+    let high = u32::try_from(value >> 32).expect("upper 32 bits");
+    let low = u32::try_from(value & u64::from(u32::MAX)).expect("lower 32 bits");
+    f64::from(high).mul_add(4_294_967_296.0, f64::from(low))
+}
+
+fn covered_samples(ranges: &mut [(u64, u64)]) -> u64 {
+    ranges.sort_unstable();
+    let (mut covered, mut previous_end) = (0, 0);
+    for &(start, end) in ranges.iter() {
+        covered += end.saturating_sub(start.max(previous_end));
+        previous_end = previous_end.max(end);
+    }
+    covered
+}
+
+fn range_entries(ranges: BTreeMap<&str, Vec<(u64, u64)>>, total: u64) -> Vec<FlamegraphEntry> {
+    count_entries(
+        ranges
+            .into_iter()
+            .map(|(name, mut ranges)| (name, covered_samples(&mut ranges)))
+            .collect(),
+        total,
+    )
+}
+
+fn count_entries(counts: BTreeMap<&str, u64>, total: u64) -> Vec<FlamegraphEntry> {
+    let mut entries = counts
+        .into_iter()
+        .filter(|(_, samples)| *samples > 0)
+        .map(|(name, samples)| FlamegraphEntry {
+            name: name.to_owned(),
+            samples,
+            percent: percentage(samples, total),
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        right
+            .samples
+            .cmp(&left.samples)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    entries
+}
+
+fn deepest_samples(frames: &[Frame], total: u64, inverted: bool) -> BTreeMap<&str, u64> {
+    let mut order = (0..frames.len()).collect::<Vec<_>>();
+    order.sort_by(|&left, &right| {
+        let order = frames[left].y.total_cmp(&frames[right].y);
+        if inverted { order } else { order.reverse() }
+    });
+    let mut events = Vec::with_capacity(frames.len() * 2);
+    for (depth, &index) in order.iter().enumerate() {
+        let frame = &frames[index];
+        if frame.start < frame.end {
+            events.push((frame.start, true, depth));
+            events.push((frame.end, false, depth));
+        }
+    }
+    events.sort_unstable();
+    let mut active = BTreeSet::<usize>::new();
+    let mut counts = BTreeMap::new();
+    let mut previous = 0;
+    // At equal positions, ends precede starts. Each interval is charged once
+    // to the deepest visible frame, including gaps as [unattributed].
+    for (position, start, depth) in events {
+        if position > previous {
+            let name = active.last().map_or("[unattributed]", |depth| {
+                frames[order[*depth]].name.as_str()
+            });
+            *counts.entry(name).or_default() += position - previous;
+            previous = position;
+        }
+        if start {
+            active.insert(depth);
+        } else {
+            active.remove(&depth);
+        }
+    }
+    if previous < total {
+        *counts.entry("[unattributed]").or_default() += total - previous;
+    }
+    counts
+}
+
+fn syscall_name(name: &str) -> Option<&str> {
+    ["__x64_sys_", "__x86_sys_", "__ia32_sys_", "__arm64_sys_"]
+        .iter()
+        .find_map(|prefix| name.strip_prefix(prefix))
 }
 
 fn entries_by_name(entries: &[FlamegraphEntry]) -> BTreeMap<&str, &FlamegraphEntry> {

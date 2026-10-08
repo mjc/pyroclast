@@ -1025,13 +1025,13 @@ fn analyze_flamegraph_command_emits_json_summary() {
     let svg = root.path().join("flamegraph.svg");
     std::fs::write(
         &svg,
-        r"
-<svg>
-  <title>all (100 samples, 100%)</title>
-  <title>tokio::runtime::park (40 samples, 40.00%)</title>
-  <title>zfs_read (30 samples, 30.00%)</title>
+        r#"
+<svg total_samples="100">
+  <g><title>all (100 samples, 100%)</title><rect fg:x="0" fg:w="100" y="96"/></g>
+  <g><title>tokio::runtime::park (40 samples, 40.00%)</title><rect fg:x="0" fg:w="40" y="80"/></g>
+  <g><title>zfs_read (30 samples, 30.00%)</title><rect fg:x="40" fg:w="30" y="80"/></g>
 </svg>
-",
+"#,
     )
     .expect("svg");
 
@@ -1051,6 +1051,8 @@ fn analyze_flamegraph_command_emits_json_summary() {
     assert_eq!(json[0]["percent"], 40.0);
     assert_eq!(json[1]["name"], "Disk I/O");
     assert_eq!(json[1]["percent"], 30.0);
+    assert_eq!(json[2]["name"], "Other");
+    assert_eq!(json[2]["percent"], 30.0);
 }
 
 #[test]
@@ -1060,12 +1062,16 @@ fn analyze_flamegraph_command_emits_text_diff() {
     let after = root.path().join("after.svg");
     std::fs::write(
         &before,
-        r"<title>parse (80 samples, 80.00%)</title><title>read (20 samples, 20.00%)</title>",
+        r#"<svg total_samples="100"><g><title>all (100 samples, 100%)</title><rect fg:x="0" fg:w="100" y="96"/></g>
+        <g><title>parse (80 samples, 80.00%)</title><rect fg:x="0" fg:w="80" y="80"/></g>
+        <g><title>read (20 samples, 20.00%)</title><rect fg:x="80" fg:w="20" y="80"/></g></svg>"#,
     )
     .expect("before");
     std::fs::write(
         &after,
-        r"<title>parse (50 samples, 50.00%)</title><title>write (50 samples, 50.00%)</title>",
+        r#"<svg total_samples="100"><g><title>all (100 samples, 100%)</title><rect fg:x="0" fg:w="100" y="96"/></g>
+        <g><title>parse (50 samples, 50.00%)</title><rect fg:x="0" fg:w="50" y="80"/></g>
+        <g><title>write (50 samples, 50.00%)</title><rect fg:x="50" fg:w="50" y="80"/></g></svg>"#,
     )
     .expect("after");
 

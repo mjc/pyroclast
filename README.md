@@ -55,6 +55,21 @@ pyroclast plumbing parse flamegraph syscalls <flamegraph.svg>
 pyroclast plumbing parse flamegraph diff <before.svg> <after.svg>
 ```
 
+## Flamegraph Analysis
+
+```sh
+pyroclast analyze flamegraph.svg
+pyroclast analyze flamegraph.svg --json --limit 10 --min-percent 1
+```
+
+Reports inclusive hotspots, self samples, heuristic categories and syscall coverage.
+Uses Inferno's exact sample ranges, unions recursive/repeated function frames, and
+supports normal, inverted and differential SVGs. Inclusive rows overlap; category
+rows partition all samples. Self samples refer to the deepest visible frame, not
+children hidden by rendering thresholds. Counts are raw SVG sample weights, even
+when titles use scaled units. SVGs without exact Inferno ranges are rejected.
+Use the plumbing commands above for search and before/after comparisons.
+
 ## Outputs
 
 Profile runs write a Pyroclast artifact directory containing the command, stdout/stderr logs,

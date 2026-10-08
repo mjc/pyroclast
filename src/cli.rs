@@ -35,6 +35,8 @@ pub enum CliCommand {
     Latency(RunArgs),
     Async(RunArgs),
     Profile(ProfileArgs),
+    /// Report hotspots and category coverage from an Inferno flamegraph SVG.
+    Analyze(FlamegraphReportArgs),
     Plumbing {
         #[command(subcommand)]
         command: PlumbingCommand,
@@ -212,7 +214,7 @@ impl CliCommand {
                 duration_secs: args.duration_secs,
                 command: args.command.clone(),
             }),
-            Self::Plumbing { .. } => None,
+            Self::Plumbing { .. } | Self::Analyze(_) => None,
         }
     }
 }
@@ -342,6 +344,22 @@ pub struct SummarizeArgs {
     pub json: bool,
 
     pub artifact_dir: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct FlamegraphReportArgs {
+    pub input: PathBuf,
+
+    #[arg(long)]
+    pub json: bool,
+
+    /// Maximum rows per function table.
+    #[arg(long, default_value_t = 10)]
+    pub limit: usize,
+
+    /// Minimum function coverage percentage.
+    #[arg(long, default_value_t = 1.0)]
+    pub min_percent: f64,
 }
 
 #[derive(Debug, Args)]
