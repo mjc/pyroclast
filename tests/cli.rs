@@ -44,6 +44,7 @@ fn run_args_for_property(
     command: Vec<String>,
 ) -> RunArgs {
     RunArgs {
+        offcpu_method: None,
         out: Some(PathBuf::from("runs/out")),
         name: Some("named-run".to_string()),
         json: true,
@@ -558,6 +559,7 @@ proptest! {
         let event = perf_event_from_case(perf_event_case);
         let call_graph = perf_call_graph_from_case(call_graph_case);
         let cli_command = CliCommand::Profile(ProfileArgs {
+            offcpu_method: None,
             kind,
             out: Some(PathBuf::from("runs/out")),
             name: Some("named-run".to_string()),

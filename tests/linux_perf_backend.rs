@@ -49,9 +49,9 @@ fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["perf", "inferno-flamegraph"]
+        vec!["perf"]
     );
-    assert_eq!(runner.programs(), vec!["perf", "inferno-flamegraph"]);
+    assert_eq!(runner.programs(), vec!["perf"]);
     assert_eq!(runner.perf_frequency(), Some("199".to_string()));
     assert_eq!(runner.perf_call_graph(), Some("dwarf,64000".to_string()));
     assert!(result.layout.raw_profile("perf.data").is_file());
@@ -63,10 +63,9 @@ fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
         std::fs::read_to_string(result.layout.stacks_folded()).expect("stacks folded"),
         "app;[app] 1\n"
     );
-    assert_eq!(
-        std::fs::read_to_string(result.layout.flamegraph_svg()).expect("flamegraph svg"),
-        "<svg></svg>\n"
-    );
+    let svg = std::fs::read_to_string(result.layout.flamegraph_svg()).expect("flamegraph svg");
+    assert!(svg.contains("<svg"));
+    assert!(svg.contains("app"));
     let summary_json: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(result.layout.summary_json()).expect("summary json"),
     )
@@ -74,10 +73,13 @@ fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
     assert_eq!(summary_json["folded_lines"], 1);
     assert_eq!(summary_json["folded_bytes"], 12);
     assert_eq!(summary_json["total_count"], 1);
-    assert_eq!(
-        std::fs::read_to_string(result.layout.summary_txt()).expect("summary txt"),
-        "folded lines: 1\nfolded bytes: 12\ntotal count: 1\n"
-    );
+    assert_eq!(summary_json["profile"]["total_samples"], 1);
+    assert_eq!(summary_json["profile"]["threads"][0]["comm"], "app");
+    assert_eq!(summary_json["profile"]["timeline"]["untimed_samples"], 1);
+    let summary_text = std::fs::read_to_string(result.layout.summary_txt()).expect("summary txt");
+    assert!(summary_text.starts_with("folded lines: 1\nfolded bytes: 12\ntotal count: 1\n"));
+    assert!(summary_text.contains("recorded sample span: unavailable"));
+    assert!(summary_text.contains("thread 2 (app): 1 samples"));
     assert!(result.layout.run_json().is_file());
     assert!(result.layout.stderr_log().is_file());
 }
@@ -109,7 +111,7 @@ fn linux_perf_backend_keeps_module_fallback_without_a_perf_base_symbol() {
 
     let result = backend.profile(&request).expect("profile");
 
-    assert_eq!(runner.programs(), vec!["perf", "inferno-flamegraph"]);
+    assert_eq!(runner.programs(), vec!["perf"]);
     assert_eq!(
         std::fs::read_to_string(result.layout.stacks_folded()).expect("stacks folded"),
         "app;[app] 1\n"
@@ -264,14 +266,17 @@ fn linux_perf_backend_keeps_processing_after_ctrl_c_interrupt() {
     assert!(result.layout.raw_profile("perf.data").is_file());
     assert!(result.layout.stacks_folded().is_file());
     assert!(result.layout.flamegraph_svg().is_file());
-    assert_eq!(runner.programs(), vec!["perf", "inferno-flamegraph"]);
+    assert_eq!(runner.programs(), vec!["perf"]);
 }
 
 #[test]
 fn linux_perf_backend_preflights_flamegraph_tool_before_perf_record() {
     let root = tempfile::tempdir().expect("tempdir");
     let runner = MissingInfernoRunner::default();
-    let backend = LinuxPerfBackend::new(&runner);
+    let backend = LinuxPerfBackend::with_renderer(
+        &runner,
+        pyroclast::flamegraph::InfernoFlamegraphRenderer::new(&runner),
+    );
     let request = ProfileRequest {
         kind: ProfileKind::Cpu,
         command: vec!["true".to_string()],

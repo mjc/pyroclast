@@ -47,6 +47,10 @@ fn heaptrack_backend_writes_heap_summary_artifacts() {
             .expect("summary json");
     assert_eq!(summary_json["total_allocations"], 42);
     assert_eq!(summary_json["peak_heap_bytes"], 1024);
+    assert_eq!(summary_json["temporary_allocations"], 5);
+    assert_eq!(summary_json["leaked_bytes"], 256);
+    assert_eq!(summary_json["peak_rss_bytes"], 4096);
+    assert_eq!(summary_json["runtime_seconds"], 1.5);
     assert_eq!(runner.programs(), vec!["heaptrack", "heaptrack_print"]);
     assert_eq!(
         runner
@@ -181,7 +185,7 @@ impl CommandRunner for RecordingHeaptrackRunner {
             }
             "heaptrack_print" => Ok(CommandOutput {
                 status_code: Some(0),
-                stdout: b"total allocations: 42\npeak heap memory consumption: 1024 bytes\n"
+                stdout: b"total allocations: 42\npeak heap memory consumption: 1024 bytes\ntemporary memory allocations: 5\ntotal memory leaked: 256B\npeak RSS (including heaptrack overhead): 4.096K\ntotal runtime: 1.5s\n"
                     .to_vec(),
                 stderr: Vec::new(),
             }),

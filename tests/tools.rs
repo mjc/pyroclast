@@ -40,6 +40,24 @@ fn macos_required_tools_mark_xctrace_as_apple_provided() {
 }
 
 #[test]
+fn xctrace_probe_uses_native_version_subcommand() {
+    struct XctraceVersion;
+    impl CommandRunner for XctraceVersion {
+        fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
+            assert_eq!(command.args, ["version"]);
+            Ok(CommandOutput {
+                status_code: Some(0),
+                stdout: b"xctrace version 27.0\n".to_vec(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+    let versions = collect_tool_versions(&XctraceVersion, &[pyroclast::tools::XCTRACE]);
+    assert_eq!(versions[0].version.as_deref(), Some("xctrace version 27.0"));
+    assert!(versions[0].error.is_none());
+}
+
+#[test]
 fn collects_tool_versions_with_version_flag() {
     let runner = VersionRunner;
     let versions = collect_tool_versions(&runner, &[ToolSpec::nix_managed("perf")]);
@@ -158,7 +176,7 @@ fn resolver_reports_full_attempt_trace_when_all_sources_fail() {
         "ephemeral nix shell via `nix shell nixpkgs#inferno --command inferno-flamegraph`"
     ));
     assert!(text.contains("error: build of 'inferno' failed"));
-    assert!(text.contains("Next step: install `inferno-flamegraph` directly"));
+    assert!(text.contains("Next step: install `inferno-flamegraph` using your OS package manager"));
 }
 
 #[test]
@@ -176,7 +194,7 @@ fn resolver_reports_skip_reasons_when_nix_is_unavailable() {
 
     assert!(text.contains("PATH: not found"));
     assert!(text.contains("ephemeral nix shell: skipped because `nix` was not found on PATH"));
-    assert!(text.contains("Next step: install `inferno-flamegraph` directly"));
+    assert!(text.contains("Next step: install `inferno-flamegraph` using your OS package manager"));
 }
 
 #[test]
@@ -700,7 +718,7 @@ struct XctraceWrapperRunner;
 impl CommandRunner for XctraceWrapperRunner {
     fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
         assert!(command.program.ends_with("/xctrace"));
-        assert_eq!(command.args, ["--version"]);
+        assert_eq!(command.args, ["version"]);
         Ok(CommandOutput {
             status_code: Some(1),
             stdout: Vec::new(),

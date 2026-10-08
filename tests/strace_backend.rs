@@ -46,6 +46,14 @@ fn strace_backend_writes_syscall_summary_artifacts() {
             .expect("summary json");
     assert_eq!(summary_json["total_calls"], 2);
     assert_eq!(summary_json["by_syscall"]["read"]["calls"], 1);
+    assert_eq!(summary_json["syscalls"][0]["name"], "write");
+    assert_eq!(summary_json["syscalls"][0]["mean_seconds"], 0.0025);
+    assert!(
+        summary_json["syscalls"][0]["percent_of_syscall_time"]
+            .as_f64()
+            .unwrap()
+            > 70.0
+    );
     assert_eq!(runner.programs(), vec!["strace"]);
     assert_eq!(
         result.manifest.actual_backend,

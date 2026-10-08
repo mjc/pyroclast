@@ -174,6 +174,12 @@ fn builds_bpftrace_offcpu_command() {
         ["-c", "target/release/app --serve", "--unsafe"]
     );
     assert!(command.interactive);
+    assert!(command.capture_output, "offcpu samples must be captured");
+    let program = &command.args[1];
+    assert!(program.contains("pid == cpid"));
+    assert!(program.contains("@stack[args->prev_pid] = kstack"));
+    assert!(program.contains("@offcpu[@stack[args->next_pid]]"));
+    assert!(!program.contains("@offcpu[kstack]"));
 }
 
 #[test]
@@ -303,7 +309,7 @@ fn builds_macos_xctrace_export_command() {
             "--output",
             "run/profile.raw.xctrace.xml",
             "--xpath",
-            "//table",
+            "//table[@schema=\"cpu-profile\" or @schema=\"time-profile\"]",
         ]
     );
     assert!(!command.interactive);
@@ -673,7 +679,7 @@ proptest! {
                 "--output".to_string(),
                 xml_path.display().to_string(),
                 "--xpath".to_string(),
-                "//table".to_string(),
+                "//table[@schema=\"cpu-profile\" or @schema=\"time-profile\"]".to_string(),
             ]
         );
         prop_assert!(!xctrace_export.interactive);

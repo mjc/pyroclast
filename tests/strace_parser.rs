@@ -35,6 +35,23 @@ fn parses_per_syscall_breakdown() {
     assert!((write.total_seconds - 0.0025).abs() < f64::EPSILON);
 }
 
+#[test]
+fn attributes_interleaved_resumed_calls_to_their_syscall_names() {
+    let input = "11 1.000 read(3, <unfinished ...>\n12 1.001 wait4(-1, <unfinished ...>\n11 1.002 <... read resumed>\"abc\", 3) = 3 <0.002>\n12 1.003 <... wait4 resumed>[{WIFEXITED(s) && WEXITSTATUS(s) == 0}], 0, NULL) = 13 <0.004>\n14 1.004 <... openat resumed>0x123, 0) = -1 ENOENT (No such file or directory) <0.001>\n";
+    let summary = parse_strace_summary(input);
+    assert_eq!(summary.total_calls, 3);
+    assert_eq!(summary.by_syscall["read"].calls, 1);
+    assert_eq!(summary.by_syscall["wait4"].calls, 1);
+    assert_eq!(summary.by_syscall["openat"].calls, 1);
+    assert_eq!(summary.by_syscall.len(), 3);
+}
+
+#[test]
+fn ignores_signal_noise_and_nonfinite_or_negative_durations() {
+    let input = "11 --- SIGCHLD {si_code=CLD_EXITED} --- <0.2>\n11 read(0) = 0 <NaN>\n11 write(0) = 0 <-1>\n11 close(0) = 0 <inf>\n";
+    assert_eq!(parse_strace_summary(input).total_calls, 0);
+}
+
 proptest! {
     #[test]
     fn property_aggregates_total_and_per_syscall_counts(

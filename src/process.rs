@@ -14,6 +14,7 @@ pub struct CommandSpec {
     pub env: Vec<(String, String)>,
     pub stdin: Option<Vec<u8>>,
     pub interactive: bool,
+    pub capture_output: bool,
     pub inherit_stderr: bool,
 }
 
@@ -26,6 +27,7 @@ impl CommandSpec {
             env: Vec::new(),
             stdin: None,
             interactive: false,
+            capture_output: false,
             inherit_stderr: false,
         }
     }
@@ -57,6 +59,13 @@ impl CommandSpec {
     #[must_use]
     pub fn interactive(mut self) -> Self {
         self.interactive = true;
+        self
+    }
+
+    /// Captures stdout and stderr while retaining interactive stdin and signals.
+    #[must_use]
+    pub fn capture_output(mut self) -> Self {
+        self.capture_output = true;
         self
     }
 
@@ -152,6 +161,18 @@ impl CommandRunner for RealCommandRunner {
     }
 }
 
+#[cfg(unix)]
+struct InteractiveSignalGuard(Option<signal_hook::SigId>);
+
+#[cfg(unix)]
+impl Drop for InteractiveSignalGuard {
+    fn drop(&mut self) {
+        if let Some(handler) = self.0.take() {
+            signal_hook::low_level::unregister(handler);
+        }
+    }
+}
+
 fn run_process(command: &CommandSpec) -> std::io::Result<CommandOutput> {
     if command.interactive && command.stdin.is_some() {
         return Err(std::io::Error::other(
@@ -162,6 +183,8 @@ fn run_process(command: &CommandSpec) -> std::io::Result<CommandOutput> {
     std_command.args(&command.args);
     if command.interactive {
         std_command.stdin(std::process::Stdio::inherit());
+    }
+    if command.interactive && !command.capture_output {
         std_command.stdout(std::process::Stdio::inherit());
         std_command.stderr(std::process::Stdio::inherit());
     } else {
@@ -179,37 +202,43 @@ fn run_process(command: &CommandSpec) -> std::io::Result<CommandOutput> {
         std_command.stdin(std::process::Stdio::piped());
     }
     let mut child = std_command.spawn()?;
-    if let Some(stdin) = &command.stdin {
-        use std::io::Write;
-
-        match child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| std::io::Error::other("failed to open child stdin"))?
-            .write_all(stdin)
-        {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
-            Err(error) => return Err(error),
-        }
-    }
-
     #[cfg(unix)]
-    let sigint_handler = if command.interactive {
-        Some(unsafe {
-            signal_hook::low_level::register(SIGINT, || {})
-                .map_err(|error| std::io::Error::other(error.to_string()))?
-        })
+    let _sigint_handler = InteractiveSignalGuard(if command.interactive {
+        // SAFETY: The handler performs no operations, so it is async-signal-safe.
+        // InteractiveSignalGuard unregisters it on every exit path.
+        match unsafe { signal_hook::low_level::register(SIGINT, || {}) } {
+            Ok(handler) => Some(handler),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        }
     } else {
         None
-    };
+    });
 
-    let output = if command.interactive {
+    let output = if let Some(bytes) = &command.stdin {
+        use std::io::Write;
+
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("failed to open child stdin"))?;
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(move || match stdin.write_all(bytes) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                Err(error) => Err(error),
+            });
+            let output = child.wait_with_output();
+            writer
+                .join()
+                .map_err(|_| std::io::Error::other("child stdin writer panicked"))??;
+            output
+        })?
+    } else if command.interactive && !command.capture_output {
         let status = child.wait();
-        #[cfg(unix)]
-        if let Some(sigint_handler) = sigint_handler {
-            signal_hook::low_level::unregister(sigint_handler);
-        }
         let status = status?;
         std::process::Output {
             status,

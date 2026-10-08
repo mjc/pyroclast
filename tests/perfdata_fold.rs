@@ -43,6 +43,413 @@ fn render_unknown_folded_callchain(frames: &[u64], count: u64) -> String {
 }
 
 #[test]
+fn audit_regression_rejects_maximal_attr_section_before_allocation() {
+    let mut bytes = perfdata_with_records_and_attrs([], []);
+    put_u64(&mut bytes, 32, u64::MAX);
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), &bytes).unwrap();
+    assert!(fold_perfdata_file_with_options(file.path(), FoldOptions::default()).is_err());
+    assert!(fold_perfdata_callchains(&bytes).is_err());
+}
+
+#[test]
+fn audit_regression_rejects_overflowing_event_desc_range() {
+    let mut bytes = perfdata_with_records_and_attrs([], []);
+    put_u64(&mut bytes, 72, 1 << 12);
+    bytes.extend(1_u64.to_le_bytes());
+    bytes.extend(u64::MAX.to_le_bytes());
+    assert!(summarize_perfdata(&bytes).is_err());
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), &bytes).unwrap();
+    assert!(fold_perfdata_file_with_options(file.path(), FoldOptions::default()).is_err());
+}
+
+#[test]
+fn audit_regression_rejects_overlapping_attr_and_data_sections() {
+    let mut bytes = perfdata_with_records_and_attrs([file_attr_bytes(0, 0, 0)], []);
+    put_u64(&mut bytes, 40, 112);
+    put_u64(&mut bytes, 48, 8);
+    // A structurally valid unknown record inside the attr's config word.
+    put_u64(&mut bytes, 112, (8_u64 << 48) | 0x63);
+    assert!(summarize_perfdata(&bytes).is_err());
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), &bytes).unwrap();
+    assert!(fold_perfdata_file_with_options(file.path(), FoldOptions::default()).is_err());
+}
+
+#[test]
+fn audit_regression_rejects_event_desc_counts_and_truncation() {
+    let event_count = [u32::MAX.to_le_bytes(), 0_u32.to_le_bytes()].concat();
+    let id_count = [
+        1_u32.to_le_bytes(),
+        0_u32.to_le_bytes(),
+        u32::MAX.to_le_bytes(),
+        0_u32.to_le_bytes(),
+    ]
+    .concat();
+    for payload in [event_count, id_count] {
+        let mut bytes = perfdata_with_records_and_attrs([], []);
+        put_u64(&mut bytes, 72, 1 << 12);
+        let payload_offset = bytes.len() + 16;
+        bytes.extend(u64::try_from(payload_offset).unwrap().to_le_bytes());
+        bytes.extend(u64::try_from(payload.len()).unwrap().to_le_bytes());
+        bytes.extend(payload);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), &bytes).unwrap();
+        assert!(summarize_perfdata(&bytes).is_err());
+        assert!(fold_perfdata_file_with_options(file.path(), FoldOptions::default()).is_err());
+        bytes.truncate(112);
+        std::fs::write(file.path(), &bytes).unwrap();
+        assert!(summarize_perfdata(&bytes).is_err());
+        assert!(fold_perfdata_file_with_options(file.path(), FoldOptions::default()).is_err());
+    }
+}
+
+#[test]
+fn audit_regression_rejects_maximal_attr_id_range() {
+    let bytes = perfdata_with_records_and_attrs([file_attr_bytes(0, 104, u64::MAX)], []);
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), &bytes).unwrap();
+    assert!(summarize_perfdata(&bytes).is_err());
+    assert!(fold_perfdata_file_with_options(file.path(), FoldOptions::default()).is_err());
+}
+
+#[test]
+fn audit_regression_summary_uses_recording_architecture_for_register_ip() {
+    for (arch, mask, values, expected) in [
+        ("x86_64", 1 << 8, vec![0x1111], Some(0x1111)),
+        (
+            "aarch64",
+            (1 << 8) | (1 << 32),
+            vec![0x8888, 0x3232],
+            Some(0x3232),
+        ),
+        ("aarch64", 1 << 8, vec![0x8888], None),
+    ] {
+        let mut payload = sample_payload(0x1000, 11, 12, [0x1000]);
+        payload.extend(2_u64.to_le_bytes());
+        for value in values {
+            payload.extend(u64::to_le_bytes(value));
+        }
+        let bytes = perfdata_with_records_attrs_and_arch_feature(
+            [file_attr_bytes_with_regs(
+                PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_REGS_USER,
+                mask,
+            )],
+            [record_bytes(9, &payload)],
+            arch,
+        );
+        let summary = summarize_perfdata(&bytes).unwrap();
+        assert_eq!(
+            summary.sample_stacks[0].user_register_ip, expected,
+            "{arch}"
+        );
+    }
+}
+
+#[test]
+fn file_summary_preserves_sample_timestamps_and_cpu() {
+    use pyroclast::perfdata::fold::summarize_perfdata_file;
+    use pyroclast::perfdata::samples::PERF_SAMPLE_CPU;
+    let mut payload = Vec::new();
+    payload.extend(0x1000_u64.to_le_bytes());
+    payload.extend(11_u32.to_le_bytes());
+    payload.extend(12_u32.to_le_bytes());
+    payload.extend(1_234_567_890_u64.to_le_bytes());
+    payload.extend(7_u32.to_le_bytes());
+    payload.extend(0_u32.to_le_bytes());
+    payload.extend(1_u64.to_le_bytes());
+    payload.extend(0x1000_u64.to_le_bytes());
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_TIME
+                | PERF_SAMPLE_CPU
+                | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [record_bytes(9, &payload)],
+    );
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), &bytes).unwrap();
+    let memory = summarize_perfdata(&bytes).unwrap();
+    assert_eq!(memory.sample_stacks[0].time, Some(1_234_567_890));
+    assert_eq!(memory.sample_stacks[0].cpu, Some(7));
+    assert_eq!(summarize_perfdata_file(file.path()).unwrap(), memory);
+}
+
+#[test]
+fn audit_regression_summary_uses_the_event_default_period_when_payload_omits_it() {
+    use pyroclast::perfdata::fold::summarize_perfdata_file;
+    for default_period in [0_u64, 37] {
+        let mut attr = file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        );
+        put_u64(&mut attr, 16, default_period);
+        let bytes = perfdata_with_records_and_attrs(
+            [attr],
+            [record_bytes(
+                9,
+                &sample_payload_with_time(0x1000, 11, 12, 100, [0x1000]),
+            )],
+        );
+        let memory = summarize_perfdata(&bytes).unwrap();
+        assert_eq!(memory.sample_stacks[0].period, Some(default_period));
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), &bytes).unwrap();
+        assert_eq!(summarize_perfdata_file(file.path()).unwrap(), memory);
+        let profile = pyroclast::summary::summarize_perf_summary(&memory, 1000, 10).unwrap();
+        assert_eq!(profile.weighted_samples, default_period);
+        assert_eq!(profile.threads[0].weighted_samples, default_period);
+        assert_eq!(profile.timeline.buckets[0].weighted_samples, default_period);
+        assert_eq!(
+            pyroclast::perfdata::analysis::analyze_perfdata(&bytes, 10)
+                .unwrap()
+                .weighted_samples,
+            default_period
+        );
+    }
+}
+
+#[test]
+fn bounded_file_profile_matches_retained_summary_for_unordered_and_untimed_samples() {
+    for timed in [true, false] {
+        let flags = PERF_SAMPLE_IP
+            | PERF_SAMPLE_TID
+            | PERF_SAMPLE_CALLCHAIN
+            | if timed { PERF_SAMPLE_TIME } else { 0 };
+        let mut attr = file_attr_bytes(flags, 0, 0);
+        put_u64(&mut attr, 16, 37);
+        let mut records = vec![
+            record_bytes(3, &comm_payload(11, 12, "parent")),
+            record_bytes(7, &fork_payload(11, 11, 13, 12, 0)),
+        ];
+        for (tid, time) in [(12, 3000), (13, 1000), (12, 1500), (13, 1000)] {
+            let payload = if timed {
+                sample_payload_with_time(0x1000, 11, tid, time, [0x1000])
+            } else {
+                sample_payload(0x1000, 11, tid, [0x1000])
+            };
+            records.push(record_bytes(9, &payload));
+        }
+        records.push(record_bytes(3, &comm_payload(11, 12, "renamed")));
+        records.push(record_bytes(2, &lost_payload(1, 5)));
+        let records: [Vec<u8>; 8] = records.try_into().unwrap();
+        let bytes = perfdata_with_records_and_attrs([attr], records);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), &bytes).unwrap();
+        let expected = pyroclast::summary::summarize_perfdata_profile(&bytes, 1000, 10).unwrap();
+        assert_eq!(
+            pyroclast::summary::summarize_perfdata_profile_file(file.path(), 1000, 10).unwrap(),
+            expected
+        );
+        assert_eq!(expected.threads[0].comm, "renamed");
+        assert_eq!(expected.threads[1].comm, "parent");
+        assert_eq!(expected.lost_records, 5);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bounded_file_profile_storage_does_not_grow_with_repeated_samples() {
+    use std::io::Write;
+    if let Some(path) = std::env::var_os("PYROCLAST_SUMMARY_MEMORY_FIXTURE") {
+        let summary = pyroclast::summary::summarize_perfdata_profile_file(
+            std::path::Path::new(&path),
+            1000,
+            10,
+        )
+        .unwrap();
+        let samples = std::env::var("PYROCLAST_SUMMARY_EXPECTED_SAMPLES")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        assert_eq!(summary.total_samples, samples);
+        assert_eq!(summary.weighted_samples, u64::try_from(samples).unwrap());
+        assert_eq!(summary.threads[0].samples, samples);
+        assert_eq!(summary.timeline.buckets[0].samples, samples);
+        assert_eq!(summary.threads.len(), 1);
+        assert_eq!(summary.timeline.buckets.len(), 1);
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let peak = status
+            .lines()
+            .find(|line| line.starts_with("VmHWM:"))
+            .unwrap();
+        println!(
+            "summary_peak_rss_kib={}",
+            peak.split_whitespace().nth(1).unwrap()
+        );
+        return;
+    }
+    let measure = |samples: u64| {
+        let mut attr = file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        );
+        put_u64(&mut attr, 16, 1);
+        let record = record_bytes(
+            9,
+            &sample_payload_with_time(0x1000, 11, 12, 100, [0x1000; 128]),
+        );
+        let mut header = perfdata_with_records_and_attrs([attr], []);
+        put_u64(
+            &mut header,
+            48,
+            samples * u64::try_from(record.len()).unwrap(),
+        );
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut writer = std::io::BufWriter::new(file.as_file());
+        writer.write_all(&header).unwrap();
+        for _ in 0..samples {
+            writer.write_all(&record).unwrap();
+        }
+        writer.flush().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "bounded_file_profile_storage_does_not_grow_with_repeated_samples",
+                "--nocapture",
+            ])
+            .env("PYROCLAST_SUMMARY_MEMORY_FIXTURE", file.path())
+            .env("PYROCLAST_SUMMARY_EXPECTED_SAMPLES", samples.to_string())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("summary_peak_rss_kib="))
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+    };
+    // Both recordings exceed the 4 MiB read window; the larger one has 24x as
+    // many samples, identical threads/buckets, and ~200 MiB of repeated frames.
+    let small_peak = measure(8192);
+    let large_peak = measure(200_000);
+    println!("bounded_summary_peak_rss small={small_peak}KiB large={large_peak}KiB");
+    assert!(
+        large_peak <= small_peak + 16 * 1024,
+        "sample retention grew memory: small={small_peak} KiB large={large_peak} KiB"
+    );
+}
+
+#[test]
+fn audit_regression_summary_retains_metadata_without_callchain() {
+    let flags = PERF_SAMPLE_IP
+        | PERF_SAMPLE_TID
+        | PERF_SAMPLE_PERIOD
+        | PERF_SAMPLE_REGS_USER
+        | PERF_SAMPLE_STACK_USER;
+    for stack in [Vec::new(), vec![1, 2, 3, 4, 5, 6, 7, 8]] {
+        let mut payload = sample_payload_with_period_no_callchain(0x1000, 11, 12, 7);
+        payload.extend(2_u64.to_le_bytes());
+        payload.extend(0xaaaa_u64.to_le_bytes());
+        payload.extend(u64::try_from(stack.len()).unwrap().to_le_bytes());
+        payload.extend(&stack);
+        if !stack.is_empty() {
+            payload.extend(u64::try_from(stack.len()).unwrap().to_le_bytes());
+        }
+        let bytes = perfdata_with_records_and_attrs(
+            [file_attr_bytes_with_regs(flags, 1 << 8)],
+            [record_bytes(9, &payload)],
+        );
+        let summary = summarize_perfdata(&bytes).unwrap();
+        let sample = &summary.sample_stacks[0];
+        assert_eq!(sample.user_register_ip, Some(0xaaaa));
+        assert_eq!(sample.user_register_count, 1);
+        assert!(sample.has_user_stack);
+        assert_eq!(sample.user_stack_size, stack.len());
+        let analysis = pyroclast::perfdata::analysis::analyze_perfdata(&bytes, 10).unwrap();
+        assert_eq!(analysis.user_register_samples, 1);
+        assert_eq!(analysis.user_stack_samples, 1);
+        assert_eq!(analysis.user_stack_bytes, stack.len());
+        // Folding must keep perf's event-line IP behavior without DWARF callers.
+        let ip_payload = sample_payload_with_period_no_callchain(0x1000, 11, 12, 7);
+        let ip_bytes = perfdata_with_records_and_attrs(
+            [file_attr_bytes(
+                PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD,
+                0,
+                0,
+            )],
+            [record_bytes(9, &ip_payload)],
+        );
+        assert_eq!(
+            fold_perfdata_callchains(&bytes).unwrap(),
+            fold_perfdata_callchains(&ip_bytes).unwrap()
+        );
+        payload.pop();
+        let truncated = perfdata_with_records_and_attrs(
+            [file_attr_bytes_with_regs(flags, 1 << 8)],
+            [record_bytes(9, &payload)],
+        );
+        assert!(summarize_perfdata(&truncated).is_err());
+    }
+}
+
+#[test]
+fn audit_regression_file_and_bytes_share_stream_build_ids() {
+    use pyroclast::perfdata::fold::fold_perfdata_file_with_symbols;
+    let attr = file_attr_bytes(
+        PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+        0,
+        0,
+    );
+    let mapping = record_bytes(10, &mmap2_payload(11, 12, 0x1000, 0x100, 0, 5, "/bin/app"));
+    let sample = record_bytes(9, &sample_payload(0x1010, 11, 12, [0x1010]));
+    for (header_id, stream_id) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut records = vec![mapping.clone(), sample.clone()];
+        if stream_id {
+            records.push(build_id_event_payload(11, &[0xbb; 20], "/bin/app"));
+        }
+        let mut bytes = perfdata_with_records_and_attrs_vec(vec![attr], records);
+        if header_id {
+            let payload = build_id_event_payload(11, &[0xaa; 20], "/bin/app");
+            put_u64(&mut bytes, 72, 1 << 2);
+            let offset = bytes.len() + 16;
+            bytes.extend(u64::try_from(offset).unwrap().to_le_bytes());
+            bytes.extend(u64::try_from(payload.len()).unwrap().to_le_bytes());
+            bytes.extend(payload);
+        }
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), &bytes).unwrap();
+        let memory_resolver = RecordingSymbolResolver::default();
+        let file_resolver = RecordingSymbolResolver::default();
+        let options = FoldOptions::default();
+        let memory =
+            fold_perfdata_callchains_with_symbols(&bytes, options, &memory_resolver).unwrap();
+        let disk = fold_perfdata_file_with_symbols(file.path(), options, &file_resolver).unwrap();
+        assert_eq!(disk, memory);
+        assert_eq!(
+            file_resolver.calls(),
+            memory_resolver.calls(),
+            "header={header_id}, stream={stream_id}"
+        );
+        let requests = memory_resolver.calls();
+        assert!(!requests.is_empty());
+        assert_eq!(
+            requests[0][0].build_id,
+            if stream_id {
+                Some("bb".repeat(20))
+            } else if header_id {
+                Some("aa".repeat(20))
+            } else {
+                None
+            }
+        );
+    }
+}
+
+#[test]
 fn summarizes_record_counts_and_comm_names() {
     let bytes = perfdata_with_records_and_attrs(
         [],
@@ -1031,6 +1438,41 @@ fn keeps_current_ip_only_object_unwind_for_mapped_dwarf_user_stack_like_perf_lib
     let expected = format!(":12;[{}] 1\n", fixture.file_name());
 
     assert_eq!(folded, expected);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_vdso_dwarf_leaf_is_not_dropped_without_build_id_metadata() {
+    use inferno::collapse::Collapse;
+    let mut bytes = x86_leaf_only_perfdata("[vdso]", [0x7ffe_ff00, 0x7fff_0000, 0x400], [0; 24]);
+    put_u64(&mut bytes, 16, 144);
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), &bytes).unwrap();
+    let native = Command::new("perf")
+        .args(["script", "--force", "--inline", "-i"])
+        .arg(file.path())
+        .output()
+        .unwrap();
+    assert!(
+        native.status.success(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    let mut expected = Vec::new();
+    inferno::collapse::perf::Folder::default()
+        .collapse(std::io::Cursor::new(native.stdout), &mut expected)
+        .unwrap();
+    let expected = String::from_utf8(expected).unwrap();
+    assert!(
+        !expected.is_empty(),
+        "native perf retains the sampled vDSO leaf"
+    );
+    assert!(expected.contains("vdso"), "{expected}");
+    assert_eq!(fold_perfdata_callchains(&bytes).unwrap(), expected);
+    assert_eq!(
+        fold_perfdata_file_with_options(file.path(), FoldOptions::default()).unwrap(),
+        expected
+    );
 }
 
 #[cfg(target_os = "linux")]

@@ -21,7 +21,7 @@ use artifacts::ArtifactLayout;
 use backends::heaptrack::HeaptrackBackend;
 use backends::linux_perf::LinuxPerfBackend;
 use backends::macos_xctrace::MacosXctraceBackend;
-use backends::offcpu::OffcpuBackend;
+use backends::offcpu::{OffcpuBackend, OffcpuMethod};
 use backends::strace::StraceBackend;
 use backends::{ProfileRequest, ProfilerBackend};
 use clap::Parser;
@@ -30,10 +30,11 @@ use cli::{
     ParseCommand, ParseFlamegraphCommand, ParsePerfCommand, PlumbingCommand,
 };
 use flamegraph::analysis::{
-    FlamegraphCategory, FlamegraphDelta, FlamegraphEntry, category_summary, diff_flamegraphs,
-    parse_flamegraph_entries, search_entries, syscall_breakdown, top_entries,
+    FlamegraphCategory, FlamegraphDelta, FlamegraphEntry, diff_flamegraph_svgs,
+    parse_flamegraph_categories, parse_flamegraph_entries, search_entries, syscall_breakdown,
+    top_entries,
 };
-use flamegraph::{FlamegraphRenderer, FlamegraphRequest, InfernoFlamegraphRenderer};
+use flamegraph::{BuiltinFlamegraphRenderer, FlamegraphRenderer, FlamegraphRequest};
 pub use output::{CliOutput, write_cli_output};
 use perfdata::analysis::{PerfdataAnalysis, analyze_perfdata_file};
 use perfdata::fold::{
@@ -76,6 +77,10 @@ where
 {
     let cli = Cli::parse_from(args);
     let runner = RealCommandRunner::default();
+    let json_profile = cli
+        .command
+        .profile_invocation()
+        .is_some_and(|invocation| invocation.json);
     let mut stream = output::PipeWriter::new(&mut stdout);
     let result = match cli.command {
         CliCommand::Plumbing {
@@ -106,10 +111,21 @@ where
             PerfdataOutput::PerfScript,
             &mut stream,
         ),
-        command => {
-            let output = run_parsed_cli(Cli { command })?;
-            write_cli_output(&output, &mut stream, &mut stderr).map_err(Into::into)
-        }
+        command => match run_parsed_cli(Cli { command }) {
+            Ok(output) => write_cli_output(&output, &mut stream, &mut stderr).map_err(Into::into),
+            Err(error) => {
+                if json_profile {
+                    serde_json::to_writer(
+                        &mut stream,
+                        &serde_json::json!({
+                            "status": "failed", "error": error.to_string(),
+                        }),
+                    )?;
+                    std::io::Write::write_all(&mut stream, b"\n")?;
+                }
+                Err(error)
+            }
+        },
     };
     if stream.broken_pipe() {
         return Ok(());
@@ -170,7 +186,7 @@ pub fn run_parsed_cli_with_runner<R>(cli: Cli, runner: &R) -> backends::BackendR
 where
     R: CommandRunner,
 {
-    run_parsed_cli_with_runner_and_renderer(cli, runner, InfernoFlamegraphRenderer::new(runner))
+    run_parsed_cli_with_runner_and_renderer(cli, runner, BuiltinFlamegraphRenderer)
 }
 
 /// Runs a parsed CLI command with an injected process runner and explicit
@@ -191,7 +207,7 @@ where
     run_parsed_cli_with_runner_and_renderer_on_platform(
         cli,
         runner,
-        InfernoFlamegraphRenderer::new(runner),
+        BuiltinFlamegraphRenderer,
         platform,
     )
 }
@@ -214,7 +230,7 @@ where
     run_parsed_cargo_cli_with_runner_and_renderer_on_platform(
         cli,
         runner,
-        InfernoFlamegraphRenderer::new(runner),
+        BuiltinFlamegraphRenderer,
         platform,
     )
 }
@@ -232,11 +248,7 @@ pub fn run_parsed_cargo_cli_with_runner<R>(
 where
     R: CommandRunner,
 {
-    run_parsed_cargo_cli_with_runner_and_renderer(
-        cli,
-        runner,
-        InfernoFlamegraphRenderer::new(runner),
-    )
+    run_parsed_cargo_cli_with_runner_and_renderer(cli, runner, BuiltinFlamegraphRenderer)
 }
 
 /// Runs a parsed CLI command with injected process and flamegraph renderers.
@@ -303,8 +315,7 @@ where
     F: FlamegraphRenderer,
 {
     if let Some(invocation) = cli.command.profile_invocation() {
-        run_profile_invocation(invocation, runner, flamegraph_renderer, platform)?;
-        return Ok(CliOutput::default());
+        return run_profile_invocation(invocation, runner, flamegraph_renderer, platform);
     }
 
     run_non_profile_command(cli.command, runner, &flamegraph_renderer)
@@ -331,8 +342,7 @@ where
         .command
         .pyroclast_command()
         .into_profile_invocation(runner)?;
-    run_profile_invocation(invocation, runner, flamegraph_renderer, platform)?;
-    Ok(CliOutput::default())
+    run_profile_invocation(invocation, runner, flamegraph_renderer, platform)
 }
 
 pub(crate) fn run_profile_invocation<R, F>(
@@ -340,7 +350,7 @@ pub(crate) fn run_profile_invocation<R, F>(
     runner: &R,
     flamegraph_renderer: F,
     platform: &str,
-) -> backends::BackendResult<()>
+) -> backends::BackendResult<CliOutput>
 where
     R: CommandRunner,
     F: FlamegraphRenderer,
@@ -349,6 +359,44 @@ where
         .out
         .clone()
         .unwrap_or_else(|| std::path::PathBuf::from("pyroclast-runs/latest"));
+    ArtifactLayout::new(out_dir.clone()).prepare()?;
+    let attaching = invocation.pid.is_some()
+        || !invocation.tids.is_empty()
+        || invocation.threads_of_pid.is_some();
+    if attaching && !(invocation.kind == cli::ProfileKind::Cpu && platform == "linux") {
+        return Err(format!(
+            "{} profiling does not support attach targets on {platform}",
+            profile_kind_name(invocation.kind)
+        )
+        .into());
+    }
+    if invocation.offcpu_method.is_some()
+        && !matches!(
+            invocation.kind,
+            cli::ProfileKind::Offcpu | cli::ProfileKind::Async
+        )
+    {
+        return Err("--offcpu-method is only available for offcpu and async profiles".into());
+    }
+    let offcpu_method = if matches!(
+        invocation.kind,
+        cli::ProfileKind::Offcpu | cli::ProfileKind::Async
+    ) && platform == "linux"
+    {
+        Some(match invocation.offcpu_method {
+            Some(cli::OffcpuChoice::PerfSched) => OffcpuMethod::PerfSched,
+            Some(cli::OffcpuChoice::Bpftrace) => OffcpuMethod::Bpftrace,
+            None => match probe_perf_sched(runner) {
+                Ok(()) => OffcpuMethod::PerfSched,
+                Err(perf_error) => {
+                    probe_bpftrace_offcpu(runner).map_err(|bpf_error| format!("blocked-time profiling needs a usable native recorder: perf: {perf_error}; bpftrace: {bpf_error}"))?;
+                    OffcpuMethod::Bpftrace
+                }
+            },
+        })
+    } else {
+        None
+    };
     let request = ProfileRequest {
         kind: invocation.kind,
         command: invocation.command,
@@ -364,30 +412,23 @@ where
         tids: invocation.tids,
         threads_of_pid: invocation.threads_of_pid,
         duration_secs: invocation.duration_secs,
-        offcpu_method: None,
+        offcpu_method,
     };
-    match request.kind {
+    let result = match request.kind {
         cli::ProfileKind::Cpu if platform == "linux" => {
-            LinuxPerfBackend::with_renderer(runner, flamegraph_renderer).profile(&request)?;
+            LinuxPerfBackend::with_renderer(runner, flamegraph_renderer).profile(&request)?
         }
         cli::ProfileKind::Cpu if platform == "macos" => {
-            MacosXctraceBackend::new(runner).profile(&request)?;
+            MacosXctraceBackend::new(runner).profile(&request)?
         }
         cli::ProfileKind::Latency if platform == "linux" => {
-            StraceBackend::new(runner).profile(&request)?;
+            StraceBackend::new(runner).profile(&request)?
         }
         cli::ProfileKind::Memory if platform == "linux" => {
-            HeaptrackBackend::new(runner).profile(&request)?;
+            HeaptrackBackend::new(runner).profile(&request)?
         }
-        cli::ProfileKind::Offcpu if platform == "linux" => {
-            OffcpuBackend::new(runner).profile(&request)?;
-        }
-        cli::ProfileKind::Async => {
-            return Err(format!(
-                "{} profiling is not implemented yet",
-                profile_kind_name(request.kind)
-            )
-            .into());
+        cli::ProfileKind::Offcpu | cli::ProfileKind::Async if platform == "linux" => {
+            OffcpuBackend::new(runner).profile(&request)?
         }
         kind => {
             return Err(format!(
@@ -396,8 +437,66 @@ where
             )
             .into());
         }
+    };
+    Ok(CliOutput {
+        stdout: if request.json {
+            format!("{}\n", serde_json::to_string_pretty(&result.manifest)?)
+        } else {
+            String::new()
+        },
+        stderr: String::new(),
+    })
+}
+
+fn probe_perf_sched(runner: &impl CommandRunner) -> Result<(), String> {
+    runner
+        .resolve_tool(&tools::PERF)
+        .map_err(|error| error.to_string())?;
+    let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let command = process::CommandSpec::new("perf").args([
+        "sched".to_string(),
+        "record".to_string(),
+        "-o".to_string(),
+        temporary
+            .path()
+            .join("probe.perf.data")
+            .display()
+            .to_string(),
+        "--".to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        ":".to_string(),
+    ]);
+    check_recorder_probe(runner, &command)
+}
+
+fn probe_bpftrace_offcpu(runner: &impl CommandRunner) -> Result<(), String> {
+    runner
+        .resolve_tool(&tools::BPFTRACE)
+        .map_err(|error| error.to_string())?;
+    // Attach the actual required tracepoint and compile the stack helper before
+    // starting the requested workload. A BEGIN-only probe misses these checks.
+    let command = process::CommandSpec::new("bpftrace").args([
+        "-e",
+        "tracepoint:sched:sched_switch { @probe[kstack(perf)] = count(); } interval:ms:1 { exit(); } END { clear(@probe); }",
+    ]);
+    check_recorder_probe(runner, &command)
+}
+
+fn check_recorder_probe(
+    runner: &impl CommandRunner,
+    command: &process::CommandSpec,
+) -> Result<(), String> {
+    let output = runner.run(command).map_err(|error| error.to_string())?;
+    if output.status_code == Some(0) {
+        Ok(())
+    } else {
+        Err(format!(
+            "capability probe exited with {:?}: {}",
+            output.status_code,
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ))
     }
-    Ok(())
 }
 
 fn profile_kind_name(kind: cli::ProfileKind) -> &'static str {
@@ -573,6 +672,22 @@ fn render_perfdata_analysis(
     writeln!(output, "samples: {}", analysis.total_samples)?;
     writeln!(output, "weighted samples: {}", analysis.weighted_samples)?;
     writeln!(output, "lost records: {}", analysis.lost_records)?;
+    if let Some(duration) = analysis.profile.timeline.duration_ns {
+        writeln!(output, "sample span (ns): {duration}")?;
+    }
+    writeln!(
+        output,
+        "untimed samples: {}",
+        analysis.profile.timeline.untimed_samples
+    )?;
+    writeln!(output, "timeline (1 second buckets)")?;
+    for bucket in &analysis.profile.timeline.buckets {
+        writeln!(
+            output,
+            "{} ns: {} samples, {} weight",
+            bucket.start_offset_ns, bucket.samples, bucket.weighted_samples
+        )?;
+    }
     writeln!(output)?;
     writeln!(output, "threads")?;
     for thread in &analysis.threads {
@@ -622,7 +737,7 @@ fn analyze_flamegraph_for_cli(command: &AnalyzeFlamegraphArgs) -> backends::Back
             render_flamegraph_entries(&entries, command.json)
         }
         FlamegraphAnalysisMode::Summary => {
-            let categories = category_summary(&entries);
+            let categories = parse_flamegraph_categories(&svg)?;
             render_flamegraph_categories(&categories, command.json)
         }
         FlamegraphAnalysisMode::Diff => {
@@ -631,8 +746,7 @@ fn analyze_flamegraph_for_cli(command: &AnalyzeFlamegraphArgs) -> backends::Back
                 .as_ref()
                 .ok_or("--other is required for flamegraph diff mode")?;
             let other_svg = std::fs::read_to_string(other)?;
-            let other_entries = parse_flamegraph_entries(&other_svg);
-            let deltas = diff_flamegraphs(&entries, &other_entries, command.min_percent);
+            let deltas = diff_flamegraph_svgs(&svg, &other_svg, command.min_percent)?;
             render_flamegraph_deltas(&deltas, command.json)
         }
     }

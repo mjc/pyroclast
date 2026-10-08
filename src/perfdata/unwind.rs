@@ -41,6 +41,13 @@ pub enum PerfArch {
 }
 
 impl PerfArch {
+    pub(crate) const fn instruction_pointer_register(self) -> u32 {
+        match self {
+            Self::X86_64 => 8,
+            Self::Aarch64 => 32,
+        }
+    }
+
     #[must_use]
     pub fn from_header_arch(arch: &str) -> Option<Self> {
         match arch {
@@ -876,7 +883,9 @@ impl PerfX86_64Regs {
                     registers[Reg::RSP as usize] = value;
                     sp = Some(value);
                 }
-                8 => ip = Some(value),
+                register if register == PerfArch::X86_64.instruction_pointer_register() => {
+                    ip = Some(value);
+                }
                 16 => registers[Reg::R8 as usize] = value,
                 17 => registers[Reg::R9 as usize] = value,
                 18 => registers[Reg::R10 as usize] = value,
@@ -933,7 +942,6 @@ impl PerfAarch64Regs {
         const FP: u32 = 29;
         const LR: u32 = 30;
         const SP: u32 = 31;
-        const PC: u32 = 32;
 
         if mask.count_ones() as usize != values.len() {
             return Err("perf register mask and value count differ".to_string());
@@ -948,7 +956,7 @@ impl PerfAarch64Regs {
         };
 
         Ok(Self {
-            pc: masked(PC)
+            pc: masked(PerfArch::Aarch64.instruction_pointer_register())
                 .ok_or_else(|| "perf sample is missing aarch64 PC register".to_string())?,
             sp: masked(SP)
                 .ok_or_else(|| "perf sample is missing aarch64 SP register".to_string())?,

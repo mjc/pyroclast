@@ -2,7 +2,9 @@
 {
   languages.rust = {
     enable = true;
-    channel = "stable";
+    # The Darwin rust-overlay aggregate currently aliases lib directories,
+    # causing its union builder to copy librustc_driver onto itself.
+    channel = if pkgs.stdenv.hostPlatform.isDarwin then "nixpkgs" else "stable";
     components = [
       "cargo"
       "clippy"
@@ -38,11 +40,25 @@
 
   env.RUST_BACKTRACE = "1";
 
+  scripts.check-perf-parity.exec = ''
+    exec "$DEVENV_ROOT/scripts/check-perf-parity" "$@"
+  '';
+
+  scripts.xctrace = lib.mkIf pkgs.stdenv.hostPlatform.isDarwin {
+    exec = ''
+      # Keep Nix's SDK for compilation; only native profiling needs Xcode.
+      export DEVELOPER_DIR=$(/usr/bin/env -u DEVELOPER_DIR /usr/bin/xcode-select -p)
+      exec /usr/bin/xcrun xctrace "$@"
+    '';
+  };
+
   enterShell = ''
     git config --local core.hooksPath .githooks
 
-    if [ "$(uname -s)" = Darwin ] && ! command -v xctrace >/dev/null 2>&1; then
-      echo "warning: xctrace not found; install Xcode or Command Line Tools for macOS profiling" >&2
+    if [ "$(uname -s)" = Darwin ]; then
+      if ! /usr/bin/env -u DEVELOPER_DIR /usr/bin/xcrun --find xctrace >/dev/null 2>&1; then
+        echo "warning: xctrace not found; install Xcode for macOS profiling" >&2
+      fi
     fi
   '';
 }

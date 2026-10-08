@@ -11,8 +11,9 @@ pub struct FakeBackend;
 
 impl ProfilerBackend for FakeBackend {
     fn profile(&self, request: &ProfileRequest) -> BackendResult<ProfileResult> {
+        let started_at_unix_ms = unix_ms_now();
         let layout = ArtifactLayout::new(request.out_dir.clone());
-        fs::create_dir_all(layout.root())?;
+        layout.prepare()?;
 
         write_file(layout.stdout_log(), "")?;
         write_file(layout.stderr_log(), "")?;
@@ -22,6 +23,7 @@ impl ProfilerBackend for FakeBackend {
         write_file(layout.tool_errors_log(), "")?;
 
         let manifest = RunManifest {
+            name: request.name.clone(),
             command: request.command.clone(),
             cwd: std::env::current_dir()?,
             profile_kind: request.kind,
@@ -29,7 +31,7 @@ impl ProfilerBackend for FakeBackend {
             actual_backend: BackendName::Fake,
             fallback_reason: None,
             platform: std::env::consts::OS.to_string(),
-            started_at_unix_ms: unix_ms_now(),
+            started_at_unix_ms,
             ended_at_unix_ms: Some(unix_ms_now()),
             exit_status: Some(0),
             sample_frequency: request.frequency,

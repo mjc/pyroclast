@@ -109,7 +109,7 @@ pub struct StreamingComparisonReport {
 /// # Errors
 ///
 /// Returns an error when the benchmark input is missing, perf-script export
-/// fails, or the comparison run fails.
+/// fails, or the folded/SVG comparison differs or fails.
 pub fn run_bench_command<R>(args: &BenchArgs, runner: &R) -> Result<String, String>
 where
     R: CommandRunner + Sync,
@@ -124,7 +124,7 @@ where
 
     let perf_script = match &args.export_perf_script {
         Some(path) => {
-            export_perf_script(&input, path, runner)
+            export_perf_script_with_inline(&input, path, runner, Some(args.inline))
                 .map_err(|error| format!("perf script export failed: {error}"))?;
             Some(path.clone())
         }
@@ -148,7 +148,22 @@ where
         args.inline,
     )
     .map_err(|error| format!("inferno comparison failed: {error}"))?;
-    Ok(format_bench_output(&report))
+    let source = if args.export_perf_script.is_some() {
+        "native-perf-script"
+    } else if args.perf_script.is_some() {
+        "provided-perf-script"
+    } else {
+        "pyroclast-self-consistency"
+    };
+    let output = format!(
+        "comparison.source={source}\ncomparison.inline={}\n{}",
+        args.inline,
+        format_bench_output(&report)
+    );
+    if !report.comparison.matches {
+        return Err(format!("folded or SVG comparison mismatch\n{output}"));
+    }
+    Ok(output)
 }
 
 #[must_use]
@@ -393,8 +408,9 @@ where
         let (inferno_tx, inferno_rx) = sync_channel(64);
         let pyro_thread =
             scope.spawn(move || run_pyroclast_stream(perf_data, runner, symbols, inline, pyro_tx));
-        let inferno_thread = scope
-            .spawn(move || run_inferno_stream(perf_data, perf_script, runner, symbols, inferno_tx));
+        let inferno_thread = scope.spawn(move || {
+            run_inferno_stream(perf_data, perf_script, runner, symbols, inline, inferno_tx)
+        });
         let diff = compare_folded_line_receivers(&pyro_rx, &inferno_rx)?;
         let pyro = match pyro_thread.join() {
             Ok(result) => result?,
@@ -436,17 +452,24 @@ pub fn export_perf_script<R>(perf_data: &Path, output: &Path, runner: &R) -> Res
 where
     R: CommandRunner,
 {
+    export_perf_script_with_inline(perf_data, output, runner, None)
+}
+
+fn export_perf_script_with_inline<R: CommandRunner>(
+    perf_data: &Path,
+    output: &Path,
+    runner: &R,
+    inline: Option<bool>,
+) -> Result<(), String> {
     let perf_data = perf_data
         .to_str()
         .ok_or_else(|| format!("perf.data path is not utf-8: {}", perf_data.display()))?;
+    let mut command = CommandSpec::new("perf").arg("script").arg("--force");
+    if let Some(inline) = inline {
+        command = command.arg(if inline { "--inline" } else { "--no-inline" });
+    }
     let output_bytes = runner
-        .run(
-            &CommandSpec::new("perf")
-                .arg("script")
-                .arg("--force")
-                .arg("-i")
-                .arg(perf_data),
-        )
+        .run(&command.arg("-i").arg(perf_data))
         .map_err(|error| format!("failed to run perf script: {error}"))?;
     if output_bytes.status_code != Some(0) {
         return Err(format!(
@@ -716,6 +739,7 @@ fn run_inferno_stream<R>(
     perf_script: Option<&Path>,
     runner: &R,
     symbols: bool,
+    inline: bool,
     line_sender: SyncSender<String>,
 ) -> Result<ProducerResult, String>
 where
@@ -772,14 +796,14 @@ where
                             perf_symbol_resolver_for_current_home(runner, &export_perf_data);
                         write_inferno_perf_script_file_with_symbols(
                             &export_perf_data,
-                            benchmark_fold_options(true),
+                            benchmark_fold_options(inline),
                             &resolver,
                             &mut stdin,
                         )
                     } else {
                         write_inferno_perf_script_file_with_options(
                             &export_perf_data,
-                            benchmark_fold_options(true),
+                            benchmark_fold_options(inline),
                             &mut stdin,
                         )
                     }?;

@@ -67,6 +67,54 @@ pub fn build_id_events_from_perfdata(bytes: &[u8]) -> Result<Vec<BuildIdEvent>, 
     Ok(events)
 }
 
+pub(super) fn build_id_events_from_reader(
+    reader: &mut (impl Read + Seek),
+) -> Result<Vec<BuildIdEvent>, String> {
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("failed to seek perf.data header: {error}"))?;
+    let mut header_bytes = [0_u8; 104];
+    reader
+        .read_exact(&mut header_bytes)
+        .map_err(|error| format!("failed to read perf.data header: {error}"))?;
+    let header = parse_header(&header_bytes)?;
+    let sections = feature_sections_from_reader(reader, &header, &header_bytes)?;
+    let file_size = reader
+        .seek(SeekFrom::End(0))
+        .map_err(|error| format!("failed to read perf.data size: {error}"))?;
+    let mut events = Vec::new();
+    let mut collect = |event| {
+        events.push(event);
+        true
+    };
+    if let Some(section) = sections
+        .into_iter()
+        .find(|section| section.feature == HEADER_BUILD_ID)
+    {
+        visit_build_id_record_section(
+            reader,
+            section.offset,
+            section.size,
+            file_size,
+            true,
+            false,
+            &mut collect,
+        )?;
+    }
+    // This prepass supplies optional metadata. Replay owns malformed data-stream
+    // framing errors so streaming consumers receive valid earlier samples first.
+    visit_build_id_record_section(
+        reader,
+        header.data_offset,
+        header.data_size,
+        file_size,
+        false,
+        true,
+        &mut collect,
+    )?;
+    Ok(events)
+}
+
 /// Extracts the kernel build ID recorded in a `perf.data` file.
 ///
 /// # Errors
@@ -129,11 +177,31 @@ fn kernel_build_id_from_reader(reader: &mut (impl Read + Seek)) -> Result<Option
 
 fn kernel_build_id_from_record_section(
     reader: &mut (impl Read + Seek),
-    mut offset: u64,
+    offset: u64,
     size: u64,
     file_size: u64,
     feature: bool,
 ) -> Result<Option<String>, String> {
+    let mut kernel_build_id = None;
+    visit_build_id_record_section(reader, offset, size, file_size, feature, false, |event| {
+        if kernel_build_id.is_none() && is_kernel_build_id_filename(&event.filename) {
+            kernel_build_id = Some(event.build_id);
+        }
+        // Header features must be validated in full; data lookup can stop.
+        feature || kernel_build_id.is_none()
+    })?;
+    Ok(kernel_build_id)
+}
+
+fn visit_build_id_record_section(
+    reader: &mut (impl Read + Seek),
+    mut offset: u64,
+    size: u64,
+    file_size: u64,
+    feature: bool,
+    stop_on_invalid_framing: bool,
+    mut visit: impl FnMut(BuildIdEvent) -> bool,
+) -> Result<(), String> {
     let end = offset
         .checked_add(size)
         .ok_or_else(|| "build-id record section range overflows u64".to_string())?;
@@ -145,9 +213,11 @@ fn kernel_build_id_from_record_section(
         .map_err(|error| format!("failed to seek build-id record section: {error}"))?;
     let mut reader = BufReader::new(reader);
     let mut bytes = Vec::new();
-    let mut kernel_build_id = None;
     while offset < end {
         if end - offset < 8 {
+            if stop_on_invalid_framing {
+                return Ok(());
+            }
             return Err(format!("truncated perf record header at offset {offset}"));
         }
         let mut header_bytes = [0_u8; 8];
@@ -156,6 +226,9 @@ fn kernel_build_id_from_record_section(
         })?;
         let header = parse_record_header(&header_bytes)?;
         if header.size < 8 || (feature && usize::from(header.size) < BUILD_ID_EVENT_MIN_SIZE) {
+            if stop_on_invalid_framing {
+                return Ok(());
+            }
             return Err(format!(
                 "invalid build-id record section record size {} at offset {offset}",
                 header.size
@@ -165,6 +238,9 @@ fn kernel_build_id_from_record_section(
             .checked_add(u64::from(header.size))
             .ok_or_else(|| "build-id record size overflows u64".to_string())?;
         if next > end {
+            if stop_on_invalid_framing {
+                return Ok(());
+            }
             return Err(format!(
                 "build-id record overruns section at offset {offset}"
             ));
@@ -189,12 +265,8 @@ fn kernel_build_id_from_record_section(
             } else {
                 parse_build_id_record(header.misc, &bytes[8..])?
             };
-            if kernel_build_id.is_none() && is_kernel_build_id_filename(&event.filename) {
-                if !feature {
-                    return Ok(Some(event.build_id));
-                }
-                // perf_header__read_build_ids validates the whole feature.
-                kernel_build_id = Some(event.build_id);
+            if !visit(event) {
+                return Ok(());
             }
         } else {
             reader
@@ -205,7 +277,7 @@ fn kernel_build_id_from_record_section(
         }
         offset = next;
     }
-    Ok(kernel_build_id)
+    Ok(())
 }
 
 fn build_id_events_from_record_stream(bytes: &[u8]) -> Result<Vec<BuildIdEvent>, String> {

@@ -45,32 +45,17 @@ cd "$REPO"
 cargo build --quiet --release --bin pyroclast --example pyroclast-bench
 
 for name in ${ORACLE_NAMES:-fp dwarf}; do
-    [ -f "$ORACLE_OUT/$name.perf.data" ] || continue
-    # Keep Pyroclast's inline-capable fold path on for every oracle. fp data
-    # naturally stays one frame per callchain entry, while DWARF data can match
-    # the `(inlined)` rows that modern `perf script` emits.
-    timeout 600 "$CARGO_TARGET_DIR/release/examples/pyroclast-bench" \
-        "$ORACLE_OUT/$name.perf.data" \
-        --perf-script "$ORACLE_OUT/$name.perf.script" \
-        --symbols \
-        | tee "$ORACLE_OUT/$name.bench.txt" \
-        || echo "pyroclast-bench failed for $name (continuing)" >&2
-    # --count-periods matches the scoreboard (benchmark_fold_options) so the
-    # printed folded diff lines up with inferno's period-weighted counts.
-    timeout 600 "$CARGO_TARGET_DIR/release/pyroclast" plumbing fold --count-periods \
-        "$ORACLE_OUT/$name.perf.data" > "$ORACLE_OUT/$name.pyroclast.folded" \
-        || echo "plumbing fold failed for $name (continuing)" >&2
-    timeout 600 "$CARGO_TARGET_DIR/release/pyroclast" plumbing perf-script \
-        "$ORACLE_OUT/$name.perf.data" > "$ORACLE_OUT/$name.pyroclast.script" \
-        || echo "plumbing perf-script failed for $name (continuing)" >&2
-done
-
-for name in ${ORACLE_NAMES:-fp dwarf}; do
-    [ -f "$ORACLE_OUT/$name.pyroclast.script" ] || continue
-    echo "================ $name script diff (perf vs pyroclast) ================"
-    diff "$ORACLE_OUT/$name.perf.script" "$ORACLE_OUT/$name.pyroclast.script" | head -50 || true
-    echo "================ $name folded diff (inferno vs pyroclast) ============="
-    diff <(sort "$ORACLE_OUT/$name.inferno.folded") <(sort "$ORACLE_OUT/$name.pyroclast.folded") | head -50 || true
-    echo "================ $name bench scoreboard ==============================="
-    grep -E 'inferno_compare\.(matches|only_)' "$ORACLE_OUT/$name.bench.txt" || true
+    recording="$ORACLE_OUT/$name.perf.data"
+    [ -f "$recording" ] || { echo "missing required oracle recording: $recording" >&2; exit 1; }
+    # Export fresh native perf text with the same explicit inline mode as the
+    # implementation. This job fails on missing input, tool errors, or any diff.
+    PYROCLAST_BIN="$CARGO_TARGET_DIR/release/pyroclast" \
+        timeout 600 "$REPO/scripts/check-perf-parity" "$recording" \
+        | tee "$ORACLE_OUT/$name.parity.txt"
+    for mode in inline no-inline; do
+        perf script --force "--$mode" -i "$recording" > "$ORACLE_OUT/$name.$mode.perf.script"
+        timeout 600 "$CARGO_TARGET_DIR/release/examples/pyroclast-bench" \
+            "$recording" --perf-script "$ORACLE_OUT/$name.$mode.perf.script" \
+            --symbols "--$mode" | tee "$ORACLE_OUT/$name.$mode.bench.txt"
+    done
 done

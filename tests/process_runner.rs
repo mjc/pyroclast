@@ -22,6 +22,56 @@ fn real_runner_writes_configured_stdin() {
 }
 
 #[test]
+fn real_runner_drains_output_while_writing_large_stdin() {
+    let bytes = vec![b'x'; 1024 * 1024];
+    let expected = bytes.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = RealCommandRunner::default().run(&CommandSpec::new("cat").stdin(bytes));
+        let _ = sender.send(result);
+    });
+
+    let output = receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("large bidirectional transfers must not deadlock")
+        .expect("run cat");
+    assert_eq!(output.status_code, Some(0));
+    assert_eq!(output.stdout, expected);
+}
+
+#[test]
+fn real_runner_can_capture_interactive_output() {
+    let output = RealCommandRunner::default()
+        .run(
+            &CommandSpec::new("sh")
+                .args(["-c", "printf profile-output; printf profile-error >&2"])
+                .interactive()
+                .capture_output(),
+        )
+        .expect("capture interactive command");
+
+    assert_eq!(output.stdout, b"profile-output");
+    assert_eq!(output.stderr, b"profile-error");
+}
+
+#[cfg(unix)]
+#[test]
+fn capturing_interactive_output_retains_interrupt_status() {
+    let output = RealCommandRunner::default()
+        .run(
+            &CommandSpec::new("sh")
+                .args(["-c", "printf before-interrupt; kill -INT $$"])
+                .interactive()
+                .capture_output(),
+        )
+        .unwrap();
+
+    assert_eq!(output.stdout, b"before-interrupt");
+    assert_eq!(output.status_code, Some(-libc::SIGINT));
+    assert!(output.succeeded_or_interrupted());
+}
+
+#[test]
 fn real_runner_reports_child_status_when_stdin_pipe_breaks() {
     let output = RealCommandRunner::default()
         .run(

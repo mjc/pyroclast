@@ -1,8 +1,8 @@
 use proptest::prelude::*;
 use proptest::string::string_regex;
 use pyroclast::flamegraph::analysis::{
-    FlamegraphEntry, categorize_flamegraph_frame, diff_flamegraphs, parse_flamegraph_entries,
-    syscall_breakdown, top_entries,
+    FlamegraphEntry, categorize_flamegraph_frame, diff_flamegraph_svgs, diff_flamegraphs,
+    parse_flamegraph_categories, parse_flamegraph_entries, syscall_breakdown, top_entries,
 };
 
 #[test]
@@ -76,6 +76,90 @@ fn diffs_entries_by_function_name() {
     assert_float_eq(diff[0].delta_percent, 50.0);
     assert_eq!(diff[1].name, "parse");
     assert_float_eq(diff[1].delta_percent, -30.0);
+}
+
+#[test]
+fn diff_aggregates_disjoint_occurrences_of_the_same_function() {
+    let before = vec![entry("work", 60, 60.0), entry("work", 40, 40.0)];
+    let after = vec![entry("work", 80, 80.0), entry("work", 20, 20.0)];
+    assert!(diff_flamegraphs(&before, &after, 0.01).is_empty());
+}
+
+#[test]
+fn native_svg_diff_counts_recursive_functions_once_and_keeps_disjoint_samples() {
+    let render = |lines: &[&str], direction| {
+        let mut options = inferno::flamegraph::Options::default();
+        options.direction = direction;
+        let mut svg = Vec::new();
+        inferno::flamegraph::from_lines(&mut options, lines.iter().copied(), &mut svg).unwrap();
+        String::from_utf8(svg).unwrap()
+    };
+    for direction in [
+        inferno::flamegraph::Direction::Straight,
+        inferno::flamegraph::Direction::Inverted,
+    ] {
+        let before = render(&["main;work;helper;work 60", "other;work 40"], direction);
+        let after = render(&["main;work 80", "other;work 20"], direction);
+        let diff = diff_flamegraph_svgs(&before, &after, 0.01).unwrap();
+        assert!(!diff.iter().any(|delta| delta.name == "work"));
+        let helper = diff.iter().find(|delta| delta.name == "helper").unwrap();
+        assert_eq!(helper.before_samples, 60);
+        assert_float_eq(helper.delta_percent, -60.0);
+    }
+}
+
+#[test]
+fn native_flamegraph_categories_count_exclusive_samples_once() {
+    let mut options = inferno::flamegraph::Options::default();
+    let mut svg = Vec::new();
+    inferno::flamegraph::from_lines(
+        &mut options,
+        [
+            "main;tokio::runtime;zfs_read 60",
+            "main;tokio::runtime;tokio::runtime 40",
+        ],
+        &mut svg,
+    )
+    .unwrap();
+    let categories = parse_flamegraph_categories(std::str::from_utf8(&svg).unwrap()).unwrap();
+    assert_eq!(categories.len(), 2);
+    assert_eq!(categories[0].name, "Disk I/O");
+    assert_float_eq(categories[0].percent, 60.0);
+    assert_eq!(categories[1].name, "Tokio Runtime");
+    assert_float_eq(categories[1].percent, 40.0);
+}
+
+#[test]
+fn category_summary_requires_rectangle_topology_instead_of_guessing() {
+    assert!(
+        parse_flamegraph_categories("<svg><title>work (2 samples, 100%)</title></svg>").is_err()
+    );
+}
+
+#[test]
+fn native_inverted_flamegraph_preserves_parent_self_time() {
+    let mut options = inferno::flamegraph::Options::default();
+    options.direction = inferno::flamegraph::Direction::Inverted;
+    let mut svg = Vec::new();
+    inferno::flamegraph::from_lines(
+        &mut options,
+        ["tokio::runtime 25", "tokio::runtime;zfs_read 75"],
+        &mut svg,
+    )
+    .unwrap();
+    let categories = parse_flamegraph_categories(std::str::from_utf8(&svg).unwrap()).unwrap();
+    assert_eq!(categories[0].name, "Disk I/O");
+    assert_float_eq(categories[0].percent, 75.0);
+    assert_eq!(categories[1].name, "Tokio Runtime");
+    assert_float_eq(categories[1].percent, 25.0);
+}
+
+#[test]
+fn flamegraph_parser_decodes_xml_symbol_entities() {
+    let entries = parse_flamegraph_entries(
+        "<svg><g><title>read&lt;T&gt;&amp;work (2 samples, 100%)</title></g></svg>",
+    );
+    assert_eq!(entries[0].name, "read<T>&work");
 }
 
 #[test]

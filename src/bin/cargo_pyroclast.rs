@@ -1,5 +1,11 @@
+use clap::Parser;
+
 fn main() {
-    match pyroclast::run_cargo_cli(std::env::args_os()) {
+    let cli = pyroclast::cargo_cli::CargoCli::parse_from(
+        pyroclast::cargo_cli::normalize_cargo_args(std::env::args_os()),
+    );
+    let json = cli.command.json();
+    match pyroclast::run_parsed_cargo_cli(cli) {
         Ok(output) => {
             if let Err(error) =
                 pyroclast::write_cli_output(&output, std::io::stdout(), std::io::stderr())
@@ -9,6 +15,12 @@ fn main() {
             }
         }
         Err(error) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"status": "failed", "error": error.to_string()})
+                );
+            }
             eprintln!("error: {error}");
             std::process::exit(1);
         }

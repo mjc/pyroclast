@@ -1423,6 +1423,45 @@ fn rust_addr2line_resolver_synthesizes_x86_64_plt_symbols_like_perf_script() {
 }
 
 #[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn non_pie_plt_symbols_use_virtual_addresses_after_mapping_translation() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("fixture.c");
+    let binary = root.path().join("fixture");
+    std::fs::write(
+        &source,
+        "#include <stdio.h>\nint main(void) { puts(\"hello\"); return 0; }\n",
+    )
+    .unwrap();
+    let output = Command::new("cc")
+        .args(["-fno-pie", "-no-pie", "-g"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bytes = std::fs::read(&binary).unwrap();
+    let object = object::File::parse(bytes.as_slice()).unwrap();
+    let plt = object.section_by_name(".plt").unwrap();
+    assert_ne!(plt.address(), plt.file_range().unwrap().0);
+    let address = plt.file_range().unwrap().0 + 16;
+    let resolver =
+        pyroclast::symbols::PerfSymbolResolver::from_object_resolver(RustAddr2lineResolver::new());
+    let mut request = test_symbol_request(0, 0);
+    request.path = binary;
+    request.relative_address = address;
+    let frames = resolver
+        .resolve_base_frame_batch_with_metadata(&[request])
+        .unwrap();
+    assert_eq!(frames[0].frames, vec!["puts@plt+0x0"]);
+}
+
+#[test]
 fn rust_addr2line_resolver_replaces_base_symbol_when_perf_inline_name_differs() {
     let Some((profiling_binary, object_bytes)) = profiling_binary_fixture() else {
         return;
@@ -1461,7 +1500,16 @@ fn rust_addr2line_resolver_replaces_base_symbol_when_perf_inline_name_differs() 
 
 fn profiling_binary_fixture() -> Option<(PathBuf, Vec<u8>)> {
     let profiling_binary = PathBuf::from("target/profiling/pyroclast");
-    let bytes = std::fs::read(&profiling_binary).ok()?;
+    let bytes = match std::fs::read(&profiling_binary) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!(
+                "optional profiling-binary coverage skipped ({}): {error}; run cargo build --profile profiling to enable it",
+                profiling_binary.display()
+            );
+            return None;
+        }
+    };
     Some((profiling_binary, bytes))
 }
 

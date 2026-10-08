@@ -7,9 +7,7 @@ pub use crate::symbols::SymbolizerKind;
 
 #[derive(Debug, Parser)]
 #[command(name = "pyroclast")]
-#[command(
-    about = "Rust-first profiling orchestration with separate porcelain and plumbing surfaces"
-)]
+#[command(about = "Profile any application with the appropriate native OS tools")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: CliCommand,
@@ -91,6 +89,12 @@ pub enum ProfileKind {
     Async,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum OffcpuChoice {
+    PerfSched,
+    Bpftrace,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum PerfCallGraph {
@@ -129,6 +133,9 @@ impl std::fmt::Display for PerfCallGraph {
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
+    /// Override automatic blocked-time recorder selection.
+    #[arg(long, value_enum)]
+    pub offcpu_method: Option<OffcpuChoice>,
     #[arg(long)]
     pub out: Option<PathBuf>,
 
@@ -171,6 +178,7 @@ pub struct RunArgs {
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct ProfileInvocation {
+    pub offcpu_method: Option<OffcpuChoice>,
     pub kind: ProfileKind,
     pub out: Option<PathBuf>,
     pub name: Option<String>,
@@ -197,6 +205,7 @@ impl CliCommand {
             Self::Latency(args) => Some(ProfileInvocation::from_run(ProfileKind::Latency, args)),
             Self::Async(args) => Some(ProfileInvocation::from_run(ProfileKind::Async, args)),
             Self::Profile(args) => Some(ProfileInvocation {
+                offcpu_method: args.offcpu_method,
                 kind: args.kind,
                 out: args.out.clone(),
                 name: args.name.clone(),
@@ -220,6 +229,7 @@ impl CliCommand {
 impl ProfileInvocation {
     fn from_run(kind: ProfileKind, args: &RunArgs) -> Self {
         Self {
+            offcpu_method: args.offcpu_method,
             kind,
             out: args.out.clone(),
             name: args.name.clone(),
@@ -244,6 +254,9 @@ pub(crate) fn profile_symbols_enabled(kind: ProfileKind, no_symbols: bool) -> bo
 
 #[derive(Debug, Args)]
 pub struct ProfileArgs {
+    /// Override automatic blocked-time recorder selection.
+    #[arg(long, value_enum)]
+    pub offcpu_method: Option<OffcpuChoice>,
     #[arg(long, value_enum, default_value_t = ProfileKind::Cpu)]
     pub kind: ProfileKind,
 

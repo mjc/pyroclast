@@ -44,8 +44,10 @@ pub fn parse_strace_summary(input: &str) -> StraceSummary {
     };
 
     for line in input.lines() {
-        if let Some(seconds) = parse_duration(line) {
-            summary.add_call(parse_syscall_name(line), seconds);
+        if let Some(seconds) = parse_duration(line)
+            && let Some(syscall) = parse_syscall_name(line)
+        {
+            summary.add_call(Some(syscall), seconds);
         }
     }
 
@@ -71,11 +73,24 @@ pub fn render_strace_summary_text(summary: &StraceSummary) -> String {
 fn parse_duration(line: &str) -> Option<f64> {
     let start = line.rfind('<')?;
     let end = line[start..].find('>')? + start;
-    line[start + 1..end].parse().ok()
+    let seconds: f64 = line[start + 1..end].parse().ok()?;
+    (seconds.is_finite() && seconds >= 0.0).then_some(seconds)
 }
 
 fn parse_syscall_name(line: &str) -> Option<&str> {
+    if let Some((_, resumed)) = line.split_once("<... ") {
+        let (name, _) = resumed.split_once(" resumed>")?;
+        return valid_syscall_name(name).then_some(name);
+    }
     let open = line.find('(')?;
     let before_open = line[..open].trim_end();
-    before_open.split_whitespace().last()
+    let name = before_open.split_whitespace().last()?;
+    valid_syscall_name(name).then_some(name)
+}
+
+fn valid_syscall_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }

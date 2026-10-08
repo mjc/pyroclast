@@ -1,9 +1,12 @@
+mod metadata;
+pub(crate) use metadata::{PerfSampleMetadata, visit_perfdata_file_metadata};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write as IoWrite};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use hashbrown::HashMap;
 use rustc_hash::FxBuildHasher;
@@ -15,7 +18,7 @@ use crate::folded::{
 };
 use crate::perfdata::attrs::{PerfFileAttr, parse_file_attr_ids, parse_file_attrs};
 use crate::perfdata::build_id::{
-    BuildIdEvent, build_id_events_from_perfdata, parse_build_id_events,
+    BuildIdEvent, build_id_events_from_perfdata, build_id_events_from_reader,
 };
 use crate::perfdata::endian::{read_u32, read_u64};
 use crate::perfdata::header::{
@@ -28,19 +31,19 @@ use crate::perfdata::mappings::{
 use crate::perfdata::records::{
     PERF_RECORD_FINISHED_ROUND, PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_CPUMODE_KERNEL,
     PERF_RECORD_MISC_CPUMODE_MASK, PERF_RECORD_MISC_CPUMODE_USER, PERF_RECORD_MISC_FORK_EXEC,
-    PERF_RECORD_MISC_MMAP_BUILD_ID, ParsedRecord, PerfRecord, iter_records,
-    parse_aux_output_hw_id_record, parse_aux_record, parse_bpf_event_record,
-    parse_callchain_deferred_record, parse_cgroup_record, parse_comm_record, parse_exit_record,
-    parse_fork_record, parse_itrace_start_record, parse_ksymbol_record, parse_lost_record,
-    parse_lost_samples_record, parse_mmap_record, parse_mmap2_build_id_record, parse_mmap2_record,
-    parse_namespaces_record, parse_read_record, parse_record, parse_switch_cpu_wide_record,
-    parse_switch_record, parse_text_poke_record, parse_throttle_record, parse_unthrottle_record,
+    PERF_RECORD_MISC_MMAP_BUILD_ID, ParsedRecord, PerfRecord, parse_aux_output_hw_id_record,
+    parse_aux_record, parse_bpf_event_record, parse_callchain_deferred_record, parse_cgroup_record,
+    parse_comm_record, parse_exit_record, parse_fork_record, parse_itrace_start_record,
+    parse_ksymbol_record, parse_lost_record, parse_lost_samples_record, parse_mmap_record,
+    parse_mmap2_build_id_record, parse_mmap2_record, parse_namespaces_record, parse_read_record,
+    parse_record, parse_switch_cpu_wide_record, parse_switch_record, parse_text_poke_record,
+    parse_throttle_record, parse_unthrottle_record,
 };
 use crate::perfdata::samples::{
     PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_ID,
     PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID,
     PERF_SAMPLE_TIME, SampleLayout, is_kernel_space_frame, is_perf_context_marker,
-    parse_sample_record_callchain,
+    parse_sample_record_callchain, parse_sample_record_metadata,
 };
 use crate::perfdata::source::{
     FileSource, QueuedPerfRecord, RecordSource, SliceSource, WindowStore,
@@ -51,8 +54,8 @@ use crate::perfdata::unwind::{
     unwind_x86_64_frame_pointer_stack_like_elfutils,
 };
 use crate::symbols::{
-    CachedMappingFrames, SymbolFrameCache, SymbolRequest, SymbolResolver,
-    perf_build_id_elf_path_for_dso,
+    CachedMappingFrames, LiveVdsoElf, SymbolFrameCache, SymbolRequest, SymbolResolver,
+    copy_live_vdso_elf_like_perf, perf_build_id_elf_path_for_dso,
 };
 
 const UNKNOWN_FRAME: &str = "[unknown]";
@@ -190,6 +193,9 @@ pub struct PerfSampleStack {
     pub cpumode: u16,
     pub pid: Option<u32>,
     pub tid: Option<u32>,
+    pub time: Option<u64>,
+    pub cpu: Option<u32>,
+    /// Effective event period, including the attribute default when omitted.
     pub period: Option<u64>,
     pub callchain: Vec<u64>,
     pub has_user_stack: bool,
@@ -216,7 +222,9 @@ struct SessionState {
 }
 
 struct PidUnwindState {
+    arch: PerfArch,
     object_unwinder: FramehopUnwinder,
+    live_vdso_elf: OnceLock<Option<LiveVdsoElf>>,
     attempted_unwind_mappings: BTreeSet<UnwindMappingKey>,
     loaded_unwind_modules: BTreeSet<UnwindModuleKey>,
     /// Memo of the ip-intrinsic leaf-only eligibility per sampled IP. Only the
@@ -235,7 +243,9 @@ struct PidUnwindState {
 impl PidUnwindState {
     fn with_arch(arch: PerfArch) -> Self {
         Self {
+            arch,
             object_unwinder: FramehopUnwinder::with_arch(arch),
+            live_vdso_elf: OnceLock::new(),
             attempted_unwind_mappings: BTreeSet::new(),
             loaded_unwind_modules: BTreeSet::new(),
             leaf_only_eligibility: HashMap::with_hasher(FxBuildHasher),
@@ -621,11 +631,73 @@ where
 /// supported record payload is malformed.
 pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
     let header = parse_header(bytes)?;
+    validate_perfdata_sections(header, bytes.len())?;
     let sample_layouts = sample_layouts(bytes, header)?;
-    let records = iter_records(bytes, header)?;
+    let arch = perf_arch_from_header(parse_header_arch(bytes, &header)?.as_deref());
+    summarize_perfdata_source(&mut SliceSource(bytes), header, &sample_layouts, arch)
+}
+
+/// Summarizes a completed perf recording with bounded buffered reads.
+///
+/// # Errors
+///
+/// Returns an error when the recording cannot be read or parsed.
+pub fn summarize_perfdata_file(path: &Path) -> Result<PerfSummary, String> {
+    let file = File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
+    let (header, bytes) = perfdata_header_from_file(&file)?;
+    let mut source = FileSource::new(&file)?;
+    validate_perfdata_sections(header, source.len())?;
+    let layouts = sample_layouts_from_file(&file, header, &bytes)?;
+    let arch = perf_arch_from_header(header_arch_from_file(&file, header, &bytes)?.as_deref());
+    summarize_perfdata_source(&mut source, header, &layouts, arch)
+}
+
+fn validate_perfdata_sections(header: PerfHeader, file_len: usize) -> Result<(), String> {
+    let file_len =
+        u64::try_from(file_len).map_err(|_| "perf.data length exceeds u64".to_string())?;
+    let ranges = [
+        (0, header.header_size, "perf header"),
+        (header.attr_offset, header.attr_size, "perf attr section"),
+        (header.data_offset, header.data_size, "perf data section"),
+    ];
+    for (index, &(start, size, name)) in ranges.iter().enumerate() {
+        if size == 0 {
+            continue;
+        }
+        let end = start
+            .checked_add(size)
+            .ok_or_else(|| format!("{name} range overflows u64"))?;
+        if end > file_len {
+            return Err(format!("{name} extends past end of file"));
+        }
+        for &(other_start, other_size, other_name) in &ranges[..index] {
+            if other_size != 0 && start < other_start + other_size && other_start < end {
+                return Err(format!("{name} overlaps {other_name}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn summarize_perfdata_source(
+    source: &mut impl RecordSource,
+    header: PerfHeader,
+    sample_layouts: &SampleLayouts,
+    arch: PerfArch,
+) -> Result<PerfSummary, String> {
+    let mut offset = usize::try_from(header.data_offset)
+        .map_err(|_| "perf data section offset exceeds usize".to_string())?;
+    let end = offset
+        .checked_add(
+            usize::try_from(header.data_size)
+                .map_err(|_| "perf data section size exceeds usize".to_string())?,
+        )
+        .ok_or_else(|| "perf data section range overflows usize".to_string())?;
     let mut summary = PerfSummary::default();
 
-    for record in records {
+    while offset < end {
+        let record = source.record_at(offset, end)?;
+        offset += usize::from(record.header.size);
         summary.total_records += 1;
         *summary
             .record_counts
@@ -657,7 +729,7 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
                 Ok(())
             }
             ParsedRecord::Sample(record) => {
-                parse_sample_for_summary(record.misc, &record.payload, &sample_layouts).map(
+                parse_sample_for_summary(record.misc, &record.payload, sample_layouts, arch).map(
                     |sample| {
                         if let Some(sample) = sample {
                             summary.sample_stacks.push(sample);
@@ -988,6 +1060,7 @@ where
     R: SymbolResolver,
 {
     let header = parse_header(bytes)?;
+    validate_perfdata_sections(header, bytes.len())?;
     let layouts = sample_layouts(bytes, header)?;
     let arch = perf_arch_from_header(parse_header_arch(bytes, &header)?.as_deref());
     let state = SessionState::new(header_build_ids_by_filename(bytes)?).with_arch(arch);
@@ -1185,16 +1258,56 @@ fn deliver_record<O: SampleOutput>(
 }
 
 fn header_build_ids_by_filename(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, String> {
-    build_id_events_from_perfdata(bytes)?
+    recorded_build_ids_by_filename(build_id_events_from_perfdata(bytes)?)
+}
+
+fn recorded_build_ids_by_filename(
+    events: Vec<BuildIdEvent>,
+) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    let mut ids = events
         .into_iter()
-        .map(|event| hex_build_id_bytes(&event.build_id).map(|build_id| (event.filename, build_id)))
-        .collect()
+        .map(|event| hex_build_id_bytes(&event.build_id).map(|id| (event.filename, id)))
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    if !ids.contains_key("[vdso]") {
+        // Native perf writes the live image using a mkstemp name while MMAP2
+        // retains the canonical [vdso] name. Preserve its recorded identity.
+        let aliases = ids
+            .iter()
+            .filter(|(path, _)| is_perf_temporary_vdso_path(path))
+            .map(|(_, id)| id)
+            .collect::<BTreeSet<_>>();
+        if aliases.len() > 1 {
+            return Err("ambiguous recorded native vDSO build IDs".to_string());
+        }
+        let alias_id = aliases.into_iter().next().cloned();
+        if let Some(id) = alias_id {
+            ids.insert("[vdso]".to_string(), id);
+        }
+    }
+    Ok(ids)
+}
+
+fn is_perf_temporary_vdso_path(path: &str) -> bool {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("perf-vdso.so-"))
+        .is_some_and(|suffix| {
+            suffix.len() == 6 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
 }
 
 fn file_replay_state(file: &File) -> Result<(PerfHeader, SampleLayouts, SessionState), String> {
     let (header, bytes) = perfdata_header_from_file(file)?;
+    let file_len = usize::try_from(
+        file.metadata()
+            .map_err(|error| format!("failed to stat perf.data: {error}"))?
+            .len(),
+    )
+    .map_err(|_| "perf.data length exceeds usize".to_string())?;
+    validate_perfdata_sections(header, file_len)?;
     let layouts = sample_layouts_from_file(file, header, &bytes)?;
-    let ids = header_build_ids_by_filename_from_file(file, header, &bytes)?;
+    let ids = header_build_ids_by_filename_from_file(file)?;
     let arch = perf_arch_from_header(header_arch_from_file(file, header, &bytes)?.as_deref());
     Ok((header, layouts, SessionState::new(ids).with_arch(arch)))
 }
@@ -1906,30 +2019,11 @@ fn file_attr_ids_from_file(file: &File, attr: &PerfFileAttr) -> Result<Vec<u64>,
 
 fn header_build_ids_by_filename_from_file(
     file: &File,
-    header: PerfHeader,
-    header_bytes: &[u8; 104],
 ) -> Result<BTreeMap<String, Vec<u8>>, String> {
-    build_id_events_from_file(file, header, header_bytes)?
-        .into_iter()
-        .map(|event| hex_build_id_bytes(&event.build_id).map(|build_id| (event.filename, build_id)))
-        .collect()
-}
-
-fn build_id_events_from_file(
-    file: &File,
-    header: PerfHeader,
-    header_bytes: &[u8; 104],
-) -> Result<Vec<BuildIdEvent>, String> {
-    let Some(section) = feature_sections_from_file(file, header, header_bytes)?
-        .into_iter()
-        .find(|section| section.feature == 2)
-    else {
-        return Ok(Vec::new());
-    };
-    let size = usize::try_from(section.size)
-        .map_err(|_| "build-id feature size exceeds usize".to_string())?;
-    let payload = read_file_range(file, section.offset, size, "build-id feature payload")?;
-    parse_build_id_events(&payload)
+    let mut reader = file
+        .try_clone()
+        .map_err(|error| format!("failed to clone perf.data handle: {error}"))?;
+    recorded_build_ids_by_filename(build_id_events_from_reader(&mut reader)?)
 }
 
 // HEADER_ARCH feature bit (tools/perf/util/header.h enum HEADER_*).
@@ -1994,32 +2088,31 @@ fn event_desc_entries_from_file(
     let size = usize::try_from(section.size)
         .map_err(|_| "event desc feature size exceeds usize".to_string())?;
     let payload = read_file_range(file, section.offset, size, "event desc feature payload")?;
-    Ok(parse_event_desc_entries(&payload))
+    parse_event_desc_entries(&payload)
 }
 
 fn event_desc_entries_from_bytes(
     bytes: &[u8],
     header: crate::perfdata::header::PerfHeader,
-) -> Vec<EventDescEntry> {
-    let Ok(sections) = crate::perfdata::header::parse_feature_sections(bytes, &header) else {
-        return Vec::new();
-    };
+) -> Result<Vec<EventDescEntry>, String> {
+    let sections = crate::perfdata::header::parse_feature_sections(bytes, &header)?;
     let Some(section) = sections
         .into_iter()
         .find(|section| section.feature == HEADER_EVENT_DESC_FEATURE)
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    let (Ok(offset), Ok(size)) = (
-        usize::try_from(section.offset),
-        usize::try_from(section.size),
-    ) else {
-        return Vec::new();
-    };
-    bytes
-        .get(offset..offset + size)
-        .map(parse_event_desc_entries)
-        .unwrap_or_default()
+    let offset = usize::try_from(section.offset)
+        .map_err(|_| "event desc feature offset exceeds usize".to_string())?;
+    let size = usize::try_from(section.size)
+        .map_err(|_| "event desc feature size exceeds usize".to_string())?;
+    let end = offset
+        .checked_add(size)
+        .ok_or_else(|| "event desc feature range overflows usize".to_string())?;
+    let payload = bytes
+        .get(offset..end)
+        .ok_or_else(|| "event desc feature payload is truncated".to_string())?;
+    parse_event_desc_entries(payload)
 }
 
 fn feature_sections_from_file(
@@ -2039,6 +2132,17 @@ fn read_file_range(
     len: usize,
     range_name: &str,
 ) -> Result<Vec<u8>, String> {
+    let len_u64 = u64::try_from(len).map_err(|_| format!("{range_name} size exceeds u64"))?;
+    let end = offset
+        .checked_add(len_u64)
+        .ok_or_else(|| format!("{range_name} range overflows u64"))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| format!("failed to stat {range_name}: {error}"))?
+        .len();
+    if end > file_len {
+        return Err(format!("{range_name} extends past end of file"));
+    }
     let mut bytes = vec![0; len];
     let mut reader = file
         .try_clone()
@@ -3957,15 +4061,18 @@ fn parse_sample_for_summary(
     sample_misc: u16,
     payload: &[u8],
     sample_layouts: &SampleLayouts,
+    arch: PerfArch,
 ) -> Result<Option<PerfSampleStack>, String> {
     if let Some(event) = sample_layouts.layout_for_payload(payload)? {
-        parse_sample_record_callchain(payload, event.layout).map(|sample| {
+        parse_sample_record_metadata(payload, event.layout).map(|sample| {
             sample.map(|sample| PerfSampleStack {
                 misc: sample_misc,
                 cpumode: sample_misc & PERF_RECORD_MISC_CPUMODE_MASK,
                 pid: sample.pid,
                 tid: sample.tid,
-                period: sample.period,
+                time: sample.time,
+                cpu: sample.cpu,
+                period: Some(sample.period.unwrap_or(event.default_period)),
                 callchain: sample.frames.collect(),
                 has_user_stack: sample.user_stack.is_some(),
                 user_register_count: sample
@@ -3973,7 +4080,11 @@ fn parse_sample_for_summary(
                     .as_ref()
                     .map_or(0, |regs| regs.values.len()),
                 user_register_ip: sample.user_regs.as_ref().and_then(|regs| {
-                    perf_user_reg_value(event.layout.sample_regs_user, &regs.values, 8)
+                    perf_user_reg_value(
+                        event.layout.sample_regs_user,
+                        &regs.values,
+                        arch.instruction_pointer_register(),
+                    )
                 }),
                 user_stack_size: sample
                     .user_stack
@@ -4584,6 +4695,18 @@ fn load_unwind_mapping_for_user_mapping_like_perf(
         file_identity: mapping.file_identity,
         build_id: build_id.as_deref(),
     };
+    // perf reports the native vDSO from its live ELF image when no recorded
+    // cache object is available. Symbolization already follows this fallback;
+    // unwinding must report the same module before accepting the initial IP.
+    // Compat names need their own recorded object and cannot use the host image.
+    if request.path == "[vdso]"
+        && request.build_id.is_none_or(|id| {
+            unwind_object_path_for_build_id(request.path, id, unwind_debug_dir)
+                == Path::new(request.path)
+        })
+    {
+        return load_live_vdso_unwind_mapping(state, request);
+    }
     if build_id.is_some() {
         load_build_id_unwind_mapping(
             &mut state.object_unwinder,
@@ -4600,6 +4723,42 @@ fn load_unwind_mapping_for_user_mapping_like_perf(
             request,
         )
     }
+}
+
+fn load_live_vdso_unwind_mapping(
+    state: &mut PidUnwindState,
+    request: UnwindMappingRequest<'_>,
+) -> bool {
+    let Some(image) = state
+        .live_vdso_elf
+        .get_or_init(copy_live_vdso_elf_like_perf)
+        .as_ref()
+    else {
+        return false;
+    };
+    let architecture = match state.arch {
+        PerfArch::X86_64 => object::Architecture::X86_64,
+        PerfArch::Aarch64 => object::Architecture::Aarch64,
+    };
+    if image.architecture != architecture
+        || request
+            .build_id
+            .is_some_and(|id| image.build_id.as_deref() != Some(id))
+    {
+        return false;
+    }
+    let path = image.path.to_string_lossy();
+    load_unwind_mapping(
+        &mut state.object_unwinder,
+        &mut state.attempted_unwind_mappings,
+        &mut state.loaded_unwind_modules,
+        UnwindMappingRequest {
+            path: &path,
+            pgoff: 0,
+            build_id: None,
+            ..request
+        },
+    )
 }
 
 fn unwind_user_stack_with_diagnostics(
@@ -4839,7 +4998,7 @@ fn sample_layouts(
         .iter()
         .map(|attr| parse_file_attr_ids(bytes, attr))
         .collect::<Result<Vec<_>, _>>()?;
-    let event_desc = event_desc_entries_from_bytes(bytes, header);
+    let event_desc = event_desc_entries_from_bytes(bytes, header)?;
     let event_names = build_event_names(&attrs, &attr_ids, &event_desc);
     let event_name_width = event_names
         .iter()
@@ -4915,15 +5074,17 @@ struct EventDescEntry {
 /// (`PERF_ALIGN(strlen + 1, NAME_ALIGN)`) followed by that many bytes holding
 /// the NUL-terminated name plus zero padding. We read the declared number of
 /// bytes and take the text up to the first NUL.
-fn parse_event_desc_entries(payload: &[u8]) -> Vec<EventDescEntry> {
-    parse_event_desc_entries_checked(payload).unwrap_or_default()
-}
-
-fn parse_event_desc_entries_checked(payload: &[u8]) -> Result<Vec<EventDescEntry>, String> {
+fn parse_event_desc_entries(payload: &[u8]) -> Result<Vec<EventDescEntry>, String> {
     let event_count = read_u32(payload, 0)?;
     let attr_size = usize::try_from(read_u32(payload, 4)?)
         .map_err(|_| "event desc attr size exceeds usize".to_string())?;
     let mut offset = 8usize;
+    let minimum_event_size = attr_size
+        .checked_add(8)
+        .ok_or_else(|| "event desc event size overflows usize".to_string())?;
+    if event_count as usize > payload.len().saturating_sub(offset) / minimum_event_size {
+        return Err("event desc event count exceeds payload".to_string());
+    }
     let mut entries = Vec::with_capacity(event_count as usize);
     for _ in 0..event_count {
         offset = offset
@@ -4935,11 +5096,17 @@ fn parse_event_desc_entries_checked(payload: &[u8]) -> Result<Vec<EventDescEntry
         let name_len = usize::try_from(read_u32(payload, offset)?)
             .map_err(|_| "event desc name length exceeds usize".to_string())?;
         offset += 4;
+        let name_end = offset
+            .checked_add(name_len)
+            .ok_or_else(|| "event desc name range overflows usize".to_string())?;
         let name_bytes = payload
-            .get(offset..offset + name_len)
+            .get(offset..name_end)
             .ok_or_else(|| "event desc name truncated".to_string())?;
         let name = event_desc_name_from_bytes(name_bytes);
-        offset += name_len;
+        offset = name_end;
+        if id_count > payload.len().saturating_sub(offset) / 8 {
+            return Err("event desc ID count exceeds payload".to_string());
+        }
         let mut ids = Vec::with_capacity(id_count);
         for _ in 0..id_count {
             ids.push(read_u64(payload, offset)?);
@@ -5459,7 +5626,7 @@ mod tests {
         // (e.g. "task-clock:ppp") rather than reconstructing them; the trailing
         // colon perf script appends is a separator, not part of the name.
         let payload = event_desc_payload(&[("task-clock:ppp", &[230, 231, 242])], 136);
-        let entries = super::parse_event_desc_entries(&payload);
+        let entries = super::parse_event_desc_entries(&payload).expect("event descriptions");
         assert_eq!(
             entries,
             vec![super::EventDescEntry {
@@ -5718,6 +5885,132 @@ mod tests {
                 inode_generation: 0,
             }),
         ));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn reports_live_vdso_for_unwinding_without_a_recorded_build_id() {
+        let start = 0x7000_0000;
+        let mut maps = super::MmapTable::default();
+        maps.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 11,
+            tid: 11,
+            start,
+            len: 0x1_0000,
+            pgoff: 0,
+            path: "[vdso]".into(),
+        });
+        let mapping = maps.user_mapping_for_pid_ip(11, start + 0x400).unwrap();
+        let mut state = super::PidUnwindState::with_arch(PerfArch::X86_64);
+        assert!(
+            super::load_unwind_mapping_for_user_mapping_like_perf(&mut state, mapping, None),
+            "perf reports the live vDSO before unwinding a sampled vDSO IP"
+        );
+        assert!(
+            state
+                .object_unwinder
+                .has_reported_module_for_ip(start + 0x400)
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn rejects_live_vdso_for_mismatching_recorded_identity_or_architecture() {
+        let mapping = super::UserMapping {
+            pid: 11,
+            start: 0x7000_0000,
+            len: 0x1_0000,
+            pgoff: 0,
+            prot: None,
+            path: "[vdso]",
+            build_id: Some(&[0; 20]),
+            file_identity: None,
+        };
+        let mut state = super::PidUnwindState::with_arch(PerfArch::X86_64);
+        assert!(!super::load_unwind_mapping_for_user_mapping_like_perf(
+            &mut state, mapping, None
+        ));
+        let mut foreign = super::PidUnwindState::with_arch(PerfArch::Aarch64);
+        assert!(!super::load_unwind_mapping_for_user_mapping_like_perf(
+            &mut foreign,
+            super::UserMapping {
+                build_id: None,
+                ..mapping
+            },
+            None
+        ));
+    }
+
+    #[test]
+    fn associates_perf_temporary_vdso_build_id_alias_with_the_vdso_mapping() {
+        let filename = b"/tmp/perf-vdso.so-ABC123\0";
+        let mut record = Vec::new();
+        record.extend(67_u32.to_le_bytes());
+        record.extend(0_u16.to_le_bytes());
+        record.extend(
+            u16::try_from(8 + 4 + 20 + filename.len())
+                .unwrap()
+                .to_le_bytes(),
+        );
+        record.extend(0_u32.to_le_bytes());
+        record.extend([0xaa; 20]);
+        record.extend(filename);
+        let mut bytes = vec![0_u8; 104];
+        bytes[..8].copy_from_slice(b"PERFILE2");
+        bytes[8..16].copy_from_slice(&104_u64.to_le_bytes());
+        bytes[16..24].copy_from_slice(&144_u64.to_le_bytes());
+        bytes[24..32].copy_from_slice(&104_u64.to_le_bytes());
+        bytes[40..48].copy_from_slice(&104_u64.to_le_bytes());
+        bytes[48..56].copy_from_slice(&u64::try_from(record.len()).unwrap().to_le_bytes());
+        bytes.extend(record);
+        let ids = super::header_build_ids_by_filename(&bytes).unwrap();
+        assert_eq!(ids.get("[vdso]"), Some(&vec![0xaa; 20]));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn cached_recorded_vdso_elf_is_preferred_to_the_host_image() {
+        let root = tempfile::tempdir().unwrap();
+        let cached = root.path().join("[vdso]/aa/vdso");
+        std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        std::fs::copy(std::env::current_exe().unwrap(), &cached).unwrap();
+        let mapping = super::UserMapping {
+            pid: 11,
+            start: 0x7000_0000,
+            len: 0x1000_0000,
+            pgoff: 0,
+            prot: None,
+            path: "[vdso]",
+            build_id: Some(&[0xaa]),
+            file_identity: None,
+        };
+        let mut state = super::PidUnwindState::with_arch(PerfArch::X86_64);
+        assert!(super::load_unwind_mapping_for_user_mapping_like_perf(
+            &mut state,
+            mapping,
+            Some(root.path())
+        ));
+        assert!(
+            state.live_vdso_elf.get().is_none(),
+            "the recorded cache must win without consulting host ELF"
+        );
+    }
+
+    #[test]
+    fn ambiguous_native_vdso_build_ids_do_not_choose_an_arbitrary_host_image() {
+        let events = [
+            crate::perfdata::build_id::BuildIdEvent {
+                pid: 1,
+                filename: "/tmp/perf-vdso.so-ABC123".into(),
+                build_id: "aa".into(),
+            },
+            crate::perfdata::build_id::BuildIdEvent {
+                pid: 2,
+                filename: "/tmp/perf-vdso.so-XYZ987".into(),
+                build_id: "bb".into(),
+            },
+        ];
+        assert!(super::recorded_build_ids_by_filename(events.into()).is_err());
     }
 
     #[test]

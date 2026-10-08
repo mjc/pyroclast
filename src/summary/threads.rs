@@ -1,4 +1,71 @@
+use crate::perfdata::fold::PerfSummary;
 use serde::Serialize;
+use std::collections::BTreeMap;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ThreadProfileSummary {
+    pub pid: Option<u32>,
+    pub tid: u32,
+    pub comm: String,
+    pub samples: usize,
+    pub weighted_samples: u64,
+    pub first_sample_ns: Option<u64>,
+    pub last_sample_ns: Option<u64>,
+    pub cpus: Vec<u32>,
+}
+
+#[must_use]
+pub fn summarize_threads(input: &PerfSummary, limit: usize) -> Vec<ThreadProfileSummary> {
+    let mut threads = BTreeMap::new();
+    for sample in &input.sample_stacks {
+        let Some(tid) = sample.tid.or(sample.pid) else {
+            continue;
+        };
+        let thread = threads
+            .entry((sample.pid, tid))
+            .or_insert_with(|| ThreadProfileSummary {
+                pid: sample.pid,
+                tid,
+                comm: input
+                    .comms_by_tid
+                    .get(&tid)
+                    .cloned()
+                    .unwrap_or_else(|| format!("tid {tid}")),
+                samples: 0,
+                weighted_samples: 0,
+                first_sample_ns: None,
+                last_sample_ns: None,
+                cpus: Vec::new(),
+            });
+        thread.samples += 1;
+        thread.weighted_samples = thread
+            .weighted_samples
+            .saturating_add(sample.period.unwrap_or(1));
+        if let Some(time) = sample.time {
+            thread.first_sample_ns =
+                Some(thread.first_sample_ns.map_or(time, |first| first.min(time)));
+            thread.last_sample_ns = Some(thread.last_sample_ns.map_or(time, |last| last.max(time)));
+        }
+        if let Some(cpu) = sample.cpu
+            && !thread.cpus.contains(&cpu)
+        {
+            thread.cpus.push(cpu);
+        }
+    }
+    let mut threads = threads.into_values().collect::<Vec<_>>();
+    for thread in &mut threads {
+        thread.cpus.sort_unstable();
+    }
+    threads.sort_by(|left, right| {
+        right
+            .weighted_samples
+            .cmp(&left.weighted_samples)
+            .then_with(|| left.tid.cmp(&right.tid))
+            .then_with(|| left.pid.cmp(&right.pid))
+    });
+    threads.truncate(limit);
+    threads
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct TopFoldedStack {

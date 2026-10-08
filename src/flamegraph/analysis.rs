@@ -27,9 +27,13 @@ pub struct FlamegraphCategory {
 
 #[must_use]
 pub fn parse_flamegraph_entries(svg: &str) -> Vec<FlamegraphEntry> {
-    let mut entries = svg
-        .split("<title>")
-        .filter_map(|chunk| chunk.find("</title>").map(|end| &chunk[..end]))
+    let Ok(document) = parse_svg(svg) else {
+        return Vec::new();
+    };
+    let mut entries = document
+        .descendants()
+        .filter(|node| node.has_tag_name("title"))
+        .filter_map(|node| node.text())
         .filter_map(parse_title)
         .collect::<Vec<_>>();
     entries.sort_by(|left, right| {
@@ -39,6 +43,184 @@ pub fn parse_flamegraph_entries(svg: &str) -> Vec<FlamegraphEntry> {
             .then_with(|| left.name.cmp(&right.name))
     });
     entries
+}
+
+fn parse_svg(svg: &str) -> Result<roxmltree::Document<'_>, roxmltree::Error> {
+    // Inferno emits an SVG DOCTYPE. roxmltree never fetches external DTDs.
+    roxmltree::Document::parse_with_options(
+        svg,
+        roxmltree::ParsingOptions {
+            allow_dtd: true,
+            ..Default::default()
+        },
+    )
+}
+
+fn flamegraph_frames(svg: &str) -> Result<(Vec<CategoryFrame>, u64), String> {
+    let document = parse_svg(svg).map_err(|error| format!("invalid flamegraph SVG: {error}"))?;
+    let mut frames = Vec::new();
+    for group in document.descendants().filter(|node| node.has_tag_name("g")) {
+        let title = group
+            .children()
+            .find(|node| node.has_tag_name("title"))
+            .and_then(|node| node.text());
+        let Some(entry) = title.and_then(parse_frame_title) else {
+            continue;
+        };
+        let rect = group
+            .children()
+            .find(|node| node.has_tag_name("rect"))
+            .ok_or("flamegraph frame has no rectangle")?;
+        let number = |key: &str| -> Option<f64> {
+            rect.attribute(key)?
+                .trim_end_matches('%')
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+        };
+        let x = rect
+            .attribute(("http://github.com/jonhoo/inferno", "x"))
+            .and_then(|value| value.parse().ok())
+            .or_else(|| number("x"))
+            .ok_or("invalid frame x")?;
+        let width = rect
+            .attribute(("http://github.com/jonhoo/inferno", "w"))
+            .and_then(|value| value.parse().ok())
+            .or_else(|| number("width"))
+            .ok_or("invalid frame width")?;
+        let y = number("y").ok_or("invalid frame y")?;
+        if !x.is_finite() || !width.is_finite() || width < 0.0 || !(x + width).is_finite() {
+            return Err("invalid frame extent".to_string());
+        }
+        frames.push(CategoryFrame {
+            entry,
+            x,
+            end: x + width,
+            depth: y,
+            children: 0,
+        });
+    }
+    let root = frames
+        .iter()
+        .find(|frame| frame.entry.name == "all")
+        .ok_or("flamegraph has no aggregate frame geometry")?;
+    let total = root.entry.samples;
+    let root_y = root.depth;
+    let inverted = frames.iter().any(|frame| frame.depth > root_y);
+    if !inverted {
+        for frame in &mut frames {
+            frame.depth = -frame.depth;
+        }
+    }
+    frames.sort_by(|left, right| {
+        left.x
+            .total_cmp(&right.x)
+            .then_with(|| right.end.total_cmp(&left.end))
+            .then_with(|| left.depth.total_cmp(&right.depth))
+    });
+    Ok((frames, total))
+}
+
+/// Groups exclusive sample weights using Inferno's rectangle topology.
+///
+/// # Errors
+/// Returns an error for invalid XML or missing frame geometry/total weight.
+#[allow(clippy::cast_precision_loss)] // Percentages are approximate; sample counts remain u64.
+pub fn parse_flamegraph_categories(svg: &str) -> Result<Vec<FlamegraphCategory>, String> {
+    let (mut frames, total) = flamegraph_frames(svg)?;
+    if total == 0 {
+        return Ok(Vec::new());
+    }
+    let mut ancestors: Vec<usize> = Vec::new();
+    for index in 0..frames.len() {
+        while ancestors.last().is_some_and(|&parent| {
+            frames[parent].depth >= frames[index].depth
+                || frames[parent].end + 0.0001 < frames[index].end
+        }) {
+            ancestors.pop();
+        }
+        if let Some(&parent) = ancestors.last() {
+            frames[parent].children = frames[parent]
+                .children
+                .saturating_add(frames[index].entry.samples);
+        }
+        ancestors.push(index);
+    }
+    let exclusive = frames
+        .into_iter()
+        .filter(|frame| frame.entry.name != "all")
+        .map(|frame| FlamegraphEntry {
+            name: frame.entry.name,
+            samples: frame.entry.samples.saturating_sub(frame.children),
+            percent: 100.0 * frame.entry.samples.saturating_sub(frame.children) as f64
+                / total as f64,
+        })
+        .filter(|entry| entry.samples != 0)
+        .collect::<Vec<_>>();
+    Ok(category_summary(&exclusive))
+}
+
+struct CategoryFrame {
+    entry: FlamegraphEntry,
+    x: f64,
+    end: f64,
+    depth: f64,
+    children: u64,
+}
+
+/// Compares inclusive per-function sample weights, counting recursion once per stack.
+/// Disjoint occurrences of a function are added; descendant occurrences already
+/// covered by an ancestor with the same name contribute no additional samples.
+///
+/// # Errors
+/// Returns an error for invalid SVG geometry or inconsistent sample totals.
+pub fn diff_flamegraph_svgs(
+    before: &str,
+    after: &str,
+    min_abs_delta_percent: f64,
+) -> Result<Vec<FlamegraphDelta>, String> {
+    Ok(diff_flamegraphs(
+        &inclusive_function_entries(before)?,
+        &inclusive_function_entries(after)?,
+        min_abs_delta_percent,
+    ))
+}
+
+#[allow(clippy::cast_precision_loss)] // Display percentages; counts remain exact.
+fn inclusive_function_entries(svg: &str) -> Result<Vec<FlamegraphEntry>, String> {
+    let (frames, total) = flamegraph_frames(svg)?;
+    if total == 0 {
+        return Ok(Vec::new());
+    }
+    let mut ancestors: Vec<usize> = Vec::new();
+    let mut weights = BTreeMap::<&str, u64>::new();
+    for (index, frame) in frames.iter().enumerate() {
+        while ancestors.last().is_some_and(|&parent| {
+            frames[parent].depth >= frame.depth || frames[parent].end + 0.0001 < frame.end
+        }) {
+            ancestors.pop();
+        }
+        if frame.entry.name != "all"
+            && !ancestors
+                .iter()
+                .any(|&parent| frames[parent].entry.name == frame.entry.name)
+        {
+            let weight = weights.entry(&frame.entry.name).or_default();
+            *weight = weight
+                .checked_add(frame.entry.samples)
+                .filter(|weight| *weight <= total)
+                .ok_or("flamegraph function samples exceed aggregate total")?;
+        }
+        ancestors.push(index);
+    }
+    Ok(weights
+        .into_iter()
+        .map(|(name, samples)| FlamegraphEntry {
+            name: name.to_owned(),
+            samples,
+            percent: 100.0 * samples as f64 / total as f64,
+        })
+        .collect())
 }
 
 #[must_use]
@@ -91,6 +273,8 @@ pub fn syscall_breakdown(entries: &[FlamegraphEntry]) -> Vec<FlamegraphEntry> {
 }
 
 #[must_use]
+/// Sums categories of already-exclusive entries; SVG callers must use
+/// [`parse_flamegraph_categories`] to remove overlapping ancestor weights.
 pub fn category_summary(entries: &[FlamegraphEntry]) -> Vec<FlamegraphCategory> {
     let mut categories = BTreeMap::<&'static str, f64>::new();
     for entry in entries {
@@ -116,6 +300,8 @@ pub fn category_summary(entries: &[FlamegraphEntry]) -> Vec<FlamegraphCategory> 
 }
 
 #[must_use]
+/// Compares flat entries, adding duplicate names. For inclusive SVG rectangles,
+/// use [`diff_flamegraph_svgs`] to avoid counting recursive descendants twice.
 pub fn diff_flamegraphs(
     before: &[FlamegraphEntry],
     after: &[FlamegraphEntry],
@@ -241,9 +427,14 @@ pub fn categorize_flamegraph_frame(name: &str) -> &'static str {
 }
 
 fn parse_title(title: &str) -> Option<FlamegraphEntry> {
+    let entry = parse_frame_title(title)?;
+    (entry.name != "all").then_some(entry)
+}
+
+fn parse_frame_title(title: &str) -> Option<FlamegraphEntry> {
     let paren_start = title.rfind('(')?;
     let name = title[..paren_start].trim();
-    if name.is_empty() || name == "all" {
+    if name.is_empty() {
         return None;
     }
 
@@ -261,9 +452,18 @@ fn parse_title(title: &str) -> Option<FlamegraphEntry> {
     })
 }
 
-fn entries_by_name(entries: &[FlamegraphEntry]) -> BTreeMap<&str, &FlamegraphEntry> {
-    entries
-        .iter()
-        .map(|entry| (entry.name.as_str(), entry))
-        .collect()
+fn entries_by_name(entries: &[FlamegraphEntry]) -> BTreeMap<&str, FlamegraphEntry> {
+    let mut aggregated = BTreeMap::new();
+    for entry in entries {
+        let value = aggregated
+            .entry(entry.name.as_str())
+            .or_insert_with(|| FlamegraphEntry {
+                name: entry.name.clone(),
+                samples: 0,
+                percent: 0.0,
+            });
+        value.samples = value.samples.saturating_add(entry.samples);
+        value.percent += entry.percent;
+    }
+    aggregated
 }

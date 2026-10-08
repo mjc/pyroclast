@@ -359,12 +359,10 @@ fn resolves_build_id_from_mmap2_build_id_mapping() {
 }
 
 #[test]
-fn unifies_symbol_source_for_one_object_across_mmap_record_forms() {
-    // The same on-disk object can arrive as an inline MMAP2-build-id record
-    // (build_id, no file_identity) or as a plain MMAP2 carrying file_identity
-    // plus a HEADER_BUILD_ID that supplies the same build_id. perf's
-    // __dso_id__cmp (tools/perf/util/dso.c) makes the build_id decisive once
-    // both ids define it, so both forms must map to a single symbol source.
+fn audit_regression_preserves_available_identity_across_mmap_record_forms() {
+    // Missing identities are wildcards in perf's pairwise comparison, which
+    // cannot form a transitive hash-key equality. Retain available identity
+    // rather than merging incompatible known objects through a wildcard.
     let build_id = vec![0xaa, 0xbb, 0xcc, 0xdd];
     let mut table = MmapTable::default();
     table.insert_mmap2_build_id(Mmap2BuildIdRecord {
@@ -403,9 +401,37 @@ fn unifies_symbol_source_for_one_object_across_mmap_record_forms() {
     let header = table
         .resolve_ref(2, 0x4010)
         .expect("header build-id mapping");
-    assert_eq!(
+    assert_ne!(
         inline.symbol_source_id, header.symbol_source_id,
-        "one object must resolve through one symbol source regardless of mmap form"
+        "a missing identity cannot safely alias every known device/inode"
+    );
+}
+
+#[test]
+fn audit_regression_keeps_known_file_identities_with_matching_build_ids_distinct() {
+    let mut table = MmapTable::default();
+    for (pid, inode) in [(1, 99), (2, 100)] {
+        table.insert_mmap2_with_build_id(
+            Mmap2Record {
+                pid,
+                tid: pid,
+                start: 0x1000,
+                len: 0x200,
+                pgoff: 0,
+                major: 8,
+                minor: 1,
+                inode,
+                inode_generation: 7,
+                prot: 5,
+                flags: 2,
+                path: "/bin/app".to_string(),
+            },
+            Some(vec![0xaa; 20]),
+        );
+    }
+    assert_ne!(
+        table.resolve_ref(1, 0x1010).unwrap().symbol_source_id,
+        table.resolve_ref(2, 0x1010).unwrap().symbol_source_id
     );
 }
 

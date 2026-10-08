@@ -42,6 +42,21 @@ pub trait FlamegraphRenderer {
     fn render(&self, request: &FlamegraphRequest) -> BackendResult<FlamegraphRenderResult>;
 }
 
+/// Renders in process using the Inferno library bundled with Pyroclast.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BuiltinFlamegraphRenderer;
+
+impl FlamegraphRenderer for BuiltinFlamegraphRenderer {
+    fn render(&self, request: &FlamegraphRequest) -> BackendResult<FlamegraphRenderResult> {
+        let mut options = inferno::flamegraph::Options::default();
+        options.title.clone_from(&request.title);
+        let mut svg = Vec::new();
+        inferno::flamegraph::from_reader(&mut options, request.folded_stacks.as_bytes(), &mut svg)?;
+        std::fs::write(&request.output, svg)?;
+        Ok(FlamegraphRenderResult { stderr: Vec::new() })
+    }
+}
+
 pub struct InfernoFlamegraphRenderer<'a, R> {
     runner: &'a R,
 }

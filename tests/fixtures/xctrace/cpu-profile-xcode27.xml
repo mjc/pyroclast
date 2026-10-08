@@ -1,0 +1,182 @@
+<?xml version='1.0' encoding='utf-8'?>
+<trace-query-result>
+  <node xpath="//trace-toc[1]/run[1]/data[1]/table[32]">
+    <schema name="cpu-profile" documentation="When combined with other cpu-profile samples, creates a statistical picture of where your application is spending its time.">
+      <col>
+        <mnemonic>time</mnemonic>
+        <name>Sample Time</name>
+        <engineering-type>sample-time</engineering-type>
+      </col>
+      <col>
+        <mnemonic>thread</mnemonic>
+        <name>Thread</name>
+        <engineering-type>thread</engineering-type>
+      </col>
+      <col>
+        <mnemonic>process</mnemonic>
+        <name>Process</name>
+        <engineering-type>process</engineering-type>
+      </col>
+      <col>
+        <mnemonic>core</mnemonic>
+        <name>Core</name>
+        <engineering-type>core</engineering-type>
+      </col>
+      <col>
+        <mnemonic>thread-state</mnemonic>
+        <name>State</name>
+        <engineering-type>thread-state</engineering-type>
+      </col>
+      <col>
+        <mnemonic>weight</mnemonic>
+        <name>Cycles</name>
+        <engineering-type>cycle-weight</engineering-type>
+      </col>
+      <col>
+        <mnemonic>stack</mnemonic>
+        <name>Backtrace</name>
+        <engineering-type>tagged-backtrace</engineering-type>
+      </col>
+    </schema>
+    <row>
+      <sample-time id="1" fmt="00:01.412.048">1412048500</sample-time>
+      <thread id="2" fmt="Main Thread (0x30d1ee) (workload, pid: 7)">
+        <tid id="3" fmt="0x30d1ee">3199470</tid>
+        <process id="4" fmt="workload (7)">
+          <pid id="5" fmt="7">7</pid>
+          <device-session id="6" fmt="TODO">TODO</device-session>
+        </process>
+      </thread>
+      <process ref="4" />
+      <core id="7" fmt="CPU 6 (P Core)">6</core>
+      <thread-state id="8" fmt="Running">Running</thread-state>
+      <cycle-weight id="9" fmt="81.56 k">81557</cycle-weight>
+      <tagged-backtrace id="10">
+        <frame id="11" name="invocation function for block in dyld3::MachOFile::hasExportTrie(unsigned long long&amp;, unsigned int&amp;) const" addr="0x18cbf9579">
+          <binary id="12" name="dyld" UUID="AAEB7EB8-2C6B-3597-A14F-7D05D6F641F9" arch="arm64e" load-addr="0x18cbe7000" path="/usr/lib/dyld" />
+        </frame>
+        <frame id="13" name="mach_o::UnsafeHeader::forEachLoadCommand(void (load_command const*, bool&amp;) block_pointer) const" addr="0x18cc84dbf">
+          <binary ref="12" />
+        </frame>
+        <frame id="14" name="mach_o::UnsafeHeader::forEachSegment(void (mach_o::UnsafeHeader::SegmentInfo const&amp;, bool&amp;) block_pointer) const" addr="0x18cc8789b">
+          <binary ref="12" />
+        </frame>
+        <frame id="15" name="dyld3::MachOFile::hasExportTrie(unsigned long long&amp;, unsigned int&amp;) const" addr="0x18cbf942b">
+          <binary ref="12" />
+        </frame>
+        <frame id="16" name="dyld4::JustInTimeLoader::make(dyld4::RuntimeState&amp;, mach_o::UnsafeHeader const*, char const*, dyld4::FileID const&amp;, unsigned long long, bool, bool, bool, unsigned short)" addr="0x18cc3d353">
+          <binary ref="12" />
+        </frame>
+        <frame id="17" name="dyld4::JustInTimeLoader::makeLaunchLoader(Diagnostics&amp;, dyld4::RuntimeState&amp;)" addr="0x18cc3e8d7">
+          <binary ref="12" />
+        </frame>
+        <frame id="18" name="dyld4::prepare(dyld4::APIs&amp;, mach_o::UnsafeHeader const*)" addr="0x18cc19c63">
+          <binary ref="12" />
+        </frame>
+        <frame id="19" name="dyld4::start(dyld4::KernelArgs*, void*, void*, unsigned long long)::$_1::operator()() const" addr="0x18cc19913">
+          <binary ref="12" />
+        </frame>
+        <frame id="20" name="start" addr="0x18cc18d1f">
+          <binary ref="12" />
+        </frame>
+      </tagged-backtrace>
+    </row>
+    <row>
+      <sample-time id="21" fmt="00:01.414.450">1414450541</sample-time>
+      <thread ref="2" />
+      <process ref="4" />
+      <core id="22" fmt="CPU 2 (E Core)">2</core>
+      <thread-state ref="8" />
+      <cycle-weight id="23" fmt="422.65 k">422653</cycle-weight>
+      <tagged-backtrace id="24">
+        <frame id="25" name="objc_lookUpImpOrForward" addr="0x18cb8e391">
+          <binary id="26" name="libobjc.A.dylib" UUID="1FF743DE-675D-30F9-82EC-A3B6801513D7" arch="arm64e" load-addr="0x18cb64000" path="/usr/lib/libobjc.A.dylib" />
+        </frame>
+        <frame id="27" name="_objc_msgSend_uncached" addr="0x194760b83">
+          <binary id="28" name="libobjcMsgSend.dylib" UUID="0B3C2D50-F0C7-3E78-8175-ADD879E8B1A1" arch="arm64e" load-addr="0x194760000" path="/usr/lib/objc/libobjcMsgSend.dylib" />
+        </frame>
+        <frame id="29" name="-[OS_xpc_object dealloc]" addr="0x1912c7f57">
+          <binary id="30" name="libxpc.dylib" UUID="33C03C79-7E2B-3C8A-B991-36D35984D2D4" arch="arm64e" load-addr="0x1912c4000" path="/usr/lib/system/libxpc.dylib" />
+        </frame>
+        <frame id="31" name="_xpc_collect_images" addr="0x1912c689b">
+          <binary ref="30" />
+        </frame>
+        <frame id="32" name="_libxpc_initializer" addr="0x1912c5ae3">
+          <binary ref="30" />
+        </frame>
+        <frame id="33" name="libSystem_initializer" addr="0x2d7983363">
+          <binary id="34" name="libSystem.B.dylib" UUID="74F3FC55-9EB4-3987-92F7-6242C72219A3" arch="arm64e" load-addr="0x2d7982000" path="/usr/lib/libSystem.B.dylib" />
+        </frame>
+        <frame id="35" name="invocation function for block in dyld4::Loader::findAndRunAllInitializers(dyld4::RuntimeState&amp;) const::$_0::operator()() const" addr="0x18cc4a537">
+          <binary ref="12" />
+        </frame>
+        <frame id="36" name="invocation function for block in mach_o::Image::forEachInitializer(void (unsigned int) block_pointer) const" addr="0x18cc7e12b">
+          <binary ref="12" />
+        </frame>
+        <frame id="37" name="mach_o::Header::SegmentInfo mach_o::Header::parse_segment_command&lt;true&gt;(mach_o::Header::LoadCommandInfo const&amp;, unsigned short, void (mach_o::Header::SegmentInfo const&amp;, mach_o::Header::SectionInfo const&amp;) block_pointer, mach_o::Error*) const" addr="0x18cc752fb">
+          <binary ref="12" />
+        </frame>
+        <frame id="38" name="invocation function for block in mach_o::Header::forEachSection(void (mach_o::Header::SectionInfo const&amp;, bool&amp;) block_pointer) const" addr="0x18cc7a863">
+          <binary ref="12" />
+        </frame>
+        <frame id="39" name="mach_o::Header::forEachLoadCommand(void (mach_o::Header::LoadCommandInfo const&amp;, bool&amp;) block_pointer, mach_o::Error*) const" addr="0x18cc73d93">
+          <binary ref="12" />
+        </frame>
+        <frame id="40" name="mach_o::Header::forEachSection(void (mach_o::Header::SectionInfo const&amp;, bool&amp;) block_pointer) const" addr="0x18cc77e7f">
+          <binary ref="12" />
+        </frame>
+        <frame id="41" name="mach_o::Image::forEachInitializer(void (unsigned int) block_pointer) const" addr="0x18cc7e05b">
+          <binary ref="12" />
+        </frame>
+        <frame id="42" name="dyld4::Loader::findAndRunAllInitializers(dyld4::RuntimeState&amp;) const" addr="0x18cc4536b">
+          <binary ref="12" />
+        </frame>
+        <frame id="43" name="dyld4::PrebuiltLoader::runInitializers(dyld4::RuntimeState&amp;) const" addr="0x18cc4d387">
+          <binary ref="12" />
+        </frame>
+        <frame id="44" name="dyld4::APIs::runAllInitializersForMain()" addr="0x18cc0dd1b">
+          <binary ref="12" />
+        </frame>
+        <frame id="45" name="dyld4::prepare(dyld4::APIs&amp;, mach_o::UnsafeHeader const*)" addr="0x18cc1aba3">
+          <binary ref="12" />
+        </frame>
+        <frame ref="19" />
+        <frame ref="20" />
+      </tagged-backtrace>
+    </row>
+    <row>
+      <sample-time id="46" fmt="00:01.415.453">1415453291</sample-time>
+      <thread ref="2" />
+      <process ref="4" />
+      <core id="47" fmt="CPU 1 (E Core)">1</core>
+      <thread-state ref="8" />
+      <cycle-weight id="48" fmt="519.94 k">519936</cycle-weight>
+      <tagged-backtrace id="49">
+        <frame id="50" name="hot_loop" addr="0x100ed44c1">
+          <binary id="51" name="workload" UUID="C6232909-3933-39A9-8FD4-FB5B1E9E08EA" arch="arm64" load-addr="0x100ed4000" path="/tmp/workload" />
+          <source line="3">
+            <path id="52">/tmp/workload.c</path>
+          </source>
+        </frame>
+        <frame id="53" name="main" addr="0x100ed4467">
+          <binary ref="51" />
+          <source line="4">
+            <path ref="52" />
+          </source>
+        </frame>
+        <frame id="54" name="start" addr="0x18cc18d7b">
+          <binary ref="12" />
+        </frame>
+      </tagged-backtrace>
+    </row>
+    <row>
+      <sample-time id="55" fmt="00:01.415.939">1415939208</sample-time>
+      <thread ref="2" />
+      <process ref="4" />
+      <core ref="47" />
+      <thread-state ref="8" />
+      <cycle-weight id="56" fmt="1.00 M">1000052</cycle-weight>
+      <tagged-backtrace ref="49" />
+    </row>
+  </node>
+</trace-query-result>

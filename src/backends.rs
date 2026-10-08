@@ -34,6 +34,20 @@ pub struct ProfileRequest {
     pub offcpu_method: Option<OffcpuMethod>,
 }
 
+impl ProfileRequest {
+    pub(crate) fn ensure_command_target(&self, backend: &str) -> BackendResult<()> {
+        if self.pid.is_some() || self.threads_of_pid.is_some() || !self.tids.is_empty() {
+            return Err(
+                format!("{backend} currently supports command-driven workflows only").into(),
+            );
+        }
+        if self.command.is_empty() {
+            return Err(format!("{backend} requires a workload command").into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProfileResult {
     pub layout: ArtifactLayout,

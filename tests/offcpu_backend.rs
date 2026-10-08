@@ -39,15 +39,22 @@ fn offcpu_backend_defaults_to_perf_sched_summary_artifacts() {
         "target/release/app --serve\n"
     );
     assert!(!result.layout.stacks_folded().exists());
-    assert_eq!(
-        std::fs::read_to_string(result.layout.summary_txt()).expect("summary txt"),
-        "timehist report\n"
-    );
+    let summary_text = std::fs::read_to_string(result.layout.summary_txt()).unwrap();
+    assert!(summary_text.contains("offcpu wait milliseconds: 14.000"));
     let summary_json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(result.layout.summary_json()).unwrap())
             .expect("summary json");
     assert_eq!(summary_json["method"], "perf_sched");
-    assert_eq!(summary_json["timehist_raw"], "timehist report\n");
+    assert_eq!(summary_json["target_pid"], 42);
+    assert_eq!(summary_json["total_wait_ms"], 14.0);
+    assert_eq!(summary_json["total_sched_delay_ms"], 3.0);
+    assert_eq!(summary_json["total_run_ms"], 3.0);
+    assert_eq!(summary_json["threads"].as_array().unwrap().len(), 2);
+    assert_eq!(summary_json["threads"][0]["name"], "app");
+    assert_eq!(
+        summary_json["timehist_raw"],
+        "99.000000 [0000] sh[42] 0.000 0.000 0.000\n100.000000 [0000] app[42] 10.000 2.000 1.000\n100.001000 [0001] worker[43/42] 4.000 1.000 2.000\n100.002000 [0000] unrelated[99] 500.000 0.000 1.000\n"
+    );
     assert_eq!(result.manifest.duration_secs, None);
     assert_eq!(result.manifest.sample_event, PerfEvent::Default);
     assert_eq!(
@@ -104,6 +111,13 @@ fn offcpu_backend_bpftrace_method_writes_folded_stack_artifacts() {
         std::fs::read_to_string(result.layout.stacks_folded()).expect("folded"),
         "app::serve;tokio::runtime::park 1500\n"
     );
+    assert!(result.layout.flamegraph_svg().is_file());
+    assert!(
+        result
+            .manifest
+            .artifacts
+            .contains(&result.layout.flamegraph_svg())
+    );
     let summary_json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(result.layout.summary_json()).unwrap())
             .expect("summary json");
@@ -132,8 +146,67 @@ fn offcpu_backend_bpftrace_method_writes_folded_stack_artifacts() {
     assert_eq!(runner.programs(), vec!["bpftrace"]);
 }
 
+#[cfg(unix)]
 #[test]
-fn offcpu_backend_perf_cpu_clock_method_writes_folded_stack_artifacts() {
+fn bpftrace_backend_captures_real_child_output_and_preserves_workload_arguments() {
+    struct FixtureBpftrace;
+    impl CommandRunner for FixtureBpftrace {
+        fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
+            let mut command = command.clone();
+            command.program = "sh".to_string();
+            command.args.splice(0..0, [
+                "-c".to_string(),
+                "while [ \"$1\" != '-c' ]; do shift; done; shift; $1; printf '@offcpu[\\n    55 kernel_wait+12 ([kernel.kallsyms])\\n    44 workload+7 ([kernel.kallsyms])\\n]: 1500\\n'".to_string(),
+                "fixture-bpftrace".to_string(),
+            ]);
+            pyroclast::process::RealCommandRunner::default().run(&command)
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let request = ProfileRequest {
+        kind: ProfileKind::Offcpu,
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            "printf '%s\\n' \"$@\"".into(),
+            "workload".into(),
+            "argument with spaces".into(),
+            "embedded'quote".into(),
+            "$(printf must-stay-literal)".into(),
+        ],
+        out_dir: root.path().to_path_buf(),
+        name: None,
+        json: false,
+        symbols: false,
+        symbolizer: SymbolizerKind::RustAddr2line,
+        frequency: 997,
+        event: PerfEvent::Default,
+        call_graph: PerfCallGraph::Dwarf,
+        pid: None,
+        tids: Vec::new(),
+        threads_of_pid: None,
+        duration_secs: 30,
+        offcpu_method: Some(OffcpuMethod::Bpftrace),
+    };
+    let result = OffcpuBackend::new(&FixtureBpftrace)
+        .profile(&request)
+        .unwrap();
+    let raw = std::fs::read_to_string(result.layout.raw_profile("bpftrace")).unwrap();
+    assert!(raw.contains("argument with spaces\nembedded'quote\n$(printf must-stay-literal)\n"));
+    assert_eq!(
+        std::fs::read_to_string(result.layout.stacks_folded()).unwrap(),
+        "workload;kernel_wait 1500\n"
+    );
+    let summary: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(result.layout.summary_json()).unwrap())
+            .unwrap();
+    assert_eq!(summary["weight_unit"], "nanoseconds");
+    assert_eq!(summary["total_offcpu_ns"], 1500);
+}
+
+#[test]
+fn offcpu_backend_rejects_cpu_clock_as_an_offcpu_measurement() {
     let root = tempfile::tempdir().expect("tempdir");
     let out = root.path().join("offcpu");
     let runner = RecordingOffcpuRunner::default();
@@ -155,32 +228,11 @@ fn offcpu_backend_perf_cpu_clock_method_writes_folded_stack_artifacts() {
         offcpu_method: Some(OffcpuMethod::PerfCpuClock),
     };
 
-    let result = OffcpuBackend::new(&runner)
+    let error = OffcpuBackend::new(&runner)
         .profile(&request)
-        .expect("offcpu profile");
-
-    assert!(result.layout.raw_profile("perf.data").is_file());
-    assert_eq!(
-        std::fs::read_to_string(result.layout.stacks_folded()).expect("folded"),
-        "app;[app] 1\n"
-    );
-    let summary_json: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(result.layout.summary_json()).unwrap())
-            .expect("summary json");
-    assert_eq!(summary_json["method"], "perf_cpu_clock");
-    assert_eq!(summary_json["total_count"], 1);
-    assert_eq!(result.manifest.sample_event, PerfEvent::CpuClock);
-    assert_eq!(result.manifest.duration_secs, None);
-    assert_eq!(
-        result
-            .manifest
-            .tool_versions
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["perf"]
-    );
-    assert_eq!(runner.programs(), vec!["perf"]);
+        .expect_err("CPU-clock cannot measure off-CPU waits");
+    assert!(error.to_string().contains("on-CPU"));
+    assert!(runner.programs().is_empty());
 }
 
 #[test]
@@ -291,6 +343,11 @@ impl CommandRunner for RecordingOffcpuRunner {
                 stderr: Vec::new(),
             });
         }
+        for (key, value) in &command.env {
+            if key == "PYROCLAST_OFFCPU_TARGET_PID" {
+                std::fs::write(value, "42\n")?;
+            }
+        }
         if let Some(output_path) = perf_output_path(command) {
             std::fs::write(output_path, tiny_perfdata())?;
         }
@@ -302,7 +359,7 @@ impl CommandRunner for RecordingOffcpuRunner {
                 if self.fail_timehist {
                     Vec::new()
                 } else {
-                    b"timehist report\n".to_vec()
+                    b"99.000000 [0000] sh[42] 0.000 0.000 0.000\n100.000000 [0000] app[42] 10.000 2.000 1.000\n100.001000 [0001] worker[43/42] 4.000 1.000 2.000\n100.002000 [0000] unrelated[99] 500.000 0.000 1.000\n".to_vec()
                 }
             }
             "bpftrace" => {

@@ -127,6 +127,103 @@ fn inferno_collapse_benchmark_reports_folded_output_size() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn benchmark_generated_oracle_respects_inline_mode_with_real_dwarf_frames() {
+    use object::{Object, ObjectSegment, ObjectSymbol};
+    use pyroclast::benchmarks::run_streaming_comparison_with_symbols;
+    use pyroclast::symbols::perf_dwarf_frame_names_from_object_bytes;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("inline.c");
+    let binary = root.path().join("inline.so");
+    std::fs::write(
+        &source,
+        r"
+static __attribute__((always_inline)) inline unsigned inline_leaf(unsigned x) {
+    volatile unsigned value = x + 7;
+    return value * value;
+}
+__attribute__((noinline)) unsigned profile_entry(unsigned x) { return inline_leaf(x) + 3; }
+",
+    )
+    .unwrap();
+    let compile = std::process::Command::new("cc")
+        .args(["-g", "-O2", "-fPIC", "-shared"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let bytes = std::fs::read(&binary).unwrap();
+    let object = object::File::parse(bytes.as_slice()).unwrap();
+    let symbol = object
+        .symbols()
+        .find(|symbol| symbol.name() == Ok("profile_entry"))
+        .unwrap();
+    let address = (symbol.address()..symbol.address() + symbol.size())
+        .find(|address| {
+            perf_dwarf_frame_names_from_object_bytes(&bytes, *address)
+                .is_some_and(|frames| frames.len() > 1)
+        })
+        .expect("fixture must contain real inline DWARF");
+    let file_offset = object
+        .segments()
+        .find_map(|segment| {
+            let (offset, size) = segment.file_range();
+            (address >= segment.address() && address - segment.address() < size)
+                .then(|| offset + address - segment.address())
+        })
+        .unwrap();
+    let ip = 0x10_0000 + file_offset;
+    let mut payload = sample_payload(ip, 11, 12, [ip]);
+    payload.splice(16..16, 1_000_000_u64.to_le_bytes());
+    let data = root.path().join("perf.data");
+    let mut attr = file_attr_bytes(
+        PERF_SAMPLE_IP
+            | PERF_SAMPLE_TID
+            | PERF_SAMPLE_CALLCHAIN
+            | pyroclast::perfdata::samples::PERF_SAMPLE_TIME,
+        0,
+        0,
+    );
+    put_u64(&mut attr, 16, 1);
+    std::fs::write(
+        &data,
+        perfdata_with_records_and_attrs(
+            [attr],
+            [
+                record_bytes(
+                    1,
+                    &mmap_payload(
+                        11,
+                        11,
+                        0x10_0000,
+                        u64::try_from(bytes.len()).unwrap(),
+                        0,
+                        binary.to_str().unwrap(),
+                    ),
+                ),
+                record_bytes(9, &payload),
+            ],
+        ),
+    )
+    .unwrap();
+    let runner = BenchCommandRunner::default();
+    let plain = run_streaming_comparison_with_symbols(&data, None, &runner, true, false).unwrap();
+    let inline = run_streaming_comparison_with_symbols(&data, None, &runner, true, true).unwrap();
+    assert!(plain.comparison.matches, "{:?}", plain.comparison);
+    assert!(inline.comparison.matches, "{:?}", inline.comparison);
+    assert!(
+        inline.pyroclast_fold.folded_bytes > plain.pyroclast_fold.folded_bytes,
+        "real inline frames must change the workload output"
+    );
+}
+
 #[test]
 fn symbolized_fold_benchmark_keeps_module_fallback_without_a_perf_base_symbol() {
     // perf machine.c:append_inlines requires a loaded ELF symbol, not merely
@@ -421,6 +518,68 @@ fn bench_command_exports_perf_script_and_compares_without_perf_runner() {
     assert!(output.contains("inferno_compare.matches=true"));
     assert!(output.contains("pyroclast_fold.input="));
     assert!(output.contains("inferno_collapse_perf.input="));
+}
+
+#[test]
+fn benchmark_rejects_a_mismatching_external_oracle() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let data = root.path().join("perf.data");
+    let script = root.path().join("native.script");
+    std::fs::write(&data, tiny_perfdata()).unwrap();
+    std::fs::write(
+        &script,
+        "different 2 1.000000: cycles: \n\t2000 native_symbol (app)\n\n",
+    )
+    .unwrap();
+    let args = BenchArgs {
+        perf_data: Some(data),
+        perf_script: Some(script),
+        ..BenchArgs::default()
+    };
+    let error = run_bench_command(&args, &BenchCommandRunner::default())
+        .expect_err("a differential mismatch must fail the benchmark command");
+    assert!(error.contains("inferno_compare.matches=false"), "{error}");
+}
+
+#[test]
+fn benchmark_native_export_honors_no_inline_and_identifies_the_oracle() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let data = root.path().join("perf.data");
+    std::fs::write(&data, tiny_perfdata()).unwrap();
+    let runner = BenchCommandRunner::default();
+    let args = BenchArgs {
+        perf_data: Some(data),
+        export_perf_script: Some(root.path().join("native.script")),
+        inline: false,
+        ..BenchArgs::default()
+    };
+    let output = run_bench_command(&args, &runner).unwrap();
+    assert!(
+        runner.commands.lock().unwrap()[0]
+            .args
+            .contains(&"--no-inline".to_string())
+    );
+    assert!(
+        output.contains("comparison.source=native-perf-script"),
+        "{output}"
+    );
+    assert!(output.contains("comparison.inline=false"), "{output}");
+}
+
+#[test]
+fn benchmark_identifies_generated_script_as_self_consistency() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let data = root.path().join("perf.data");
+    std::fs::write(&data, tiny_perfdata()).unwrap();
+    let args = BenchArgs {
+        perf_data: Some(data),
+        ..BenchArgs::default()
+    };
+    let output = run_bench_command(&args, &BenchCommandRunner::default()).unwrap();
+    assert!(
+        output.contains("comparison.source=pyroclast-self-consistency"),
+        "{output}"
+    );
 }
 
 #[test]

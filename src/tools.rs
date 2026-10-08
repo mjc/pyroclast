@@ -61,6 +61,7 @@ impl ToolSpec {
 
     fn probe_command(self, program: &str) -> CommandSpec {
         match self.name {
+            "xctrace" => CommandSpec::new(program).arg("version"),
             "inferno-flamegraph" | "inferno-collapse-perf" => {
                 CommandSpec::new(program).arg("--help")
             }
@@ -90,11 +91,11 @@ impl ToolSpec {
     fn missing_tool_error(self) -> String {
         match self.kind {
             ToolKind::AppleProvided => format!(
-                "{name} is required on macOS; install Xcode or Command Line Tools so the real profiler is available",
+                "{name} is required on macOS; install Xcode and select its developer directory with xcode-select",
                 name = self.name
             ),
             ToolKind::NixManaged => format!(
-                "{name} is required but was not found on PATH; install it or add it to devenv.nix",
+                "{name} is required but was not found on PATH; install the matching profiler package using your OS package manager",
                 name = self.name
             ),
         }
@@ -524,7 +525,7 @@ fn resolution_error(tool: &ToolSpec, attempts: &[String], cwd: &Path) -> std::io
     if tool.kind == ToolKind::NixManaged {
         let _ = write!(
             message,
-            "\nNext step: install `{}` directly or add it to devenv.nix for {}.",
+            "\nNext step: install `{}` using your OS package manager (project {}).",
             tool.name,
             cwd.display()
         );

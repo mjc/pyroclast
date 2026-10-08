@@ -17,6 +17,31 @@ peak heap memory consumption: 1024 bytes
     assert_eq!(summary.peak_heap_bytes, Some(1024));
 }
 
+#[test]
+fn parses_native_heaptrack_print_footer_and_decimal_units() {
+    let summary = parse_heaptrack_summary(
+        "calls to allocation functions: 2 (2000/s)\npeak heap memory consumption: 77.82K\n",
+    );
+    assert_eq!(summary.total_allocations, Some(2));
+    assert_eq!(summary.peak_heap_bytes, Some(77_820));
+}
+
+#[test]
+fn heaptrack_sizes_accept_native_suffixes_and_reject_invalid_values() {
+    for (value, expected) in [
+        ("1.5M", Some(1_500_000)),
+        ("1.25G", Some(1_250_000_000)),
+        ("42B", Some(42)),
+        ("1.5 KiB", Some(1536)),
+        ("-1K", None),
+        ("NaN", None),
+        ("18446744073709551616", None),
+    ] {
+        let summary = parse_heaptrack_summary(&format!("peak heap memory consumption: {value}\n"));
+        assert_eq!(summary.peak_heap_bytes, expected, "{value}");
+    }
+}
+
 proptest! {
     #[test]
     fn property_parses_last_valid_matching_values(

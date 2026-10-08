@@ -21,8 +21,17 @@ perf version | tee "$ORACLE_OUT/perf.version"
 
 rustc -O -Cdebuginfo=2 -o /tmp/oracle-workload "$REPO/scripts/oracle/workload.rs"
 
-sysctl -w kernel.perf_event_paranoid=-1 >/dev/null 2>&1 || true
-sysctl -w kernel.kptr_restrict=0 >/dev/null 2>&1 || true
+original_perf_paranoid=$(sysctl -n kernel.perf_event_paranoid)
+original_kptr_restrict=$(sysctl -n kernel.kptr_restrict)
+restore_settings() {
+    sysctl -w "kernel.perf_event_paranoid=$original_perf_paranoid" >/dev/null
+    sysctl -w "kernel.kptr_restrict=$original_kptr_restrict" >/dev/null
+}
+trap restore_settings EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+sysctl -w kernel.perf_event_paranoid=-1 >/dev/null
+sysctl -w kernel.kptr_restrict=0 >/dev/null
 
 record() {
     local name="$1"

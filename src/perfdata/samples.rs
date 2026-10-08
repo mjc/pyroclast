@@ -230,6 +230,21 @@ pub fn parse_sample_record_callchain(
     payload: &[u8],
     layout: SampleLayout,
 ) -> Result<Option<SampleCallchain<'_>>, String> {
+    parse_sample_callchain(payload, layout, false)
+}
+
+pub(super) fn parse_sample_record_metadata(
+    payload: &[u8],
+    layout: SampleLayout,
+) -> Result<Option<SampleCallchain<'_>>, String> {
+    parse_sample_callchain(payload, layout, true)
+}
+
+fn parse_sample_callchain(
+    payload: &[u8],
+    layout: SampleLayout,
+    retain_metadata: bool,
+) -> Result<Option<SampleCallchain<'_>>, String> {
     layout.reject_unsupported_flags()?;
     let mut cursor = SampleCursor::new(payload);
     let mut pid = None;
@@ -271,7 +286,7 @@ pub fn parse_sample_record_callchain(
     if layout.has(PERF_SAMPLE_READ) {
         cursor.skip_read_format(layout.read_format)?;
     }
-    if !layout.has(PERF_SAMPLE_CALLCHAIN) {
+    if !layout.has(PERF_SAMPLE_CALLCHAIN) && !retain_metadata {
         cursor.skip_non_callchain_tail(layout)?;
         return Ok(sample_ip.map(|ip| SampleCallchain {
             pid,
@@ -279,24 +294,31 @@ pub fn parse_sample_record_callchain(
             time,
             cpu,
             period,
-            frames: SampleCallchainFrames {
-                payload: &[],
-                single_ip: Some(ip),
-            },
+            frames: SampleCallchainFrames::from_ip(Some(ip)),
             callchain_range: None,
             user_regs: None,
             user_stack: None,
         }));
     }
 
-    let callchain_start = cursor.offset;
-    let callchain_len = usize::try_from(cursor.read_u64()?)
-        .map_err(|_| "perf sample callchain length does not fit in usize".to_string())?;
-    let callchain_bytes = callchain_len
-        .checked_mul(8)
-        .ok_or_else(|| "perf sample callchain byte length overflows usize".to_string())?;
-    let frames = cursor.read_bytes(callchain_bytes)?;
-    let callchain_range = Some(callchain_start..cursor.offset);
+    let (frames, callchain_range) = if layout.has(PERF_SAMPLE_CALLCHAIN) {
+        let callchain_start = cursor.offset;
+        let callchain_len = usize::try_from(cursor.read_u64()?)
+            .map_err(|_| "perf sample callchain length does not fit in usize".to_string())?;
+        let callchain_bytes = callchain_len
+            .checked_mul(8)
+            .ok_or_else(|| "perf sample callchain byte length overflows usize".to_string())?;
+        let frames = cursor.read_bytes(callchain_bytes)?;
+        (
+            SampleCallchainFrames {
+                payload: frames,
+                single_ip: None,
+            },
+            Some(callchain_start..cursor.offset),
+        )
+    } else {
+        (SampleCallchainFrames::from_ip(sample_ip), None)
+    };
     let mut user_regs = None;
     let mut user_stack = None;
 
@@ -319,10 +341,7 @@ pub fn parse_sample_record_callchain(
         time,
         cpu,
         period,
-        frames: SampleCallchainFrames {
-            payload: frames,
-            single_ip: None,
-        },
+        frames,
         callchain_range,
         user_regs,
         user_stack,
@@ -373,6 +392,13 @@ fn supported_perf_sample_mask() -> u64 {
 }
 
 impl SampleCallchainFrames<'_> {
+    fn from_ip(ip: Option<u64>) -> Self {
+        Self {
+            payload: &[],
+            single_ip: ip,
+        }
+    }
+
     pub(crate) fn deferred_cookie(&self) -> Option<u64> {
         let tail = self.payload.get(self.payload.len().checked_sub(16)?..)?;
         let marker = u64::from_le_bytes(tail[..8].try_into().ok()?);

@@ -1,11 +1,15 @@
 # Pyroclast
 
-Rust-first profiling orchestration and perf.data analysis.
+Profile applications in any language with the appropriate tools already available on the OS.
+Pyroclast chooses the recorder for the requested question, collects its output, and produces
+summaries and flamegraphs. Its aim is the fastest correct end-to-end profiling path with as
+few additional dependencies as possible.
 
-Pyroclast is being built to replace the slow `perf script | inferno-collapse | inferno-flamegraph`
-path with direct Rust parsing and folding. External profilers and renderers come from the host or
-the development environment; Pyroclast owns orchestration, manifests, folding, summaries, and
-command construction.
+On Linux, completed `perf.data` recordings are parsed, symbolized, and folded directly,
+avoiding the `perf script | inferno-collapse-perf` text pipeline. SVG rendering is built in.
+The Cargo wrapper is an optional convenience for Rust projects; ordinary commands can profile
+C, C++, Go, Python, services, and other workloads supported by the native recorder. Symbol and
+stack quality still depends on the runtime, debug information, and recording configuration.
 
 ## Porcelain
 
@@ -29,6 +33,7 @@ pyroclast memory -- <command...>
 pyroclast offcpu -- <command...>
 pyroclast syscalls -- <command...>
 pyroclast latency -- <command...>
+pyroclast async -- <command...>
 ```
 
 Pyroclast also ships a cargo-subcommand wrapper that mirrors `cargo-flamegraph` target
@@ -60,10 +65,50 @@ pyroclast plumbing parse flamegraph diff <before.svg> <after.svg>
 Profile runs write a Pyroclast artifact directory containing the command, stdout/stderr logs,
 raw profiler output, summaries, tool diagnostics, and a `run.json` manifest.
 
-CPU profiling on Linux records with `perf`, folds `perf.data` directly in Rust, and only invokes
-`inferno-flamegraph` for SVG rendering. Memory profiling uses `heaptrack`; latency profiling uses
-`strace`; off-CPU profiling defaults to the command-driven `perf sched` path. On macOS, CPU
-profiling uses Apple-provided `xctrace`.
+CPU profiling on Linux records with `perf`; on macOS it uses Apple's `xctrace`. Memory
+profiling currently uses `heaptrack`, and syscall latency uses `strace` on Linux. Blocked-time
+profiling checks `perf sched` access first, falling back to a checked `bpftrace`; use
+`--offcpu-method perf-sched|bpftrace` to override that choice. The scheduler report tracks the
+launched process and its threads. Bpftrace captures kernel stacks at switch-out and charges
+them when the thread resumes. These modes do not include child processes.
+
+`async` runs the blocked-time path for executor and worker-thread stalls. It reports OS thread
+waiting rather than individual futures or runtime tasks. Linux CPU profiling supports process
+and thread attachment; the other backends reject attachment before launching a workload.
+
+`--name` labels the saved run. `--json` returns the run manifest with artifact paths on stdout;
+failed CLI profiles return a JSON error and a nonzero exit status. A rerun clears prior generated
+artifacts before recording so failed runs cannot expose an older successful result.
+
+`plumbing parse perf summary --json` includes recorded process/thread IDs, CPU IDs, first and
+last sample timestamps, and sparse one-second activity buckets under `profile`. The sample span
+is distinct from process wall time; captures without timestamps report missing timing explicitly.
+Heap summaries include allocation counts and available heap, leak, RSS, and runtime totals.
+Syscall summaries include call counts, total time, and per-call averages.
+
+Supported recorder selection:
+
+| Question | Host | Target | Automatic recorder | Requirements |
+| --- | --- | --- | --- | --- |
+| CPU hotspots | Linux | Command, PID, or thread IDs | perf; direct folding and built-in SVG | perf access, usable stacks/symbols |
+| CPU hotspots | macOS | Command | xctrace | Xcode, recording permission |
+| Allocation growth | Linux | Command | heaptrack | heaptrack and heaptrack_print |
+| Syscall latency | Linux | Command | strace | ptrace permission |
+| Blocked or async worker threads | Linux | Command | perf sched, then bpftrace if perf is unavailable or unusable | scheduler trace access; bpftrace for stack attribution |
+
+Other host/question/target combinations report an unsupported case before launching. Tool
+availability is checked before recording. Automatic blocked-time selection probes recorder access
+using a disposable recording or a brief tracepoint/stack-helper check before launching the workload.
+Permission or recording failures after launch are reported rather
+than retrying a workload that may already have run. Missing tools identify the package to install;
+generic profiling does not require Cargo or a Rust toolchain. `perf sched` provides scheduler
+wait totals, while the bpftrace alternative additionally attributes waiting to captured kernel stacks.
+
+Default CPU profile summaries aggregate file metadata with bounded read windows. Their storage
+grows with distinct threads, CPUs, and sparse timeline buckets, rather than sample count. The
+explicit detailed perf analysis and retained-summary APIs still retain samples and callchains.
+Folding uses bounded read windows. Performance claims must compare equivalent
+completed output and include recording, analysis, rendering, and peak memory on the tested workload.
 
 ## Development
 
@@ -92,6 +137,13 @@ The development shell supplies them. Native-oracle tests compile ELF fixtures
 and compare against `perf script` and GNU addr2line; missing tools fail the tests
 rather than silently skipping parity checks. When running outside the development
 shell, install a C toolchain, binutils, and perf first.
+
+Some older symbol tests optionally inspect `target/profiling/pyroclast` or
+historical store binaries. A passing test count does not prove those optional
+fixtures were exercised. The required native parity gate rejects missing inputs,
+tool failures, empty oracle output, and script, folded-stack, or SVG differences.
+Mandatory compiled C fixtures cover inline frames and non-PIE PLT addresses;
+the checked-in Xcode fixture covers native referenced CPU rows and cycle units.
 
 Process completed recordings: keep the input file unchanged until analysis
 finishes. Folding reads the data section through sequential positioned reads.

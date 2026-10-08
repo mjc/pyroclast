@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write;
 use std::hash::{Hash, Hasher};
+#[cfg(target_os = "linux")]
 use std::io::{Read, Seek, SeekFrom, Write as IoWrite};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
@@ -58,23 +59,11 @@ pub struct SymbolRequest {
 }
 
 impl SymbolRequest {
-    /// Returns the `file_identity` that participates in identity comparison.
-    ///
-    /// perf's `__dso_id__cmp` (tools/perf/util/dso.c) treats a defined `build_id`
-    /// as the decisive backing-store discriminator and only weighs the mmap2
-    /// maj/min/ino when both dso ids recorded them. The same on-disk object can
-    /// arrive with the `build_id` but no `file_identity` (inline MMAP2-build-id) or
-    /// with both (plain MMAP2 + `HEADER_BUILD_ID`), so once a `build_id` is present
-    /// we ignore `file_identity` to keep the request — and thus the symbol cache
-    /// entry — unified. Distinct `build_ids` at the same path still differ via
-    /// `build_id`; `file_identity` remains the discriminator only when no
-    /// `build_id` exists.
+    /// Keep all recorded identity in cache keys. perf's missing-identity
+    /// wildcard comparison is not transitive and cannot be used as `HashMap`
+    /// equality; extra resolution is preferable to merging distinct files.
     fn identity_file_identity(&self) -> Option<FileIdentity> {
-        if self.build_id.is_some() {
-            None
-        } else {
-            self.file_identity
-        }
+        self.file_identity
     }
 }
 
@@ -646,8 +635,10 @@ struct PerfDwarfCachedUnit {
     segments: Option<Vec<PerfDwarfFrameRange>>,
 }
 
-struct LiveVdsoElf {
-    path: PathBuf,
+pub(crate) struct LiveVdsoElf {
+    pub(crate) path: PathBuf,
+    pub(crate) architecture: object::Architecture,
+    pub(crate) build_id: Option<Vec<u8>>,
 }
 
 impl Drop for LiveVdsoElf {
@@ -930,7 +921,7 @@ fn is_perf_vdso_dso_path(path: &Path) -> bool {
     matches!(path.to_str(), Some("[vdso]" | "[vdso32]" | "[vdsox32]"))
 }
 
-fn copy_live_vdso_elf_like_perf() -> Option<LiveVdsoElf> {
+pub(crate) fn copy_live_vdso_elf_like_perf() -> Option<LiveVdsoElf> {
     // perf special-cases VDSO maps in tools/perf/util/map.c: map__new()
     // clears namespace handling, forces pgoff = 0, and calls
     // machine__findnew_vdso(). tools/perf/util/vdso.c get_file() then copies
@@ -965,6 +956,9 @@ fn copy_live_vdso_elf_linux() -> Option<LiveVdsoElf> {
     mem.seek(SeekFrom::Start(vdso_range.0)).ok()?;
     mem.read_exact(&mut bytes).ok()?;
 
+    let object = object::File::parse(bytes.as_slice()).ok()?;
+    let architecture = object.architecture();
+    let build_id = object.build_id().ok()?.map(<[u8]>::to_vec);
     let path = std::env::temp_dir().join(format!(
         "pyroclast-vdso-{}-{}.so",
         std::process::id(),
@@ -982,7 +976,11 @@ fn copy_live_vdso_elf_linux() -> Option<LiveVdsoElf> {
         let _ = std::fs::remove_file(&path);
         return None;
     }
-    Some(LiveVdsoElf { path })
+    Some(LiveVdsoElf {
+        path,
+        architecture,
+        build_id,
+    })
 }
 
 #[must_use]
@@ -2431,6 +2429,13 @@ where
             .live_vdso_elf_cache
             .get_or_init(copy_live_vdso_elf_like_perf)
             .as_ref()?;
+        if request
+            .build_id
+            .as_ref()
+            .is_some_and(|id| live_vdso.build_id.as_deref().map(build_id_hex).as_ref() != Some(id))
+        {
+            return None;
+        }
         Some(clean_object_symbol_request_with_cache(
             live_vdso.path.clone(),
             request.relative_address,
@@ -3536,14 +3541,18 @@ fn perf_synthesized_plt_symbols(
     };
     let Some((plt_sec_offset, lazy_plt)) = object
         .section_by_name(".plt.sec")
-        .and_then(|section| section.file_range().map(|(offset, _)| (offset, false)))
+        .map(|section| (section.address(), false))
         .or_else(|| {
-            let (offset, size) = plt.file_range()?;
+            let size = plt.size();
             let has_header = perf_x86_64_plt_relocations(object).is_none_or(|relocations| {
                 u64::try_from(relocations.len())
                     .map_or(true, |len| len * X86_64_PLT_ENTRY_SIZE != size)
             });
-            Some((offset + u64::from(has_header) * X86_64_PLT_ENTRY_SIZE, true))
+            Some((
+                plt.address()
+                    .checked_add(u64::from(has_header) * X86_64_PLT_ENTRY_SIZE)?,
+                true,
+            ))
         })
     else {
         return Vec::new();
@@ -3559,7 +3568,7 @@ fn perf_synthesized_plt_symbols(
     if lazy_plt {
         symbols.push(PerfSymbolCandidate {
             name: ".plt".to_string(),
-            address: plt.file_range().map_or(plt.address(), |(offset, _)| offset),
+            address: plt.address(),
             size: X86_64_PLT_ENTRY_SIZE,
             bfd_size: 0,
             elf_type: Some(object::elf::STT_FUNC),
@@ -3570,6 +3579,9 @@ fn perf_synthesized_plt_symbols(
         });
     }
     for relocation in relocations {
+        let Some(next_offset) = plt_offset.checked_add(X86_64_PLT_ENTRY_SIZE) else {
+            break;
+        };
         let name = relocation
             .symbol_name
             .filter(|name| !name.is_empty())
@@ -3592,7 +3604,7 @@ fn perf_synthesized_plt_symbols(
             bfd_function_like: true,
             bfd_function: true,
         });
-        plt_offset += X86_64_PLT_ENTRY_SIZE;
+        plt_offset = next_offset;
     }
     symbols
 }
@@ -5026,7 +5038,7 @@ mod tests {
     }
 
     #[test]
-    fn symbol_request_ignores_file_identity_when_build_id_present() {
+    fn symbol_request_preserves_file_identity_when_build_id_present() {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
@@ -5040,7 +5052,8 @@ mod tests {
 
         // Same object, same build_id: the inline MMAP2-build-id form carries no
         // file_identity while the plain MMAP2 + HEADER_BUILD_ID form does.
-        // perf's __dso_id__cmp makes build_id decisive, so these are one entry.
+        // Conservatively keep these separate rather than introducing a
+        // non-transitive missing-identity wildcard into cache equality.
         let inline = SymbolRequest {
             path: PathBuf::from("/usr/lib/libc.so.6"),
             relative_address: 0x1234,
@@ -5058,9 +5071,17 @@ mod tests {
             }),
             ..inline.clone()
         };
-        assert_eq!(inline, with_identity);
-        assert_eq!(hash_of(&inline), hash_of(&with_identity));
-        assert_eq!(inline.cmp(&with_identity), std::cmp::Ordering::Equal);
+        assert_ne!(inline, with_identity);
+        assert_ne!(hash_of(&inline), hash_of(&with_identity));
+        assert_ne!(inline.cmp(&with_identity), std::cmp::Ordering::Equal);
+        let different_inode = SymbolRequest {
+            file_identity: with_identity.file_identity.map(|mut identity| {
+                identity.inode += 1;
+                identity
+            }),
+            ..with_identity.clone()
+        };
+        assert_ne!(with_identity, different_inode);
 
         // Different build_ids at the same path are genuinely different objects.
         let other_build_id = SymbolRequest {

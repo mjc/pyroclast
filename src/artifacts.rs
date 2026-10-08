@@ -26,6 +26,47 @@ impl ArtifactLayout {
         &self.root
     }
 
+    /// Creates the run directory and removes artifacts from any previous run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be created or an old artifact
+    /// cannot be removed. Unrelated files in the directory are preserved.
+    pub fn prepare(&self) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.root)?;
+        for entry in std::fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !name.starts_with("profile.raw.")
+                && !matches!(
+                    name,
+                    RUN_JSON
+                        | STDOUT_LOG
+                        | STDERR_LOG
+                        | COMMAND_TXT
+                        | STACKS_FOLDED
+                        | FLAMEGRAPH_SVG
+                        | SUMMARY_TXT
+                        | SUMMARY_JSON
+                        | TOOL_ERRORS_LOG
+                        | "xctrace-target.pid"
+                        | "offcpu-target.pid"
+                )
+            {
+                continue;
+            }
+            if entry.file_type()?.is_dir() {
+                std::fs::remove_dir_all(entry.path())?;
+            } else {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn run_json(&self) -> PathBuf {
         self.root.join(RUN_JSON)

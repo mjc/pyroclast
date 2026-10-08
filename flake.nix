@@ -46,7 +46,7 @@
             // {
               pname = "pyroclast";
               version = "0.1.0";
-              cargoExtraArgs = "--bin pyroclast";
+              cargoExtraArgs = "--bins";
               doCheck = false;
             }
           );
@@ -56,7 +56,7 @@
               pname = "pyroclast";
               version = "0.1.0";
               inherit cargoArtifacts;
-              cargoExtraArgs = "--bin pyroclast";
+              cargoExtraArgs = "--bins";
               doCheck = false;
               meta = {
                 description = packageDescription;

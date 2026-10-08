@@ -4,11 +4,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use crate::artifacts::ArtifactLayout;
-use crate::backends::linux_perf::{
-    PerfRecordTarget, build_perf_record_command, fold_linux_perfdata, linux_perf_fold_tools,
-};
+use crate::backends::linux_perf::{PerfRecordTarget, build_perf_record_command};
 use crate::backends::{BackendResult, ProfileRequest, ProfileResult, ProfilerBackend};
 use crate::cli::PerfEvent;
+use crate::flamegraph::{BuiltinFlamegraphRenderer, FlamegraphRenderer, FlamegraphRequest};
 use crate::manifest::{BackendName, RunManifest};
 use crate::parsers::bpftrace::collapse_offcpu;
 use crate::process::{CommandRunner, CommandSpec};
@@ -38,6 +37,9 @@ impl OffcpuMethod {
 #[derive(Serialize)]
 struct FoldedOffcpuSummary {
     method: OffcpuMethod,
+    weight_unit: &'static str,
+    scope: &'static str,
+    total_offcpu_ns: u64,
     #[serde(flatten)]
     folded: FoldedStackSummary,
 }
@@ -45,8 +47,26 @@ struct FoldedOffcpuSummary {
 #[derive(Serialize)]
 struct PerfSchedSummary {
     method: OffcpuMethod,
+    target_pid: u32,
+    scope: &'static str,
+    total_wait_ms: f64,
+    total_sched_delay_ms: f64,
+    total_run_ms: f64,
+    threads: Vec<PerfSchedThread>,
     timehist_raw: String,
 }
+
+#[derive(Default, Serialize)]
+struct PerfSchedThread {
+    tid: u32,
+    name: String,
+    intervals: u64,
+    wait_ms: f64,
+    sched_delay_ms: f64,
+    run_ms: f64,
+}
+
+pub const OFFCPU_PID_ENV: &str = "PYROCLAST_OFFCPU_TARGET_PID";
 
 #[must_use]
 pub fn build_bpftrace_offcpu_command(profiled_command: String, duration_secs: u32) -> CommandSpec {
@@ -57,6 +77,7 @@ pub fn build_bpftrace_offcpu_command(profiled_command: String, duration_secs: u3
         .arg(profiled_command)
         .arg("--unsafe")
         .interactive()
+        .capture_output()
 }
 
 #[must_use]
@@ -105,18 +126,26 @@ fn offcpu_bpftrace_program(duration_secs: u32) -> String {
         r"
 tracepoint:sched:sched_switch
 {{
-  if (args->prev_state != 0) {{
+  if (pid == cpid && args->prev_state != 0) {{
     @start[args->prev_pid] = nsecs;
+    @stack[args->prev_pid] = kstack(perf);
   }}
   if (@start[args->next_pid]) {{
-    @offcpu[kstack] = sum(nsecs - @start[args->next_pid]);
+    @offcpu[@stack[args->next_pid]] = sum((int64)(nsecs - @start[args->next_pid]));
     delete(@start[args->next_pid]);
+    delete(@stack[args->next_pid]);
   }}
 }}
 
 interval:s:{duration_secs}
 {{
   exit();
+}}
+
+END
+{{
+  clear(@start);
+  clear(@stack);
 }}
 "
     )
@@ -139,17 +168,20 @@ where
 {
     fn profile(&self, request: &ProfileRequest) -> BackendResult<ProfileResult> {
         ensure_command_workflow(request)?;
+        if request.offcpu_method == Some(OffcpuMethod::PerfCpuClock) {
+            return Err(
+                "cpu-clock measures on-CPU execution; use perf-sched or bpftrace for off-CPU waits"
+                    .into(),
+            );
+        }
+        let started_at_unix_ms = unix_ms_now();
+        let layout = ArtifactLayout::new(request.out_dir.clone());
+        layout.prepare()?;
         let tool_versions = resolve_required_tools(
             self.runner,
-            &offcpu_tool_specs(
-                request.offcpu_method.unwrap_or(OffcpuMethod::PerfSched),
-                request.symbols,
-                request.symbolizer,
-            ),
+            &offcpu_tool_specs(request.offcpu_method.unwrap_or(OffcpuMethod::PerfSched)),
         )?;
 
-        let layout = ArtifactLayout::new(request.out_dir.clone());
-        std::fs::create_dir_all(layout.root())?;
         std::fs::write(
             layout.command_txt(),
             format!("{}\n", request.command.join(" ")),
@@ -158,7 +190,7 @@ where
         let method = request.offcpu_method.unwrap_or(OffcpuMethod::PerfSched);
         let run = match method {
             OffcpuMethod::PerfSched => self.profile_with_perf_sched(request, &layout)?,
-            OffcpuMethod::PerfCpuClock => self.profile_with_perf_cpu_clock(request, &layout)?,
+            OffcpuMethod::PerfCpuClock => unreachable!("CPU-clock rejected before recording"),
             OffcpuMethod::Bpftrace => self.profile_with_bpftrace(request, &layout)?,
         };
 
@@ -171,10 +203,18 @@ where
         )?;
         if let Some(folded_stacks) = &run.folded_stacks {
             std::fs::write(layout.stacks_folded(), folded_stacks)?;
+            if !folded_stacks.is_empty() {
+                BuiltinFlamegraphRenderer.render(&FlamegraphRequest {
+                    title: "Off-CPU time (nanoseconds)".to_string(),
+                    folded_stacks: folded_stacks.clone(),
+                    output: layout.flamegraph_svg(),
+                })?;
+            }
         }
         std::fs::write(layout.tool_errors_log(), "")?;
 
         let manifest = RunManifest {
+            name: request.name.clone(),
             command: request.command.clone(),
             cwd: std::env::current_dir()?,
             profile_kind: request.kind,
@@ -182,7 +222,7 @@ where
             actual_backend: BackendName::Offcpu,
             fallback_reason: None,
             platform: std::env::consts::OS.to_string(),
-            started_at_unix_ms: unix_ms_now(),
+            started_at_unix_ms,
             ended_at_unix_ms: Some(unix_ms_now()),
             exit_status: run.exit_status,
             sample_frequency: request.frequency,
@@ -197,6 +237,9 @@ where
                 artifacts.push(run.raw_profile);
                 if run.folded_stacks.is_some() {
                     artifacts.push(layout.stacks_folded());
+                }
+                if layout.flamegraph_svg().is_file() {
+                    artifacts.push(layout.flamegraph_svg());
                 }
                 artifacts
             },
@@ -218,70 +261,79 @@ where
         layout: &ArtifactLayout,
     ) -> BackendResult<OffcpuRun> {
         let perf_data = layout.raw_profile("perf.data");
-        let record = build_perf_sched_record_command(&perf_data, request.command.clone());
+        let pid_path = layout.root().join("offcpu-target.pid");
+        let workload = [
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("printf '%s\\n' \"$$\" > \"${OFFCPU_PID_ENV}\"; exec \"$@\""),
+            "pyroclast-offcpu-launch".to_string(),
+        ]
+        .into_iter()
+        .chain(request.command.clone())
+        .collect();
+        let record = build_perf_sched_record_command(&perf_data, workload)
+            .env(OFFCPU_PID_ENV, pid_path.to_string_lossy());
+        let record = if request.json {
+            record.capture_output()
+        } else {
+            record
+        };
         let record_output = self.runner.run(&record)?;
         if !record_output.succeeded_or_interrupted() {
             return offcpu_command_error("perf sched record", &record_output, layout);
         }
 
-        let timehist = build_perf_sched_timehist_command(&perf_data);
+        let target_pid: u32 = std::fs::read_to_string(&pid_path)
+            .map_err(|error| format!("could not read recorded workload PID: {error}"))?
+            .trim()
+            .parse()
+            .map_err(|error| format!("invalid recorded workload PID: {error}"))?;
+        let timehist = build_perf_sched_timehist_command(&perf_data)
+            .args(["-p".to_string(), target_pid.to_string()]);
         let timehist_output = self.runner.run(&timehist)?;
         if timehist_output.status_code != Some(0) {
             return offcpu_command_error("perf sched timehist", &timehist_output, layout);
         }
 
         let timehist_raw = String::from_utf8_lossy(&timehist_output.stdout).into_owned();
+        let summary = summarize_perf_sched_timehist(timehist_raw, target_pid)?;
+        let summary_text = format!(
+            "offcpu wait milliseconds: {:.3}\nscheduling delay milliseconds: {:.3}\noncpu run milliseconds: {:.3}\n{}",
+            summary.total_wait_ms,
+            summary.total_sched_delay_ms,
+            summary.total_run_ms,
+            summary.timehist_raw,
+        );
         Ok(OffcpuRun {
-            exit_status: timehist_output.status_code,
+            exit_status: record_output.status_code,
             sample_event: PerfEvent::Default,
             duration_secs: None,
             stdout: [record_output.stdout, timehist_output.stdout].concat(),
             stderr: [record_output.stderr, timehist_output.stderr].concat(),
             raw_profile: perf_data,
             folded_stacks: None,
-            summary_text: timehist_raw.clone(),
-            summary_json: serde_json::to_value(PerfSchedSummary {
-                method: OffcpuMethod::PerfSched,
-                timehist_raw,
-            })?,
+            summary_text,
+            summary_json: serde_json::to_value(summary)?,
         })
     }
 
-    fn profile_with_perf_cpu_clock(
-        &self,
-        request: &ProfileRequest,
-        layout: &ArtifactLayout,
-    ) -> BackendResult<OffcpuRun> {
-        let perf_data = layout.raw_profile("perf.data");
-        let command = build_perf_cpu_clock_command(
-            request.frequency,
-            &request.call_graph.to_string(),
-            &perf_data,
-            request.command.clone(),
-        );
-        let output = self.runner.run(&command)?;
-        if !output.succeeded_or_interrupted() {
-            return offcpu_command_error("perf record", &output, layout);
-        }
-
-        let folded_stacks =
-            fold_linux_perfdata(&perf_data, request.symbols, request.symbolizer, self.runner)?;
-        folded_offcpu_run(
-            OffcpuMethod::PerfCpuClock,
-            output,
-            perf_data,
-            folded_stacks,
-            PerfEvent::CpuClock,
-            None,
-        )
-    }
-
+    #[cfg(unix)]
     fn profile_with_bpftrace(
         &self,
         request: &ProfileRequest,
         layout: &ArtifactLayout,
     ) -> BackendResult<OffcpuRun> {
-        let profiled_command = request.command.join(" ");
+        use std::io::Write;
+
+        // bpftrace splits -c on spaces without recognizing shell quoting.
+        // A private launcher with a whitespace-free path preserves argv and
+        // exec keeps bpftrace's cpid equal to the actual workload's PID.
+        let mut launcher = tempfile::Builder::new()
+            .prefix("pyroclast-offcpu-")
+            .tempfile_in("/tmp")?;
+        writeln!(launcher, "exec {}", shell_command(&request.command))?;
+        launcher.flush()?;
+        let profiled_command = format!("/bin/sh {}", launcher.path().display());
         let command = build_bpftrace_offcpu_command(profiled_command, request.duration_secs);
         let output = self.runner.run(&command)?;
         if !output.succeeded_or_interrupted() {
@@ -305,16 +357,21 @@ where
             Some(request.duration_secs),
         )
     }
+
+    #[cfg(not(unix))]
+    fn profile_with_bpftrace(
+        &self,
+        _request: &ProfileRequest,
+        _layout: &ArtifactLayout,
+    ) -> BackendResult<OffcpuRun> {
+        Err("bpftrace profiling requires Unix".into())
+    }
 }
 
-fn offcpu_tool_specs(
-    method: OffcpuMethod,
-    symbols: bool,
-    symbolizer: crate::cli::SymbolizerKind,
-) -> Vec<ToolSpec> {
+fn offcpu_tool_specs(method: OffcpuMethod) -> Vec<ToolSpec> {
     match method {
         OffcpuMethod::PerfSched => vec![PERF],
-        OffcpuMethod::PerfCpuClock => linux_perf_fold_tools(symbols, symbolizer),
+        OffcpuMethod::PerfCpuClock => Vec::new(),
         OffcpuMethod::Bpftrace => vec![BPFTRACE],
     }
 }
@@ -350,6 +407,9 @@ fn folded_offcpu_run(
         summary_text: render_folded_stack_summary_text(&folded_summary),
         summary_json: serde_json::to_value(FoldedOffcpuSummary {
             method,
+            weight_unit: "nanoseconds",
+            scope: "workload_process_and_threads",
+            total_offcpu_ns: folded_summary.total_count,
             folded: folded_summary,
         })?,
         folded_stacks: Some(folded_stacks),
@@ -357,10 +417,95 @@ fn folded_offcpu_run(
 }
 
 fn ensure_command_workflow(request: &ProfileRequest) -> BackendResult<()> {
-    if request.pid.is_some() || request.threads_of_pid.is_some() || !request.tids.is_empty() {
-        return Err("offcpu currently supports command-driven workflows only".into());
+    request.ensure_command_target("offcpu")
+}
+
+#[cfg(unix)]
+fn shell_command(command: &[String]) -> String {
+    command
+        .iter()
+        .map(|argument| format!("'{}'", argument.replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn summarize_perf_sched_timehist(
+    input: String,
+    target_pid: u32,
+) -> BackendResult<PerfSchedSummary> {
+    let mut threads = std::collections::BTreeMap::<u32, PerfSchedThread>::new();
+    let mut recognized = false;
+    for line in input.lines() {
+        let line = line.trim();
+        let Some((time, rest)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        if !time.parse::<f64>().is_ok_and(f64::is_finite) {
+            continue;
+        }
+        let Some((cpu, task)) = rest.trim_start().split_once(']') else {
+            continue;
+        };
+        if cpu
+            .strip_prefix('[')
+            .is_none_or(|cpu| cpu.parse::<u32>().is_err())
+        {
+            continue;
+        }
+        let Some((task, values)) = task.trim_start().split_once(']') else {
+            continue;
+        };
+        let Some((name, ids)) = task.rsplit_once('[') else {
+            continue;
+        };
+        let (tid, pid) = ids.split_once('/').unwrap_or((ids, ids));
+        let (Ok(tid), Ok(pid)) = (tid.parse::<u32>(), pid.parse::<u32>()) else {
+            continue;
+        };
+        let mut values = values.split_whitespace().take(3).map(str::parse::<f64>);
+        let (Some(Ok(wait_ms)), Some(Ok(sched_delay_ms)), Some(Ok(run_ms))) =
+            (values.next(), values.next(), values.next())
+        else {
+            continue;
+        };
+        if ![wait_ms, sched_delay_ms, run_ms]
+            .iter()
+            .all(|value| value.is_finite() && *value >= 0.0)
+        {
+            continue;
+        }
+        recognized = true;
+        if pid != target_pid {
+            continue;
+        }
+        let thread = threads.entry(tid).or_insert_with(|| PerfSchedThread {
+            tid,
+            ..PerfSchedThread::default()
+        });
+        name.clone_into(&mut thread.name);
+        thread.intervals += 1;
+        thread.wait_ms += wait_ms;
+        thread.sched_delay_ms += sched_delay_ms;
+        thread.run_ms += run_ms;
     }
-    Ok(())
+    if !(recognized
+        || (input.contains("wait time")
+            && input.contains("sch delay")
+            && input.contains("run time")))
+    {
+        return Err("perf sched timehist did not contain a recognized scheduler report".into());
+    }
+    let threads: Vec<_> = threads.into_values().collect();
+    Ok(PerfSchedSummary {
+        method: OffcpuMethod::PerfSched,
+        target_pid,
+        scope: "workload_process_and_threads",
+        total_wait_ms: threads.iter().map(|thread| thread.wait_ms).sum(),
+        total_sched_delay_ms: threads.iter().map(|thread| thread.sched_delay_ms).sum(),
+        total_run_ms: threads.iter().map(|thread| thread.run_ms).sum(),
+        threads,
+        timehist_raw: input,
+    })
 }
 
 fn offcpu_command_error<T>(

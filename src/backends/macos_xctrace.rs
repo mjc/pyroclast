@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::artifacts::ArtifactLayout;
 use crate::backends::{BackendResult, ProfileRequest, ProfileResult, ProfilerBackend};
 use crate::manifest::{BackendName, RunManifest};
-use crate::parsers::xctrace::{parse_cpu_profile, render_cpu_profile_summary_text};
+use crate::parsers::xctrace::{parse_cpu_profile_for_pid, render_cpu_profile_summary_text};
 use crate::process::CommandRunner;
 use crate::process::CommandSpec;
 use crate::tools::{XCTRACE, resolve_required_tools};
@@ -46,7 +46,7 @@ pub fn build_xctrace_export_cpu_command(trace_path: &Path, output_xml: &Path) ->
         "--output".to_string(),
         output_xml.display().to_string(),
         "--xpath".to_string(),
-        "//table".to_string(),
+        "//table[@schema=\"cpu-profile\" or @schema=\"time-profile\"]".to_string(),
     ])
 }
 
@@ -66,14 +66,21 @@ where
     R: CommandRunner,
 {
     fn profile(&self, request: &ProfileRequest) -> BackendResult<ProfileResult> {
-        let tool_versions = resolve_required_tools(self.runner, &[XCTRACE])?;
+        request.ensure_command_target("macos_xctrace")?;
+        let started_at_unix_ms = unix_ms_now();
         let layout = ArtifactLayout::new(request.out_dir.clone());
-        std::fs::create_dir_all(layout.root())?;
+        layout.prepare()?;
+        let tool_versions = resolve_required_tools(self.runner, &[XCTRACE])?;
 
         let trace_path = layout.raw_profile("xctrace.trace");
         let target_pid_path = layout.root().join("xctrace-target.pid");
         let record_command =
             build_xctrace_record_command(&trace_path, &target_pid_path, request.command.clone());
+        let record_command = if request.json {
+            record_command.capture_output()
+        } else {
+            record_command
+        };
         let record_output = self.runner.run(&record_command)?;
         std::fs::write(layout.stdout_log(), &record_output.stdout)?;
         std::fs::write(layout.stderr_log(), &record_output.stderr)?;
@@ -106,7 +113,13 @@ where
             return Err(error.into());
         }
 
-        let profile = parse_cpu_profile(&std::fs::read_to_string(&xml_path)?);
+        let target_pid: u32 = std::fs::read_to_string(&target_pid_path)
+            .map_err(|error| format!("could not read xctrace workload PID: {error}"))?
+            .trim()
+            .parse()
+            .map_err(|error| format!("invalid xctrace workload PID: {error}"))?;
+        let profile =
+            parse_cpu_profile_for_pid(&std::fs::read_to_string(&xml_path)?, Some(target_pid))?;
         std::fs::write(
             layout.summary_txt(),
             render_cpu_profile_summary_text(&profile),
@@ -118,6 +131,7 @@ where
         std::fs::write(layout.tool_errors_log(), "")?;
 
         let manifest = RunManifest {
+            name: request.name.clone(),
             command: request.command.clone(),
             cwd: std::env::current_dir()?,
             profile_kind: request.kind,
@@ -125,7 +139,7 @@ where
             actual_backend: BackendName::MacosXctrace,
             fallback_reason: None,
             platform: "macos".to_string(),
-            started_at_unix_ms: unix_ms_now(),
+            started_at_unix_ms,
             ended_at_unix_ms: Some(unix_ms_now()),
             exit_status: record_output.status_code,
             sample_frequency: request.frequency,

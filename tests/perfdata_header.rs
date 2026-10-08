@@ -31,6 +31,14 @@ fn rejects_non_perfdata_magic() {
 }
 
 #[test]
+fn rejects_overflowing_feature_table_read_offsets() {
+    let mut bytes = header_bytes("PERFILE2", 104, 104, 0, u64::MAX, 0);
+    put_u64(&mut bytes, 72, 1 << 12);
+    let header = parse_header(&bytes).unwrap();
+    assert!(parse_feature_sections(&bytes, &header).is_err());
+}
+
+#[test]
 fn parses_feature_sections_from_set_header_bits() {
     // tools/perf/util/header.h struct perf_file_header places the
     // adds_features DECLARE_BITMAP at byte offset 72 (after magic[8], size[8],

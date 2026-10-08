@@ -29,6 +29,18 @@ pub enum CargoCommand {
 
 impl CargoCommand {
     #[must_use]
+    pub fn json(&self) -> bool {
+        let Self::Pyroclast { command } = self;
+        match command {
+            CargoPyroclastCommand::Memory(args)
+            | CargoPyroclastCommand::Cpu(args)
+            | CargoPyroclastCommand::Offcpu(args)
+            | CargoPyroclastCommand::Latency(args)
+            | CargoPyroclastCommand::Async(args) => args.json,
+        }
+    }
+
+    #[must_use]
     pub fn pyroclast_command(self) -> CargoPyroclastCommand {
         match self {
             Self::Pyroclast { command } => command,
@@ -74,11 +86,18 @@ impl CargoPyroclastCommand {
             Self::Async(args) => (ProfileKind::Async, args),
         };
 
+        crate::artifacts::ArtifactLayout::new(
+            args.out
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("pyroclast-runs/latest")),
+        )
+        .prepare()?;
         let target_kind = auto_select_target(&mut args)?;
         let artifacts = build(&args, &target_kind, runner)?;
         let command = workload(&args, &artifacts)?;
 
         Ok(ProfileInvocation {
+            offcpu_method: args.offcpu_method,
             kind,
             out: args.out,
             name: args.name,
@@ -100,6 +119,8 @@ impl CargoPyroclastCommand {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Args)]
 pub struct CargoRunArgs {
+    #[arg(long, value_enum)]
+    pub offcpu_method: Option<crate::cli::OffcpuChoice>,
     #[arg(long)]
     pub dev: bool,
 
@@ -662,7 +683,8 @@ fn find_unique_target(
                 ..
             } = package_metadata;
             package_count += 1;
-            if default_run.is_some() {
+            let use_default_run = target_name.is_none() && kind == [TargetKind::Bin];
+            if use_default_run && default_run.is_some() {
                 selected_default_run = true;
             }
             targets.into_iter().filter_map(move |target| {
@@ -670,9 +692,11 @@ fn find_unique_target(
                     return None;
                 }
 
-                match &default_run {
-                    Some(default_run) if default_run != &target.name => return None,
-                    _ => {}
+                if use_default_run {
+                    match &default_run {
+                        Some(default_run) if default_run != &target.name => return None,
+                        _ => {}
+                    }
                 }
 
                 match target_name {
@@ -912,6 +936,20 @@ mod tests {
             ]
         );
         assert!(runner.commands()[0].inherit_stderr);
+    }
+
+    #[test]
+    fn default_run_does_not_hide_library_tests_or_explicit_bins() {
+        let root = tempdir().unwrap();
+        write_default_run_package(root.path(), "demo", "viewer", &["worker"]);
+        std::fs::write(root.path().join("src/lib.rs"), "pub fn library() {}\n").unwrap();
+        let manifest = root.path().join("Cargo.toml");
+        let library = find_unique_target(&[TargetKind::Lib], None, Some(&manifest), None)
+            .expect("library test target despite default-run");
+        assert_eq!(library.target, "demo");
+        let binary = find_unique_target(&[TargetKind::Bin], None, Some(&manifest), Some("worker"))
+            .expect("explicit binary despite default-run");
+        assert_eq!(binary.target, "worker");
     }
 
     #[test]

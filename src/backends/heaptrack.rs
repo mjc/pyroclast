@@ -7,6 +7,7 @@ use crate::manifest::{BackendName, RunManifest};
 use crate::parsers::heaptrack::{parse_heaptrack_summary, render_heaptrack_summary_text};
 use crate::process::CommandRunner;
 use crate::process::CommandSpec;
+use crate::summary::heap::summarize_heaptrack;
 use crate::tools::{HEAPTRACK, HEAPTRACK_PRINT, resolve_required_tools};
 
 pub fn build_heaptrack_command(
@@ -42,12 +43,19 @@ where
     R: CommandRunner,
 {
     fn profile(&self, request: &ProfileRequest) -> BackendResult<ProfileResult> {
-        let tool_versions = resolve_required_tools(self.runner, &[HEAPTRACK, HEAPTRACK_PRINT])?;
+        request.ensure_command_target("heaptrack")?;
+        let started_at_unix_ms = unix_ms_now();
         let layout = ArtifactLayout::new(request.out_dir.clone());
-        std::fs::create_dir_all(layout.root())?;
+        layout.prepare()?;
+        let tool_versions = resolve_required_tools(self.runner, &[HEAPTRACK, HEAPTRACK_PRINT])?;
 
         let raw_heaptrack = layout.raw_profile("heaptrack");
         let command = build_heaptrack_command(&raw_heaptrack, request.command.clone());
+        let command = if request.json {
+            command.capture_output()
+        } else {
+            command
+        };
         let output = self.runner.run(&command)?;
         std::fs::write(layout.stdout_log(), &output.stdout)?;
         std::fs::write(layout.stderr_log(), &output.stderr)?;
@@ -82,17 +90,19 @@ where
 
         let summary_text = String::from_utf8_lossy(&print_output.stdout);
         let summary = parse_heaptrack_summary(&summary_text);
+        let heap_summary = summarize_heaptrack(&summary_text);
         std::fs::write(
             layout.summary_txt(),
             render_heaptrack_summary_text(&summary),
         )?;
         std::fs::write(
             layout.summary_json(),
-            format!("{}\n", serde_json::to_string_pretty(&summary)?),
+            format!("{}\n", serde_json::to_string_pretty(&heap_summary)?),
         )?;
         std::fs::write(layout.tool_errors_log(), "")?;
 
         let manifest = RunManifest {
+            name: request.name.clone(),
             command: request.command.clone(),
             cwd: std::env::current_dir()?,
             profile_kind: request.kind,
@@ -100,7 +110,7 @@ where
             actual_backend: BackendName::Heaptrack,
             fallback_reason: None,
             platform: std::env::consts::OS.to_string(),
-            started_at_unix_ms: unix_ms_now(),
+            started_at_unix_ms,
             ended_at_unix_ms: Some(unix_ms_now()),
             exit_status: output.status_code,
             sample_frequency: request.frequency,

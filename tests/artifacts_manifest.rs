@@ -40,8 +40,37 @@ fn artifact_layout_uses_required_file_names() {
 }
 
 #[test]
+fn preparing_a_reused_run_removes_old_success_artifacts_and_raw_profiles() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let layout = ArtifactLayout::new(root.path().to_path_buf());
+    let mut stale = layout.standard_manifest_artifacts();
+    stale.extend([
+        layout.stacks_folded(),
+        layout.flamegraph_svg(),
+        layout.raw_profile("perf.data"),
+        layout.raw_profile("heaptrack.1234.zst"),
+    ]);
+    for path in &stale {
+        std::fs::write(path, "previous run").unwrap();
+    }
+    let trace = layout.raw_profile("xctrace.trace");
+    std::fs::create_dir(&trace).unwrap();
+    std::fs::write(trace.join("data"), "old trace").unwrap();
+    let unrelated = layout.root().join("notes.txt");
+    std::fs::write(&unrelated, "keep me").unwrap();
+
+    layout.prepare().expect("prepare reused run");
+    layout.prepare().expect("preparation is idempotent");
+
+    assert!(stale.iter().all(|path| !path.exists()));
+    assert!(!trace.exists());
+    assert_eq!(std::fs::read_to_string(unrelated).unwrap(), "keep me");
+}
+
+#[test]
 fn manifest_serializes_core_run_fields() {
     let manifest = RunManifest {
+        name: None,
         command: vec!["cargo".to_string(), "check".to_string()],
         cwd: "/work/pyroclast".into(),
         profile_kind: ProfileKind::Cpu,
@@ -224,6 +253,7 @@ proptest! {
         let sample_event = perf_event_from_case(perf_event_case);
         let call_graph = perf_call_graph_from_case(call_graph_case);
         let manifest = RunManifest {
+            name: None,
             command: vec!["cargo".to_string(), "check".to_string()],
             cwd: PathBuf::from("runs/work"),
             profile_kind,

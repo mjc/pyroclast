@@ -18,6 +18,8 @@ pub enum BackendName {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RunManifest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub command: Vec<String>,
     pub cwd: PathBuf,
     pub profile_kind: ProfileKind,

@@ -78,6 +78,394 @@ fn fold_command_reads_perfdata_directly() {
 }
 
 #[test]
+fn profiling_json_returns_named_run_and_artifact_paths() {
+    let root = tempfile::tempdir().unwrap();
+    let out = root.path().join("named");
+    let runner = RecordingRunner::default();
+    let cli = pyroclast::cli::Cli::parse_from([
+        "pyroclast",
+        "latency",
+        "--json",
+        "--name",
+        "native-service",
+        "--out",
+        out.to_str().unwrap(),
+        "--",
+        "service",
+        "--foreground",
+    ]);
+    let output = pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux").unwrap();
+    let result: serde_json::Value = serde_json::from_str(&output.stdout).expect("JSON result");
+    assert_eq!(result["name"], "native-service");
+    assert_eq!(result["actual_backend"], "strace");
+    assert_eq!(
+        result["command"],
+        serde_json::json!(["service", "--foreground"])
+    );
+    assert!(
+        result["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path.as_str().unwrap().ends_with("summary.json"))
+    );
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("run.json")).unwrap()).unwrap();
+    assert_eq!(saved["name"], "native-service");
+}
+
+#[test]
+fn unsupported_attach_is_rejected_before_launching_a_command() {
+    for (kind, platform) in [
+        ("memory", "linux"),
+        ("latency", "linux"),
+        ("cpu", "macos"),
+        ("offcpu", "linux"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let runner = RecordingRunner::default();
+        let cli = pyroclast::cli::Cli::parse_from([
+            "pyroclast",
+            kind,
+            "--pid",
+            "4294967295",
+            "--out",
+            root.path().to_str().unwrap(),
+            "--",
+            "must-not-run",
+        ]);
+        let error = pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, platform)
+            .expect_err("unsupported target");
+        assert!(error.to_string().contains("attach"), "{error}");
+        assert!(runner.programs().is_empty());
+    }
+}
+
+struct WithoutPerf(RecordingRunner);
+
+#[test]
+fn failed_automatic_selection_invalidates_previous_success() {
+    struct MissingRecorders;
+    impl pyroclast::process::CommandRunner for MissingRecorders {
+        fn run(
+            &self,
+            _: &pyroclast::process::CommandSpec,
+        ) -> std::io::Result<pyroclast::process::CommandOutput> {
+            panic!("missing recorders must not launch a workload")
+        }
+        fn resolve_tool(
+            &self,
+            _: &pyroclast::tools::ToolSpec,
+        ) -> std::io::Result<pyroclast::tools::ResolvedTool> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "missing recorder",
+            ))
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("run.json"), "old success").unwrap();
+    std::fs::write(root.path().join("summary.json"), "old summary").unwrap();
+    let cli = pyroclast::cli::Cli::parse_from([
+        "pyroclast",
+        "offcpu",
+        "--out",
+        root.path().to_str().unwrap(),
+        "--",
+        "must-not-run",
+    ]);
+    let error = pyroclast::run_parsed_cli_with_runner_on_platform(cli, &MissingRecorders, "linux")
+        .unwrap_err();
+    assert!(error.to_string().contains("missing recorder"));
+    assert!(!root.path().join("run.json").exists());
+    assert!(!root.path().join("summary.json").exists());
+}
+
+#[test]
+fn failed_json_profile_returns_machine_readable_error_and_nonzero_status() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pyroclast"))
+        .args([
+            "cpu",
+            "--json",
+            "--offcpu-method",
+            "bpftrace",
+            "--",
+            "must-not-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON failure");
+    assert_eq!(error["status"], "failed");
+    assert!(error["error"].as_str().unwrap().contains("offcpu-method"));
+}
+
+#[test]
+fn cargo_json_build_failure_returns_machine_readable_error() {
+    let root = tempfile::tempdir().unwrap();
+    let out = root.path().join("run");
+    std::fs::create_dir(&out).unwrap();
+    std::fs::write(out.join("run.json"), "old success").unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cargo-pyroclast"))
+        .args(["pyroclast", "cpu", "--json", "--manifest-path"])
+        .arg(root.path().join("missing.toml"))
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON failure");
+    assert_eq!(error["status"], "failed");
+    assert!(!error["error"].as_str().unwrap().is_empty());
+    assert!(!out.join("run.json").exists());
+}
+
+impl pyroclast::process::CommandRunner for WithoutPerf {
+    fn run(
+        &self,
+        command: &pyroclast::process::CommandSpec,
+    ) -> std::io::Result<pyroclast::process::CommandOutput> {
+        pyroclast::process::CommandRunner::run(&self.0, command)
+    }
+
+    fn resolve_tool(
+        &self,
+        tool: &pyroclast::tools::ToolSpec,
+    ) -> std::io::Result<pyroclast::tools::ResolvedTool> {
+        if tool.name == "perf" {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "perf unavailable",
+            ))
+        } else {
+            Ok(pyroclast::tools::ResolvedTool::bare(tool))
+        }
+    }
+}
+
+#[test]
+fn blocked_and_async_profiles_choose_available_native_tracing_automatically() {
+    for kind in ["offcpu", "async"] {
+        let root = tempfile::tempdir().unwrap();
+        let runner = WithoutPerf(RecordingRunner::default());
+        let cli = pyroclast::cli::Cli::parse_from([
+            "pyroclast",
+            kind,
+            "--out",
+            root.path().to_str().unwrap(),
+            "--",
+            "native-service",
+        ]);
+        pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux").unwrap();
+        assert_eq!(runner.0.programs(), vec!["bpftrace", "bpftrace"]);
+        let summary: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.path().join("summary.json")).unwrap())
+                .unwrap();
+        assert_eq!(summary["method"], "bpftrace");
+        assert!(
+            !std::fs::read_to_string(root.path().join("stacks.folded"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+struct DeniedPerf {
+    recording: RecordingRunner,
+    bpftrace_available: bool,
+    bpftrace_permitted: bool,
+}
+
+impl pyroclast::process::CommandRunner for DeniedPerf {
+    fn run(
+        &self,
+        command: &pyroclast::process::CommandSpec,
+    ) -> std::io::Result<pyroclast::process::CommandOutput> {
+        if command.program == "perf" {
+            self.recording
+                .commands
+                .lock()
+                .unwrap()
+                .push(command.clone());
+            return Ok(pyroclast::process::CommandOutput {
+                status_code: Some(255),
+                stdout: Vec::new(),
+                stderr: b"sched tracepoints are not permitted".to_vec(),
+            });
+        }
+        if command.program == "bpftrace" && !self.bpftrace_permitted {
+            self.recording
+                .commands
+                .lock()
+                .unwrap()
+                .push(command.clone());
+            return Ok(pyroclast::process::CommandOutput {
+                status_code: Some(1),
+                stdout: Vec::new(),
+                stderr: b"kernel stack helper is not permitted".to_vec(),
+            });
+        }
+        pyroclast::process::CommandRunner::run(&self.recording, command)
+    }
+
+    fn resolve_tool(
+        &self,
+        tool: &pyroclast::tools::ToolSpec,
+    ) -> std::io::Result<pyroclast::tools::ResolvedTool> {
+        if tool.name == "bpftrace" && !self.bpftrace_available {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "bpftrace unavailable",
+            ));
+        }
+        Ok(pyroclast::tools::ResolvedTool::bare(tool))
+    }
+}
+
+#[test]
+fn automatic_blocked_time_selection_checks_permissions_before_launching_workload() {
+    let root = tempfile::tempdir().unwrap();
+    let runner = DeniedPerf {
+        recording: RecordingRunner::default(),
+        bpftrace_available: true,
+        bpftrace_permitted: true,
+    };
+    let cli = pyroclast::cli::Cli::parse_from([
+        "pyroclast",
+        "offcpu",
+        "--json",
+        "--out",
+        root.path().to_str().unwrap(),
+        "--",
+        "native-service",
+    ]);
+    let output = pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux")
+        .expect("use bpftrace when installed perf lacks scheduler permissions");
+    let commands = runner.recording.commands();
+    assert_eq!(commands[0].program, "perf");
+    assert!(
+        commands[0]
+            .args
+            .ends_with(&["--".into(), "sh".into(), "-c".into(), ":".into()])
+    );
+    assert!(!commands[0].interactive);
+    assert!(!commands[0].args.iter().any(|arg| arg == "native-service"));
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| command.program == "bpftrace")
+            .count(),
+        2
+    );
+    let bpftrace_probe = &commands[1];
+    assert!(!bpftrace_probe.interactive);
+    assert!(!bpftrace_probe.args.iter().any(|arg| arg == "-c"));
+    assert!(commands[2].args.iter().any(|arg| arg == "-c"));
+    let manifest: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(manifest["command"], serde_json::json!(["native-service"]));
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("summary.json")).unwrap()).unwrap();
+    assert_eq!(summary["method"], "bpftrace");
+}
+
+#[test]
+fn unusable_blocked_time_recorders_report_both_causes_without_launching_workload() {
+    let root = tempfile::tempdir().unwrap();
+    let runner = DeniedPerf {
+        recording: RecordingRunner::default(),
+        bpftrace_available: false,
+        bpftrace_permitted: false,
+    };
+    let cli = pyroclast::cli::Cli::parse_from([
+        "pyroclast",
+        "offcpu",
+        "--out",
+        root.path().to_str().unwrap(),
+        "--",
+        "must-not-run",
+    ]);
+    let error =
+        pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux").unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("sched tracepoints are not permitted"),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("bpftrace unavailable"),
+        "{error}"
+    );
+    assert_eq!(runner.recording.programs(), vec!["perf"]);
+    assert!(!root.path().join("run.json").exists());
+}
+
+#[test]
+fn failed_blocked_time_capability_probes_do_not_launch_requested_workload() {
+    let root = tempfile::tempdir().unwrap();
+    let runner = DeniedPerf {
+        recording: RecordingRunner::default(),
+        bpftrace_available: true,
+        bpftrace_permitted: false,
+    };
+    let cli = pyroclast::cli::Cli::parse_from([
+        "pyroclast",
+        "offcpu",
+        "--out",
+        root.path().to_str().unwrap(),
+        "--",
+        "must-not-run",
+    ]);
+    let error =
+        pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux").unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("sched tracepoints are not permitted"),
+        "{error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("kernel stack helper is not permitted"),
+        "{error}"
+    );
+    let commands = runner.recording.commands();
+    assert_eq!(runner.recording.programs(), vec!["perf", "bpftrace"]);
+    assert!(commands.iter().all(|command| !command.interactive));
+    assert!(
+        commands
+            .iter()
+            .all(|command| !command.args.iter().any(|arg| arg == "must-not-run"))
+    );
+    assert!(!root.path().join("run.json").exists());
+}
+
+#[test]
+fn explicit_blocked_time_recorder_skips_automatic_capability_probe() {
+    let root = tempfile::tempdir().unwrap();
+    let runner = RecordingRunner::default();
+    let cli = pyroclast::cli::Cli::parse_from([
+        "pyroclast",
+        "offcpu",
+        "--offcpu-method",
+        "perf-sched",
+        "--out",
+        root.path().to_str().unwrap(),
+        "--",
+        "native-service",
+    ]);
+    pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux").unwrap();
+    assert_eq!(runner.programs(), vec!["perf", "perf"]);
+    assert!(
+        runner.commands()[0]
+            .env
+            .iter()
+            .any(|(name, _)| name == "PYROCLAST_OFFCPU_TARGET_PID")
+    );
+}
+
+#[test]
 fn streaming_perf_commands_match_explicit_owned_output_adapters() {
     let file = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(file.path(), tiny_perfdata()).unwrap();
@@ -907,19 +1295,14 @@ fn flamegraph_command_folds_perfdata_without_perf_script() {
 
     pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("flamegraph command");
 
-    assert_eq!(runner.programs(), vec!["inferno-flamegraph"]);
-    assert_eq!(
-        runner.first_args(),
-        Some(vec![
-            "--title".to_string(),
-            "sftp-s3 CPU".to_string(),
-            "-".to_string()
-        ])
-    );
-    assert_eq!(runner.stdins(), vec![Some(b":2;[unknown] 1\n".to_vec())]);
-    assert_eq!(
-        std::fs::read_to_string(output_svg).expect("svg"),
-        "<svg></svg>\n"
+    assert!(runner.programs().is_empty());
+    let svg = std::fs::read_to_string(output_svg).expect("svg");
+    assert!(svg.contains("sftp-s3 CPU"));
+    let entries = pyroclast::flamegraph::analysis::parse_flamegraph_entries(&svg);
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.name == "[unknown]" && entry.samples == 1)
     );
 }
 
@@ -942,7 +1325,15 @@ fn flamegraph_command_uses_infernos_unit_weight_for_untimed_period_samples() {
 
     pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("flamegraph command");
 
-    assert_eq!(runner.stdins(), vec![Some(b":2;[unknown] 1\n".to_vec())]);
+    assert!(runner.programs().is_empty());
+    let entries = pyroclast::flamegraph::analysis::parse_flamegraph_entries(
+        &std::fs::read_to_string(output_svg).unwrap(),
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.name == "[unknown]" && entry.samples == 1)
+    );
 }
 
 #[test]
@@ -1015,8 +1406,15 @@ fn flamegraph_command_keeps_module_fallback_without_a_perf_base_symbol() {
 
     pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("flamegraph command");
 
-    assert_eq!(runner.programs(), vec!["inferno-flamegraph"]);
-    assert_eq!(runner.stdins(), vec![Some(b"app;[app] 1\n".to_vec())]);
+    assert!(runner.programs().is_empty());
+    let entries = pyroclast::flamegraph::analysis::parse_flamegraph_entries(
+        &std::fs::read_to_string(output_svg).unwrap(),
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.name == "[app]" && entry.samples == 1)
+    );
 }
 
 #[test]
@@ -1025,13 +1423,11 @@ fn analyze_flamegraph_command_emits_json_summary() {
     let svg = root.path().join("flamegraph.svg");
     std::fs::write(
         &svg,
-        r"
-<svg>
-  <title>all (100 samples, 100%)</title>
-  <title>tokio::runtime::park (40 samples, 40.00%)</title>
-  <title>zfs_read (30 samples, 30.00%)</title>
-</svg>
-",
+        r#"<svg>
+  <g><title>all (100 samples, 100%)</title><rect x="0" y="40" width="100" height="15"/></g>
+  <g><title>tokio::runtime::park (40 samples, 40.00%)</title><rect x="0" y="25" width="40" height="15"/></g>
+  <g><title>zfs_read (30 samples, 30.00%)</title><rect x="40" y="25" width="30" height="15"/></g>
+</svg>"#,
     )
     .expect("svg");
 
@@ -1055,19 +1451,21 @@ fn analyze_flamegraph_command_emits_json_summary() {
 
 #[test]
 fn analyze_flamegraph_command_emits_text_diff() {
+    let render_test_flamegraph = |lines: &[&str]| {
+        let mut svg = Vec::new();
+        inferno::flamegraph::from_lines(
+            &mut inferno::flamegraph::Options::default(),
+            lines.iter().copied(),
+            &mut svg,
+        )
+        .unwrap();
+        svg
+    };
     let root = tempfile::tempdir().expect("tempdir");
     let before = root.path().join("before.svg");
     let after = root.path().join("after.svg");
-    std::fs::write(
-        &before,
-        r"<title>parse (80 samples, 80.00%)</title><title>read (20 samples, 20.00%)</title>",
-    )
-    .expect("before");
-    std::fs::write(
-        &after,
-        r"<title>parse (50 samples, 50.00%)</title><title>write (50 samples, 50.00%)</title>",
-    )
-    .expect("after");
+    std::fs::write(&before, render_test_flamegraph(&["parse 80", "read 20"])).expect("before");
+    std::fs::write(&after, render_test_flamegraph(&["parse 50", "write 50"])).expect("after");
 
     let output = pyroclast::run_cli([
         "pyroclast",
@@ -1107,6 +1505,8 @@ fn analyze_perfdata_command_emits_json_report() {
     assert_eq!(json["total_samples"], 1);
     assert_eq!(json["weighted_samples"], 144);
     assert_eq!(json["threads"][0]["tid"], 2);
+    assert_eq!(json["profile"]["threads"][0]["pid"], 1);
+    assert_eq!(json["profile"]["timeline"]["untimed_samples"], 1);
     assert_eq!(json["top_leaf_ips"][0]["ip"], "0x0000000000002000");
 }
 
@@ -1250,7 +1650,7 @@ fn top_level_cpu_command_uses_injected_perf_runner() {
 
     pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux").expect("run cli");
 
-    assert_eq!(runner.programs(), vec!["perf", "inferno-flamegraph"]);
+    assert_eq!(runner.programs(), vec!["perf"]);
     let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
     assert!(run_json.contains("\"actual_backend\": \"linux_perf\""));
     assert!(run_json.contains("\"sample_frequency\": 997"));
@@ -1285,7 +1685,7 @@ fn profile_cpu_command_uses_injected_perf_runner() {
 
     pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux").expect("run cli");
 
-    assert_eq!(runner.programs(), vec!["perf", "inferno-flamegraph"]);
+    assert_eq!(runner.programs(), vec!["perf"]);
     let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
     assert!(run_json.contains("\"actual_backend\": \"linux_perf\""));
     assert!(run_json.contains("\"symbols\": true"));
@@ -1386,7 +1786,7 @@ fn top_level_offcpu_command_uses_injected_perf_sched_runner() {
 
     pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux").expect("run cli");
 
-    assert_eq!(runner.programs(), vec!["perf", "perf"]);
+    assert_eq!(runner.programs(), vec!["perf", "perf", "perf"]);
     let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
     assert!(run_json.contains("\"actual_backend\": \"offcpu\""));
     assert!(run_json.contains("\"symbols\": true"));
@@ -1415,7 +1815,7 @@ fn top_level_offcpu_command_rejects_attach_workflows() {
 
     assert_eq!(
         error.to_string(),
-        "offcpu currently supports command-driven workflows only"
+        "off-cpu profiling does not support attach targets on linux"
     );
     assert!(runner.programs().is_empty());
 }
@@ -1443,10 +1843,6 @@ impl RecordingRunner {
             .map(|command| command.stdin.clone())
             .collect()
     }
-
-    fn first_args(&self) -> Option<Vec<String>> {
-        self.commands().first().map(|command| command.args.clone())
-    }
 }
 
 impl pyroclast::process::CommandRunner for RecordingRunner {
@@ -1461,6 +1857,14 @@ impl pyroclast::process::CommandRunner for RecordingRunner {
                 stdout: format!("{} fake version\n", command.program).into_bytes(),
                 stderr: Vec::new(),
             });
+        }
+        for (name, path) in &command.env {
+            if matches!(
+                name.as_str(),
+                "PYROCLAST_OFFCPU_TARGET_PID" | "PYROCLAST_XCTRACE_TARGET_PID"
+            ) {
+                std::fs::write(path, "42\n")?;
+            }
         }
         if let Some(output_path) = perf_output_path(command) {
             std::fs::write(output_path, tiny_perfdata())?;
@@ -1480,7 +1884,7 @@ impl pyroclast::process::CommandRunner for RecordingRunner {
         if let Some(xml_path) = xctrace_export_output_path(command) {
             std::fs::write(
                 xml_path,
-                "<table><row><symbol>app::main</symbol><weight>12.5</weight></row></table>",
+                "<table><row><process pid=\"42\"/><symbol>app::main</symbol><weight>12.5</weight></row></table>",
             )?;
         }
         let stdout = match command.program.as_str() {
@@ -1489,7 +1893,7 @@ impl pyroclast::process::CommandRunner for RecordingRunner {
                 if command.args.first().map(String::as_str) == Some("sched")
                     && command.args.get(1).map(String::as_str) == Some("timehist") =>
             {
-                b"timehist report\n".to_vec()
+                b"100.000000 [0000] app[42] 10.000 2.000 1.000\n".to_vec()
             }
             "bpftrace" => {
                 b"@offcpu[\n    55 tokio::runtime::park+12 (/bin/app)\n    44 app::serve+7 (/bin/app)\n]: 1500\n".to_vec()

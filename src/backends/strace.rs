@@ -7,6 +7,7 @@ use crate::manifest::{BackendName, RunManifest};
 use crate::parsers::strace::{parse_strace_summary, render_strace_summary_text};
 use crate::process::CommandRunner;
 use crate::process::CommandSpec;
+use crate::summary::syscalls::{SyscallLatency, summarize_syscalls};
 use crate::tools::{STRACE, resolve_required_tools};
 
 pub fn build_strace_command(
@@ -25,6 +26,13 @@ pub struct StraceBackend<'a, R> {
     runner: &'a R,
 }
 
+#[derive(serde::Serialize)]
+struct SyscallProfileSummary<'a> {
+    #[serde(flatten)]
+    totals: &'a crate::parsers::strace::StraceSummary,
+    syscalls: Vec<SyscallLatency>,
+}
+
 impl<'a, R> StraceBackend<'a, R> {
     pub fn new(runner: &'a R) -> Self {
         Self { runner }
@@ -36,12 +44,19 @@ where
     R: CommandRunner,
 {
     fn profile(&self, request: &ProfileRequest) -> BackendResult<ProfileResult> {
-        let tool_versions = resolve_required_tools(self.runner, &[STRACE])?;
+        request.ensure_command_target("strace")?;
+        let started_at_unix_ms = unix_ms_now();
         let layout = ArtifactLayout::new(request.out_dir.clone());
-        std::fs::create_dir_all(layout.root())?;
+        layout.prepare()?;
+        let tool_versions = resolve_required_tools(self.runner, &[STRACE])?;
 
         let raw_strace = layout.raw_profile("strace");
         let command = build_strace_command(&raw_strace, request.command.clone());
+        let command = if request.json {
+            command.capture_output()
+        } else {
+            command
+        };
         let output = self.runner.run(&command)?;
         std::fs::write(layout.stdout_log(), &output.stdout)?;
         std::fs::write(layout.stderr_log(), &output.stderr)?;
@@ -62,14 +77,22 @@ where
 
         let raw_output = std::fs::read_to_string(&raw_strace)?;
         let summary = parse_strace_summary(&raw_output);
+        let ranked = summarize_syscalls(&raw_output, 20);
         std::fs::write(layout.summary_txt(), render_strace_summary_text(&summary))?;
         std::fs::write(
             layout.summary_json(),
-            format!("{}\n", serde_json::to_string_pretty(&summary)?),
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&SyscallProfileSummary {
+                    totals: &summary,
+                    syscalls: ranked.syscalls,
+                })?
+            ),
         )?;
         std::fs::write(layout.tool_errors_log(), "")?;
 
         let manifest = RunManifest {
+            name: request.name.clone(),
             command: request.command.clone(),
             cwd: std::env::current_dir()?,
             profile_kind: request.kind,
@@ -77,7 +100,7 @@ where
             actual_backend: BackendName::Strace,
             fallback_reason: None,
             platform: std::env::consts::OS.to_string(),
-            started_at_unix_ms: unix_ms_now(),
+            started_at_unix_ms,
             ended_at_unix_ms: Some(unix_ms_now()),
             exit_status: output.status_code,
             sample_frequency: request.frequency,

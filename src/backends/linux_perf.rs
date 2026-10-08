@@ -5,7 +5,7 @@ use crate::artifacts::ArtifactLayout;
 use crate::backends::{BackendResult, ProfileRequest, ProfileResult, ProfilerBackend};
 use crate::cli::PerfEvent;
 use crate::flamegraph::{
-    FlamegraphRenderer, FlamegraphRequest, INFERNO_DEFAULT_TITLE, InfernoFlamegraphRenderer,
+    BuiltinFlamegraphRenderer, FlamegraphRenderer, FlamegraphRequest, INFERNO_DEFAULT_TITLE,
 };
 use crate::manifest::{BackendName, RunManifest};
 use crate::perfdata::fold::{
@@ -13,7 +13,10 @@ use crate::perfdata::fold::{
 };
 use crate::platform::{NativeThreadLister, ThreadLister};
 use crate::process::{CommandRunner, CommandSpec};
-use crate::summary::threads::{render_folded_stack_summary_text, summarize_folded_stacks};
+use crate::summary::threads::{
+    FoldedStackSummary, render_folded_stack_summary_text, summarize_folded_stacks,
+};
+use crate::summary::{PerfProfileSummary, summarize_perfdata_profile_file};
 use crate::symbols::{SymbolizerKind, perf_symbol_resolver_for_current_home_with_symbolizer};
 use crate::tools::{ADDR2LINE, PERF, ToolSpec, resolve_required_tools};
 
@@ -22,6 +25,13 @@ pub enum PerfRecordTarget {
     Command(Vec<String>),
     Process(u32),
     Threads(Vec<u32>),
+}
+
+#[derive(serde::Serialize)]
+struct CpuProfileSummary<'a> {
+    #[serde(flatten)]
+    folded: &'a FoldedStackSummary,
+    profile: PerfProfileSummary,
 }
 
 pub fn build_perf_record_command(
@@ -70,18 +80,18 @@ pub fn build_perf_record_command(
     }
 }
 
-pub struct LinuxPerfBackend<'a, R, T = NativeThreadLister, F = InfernoFlamegraphRenderer<'a, R>> {
+pub struct LinuxPerfBackend<'a, R, T = NativeThreadLister, F = BuiltinFlamegraphRenderer> {
     runner: &'a R,
     thread_lister: T,
     flamegraph_renderer: F,
 }
 
-impl<'a, R> LinuxPerfBackend<'a, R, NativeThreadLister, InfernoFlamegraphRenderer<'a, R>> {
+impl<'a, R> LinuxPerfBackend<'a, R, NativeThreadLister, BuiltinFlamegraphRenderer> {
     pub fn new(runner: &'a R) -> Self {
         Self {
             runner,
             thread_lister: NativeThreadLister::default(),
-            flamegraph_renderer: InfernoFlamegraphRenderer::new(runner),
+            flamegraph_renderer: BuiltinFlamegraphRenderer,
         }
     }
 
@@ -97,12 +107,12 @@ impl<'a, R> LinuxPerfBackend<'a, R, NativeThreadLister, InfernoFlamegraphRendere
     }
 }
 
-impl<'a, R, T> LinuxPerfBackend<'a, R, T, InfernoFlamegraphRenderer<'a, R>> {
+impl<'a, R, T> LinuxPerfBackend<'a, R, T, BuiltinFlamegraphRenderer> {
     pub fn with_thread_lister(runner: &'a R, thread_lister: T) -> Self {
         Self {
             runner,
             thread_lister,
-            flamegraph_renderer: InfernoFlamegraphRenderer::new(runner),
+            flamegraph_renderer: BuiltinFlamegraphRenderer,
         }
     }
 }
@@ -114,6 +124,9 @@ where
     F: FlamegraphRenderer,
 {
     fn profile(&self, request: &ProfileRequest) -> BackendResult<ProfileResult> {
+        let started_at_unix_ms = unix_ms_now();
+        let layout = ArtifactLayout::new(request.out_dir.clone());
+        layout.prepare()?;
         let tool_versions = resolve_required_tools(
             self.runner,
             &linux_perf_tools(
@@ -122,8 +135,6 @@ where
                 &self.flamegraph_renderer,
             ),
         )?;
-        let layout = ArtifactLayout::new(request.out_dir.clone());
-        std::fs::create_dir_all(layout.root())?;
 
         let perf_data = layout.raw_profile("perf.data");
         let call_graph = request.call_graph.to_string();
@@ -136,6 +147,11 @@ where
             target.clone(),
             request.duration_secs,
         );
+        let command = if request.json {
+            command.capture_output()
+        } else {
+            command
+        };
         let output = self.runner.run(&command)?;
         if !output.succeeded_or_interrupted() {
             std::fs::write(layout.stdout_log(), &output.stdout)?;
@@ -169,17 +185,11 @@ where
         stderr.extend(flamegraph_output.stderr);
         std::fs::write(layout.stderr_log(), &stderr)?;
         std::fs::write(layout.command_txt(), command_text(request, &target))?;
-        std::fs::write(
-            layout.summary_txt(),
-            render_folded_stack_summary_text(&folded_summary),
-        )?;
-        std::fs::write(
-            layout.summary_json(),
-            format!("{}\n", serde_json::to_string_pretty(&folded_summary)?),
-        )?;
+        write_profile_summary(&layout, &perf_data, &folded_summary)?;
         std::fs::write(layout.tool_errors_log(), "")?;
 
         let manifest = RunManifest {
+            name: request.name.clone(),
             command: request.command.clone(),
             cwd: std::env::current_dir()?,
             profile_kind: request.kind,
@@ -187,7 +197,7 @@ where
             actual_backend: BackendName::LinuxPerf,
             fallback_reason: None,
             platform: std::env::consts::OS.to_string(),
-            started_at_unix_ms: unix_ms_now(),
+            started_at_unix_ms,
             ended_at_unix_ms: Some(unix_ms_now()),
             exit_status: output.status_code,
             sample_frequency: request.frequency,
@@ -210,6 +220,38 @@ where
 
         Ok(ProfileResult { layout, manifest })
     }
+}
+
+fn write_profile_summary(
+    layout: &ArtifactLayout,
+    perf_data: &Path,
+    folded: &FoldedStackSummary,
+) -> BackendResult<()> {
+    use std::fmt::Write as _;
+
+    let summary = CpuProfileSummary {
+        folded,
+        profile: summarize_perfdata_profile_file(perf_data, 1_000_000_000, 20)?,
+    };
+    let mut text = render_folded_stack_summary_text(folded);
+    if let Some(span) = summary.profile.timeline.duration_ns {
+        writeln!(text, "recorded sample span: {span} ns")?;
+    } else {
+        text.push_str("recorded sample span: unavailable\n");
+    }
+    for thread in &summary.profile.threads {
+        writeln!(
+            text,
+            "thread {} ({}): {} samples, {} weighted samples",
+            thread.tid, thread.comm, thread.samples, thread.weighted_samples
+        )?;
+    }
+    std::fs::write(layout.summary_txt(), text)?;
+    std::fs::write(
+        layout.summary_json(),
+        format!("{}\n", serde_json::to_string_pretty(&summary)?),
+    )?;
+    Ok(())
 }
 
 impl<R, T, F> LinuxPerfBackend<'_, R, T, F>

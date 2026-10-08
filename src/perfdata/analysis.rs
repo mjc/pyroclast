@@ -3,7 +3,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::perfdata::fold::summarize_perfdata;
+use crate::perfdata::fold::{PerfSummary, summarize_perfdata, summarize_perfdata_file};
 use crate::perfdata::records::{PERF_RECORD_MISC_CPUMODE_KERNEL, PERF_RECORD_MISC_CPUMODE_USER};
 use crate::perfdata::samples::is_perf_context_marker;
 
@@ -22,6 +22,7 @@ pub struct PerfdataAnalysis {
     pub threads: Vec<PerfdataThread>,
     pub top_leaf_ips: Vec<PerfdataIpCount>,
     pub top_edges: Vec<PerfdataEdgeCount>,
+    pub profile: crate::summary::PerfProfileSummary,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -74,6 +75,10 @@ struct Count {
 /// file.
 pub fn analyze_perfdata(bytes: &[u8], limit: usize) -> Result<PerfdataAnalysis, String> {
     let summary = summarize_perfdata(bytes)?;
+    analyze_summary(&summary, limit)
+}
+
+fn analyze_summary(summary: &PerfSummary, limit: usize) -> Result<PerfdataAnalysis, String> {
     let mut threads = BTreeMap::<u32, Count>::new();
     let mut sample_modes = BTreeMap::<u16, Count>::new();
     let mut leaf_ips = BTreeMap::<u64, Count>::new();
@@ -140,6 +145,7 @@ pub fn analyze_perfdata(bytes: &[u8], limit: usize) -> Result<PerfdataAnalysis, 
         threads: ranked_threads(threads, &summary.comms_by_tid, limit),
         top_leaf_ips: ranked_ips(leaf_ips, limit),
         top_edges: ranked_edges(edges, limit),
+        profile: crate::summary::summarize_perf_summary(summary, 1_000_000_000, limit)?,
     })
 }
 
@@ -148,19 +154,10 @@ pub fn analyze_perfdata(bytes: &[u8], limit: usize) -> Result<PerfdataAnalysis, 
 ///
 /// # Errors
 ///
-/// Returns an error when the file cannot be opened, mapped, or parsed.
+/// Returns an error when the file cannot be opened, read, or parsed.
 pub fn analyze_perfdata_file(path: &Path, limit: usize) -> Result<PerfdataAnalysis, String> {
-    let file =
-        std::fs::File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
-    let mapping = map_perfdata_file(&file)?;
-    analyze_perfdata(&mapping, limit)
-}
-
-fn map_perfdata_file(file: &std::fs::File) -> Result<memmap2::Mmap, String> {
-    // SAFETY: The mapping is read-only and is only borrowed immutably by the
-    // parser while both the file handle and mapping are alive.
-    unsafe { memmap2::MmapOptions::new().map(file) }
-        .map_err(|error| format!("failed to map perf.data: {error}"))
+    let summary = summarize_perfdata_file(path)?;
+    analyze_summary(&summary, limit)
 }
 
 fn add_count(count: &mut Count, weight: u64) {
