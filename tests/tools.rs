@@ -1,6 +1,59 @@
 use std::collections::BTreeSet;
 
 use proptest::prelude::*;
+
+#[cfg(unix)]
+#[test]
+fn path_search_skips_non_executable_candidates() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let directory = tempfile::tempdir().unwrap();
+    let blocked = directory.path().join("blocked");
+    let usable = directory.path().join("usable");
+    std::fs::create_dir(&blocked).unwrap();
+    std::fs::create_dir(&usable).unwrap();
+    for (dir, mode) in [(&blocked, 0o644), (&usable, 0o755)] {
+        let tool = dir.join("perf");
+        std::fs::write(&tool, "#!/bin/sh\nprintf 'perf version test\\n'\n").unwrap();
+        std::fs::set_permissions(tool, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let path = std::env::join_paths([&blocked, &usable]).unwrap();
+    assert_eq!(
+        find_executable_on_path("perf", Some(&path)),
+        Some(usable.join("perf"))
+    );
+    let blocked_path = std::env::join_paths([&blocked]).unwrap();
+    assert_eq!(find_executable_on_path("perf", Some(&blocked_path)), None);
+}
+#[cfg(unix)]
+#[test]
+fn path_search_matches_native_shell_execute_permissions() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = tempfile::tempdir().unwrap();
+    let first = root.path().join("first");
+    let second = root.path().join("second");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    executable_stub(first.join("perf"));
+    executable_stub(second.join("perf"));
+    let path = std::env::join_paths([&first, &second]).unwrap();
+    for mode in [0o644, 0o001, 0o010, 0o100, 0o755] {
+        std::fs::set_permissions(first.join("perf"), std::fs::Permissions::from_mode(mode))
+            .unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", "command -v perf"])
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let selected = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            find_executable_on_path("perf", Some(&path)),
+            Some(std::path::PathBuf::from(selected.trim())),
+            "mode={mode:o}"
+        );
+    }
+}
+
 use proptest::string::string_regex;
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
 use pyroclast::tools::{
@@ -91,8 +144,8 @@ fn resolver_prefers_supported_path_tools() {
     let root = tempfile::tempdir().expect("tempdir");
     let bin = root.path().join("bin");
     std::fs::create_dir_all(&bin).expect("bin dir");
-    std::fs::write(bin.join("perf"), b"").expect("perf stub");
-    std::fs::write(bin.join("nix"), b"").expect("nix stub");
+    executable_stub(bin.join("perf"));
+    executable_stub(bin.join("nix"));
     let path = std::env::join_paths([bin.as_path()]).expect("join path");
     let mut resolver = SystemToolResolver::new(
         VersionRunner,
@@ -113,7 +166,7 @@ fn resolver_marks_path_tools_from_current_devenv_shell() {
     let root = tempfile::tempdir().expect("tempdir");
     let bin = root.path().join("bin");
     std::fs::create_dir_all(&bin).expect("bin dir");
-    std::fs::write(bin.join("inferno-flamegraph"), b"").expect("inferno stub");
+    executable_stub(bin.join("inferno-flamegraph"));
     let path = std::env::join_paths([bin.as_path()]).expect("join path");
     let mut resolver = SystemToolResolver::new(
         InfernoHelpRunner,
@@ -136,7 +189,7 @@ fn resolver_rejects_xctrace_wrapper_stub() {
     let root = tempfile::tempdir().expect("tempdir");
     let bin = root.path().join("bin");
     std::fs::create_dir_all(&bin).expect("bin dir");
-    std::fs::write(bin.join("xctrace"), b"").expect("xctrace stub");
+    executable_stub(bin.join("xctrace"));
     let path = std::env::join_paths([bin.as_path()]).expect("join path");
     let mut resolver = SystemToolResolver::new(
         XctraceWrapperRunner,
@@ -157,7 +210,7 @@ fn resolver_reports_full_attempt_trace_when_all_sources_fail() {
     let bin = root.path().join("bin");
     std::fs::create_dir_all(&project).expect("project dir");
     std::fs::create_dir_all(&bin).expect("bin dir");
-    std::fs::write(bin.join("nix"), b"").expect("nix stub");
+    executable_stub(bin.join("nix"));
     let path = std::env::join_paths([bin.as_path()]).expect("join path");
     let runner = AllSourcesFailRunner::default();
     let mut resolver = SystemToolResolver::new(
@@ -202,7 +255,7 @@ fn resolver_uses_ephemeral_nix_for_safe_utility_without_flake() {
     let root = tempfile::tempdir().expect("tempdir");
     let bin = root.path().join("bin");
     std::fs::create_dir_all(&bin).expect("bin dir");
-    std::fs::write(bin.join("nix"), b"").expect("nix stub");
+    executable_stub(bin.join("nix"));
     let path = std::env::join_paths([bin.as_path()]).expect("join path");
     let runner = NixFallbackRunner::default();
     let mut resolver = SystemToolResolver::new(
@@ -239,8 +292,8 @@ fn resolver_falls_back_after_path_probe_failure() {
     let root = tempfile::tempdir().expect("tempdir");
     let bin = root.path().join("bin");
     std::fs::create_dir_all(&bin).expect("bin dir");
-    std::fs::write(bin.join("inferno-flamegraph"), b"").expect("inferno stub");
-    std::fs::write(bin.join("nix"), b"").expect("nix stub");
+    executable_stub(bin.join("inferno-flamegraph"));
+    executable_stub(bin.join("nix"));
     let path = std::env::join_paths([bin.as_path()]).expect("join path");
     let runner = PathProbeFailureThenShellRunner {
         broken_path: bin.join("inferno-flamegraph").display().to_string(),
@@ -266,7 +319,7 @@ fn resolver_uses_last_stdout_line_from_shell_probe() {
     let root = tempfile::tempdir().expect("tempdir");
     let bin = root.path().join("bin");
     std::fs::create_dir_all(&bin).expect("bin dir");
-    std::fs::write(bin.join("nix"), b"").expect("nix stub");
+    executable_stub(bin.join("nix"));
     let path = std::env::join_paths([bin.as_path()]).expect("join path");
     let runner = NoisyShellProbeRunner::default();
     let mut resolver = SystemToolResolver::new(
@@ -290,7 +343,7 @@ fn resolver_does_not_use_ephemeral_nix_for_perf() {
     let root = tempfile::tempdir().expect("tempdir");
     let bin = root.path().join("bin");
     std::fs::create_dir_all(&bin).expect("bin dir");
-    std::fs::write(bin.join("nix"), b"").expect("nix stub");
+    executable_stub(bin.join("nix"));
     let path = std::env::join_paths([bin.as_path()]).expect("join path");
     let runner = NixFallbackRunner::default();
     let mut resolver = SystemToolResolver::new(
@@ -311,7 +364,7 @@ fn resolver_uses_ephemeral_nix_for_heaptrack() {
     let root = tempfile::tempdir().expect("tempdir");
     let bin = root.path().join("bin");
     std::fs::create_dir_all(&bin).expect("bin dir");
-    std::fs::write(bin.join("nix"), b"").expect("nix stub");
+    executable_stub(bin.join("nix"));
     let path = std::env::join_paths([bin.as_path()]).expect("join path");
     let runner = NixFallbackRunner::default();
     let mut resolver = SystemToolResolver::new(
@@ -345,7 +398,7 @@ fn resolver_uses_ephemeral_nix_for_heaptrack_print() {
     let root = tempfile::tempdir().expect("tempdir");
     let bin = root.path().join("bin");
     std::fs::create_dir_all(&bin).expect("bin dir");
-    std::fs::write(bin.join("nix"), b"").expect("nix stub");
+    executable_stub(bin.join("nix"));
     let path = std::env::join_paths([bin.as_path()]).expect("join path");
     let runner = NixFallbackRunner::default();
     let mut resolver = SystemToolResolver::new(
@@ -385,7 +438,7 @@ fn resolver_reports_ephemeral_nix_probe_failure_detail() {
     std::fs::create_dir_all(&project).expect("project dir");
     std::fs::create_dir_all(&bin).expect("bin dir");
     std::fs::write(root.path().join("project/flake.nix"), b"{}").expect("flake");
-    std::fs::write(bin.join("nix"), b"").expect("nix stub");
+    executable_stub(bin.join("nix"));
     let path = std::env::join_paths([bin.as_path()]).expect("join path");
     let runner = EphemeralNixFailureRunner::default();
     let mut resolver = SystemToolResolver::new(
@@ -399,6 +452,17 @@ fn resolver_reports_ephemeral_nix_probe_failure_detail() {
 
     assert!(error.to_string().contains("nix shell probe failed"));
     assert!(error.to_string().contains("inferno package blew up"));
+}
+
+fn executable_stub(path: impl AsRef<std::path::Path>) {
+    let path = path.as_ref();
+    std::fs::write(path, "").expect("tool stub");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("executable stub");
+    }
 }
 
 fn supported_tool_names() -> BTreeSet<&'static str> {
@@ -475,7 +539,7 @@ proptest! {
                     std::fs::create_dir_all(&candidate).expect("directory candidate");
                 }
                 2 => {
-                    std::fs::write(&candidate, "").expect("file candidate");
+                    executable_stub(&candidate);
                     if expected.is_none() {
                         expected = Some(candidate.clone());
                     }

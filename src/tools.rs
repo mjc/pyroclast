@@ -604,5 +604,29 @@ pub fn find_executable_on_path(name: &str, path_var: Option<&std::ffi::OsStr>) -
     let path_var = path_var?;
     std::env::split_paths(path_var)
         .map(|directory| directory.join(name))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| {
+            let Ok(metadata) = candidate.metadata() else {
+                return false;
+            };
+            if !metadata.is_file() {
+                return false;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt as _;
+                let Ok(path) = std::ffi::CString::new(candidate.as_os_str().as_bytes()) else {
+                    return false;
+                };
+                // exec uses effective credentials, including owner/group and
+                // ACL rules; any execute bit alone does not imply permission.
+                unsafe {
+                    libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::X_OK, libc::AT_EACCESS)
+                        == 0
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        })
 }
