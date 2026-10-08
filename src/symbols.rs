@@ -2988,6 +2988,27 @@ fn read_regular_object(path: &Path) -> Option<Vec<u8>> {
     read_object_with_size(file, len)
 }
 
+fn read_regular_snapshot(path: &Path) -> Option<Arc<[u8]>> {
+    let file = open_regular_object(path)?;
+    let len = file.metadata().ok()?.len();
+    read_snapshot_with_size(file, len).map(Into::into)
+}
+
+fn read_snapshot_with_size(reader: impl Read, len: u64) -> Option<Vec<u8>> {
+    let mut reader = reader.take(len);
+    let mut bytes = Vec::new();
+    let mut chunk = [0; 8 * 1024];
+    loop {
+        let count = reader.read(&mut chunk).ok()?;
+        if count == 0 {
+            break;
+        }
+        bytes.try_reserve(count).ok()?;
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    (u64::try_from(bytes.len()).ok()? == len).then_some(bytes)
+}
+
 fn read_object_with_size(mut reader: impl Read + std::io::Seek, len: u64) -> Option<Vec<u8>> {
     // Classify through a bounded view before allocating the whole image. PE
     // recognition may seek beyond the initial magic to its optional header.
@@ -3011,20 +3032,7 @@ fn read_object_with_size(mut reader: impl Read + std::io::Seek, len: u64) -> Opt
         return None;
     }
     reader.rewind().ok()?;
-    let mut reader = reader.take(len);
-    let mut bytes = Vec::new();
-    let mut chunk = [0; 8 * 1024];
-    loop {
-        let count = reader.read(&mut chunk).ok()?;
-        if count == 0 {
-            break;
-        }
-        bytes.try_reserve(count).ok()?;
-        bytes.extend_from_slice(&chunk[..count]);
-    }
-    if u64::try_from(bytes.len()).ok()? != len {
-        return None;
-    }
+    let bytes = read_snapshot_with_size(reader, len)?;
     object::File::parse(bytes.as_slice()).ok()?;
     Some(bytes)
 }
@@ -3194,20 +3202,33 @@ impl SymbolResolver for RustAddr2lineResolver {
         let mut resolved = vec![None; requests.len()];
         for (path, indexes) in grouped_request_indexes(requests) {
             let path = Path::new(path);
-            let object_metadata = self.object_metadata(path);
-            if object_metadata.is_none() {
+            let Some(object_metadata) = self.object_metadata(path) else {
                 continue;
-            }
-            let Ok(loader) = addr2line::Loader::new(path) else {
+            };
+            let main_path = path.to_path_buf();
+            let main_bytes = Arc::clone(&object_metadata.object_bytes);
+            let Ok(loader) = addr2line::Loader::new_with_opener(path, move |requested| {
+                if requested == main_path {
+                    return Ok(Arc::clone(&main_bytes));
+                }
+                read_regular_snapshot(requested).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "cannot snapshot regular auxiliary file {}",
+                            requested.display()
+                        ),
+                    )
+                    .into()
+                })
+            }) else {
                 continue;
             };
             for index in indexes {
                 let request = &requests[index];
-                let object_symbol = object_metadata.as_ref().and_then(|metadata| {
-                    metadata
-                        .object_metadata
-                        .object_symbol(request.relative_address)
-                });
+                let object_symbol = object_metadata
+                    .object_metadata
+                    .object_symbol(request.relative_address);
                 let symbol = loader
                     .find_symbol(request.relative_address)
                     .map(demangle_addr2line_name_qualified)
@@ -5717,6 +5738,57 @@ mod tests {
         assert!(super::read_object_with_size(std::io::Cursor::new(b"not ELF"), 7).is_none());
     }
 
+    #[test]
+    fn pyroc48_auxiliary_snapshot_is_finite_and_accepts_archives() {
+        let bytes = b"!<arch>\n";
+        object::read::archive::ArchiveFile::parse(bytes.as_slice()).unwrap();
+        assert!(object::File::parse(bytes.as_slice()).is_err());
+        let mut grown = bytes.to_vec();
+        grown.extend_from_slice(b"later growth");
+        let mut reader = std::io::Cursor::new(grown);
+        assert_eq!(
+            super::read_snapshot_with_size(&mut reader, bytes.len() as u64),
+            Some(bytes.to_vec())
+        );
+        assert_eq!(reader.position(), bytes.len() as u64);
+        assert!(super::read_snapshot_with_size(bytes.as_slice(), bytes.len() as u64 + 1).is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("objects.a");
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(super::read_regular_snapshot(&path).unwrap().as_ref(), bytes);
+        assert!(super::read_regular_snapshot(dir.path()).is_none());
+    }
+
+    #[test]
+    fn pyroc48_resolve_batch_uses_cached_main_after_replacement_and_unlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("library.so");
+        std::fs::write(&path, regression_elf_with_build_id()).unwrap();
+        let resolver = RustAddr2lineResolver::new();
+        let metadata = resolver.object_metadata(&path).unwrap();
+        let request = test_request(path.to_str().unwrap(), 0x1001);
+        std::fs::write(
+            &path,
+            elf_with_dynamic_text_symbol(b"replacement", 0x1000, 16),
+        )
+        .unwrap();
+        for unlink in [false, true] {
+            if unlink {
+                std::fs::remove_file(&path).unwrap();
+            }
+            assert_eq!(
+                resolver
+                    .resolve_batch(std::slice::from_ref(&request))
+                    .unwrap(),
+                [Some("recorded_function".into())]
+            );
+            assert!(Arc::ptr_eq(
+                &metadata.object_bytes,
+                &resolver.object_metadata(&path).unwrap().object_bytes,
+            ));
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn pyroc48_recording_selected_fifo_is_rejected_before_object_read() {
@@ -5763,6 +5835,145 @@ mod tests {
             "FIFO bytes must not translate a recorded offset"
         );
         assert!(super::object_load_segment_ranges(dir.path()).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    struct Pyroc48LoaderWorker(Option<std::process::Child>);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for Pyroc48LoaderWorker {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                // The unreaped owned child cannot have its PID reused.
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pyroc48_loader_child(root: std::path::PathBuf) {
+        let path = super::perf_build_id_elf_path(&root, "aabbccdd");
+        let bytes = std::fs::read(&path).expect("regular main ELF fixture");
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        assert_eq!(
+            object.build_id().unwrap(),
+            Some(&[0xaa, 0xbb, 0xcc, 0xdd][..])
+        );
+        let offset = object.segments().next().unwrap().file_range().0;
+        let recorded_path = root.join("recorded/library.so");
+        assert!(!recorded_path.exists());
+        let mut request = test_request(recorded_path.to_str().unwrap(), offset);
+        request.build_id = Some("aabbccdd".into());
+        let resolver =
+            super::PerfSymbolResolver::from_object_resolver(RustAddr2lineResolver::new())
+                .with_debug_dir(root);
+        let selected =
+            resolver.object_symbol_request(&request, &mut super::ObjectAddressCache::default());
+        assert_eq!(selected.path, path, "select the recorded build-ID image");
+        assert_eq!(selected.relative_address, 0x1000);
+        assert!(resolver.object_resolver.object_metadata(&path).is_some());
+        assert_eq!(resolver.object_resolver.cached_object_count(), 1);
+        // Unlike the metadata-only frame path, resolve_batch constructs Loader.
+        assert_eq!(
+            resolver.object_resolver.resolve_batch(&[selected]).unwrap(),
+            [Some("recorded_function".into())]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pyroc48_loader_snapshot_subprocess(test: &str, fifo: bool) {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        const WORKER: &str = "PYROCLAST_PYROC48_LOADER_WORKER";
+        const ROOT: &str = "PYROCLAST_PYROC48_LOADER_ROOT";
+        if std::env::var(WORKER).as_deref() == Ok(test) {
+            pyroc48_loader_child(std::path::PathBuf::from(std::env::var_os(ROOT).unwrap()));
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let path = super::perf_build_id_elf_path(root.path(), "aabbccdd");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, regression_elf_with_build_id()).unwrap();
+        // The cache image is named "elf", so Loader derives exactly "elf.dwp".
+        let dwp = path.with_extension("dwp");
+        if fifo {
+            let name = std::ffi::CString::new(dwp.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        } else {
+            // Optional parse errors must not hide a valid main-file symbol.
+            std::fs::write(&dwp, b"not a DWARF package").unwrap();
+        }
+
+        let mut worker = Pyroc48LoaderWorker(Some(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &format!("symbols::tests::{test}"), "--nocapture"])
+                .env(WORKER, test)
+                .env(ROOT, root.path())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("isolated Loader worker"),
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut fifo_writer = None;
+        let timed_out = loop {
+            if fifo && fifo_writer.is_none() {
+                // ENXIO means no reader. Success proves Loader opened this FIFO,
+                // and releases its blocking open without writing or reading bytes.
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+                    .open(&dwp)
+                {
+                    Ok(writer) => fifo_writer = Some(writer),
+                    Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {}
+                    Err(error) => panic!("FIFO writer handshake: {error}"),
+                }
+            }
+            let child = worker.0.as_mut().unwrap();
+            if child.try_wait().expect("poll Loader worker").is_some() {
+                break false;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().expect("stop timed-out Loader worker");
+                break true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let fifo_opened = fifo_writer.is_some();
+        drop(fifo_writer);
+        let output = worker.0.take().unwrap().wait_with_output().unwrap();
+        assert!(
+            !timed_out && output.status.success(),
+            "{test}: timeout={timed_out}, fifo_opened={fifo_opened}, status={}\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+            "worker must execute exactly one test: {}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        assert!(
+            !fifo_opened,
+            "Loader opened the derived .dwp FIFO after selecting a valid recorded ELF"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pyroc48_loader_derived_dwp_fifo_is_not_opened() {
+        pyroc48_loader_snapshot_subprocess("pyroc48_loader_derived_dwp_fifo_is_not_opened", true);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pyroc48_loader_regular_object_control() {
+        pyroc48_loader_snapshot_subprocess("pyroc48_loader_regular_object_control", false);
     }
 
     #[test]

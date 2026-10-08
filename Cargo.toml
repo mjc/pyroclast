@@ -13,7 +13,7 @@ name = "cargo-pyroclast"
 path = "src/bin/cargo_pyroclast.rs"
 
 [dependencies]
-addr2line = "0.26.1"
+addr2line = { version = "0.26.1", path = "vendor/addr2line" }
 blake3 = "1"
 cargo_metadata = "0.23"
 clap = { version = "4", features = ["derive"] }
