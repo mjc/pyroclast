@@ -38,7 +38,16 @@
         let
           craneLib = crane.mkLib pkgs;
           commonArgs = {
-            src = craneLib.cleanCargoSource ./.;
+            src = pkgs.lib.cleanSourceWith {
+              src = pkgs.lib.cleanSource ./.;
+              filter =
+                path: type:
+                craneLib.filterCargoSources path type
+                || pkgs.lib.any (suffix: pkgs.lib.hasSuffix suffix (toString path)) [
+                  "/vendor/inferno/src/flamegraph/flamegraph.css"
+                  "/vendor/inferno/src/flamegraph/flamegraph.js"
+                ];
+            };
             strictDeps = true;
           };
           cargoArtifacts = craneLib.buildDepsOnly (
@@ -67,6 +76,17 @@
         in
         {
           default = pyroclast;
+        }
+      );
+
+      checks = forAllSystems (
+        { pkgs, system }:
+        {
+          package-source-assets = pkgs.runCommand "pyroclast-package-source-assets" { } ''
+            test -s ${self.packages.${system}.default.src}/vendor/inferno/src/flamegraph/flamegraph.css
+            test -s ${self.packages.${system}.default.src}/vendor/inferno/src/flamegraph/flamegraph.js
+            mkdir "$out"
+          '';
         }
       );
 
