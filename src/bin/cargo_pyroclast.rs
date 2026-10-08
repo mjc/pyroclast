@@ -13,6 +13,7 @@ fn main() {
                 eprintln!("error: {error}");
                 std::process::exit(1);
             }
+            std::process::exit(i32::from(output.exit_code));
         }
         Err(error) => {
             if json {

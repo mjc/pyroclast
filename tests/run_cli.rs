@@ -382,6 +382,7 @@ fn automatic_blocked_time_selection_checks_permissions_before_launching_workload
     let manifest: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
     assert_eq!(manifest["command"], serde_json::json!(workload));
     assert_eq!(manifest["exit_status"], 7);
+    assert_eq!(output.exit_code, 7);
     let summary: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.path().join("summary.json")).unwrap()).unwrap();
     assert_eq!(summary["method"], "bpftrace");

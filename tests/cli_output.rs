@@ -7,6 +7,7 @@ fn ignores_broken_pipe_when_writing_stdout() {
     let output = CliOutput {
         stdout: "many mappings\n".to_string(),
         stderr: String::new(),
+        exit_code: 0,
     };
 
     write_cli_output(&output, BrokenPipeWriter, Vec::new()).expect("broken pipe is ignored");

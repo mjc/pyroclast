@@ -4,6 +4,8 @@ use std::io::{ErrorKind, Write};
 pub struct CliOutput {
     pub stdout: String,
     pub stderr: String,
+    /// Process status, independent of whether output and artifact writes succeed.
+    pub exit_code: u8,
 }
 
 pub(crate) struct PipeWriter<W> {

@@ -62,6 +62,7 @@ where
 }
 
 /// Runs the CLI with streaming perf text and folded output.
+/// Returns the command's exit code after writing and flushing its output.
 ///
 /// # Errors
 ///
@@ -70,7 +71,7 @@ pub fn run_cli_to_writers<I, T>(
     args: I,
     mut stdout: impl std::io::Write,
     mut stderr: impl std::io::Write,
-) -> backends::BackendResult<()>
+) -> backends::BackendResult<u8>
 where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
@@ -96,7 +97,8 @@ where
             &runner,
             PerfdataOutput::Folded,
             &mut stream,
-        ),
+        )
+        .map(|()| 0),
         CliCommand::Plumbing {
             command: PlumbingCommand::PerfScript(command),
         } => write_perfdata_for_cli(
@@ -110,9 +112,12 @@ where
             &runner,
             PerfdataOutput::PerfScript,
             &mut stream,
-        ),
+        )
+        .map(|()| 0),
         command => match run_parsed_cli(Cli { command }) {
-            Ok(output) => write_cli_output(&output, &mut stream, &mut stderr).map_err(Into::into),
+            Ok(output) => write_cli_output(&output, &mut stream, &mut stderr)
+                .map(|()| output.exit_code)
+                .map_err(Into::into),
             Err(error) => {
                 if json_profile {
                     serde_json::to_writer(
@@ -128,12 +133,12 @@ where
         },
     };
     if stream.broken_pipe() {
-        return Ok(());
+        return Ok(result.unwrap_or(0));
     }
     // Flush even on a parse error: samples already delivered are valid text.
     let flushed = std::io::Write::flush(&mut stream);
     if stream.broken_pipe() {
-        return Ok(());
+        return Ok(result.unwrap_or(0));
     }
     flushed?;
     result
@@ -438,6 +443,11 @@ where
             .into());
         }
     };
+    let exit_code = match result.manifest.exit_status {
+        Some(status) if status < 0 => u8::try_from(128_i64 - i64::from(status))?,
+        Some(status) => u8::try_from(status)?,
+        None => 0,
+    };
     Ok(CliOutput {
         stdout: if request.json {
             format!("{}\n", serde_json::to_string_pretty(&result.manifest)?)
@@ -445,6 +455,7 @@ where
             String::new()
         },
         stderr: String::new(),
+        exit_code,
     })
 }
 
@@ -525,6 +536,7 @@ where
         CliCommand::Analyze(command) => Ok(CliOutput {
             stdout: analyze_svg_report_for_cli(&command)?,
             stderr: String::new(),
+            exit_code: 0,
         }),
         CliCommand::Memory(_)
         | CliCommand::Cpu(_)
@@ -560,6 +572,7 @@ where
             Ok(CliOutput {
                 stdout,
                 stderr: String::new(),
+                exit_code: 0,
             })
         }
         PlumbingCommand::PerfScript(command) => {
@@ -573,6 +586,7 @@ where
             Ok(CliOutput {
                 stdout,
                 stderr: String::new(),
+                exit_code: 0,
             })
         }
         PlumbingCommand::Flamegraph(command) => {
@@ -598,6 +612,7 @@ where
             Ok(CliOutput {
                 stdout: String::new(),
                 stderr: String::from_utf8_lossy(&render.stderr).into_owned(),
+                exit_code: 0,
             })
         }
         PlumbingCommand::Summarize(command) => {
@@ -605,6 +620,7 @@ where
             Ok(CliOutput {
                 stdout,
                 stderr: String::new(),
+                exit_code: 0,
             })
         }
         PlumbingCommand::Parse { command } => run_parse_command(command),
@@ -625,6 +641,7 @@ fn run_parse_perf_command(command: ParsePerfCommand) -> backends::BackendResult<
             Ok(CliOutput {
                 stdout,
                 stderr: String::new(),
+                exit_code: 0,
             })
         }
     }
@@ -653,6 +670,7 @@ fn run_parse_flamegraph_command(
     Ok(CliOutput {
         stdout,
         stderr: String::new(),
+        exit_code: 0,
     })
 }
 

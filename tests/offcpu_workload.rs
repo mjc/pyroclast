@@ -206,3 +206,152 @@ fn stopped_workload(duration: bool) {
             .contains(&format!("workload outcome: {outcome}"))
     );
 }
+
+#[cfg(target_os = "linux")]
+fn cli_recorder_fixture(tools: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir(tools).unwrap();
+    let recorder = tools.join("bpftrace");
+    // Execute the real product supervisor. The recorder deliberately exits
+    // successfully regardless of the supervised workload's exit status.
+    std::fs::write(
+        &recorder,
+        r#"#!/bin/sh
+if [ "$1" = --version ]; then echo 'bpftrace v0.24.0'; exit 0; fi
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -c) shift; workload=$1 ;;
+        -o) shift; data=$1 ;;
+    esac
+    shift
+done
+/bin/sh -c "$workload"
+printf '@offcpu[\n    1 real_wait+0 ([kernel.kallsyms])\n]: 200\n' > "$data"
+exit 0
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let cargo = tools.join("cargo");
+    std::fs::write(
+        &cargo,
+        "#!/bin/sh\ncat \"$PYROCLAST_TEST_CARGO_ARTIFACT\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn cli_cargo_artifact(root: &std::path::Path, executable: &str) -> std::path::PathBuf {
+    let path = root.join("cargo-artifact.json");
+    let artifact = serde_json::json!({
+        "reason": "compiler-artifact", "package_id": "path+file:///fixture#fixture@0.1.0",
+        "manifest_path": "/fixture/Cargo.toml",
+        "target": {
+            "name": "fixture", "kind": ["bin"], "crate_types": ["bin"],
+            "src_path": "/fixture/src/main.rs", "edition": "2024",
+            "doc": true, "doctest": false, "test": true,
+        },
+        "profile": {
+            "opt_level": "0", "debuginfo": 2, "debug_assertions": false,
+            "overflow_checks": true, "test": false,
+        },
+        "features": [], "filenames": [], "executable": executable, "fresh": true,
+    });
+    std::fs::write(&path, format!("{artifact}\n")).unwrap();
+    path
+}
+
+#[cfg(target_os = "linux")]
+fn assert_cli_workload_status(workload: &[&str], status: i32) {
+    for (json, cargo, closed_pipe) in [
+        (false, false, false),
+        (true, false, false),
+        (true, false, true),
+        (false, true, false),
+        (true, true, false),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let tools = root.path().join("bin");
+        cli_recorder_fixture(&tools);
+        let out = root.path().join("run");
+        let mut command = std::process::Command::new(if cargo {
+            env!("CARGO_BIN_EXE_cargo-pyroclast")
+        } else {
+            env!("CARGO_BIN_EXE_pyroclast")
+        });
+        if cargo {
+            command.args(["pyroclast", "offcpu", "--bin", "fixture"]);
+            command.env(
+                "PYROCLAST_TEST_CARGO_ARTIFACT",
+                cli_cargo_artifact(root.path(), workload[0]),
+            );
+        } else {
+            command.arg("offcpu");
+        }
+        command
+            .args(["--offcpu-method", "bpftrace", "--out"])
+            .arg(&out)
+            .env(
+                "PATH",
+                format!("{}:{}", tools.display(), std::env::var("PATH").unwrap()),
+            );
+        if json {
+            command.arg("--json");
+        }
+        command
+            .arg("--")
+            .args(if cargo { &workload[1..] } else { workload });
+        let output = if closed_pipe {
+            let mut child = command
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            drop(child.stdout.take());
+            child.wait_with_output().unwrap()
+        } else {
+            command.output().unwrap()
+        };
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out.join("run.json")).unwrap()).unwrap();
+        assert_eq!(manifest["exit_status"], status);
+        if json && !closed_pipe {
+            let emitted: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(emitted, manifest);
+        } else {
+            assert!(output.stdout.is_empty(), "{output:?}");
+        }
+        assert_eq!(
+            output.status.code(),
+            Some(status),
+            "workload={workload:?}, json={json}, cargo={cargo}, closed_pipe={closed_pipe}, stderr={}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_offcpu_returns_actual_workload_failure_in_both_output_modes() {
+    assert_cli_workload_status(&["sh", "-c", "exit 7"], 7);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_offcpu_returns_launch_failure_in_both_output_modes() {
+    assert_cli_workload_status(&["/pyroclast-nonexistent-executable"], 127);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_offcpu_returns_completed_exit_130_in_both_output_modes() {
+    assert_cli_workload_status(&["sh", "-c", "exit 130"], 130);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_offcpu_returns_success_in_both_output_modes() {
+    assert_cli_workload_status(&["sh", "-c", "exit 0"], 0);
+}
