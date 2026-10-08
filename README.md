@@ -83,7 +83,9 @@ scripts/pyroclast-bench [<perf.data>] [--perf-script <perf.script>] [--export-pe
 ```
 
 The pre-commit hook enters `devenv shell` and runs rustfmt, Clippy pedantic,
-`cargo nextest run`, and `nix flake check`.
+`cargo nextest run`, the `perf script | Inferno` parity check, and `nix flake check`.
+The parity check uses `/mnt/downloads/inferno-slow-collapse.perf.data` by default;
+set `PERF_PARITY_DATA` to select another recording.
 
 The Linux test suite requires `cc`, `objcopy`, `addr2line`, and `perf` in `PATH`.
 The development shell supplies them. Native-oracle tests compile ELF fixtures
@@ -92,5 +94,7 @@ rather than silently skipping parity checks. When running outside the developmen
 shell, install a C toolchain, binutils, and perf first.
 
 Process completed recordings: keep the input file unchanged until analysis
-finishes. Like native `perf script`, ordered file delivery uses a read-only
-file mapping, not a snapshot protected against concurrent writes or truncation.
+finishes. Folding reads the data section through sequential positioned reads.
+Timestamp-ordered records retain references to those read windows until delivery,
+so the input bytes are not copied or read a second time. This is not a snapshot
+protected against concurrent writes or truncation.

@@ -11,6 +11,17 @@ exec devenv shell -- sh -eu -c '
   cargo clippy --all-targets -- -D warnings -W clippy::pedantic
   echo "pre-commit: nextest" >&2
   cargo nextest run
+  perf_parity_data=${PERF_PARITY_DATA:-/mnt/downloads/inferno-slow-collapse.perf.data}
+  if [ ! -f "$perf_parity_data" ]; then
+    echo "missing perf parity data: $perf_parity_data" >&2
+    echo "set PERF_PARITY_DATA to a perf.data fixture before committing" >&2
+    exit 1
+  fi
+  echo "pre-commit: perf script and Inferno parity ($perf_parity_data)" >&2
+  parity_output=$(cargo run --quiet --example pyroclast-bench -- \
+    "$perf_parity_data" --symbols --inline)
+  printf "%s\n" "$parity_output"
+  printf "%s\n" "$parity_output" | grep -Fqx 'inferno_compare.matches=true'
   echo "pre-commit: flake check" >&2
   nix flake check --no-build
 '
