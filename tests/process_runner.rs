@@ -113,3 +113,53 @@ fn real_runner_can_inherit_stderr_while_capturing_stdout() {
     assert_eq!(output.stdout, b"out");
     assert!(output.stderr.is_empty());
 }
+
+#[cfg(unix)]
+#[test]
+fn cli_owned_writer_restores_shared_descriptor_flags_after_success() {
+    use pyroclast::process::CliWriter;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::fd::AsRawFd;
+
+    let mut file = tempfile::tempfile().unwrap();
+    // SAFETY: The file descriptor remains owned throughout both queries.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0);
+    let mut writer = CliWriter::new(file.try_clone().unwrap().into());
+    writer.write_all(b"final output").unwrap();
+    writer.flush().unwrap();
+    // SAFETY: file is still live; its duplicate shares the file-status flags.
+    assert_eq!(
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) },
+        flags
+    );
+    file.seek(SeekFrom::Start(0)).unwrap();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"final output");
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_owned_writer_restores_shared_descriptor_flags_after_broken_pipe() {
+    use pyroclast::process::CliWriter;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    let (output, reader) = UnixStream::pair().unwrap();
+    drop(reader);
+    // SAFETY: output retains ownership throughout the queries and write.
+    let flags = unsafe { libc::fcntl(output.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0);
+    let mut writer = CliWriter::new(output.try_clone().unwrap().into());
+    assert_eq!(
+        writer.write_all(b"closed").unwrap_err().kind(),
+        std::io::ErrorKind::BrokenPipe
+    );
+    // SAFETY: output remains live after the failed write through its duplicate.
+    assert_eq!(
+        unsafe { libc::fcntl(output.as_raw_fd(), libc::F_GETFL) },
+        flags
+    );
+}
