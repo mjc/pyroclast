@@ -5,6 +5,94 @@ use pyroclast::backends::{ProfileRequest, ProfilerBackend};
 use pyroclast::cli::{PerfCallGraph, PerfEvent, ProfileKind, SymbolizerKind};
 use pyroclast::process::{CommandOutput, CommandRunner, CommandSpec};
 
+#[test]
+fn typed_completion_requires_recorder_evidence_for_unobserved_workloads() {
+    use pyroclast::backends::{ProfileCompletion, WorkloadOutcome};
+
+    for (recorder_status, expected) in [(None, 1), (Some(0), 0), (Some(7), 7)] {
+        let completion = ProfileCompletion {
+            recorder_status,
+            workload: WorkloadOutcome::Unobserved,
+            cancellation_signal: None,
+        };
+        assert_eq!(completion.exit_code().unwrap(), expected);
+    }
+}
+
+#[test]
+fn typed_completion_preserves_actual_workload_130_and_parent_cancellation_separately() {
+    use pyroclast::backends::{ProfileCompletion, WorkloadOutcome};
+
+    let completed = ProfileCompletion {
+        recorder_status: Some(0),
+        workload: WorkloadOutcome::Completed(130),
+        cancellation_signal: None,
+    };
+    assert_eq!(completed.exit_code().unwrap(), 130);
+    assert_eq!(completed.workload.exit_status(), Some(130));
+    assert_eq!(completed.workload.as_str(), "completed");
+    let cancelled = ProfileCompletion {
+        cancellation_signal: Some(libc::SIGTERM),
+        ..completed
+    };
+    assert_eq!(cancelled.exit_code().unwrap(), 143);
+    assert_eq!(cancelled.workload, WorkloadOutcome::Completed(130));
+    assert_eq!(cancelled.recorder_status, Some(0));
+}
+
+#[test]
+fn typed_completion_distinguishes_incomplete_interrupted_and_duration_limited() {
+    use pyroclast::backends::{ProfileCompletion, WorkloadOutcome};
+
+    for (workload, expected) in [
+        (WorkloadOutcome::Incomplete, 1),
+        (WorkloadOutcome::Interrupted, 130),
+        (WorkloadOutcome::DurationLimited, 0),
+    ] {
+        let completion = ProfileCompletion {
+            recorder_status: Some(0),
+            workload,
+            cancellation_signal: None,
+        };
+        assert_eq!(completion.exit_code().unwrap(), expected);
+        assert_eq!(completion.workload.exit_status(), None);
+    }
+}
+
+#[test]
+fn typed_interruption_preserves_known_recorder_signal_and_parent_precedence() {
+    use pyroclast::backends::{ProfileCompletion, WorkloadOutcome};
+
+    for (recorder_status, expected) in [
+        (None, 130),
+        (Some(0), 130),
+        (Some(7), 130),
+        (Some(-libc::SIGINT), 130),
+        (Some(-libc::SIGTERM), 143),
+        (Some(-libc::SIGKILL), 137),
+    ] {
+        let completion = ProfileCompletion {
+            recorder_status,
+            workload: WorkloadOutcome::Interrupted,
+            cancellation_signal: None,
+        };
+        assert_eq!(completion.exit_code().unwrap(), expected);
+        assert_eq!(completion.workload.exit_status(), None);
+        let cancelled = ProfileCompletion {
+            cancellation_signal: Some(libc::SIGINT),
+            ..completion
+        };
+        assert_eq!(cancelled.exit_code().unwrap(), 130);
+        assert_eq!(cancelled.recorder_status, recorder_status);
+    }
+    let completed = ProfileCompletion {
+        recorder_status: Some(-libc::SIGTERM),
+        workload: WorkloadOutcome::Completed(130),
+        cancellation_signal: None,
+    };
+    assert_eq!(completed.exit_code().unwrap(), 130);
+}
+
 // Model bpftrace's native -c/-o contract, but execute the real generated launcher.
 struct Recorder {
     stop: Option<bool>, // true: duration, false: interruption
@@ -183,6 +271,53 @@ fn offcpu_workload_duration_limit_is_not_successful_completion() {
 #[test]
 fn offcpu_workload_interruption_is_not_workload_exit_130() {
     stopped_workload(false);
+}
+
+struct MissingCompletionRecorder;
+
+impl CommandRunner for MissingCompletionRecorder {
+    fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
+        let output = command
+            .args
+            .windows(2)
+            .find(|args| args[0] == "-o")
+            .unwrap();
+        std::fs::write(
+            &output[1],
+            b"@offcpu[\n    1 real_wait+0 ([kernel.kallsyms])\n]: 200\n",
+        )?;
+        // Native bpftrace can return recorder success after killing its -c
+        // child before the supervisor can publish completion (PYROC-37).
+        Ok(CommandOutput {
+            status_code: Some(0),
+            stdout: b"workload log\n".to_vec(),
+            stderr: b"recorder log\n".to_vec(),
+        })
+    }
+}
+
+#[test]
+fn recorder_success_without_workload_completion_is_incomplete_not_success_or_cancellation() {
+    let root = tempfile::tempdir().unwrap();
+    let request = request(root.path(), vec!["sleep".into(), "30".into()]);
+    let result = OffcpuBackend::new(&MissingCompletionRecorder)
+        .profile(&request)
+        .expect("retain partial recording and its unknown workload outcome");
+    assert_eq!(result.manifest.exit_status, None);
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(result.layout.summary_json()).unwrap()).unwrap();
+    assert_eq!(summary["workload_outcome"], "incomplete");
+    assert_eq!(summary["recorder_status"], 0);
+    assert!(summary["cancellation_signal"].is_null());
+    assert_eq!(summary["total_offcpu_ns"], 200);
+    assert_eq!(
+        std::fs::read(result.layout.stdout_log()).unwrap(),
+        b"workload log\n"
+    );
+    assert_eq!(
+        std::fs::read(result.layout.stderr_log()).unwrap(),
+        b"recorder log\n"
+    );
 }
 
 fn stopped_workload(duration: bool) {

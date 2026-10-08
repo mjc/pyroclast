@@ -45,7 +45,11 @@ impl ProfilerBackend for FakeBackend {
 
         write_file(layout.run_json(), serde_json::to_string_pretty(&manifest)?)?;
 
-        Ok(ProfileResult { layout, manifest })
+        Ok(ProfileResult {
+            completion: super::ProfileCompletion::from_recorder(manifest.exit_status, None),
+            layout,
+            manifest,
+        })
     }
 }
 

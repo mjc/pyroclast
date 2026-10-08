@@ -15,6 +15,7 @@ pub fn build_heaptrack_command(
     profiled_command: impl IntoIterator<Item = String>,
 ) -> CommandSpec {
     CommandSpec::new("heaptrack")
+        .recording()
         .arg("--record-only")
         .arg("-o")
         .arg(output_prefix.display().to_string())
@@ -24,7 +25,9 @@ pub fn build_heaptrack_command(
 
 #[must_use]
 pub fn build_heaptrack_print_command(raw_output: &Path) -> CommandSpec {
-    CommandSpec::new("heaptrack_print").arg(raw_output.display().to_string())
+    CommandSpec::new("heaptrack_print")
+        .finalization()
+        .arg(raw_output.display().to_string())
 }
 
 pub struct HeaptrackBackend<'a, R> {
@@ -127,7 +130,14 @@ where
         };
         std::fs::write(layout.run_json(), serde_json::to_string_pretty(&manifest)?)?;
 
-        Ok(ProfileResult { layout, manifest })
+        Ok(ProfileResult {
+            completion: super::ProfileCompletion::from_recorder(
+                output.status_code,
+                self.runner.cancellation_signal(),
+            ),
+            layout,
+            manifest,
+        })
     }
 }
 

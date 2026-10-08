@@ -42,9 +42,28 @@ use perfdata::fold::{
     write_folded_perfdata_file_with_symbols, write_inferno_perf_script_file_with_options,
     write_inferno_perf_script_file_with_symbols,
 };
-use process::{CommandRunner, RealCommandRunner};
+use process::{CancellationScope, CommandRunner, RealCommandRunner};
 use summary::threads::{render_folded_stack_summary_text, summarize_folded_stacks};
 use symbols::{SymbolizerKind, perf_symbol_resolver_for_current_home_with_symbolizer};
+
+/// Converts Clap help, version, or usage errors into normal CLI output.
+#[must_use]
+pub fn cli_parse_output(error: &clap::Error) -> CliOutput {
+    let text = error.to_string();
+    if error.use_stderr() {
+        // Clap's documented usage-error status is 2; help and version use 0.
+        CliOutput {
+            stderr: text,
+            exit_code: 2,
+            ..CliOutput::default()
+        }
+    } else {
+        CliOutput {
+            stdout: text,
+            ..CliOutput::default()
+        }
+    }
+}
 
 /// Parses command-line arguments and runs the requested Pyroclast command.
 ///
@@ -57,7 +76,11 @@ where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
-    let cli = Cli::parse_from(args);
+    let _cancellation = CancellationScope::enter()?;
+    let cli = match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(error) => return Ok(cli_parse_output(&error)),
+    };
     run_parsed_cli(cli)
 }
 
@@ -76,7 +99,24 @@ where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
-    let cli = Cli::parse_from(args);
+    let cancellation = CancellationScope::enter()?;
+    let cli = match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let output = cli_parse_output(&error);
+            let mut stream = output::PipeWriter::new(&mut stdout);
+            let written = write_cli_output(&output, &mut stream, &mut stderr)
+                .and_then(|()| std::io::Write::flush(&mut stream))
+                .and_then(|()| std::io::Write::flush(&mut stderr));
+            if let Some(exit_code) = cancellation.exit_code() {
+                return Ok(exit_code);
+            }
+            if !stream.broken_pipe() {
+                written?;
+            }
+            return Ok(output.exit_code);
+        }
+    };
     let runner = RealCommandRunner::default();
     let json_profile = cli
         .command
@@ -133,14 +173,17 @@ where
         },
     };
     if stream.broken_pipe() {
-        return Ok(result.unwrap_or(0));
+        return Ok(cancellation.exit_code().unwrap_or(result.unwrap_or(0)));
     }
     // Flush even on a parse error: samples already delivered are valid text.
     let flushed = std::io::Write::flush(&mut stream);
     if stream.broken_pipe() {
-        return Ok(result.unwrap_or(0));
+        return Ok(cancellation.exit_code().unwrap_or(result.unwrap_or(0)));
     }
     flushed?;
+    if let Some(exit_code) = cancellation.exit_code() {
+        return Ok(exit_code);
+    }
     result
 }
 
@@ -155,7 +198,11 @@ where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
-    let cli = cargo_cli::CargoCli::parse_from(cargo_cli::normalize_cargo_args(args));
+    let _cancellation = CancellationScope::enter()?;
+    let cli = match cargo_cli::CargoCli::try_parse_from(cargo_cli::normalize_cargo_args(args)) {
+        Ok(cli) => cli,
+        Err(error) => return Ok(cli_parse_output(&error)),
+    };
     run_parsed_cargo_cli(cli)
 }
 
@@ -166,8 +213,11 @@ where
 /// Returns an error when command execution, artifact I/O, or input parsing
 /// fails.
 pub fn run_parsed_cli(cli: Cli) -> backends::BackendResult<CliOutput> {
+    let cancellation = CancellationScope::enter()?;
     let runner = RealCommandRunner::default();
-    run_parsed_cli_with_runner(cli, &runner)
+    let mut output = run_parsed_cli_with_runner(cli, &runner)?;
+    output.exit_code = cancellation.exit_code().unwrap_or(output.exit_code);
+    Ok(output)
 }
 
 /// Runs a parsed cargo-subcommand command with the real process runner.
@@ -177,8 +227,11 @@ pub fn run_parsed_cli(cli: Cli) -> backends::BackendResult<CliOutput> {
 /// Returns an error when cargo target resolution, command execution, artifact
 /// I/O, or input parsing fails.
 pub fn run_parsed_cargo_cli(cli: cargo_cli::CargoCli) -> backends::BackendResult<CliOutput> {
+    let cancellation = CancellationScope::enter()?;
     let runner = RealCommandRunner::default();
-    run_parsed_cargo_cli_with_runner(cli, &runner)
+    let mut output = run_parsed_cargo_cli_with_runner(cli, &runner)?;
+    output.exit_code = cancellation.exit_code().unwrap_or(output.exit_code);
+    Ok(output)
 }
 
 /// Runs a parsed CLI command with an injected process runner.
@@ -443,11 +496,7 @@ where
             .into());
         }
     };
-    let exit_code = match result.manifest.exit_status {
-        Some(status) if status < 0 => u8::try_from(128_i64 - i64::from(status))?,
-        Some(status) => u8::try_from(status)?,
-        None => 0,
-    };
+    let exit_code = result.completion.exit_code()?;
     Ok(CliOutput {
         stdout: if request.json {
             format!("{}\n", serde_json::to_string_pretty(&result.manifest)?)

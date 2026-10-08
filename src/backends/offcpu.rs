@@ -78,6 +78,7 @@ pub fn build_bpftrace_offcpu_command(profiled_command: String, duration_secs: u3
 
 fn bpftrace_command(profiled_command: String, program: String) -> CommandSpec {
     CommandSpec::new("bpftrace")
+        .recording()
         .arg("-e")
         .arg(program)
         .arg("-c")
@@ -93,6 +94,7 @@ pub fn build_perf_sched_record_command(
     profiled_command: Vec<String>,
 ) -> CommandSpec {
     CommandSpec::new("perf")
+        .recording()
         .arg("sched")
         .arg("record")
         .arg("-o")
@@ -105,6 +107,7 @@ pub fn build_perf_sched_record_command(
 #[must_use]
 pub fn build_perf_sched_timehist_command(input: &Path) -> CommandSpec {
     CommandSpec::new("perf")
+        .finalization()
         .arg("sched")
         .arg("timehist")
         .arg("-i")
@@ -262,19 +265,22 @@ where
             },
             diagnostics: {
                 let mut diagnostics = vec![format!("offcpu method: {}", method.summary_label())];
-                if let Some(outcome) = run
-                    .summary_json
-                    .get("workload_outcome")
-                    .and_then(serde_json::Value::as_str)
-                {
-                    diagnostics.push(format!("workload outcome: {outcome}"));
+                if run.completion.workload != super::WorkloadOutcome::Unobserved {
+                    diagnostics.push(format!(
+                        "workload outcome: {}",
+                        run.completion.workload.as_str()
+                    ));
                 }
                 diagnostics
             },
         };
         std::fs::write(layout.run_json(), serde_json::to_string_pretty(&manifest)?)?;
 
-        Ok(ProfileResult { layout, manifest })
+        Ok(ProfileResult {
+            completion: run.completion,
+            layout,
+            manifest,
+        })
     }
 }
 
@@ -333,6 +339,10 @@ where
         );
         Ok(OffcpuRun {
             exit_status: record_output.status_code,
+            completion: super::ProfileCompletion::from_recorder(
+                record_output.status_code,
+                self.runner.cancellation_signal(),
+            ),
             duration_secs: None,
             stdout: [record_output.stdout, timehist_output.stdout].concat(),
             stderr: [record_output.stderr, timehist_output.stderr].concat(),
@@ -349,6 +359,7 @@ where
         request: &ProfileRequest,
         layout: &ArtifactLayout,
     ) -> BackendResult<OffcpuRun> {
+        use super::WorkloadOutcome;
         use std::io::Write;
 
         // bpftrace's status describes the recorder, not its -c child. A private
@@ -374,8 +385,9 @@ where
         )
         .arg("-o")
         .arg(data_path.to_string_lossy());
-        let mut output = self.runner.run(&command)?;
-        if !output.succeeded_or_interrupted() {
+        let output = self.runner.run(&command)?;
+        let cancellation_signal = self.runner.cancellation_signal();
+        if !output.succeeded_or_interrupted() && cancellation_signal.is_none() {
             return offcpu_command_error("bpftrace", &output, layout);
         }
         std::fs::write(layout.stdout_log(), &output.stdout)?;
@@ -389,12 +401,18 @@ where
         std::fs::write(&raw_bpftrace, &data)?;
         let data = String::from_utf8_lossy(&data);
         let duration_limited = data.lines().any(|line| line == "@duration_limited: 1");
-        let status = std::fs::read_to_string(&status_path);
-        let (exit_status, outcome) = match status.as_deref().map(str::trim) {
-            Ok("stopped") if duration_limited => (None, "duration_limited"),
-            Ok("stopped") => (None, "interrupted"),
-            Ok(status) => match status.parse::<i32>() {
-                Ok(status @ 0..=255) => (Some(status), "completed"),
+        let status = match std::fs::read_to_string(&status_path) {
+            Ok(status) => Some(status),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let workload = match status.as_deref().map(str::trim) {
+            Some("stopped") if duration_limited && cancellation_signal.is_none() => {
+                WorkloadOutcome::DurationLimited
+            }
+            Some("stopped") => WorkloadOutcome::Interrupted,
+            Some(status) => match status.parse::<i32>() {
+                Ok(status @ 0..=255) => WorkloadOutcome::Completed(status),
                 _ => {
                     return offcpu_command_error(
                         "invalid workload completion status",
@@ -403,20 +421,24 @@ where
                     );
                 }
             },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && duration_limited => {
-                (None, "duration_limited")
-            }
-            Err(error)
-                if error.kind() == std::io::ErrorKind::NotFound
-                    && output.status_code != Some(0) =>
-            {
-                (None, "interrupted")
-            }
-            Err(_) => {
-                return offcpu_command_error("missing workload completion status", &output, layout);
+            None => {
+                if cancellation_signal.is_some() {
+                    WorkloadOutcome::Interrupted
+                } else if duration_limited {
+                    WorkloadOutcome::DurationLimited
+                } else if matches!(output.status_code, Some(code) if code == -libc::SIGINT || code == -libc::SIGTERM)
+                {
+                    WorkloadOutcome::Interrupted
+                } else {
+                    WorkloadOutcome::Incomplete
+                }
             }
         };
-        output.status_code = exit_status;
+        let completion = super::ProfileCompletion {
+            recorder_status: output.status_code,
+            workload,
+            cancellation_signal,
+        };
         let folded_stacks = collapse_offcpu(&data).join("\n");
         let folded_stacks = if folded_stacks.is_empty() {
             String::new()
@@ -429,8 +451,11 @@ where
             raw_bpftrace,
             folded_stacks,
             Some(request.duration_secs),
+            completion,
         )?;
-        run.summary_json["workload_outcome"] = outcome.into();
+        run.summary_json["workload_outcome"] = workload.as_str().into();
+        run.summary_json["recorder_status"] = completion.recorder_status.into();
+        run.summary_json["cancellation_signal"] = completion.cancellation_signal.into();
         Ok(run)
     }
 
@@ -454,6 +479,7 @@ fn offcpu_tool_specs(method: OffcpuMethod) -> Vec<ToolSpec> {
 
 struct OffcpuRun {
     exit_status: Option<i32>,
+    completion: super::ProfileCompletion,
     duration_secs: Option<u32>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
@@ -469,10 +495,12 @@ fn folded_offcpu_run(
     raw_profile: PathBuf,
     folded_stacks: String,
     duration_secs: Option<u32>,
+    completion: super::ProfileCompletion,
 ) -> BackendResult<OffcpuRun> {
     let folded_summary = summarize_folded_stacks(&folded_stacks);
     Ok(OffcpuRun {
-        exit_status: output.status_code,
+        exit_status: completion.workload.exit_status(),
+        completion,
         duration_secs,
         stdout: output.stdout,
         stderr: output.stderr,

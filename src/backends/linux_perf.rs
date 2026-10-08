@@ -12,7 +12,7 @@ use crate::perfdata::fold::{
     FoldOptions, fold_perfdata_file_with_options, fold_perfdata_file_with_symbols,
 };
 use crate::platform::{NativeThreadLister, ThreadLister};
-use crate::process::{CommandRunner, CommandSpec};
+use crate::process::{CommandOutput, CommandRunner, CommandSpec, FinalizationScope};
 use crate::summary::threads::{
     FoldedStackSummary, render_folded_stack_summary_text, summarize_folded_stacks,
 };
@@ -42,7 +42,9 @@ pub fn build_perf_record_command(
     target: PerfRecordTarget,
     duration_secs: u32,
 ) -> CommandSpec {
-    let mut command = CommandSpec::new("perf").arg("record".to_string());
+    let mut command = CommandSpec::new("perf")
+        .recording()
+        .arg("record".to_string());
     if event != PerfEvent::Default {
         command = command.args(["-e".to_string(), event.to_string()]);
     }
@@ -153,17 +155,8 @@ where
             command
         };
         let output = self.runner.run(&command)?;
-        if !output.succeeded_or_interrupted() {
-            std::fs::write(layout.stdout_log(), &output.stdout)?;
-            std::fs::write(layout.stderr_log(), &output.stderr)?;
-            let error = format!(
-                "perf record exited with {:?}: {}",
-                output.status_code,
-                String::from_utf8_lossy(&output.stderr)
-            );
-            std::fs::write(layout.tool_errors_log(), format!("{error}\n"))?;
-            return Err(error.into());
-        }
+        check_perf_record_output(&output, &layout)?;
+        let _finalization = FinalizationScope::enter();
         let folded_stacks =
             fold_linux_perfdata(&perf_data, request.symbols, request.symbolizer, self.runner)?;
         let folded_summary = summarize_folded_stacks(&folded_stacks);
@@ -220,8 +213,30 @@ where
         };
         std::fs::write(layout.run_json(), serde_json::to_string_pretty(&manifest)?)?;
 
-        Ok(ProfileResult { layout, manifest })
+        Ok(ProfileResult {
+            completion: super::ProfileCompletion::from_recorder(
+                output.status_code,
+                self.runner.cancellation_signal(),
+            ),
+            layout,
+            manifest,
+        })
     }
+}
+
+fn check_perf_record_output(output: &CommandOutput, layout: &ArtifactLayout) -> BackendResult<()> {
+    if !output.succeeded_or_interrupted() {
+        std::fs::write(layout.stdout_log(), &output.stdout)?;
+        std::fs::write(layout.stderr_log(), &output.stderr)?;
+        let error = format!(
+            "perf record exited with {:?}: {}",
+            output.status_code,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::write(layout.tool_errors_log(), format!("{error}\n"))?;
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 fn write_profile_summary(

@@ -63,6 +63,83 @@ impl ProfileRequest {
 pub struct ProfileResult {
     pub layout: ArtifactLayout,
     pub manifest: RunManifest,
+    pub completion: ProfileCompletion,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkloadOutcome {
+    Completed(i32),
+    Interrupted,
+    DurationLimited,
+    Incomplete,
+    /// This backend exposes recorder status, not independent workload status.
+    Unobserved,
+}
+
+impl WorkloadOutcome {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed(_) => "completed",
+            Self::Interrupted => "interrupted",
+            Self::DurationLimited => "duration_limited",
+            Self::Incomplete => "incomplete",
+            Self::Unobserved => "unobserved",
+        }
+    }
+
+    #[must_use]
+    pub fn exit_status(self) -> Option<i32> {
+        match self {
+            Self::Completed(status) => Some(status),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProfileCompletion {
+    pub recorder_status: Option<i32>,
+    pub workload: WorkloadOutcome,
+    pub cancellation_signal: Option<i32>,
+}
+
+impl ProfileCompletion {
+    pub(crate) fn from_recorder(status: Option<i32>, cancellation_signal: Option<i32>) -> Self {
+        Self {
+            recorder_status: status,
+            workload: WorkloadOutcome::Unobserved,
+            cancellation_signal,
+        }
+    }
+
+    /// Returns the CLI status without inferring success from missing evidence.
+    /// Parent cancellation takes precedence over a known recorder signal.
+    ///
+    /// # Errors
+    /// Returns an error if an external status cannot fit in a process exit code.
+    pub fn exit_code(self) -> Result<u8, std::num::TryFromIntError> {
+        if let Some(signal) = self.cancellation_signal {
+            return u8::try_from(128_i64 + i64::from(signal));
+        }
+        let status = match self.workload {
+            WorkloadOutcome::Completed(status) => Some(status),
+            WorkloadOutcome::Interrupted
+                if self.recorder_status.is_some_and(|status| status < 0) =>
+            {
+                self.recorder_status
+            }
+            WorkloadOutcome::Interrupted => return Ok(130),
+            WorkloadOutcome::DurationLimited => return Ok(0),
+            WorkloadOutcome::Incomplete => return Ok(1),
+            WorkloadOutcome::Unobserved => self.recorder_status,
+        };
+        match status {
+            Some(status) if status < 0 => u8::try_from(128_i64 - i64::from(status)),
+            Some(status) => u8::try_from(status),
+            None => Ok(1),
+        }
+    }
 }
 
 pub trait ProfilerBackend {

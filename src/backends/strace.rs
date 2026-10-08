@@ -15,6 +15,7 @@ pub fn build_strace_command(
     profiled_command: impl IntoIterator<Item = String>,
 ) -> CommandSpec {
     CommandSpec::new("strace")
+        .recording()
         .args(["-f", "-ttt", "-T", "-o"])
         .arg(output.display().to_string())
         .arg("--")
@@ -117,7 +118,14 @@ where
         };
         std::fs::write(layout.run_json(), serde_json::to_string_pretty(&manifest)?)?;
 
-        Ok(ProfileResult { layout, manifest })
+        Ok(ProfileResult {
+            completion: super::ProfileCompletion::from_recorder(
+                output.status_code,
+                self.runner.cancellation_signal(),
+            ),
+            layout,
+            manifest,
+        })
     }
 }
 

@@ -21,6 +21,7 @@ pub fn build_xctrace_record_command(
     profiled_command: impl IntoIterator<Item = String>,
 ) -> CommandSpec {
     CommandSpec::new("xctrace")
+        .recording()
         .args([
             "record".to_string(),
             "--quiet".to_string(),
@@ -43,7 +44,7 @@ pub fn build_xctrace_record_command(
 
 #[must_use]
 pub fn build_xctrace_export_cpu_command(trace_path: &Path, output_xml: &Path) -> CommandSpec {
-    CommandSpec::new("xctrace").args([
+    CommandSpec::new("xctrace").finalization().args([
         "export".to_string(),
         "--input".to_string(),
         trace_path.display().to_string(),
@@ -165,7 +166,14 @@ where
         };
         std::fs::write(layout.run_json(), serde_json::to_string_pretty(&manifest)?)?;
 
-        Ok(ProfileResult { layout, manifest })
+        Ok(ProfileResult {
+            completion: super::ProfileCompletion::from_recorder(
+                record_output.status_code,
+                self.runner.cancellation_signal(),
+            ),
+            layout,
+            manifest,
+        })
     }
 }
 
