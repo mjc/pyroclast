@@ -239,6 +239,188 @@ fn fixed_elf_distinct_images_do_not_share_zero_bias_identity() {
     assert_eq!(unwinder.module_count(), 2);
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn compile_address_cfi_elf(
+    root: &std::path::Path,
+    fixed: bool,
+    header: bool,
+    cfi: bool,
+) -> std::path::PathBuf {
+    let linked_start = if fixed { 0x0001_0040_0000 } else { 0x0040_0000 };
+    let binary = compile_fixed_cfi_elf(root, linked_start);
+    if !fixed {
+        let output = std::process::Command::new("cc")
+            .args([
+                "-nostdlib",
+                "-shared",
+                "-Wl,-Bsymbolic",
+                "-Wl,-e,leaf",
+                "-Wl,--eh-frame-hdr",
+                "-Wl,-Ttext-segment=0x400000",
+            ])
+            .arg(root.join("fixed.S"))
+            .arg("-o")
+            .arg(&binary)
+            .output()
+            .expect("compile nonzero-vaddr ET_DYN");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    if !header || !cfi {
+        let mut command = std::process::Command::new("objcopy");
+        command.arg("--remove-section=.eh_frame_hdr");
+        if !cfi {
+            command.arg("--remove-section=.eh_frame");
+        }
+        let output = command
+            .arg(&binary)
+            .output()
+            .expect("strip fixture sections");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    binary
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn assert_native_address_case(fixed: bool, actual_start: u64, header: bool, cfi: bool) {
+    let root = tempfile::tempdir().expect("address fixture directory");
+    let binary = compile_address_cfi_elf(root.path(), fixed, header, cfi);
+    let linked_start = if fixed { 0x0001_0040_0000 } else { 0x0040_0000 };
+    let bytes = std::fs::read(&binary).expect("read address fixture");
+    let object = object::File::parse(&bytes[..]).expect("parse address fixture");
+    assert_eq!(
+        object.kind(),
+        if fixed {
+            object::ObjectKind::Executable
+        } else {
+            object::ObjectKind::Dynamic
+        }
+    );
+    assert_eq!(
+        object.segments().map(|s| s.address()).min(),
+        Some(linked_start)
+    );
+    assert_eq!(
+        object.section_by_name(".eh_frame_hdr").is_some(),
+        header && cfi
+    );
+    assert_eq!(object.section_by_name(".eh_frame").is_some(), cfi);
+    let symbol = |name| {
+        object
+            .symbols()
+            .find(|s| s.name() == Ok(name))
+            .expect("fixture symbol")
+            .address()
+    };
+    // Native libdw 0.195 recovered these exact frames for all six CFI cases;
+    // stripped controls returned only the leaf (target/native-address-20261008).
+    let translate = |address: u64| {
+        u64::try_from(i128::from(address) + i128::from(actual_start) - i128::from(linked_start))
+            .expect("representable runtime address")
+    };
+    let ip = translate(symbol("leaf") + 1);
+    let caller = translate(symbol("caller"));
+    assert_eq!(ip, actual_start + 0x1001);
+    assert_eq!(caller, actual_start + 0x1020);
+    let segment = object
+        .segments()
+        .find(|s| s.address() <= symbol("leaf") && symbol("leaf") < s.address() + s.size())
+        .expect("leaf PT_LOAD");
+    let start = translate(segment.address());
+    let (offset, size) = segment.file_range();
+    assert_eq!(start.checked_sub(offset), Some(actual_start));
+    assert!(size >= 8);
+    let mut unwinder = FramehopUnwinder::new();
+    assert!(
+        unwinder
+            .add_object_mapping(&binary, start, segment.size(), offset)
+            .expect("load address fixture")
+    );
+    let sp = 0x7fff_0000;
+    let regs = PerfUserRegs::X86_64(PerfX86_64Regs {
+        ip,
+        sp,
+        bp: 0,
+        registers: registers_with_bp_sp(0, sp),
+    });
+    let mut stack = vec![0; 64];
+    stack[..8].copy_from_slice(&(caller + 1).to_le_bytes());
+    assert_eq!(
+        unwinder.unwind_stack(regs, &stack, 8),
+        if cfi { vec![ip, caller] } else { vec![ip] }
+    );
+    assert!(unwinder.has_reported_module_for_ip(ip));
+    assert_eq!(unwinder.has_unwind_info_for_ip(ip), cfi);
+    let offset = usize::try_from(offset).expect("file offset");
+    assert_eq!(
+        unwinder.read_process_u64(start),
+        Some(u64::from_le_bytes(
+            bytes[offset..offset + 8].try_into().expect("mapped word")
+        ))
+    );
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn high_et_exec_with_eh_frame_hdr() {
+    assert_native_address_case(true, 0x0001_0040_0000, true, true);
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn high_et_exec_without_eh_frame_hdr() {
+    assert_native_address_case(true, 0x0001_0040_0000, false, true);
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn high_et_exec_without_cfi() {
+    assert_native_address_case(true, 0x0001_0040_0000, false, false);
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn nonzero_vaddr_et_dyn_high_with_eh_frame_hdr() {
+    assert_native_address_case(false, 0x7000_0000, true, true);
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn nonzero_vaddr_et_dyn_high_without_eh_frame_hdr() {
+    assert_native_address_case(false, 0x7000_0000, false, true);
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn nonzero_vaddr_et_dyn_high_without_cfi() {
+    assert_native_address_case(false, 0x7000_0000, false, false);
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn nonzero_vaddr_et_dyn_downward_with_eh_frame_hdr() {
+    assert_native_address_case(false, 0x0020_0000, true, true);
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn nonzero_vaddr_et_dyn_downward_without_eh_frame_hdr() {
+    assert_native_address_case(false, 0x0020_0000, false, true);
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn nonzero_vaddr_et_dyn_downward_without_cfi() {
+    assert_native_address_case(false, 0x0020_0000, false, false);
+}
+
 #[test]
 fn reads_mapped_object_memory_outside_sampled_stack_like_perf_libdw() {
     let current_exe = std::env::current_exe().expect("current exe");

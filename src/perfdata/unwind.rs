@@ -214,6 +214,26 @@ struct ReportedModule {
     unwind_ranges: Vec<Range<u64>>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ModuleAddresses {
+    base_svma: u64,
+    base_avma: u64,
+}
+
+impl ModuleAddresses {
+    fn svma_to_avma(self, address: u64) -> Option<u64> {
+        if let Some(offset) = address.checked_sub(self.base_svma) {
+            self.base_avma.checked_add(offset)
+        } else {
+            self.base_avma.checked_sub(self.base_svma - address)
+        }
+    }
+
+    fn svma_range_to_avma(self, range: Range<u64>) -> Option<Range<u64>> {
+        Some(self.svma_to_avma(range.start)?..self.svma_to_avma(range.end)?)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ModuleMemorySegment {
     range: Range<u64>,
@@ -342,32 +362,54 @@ impl FramehopUnwinder {
         let object = object::File::parse(&mapped[..]).map_err(|error| {
             format!("failed to parse unwind object {}: {error}", path.display())
         })?;
-        let base = if path
-            .to_str()
-            .is_some_and(|path| path.starts_with("/tmp/jitted-"))
-        {
-            start
-        } else {
-            start.saturating_sub(pgoff)
-        };
-        // perf util/unwind-libdw.c:98-115 passes start-pgoff to dwfl_report_elf.
-        // elfutils 0.195 libdwfl/dwfl_report_elf.c:170-174 overrides that bias
-        // to zero for ET_EXEC/ET_CORE: their PT_LOAD/FDE addresses are absolute.
+        // perf util/unwind-libdw.c:88-115 reports start-pgoff (start for JIT).
+        // elfutils 0.195 libdwfl/dwfl_report_elf.c:170-201 places the aligned
+        // first PT_LOAD there for ET_DYN; ET_EXEC/ET_CORE retain linked PCs.
         let fixed_elf = object.format() == object::BinaryFormat::Elf
             && matches!(
                 object.kind(),
                 object::ObjectKind::Executable | object::ObjectKind::Core
             );
-        let load_bias = if fixed_elf { 0 } else { base };
-        let Some(module_range) = object_load_range(&object).map(|range| {
-            load_bias.saturating_add(range.start)..load_bias.saturating_add(range.end)
-        }) else {
+        let linked_base = object_base_svma(&object);
+        let base = if fixed_elf {
+            linked_base
+        } else if path
+            .to_str()
+            .is_some_and(|path| path.starts_with("/tmp/jitted-"))
+        {
+            start
+        } else {
+            let Some(base) = start.checked_sub(pgoff) else {
+                return Ok(false);
+            };
+            base
+        };
+        let runtime_base = if object.format() == object::BinaryFormat::Elf {
+            base
+        } else {
+            let Some(address) = base.checked_add(linked_base) else {
+                return Ok(false);
+            };
+            address
+        };
+        // framehop 0.16 uses u32 PC/FDE offsets relative to these paired
+        // anchors, not a relocation bias (which may be negative).
+        let addresses = ModuleAddresses {
+            base_svma: linked_base,
+            base_avma: runtime_base,
+        };
+        let Some(module_range) =
+            object_load_range(&object).and_then(|range| addresses.svma_range_to_avma(range))
+        else {
             return Ok(false);
         };
         // Distinct fixed images all have zero bias, but not the same identity.
         // Use their linked start for duplicate/conflict handling, not that bias.
         let base = if fixed_elf { module_range.start } else { base };
-        let mapping_range = start..start.saturating_add(len);
+        let Some(mapping_end) = start.checked_add(len) else {
+            return Ok(false);
+        };
+        let mapping_range = start..mapping_end;
         if self
             .reported_modules
             .iter()
@@ -383,13 +425,13 @@ impl FramehopUnwinder {
         {
             return Ok(false);
         }
-        let section_info = explicit_module_section_info(&mapped, &object);
-        let memory_segments = module_memory_segments(&mapped, &object, load_bias);
-        let unwind_ranges = object_unwind_ranges(&object, load_bias);
+        let section_info = explicit_module_section_info(&mapped, &object, linked_base);
+        let memory_segments = module_memory_segments(&mapped, &object, addresses);
+        let unwind_ranges = object_unwind_ranges(&object, addresses);
         let module = Module::<ModuleBytes>::new(
             path.to_string_lossy().into_owned(),
             module_range.clone(),
-            load_bias,
+            runtime_base,
             section_info,
         );
         self.arch.add_module(module);
@@ -563,9 +605,10 @@ impl Deref for MappedBytes {
 fn explicit_module_section_info<'a>(
     mapped: &Arc<Mmap>,
     object: &object::File<'a, &'a [u8]>,
+    base_svma: u64,
 ) -> ExplicitModuleSectionInfo<ModuleBytes> {
     ExplicitModuleSectionInfo {
-        base_svma: object_base_svma(object),
+        base_svma,
         text_svma: first_section_svma_range(object, &[b"__text", b".text"]),
         text: first_section_data(mapped, object, &[b"__text", b".text"]),
         stubs_svma: first_section_svma_range(object, &[b"__stubs"]),
@@ -583,6 +626,13 @@ fn explicit_module_section_info<'a>(
 }
 
 fn object_base_svma<'a>(object: &object::File<'a, &'a [u8]>) -> u64 {
+    if object.format() == object::BinaryFormat::Elf {
+        // object 0.39's ELF segment iterator yields PT_LOADs in header order.
+        // Match libdwfl's p_vaddr & -p_align anchor, including p_align == 0.
+        return object.segments().next().map_or(0, |segment| {
+            segment.address() & segment.align().wrapping_neg()
+        });
+    }
     object
         .segments()
         .find(|segment| segment.name() == Ok(Some("__TEXT")))
@@ -593,28 +643,37 @@ fn object_base_svma<'a>(object: &object::File<'a, &'a [u8]>) -> u64 {
 }
 
 fn object_load_range<'a>(object: &object::File<'a, &'a [u8]>) -> Option<Range<u64>> {
-    object
-        .segments()
-        .filter(|segment| segment.size() != 0)
-        .map(|segment| {
-            let start = segment.address();
-            start..start.saturating_add(segment.size())
-        })
-        .reduce(|left, right| left.start.min(right.start)..left.end.max(right.end))
+    let mut range: Option<Range<u64>> = None;
+    for segment in object.segments().filter(|segment| segment.size() != 0) {
+        let start = segment.address();
+        let end = start.checked_add(segment.size())?;
+        range = Some(match range {
+            Some(range) => range.start.min(start)..range.end.max(end),
+            None => start..end,
+        });
+    }
+    let mut range = range?;
+    if object.format() == object::BinaryFormat::Elf {
+        range.start = object_base_svma(object);
+    }
+    Some(range)
 }
 
-fn object_unwind_ranges<'a>(object: &object::File<'a, &'a [u8]>, base: u64) -> Vec<Range<u64>> {
+fn object_unwind_ranges<'a>(
+    object: &object::File<'a, &'a [u8]>,
+    addresses: ModuleAddresses,
+) -> Vec<Range<u64>> {
     let bases = object_cfi_base_addresses(object);
     let mut ranges = Vec::new();
-    append_eh_frame_unwind_ranges(object, base, &bases, &mut ranges);
-    append_debug_frame_unwind_ranges(object, base, &bases, &mut ranges);
+    append_eh_frame_unwind_ranges(object, addresses, &bases, &mut ranges);
+    append_debug_frame_unwind_ranges(object, addresses, &bases, &mut ranges);
     normalize_ranges(&mut ranges);
     ranges
 }
 
 fn append_eh_frame_unwind_ranges<'a>(
     object: &object::File<'a, &'a [u8]>,
-    base: u64,
+    addresses: ModuleAddresses,
     bases: &BaseAddresses,
     ranges: &mut Vec<Range<u64>>,
 ) {
@@ -633,13 +692,13 @@ fn append_eh_frame_unwind_ranges<'a>(
         let Ok(fde) = partial.parse(EhFrame::cie_from_offset) else {
             continue;
         };
-        push_unwind_range(ranges, base, fde.initial_address(), fde.end_address());
+        push_unwind_range(ranges, addresses, fde.initial_address(), fde.end_address());
     }
 }
 
 fn append_debug_frame_unwind_ranges<'a>(
     object: &object::File<'a, &'a [u8]>,
-    base: u64,
+    addresses: ModuleAddresses,
     bases: &BaseAddresses,
     ranges: &mut Vec<Range<u64>>,
 ) {
@@ -658,7 +717,7 @@ fn append_debug_frame_unwind_ranges<'a>(
         let Ok(fde) = partial.parse(DebugFrame::cie_from_offset) else {
             continue;
         };
-        push_unwind_range(ranges, base, fde.initial_address(), fde.end_address());
+        push_unwind_range(ranges, addresses, fde.initial_address(), fde.end_address());
     }
 }
 
@@ -689,15 +748,17 @@ fn first_section_address<'a>(object: &object::File<'a, &'a [u8]>, names: &[&[u8]
     names.iter().find_map(|name| section_address(object, name))
 }
 
-fn push_unwind_range(ranges: &mut Vec<Range<u64>>, base: u64, start: u64, end: u64) {
-    let Some(start) = base.checked_add(start) else {
+fn push_unwind_range(
+    ranges: &mut Vec<Range<u64>>,
+    addresses: ModuleAddresses,
+    start: u64,
+    end: u64,
+) {
+    let Some(range) = addresses.svma_range_to_avma(start..end) else {
         return;
     };
-    let Some(end) = base.checked_add(end) else {
-        return;
-    };
-    if start < end {
-        ranges.push(start..end);
+    if range.start < range.end {
+        ranges.push(range);
     }
 }
 
@@ -731,16 +792,16 @@ fn normalize_ranges(ranges: &mut Vec<Range<u64>>) {
 fn module_memory_segments<'a>(
     mapped: &Arc<Mmap>,
     object: &object::File<'a, &'a [u8]>,
-    base: u64,
+    addresses: ModuleAddresses,
 ) -> Vec<ModuleMemorySegment> {
     object
         .segments()
         .filter_map(|segment| {
             let bytes = map_file_range(mapped, segment.file_range())?;
-            let start = base.saturating_add(segment.address());
+            let start = addresses.svma_to_avma(segment.address())?;
             let len = u64::try_from(bytes.len()).ok()?;
             Some(ModuleMemorySegment {
-                range: start..start.saturating_add(len),
+                range: start..start.checked_add(len)?,
                 bytes,
             })
         })
@@ -769,7 +830,7 @@ fn first_section_svma_range<'a>(
 ) -> Option<Range<u64>> {
     names.iter().find_map(|name| {
         let section = object.section_by_name_bytes(name)?;
-        Some(section.address()..section.address().saturating_add(section.size()))
+        Some(section.address()..section.address().checked_add(section.size())?)
     })
 }
 
@@ -788,7 +849,7 @@ fn segment_svma_range<'a>(object: &object::File<'a, &'a [u8]>, name: &[u8]) -> O
     let segment = object
         .segments()
         .find(|segment| segment.name_bytes() == Ok(Some(name)))?;
-    Some(segment.address()..segment.address().saturating_add(segment.size()))
+    Some(segment.address()..segment.address().checked_add(segment.size())?)
 }
 
 fn segment_data<'a>(
