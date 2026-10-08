@@ -42,7 +42,9 @@ use crate::perfdata::samples::{
     PERF_SAMPLE_TIME, SampleLayout, is_kernel_space_frame, is_perf_context_marker,
     parse_sample_record_callchain,
 };
-use crate::perfdata::source::{FileSource, RecordSource, SliceSource};
+use crate::perfdata::source::{
+    FileSource, QueuedPerfRecord, RecordSource, SliceSource, WindowStore,
+};
 use crate::perfdata::unwind::{
     FramehopUnwinder, PerfArch, PerfUserRegs, UserStackUnwindResult, UserStackUnwinder,
     unwind_aarch64_frame_pointer_stack_like_elfutils,
@@ -297,9 +299,8 @@ enum FoldRecord<'a> {
     Ignored,
 }
 
-#[derive(Clone, Copy)]
 struct PendingFoldRecord {
-    offset: usize,
+    record: QueuedPerfRecord,
     time: u64,
 }
 
@@ -308,6 +309,7 @@ struct OrderedRecordQueue {
     pending_records: Vec<PendingFoldRecord>,
     next_flush_time: Option<u64>,
     max_timestamp: Option<u64>,
+    windows: WindowStore,
 }
 
 struct DeferredFoldSample {
@@ -1134,60 +1136,52 @@ fn replay_records<O: SampleOutput>(
         .as_ref()
         .is_some_and(|event| event.layout.sample_id_all);
     while offset < end {
-        let record = source.record_at(offset, end)?;
-        let next = offset + usize::from(record.header.size);
-        if record.header.record_type == PERF_RECORD_FINISHED_ROUND {
-            ordered.flush_round_with(|offset| {
-                deliver_record(source, offset, end, layouts, options, sink)
-            })?;
-            // ordered-events.c:do_flush leaves newer timestamps queued.
-            // Their file offsets are not timestamp ordered. Retire only the
-            // consumed prefix, without touching the pending boundary page.
-            let oldest_pending = ordered
-                .pending_records
-                .iter()
-                .map(|record| record.offset)
-                .min()
-                .unwrap_or(next);
-            source.retire_before(oldest_pending.min(next))?;
-        } else if ordered_events
-            && let Some(time) =
+        let (record_type, header, next, queue_time) = {
+            let record = source.record_at(offset, end)?;
+            let record_type = record.header.record_type;
+            let header = record.header;
+            let next = offset + usize::from(record.header.size);
+            let queue_time = if ordered_events && record_type != PERF_RECORD_FINISHED_ROUND {
                 record_time(record, layouts)?.filter(|time| *time != 0 && *time != u64::MAX)
-        {
+            } else {
+                None
+            };
+            if record_type != PERF_RECORD_FINISHED_ROUND && queue_time.is_none() {
+                sink.apply_fold_record(parse_fold_record(record)?, layouts, options)?;
+            }
+            (record_type, header, next, queue_time)
+        };
+        if record_type == PERF_RECORD_FINISHED_ROUND {
+            ordered.flush_round_with(|record, offset| {
+                deliver_record(record, offset, layouts, options, sink)
+            })?;
+        } else if let Some(time) = queue_time {
             // ordered-events.c rejects zero/~0ULL with -ETIME; session.c then
             // delivers directly. Ties retain input order (file offset).
-            source.retain_record(offset)?;
-            ordered.queue(offset, time);
-        } else {
-            sink.apply_fold_record(parse_fold_record(record)?, layouts, options)?;
+            let record = source.queue_record(offset, end, header, &mut ordered.windows)?;
+            ordered.queue(record, time);
         }
         offset = next;
     }
-    ordered
-        .flush_final_with(|offset| deliver_record(source, offset, end, layouts, options, sink))?;
-    source.retire_before(end)?;
+    ordered.flush_final_with(|record, offset| {
+        deliver_record(record, offset, layouts, options, sink)
+    })?;
     sink.flush_deferred_samples()
 }
 
 fn deliver_record<O: SampleOutput>(
-    source: &mut impl RecordSource,
+    record: crate::perfdata::records::PerfRecord<'_>,
     offset: usize,
-    end: usize,
     layouts: &SampleLayouts,
     options: FoldOptions,
     sink: &mut SampleSink<O>,
 ) -> Result<(), String> {
-    let result = (|| {
-        let record = source.delivered_record_at(offset, end)?;
-        let record_type = record.header.record_type;
-        parse_fold_record(record)
-            .and_then(|record| sink.apply_fold_record(record, layouts, options))
-            .map_err(|error| {
-                format!("failed to parse record type {record_type} at offset {offset}: {error}")
-            })
-    })();
-    source.release_record(offset);
-    result
+    let record_type = record.header.record_type;
+    parse_fold_record(record)
+        .and_then(|record| sink.apply_fold_record(record, layouts, options))
+        .map_err(|error| {
+            format!("failed to parse record type {record_type} at offset {offset}: {error}")
+        })
 }
 
 fn header_build_ids_by_filename(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, String> {
@@ -1765,7 +1759,7 @@ fn perf_script_comm<'a>(
 }
 
 impl OrderedRecordQueue {
-    fn queue(&mut self, offset: usize, time: u64) {
+    fn queue(&mut self, record: QueuedPerfRecord, time: u64) {
         // perf util/ordered-events.c:queue_event resets max_timestamp when
         // oe->last is NULL, which do_flush sets after emptying the queue.
         self.max_timestamp = Some(if self.pending_records.is_empty() {
@@ -1774,12 +1768,12 @@ impl OrderedRecordQueue {
             self.max_timestamp.map_or(time, |max| max.max(time))
         });
         self.pending_records
-            .push(PendingFoldRecord { offset, time });
+            .push(PendingFoldRecord { record, time });
     }
 
     fn flush_round_with<F>(&mut self, apply: F) -> Result<(), String>
     where
-        F: FnMut(usize) -> Result<(), String>,
+        F: FnMut(crate::perfdata::records::PerfRecord<'_>, usize) -> Result<(), String>,
     {
         if let Some(limit) = self.next_flush_time {
             self.flush_through_with(Some(limit), apply)?;
@@ -1790,23 +1784,32 @@ impl OrderedRecordQueue {
 
     fn flush_final_with<F>(&mut self, apply: F) -> Result<(), String>
     where
-        F: FnMut(usize) -> Result<(), String>,
+        F: FnMut(crate::perfdata::records::PerfRecord<'_>, usize) -> Result<(), String>,
     {
         self.flush_through_with(None, apply)
     }
 
     fn flush_through_with<F>(&mut self, limit: Option<u64>, mut apply: F) -> Result<(), String>
     where
-        F: FnMut(usize) -> Result<(), String>,
+        F: FnMut(crate::perfdata::records::PerfRecord<'_>, usize) -> Result<(), String>,
     {
         self.pending_records
-            .sort_unstable_by_key(|record| (record.time, record.offset));
+            .sort_unstable_by_key(|record| (record.time, record.record.offset));
         let split = limit.map_or(self.pending_records.len(), |limit| {
             self.pending_records
                 .partition_point(|record| record.time <= limit)
         });
-        for record in self.pending_records.drain(..split) {
-            apply(record.offset)?;
+        let mut ready = self.pending_records.drain(..split);
+        while let Some(queued) = ready.next() {
+            let offset = queued.record.offset;
+            let result = apply(self.windows.record(&queued.record), offset);
+            self.windows.release(&queued.record);
+            if let Err(error) = result {
+                for pending in ready {
+                    self.windows.release(&pending.record);
+                }
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -5144,14 +5147,12 @@ mod tests {
         assert_eq!(stacks.len(), 1024);
     }
 
-    struct RetentionCheckedSource<'a> {
+    struct OnePassSource<'a> {
         source: super::SliceSource<'a>,
-        pending: std::collections::BTreeSet<usize>,
-        delivered: Vec<usize>,
-        retired: Vec<usize>,
+        reads: Vec<usize>,
     }
 
-    impl super::RecordSource for RetentionCheckedSource<'_> {
+    impl super::RecordSource for OnePassSource<'_> {
         fn len(&self) -> usize {
             self.source.len()
         }
@@ -5160,40 +5161,20 @@ mod tests {
             self.source.bytes_at(offset, len)
         }
 
-        fn retain_record(&mut self, offset: usize) -> Result<(), String> {
-            assert!(self.pending.insert(offset));
-            Ok(())
-        }
-
-        fn delivered_record_at(
+        fn queue_record(
             &mut self,
             offset: usize,
             end: usize,
-        ) -> Result<super::PerfRecord<'_>, String> {
-            assert!(
-                self.pending.contains(&offset),
-                "delivery must retain backing first"
-            );
-            self.delivered.push(offset);
-            self.source.record_at(offset, end)
-        }
-
-        fn release_record(&mut self, offset: usize) {
-            assert!(
-                self.pending.remove(&offset),
-                "release must balance retention"
-            );
-        }
-
-        fn retire_before(&mut self, offset: usize) -> Result<(), String> {
-            assert!(self.pending.iter().all(|pending| *pending >= offset));
-            self.retired.push(offset);
-            Ok(())
+            header: crate::perfdata::records::PerfRecordHeader,
+            windows: &mut super::WindowStore,
+        ) -> Result<super::QueuedPerfRecord, String> {
+            self.reads.push(offset);
+            self.source.queue_record(offset, end, header, windows)
         }
     }
 
     #[test]
-    fn replay_retires_consumed_backing_after_delivery_but_not_after_parse_errors() {
+    fn replay_delivers_timestamp_ordered_records_without_reading_them_twice() {
         let layouts = super::SampleLayouts {
             fallback: Some(std::sync::Arc::new(super::SampleEventLayout::new(
                 crate::perfdata::samples::SampleLayout {
@@ -5228,11 +5209,9 @@ mod tests {
                 data_offset: 0,
                 data_size: u64::try_from(bytes.len()).unwrap(),
             };
-            let mut source = RetentionCheckedSource {
+            let mut source = OnePassSource {
                 source: super::SliceSource(&bytes),
-                pending: std::collections::BTreeSet::new(),
-                delivered: Vec::new(),
-                retired: Vec::new(),
+                reads: Vec::new(),
             };
             let mut sink = super::SampleSink::new(
                 super::SessionState::new(std::collections::BTreeMap::new()),
@@ -5258,21 +5237,17 @@ mod tests {
                         .unwrap_err()
                         .contains("failed to parse record type 1")
                 );
-                assert_eq!(source.delivered, [32]);
-                assert_eq!(source.pending, std::collections::BTreeSet::from([0]));
-                assert!(source.retired.is_empty());
+                assert_eq!(source.reads, [0, 32]);
             } else {
                 result.unwrap();
-                assert_eq!(source.delivered, [32, 0]);
-                assert!(source.pending.is_empty());
-                assert_eq!(source.retired, [bytes.len()]);
+                assert_eq!(source.reads, [0, 32]);
                 assert_eq!(sink.accumulator.thread_comms[&12].name, "later");
             }
         }
     }
 
     #[test]
-    fn replay_round_retirement_uses_oldest_file_offset_not_first_timestamp() {
+    fn replay_retains_only_timed_samples_in_physical_file_order() {
         let layouts = super::SampleLayouts {
             fallback: Some(std::sync::Arc::new(super::SampleEventLayout::new(
                 crate::perfdata::samples::SampleLayout {
@@ -5312,11 +5287,9 @@ mod tests {
             data_offset: 0,
             data_size: u64::try_from(bytes.len()).unwrap(),
         };
-        let mut source = RetentionCheckedSource {
+        let mut source = OnePassSource {
             source: super::SliceSource(&bytes),
-            pending: std::collections::BTreeSet::new(),
-            delivered: Vec::new(),
-            retired: Vec::new(),
+            reads: Vec::new(),
         };
         let mut sink = super::SampleSink::new(
             super::SessionState::new(std::collections::BTreeMap::new()),
@@ -5334,47 +5307,67 @@ mod tests {
             &mut sink,
         )
         .unwrap();
-        // ordered-events.c:OE_FLUSH__ROUND uses the preceding round's maximum.
-        // The timestamp-first pending record is at 104; offset 72 is still live.
-        assert_eq!(source.delivered, [32, 0, 104, 72]);
-        assert_eq!(source.retired, [0, rounds[0], bytes.len()]);
-        assert!(source.pending.is_empty());
+        assert_eq!(source.reads, [0, 32, 72, 104]);
+        assert_eq!(rounds, [72, bytes.len()]);
     }
 
     #[test]
-    fn ordered_backlog_retains_only_timestamp_and_record_location() {
+    fn ordered_backlog_retains_a_window_reference_not_a_record_copy() {
         assert!(
-            std::mem::size_of::<super::PendingFoldRecord>() <= 24,
-            "ordering must not retain decoded records or sample payloads: {} bytes",
+            std::mem::size_of::<super::PendingFoldRecord>() <= 64,
+            "ordering metadata should stay pointer-sized: {} bytes",
             std::mem::size_of::<super::PendingFoldRecord>()
         );
+    }
+
+    fn ordered_record(
+        offset: usize,
+        queue: &mut super::OrderedRecordQueue,
+    ) -> super::QueuedPerfRecord {
+        let window = queue
+            .windows
+            .retain_with(offset, || std::sync::Arc::new(Vec::new()));
+        super::QueuedPerfRecord {
+            offset,
+            header: crate::perfdata::records::PerfRecordHeader {
+                record_type: crate::perfdata::records::PERF_RECORD_SAMPLE,
+                misc: 0,
+                size: 8,
+            },
+            window,
+            payload: 0..0,
+        }
     }
 
     #[test]
     fn ordered_delivery_preserves_ties_and_one_round_lag_like_perf() {
         let mut queue = super::OrderedRecordQueue::default();
-        queue.queue(24, 10);
-        queue.queue(8, 10);
-        queue.queue(16, 20);
+        let record = ordered_record(24, &mut queue);
+        queue.queue(record, 10);
+        let record = ordered_record(8, &mut queue);
+        queue.queue(record, 10);
+        let record = ordered_record(16, &mut queue);
+        queue.queue(record, 20);
         let mut delivered = Vec::new();
         queue
-            .flush_round_with(|offset| {
-                delivered.push(offset);
+            .flush_round_with(|record, _| {
+                delivered.push(record.offset);
                 Ok(())
             })
             .unwrap();
         assert!(delivered.is_empty());
-        queue.queue(32, 30);
+        let record = ordered_record(32, &mut queue);
+        queue.queue(record, 30);
         queue
-            .flush_round_with(|offset| {
-                delivered.push(offset);
+            .flush_round_with(|record, _| {
+                delivered.push(record.offset);
                 Ok(())
             })
             .unwrap();
         assert_eq!(delivered, [8, 24, 16]);
         queue
-            .flush_final_with(|offset| {
-                delivered.push(offset);
+            .flush_final_with(|record, _| {
+                delivered.push(record.offset);
                 Ok(())
             })
             .unwrap();
@@ -5387,31 +5380,34 @@ mod tests {
         // queue_event then sets max_timestamp to the first new timestamp.
         // Older timestamps are counted as unordered, not rejected.
         let mut queue = super::OrderedRecordQueue::default();
-        queue.queue(0, 100);
-        queue.flush_round_with(|_| Ok(())).unwrap();
-        queue.flush_round_with(|_| Ok(())).unwrap();
+        let record = ordered_record(0, &mut queue);
+        queue.queue(record, 100);
+        queue.flush_round_with(|_, _| Ok(())).unwrap();
+        queue.flush_round_with(|_, _| Ok(())).unwrap();
         assert!(queue.pending_records.is_empty());
 
-        queue.queue(8, 10);
+        let record = ordered_record(8, &mut queue);
+        queue.queue(record, 10);
         let mut delivered = Vec::new();
         queue
-            .flush_round_with(|offset| {
-                delivered.push(offset);
+            .flush_round_with(|record, _| {
+                delivered.push(record.offset);
                 Ok(())
             })
             .unwrap();
         assert_eq!(delivered, [8]);
-        queue.queue(16, 50);
+        let record = ordered_record(16, &mut queue);
+        queue.queue(record, 50);
         queue
-            .flush_round_with(|offset| {
-                delivered.push(offset);
+            .flush_round_with(|record, _| {
+                delivered.push(record.offset);
                 Ok(())
             })
             .unwrap();
         assert_eq!(delivered, [8], "new round must retain its one-round lag");
         queue
-            .flush_final_with(|offset| {
-                delivered.push(offset);
+            .flush_final_with(|record, _| {
+                delivered.push(record.offset);
                 Ok(())
             })
             .unwrap();
