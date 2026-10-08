@@ -371,6 +371,7 @@ fn read_frames(svg: &str) -> io::Result<(Vec<Frame>, Option<u64>)> {
         match reader.read_event().map_err(invalid_data)? {
             Event::Start(element) if element.name().as_ref() == b"title" => {
                 let text = reader.read_text(element.name()).map_err(invalid_data)?;
+                let text = text.decode().map_err(invalid_data)?;
                 let text = quick_xml::escape::unescape(&text).map_err(invalid_data)?;
                 if let Some(container) = containers.last_mut().filter(|container| container.frame)
                     && let Some((name, metadata)) = text.rsplit_once(" (")
@@ -480,7 +481,7 @@ fn attribute(element: &BytesStart<'_>, name: &[u8]) -> io::Result<Option<String>
         .map_err(invalid_data)?
         .map(|attribute| {
             attribute
-                .unescape_value()
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                 .map(std::borrow::Cow::into_owned)
                 .map_err(invalid_data)
         })

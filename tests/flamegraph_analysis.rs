@@ -164,6 +164,51 @@ fn flamegraph_parser_decodes_xml_symbol_entities() {
 }
 
 #[test]
+fn xml_title_decoding_preserves_whitespace_and_unescapes_once() {
+    let svg = ranged_svg(
+        "<g><title> work\tline\r\n&amp;lt;T&amp;gt;&#x9;end  (2 samples, 2%)</title><rect fg:x=\"0\" fg:w=\"2\" y=\"80\"/></g>",
+    );
+    let profile = parse_flamegraph(&svg).unwrap();
+    assert_eq!(profile.inclusive[0].name, " work\tline\r\n&lt;T&gt;\tend ");
+}
+
+#[test]
+fn xml_attributes_decode_numeric_references_without_accepting_invalid_values() {
+    let svg = ranged_svg(
+        r#"<g><title>work (2 samples, 2%)</title><rect fg:x="&#48;" fg:w="&#x32;" y="8&#48;"/></g>"#,
+    );
+    assert_eq!(
+        parse_flamegraph(&svg).unwrap().inclusive,
+        vec![entry("work", 2, 2.0)]
+    );
+    for attribute in ["8\t0", "8\r\n0", "8&#x9;0", "&unknown;", "&#0;"] {
+        let svg = ranged_svg(&format!(
+            r#"<g><title>work (2 samples, 2%)</title><rect fg:x="0" fg:w="2" y="{attribute}"/></g>"#,
+        ));
+        assert!(parse_flamegraph(&svg).is_err(), "accepted y={attribute:?}");
+    }
+}
+
+#[test]
+fn xml_rejects_unknown_title_entities_and_reads_large_attribute_sets() {
+    let svg = ranged_svg(
+        r#"<g><title>work&unknown; (2 samples, 2%)</title><rect fg:x="0" fg:w="2" y="80"/></g>"#,
+    );
+    assert!(parse_flamegraph(&svg).is_err());
+    let mut attributes = String::new();
+    for index in 0..2048 {
+        write!(attributes, " a{index}=\"value\"").unwrap();
+    }
+    let svg = ranged_svg(&format!(
+        r#"<g><title>work (2 samples, 2%)</title><rect{attributes} fg:x="0" fg:w="2" y="80"/></g>"#,
+    ));
+    assert_eq!(
+        parse_flamegraph(&svg).unwrap().inclusive,
+        vec![entry("work", 2, 2.0)]
+    );
+}
+
+#[test]
 fn categorizes_frames_for_agent_summaries() {
     assert_eq!(
         categorize_flamegraph_frame("tokio::runtime::park"),
