@@ -360,7 +360,6 @@ struct UserFrameAddresses {
 struct UserFrameSourceHint {
     source: usize,
     index: Option<usize>,
-    last_address: Option<(u64, Option<usize>)>,
 }
 
 #[derive(Default)]
@@ -369,6 +368,10 @@ struct UserFrameTable {
     sources: Vec<UserFrameAddresses>,
     // A cached source with no index is terminal unavailable, including all IPs.
     last_source: Cell<Option<UserFrameSourceHint>>,
+    // Qualified by last_source; source changes and mutations invalidate it.
+    last_address: Cell<Option<(u64, Option<usize>)>>,
+    #[cfg(test)]
+    source_hint_publications: Cell<usize>,
     #[cfg(test)]
     source_searches: Cell<usize>,
     #[cfg(test)]
@@ -383,67 +386,77 @@ struct UserFrameTable {
 
 impl UserFrameTable {
     #[inline]
+    fn publish_source_hint(&self, hint: UserFrameSourceHint) {
+        #[cfg(test)]
+        self.source_hint_publications
+            .set(self.source_hint_publications.get() + 1);
+        self.last_source.set(Some(hint));
+        self.last_address.set(None);
+    }
+
+    #[inline]
     fn slot(&self, source: usize, address: u64) -> Option<usize> {
-        let (index, addresses, last_address) = if let Some(hint) = self.last_source.get()
+        if let Some(hint) = self.last_source.get()
             && hint.source == source
         {
             // perf util/symbol.c:dso__find_symbol (575-583) keys a hit by IP.
-            // Keep the source-qualified result beside the source index so
-            // repeated IPs need no source-vector access. Mutations reset it.
-            if let Some((cached_address, slot)) = hint.last_address
+            // Changing the IP result does not change the selected source.
+            if let Some((cached_address, slot)) = self.last_address.get()
                 && cached_address == address
             {
                 return slot;
             }
-            match hint.index {
-                // The source hint establishes availability and rules out the
-                // per-source IP hint. Mutations reset both hints.
-                Some(index) => {
-                    #[cfg(test)]
-                    self.source_accesses.set(self.source_accesses.get() + 1);
-                    (index, &self.sources[index], None)
-                }
-                None => return Some(0),
-            }
-        } else {
-            #[cfg(test)]
-            self.source_searches.set(self.source_searches.get() + 1);
-            let index = *self.by_source.get(&source)?;
+            let Some(index) = hint.index else {
+                return Some(0);
+            };
             #[cfg(test)]
             self.source_accesses.set(self.source_accesses.get() + 1);
-            let addresses = &self.sources[index];
-            #[cfg(test)]
-            self.source_state_checks
-                .set(self.source_state_checks.get() + 1);
-            if addresses.unavailable {
-                self.last_source.set(Some(UserFrameSourceHint {
-                    source,
-                    index: None,
-                    last_address: None,
-                }));
-                return Some(0);
-            }
-            #[cfg(test)]
-            self.address_hint_checks
-                .set(self.address_hint_checks.get() + 1);
-            (index, addresses, addresses.last_address.get())
-        };
-        let slot = if let Some((cached_address, slot)) = last_address
-            && cached_address == address
-        {
-            slot
-        } else {
-            #[cfg(test)]
-            self.address_searches.set(self.address_searches.get() + 1);
-            let slot = addresses.by_address.get(&address).copied();
-            addresses.last_address.set(Some((address, slot)));
-            slot
-        };
-        self.last_source.set(Some(UserFrameSourceHint {
+            return self.lookup_address(&self.sources[index], address);
+        }
+        self.slot_for_new_source(source, address)
+    }
+
+    #[inline(never)]
+    fn slot_for_new_source(&self, source: usize, address: u64) -> Option<usize> {
+        #[cfg(test)]
+        self.source_searches.set(self.source_searches.get() + 1);
+        let index = *self.by_source.get(&source)?;
+        #[cfg(test)]
+        self.source_accesses.set(self.source_accesses.get() + 1);
+        let addresses = &self.sources[index];
+        #[cfg(test)]
+        self.source_state_checks
+            .set(self.source_state_checks.get() + 1);
+        if addresses.unavailable {
+            self.publish_source_hint(UserFrameSourceHint {
+                source,
+                index: None,
+            });
+            return Some(0);
+        }
+        self.publish_source_hint(UserFrameSourceHint {
             source,
             index: Some(index),
-            last_address: Some((address, slot)),
-        }));
+        });
+        #[cfg(test)]
+        self.address_hint_checks
+            .set(self.address_hint_checks.get() + 1);
+        if let Some((cached_address, slot)) = addresses.last_address.get()
+            && cached_address == address
+        {
+            self.last_address.set(Some((address, slot)));
+            return slot;
+        }
+        self.lookup_address(addresses, address)
+    }
+
+    #[inline(never)]
+    fn lookup_address(&self, addresses: &UserFrameAddresses, address: u64) -> Option<usize> {
+        #[cfg(test)]
+        self.address_searches.set(self.address_searches.get() + 1);
+        let slot = addresses.by_address.get(&address).copied();
+        addresses.last_address.set(Some((address, slot)));
+        self.last_address.set(Some((address, slot)));
         slot
     }
 
@@ -461,11 +474,10 @@ impl UserFrameTable {
         addresses.unavailable = false;
         addresses.by_address.insert(address, slot);
         addresses.last_address.set(None);
-        self.last_source.set(Some(UserFrameSourceHint {
+        self.publish_source_hint(UserFrameSourceHint {
             source,
             index: Some(index),
-            last_address: None,
-        }));
+        });
     }
 
     fn mark_unavailable(&mut self, source: usize) {
@@ -474,11 +486,10 @@ impl UserFrameTable {
             unavailable: true,
             ..UserFrameAddresses::default()
         };
-        self.last_source.set(Some(UserFrameSourceHint {
+        self.publish_source_hint(UserFrameSourceHint {
             source,
             index: None,
-            last_address: None,
-        }));
+        });
     }
 
     #[cfg(test)]
@@ -8083,6 +8094,85 @@ mod tests {
         assert_eq!(table.slot(9, 0), Some(1));
         assert_eq!(table.slot(7, 0), Some(0));
         assert_eq!(table.source_searches.get() - searches, 3);
+    }
+
+    #[test]
+    fn source_selection_stays_published_while_warm_ips_change() {
+        for source in [7, usize::MAX] {
+            let mut table = super::UserFrameTable::default();
+            for address in 0..64 {
+                match address % 3 {
+                    0 => table.insert(source, address, usize::try_from(address).unwrap() + 1),
+                    1 => table.insert(source, address, 0),
+                    _ => {}
+                }
+            }
+            assert_eq!(table.slot(source, 0), Some(1));
+            let publications = table.source_hint_publications.get();
+            let searches = table.source_searches.get();
+            for _ in 0..3 {
+                for address in 0..64 {
+                    let expected = match address % 3 {
+                        0 => Some(usize::try_from(address).unwrap() + 1),
+                        1 => Some(0),
+                        _ => None,
+                    };
+                    assert_eq!(table.slot(source, address), expected);
+                }
+            }
+            assert_eq!(table.source_searches.get(), searches);
+            assert_eq!(
+                table.source_hint_publications.get() - publications,
+                0,
+                "changing IP results must not republish the unchanged source selection"
+            );
+        }
+    }
+
+    #[test]
+    fn source_selection_is_published_once_per_source_switch() {
+        let mut table = super::UserFrameTable::default();
+        for source in [7, usize::MAX] {
+            for address in 0..32 {
+                table.insert(source, address, usize::try_from(address).unwrap());
+            }
+        }
+        assert_eq!(table.slot(7, 0), Some(0));
+        let publications = table.source_hint_publications.get();
+        let searches = table.source_searches.get();
+        for source in [usize::MAX, 7, usize::MAX, 7] {
+            for address in 0..32 {
+                assert_eq!(
+                    table.slot(source, address),
+                    Some(usize::try_from(address).unwrap())
+                );
+            }
+        }
+        assert_eq!(table.source_searches.get() - searches, 4);
+        assert_eq!(
+            table.source_hint_publications.get() - publications,
+            4,
+            "only the four actual source switches need source selection publication"
+        );
+    }
+
+    #[test]
+    fn source_hint_publications_include_insertion_replacement_and_unavailability() {
+        let mut table = super::UserFrameTable::default();
+        table.insert(7, 42, 11);
+        assert_eq!(table.source_hint_publications.get(), 1);
+        table.insert(7, 42, 12);
+        assert_eq!(table.source_hint_publications.get(), 2);
+        table.mark_unavailable(7);
+        assert_eq!(table.source_hint_publications.get(), 3);
+        for address in [0, 42, u64::MAX] {
+            assert_eq!(table.slot(7, address), Some(0));
+        }
+        assert_eq!(table.source_hint_publications.get(), 3);
+        table.insert(7, 42, 13);
+        assert_eq!(table.source_hint_publications.get(), 4);
+        assert_eq!(table.slot(7, 42), Some(13));
+        assert_eq!(table.slot(7, 0), None);
     }
 
     #[test]
