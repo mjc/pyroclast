@@ -1298,7 +1298,9 @@ fn flamegraph_command_folds_perfdata_without_perf_script() {
     assert!(runner.programs().is_empty());
     let svg = std::fs::read_to_string(output_svg).expect("svg");
     assert!(svg.contains("sftp-s3 CPU"));
-    let entries = pyroclast::flamegraph::analysis::parse_flamegraph_entries(&svg);
+    let entries = pyroclast::flamegraph::analysis::parse_flamegraph(&svg)
+        .expect("profile")
+        .inclusive;
     assert!(
         entries
             .iter()
@@ -1326,9 +1328,11 @@ fn flamegraph_command_uses_infernos_unit_weight_for_untimed_period_samples() {
     pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("flamegraph command");
 
     assert!(runner.programs().is_empty());
-    let entries = pyroclast::flamegraph::analysis::parse_flamegraph_entries(
+    let entries = pyroclast::flamegraph::analysis::parse_flamegraph(
         &std::fs::read_to_string(output_svg).unwrap(),
-    );
+    )
+    .expect("profile")
+    .inclusive;
     assert!(
         entries
             .iter()
@@ -1407,9 +1411,11 @@ fn flamegraph_command_keeps_module_fallback_without_a_perf_base_symbol() {
     pyroclast::run_parsed_cli_with_runner(cli, &runner).expect("flamegraph command");
 
     assert!(runner.programs().is_empty());
-    let entries = pyroclast::flamegraph::analysis::parse_flamegraph_entries(
+    let entries = pyroclast::flamegraph::analysis::parse_flamegraph(
         &std::fs::read_to_string(output_svg).unwrap(),
-    );
+    )
+    .expect("profile")
+    .inclusive;
     assert!(
         entries
             .iter()
@@ -1423,11 +1429,13 @@ fn analyze_flamegraph_command_emits_json_summary() {
     let svg = root.path().join("flamegraph.svg");
     std::fs::write(
         &svg,
-        r#"<svg>
-  <g><title>all (100 samples, 100%)</title><rect x="0" y="40" width="100" height="15"/></g>
-  <g><title>tokio::runtime::park (40 samples, 40.00%)</title><rect x="0" y="25" width="40" height="15"/></g>
-  <g><title>zfs_read (30 samples, 30.00%)</title><rect x="40" y="25" width="30" height="15"/></g>
-</svg>"#,
+        r#"
+<svg total_samples="100">
+  <g><title>all (100 samples, 100%)</title><rect fg:x="0" fg:w="100" y="96"/></g>
+  <g><title>tokio::runtime::park (40 samples, 40.00%)</title><rect fg:x="0" fg:w="40" y="80"/></g>
+  <g><title>zfs_read (30 samples, 30.00%)</title><rect fg:x="40" fg:w="30" y="80"/></g>
+</svg>
+"#,
     )
     .expect("svg");
 
@@ -1447,6 +1455,8 @@ fn analyze_flamegraph_command_emits_json_summary() {
     assert_eq!(json[0]["percent"], 40.0);
     assert_eq!(json[1]["name"], "Disk I/O");
     assert_eq!(json[1]["percent"], 30.0);
+    assert_eq!(json[2]["name"], "Other");
+    assert_eq!(json[2]["percent"], 30.0);
 }
 
 #[test]

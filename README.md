@@ -60,6 +60,45 @@ pyroclast plumbing parse flamegraph syscalls <flamegraph.svg>
 pyroclast plumbing parse flamegraph diff <before.svg> <after.svg>
 ```
 
+## Flamegraph Analysis
+
+```sh
+pyroclast analyze flamegraph.svg
+pyroclast analyze flamegraph.svg --json --limit 10 --min-percent 1
+pyroclast analyze flamegraph.svg top --self --limit 30
+pyroclast analyze flamegraph.svg search planner
+pyroclast analyze flamegraph.svg syscalls
+pyroclast analyze flamegraph.svg summary
+pyroclast analyze before.svg diff after.svg --self
+```
+
+Reports inclusive hotspots, self samples, heuristic categories and syscall coverage.
+Uses Inferno's exact sample ranges, unions recursive/repeated function frames, and
+supports normal, inverted and differential SVGs. Inclusive rows overlap; category
+rows partition all samples. Self samples refer to the deepest visible frame, not
+children hidden by rendering thresholds. Counts are raw SVG sample weights, even
+when titles use scaled units. SVGs without exact Inferno ranges are rejected.
+`--json`, `--limit` and `--min-percent` work before or after the analysis mode.
+Search is a case-insensitive substring match, including small functions by
+default. Diff defaults to a 0.01 percentage-point threshold; compare equivalent
+workloads, since coverage changes are not elapsed-time speedups.
+
+Use `--categories categories.json` to adapt the full report or `summary` to a
+project without forking the analyzer. Rules are ordered, case-insensitive
+substring matches; the first match wins, then built-in categories are the fallback:
+
+```json
+[
+  {"name": "Writer", "contains": ["build::writer", "copy_from_archive"]},
+  {"name": "Archive", "contains": ["r7z", "zstd", "libarchive"]},
+  {"name": "SQLite", "contains": ["sqlite", "diesel"]}
+]
+```
+
+Category rows cover all samples regardless of `--limit` or `--min-percent`.
+Each category also lists its top inclusive functions, with those controls
+applied per category. Their coverage overlaps and must not be added together.
+
 ## Outputs
 
 Profile runs write a Pyroclast artifact directory containing the command, stdout/stderr logs,

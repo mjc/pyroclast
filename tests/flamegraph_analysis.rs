@@ -1,34 +1,32 @@
 use proptest::prelude::*;
 use proptest::string::string_regex;
 use pyroclast::flamegraph::analysis::{
-    FlamegraphEntry, categorize_flamegraph_frame, diff_flamegraph_svgs, diff_flamegraphs,
-    parse_flamegraph_categories, parse_flamegraph_entries, syscall_breakdown, top_entries,
+    FlamegraphEntry, categorize_flamegraph_frame, diff_flamegraphs, parse_flamegraph, top_entries,
 };
 
 #[test]
-fn parses_inferno_svg_title_entries() {
-    let svg = r"
-<svg>
-  <title>all (1,000 samples, 100%)</title>
-  <g><title>read (250 samples, 25.00%)</title></g>
-  <g><title>tokio::runtime::park (125 samples, 12.50%)</title></g>
-</svg>
-";
+fn parses_inferno_sample_ranges() {
+    let svg = ranged_svg(
+        r#"
+  <g><title>read (25 samples, 25.00%)</title><rect fg:x="0" fg:w="25" y="80"/></g>
+  <g><title>tokio::runtime::park (12 samples, 12.00%)</title><rect fg:x="25" fg:w="12" y="80"/></g>
+"#,
+    );
 
-    let entries = parse_flamegraph_entries(svg);
+    let entries = parse_flamegraph(&svg).expect("profile").inclusive;
 
     assert_eq!(
         entries,
         vec![
             FlamegraphEntry {
                 name: "read".to_string(),
-                samples: 250,
+                samples: 25,
                 percent: 25.0,
             },
             FlamegraphEntry {
                 name: "tokio::runtime::park".to_string(),
-                samples: 125,
-                percent: 12.5,
+                samples: 12,
+                percent: 12.0,
             },
         ]
     );
@@ -49,13 +47,12 @@ fn ranks_top_entries_with_minimum_percent() {
 
 #[test]
 fn groups_syscall_entries_without_arch_prefixes() {
-    let entries = vec![
-        entry("__x64_sys_read", 30, 30.0),
-        entry("__x86_sys_write", 20, 20.0),
-        entry("user_work", 50, 50.0),
-    ];
-
-    let syscalls = syscall_breakdown(&entries);
+    let svg = ranged_svg(
+        r#"
+      <g><title>__x64_sys_read (30 samples, 30%)</title><rect fg:x="0" fg:w="30" y="80"/></g>
+      <g><title>__x86_sys_write (20 samples, 20%)</title><rect fg:x="30" fg:w="20" y="80"/></g>"#,
+    );
+    let syscalls = parse_flamegraph(&svg).expect("profile").syscalls;
 
     assert_eq!(
         syscalls,
@@ -100,7 +97,9 @@ fn native_svg_diff_counts_recursive_functions_once_and_keeps_disjoint_samples() 
     ] {
         let before = render(&["main;work;helper;work 60", "other;work 40"], direction);
         let after = render(&["main;work 80", "other;work 20"], direction);
-        let diff = diff_flamegraph_svgs(&before, &after, 0.01).unwrap();
+        let before = parse_flamegraph(&before).unwrap();
+        let after = parse_flamegraph(&after).unwrap();
+        let diff = diff_flamegraphs(&before.inclusive, &after.inclusive, 0.01);
         assert!(!diff.iter().any(|delta| delta.name == "work"));
         let helper = diff.iter().find(|delta| delta.name == "helper").unwrap();
         assert_eq!(helper.before_samples, 60);
@@ -121,7 +120,9 @@ fn native_flamegraph_categories_count_exclusive_samples_once() {
         &mut svg,
     )
     .unwrap();
-    let categories = parse_flamegraph_categories(std::str::from_utf8(&svg).unwrap()).unwrap();
+    let categories = parse_flamegraph(std::str::from_utf8(&svg).unwrap())
+        .unwrap()
+        .categories;
     assert_eq!(categories.len(), 2);
     assert_eq!(categories[0].name, "Disk I/O");
     assert_float_eq(categories[0].percent, 60.0);
@@ -131,9 +132,7 @@ fn native_flamegraph_categories_count_exclusive_samples_once() {
 
 #[test]
 fn category_summary_requires_rectangle_topology_instead_of_guessing() {
-    assert!(
-        parse_flamegraph_categories("<svg><title>work (2 samples, 100%)</title></svg>").is_err()
-    );
+    assert!(parse_flamegraph("<svg><title>work (2 samples, 100%)</title></svg>").is_err());
 }
 
 #[test]
@@ -147,7 +146,9 @@ fn native_inverted_flamegraph_preserves_parent_self_time() {
         &mut svg,
     )
     .unwrap();
-    let categories = parse_flamegraph_categories(std::str::from_utf8(&svg).unwrap()).unwrap();
+    let categories = parse_flamegraph(std::str::from_utf8(&svg).unwrap())
+        .unwrap()
+        .categories;
     assert_eq!(categories[0].name, "Disk I/O");
     assert_float_eq(categories[0].percent, 75.0);
     assert_eq!(categories[1].name, "Tokio Runtime");
@@ -156,9 +157,9 @@ fn native_inverted_flamegraph_preserves_parent_self_time() {
 
 #[test]
 fn flamegraph_parser_decodes_xml_symbol_entities() {
-    let entries = parse_flamegraph_entries(
-        "<svg><g><title>read&lt;T&gt;&amp;work (2 samples, 100%)</title></g></svg>",
-    );
+    let entries = parse_flamegraph(&ranged_svg(
+        r#"<g><title>read&lt;T&gt;&amp;work (2 samples, 2%)</title><rect fg:x="0" fg:w="2" y="80"/></g>"#,
+    )).unwrap().inclusive;
     assert_eq!(entries[0].name, "read<T>&work");
 }
 
@@ -170,6 +171,309 @@ fn categorizes_frames_for_agent_summaries() {
     );
     assert_eq!(categorize_flamegraph_frame("zfs_read"), "Disk I/O");
     assert_eq!(categorize_flamegraph_frame("__x64_sys_read"), "Syscall");
+}
+
+#[test]
+fn cli_top_unions_repeated_and_recursive_function_ranges() {
+    let svg = ranged_svg(
+        r#"<g><title>work (70 samples, 70%)</title><rect fg:x="0" fg:w="70" y="64"/></g>
+        <g><title>work (40 samples, 40%)</title><rect fg:x="10" fg:w="40" y="48"/></g>
+        <g><title>work (20 samples, 20%)</title><rect fg:x="80" fg:w="20" y="64"/></g>"#,
+    );
+    let output = analyze_svg(&svg, "top").expect("analysis");
+    assert_eq!(output.as_array().expect("entries").len(), 1);
+    assert_eq!(output[0]["samples"], 90);
+    assert_eq!(output[0]["percent"], 90.0);
+}
+
+#[test]
+fn cli_summary_partitions_samples_by_deepest_visible_frame() {
+    let svg = ranged_svg(
+        r#"<g><title>app (100 samples, 100%)</title><rect fg:x="0" fg:w="100" y="80"/></g>
+        <g><title>tokio::runtime (70 samples, 70%)</title><rect fg:x="0" fg:w="70" y="64"/></g>
+        <g><title>zfs_read (40 samples, 40%)</title><rect fg:x="0" fg:w="40" y="48"/></g>
+        <g><title>rustls::encrypt (30 samples, 30%)</title><rect fg:x="40" fg:w="30" y="48"/></g>"#,
+    );
+    let output = analyze_svg(&svg, "summary").expect("analysis");
+    assert_eq!(output[0]["name"], "Disk I/O");
+    assert_eq!(output[0]["percent"], 40.0);
+    let percent: f64 = output
+        .as_array()
+        .expect("categories")
+        .iter()
+        .map(|row| row["percent"].as_f64().expect("percentage"))
+        .sum();
+    assert_float_eq(percent, 100.0);
+    assert!(
+        !output
+            .as_array()
+            .expect("categories")
+            .iter()
+            .any(|row| row["name"] == "Tokio Runtime")
+    );
+}
+
+#[test]
+fn cli_analysis_decodes_xml_function_names() {
+    let svg = ranged_svg(
+        r#"<g><title>&lt;Cache&lt;T&gt; as Trait&gt;::get &amp; check (100 samples, 100%)</title><rect fg:x="0" fg:w="100" y="80"/></g>"#,
+    );
+    let output = analyze_svg(&svg, "top").expect("analysis");
+    assert_eq!(output[0]["name"], "<Cache<T> as Trait>::get & check");
+}
+
+#[test]
+fn cli_analysis_rejects_frames_outside_declared_sample_range() {
+    let svg = ranged_svg(
+        r#"<g><title>work (10 samples, 10%)</title><rect fg:x="95" fg:w="10" y="80"/></g>"#,
+    );
+    assert!(analyze_svg(&svg, "top").is_err());
+}
+
+#[test]
+fn analyze_shortcut_reports_inclusive_self_categories_and_syscalls() {
+    use clap::Parser as _;
+    let directory = tempfile::tempdir().expect("directory");
+    let path = directory.path().join("profile.svg");
+    std::fs::write(
+        &path,
+        ranged_svg(
+            r#"
+        <g><title>app (100 samples, 100%)</title><rect fg:x="0" fg:w="100" y="80"/></g>
+        <g><title>__arm64_sys_read (30 samples, 30%)</title><rect fg:x="0" fg:w="30" y="64"/></g>"#,
+        ),
+    )
+    .expect("SVG");
+    let cli = pyroclast::cli::Cli::try_parse_from([
+        "pyroclast",
+        "analyze",
+        path.to_str().expect("path"),
+        "--json",
+        "--limit",
+        "1",
+    ])
+    .expect("analyze shortcut");
+    let output = pyroclast::run_parsed_cli(cli).expect("analysis");
+    let report: serde_json::Value = serde_json::from_str(&output.stdout).expect("JSON");
+    assert_eq!(report["total_samples"], 100);
+    assert_eq!(report["inclusive"].as_array().expect("inclusive").len(), 1);
+    assert_eq!(report["inclusive"][0]["name"], "app");
+    assert_eq!(report["self_samples"][0]["name"], "app");
+    assert_eq!(report["self_samples"][0]["samples"], 70);
+    assert_eq!(report["any_syscall_samples"], 30);
+    assert_eq!(report["syscalls"][0]["name"], "read");
+    assert_eq!(report["categories"][0]["name"], "Other");
+}
+
+#[test]
+fn real_inferno_normal_and_inverted_graphs_have_identical_accounting() {
+    use inferno::flamegraph::{Direction, Options};
+    let stacks = "app;work;work;<T as Trait>::get 40\napp;work;rustls::encrypt 30\napp;__arm64_sys_read 20\napp 10\n";
+    let render = |direction| {
+        let mut options = Options::default();
+        options.direction = direction;
+        // Titles use scaled/custom units; fg:x/fg:w remain exact raw weights.
+        options.factor = 2.0;
+        options.count_name = "bytes".to_owned();
+        let mut svg = Vec::new();
+        inferno::flamegraph::from_lines(&mut options, stacks.lines(), &mut svg)
+            .expect("Inferno SVG");
+        parse_flamegraph(std::str::from_utf8(&svg).expect("UTF-8 SVG")).expect("profile")
+    };
+    let profile = render(Direction::Straight);
+    assert_eq!(profile, render(Direction::Inverted));
+    assert_eq!(profile.total_samples, 100);
+    assert_eq!(
+        profile
+            .inclusive
+            .iter()
+            .find(|entry| entry.name == "work")
+            .expect("work")
+            .samples,
+        70
+    );
+    assert_eq!(
+        profile
+            .self_samples
+            .iter()
+            .find(|entry| entry.name == "<T as Trait>::get")
+            .expect("decoded name")
+            .samples,
+        40
+    );
+    assert_eq!(
+        profile
+            .self_samples
+            .iter()
+            .find(|entry| entry.name == "app")
+            .expect("app")
+            .samples,
+        10
+    );
+    assert_eq!(profile.any_syscall_samples, 20);
+}
+
+#[test]
+fn syscall_ranges_are_unioned_across_recursive_and_architecture_wrappers() {
+    let svg = ranged_svg(
+        r#"
+        <g><title>__x64_sys_read (60 samples, 60%)</title><rect fg:x="0" fg:w="60" y="80"/></g>
+        <g><title>__ia32_sys_read (40 samples, 40%)</title><rect fg:x="10" fg:w="40" y="64"/></g>
+        <g><title>__arm64_sys_write (20 samples, 20%)</title><rect fg:x="20" fg:w="20" y="48"/></g>
+        <g><title>__x86_sys_read (20 samples, 20%)</title><rect fg:x="80" fg:w="20" y="80"/></g>"#,
+    );
+    let profile = parse_flamegraph(&svg).expect("profile");
+    assert_eq!(
+        profile.syscalls,
+        vec![entry("read", 80, 80.0), entry("write", 20, 20.0)]
+    );
+    assert_eq!(profile.any_syscall_samples, 80);
+}
+
+#[test]
+fn rejects_missing_geometry_overflow_nonfinite_coordinates_and_truncated_xml() {
+    for frame in [
+        r"<g><title>work (10 samples, 10%)</title></g>",
+        r#"<g><title>work (10 samples, 10%)</title><rect x="0" width="10" y="80"/></g>"#,
+        r#"<g><title>work (10 samples, 10%)</title><rect fg:x="18446744073709551615" fg:w="1" y="80"/></g>"#,
+        r#"<g><title>work (10 samples, 10%)</title><rect fg:x="0" fg:w="10" y="NaN"/></g>"#,
+        r#"<g><title>work (10 samples, 10%)</title><rect fg:x="0" fg:w="10" y="80"/></a>"#,
+    ] {
+        assert!(
+            parse_flamegraph(&ranged_svg(frame)).is_err(),
+            "accepted {frame}"
+        );
+    }
+    assert!(parse_flamegraph("<svg><g>").is_err());
+    assert!(parse_flamegraph("not a flamegraph").is_err());
+}
+
+#[test]
+fn parses_linked_frames_single_quoted_attributes_and_explicit_rect_end_tags() {
+    let svg = ranged_svg(
+        r"<a href='file:///source.rs'><title>foo&#58;&#58;bar (100 samples, 100%)</title><rect y='80.5' fg:w='100' fg:x='0'></rect></a>",
+    );
+    assert_eq!(
+        parse_flamegraph(&svg).expect("profile").inclusive,
+        vec![entry("foo::bar", 100, 100.0)]
+    );
+}
+
+#[test]
+fn real_inferno_differential_titles_do_not_change_sample_accounting() {
+    let mut options = inferno::flamegraph::Options::default();
+    let mut svg = Vec::new();
+    inferno::flamegraph::from_lines(&mut options, ["app;work 50 70", "app;read 50 30"], &mut svg)
+        .expect("differential SVG");
+    let profile = parse_flamegraph(std::str::from_utf8(&svg).expect("UTF-8 SVG")).expect("profile");
+    assert_eq!(profile.total_samples, 100);
+    assert_eq!(
+        profile.self_samples,
+        vec![entry("work", 70, 70.0), entry("read", 30, 30.0)]
+    );
+}
+
+#[test]
+fn rendering_minimum_width_leaves_hidden_samples_at_visible_parent() {
+    let mut options = inferno::flamegraph::Options::default();
+    options.min_width = 2.0;
+    let mut svg = Vec::new();
+    inferno::flamegraph::from_lines(&mut options, ["app;tiny 1", "app;work 9999"], &mut svg)
+        .expect("SVG");
+    let profile = parse_flamegraph(std::str::from_utf8(&svg).expect("UTF-8 SVG")).expect("profile");
+    assert_eq!(profile.total_samples, 10000);
+    assert!(!profile.inclusive.iter().any(|entry| entry.name == "tiny"));
+    assert_eq!(
+        profile
+            .self_samples
+            .iter()
+            .find(|entry| entry.name == "app")
+            .expect("visible parent")
+            .samples,
+        1
+    );
+    assert_eq!(
+        profile
+            .categories
+            .iter()
+            .map(|category| category.samples)
+            .sum::<u64>(),
+        10000
+    );
+}
+
+#[test]
+fn analyze_binary_prints_compact_text_report_without_running_a_profiler() {
+    let directory = tempfile::tempdir().expect("directory");
+    let path = directory.path().join("profile.svg");
+    let mut svg = Vec::new();
+    inferno::flamegraph::from_lines(
+        &mut inferno::flamegraph::Options::default(),
+        ["app;work 70", "app;__x64_sys_read 30"],
+        &mut svg,
+    )
+    .expect("SVG");
+    std::fs::write(&path, svg).expect("write SVG");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pyroclast"))
+        .arg("analyze")
+        .arg(&path)
+        .args(["--limit", "1"])
+        .output()
+        .expect("analyze");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8(output.stdout).expect("text");
+    assert!(report.starts_with("100 sample units\n"));
+    assert!(report.contains("Inclusive coverage (rows overlap)"));
+    assert!(report.contains("Self coverage (deepest visible frame)"));
+    assert!(report.contains("Exclusive categories (all samples)"));
+    assert!(report.contains("Syscall coverage (rows may overlap)"));
+    assert!(report.contains("Any syscall: 30 sample units"));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn keeps_full_u64_weights_even_when_percentages_require_rounding() {
+    let total = u64::MAX;
+    let svg = format!(
+        r#"<svg total_samples="{total}">
+        <g><title>all ({total} samples, 100%)</title><rect fg:x="0" fg:w="{total}" y="96"/></g>
+        <g><title>work ({total} samples, 100%)</title><rect fg:x="0" fg:w="{total}" y="80"/></g></svg>"#
+    );
+    let profile = parse_flamegraph(&svg).expect("profile");
+    assert_eq!(profile.inclusive, vec![entry("work", total, 100.0)]);
+    assert_eq!(profile.self_samples, profile.inclusive);
+    assert_eq!(profile.categories[0].samples, total);
+}
+
+fn ranged_svg(frames: &str) -> String {
+    format!(
+        r#"<svg xmlns:fg="http://github.com/jonhoo/inferno"><svg id="frames" total_samples="100">
+        <g><title>all (100 samples, 100%)</title><rect fg:x="0" fg:w="100" y="96"/></g>
+        {frames}</svg></svg>"#
+    )
+}
+
+fn analyze_svg(
+    svg: &str,
+    mode: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("profile.svg");
+    std::fs::write(&path, svg)?;
+    let output = pyroclast::run_cli([
+        "pyroclast",
+        "plumbing",
+        "parse",
+        "flamegraph",
+        mode,
+        "--json",
+        path.to_str().expect("SVG path"),
+    ])?;
+    Ok(serde_json::from_str(&output.stdout)?)
 }
 
 fn entry(name: &str, samples: u64, percent: f64) -> FlamegraphEntry {
@@ -189,19 +493,29 @@ fn assert_float_eq(actual: f64, expected: f64) {
 
 proptest! {
     #[test]
-    fn property_parses_svg_titles_and_sorts_by_percent_then_name(
-        entries in prop::collection::vec(flamegraph_entry(), 0..64),
+    fn property_unions_disjoint_function_ranges_and_partitions_self_samples(
+        entries in prop::collection::vec((flamegraph_name(), 1_u16..1000), 1..64),
     ) {
-        let svg = render_svg(&entries);
-        let mut expected = entries.clone();
-        expected.sort_by(|left, right| {
-            right
-                .percent
-                .total_cmp(&left.percent)
-                .then_with(|| left.name.cmp(&right.name))
-        });
-
-        prop_assert_eq!(parse_flamegraph_entries(&svg), expected);
+        let mut counts = std::collections::BTreeMap::<String, u64>::new();
+        let mut frames = String::new();
+        let mut total = 0_u64;
+        for (name, samples) in entries {
+            let samples = u64::from(samples);
+            write!(frames, r#"<g><title>{name} ({samples} samples, 0%)</title><rect fg:x="{total}" fg:w="{samples}" y="80"/></g>"#).expect("frame");
+            *counts.entry(name).or_default() += samples;
+            total += samples;
+        }
+        let svg = format!(r#"<svg total_samples="{total}"><g><title>all ({total} samples, 100%)</title><rect fg:x="0" fg:w="{total}" y="96"/></g>{frames}</svg>"#);
+        let profile = parse_flamegraph(&svg).expect("profile");
+        prop_assert_eq!(profile.total_samples, total);
+        prop_assert_eq!(&profile.inclusive, &profile.self_samples);
+        prop_assert_eq!(profile.self_samples.iter().map(|entry| entry.samples).sum::<u64>(), total);
+        for entry in profile.inclusive {
+            prop_assert_eq!(entry.samples, counts[&entry.name]);
+            let expected = f64::from(u32::try_from(entry.samples).expect("test samples"))
+                / f64::from(u32::try_from(total).expect("test total")) * 100.0;
+            prop_assert!((entry.percent - expected).abs() < f64::EPSILON);
+        }
     }
 
     #[test]
@@ -243,32 +557,4 @@ fn flamegraph_name() -> impl Strategy<Value = String> {
         .prop_filter("exclude reserved aggregate frame", |name| name != "all")
 }
 
-fn render_svg(entries: &[FlamegraphEntry]) -> String {
-    let mut svg = String::from("<svg><title>all (1,000 samples, 100%)</title>");
-    for entry in entries {
-        let _ = write!(
-            svg,
-            "<g><title>{} ({} samples, {}%)</title></g>",
-            entry.name,
-            format_with_commas(entry.samples),
-            entry.percent,
-        );
-    }
-    svg.push_str("</svg>");
-    svg
-}
-
-fn format_with_commas(value: u64) -> String {
-    let digits = value.to_string();
-    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
-
-    for (index, character) in digits.chars().rev().enumerate() {
-        if index > 0 && index % 3 == 0 {
-            formatted.push(',');
-        }
-        formatted.push(character);
-    }
-
-    formatted.chars().rev().collect()
-}
 use std::fmt::Write as _;

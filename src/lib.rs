@@ -27,12 +27,12 @@ use backends::{ProfileRequest, ProfilerBackend};
 use clap::Parser;
 use cli::{
     AnalyzeFlamegraphArgs, AnalyzePerfdataArgs, Cli, CliCommand, FlamegraphAnalysisMode,
-    ParseCommand, ParseFlamegraphCommand, ParsePerfCommand, PlumbingCommand,
+    FlamegraphReportArgs, FlamegraphReportCommand, ParseCommand, ParseFlamegraphCommand,
+    ParsePerfCommand, PlumbingCommand,
 };
 use flamegraph::analysis::{
-    FlamegraphCategory, FlamegraphDelta, FlamegraphEntry, diff_flamegraph_svgs,
-    parse_flamegraph_categories, parse_flamegraph_entries, search_entries, syscall_breakdown,
-    top_entries,
+    FlamegraphCategory, FlamegraphDelta, FlamegraphEntry, FlamegraphProfile, categorize_profile,
+    diff_flamegraphs, parse_category_rules, parse_flamegraph, search_entries, top_entries,
 };
 use flamegraph::{BuiltinFlamegraphRenderer, FlamegraphRenderer, FlamegraphRequest};
 pub use output::{CliOutput, write_cli_output};
@@ -522,6 +522,10 @@ where
         CliCommand::Plumbing { command } => {
             run_plumbing_command(command, runner, flamegraph_renderer)
         }
+        CliCommand::Analyze(command) => Ok(CliOutput {
+            stdout: analyze_svg_report_for_cli(&command)?,
+            stderr: String::new(),
+        }),
         CliCommand::Memory(_)
         | CliCommand::Cpu(_)
         | CliCommand::Offcpu(_)
@@ -718,38 +722,143 @@ fn render_perfdata_analysis(
     Ok(output)
 }
 
-fn analyze_flamegraph_for_cli(command: &AnalyzeFlamegraphArgs) -> backends::BackendResult<String> {
+fn analyze_svg_report_for_cli(command: &FlamegraphReportArgs) -> backends::BackendResult<String> {
     let svg = std::fs::read_to_string(&command.input)?;
-    let entries = parse_flamegraph_entries(&svg);
-
-    match command.mode {
-        FlamegraphAnalysisMode::Top => {
-            let entries = top_entries(&entries, command.limit, command.min_percent);
-            render_flamegraph_entries(&entries, command.json)
-        }
-        FlamegraphAnalysisMode::Search => {
-            let pattern = command.search.as_deref().unwrap_or_default();
-            let entries = search_entries(&entries, pattern);
-            render_flamegraph_entries(&entries, command.json)
-        }
-        FlamegraphAnalysisMode::Syscalls => {
-            let entries = syscall_breakdown(&entries);
-            render_flamegraph_entries(&entries, command.json)
-        }
-        FlamegraphAnalysisMode::Summary => {
-            let categories = parse_flamegraph_categories(&svg)?;
-            render_flamegraph_categories(&categories, command.json)
-        }
-        FlamegraphAnalysisMode::Diff => {
-            let other = command
-                .other
-                .as_ref()
-                .ok_or("--other is required for flamegraph diff mode")?;
-            let other_svg = std::fs::read_to_string(other)?;
-            let deltas = diff_flamegraph_svgs(&svg, &other_svg, command.min_percent)?;
-            render_flamegraph_deltas(&deltas, command.json)
-        }
+    let mut profile = parse_flamegraph(&svg)?;
+    let min_percent = command.min_percent.unwrap_or(match command.mode {
+        Some(FlamegraphReportCommand::Search { .. }) => 0.0,
+        Some(FlamegraphReportCommand::Diff { .. }) => 0.01,
+        _ => 1.0,
+    });
+    let rules = command
+        .categories
+        .as_ref()
+        .map(|path| {
+            let json = std::fs::read_to_string(path)?;
+            parse_category_rules(&json)
+        })
+        .transpose()?
+        .unwrap_or_default();
+    if matches!(command.mode, None | Some(FlamegraphReportCommand::Summary)) {
+        categorize_profile(&mut profile, &rules, command.limit, min_percent);
     }
+    if let Some(mode) = &command.mode {
+        let entries = if mode.uses_self_samples() {
+            &profile.self_samples
+        } else {
+            &profile.inclusive
+        };
+        return match mode {
+            FlamegraphReportCommand::Top { .. } => render_flamegraph_entries(
+                &top_entries(entries, command.limit, min_percent),
+                command.json,
+            ),
+            FlamegraphReportCommand::Search { pattern, .. } => {
+                let found = search_entries(entries, pattern);
+                render_flamegraph_entries(
+                    &top_entries(&found, command.limit, min_percent),
+                    command.json,
+                )
+            }
+            FlamegraphReportCommand::Syscalls => render_flamegraph_entries(
+                &top_entries(&profile.syscalls, command.limit, min_percent),
+                command.json,
+            ),
+            FlamegraphReportCommand::Summary => {
+                render_flamegraph_categories(&profile.categories, command.json)
+            }
+            FlamegraphReportCommand::Diff { other, .. } => {
+                let other_svg = std::fs::read_to_string(other)?;
+                let other_profile = parse_flamegraph(&other_svg)?;
+                let other_entries = if mode.uses_self_samples() {
+                    &other_profile.self_samples
+                } else {
+                    &other_profile.inclusive
+                };
+                let mut deltas = diff_flamegraphs(entries, other_entries, min_percent);
+                deltas.truncate(command.limit);
+                render_flamegraph_deltas(&deltas, command.json)
+            }
+        };
+    }
+    profile.inclusive = top_entries(&profile.inclusive, command.limit, min_percent);
+    profile.self_samples = top_entries(&profile.self_samples, command.limit, min_percent);
+    profile.syscalls = top_entries(&profile.syscalls, command.limit, min_percent);
+    render_svg_report(&profile, command.json)
+}
+
+fn render_svg_report(profile: &FlamegraphProfile, json: bool) -> backends::BackendResult<String> {
+    use std::fmt::Write as _;
+    if json {
+        return Ok(format!("{}\n", serde_json::to_string_pretty(&profile)?));
+    }
+    let mut output = format!("{} sample units\n", profile.total_samples);
+    for (heading, entries) in [
+        ("Inclusive coverage (rows overlap)", &profile.inclusive),
+        (
+            "Self coverage (deepest visible frame)",
+            &profile.self_samples,
+        ),
+    ] {
+        writeln!(output, "\n{heading}")?;
+        output.push_str(&render_flamegraph_entries(entries, false)?);
+    }
+    writeln!(output, "\nExclusive categories (all samples)")?;
+    output.push_str(&render_flamegraph_categories(&profile.categories, false)?);
+    if profile.any_syscall_samples > 0 {
+        writeln!(output, "\nSyscall coverage (rows may overlap)")?;
+        output.push_str(&render_flamegraph_entries(&profile.syscalls, false)?);
+        writeln!(
+            output,
+            "Any syscall: {} sample units",
+            profile.any_syscall_samples
+        )?;
+    }
+    Ok(output)
+}
+
+fn analyze_flamegraph_for_cli(command: &AnalyzeFlamegraphArgs) -> backends::BackendResult<String> {
+    let mode = match command.mode {
+        FlamegraphAnalysisMode::Top => FlamegraphReportCommand::Top {
+            self_samples: false,
+        },
+        FlamegraphAnalysisMode::Search => FlamegraphReportCommand::Search {
+            pattern: command.search.clone().unwrap_or_default(),
+            self_samples: false,
+        },
+        FlamegraphAnalysisMode::Syscalls => FlamegraphReportCommand::Syscalls,
+        FlamegraphAnalysisMode::Summary => FlamegraphReportCommand::Summary,
+        FlamegraphAnalysisMode::Diff => FlamegraphReportCommand::Diff {
+            other: command
+                .other
+                .clone()
+                .ok_or("other SVG is required for flamegraph diff")?,
+            self_samples: false,
+        },
+    };
+    let unbounded = matches!(
+        command.mode,
+        FlamegraphAnalysisMode::Search
+            | FlamegraphAnalysisMode::Syscalls
+            | FlamegraphAnalysisMode::Diff
+    );
+    analyze_svg_report_for_cli(&FlamegraphReportArgs {
+        input: command.input.clone(),
+        json: command.json,
+        limit: if unbounded { usize::MAX } else { command.limit },
+        min_percent: Some(
+            if matches!(
+                command.mode,
+                FlamegraphAnalysisMode::Search | FlamegraphAnalysisMode::Syscalls
+            ) {
+                0.0
+            } else {
+                command.min_percent
+            },
+        ),
+        mode: Some(mode),
+        categories: None,
+    })
 }
 
 fn render_flamegraph_entries(
@@ -783,6 +892,13 @@ fn render_flamegraph_categories(
         for category in categories {
             use std::fmt::Write as _;
             writeln!(output, "{:>6.2}%  {}", category.percent, category.name)?;
+            for entry in &category.inclusive_functions {
+                writeln!(
+                    output,
+                    "    {:>6.2}% inclusive {:>10}  {}",
+                    entry.percent, entry.samples, entry.name
+                )?;
+            }
         }
         Ok(output)
     }
