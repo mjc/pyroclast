@@ -7,6 +7,40 @@ use pyroclast::perfdata::build_id::{
 use pyroclast::perfdata::records::{PERF_RECORD_MISC_MMAP_BUILD_ID, PERF_RECORD_MMAP2};
 
 #[test]
+fn empty_and_zero_kernel_build_ids_are_absent_in_feature_stream_and_mmap2() {
+    // perf util/dso.h:dso__has_build_id delegates to util/build-id.c:
+    // build_id__is_defined: size zero and all-zero bytes are undefined.
+    for size in [0_u8, 20] {
+        let mut feature = build_id_event_payload_like_perf(u32::MAX, &[0; 20], "[kernel.kallsyms]");
+        feature[32] = size;
+        let mut stream = feature.clone();
+        stream[..4].copy_from_slice(&67_u32.to_le_bytes());
+        let mmap = perf_record(
+            PERF_RECORD_MMAP2,
+            PERF_RECORD_MISC_MMAP_BUILD_ID,
+            &mmap2_build_id_payload(
+                u32::MAX,
+                &vec![0; usize::from(size)],
+                "[kernel.kallsyms]_text",
+            ),
+        );
+        for bytes in [
+            perfdata_with_build_id_feature(&feature),
+            perfdata_with_data_records(&stream),
+            perfdata_with_data_records(&mmap),
+        ] {
+            assert_eq!(kernel_build_id_from_perfdata(&bytes).unwrap(), None);
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), bytes).unwrap();
+            assert_eq!(
+                kernel_build_id_from_perfdata_file(file.path()).unwrap(),
+                None
+            );
+        }
+    }
+}
+
+#[test]
 fn parses_build_id_events_from_header_feature_payload() {
     let payload = build_id_event_payload(
         123,

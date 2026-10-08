@@ -7,8 +7,9 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write;
 use std::hash::{Hash, Hasher};
+use std::io::Read;
 #[cfg(target_os = "linux")]
-use std::io::{Read, Seek, SeekFrom, Write as IoWrite};
+use std::io::{Seek, SeekFrom, Write as IoWrite};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -61,6 +62,12 @@ pub struct SymbolRequest {
 }
 
 impl SymbolRequest {
+    fn recorded_build_id(&self) -> Option<&str> {
+        self.build_id
+            .as_deref()
+            .filter(|id| build_id_is_defined(id))
+    }
+
     /// Keep all recorded identity in cache keys. perf's missing-identity
     /// wildcard comparison is not transitive and cannot be used as `HashMap`
     /// equality; extra resolution is preferable to merging distinct files.
@@ -73,7 +80,7 @@ impl PartialEq for SymbolRequest {
     fn eq(&self, other: &Self) -> bool {
         self.relative_address == other.relative_address
             && self.kernel_mapping_range == other.kernel_mapping_range
-            && self.build_id == other.build_id
+            && self.recorded_build_id() == other.recorded_build_id()
             && self.identity_file_identity() == other.identity_file_identity()
             && self.kernel_relocation == other.kernel_relocation
             && self.path.as_os_str() == other.path.as_os_str()
@@ -87,7 +94,7 @@ impl Hash for SymbolRequest {
         self.path.as_os_str().hash(state);
         self.relative_address.hash(state);
         self.kernel_mapping_range.hash(state);
-        self.build_id.hash(state);
+        self.recorded_build_id().hash(state);
         self.identity_file_identity().hash(state);
         self.kernel_relocation.hash(state);
     }
@@ -106,7 +113,7 @@ impl Ord for SymbolRequest {
             .cmp(other.path.as_os_str())
             .then_with(|| self.relative_address.cmp(&other.relative_address))
             .then_with(|| self.kernel_mapping_range.cmp(&other.kernel_mapping_range))
-            .then_with(|| self.build_id.cmp(&other.build_id))
+            .then_with(|| self.recorded_build_id().cmp(&other.recorded_build_id()))
             .then_with(|| {
                 self.identity_file_identity()
                     .cmp(&other.identity_file_identity())
@@ -647,7 +654,12 @@ pub struct RustAddr2lineResolver {
 
 #[derive(Default)]
 struct ObjectAddressCache {
-    segments_by_path: FxHashMap<OsString, Option<Vec<ObjectSegmentRange>>>,
+    segments_by_path: FxHashMap<OsString, Option<ObjectAddressMetadata>>,
+}
+
+struct ObjectAddressMetadata {
+    segments: Vec<ObjectSegmentRange>,
+    build_id: Option<String>,
 }
 
 struct ObjectSegmentRange {
@@ -821,6 +833,7 @@ impl FileKernelCache {
             let Some(build_id) = kernel_build_id_from_perfdata_file(&self.perfdata)
                 .ok()
                 .flatten()
+                .filter(|id| build_id_is_defined(id))
             else {
                 return CachedKernelSymbols::default();
             };
@@ -989,7 +1002,11 @@ pub fn perf_debug_dir(home: &Path) -> PathBuf {
 }
 
 #[must_use]
+/// Returns an empty path for an absent or malformed hexadecimal build ID.
 pub fn perf_build_id_elf_path(debug_dir: &Path, build_id: &str) -> PathBuf {
+    if !valid_build_id(build_id) {
+        return PathBuf::new();
+    }
     let (prefix, suffix) = build_id.split_at(2);
     debug_dir
         .join(".build-id")
@@ -1004,6 +1021,9 @@ pub fn perf_build_id_elf_path_for_dso(
     dso_path: &Path,
     build_id: &str,
 ) -> PathBuf {
+    if !valid_build_id(build_id) {
+        return PathBuf::new();
+    }
     if is_perf_vdso_dso_path(dso_path) {
         // perf's build-id cache uses [vdso]/<build-id>/vdso for VDSO DSOs
         // (tools/perf/util/build-id.c: build_id_cache__basename with is_vdso).
@@ -1011,6 +1031,17 @@ pub fn perf_build_id_elf_path_for_dso(
     }
 
     perf_build_id_elf_path(debug_dir, build_id)
+}
+
+fn valid_build_id(build_id: &str) -> bool {
+    build_id_is_defined(build_id)
+        && build_id.len().is_multiple_of(2)
+        && build_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn build_id_is_defined(build_id: &str) -> bool {
+    // perf's build_id__is_defined requires at least one nonzero ID byte.
+    build_id.bytes().any(|byte| byte != b'0')
 }
 
 fn is_perf_vdso_dso_path(path: &Path) -> bool {
@@ -1269,7 +1300,7 @@ impl RustAddr2lineResolver {
         match cache.raw_entry_mut().from_key(path.as_os_str()) {
             RawEntryMut::Occupied(entry) => entry.get().clone(),
             RawEntryMut::Vacant(entry) => {
-                let loaded = std::fs::read(path).ok().map(|bytes| {
+                let loaded = read_regular_object(path).map(|bytes| {
                     Arc::new(CachedObjectMetadata {
                         object_metadata: PreparedObjectMetadata::from_object_bytes(&bytes),
                         object_bytes: bytes.into(),
@@ -1325,7 +1356,7 @@ where
         match cache.raw_entry_mut().from_key(path.as_os_str()) {
             RawEntryMut::Occupied(entry) => entry.get().clone(),
             RawEntryMut::Vacant(entry) => {
-                let loaded = std::fs::read(path).ok().map(|bytes| {
+                let loaded = read_regular_object(path).map(|bytes| {
                     Arc::new(CachedObjectMetadata {
                         object_metadata: PreparedObjectMetadata::from_object_bytes(&bytes),
                         object_bytes: bytes.into(),
@@ -1474,6 +1505,9 @@ where
 
     fn with_perfdata_kernel_build_id(self, build_id: &str, debug_dir: &Path) -> Self {
         let mut self_with_debug_dir = self.with_debug_dir(debug_dir.to_path_buf());
+        if !build_id_is_defined(build_id) {
+            return self_with_debug_dir;
+        }
         self_with_debug_dir.recorded_kernel_build_id = Some(build_id.to_string());
         let kernel_elf = perf_build_id_elf_path(debug_dir, build_id);
         let self_with_kallsyms = match Kallsyms::load_perf_build_id_cache(debug_dir, build_id) {
@@ -2432,6 +2466,9 @@ where
                 if let Some(symbol) = self.resolve_kernel_symbol(request) {
                     resolved[index] = Some(symbol);
                 } else if let Some(kernel_elf) = self.kernel_elf_ref() {
+                    if !object_build_id_matches(kernel_elf, request, &mut address_cache) {
+                        continue;
+                    }
                     kernel_elf_indexes.push(index);
                     kernel_elf_requests.push(clean_object_symbol_request_with_cache(
                         kernel_elf.clone(),
@@ -2441,6 +2478,9 @@ where
                 }
             } else {
                 let object_request = self.object_symbol_request(request, &mut address_cache);
+                if !object_build_id_matches(&object_request.path, request, &mut address_cache) {
+                    continue;
+                }
                 user_indexes.push(index);
                 user_requests.push(object_request);
             }
@@ -2562,6 +2602,10 @@ where
                 if let Some(symbol) = self.resolve_kernel_symbol(request) {
                     resolved[index] = ResolvedSymbolFrames::from_frames(vec![symbol]);
                 } else if let Some(kernel_elf) = self.kernel_elf_ref() {
+                    if !object_build_id_matches(kernel_elf, request, &mut address_cache) {
+                        resolved[index].source_state = SymbolSourceState::Unavailable;
+                        continue;
+                    }
                     kernel_elf_indexes.push(index);
                     kernel_elf_requests.push(clean_object_symbol_request_with_cache(
                         kernel_elf.clone(),
@@ -2571,6 +2615,10 @@ where
                 }
             } else {
                 let object_request = self.object_symbol_request(request, &mut address_cache);
+                if !object_build_id_matches(&object_request.path, request, &mut address_cache) {
+                    resolved[index].source_state = SymbolSourceState::Unavailable;
+                    continue;
+                }
                 user_indexes.push(index);
                 user_requests.push(object_request);
             }
@@ -2592,31 +2640,45 @@ where
                 .zip(user_frames)
                 .zip(&user_requests)
             {
-                let module = is_kernel_module_symbol_path(&requests[index].path);
                 let old_module = old_module_objects.contains(&index);
-                let mut frames = if frames.frames.is_empty() && module && !old_module {
-                    self.resolve_kernel_symbol(&requests[index])
-                        .map(|symbol| ResolvedSymbolFrames::from_frames(vec![symbol]))
-                        .unwrap_or(frames)
-                } else {
-                    frames
-                };
-                // A missing module ELF does not rule out its kallsyms source.
-                if module {
-                    frames.source_state = SymbolSourceState::AddressDependent;
-                }
-                if old_module {
-                    // Even a successful module ELF load initializes the core
-                    // maps after resolving this cursor with its original DSO.
-                    if let Some(symbols) = self.kcore_symbols_ref() {
-                        symbols.finish_module_load(&object_request.path);
-                    }
-                    frames.source_state = SymbolSourceState::KernelObjectMapReplaced;
-                }
-                resolved[index] = frames;
+                resolved[index] = self.finish_module_frame(
+                    frames,
+                    &requests[index],
+                    &object_request.path,
+                    old_module,
+                );
             }
         }
         Ok(resolved)
+    }
+
+    fn finish_module_frame(
+        &self,
+        frames: ResolvedSymbolFrames,
+        request: &SymbolRequest,
+        path: &Path,
+        old_module: bool,
+    ) -> ResolvedSymbolFrames {
+        let module = is_kernel_module_symbol_path(&request.path);
+        let mut frames = if frames.frames.is_empty() && module && !old_module {
+            self.resolve_kernel_symbol(request)
+                .map(|symbol| ResolvedSymbolFrames::from_frames(vec![symbol]))
+                .unwrap_or(frames)
+        } else {
+            frames
+        };
+        // A missing module ELF does not rule out its kallsyms source.
+        if module {
+            frames.source_state = SymbolSourceState::AddressDependent;
+        }
+        if old_module {
+            // Initialize core maps after resolving this cursor's original DSO.
+            if let Some(symbols) = self.kcore_symbols_ref() {
+                symbols.finish_module_load(path);
+            }
+            frames.source_state = SymbolSourceState::KernelObjectMapReplaced;
+        }
+        frames
     }
 
     fn resolve_object_frame_batch(
@@ -2649,9 +2711,9 @@ where
         address_cache: &mut ObjectAddressCache,
     ) -> Option<SymbolRequest> {
         let debug_dir = self.debug_dir.as_ref()?;
-        let build_id = request.build_id.as_ref()?;
+        let build_id = request.recorded_build_id()?;
         let elf = perf_build_id_elf_path_for_dso(debug_dir, &request.path, build_id);
-        elf.exists().then(|| {
+        (elf.exists() && object_build_id_matches(&elf, request, address_cache)).then(|| {
             clean_object_symbol_request_with_cache(elf, request.relative_address, address_cache)
         })
     }
@@ -2684,11 +2746,9 @@ where
             .live_vdso_elf_cache
             .get_or_init(copy_live_vdso_elf_like_perf)
             .as_ref()?;
-        if request
-            .build_id
-            .as_ref()
-            .is_some_and(|id| live_vdso.build_id.as_deref().map(build_id_hex).as_ref() != Some(id))
-        {
+        if request.recorded_build_id().is_some_and(|id| {
+            live_vdso.build_id.as_deref().map(build_id_hex).as_deref() != Some(id)
+        }) {
             return None;
         }
         Some(clean_object_symbol_request_with_cache(
@@ -2836,7 +2896,18 @@ fn object_virtual_address_for_file_offset_cached(
     file_offset: u64,
     address_cache: &mut ObjectAddressCache,
 ) -> Option<u64> {
-    let segments = match address_cache
+    let metadata = object_address_metadata(path, address_cache)?;
+    metadata.segments.iter().find_map(|segment| {
+        (file_offset >= segment.file_offset && file_offset < segment.file_end)
+            .then(|| segment.virtual_address + (file_offset - segment.file_offset))
+    })
+}
+
+fn object_address_metadata<'a>(
+    path: &Path,
+    address_cache: &'a mut ObjectAddressCache,
+) -> Option<&'a ObjectAddressMetadata> {
+    let metadata = match address_cache
         .segments_by_path
         .raw_entry_mut()
         .from_key(path.as_os_str())
@@ -2847,15 +2918,38 @@ fn object_virtual_address_for_file_offset_cached(
             entry.insert(path.as_os_str().to_owned(), segments).1
         }
     };
-    segments.as_ref()?.iter().find_map(|segment| {
-        (file_offset >= segment.file_offset && file_offset < segment.file_end)
-            .then(|| segment.virtual_address + (file_offset - segment.file_offset))
-    })
+    metadata.as_ref()
 }
 
-fn object_load_segment_ranges(path: &Path) -> Option<Vec<ObjectSegmentRange>> {
-    let bytes = std::fs::read(path).ok()?;
-    let object = object::File::parse(bytes.as_slice()).ok()?;
+fn object_build_id_matches(
+    path: &Path,
+    request: &SymbolRequest,
+    address_cache: &mut ObjectAddressCache,
+) -> bool {
+    let Some(recorded) = request.recorded_build_id() else {
+        return true;
+    };
+    object_address_metadata(path, address_cache)
+        .and_then(|metadata| metadata.build_id.as_deref())
+        .is_some_and(|actual| actual.eq_ignore_ascii_case(recorded))
+}
+
+fn object_load_segment_ranges(path: &Path) -> Option<ObjectAddressMetadata> {
+    let file = open_regular_object(path)?;
+    let len = file.metadata().ok()?.len();
+    // ReadCache fetches ELF headers, notes and tables on demand, not the image.
+    // Restrict its view to the opened file's size even if the file grows.
+    let cache = object::read::ReadCache::new(file);
+    let range = cache.range(0, len);
+    let object = object::File::parse(range).ok()?;
+    if object.format() != object::BinaryFormat::Elf {
+        return None;
+    }
+    let build_id = object
+        .build_id()
+        .ok()?
+        .filter(|id| !id.is_empty())
+        .map(build_id_hex);
     let segments = object
         .segments()
         .filter_map(|segment| {
@@ -2867,7 +2961,70 @@ fn object_load_segment_ranges(path: &Path) -> Option<Vec<ObjectSegmentRange>> {
             })
         })
         .collect::<Vec<_>>();
-    (!segments.is_empty()).then_some(segments)
+    Some(ObjectAddressMetadata { segments, build_id })
+}
+
+fn open_regular_object(path: &Path) -> Option<std::fs::File> {
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A replacement FIFO between stat and open must not block at open.
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
+    let file = options.open(path).ok()?;
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
+fn read_regular_object(path: &Path) -> Option<Vec<u8>> {
+    let file = open_regular_object(path)?;
+    let len = file.metadata().ok()?.len();
+    read_object_with_size(file, len)
+}
+
+fn read_object_with_size(mut reader: impl Read + std::io::Seek, len: u64) -> Option<Vec<u8>> {
+    // Classify through a bounded view before allocating the whole image. PE
+    // recognition may seek beyond the initial magic to its optional header.
+    let kind = {
+        let cache = object::read::ReadCache::new(&mut reader);
+        object::FileKind::parse(cache.range(0, len)).ok()?
+    };
+    if !matches!(
+        kind,
+        object::FileKind::Elf32
+            | object::FileKind::Elf64
+            | object::FileKind::MachO32
+            | object::FileKind::MachO64
+            | object::FileKind::Pe32
+            | object::FileKind::Pe64
+            | object::FileKind::Coff
+            | object::FileKind::CoffBig
+            | object::FileKind::Xcoff32
+            | object::FileKind::Xcoff64
+    ) {
+        return None;
+    }
+    reader.rewind().ok()?;
+    let mut reader = reader.take(len);
+    let mut bytes = Vec::new();
+    let mut chunk = [0; 8 * 1024];
+    loop {
+        let count = reader.read(&mut chunk).ok()?;
+        if count == 0 {
+            break;
+        }
+        bytes.try_reserve(count).ok()?;
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    if u64::try_from(bytes.len()).ok()? != len {
+        return None;
+    }
+    object::File::parse(bytes.as_slice()).ok()?;
+    Some(bytes)
 }
 
 impl<R> SymbolResolver for Addr2lineResolver<'_, R>
@@ -2878,6 +3035,9 @@ where
         let mut resolved = vec![None; requests.len()];
         for (path, indexes) in grouped_request_indexes(requests) {
             let path = Path::new(path);
+            if std::fs::metadata(path).is_ok_and(|metadata| !metadata.is_file()) {
+                continue;
+            }
             let symbols = self.resolve_group_symbols(path, requests, &indexes)?;
             let object_metadata = self.object_metadata(path);
             for (index, symbol) in indexes.into_iter().zip(symbols) {
@@ -3032,10 +3192,13 @@ impl SymbolResolver for RustAddr2lineResolver {
         let mut resolved = vec![None; requests.len()];
         for (path, indexes) in grouped_request_indexes(requests) {
             let path = Path::new(path);
+            let object_metadata = self.object_metadata(path);
+            if object_metadata.is_none() {
+                continue;
+            }
             let Ok(loader) = addr2line::Loader::new(path) else {
                 continue;
             };
-            let object_metadata = self.object_metadata(path);
             for index in indexes {
                 let request = &requests[index];
                 let object_symbol = object_metadata.as_ref().and_then(|metadata| {
@@ -4118,7 +4281,7 @@ fn rust_addr2line_frame_names(loader: &addr2line::Loader, address: u64) -> Optio
 
 #[must_use]
 pub fn perf_dwarf_frame_names_from_object(path: &Path, address: u64) -> Option<Vec<String>> {
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = read_regular_object(path)?;
     perf_dwarf_frame_names_from_object_bytes(&bytes, address)
 }
 
@@ -4944,7 +5107,10 @@ fn update_symbol_request_from_mapping_ref(
     );
     request.relative_address = mapping.relative_address;
     request.kernel_mapping_range = kernel_mapping_range_from_ref(mapping);
-    if let Some(build_id) = mapping.build_id {
+    if let Some(build_id) = mapping
+        .build_id
+        .filter(|id| id.iter().any(|byte| *byte != 0))
+    {
         let hex = request.build_id.get_or_insert_with(String::new);
         hex.clear();
         for byte in build_id {
@@ -5230,6 +5396,429 @@ mod tests {
         perf_dwarf_frame_ranges_from_roots, perf_frames_with_object_alias,
         perf_symbol_candidate_search_end, resolve_base_frames_from_object_metadata,
     };
+
+    fn regression_elf_with_build_id() -> Vec<u8> {
+        let bytes = elf_with_dynamic_text_symbol(b"recorded_function", 0x1000, 16);
+        let mut builder = build::elf::Builder::read(bytes.as_slice()).unwrap();
+        let note = builder.sections.add();
+        note.name = b".note.gnu.build-id"[..].into();
+        note.sh_type = elf::SHT_NOTE;
+        note.sh_addralign = 4;
+        note.data = build::elf::SectionData::Data(
+            vec![
+                4, 0, 0, 0, 4, 0, 0, 0, 3, 0, 0, 0, b'G', b'N', b'U', 0, 0xaa, 0xbb, 0xcc, 0xdd,
+            ]
+            .into(),
+        );
+        builder.set_section_sizes();
+        let mut output = Vec::new();
+        builder.write(&mut output).unwrap();
+        assert_eq!(
+            object::File::parse(output.as_slice())
+                .unwrap()
+                .build_id()
+                .unwrap(),
+            Some(&[0xaa, 0xbb, 0xcc, 0xdd][..])
+        );
+        output
+    }
+
+    #[test]
+    fn pyroc34_rejects_live_and_cached_build_id_mismatches_in_both_symbolizers() {
+        struct NoCommands;
+        impl crate::process::CommandRunner for NoCommands {
+            fn run(
+                &self,
+                _: &crate::process::CommandSpec,
+            ) -> std::io::Result<crate::process::CommandOutput> {
+                panic!("base symbol lookup must not spawn addr2line");
+            }
+        }
+        let bytes = regression_elf_with_build_id();
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        let offset = object.segments().next().unwrap().file_range().0;
+        for kind in [
+            super::SymbolizerKind::Addr2line,
+            super::SymbolizerKind::RustAddr2line,
+        ] {
+            for cached in [false, true] {
+                for inline in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("library.so");
+                    std::fs::write(&path, &bytes).unwrap();
+                    let mut request = test_request(path.to_str().unwrap(), offset);
+                    request.build_id = Some("11223344".into());
+                    let cache = super::perf_build_id_elf_path(dir.path(), "11223344");
+                    if cached {
+                        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+                        std::fs::write(&cache, &bytes).unwrap();
+                    }
+                    let resolver = super::PerfSymbolResolver::from_object_resolver(
+                        super::SelectedObjectResolver::new(&NoCommands, kind),
+                    )
+                    .with_debug_dir(dir.path().into());
+                    let frames = if inline {
+                        resolver.resolve_frame_batch_with_metadata(&[request])
+                    } else {
+                        resolver.resolve_base_frame_batch_with_metadata(&[request])
+                    }
+                    .unwrap();
+                    assert!(
+                        frames[0].frames.is_empty(),
+                        "{kind:?}, cached={cached}, inline={inline}: {:?}",
+                        frames[0]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pyroc35_empty_build_id_uses_live_object_like_absent_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("library.so");
+        let bytes = regression_elf_with_build_id();
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        let offset = object.segments().next().unwrap().file_range().0;
+        std::fs::write(&path, &bytes).unwrap();
+        let resolver =
+            super::PerfSymbolResolver::from_object_resolver(RustAddr2lineResolver::new())
+                .with_debug_dir(dir.path().into());
+        for id in [None, Some(String::new())] {
+            let mut request = test_request(path.to_str().unwrap(), offset);
+            request.build_id = id;
+            assert_eq!(
+                resolver
+                    .resolve_base_frame_batch_with_metadata(&[request])
+                    .unwrap()[0]
+                    .frames,
+                ["recorded_function+0x0"]
+            );
+        }
+    }
+
+    #[test]
+    fn pyroc35_public_cache_helpers_reject_invalid_ids_without_panicking() {
+        for id in [
+            "",
+            "a",
+            "abc",
+            "../escape",
+            "a/../../escape",
+            "\u{e9}aa",
+            "zzzz",
+        ] {
+            assert!(
+                super::perf_build_id_elf_path(std::path::Path::new("/cache"), id)
+                    .as_os_str()
+                    .is_empty()
+            );
+            assert!(
+                super::perf_build_id_elf_path_for_dso(
+                    std::path::Path::new("/cache"),
+                    std::path::Path::new("[vdso]"),
+                    id
+                )
+                .as_os_str()
+                .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn pyroc35_empty_mapping_build_id_normalizes_to_absent_request_identity() {
+        use std::hash::{Hash, Hasher};
+        let mut mapping = test_mapping_ref("/bin/object", 0x10);
+        let absent = super::symbol_request_from_mapping_ref(&mapping);
+        mapping.build_id = Some(&[]);
+        let empty = super::symbol_request_from_mapping_ref(&mapping);
+        assert_eq!(empty.build_id, None);
+        let mut reused = absent.clone();
+        reused.build_id = Some("aabbccdd".into());
+        super::update_symbol_request_from_mapping_ref(&mut reused, &mapping);
+        assert_eq!(reused.build_id, None);
+        let direct_empty = SymbolRequest {
+            build_id: Some(String::new()),
+            ..absent.clone()
+        };
+        assert_eq!(direct_empty, absent);
+        assert_eq!(direct_empty.cmp(&absent), std::cmp::Ordering::Equal);
+        let hash = |request: &SymbolRequest| {
+            let mut state = std::hash::DefaultHasher::new();
+            request.hash(&mut state);
+            state.finish()
+        };
+        assert_eq!(hash(&direct_empty), hash(&absent));
+    }
+
+    #[test]
+    fn pyroc35_zero_mapping_build_id_normalizes_to_absent_request_identity() {
+        use std::hash::{Hash, Hasher};
+        let mut mapping = test_mapping_ref("/bin/object", 0x10);
+        let absent = super::symbol_request_from_mapping_ref(&mapping);
+        mapping.build_id = Some(&[0; 20]);
+        let zero = super::symbol_request_from_mapping_ref(&mapping);
+        assert_eq!(zero.build_id, None);
+        let mut reused = absent.clone();
+        reused.build_id = Some("aabbccdd".into());
+        super::update_symbol_request_from_mapping_ref(&mut reused, &mapping);
+        assert_eq!(reused.build_id, None);
+        let direct_zero = SymbolRequest {
+            build_id: Some("00".repeat(20)),
+            ..absent.clone()
+        };
+        assert_eq!(direct_zero, absent);
+        assert_eq!(direct_zero.cmp(&absent), std::cmp::Ordering::Equal);
+        let hash = |request: &SymbolRequest| {
+            let mut state = std::hash::DefaultHasher::new();
+            request.hash(&mut state);
+            state.finish()
+        };
+        assert_eq!(hash(&direct_zero), hash(&absent));
+    }
+
+    #[test]
+    fn pyroc35_zero_recorded_id_allows_live_elf_without_build_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("library.so");
+        let bytes = elf_with_dynamic_text_symbol(b"recorded_function", 0x1000, 16);
+        let offset = object::File::parse(bytes.as_slice())
+            .unwrap()
+            .segments()
+            .next()
+            .unwrap()
+            .file_range()
+            .0;
+        std::fs::write(&path, &bytes).unwrap();
+        let resolver =
+            super::PerfSymbolResolver::from_object_resolver(RustAddr2lineResolver::new())
+                .with_debug_dir(dir.path().into());
+        let mut request = test_request(path.to_str().unwrap(), offset);
+        request.build_id = Some("00".repeat(20));
+        assert_eq!(
+            resolver
+                .resolve_base_frame_batch_with_metadata(&[request])
+                .unwrap()[0]
+                .frames,
+            ["recorded_function+0x0"]
+        );
+    }
+
+    #[test]
+    fn pyroc34_enforces_recorded_id_and_preserves_no_recorded_id_behavior() {
+        for bytes in [
+            regression_elf_with_build_id(),
+            elf_with_dynamic_text_symbol(b"recorded_function", 0x1000, 16),
+        ] {
+            let object = object::File::parse(bytes.as_slice()).unwrap();
+            let has_elf_id = object.build_id().unwrap().is_some();
+            let offset = object.segments().next().unwrap().file_range().0;
+            for id in [None, Some(String::new()), Some("aabbccdd".into())] {
+                for cached in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("library.so");
+                    std::fs::write(&path, &bytes).unwrap();
+                    let cache = super::perf_build_id_elf_path(dir.path(), "aabbccdd");
+                    if cached {
+                        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+                        std::fs::write(&cache, &bytes).unwrap();
+                        std::fs::remove_file(&path).unwrap();
+                    }
+                    if cached && id.as_ref().is_none_or(String::is_empty) {
+                        continue;
+                    }
+                    let mut request = test_request(path.to_str().unwrap(), offset);
+                    request.build_id = id.clone();
+                    request.file_identity = Some(super::FileIdentity {
+                        major: u32::MAX,
+                        minor: u32::MAX,
+                        inode: u64::MAX,
+                        inode_generation: u64::MAX,
+                    });
+                    let resolver = super::PerfSymbolResolver::from_object_resolver(
+                        RustAddr2lineResolver::new(),
+                    )
+                    .with_debug_dir(dir.path().into());
+                    for inline in [false, true] {
+                        let frames = if inline {
+                            resolver.resolve_frame_batch_with_metadata(&[request.clone()])
+                        } else {
+                            resolver.resolve_base_frame_batch_with_metadata(&[request.clone()])
+                        }
+                        .unwrap();
+                        if !has_elf_id && id.as_ref().is_some_and(|id| !id.is_empty()) {
+                            assert!(
+                                frames[0].frames.is_empty(),
+                                "recorded ID requires a readable ELF ID"
+                            );
+                        } else {
+                            assert_eq!(frames[0].frames, ["recorded_function+0x0"]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pyroc34_unreadable_cache_falls_back_to_matching_live_elf() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("library.so");
+        let bytes = regression_elf_with_build_id();
+        let offset = object::File::parse(bytes.as_slice())
+            .unwrap()
+            .segments()
+            .next()
+            .unwrap()
+            .file_range()
+            .0;
+        std::fs::write(&path, &bytes).unwrap();
+        let cache = super::perf_build_id_elf_path(dir.path(), "aabbccdd");
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(&cache, b"not an ELF").unwrap();
+        let mut request = test_request(path.to_str().unwrap(), offset);
+        request.build_id = Some("aabbccdd".into());
+        let resolver =
+            super::PerfSymbolResolver::from_object_resolver(RustAddr2lineResolver::new())
+                .with_debug_dir(dir.path().into());
+        assert_eq!(
+            resolver
+                .resolve_base_frame_batch_with_metadata(&[request])
+                .unwrap()[0]
+                .frames,
+            ["recorded_function+0x0"]
+        );
+    }
+
+    #[test]
+    fn generic_symbolizers_accept_macho_with_text_symbol() {
+        struct NoCommands;
+        impl crate::process::CommandRunner for NoCommands {
+            fn run(
+                &self,
+                _: &crate::process::CommandSpec,
+            ) -> std::io::Result<crate::process::CommandOutput> {
+                panic!("symbol-table lookup must not spawn addr2line");
+            }
+        }
+        let mut object = object::write::Object::new(
+            object::BinaryFormat::MachO,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let text = object.section_id(object::write::StandardSection::Text);
+        object.append_section_data(text, &[0x90; 32], 1);
+        object.add_symbol(object::write::Symbol {
+            name: b"macho_function".to_vec(),
+            value: 16,
+            size: 16,
+            kind: object::SymbolKind::Text,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: object::write::SymbolSection::Section(text),
+            flags: object::SymbolFlags::None,
+        });
+        let bytes = object.write().unwrap();
+        let parsed = object::File::parse(bytes.as_slice()).unwrap();
+        assert_eq!(parsed.format(), object::BinaryFormat::MachO);
+        let symbol = parsed
+            .symbols()
+            .find(|symbol| symbol.kind() == object::SymbolKind::Text)
+            .unwrap();
+        let address = symbol.address();
+        assert_eq!(symbol.name().unwrap(), "_macho_function");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture.macho");
+        std::fs::write(&path, &bytes).unwrap();
+        let request = test_request(path.to_str().unwrap(), address);
+        let rust = RustAddr2lineResolver::new();
+        assert!(
+            rust.object_metadata(&path).is_some(),
+            "generic metadata must accept Mach-O"
+        );
+        let runner = NoCommands;
+        let external = super::Addr2lineResolver::new(&runner);
+        assert!(external.object_metadata(&path).is_some());
+        assert_eq!(
+            rust.resolve_batch(std::slice::from_ref(&request)).unwrap(),
+            [Some("_macho_function".into())]
+        );
+        for resolver in [&rust as &dyn SymbolResolver, &external] {
+            assert_eq!(
+                resolver
+                    .resolve_base_frame_batch_with_metadata(std::slice::from_ref(&request))
+                    .unwrap()[0]
+                    .frames,
+                ["_macho_function+0x0"]
+            );
+        }
+    }
+
+    #[test]
+    fn pyroc48_object_reader_stops_at_snapshot_size_and_rejects_truncation() {
+        let bytes = regression_elf_with_build_id();
+        let mut grown = bytes.clone();
+        grown.extend_from_slice(b"unrecorded growth must not be consumed");
+        let mut reader = std::io::Cursor::new(grown);
+        assert_eq!(
+            super::read_object_with_size(&mut reader, bytes.len() as u64),
+            Some(bytes.clone())
+        );
+        assert_eq!(reader.position(), bytes.len() as u64);
+        assert!(
+            super::read_object_with_size(std::io::Cursor::new(&bytes), bytes.len() as u64 + 1)
+                .is_none()
+        );
+        assert!(super::read_object_with_size(std::io::Cursor::new(b"not ELF"), 7).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pyroc48_recording_selected_fifo_is_rejected_before_object_read() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("object.fifo");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        // A finite ELF and finite writer lifetime make the old read safe to exercise.
+        let mut writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        let bytes = regression_elf_with_build_id();
+        let capacity =
+            usize::try_from(unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETPIPE_SZ) })
+                .expect("FIFO capacity must be nonnegative");
+        assert!(capacity > 0 && bytes.len() <= capacity);
+        let offset = object::File::parse(bytes.as_slice())
+            .unwrap()
+            .segments()
+            .next()
+            .unwrap()
+            .file_range()
+            .0;
+        writer.write_all(&bytes).unwrap();
+        let close = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(writer);
+        });
+        let resolver =
+            super::PerfSymbolResolver::from_object_resolver(RustAddr2lineResolver::new());
+        let request = test_request(path.to_str().unwrap(), offset);
+        let selected =
+            resolver.object_symbol_request(&request, &mut super::ObjectAddressCache::default());
+        close.join().unwrap();
+        assert_eq!(
+            selected.relative_address, offset,
+            "FIFO bytes must not translate a recorded offset"
+        );
+        assert!(super::object_load_segment_ranges(dir.path()).is_none());
+    }
 
     #[test]
     fn gnu_build_id_from_notes_reads_kernel_nt_gnu_build_id() {
@@ -8804,6 +9393,12 @@ mod tests {
     fn source_without_object_symbols_never_initializes_the_inline_dwarf_index() {
         // machine.c:append_inlines requires both a map and a base symbol.
         let file = tempfile::NamedTempFile::new().unwrap();
+        let mut builder = build::elf::Builder::new(object::Endianness::Little, true);
+        builder.header.e_type = elf::ET_DYN;
+        builder.header.e_machine = elf::EM_X86_64;
+        let mut bytes = Vec::new();
+        builder.write(&mut bytes).unwrap();
+        std::fs::write(file.path(), bytes).unwrap();
         let resolver = super::RustAddr2lineResolver::new();
         let request = super::clean_object_symbol_request(file.path().into(), 0x10);
         let frames = resolver

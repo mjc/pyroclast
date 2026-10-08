@@ -1268,6 +1268,9 @@ fn recorded_build_ids_by_filename(
 ) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let mut ids = events
         .into_iter()
+        // tools/perf/util/build-id.c:build_id__is_defined: empty and all-zero
+        // recorded IDs are absent, not identities to require from an ELF.
+        .filter(|event| event.build_id.bytes().any(|byte| byte != b'0'))
         .map(|event| hex_build_id_bytes(&event.build_id).map(|id| (event.filename, id)))
         .collect::<Result<BTreeMap<_, _>, _>>()?;
     if !ids.contains_key("[vdso]") {
@@ -4782,7 +4785,10 @@ fn load_unwind_mapping_for_user_mapping_like_perf(
     unwind_debug_dir: Option<&Path>,
 ) -> bool {
     let path = mapping.path.to_string();
-    let build_id = mapping.build_id.map(<[u8]>::to_vec);
+    let build_id = mapping
+        .build_id
+        .filter(|id| id.iter().any(|byte| *byte != 0))
+        .map(<[u8]>::to_vec);
     let request = UnwindMappingRequest {
         start: mapping.start,
         len: mapping.len,
@@ -5070,6 +5076,9 @@ fn unwind_object_path_for_build_id(
     build_id: &[u8],
     debug_dir: Option<&Path>,
 ) -> PathBuf {
+    if !build_id.iter().any(|byte| *byte != 0) {
+        return PathBuf::from(path);
+    }
     debug_dir
         .map(|debug_dir| {
             perf_build_id_elf_path_for_dso(debug_dir, Path::new(path), &build_id_hex(build_id))
@@ -6019,7 +6028,30 @@ mod tests {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
-    fn rejects_live_vdso_for_mismatching_recorded_identity_or_architecture() {
+    fn reports_live_vdso_when_recorded_build_id_is_undefined_like_perf() {
+        for build_id in [&[][..], &[0; 20][..]] {
+            let mapping = super::UserMapping {
+                pid: 11,
+                start: 0x7000_0000,
+                len: 0x1_0000,
+                pgoff: 0,
+                prot: None,
+                path: "[vdso]",
+                build_id: Some(build_id),
+                file_identity: None,
+            };
+            let mut state = super::PidUnwindState::with_arch(PerfArch::X86_64);
+            // tools/perf/util/build-id.c:build_id__is_defined rejects empty
+            // and all-zero IDs; neither constrains the native vDSO image.
+            assert!(super::load_unwind_mapping_for_user_mapping_like_perf(
+                &mut state, mapping, None
+            ));
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn rejects_live_vdso_for_defined_mismatching_identity_or_foreign_architecture() {
         let mapping = super::UserMapping {
             pid: 11,
             start: 0x7000_0000,
@@ -6027,7 +6059,7 @@ mod tests {
             pgoff: 0,
             prot: None,
             path: "[vdso]",
-            build_id: Some(&[0; 20]),
+            build_id: Some(&[0xff; 20]),
             file_identity: None,
         };
         let mut state = super::PidUnwindState::with_arch(PerfArch::X86_64);
@@ -6043,6 +6075,24 @@ mod tests {
             },
             None
         ));
+    }
+
+    #[test]
+    fn undefined_recorded_build_ids_do_not_constrain_mappings_like_perf() {
+        let events = ["", "0000000000000000000000000000000000000000"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, build_id)| super::BuildIdEvent {
+                pid: 11,
+                filename: format!("/object-{index}"),
+                build_id: build_id.into(),
+            })
+            .collect();
+        assert!(
+            super::recorded_build_ids_by_filename(events)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

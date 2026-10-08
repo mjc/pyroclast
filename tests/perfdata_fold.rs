@@ -3702,8 +3702,38 @@ fn kcore_module_object_resolution_precedes_initial_core_loading() {
     let debug = root.path().join(".debug");
     let object = pyroclast::symbols::perf_build_id_elf_path(&debug, "abcdef");
     std::fs::create_dir_all(object.parent().unwrap()).unwrap();
-    // Symbol parsing is delegated to the mock above; this pins source routing.
-    std::fs::write(object, b"mock object source").unwrap();
+    // Routing still validates ELF identity before delegating symbol parsing.
+    let mut builder = object::build::elf::Builder::new(object::Endianness::Little, true);
+    // A relocatable .ko keeps its recorded map; ET_DYN module loading moves
+    // the map and intentionally rejects the subsequent live kcore source.
+    builder.header.e_type = object::elf::ET_REL;
+    builder.header.e_machine = object::elf::EM_X86_64;
+    let names = builder.sections.add();
+    names.name = b".shstrtab"[..].into();
+    names.sh_type = object::elf::SHT_STRTAB;
+    names.sh_addralign = 1;
+    names.data = object::build::elf::SectionData::SectionString;
+    let note = builder.sections.add();
+    note.name = b".note.gnu.build-id"[..].into();
+    note.sh_type = object::elf::SHT_NOTE;
+    note.sh_addralign = 4;
+    note.data = object::build::elf::SectionData::Data(
+        vec![
+            4, 0, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0, b'G', b'N', b'U', 0, 0xab, 0xcd, 0xef, 0,
+        ]
+        .into(),
+    );
+    builder.set_section_sizes();
+    let mut bytes = Vec::new();
+    builder.write(&mut bytes).unwrap();
+    assert_eq!(
+        object::File::parse(bytes.as_slice())
+            .unwrap()
+            .build_id()
+            .unwrap(),
+        Some(&[0xab, 0xcd, 0xef][..])
+    );
+    std::fs::write(object, bytes).unwrap();
     let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
         ObjectResolver,
         &root.path().join("perf.data"),

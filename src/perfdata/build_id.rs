@@ -124,7 +124,7 @@ pub(super) fn build_id_events_from_reader(
 pub fn kernel_build_id_from_perfdata(bytes: &[u8]) -> Result<Option<String>, String> {
     Ok(build_id_events_from_perfdata(bytes)?
         .into_iter()
-        .find(|event| is_kernel_build_id_filename(&event.filename))
+        .find(is_defined_kernel_build_id)
         .map(|event| event.build_id))
 }
 
@@ -184,7 +184,7 @@ fn kernel_build_id_from_record_section(
 ) -> Result<Option<String>, String> {
     let mut kernel_build_id = None;
     visit_build_id_record_section(reader, offset, size, file_size, feature, false, |event| {
-        if kernel_build_id.is_none() && is_kernel_build_id_filename(&event.filename) {
+        if kernel_build_id.is_none() && is_defined_kernel_build_id(&event) {
             kernel_build_id = Some(event.build_id);
         }
         // Header features must be validated in full; data lookup can stop.
@@ -374,6 +374,12 @@ fn parse_build_id_record(misc: u16, payload: &[u8]) -> Result<BuildIdEvent, Stri
         build_id: build_id_hex(&payload[4..4 + build_id_size]),
         filename: filename(&payload[BUILD_ID_RECORD_PAYLOAD_MIN_SIZE..])?,
     })
+}
+
+fn is_defined_kernel_build_id(event: &BuildIdEvent) -> bool {
+    // perf util/build-id.c:build_id__is_defined requires both a nonzero size
+    // and at least one nonzero byte; dso__has_build_id uses that definition.
+    event.build_id.bytes().any(|byte| byte != b'0') && is_kernel_build_id_filename(&event.filename)
 }
 
 fn is_kernel_build_id_filename(filename: &str) -> bool {

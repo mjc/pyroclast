@@ -2865,7 +2865,7 @@ fn perf_symbol_resolver_uses_module_build_id_elf() {
     let module_elf =
         pyroclast::symbols::perf_build_id_elf_path(&perf_debug_dir(home.path()), build_id);
     std::fs::create_dir_all(module_elf.parent().expect("module elf parent")).expect("cache dir");
-    std::fs::write(&module_elf, b"not a real elf; runner is faked").expect("module elf");
+    std::fs::write(&module_elf, elf_with_recorded_build_id(build_id)).expect("module elf");
 
     let runner = Addr2lineRunner::new(b"igb_clean_rx_irq\n??:0\n");
     let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
@@ -2883,6 +2883,7 @@ fn perf_symbol_resolver_uses_module_build_id_elf() {
         .expect("symbols");
 
     assert_eq!(symbols, vec![Some("igb_clean_rx_irq".to_string())]);
+    assert_eq!(runner.commands()[0].stdin.as_deref(), Some(&b"0x30\n"[..]));
     assert_eq!(
         runner.commands()[0].args,
         vec![
@@ -2901,7 +2902,7 @@ fn perf_symbol_resolver_uses_vdso_build_id_cache_layout_like_perf_script() {
     let vdso_elf =
         perf_build_id_elf_path_for_dso(&perf_debug_dir(home.path()), Path::new("[vdso]"), build_id);
     std::fs::create_dir_all(vdso_elf.parent().expect("vdso elf parent")).expect("cache dir");
-    std::fs::write(&vdso_elf, b"not a real elf; runner is faked").expect("vdso elf");
+    std::fs::write(&vdso_elf, elf_with_recorded_build_id(build_id)).expect("vdso elf");
 
     let runner = Addr2lineRunner::new(b"__vdso_clock_gettime\n??:0\n");
     let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
@@ -2919,6 +2920,7 @@ fn perf_symbol_resolver_uses_vdso_build_id_cache_layout_like_perf_script() {
         .expect("symbols");
 
     assert_eq!(symbols, vec![Some("__vdso_clock_gettime".to_string())]);
+    assert_eq!(runner.commands()[0].stdin.as_deref(), Some(&b"0x970\n"[..]));
     assert_eq!(
         runner.commands()[0].args,
         vec![
@@ -3412,6 +3414,43 @@ impl CommandRunner for Addr2lineRunner {
             stderr: Vec::new(),
         })
     }
+}
+
+fn elf_with_recorded_build_id(build_id: &str) -> Vec<u8> {
+    assert!(build_id.len().is_multiple_of(2));
+    let id = build_id
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect::<Vec<_>>();
+    let mut note = Vec::new();
+    note.extend_from_slice(&4_u32.to_le_bytes());
+    note.extend_from_slice(&u32::try_from(id.len()).unwrap().to_le_bytes());
+    note.extend_from_slice(&elf::NT_GNU_BUILD_ID.to_le_bytes());
+    note.extend_from_slice(b"GNU\0");
+    note.extend_from_slice(&id);
+    note.resize(note.len().next_multiple_of(4), 0);
+
+    let mut builder = build::elf::Builder::new(object::Endianness::Little, true);
+    builder.header.e_type = elf::ET_DYN;
+    builder.header.e_machine = elf::EM_X86_64;
+    let section = builder.sections.add();
+    section.name = b".shstrtab"[..].into();
+    section.sh_type = elf::SHT_STRTAB;
+    section.data = build::elf::SectionData::SectionString;
+    let section = builder.sections.add();
+    section.name = b".note.gnu.build-id"[..].into();
+    section.sh_type = elf::SHT_NOTE;
+    section.sh_addralign = 4;
+    section.data = build::elf::SectionData::Data(note.into());
+    builder.set_section_sizes();
+    let mut bytes = Vec::new();
+    builder.write(&mut bytes).unwrap();
+    let object = object::File::parse(bytes.as_slice()).unwrap();
+    assert_eq!(object.build_id().unwrap(), Some(id.as_slice()));
+    bytes
 }
 
 fn elf_with_dynamic_text_symbol(name: &'static [u8], address: u64, size: usize) -> Vec<u8> {
