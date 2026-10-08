@@ -2928,6 +2928,7 @@ fn write_native_module_kallsyms_fixture(
     kallsyms: &str,
     sampled_ips: &[u64],
     distinct_queries: bool,
+    module_paths: [&str; 2],
 ) -> (tempfile::TempDir, Vec<u8>) {
     const KERNEL_START: u64 = 0xffff_ffff_8100_0000;
     const MODULE_START: u64 = 0xffff_ffff_c100_0000;
@@ -2957,8 +2958,8 @@ fn write_native_module_kallsyms_fixture(
             KERNEL_START,
             "[kernel.kallsyms]_stext",
         ),
-        (MODULE_START, 0x4000, 0, "[a]"),
-        (MODULE_START + 0x1_0000, 0x4000, 0, "[b]"),
+        (MODULE_START, 0x4000, 0, module_paths[0]),
+        (MODULE_START + 0x1_0000, 0x4000, 0, module_paths[1]),
     ] {
         let mut payload = mmap_payload(u32::MAX, u32::MAX, start, len, pgoff, path);
         payload.resize(payload.len().next_multiple_of(8), 0);
@@ -3050,8 +3051,12 @@ fn assert_native_module_kallsyms_queries_parity(
     expected_native: Option<&str>,
     expected_ends: &[(&str, u64)],
 ) {
-    let (root, bytes) =
-        write_native_module_kallsyms_fixture(kallsyms, sampled_ips, expected_native.is_none());
+    let (root, bytes) = write_native_module_kallsyms_fixture(
+        kallsyms,
+        sampled_ips,
+        expected_native.is_none(),
+        ["[a]", "[b]"],
+    );
     let (script, stderr, native) = query_native_module_kallsyms(root.path(), expected_ends);
     // Establish the native result independently before checking Pyroclast.
     if let Some(expected) = expected_native {
@@ -3109,6 +3114,639 @@ fn assert_native_module_kallsyms_queries_parity(
     )
     .expect("fold synthetic module kallsyms");
     assert_eq!(actual.as_bytes(), native, "native script={script}");
+}
+
+#[cfg(target_os = "linux")]
+fn resolved_kernel_dso<'a>(
+    resolver: &impl SymbolResolver,
+    mapping: &pyroclast::perfdata::mappings::ResolvedMappingRef<'a>,
+) -> &'a str {
+    let request = SymbolRequest {
+        path: mapping.path.into(),
+        relative_address: mapping.relative_address,
+        kernel_mapping_range: Some((mapping.start, mapping.end)),
+        build_id: None,
+        file_identity: None,
+        kernel_relocation: mapping.kernel_relocation.clone(),
+    };
+    if resolver
+        .resolve_frame_batch_with_metadata(&[request])
+        .unwrap()[0]
+        .kernel_dso
+        == pyroclast::symbols::SymbolDsoName::KernelKallsyms
+    {
+        "[kernel.kallsyms]"
+    } else {
+        mapping.path
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn write_native_kcore_fixture(module_path: &str) -> (tempfile::TempDir, Vec<u8>) {
+    const MODULE_IP: u64 = 0xffff_ffff_c100_0010;
+    let (root, bytes) = write_native_module_kallsyms_fixture(
+        "ffffffff81000000 T _stext\n\
+         ffffffff81000100 T _etext\n\
+         ffffffffc1000000 T first\t[a]\n\
+         ffffffffc1000200 T next\t[a]\n\
+         ffffffffc1010000 T sentinel\t[b]\n",
+        &[MODULE_IP],
+        false,
+        [module_path, "[b]"],
+    );
+    std::fs::write(
+        root.path().join("modules"),
+        "a 16384 0 - Live 0xffffffffc1000000\nb 16384 0 - Live 0xffffffffc1010000\n",
+    )
+    .unwrap();
+    // Only ELF/program headers are needed: these large kernel ranges carry no
+    // copied kernel memory or executable payload.
+    let mut elf = vec![0_u8; 64 + 2 * 56];
+    elf[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+    elf[16..18].copy_from_slice(&4_u16.to_le_bytes());
+    elf[18..20].copy_from_slice(&62_u16.to_le_bytes());
+    elf[20..24].copy_from_slice(&1_u32.to_le_bytes());
+    elf[32..40].copy_from_slice(&64_u64.to_le_bytes());
+    elf[52..54].copy_from_slice(&64_u16.to_le_bytes());
+    elf[54..56].copy_from_slice(&56_u16.to_le_bytes());
+    elf[56..58].copy_from_slice(&2_u16.to_le_bytes());
+    for (index, (start, len)) in [
+        (0xffff_ffff_8100_0000_u64, 0x10000_u64),
+        (0xffff_ffff_c100_0000, 0x20000),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let offset = 64 + index * 56;
+        elf[offset..offset + 4].copy_from_slice(&1_u32.to_le_bytes());
+        elf[offset + 4..offset + 8].copy_from_slice(&7_u32.to_le_bytes());
+        elf[offset + 8..offset + 16]
+            .copy_from_slice(&(4096_u64 + u64::try_from(index).unwrap() * 0x1_0000).to_le_bytes());
+        elf[offset + 16..offset + 24].copy_from_slice(&start.to_le_bytes());
+        elf[offset + 32..offset + 40].copy_from_slice(&len.to_le_bytes());
+        elf[offset + 40..offset + 48].copy_from_slice(&len.to_le_bytes());
+    }
+    std::fs::write(root.path().join("kcore"), elf).unwrap();
+    (root, bytes)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_kcore_replaces_module_dso_names_only_when_recorded_addresses_match() {
+    const MODULE_IP: u64 = 0xffff_ffff_c100_0010;
+    let (root, bytes) = write_native_kcore_fixture("[a]");
+    let (script, stderr, _) = query_native_module_kallsyms(root.path(), &[]);
+    assert!(
+        stderr.contains("Using ") && stderr.contains("/kcore for kernel data"),
+        "{stderr}"
+    );
+    assert!(
+        script.contains("first+0x10 ([kernel.kallsyms])"),
+        "{script}"
+    );
+    let summary = summarize_perfdata(&bytes).unwrap();
+    let mapping = summary.mmap_table.resolve_ref(11, MODULE_IP).unwrap();
+    let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+        StaticSymbolResolver,
+        &root.path().join("perf.data"),
+        root.path(),
+        [],
+        &root.path().join("kallsyms"),
+    );
+    let core = summary
+        .mmap_table
+        .resolve_ref(11, 0xffff_ffff_8100_0010)
+        .unwrap();
+    assert_eq!(resolved_kernel_dso(&resolver, &core), "[kernel.kallsyms]");
+    assert_eq!(
+        resolved_kernel_dso(&resolver, &mapping),
+        "[kernel.kallsyms]"
+    );
+    let request = SymbolRequest {
+        path: "[a]".into(),
+        relative_address: MODULE_IP,
+        kernel_mapping_range: Some((mapping.start, mapping.end)),
+        build_id: None,
+        file_identity: None,
+        kernel_relocation: None,
+    };
+    assert_eq!(
+        resolver
+            .resolve_batch(std::slice::from_ref(&request))
+            .unwrap(),
+        [Some("first+0x10".into())]
+    );
+    for inline in [false, true] {
+        let actual = fold_perfdata_callchains_with_symbols(
+            &bytes,
+            FoldOptions {
+                inline,
+                count_periods: true,
+            },
+            &resolver,
+        )
+        .unwrap();
+        let (_, _, native) = query_native_module_kallsyms(root.path(), &[]);
+        assert_eq!(actual.as_bytes(), native);
+    }
+    let new_resolver = || {
+        perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+            StaticSymbolResolver,
+            &root.path().join("perf.data"),
+            root.path(),
+            [],
+            &root.path().join("kallsyms"),
+        )
+    };
+    // Matching kernel identity alone cannot validate a module loaded elsewhere.
+    std::fs::write(
+        root.path().join("modules"),
+        "a 16384 0 - Live 0xffffffffc1001000\nb 16384 0 - Live 0xffffffffc1010000\n",
+    )
+    .unwrap();
+    let (script, _, _) = query_native_module_kallsyms(root.path(), &[]);
+    assert!(script.contains("first+0x10 ([a])"), "{script}");
+    assert_eq!(resolved_kernel_dso(&new_resolver(), &mapping), "[a]");
+    std::fs::write(
+        root.path().join("modules"),
+        "a 16384 0 - Live 0xffffffffc1000000\nb 16384 0 - Live 0xffffffffc1010000\n",
+    )
+    .unwrap();
+    // A relocated core can use relocated kallsyms but cannot reuse live kcore.
+    let mut relocated = bytes.clone();
+    let name = b"[kernel.kallsyms]_stext";
+    let offset = relocated
+        .windows(name.len())
+        .position(|bytes| bytes == name)
+        .unwrap();
+    put_u64(&mut relocated, offset - 8, 0xffff_ffff_8100_1000);
+    std::fs::write(root.path().join("perf.data"), &relocated).unwrap();
+    let (script, _, _) = query_native_module_kallsyms(root.path(), &[]);
+    assert!(script.contains("first+0x10 ([a])"), "{script}");
+    assert_eq!(resolved_kernel_dso(&new_resolver(), &mapping), "[a]");
+    std::fs::write(root.path().join("perf.data"), &bytes).unwrap();
+    std::fs::write(root.path().join("kcore"), b"truncated").unwrap();
+    assert_eq!(resolved_kernel_dso(&new_resolver(), &mapping), "[a]");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_kcore_checks_absolute_and_compressed_module_addresses() {
+    for module_path in [
+        "/lib/modules/a.ko",
+        "/lib/modules/a.ko.xz",
+        "/lib/modules/a.ko.zst",
+    ] {
+        let (root, bytes) = write_native_kcore_fixture(module_path);
+        let summary = summarize_perfdata(&bytes).unwrap();
+        let mapping = summary
+            .mmap_table
+            .resolve_ref(11, 0xffff_ffff_c100_0010)
+            .unwrap();
+        std::fs::write(
+            root.path().join("modules"),
+            "a 16384 0 - Live 0xffffffffc1001000\nb 16384 0 - Live 0xffffffffc1010000\n",
+        )
+        .unwrap();
+        let (script, stderr, _) = query_native_module_kallsyms(root.path(), &[]);
+        assert!(!stderr.contains("/kcore for kernel data"), "{stderr}");
+        assert!(
+            !script.contains("first+0x10 ([kernel.kallsyms])"),
+            "{script}"
+        );
+        let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+            StaticSymbolResolver,
+            &root.path().join("perf.data"),
+            root.path(),
+            [],
+            &root.path().join("kallsyms"),
+        );
+        assert_eq!(resolved_kernel_dso(&resolver, &mapping), module_path);
+        // Exercise the same validation through the core map, independent of
+        // the module frame's absolute object path.
+        let core = summary
+            .mmap_table
+            .resolve_ref(11, 0xffff_ffff_8100_0010)
+            .unwrap();
+        assert_eq!(resolved_kernel_dso(&resolver, &core), core.path);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_kcore_accepts_a_hidden_zero_relocation_reference() {
+    let (root, mut bytes) = write_native_kcore_fixture("[a]");
+    let name = b"[kernel.kallsyms]_stext";
+    let offset = bytes
+        .windows(name.len())
+        .position(|bytes| bytes == name)
+        .unwrap();
+    put_u64(&mut bytes, offset - 8, 0);
+    std::fs::write(root.path().join("perf.data"), &bytes).unwrap();
+    let (script, stderr, _) = query_native_module_kallsyms(root.path(), &[]);
+    assert!(stderr.contains("/kcore for kernel data"), "{stderr}");
+    assert!(
+        script.contains("first+0x10 ([kernel.kallsyms])"),
+        "{script}"
+    );
+    let summary = summarize_perfdata(&bytes).unwrap();
+    let mapping = summary
+        .mmap_table
+        .resolve_ref(11, 0xffff_ffff_c100_0010)
+        .unwrap();
+    let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+        StaticSymbolResolver,
+        &root.path().join("perf.data"),
+        root.path(),
+        [],
+        &root.path().join("kallsyms"),
+    );
+    let core = summary
+        .mmap_table
+        .resolve_ref(11, 0xffff_ffff_8100_0010)
+        .unwrap();
+    assert_eq!(resolved_kernel_dso(&resolver, &core), "[kernel.kallsyms]");
+    assert_eq!(
+        resolved_kernel_dso(&resolver, &mapping),
+        "[kernel.kallsyms]"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_kcore_module_core_module_lookup_order_updates_cached_symbols() {
+    const MODULE: u64 = 0xffff_ffff_c100_0010;
+    const CORE: u64 = 0xffff_ffff_8100_0010;
+    let (root, bytes) = write_native_kcore_fixture("[a]");
+    let summary = summarize_perfdata(&bytes).unwrap();
+    let data_start =
+        usize::try_from(u64::from_le_bytes(bytes[40..48].try_into().unwrap())).unwrap();
+    let mut offset = data_start;
+    while u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) != PERF_RECORD_SAMPLE {
+        offset += usize::from(u16::from_le_bytes(
+            bytes[offset + 6..offset + 8].try_into().unwrap(),
+        ));
+    }
+    let mut ordered = bytes[..offset].to_vec();
+    for (index, ip) in [MODULE, CORE, MODULE].into_iter().enumerate() {
+        ordered.extend(record_bytes_with_misc(
+            PERF_RECORD_SAMPLE,
+            PERF_RECORD_MISC_CPUMODE_KERNEL,
+            &sample_payload_with_time(
+                ip,
+                11,
+                12,
+                1_000_000_000 + u64::try_from(index).unwrap(),
+                [0xffff_ffff_ffff_ff80, ip],
+            ),
+        ));
+    }
+    let data_size = u64::try_from(ordered.len() - data_start).unwrap();
+    put_u64(&mut ordered, 48, data_size);
+    std::fs::write(root.path().join("perf.data"), &ordered).unwrap();
+    let (script, _, native) = query_native_module_kallsyms(root.path(), &[]);
+    assert!(script.contains("[unknown] ([a])"), "{script}");
+    assert!(
+        script.contains("first+0x10 ([kernel.kallsyms])"),
+        "{script}"
+    );
+    assert!(summary.mmap_table.resolve_ref(11, MODULE).is_some());
+    for inline in [false, true] {
+        let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+            StaticSymbolResolver,
+            &root.path().join("perf.data"),
+            root.path(),
+            [],
+            &root.path().join("kallsyms"),
+        );
+        let actual = fold_perfdata_callchains_with_symbols(
+            &ordered,
+            FoldOptions {
+                inline,
+                count_periods: true,
+            },
+            &resolver,
+        )
+        .unwrap();
+        assert_eq!(actual.as_bytes(), native, "{script}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_kcore_same_callchain_module_core_module_preserves_each_cursor_source() {
+    let (root, bytes) = write_native_kcore_fixture("[a]");
+    let data_start =
+        usize::try_from(u64::from_le_bytes(bytes[40..48].try_into().unwrap())).unwrap();
+    let mut offset = data_start;
+    while u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) != PERF_RECORD_SAMPLE {
+        offset += usize::from(u16::from_le_bytes(
+            bytes[offset + 6..offset + 8].try_into().unwrap(),
+        ));
+    }
+    let mut ordered = bytes[..offset].to_vec();
+    ordered.extend(record_bytes_with_misc(
+        PERF_RECORD_SAMPLE,
+        PERF_RECORD_MISC_CPUMODE_KERNEL,
+        &sample_payload_with_time(
+            0xffff_ffff_c100_0010,
+            11,
+            12,
+            1_000_000_000,
+            [
+                0xffff_ffff_ffff_ff80,
+                0xffff_ffff_c100_0010,
+                0xffff_ffff_c100_0020,
+                0xffff_ffff_8100_0010,
+                0xffff_ffff_c100_0010,
+            ],
+        ),
+    ));
+    let data_size = u64::try_from(ordered.len() - data_start).unwrap();
+    put_u64(&mut ordered, 48, data_size);
+    std::fs::write(root.path().join("perf.data"), &ordered).unwrap();
+    let (script, _, native) = query_native_module_kallsyms(root.path(), &[]);
+    assert!(script.contains("[unknown] ([a])"), "{script}");
+    assert!(
+        script.contains("first+0x10 ([kernel.kallsyms])"),
+        "{script}"
+    );
+    for inline in [false, true] {
+        let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+            StaticSymbolResolver,
+            &root.path().join("perf.data"),
+            root.path(),
+            [],
+            &root.path().join("kallsyms"),
+        );
+        let actual = fold_perfdata_callchains_with_symbols(
+            &ordered,
+            FoldOptions {
+                inline,
+                count_periods: true,
+            },
+            &resolver,
+        )
+        .unwrap();
+        assert_eq!(actual.as_bytes(), native, "{script}");
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn write_cached_kernel_module_elf(root: &std::path::Path, shared: bool) -> Vec<u8> {
+    use std::fmt::Write as _;
+    let source = root.join("module.S");
+    let elf_path = root.join("module.elf");
+    std::fs::write(&source, ".text\n.globl cached_module_object\n.type cached_module_object,@function\ncached_module_object:\n.fill 512,1,0x90\n.size cached_module_object,.-cached_module_object\n").unwrap();
+    let compiler = Command::new("cc")
+        .args([
+            "-nostdlib",
+            if shared { "-shared" } else { "-no-pie" },
+            "-Wl,-e,cached_module_object",
+            "-Wl,--build-id",
+            "-Wl,-Ttext=0xffffffffc1000000",
+            "-o",
+        ])
+        .arg(&elf_path)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        compiler.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiler.stderr)
+    );
+    let elf_bytes = std::fs::read(&elf_path).unwrap();
+    let elf = object::File::parse(elf_bytes.as_slice()).unwrap();
+    let id = elf.build_id().unwrap().unwrap();
+    assert_eq!(id.len(), 20);
+    let hex = id.iter().fold(String::new(), |mut hex, byte| {
+        write!(hex, "{byte:02x}").unwrap();
+        hex
+    });
+    let cache = pyroclast::symbols::perf_build_id_elf_path(&root.join(".debug"), &hex);
+    std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    std::fs::write(cache, &elf_bytes).unwrap();
+    id.to_vec()
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn write_native_cached_module_fixture(
+    shared: bool,
+    single_callchain: bool,
+) -> (tempfile::TempDir, Vec<u8>) {
+    const MODULE: u64 = 0xffff_ffff_c100_0010;
+    const CORE: u64 = 0xffff_ffff_8100_0010;
+    let (root, _) = write_native_kcore_fixture("[a]");
+    let id = write_cached_kernel_module_elf(root.path(), shared);
+    let mut comm = comm_payload(11, 12, "worker");
+    comm.resize(comm.len().next_multiple_of(8), 0);
+    let mut records = vec![record_bytes(3, &comm)];
+    for (start, len, pgoff, path) in [
+        (
+            0xffff_ffff_8100_0000,
+            0x10000,
+            0xffff_ffff_8100_0000,
+            "[kernel.kallsyms]_stext",
+        ),
+        (0xffff_ffff_c101_0000, 0x4000, 0, "[b]"),
+    ] {
+        let mut payload = mmap_payload(u32::MAX, u32::MAX, start, len, pgoff, path);
+        payload.resize(payload.len().next_multiple_of(8), 0);
+        records.push(record_bytes_with_misc(
+            1,
+            PERF_RECORD_MISC_CPUMODE_KERNEL,
+            &payload,
+        ));
+    }
+    let mut payload =
+        mmap2_build_id_payload(u32::MAX, u32::MAX, 0xffff_ffff_c100_0000, 0x4000, 0, "[a]");
+    payload[32] = 20;
+    payload[36..56].copy_from_slice(&id);
+    payload.resize(payload.len().next_multiple_of(8), 0);
+    records.push(record_bytes_with_misc(
+        10,
+        PERF_RECORD_MISC_CPUMODE_KERNEL | PERF_RECORD_MISC_MMAP_BUILD_ID,
+        &payload,
+    ));
+    for (index, ip) in [MODULE, MODULE, CORE, MODULE].into_iter().enumerate() {
+        let time = 1_000_000_000 + u64::try_from(index).unwrap();
+        let payload = if single_callchain {
+            if index != 0 {
+                break;
+            }
+            sample_payload_with_time(
+                MODULE,
+                11,
+                12,
+                time,
+                [0xffff_ffff_ffff_ff80, MODULE, MODULE + 0x10, CORE, MODULE],
+            )
+        } else {
+            sample_payload_with_time(ip, 11, 12, time, [0xffff_ffff_ffff_ff80, ip])
+        };
+        records.push(record_bytes_with_misc(
+            PERF_RECORD_SAMPLE,
+            PERF_RECORD_MISC_CPUMODE_KERNEL,
+            &payload,
+        ));
+    }
+    let mut attr = file_attr_bytes(
+        PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CALLCHAIN,
+        0,
+        0,
+    );
+    put_u64(&mut attr, 16, 1);
+    let mut bytes = perfdata_with_records_and_attrs_vec(vec![attr], records);
+    put_u64(&mut bytes, 16, 144);
+    std::fs::write(root.path().join("perf.data"), &bytes).unwrap();
+    (root, bytes)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_kcore_preserves_cached_module_objects_until_core_replacement() {
+    struct CountedObjectResolver {
+        inner: pyroclast::symbols::RustAddr2lineResolver,
+        calls: std::cell::Cell<usize>,
+    }
+    impl SymbolResolver for CountedObjectResolver {
+        fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
+            self.calls.set(self.calls.get() + 1);
+            self.inner.resolve_batch(requests)
+        }
+        fn resolve_frame_batch_with_metadata(
+            &self,
+            requests: &[SymbolRequest],
+        ) -> Result<Vec<ResolvedSymbolFrames>, String> {
+            self.calls.set(self.calls.get() + 1);
+            self.inner.resolve_frame_batch_with_metadata(requests)
+        }
+    }
+    use inferno::collapse::Collapse as _;
+    for single_callchain in [false, true] {
+        let (root, bytes) = write_native_cached_module_fixture(false, single_callchain);
+        let native = Command::new("perf")
+            .arg("--buildid-dir")
+            .arg(root.path().join(".debug"))
+            .args(["script", "--force", "-vvvv", "--kallsyms"])
+            .arg(root.path().join("kallsyms"))
+            .arg("-i")
+            .arg(root.path().join("perf.data"))
+            .output()
+            .unwrap();
+        assert!(
+            native.status.success(),
+            "{}",
+            String::from_utf8_lossy(&native.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&native.stderr).contains("/kcore for kernel data"),
+            "{}",
+            String::from_utf8_lossy(&native.stderr)
+        );
+        let script = String::from_utf8(native.stdout).unwrap();
+        assert_eq!(
+            script.matches("cached_module_object+0x10 ([a])").count(),
+            1,
+            "{script}"
+        );
+        assert!(
+            script.contains("first+0x10 ([kernel.kallsyms])"),
+            "{script}"
+        );
+        let mut expected = Vec::new();
+        inferno::collapse::perf::Folder::default()
+            .collapse(script.as_bytes(), &mut expected)
+            .unwrap();
+        for inline in [false, true] {
+            let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+                CountedObjectResolver {
+                    inner: pyroclast::symbols::RustAddr2lineResolver::new(),
+                    calls: std::cell::Cell::new(0),
+                },
+                &root.path().join("perf.data"),
+                root.path(),
+                [],
+                &root.path().join("kallsyms"),
+            );
+            let actual = fold_perfdata_callchains_with_symbols(
+                &bytes,
+                FoldOptions {
+                    inline,
+                    count_periods: true,
+                },
+                &resolver,
+            )
+            .unwrap();
+            assert_eq!(actual.as_bytes(), expected, "{script}");
+            assert_eq!(
+                resolver.object_resolver().calls.get(),
+                if single_callchain { 2 } else { 1 },
+                "the original module object should resolve only once"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn kcore_module_object_resolution_precedes_initial_core_loading() {
+    struct ObjectResolver;
+    impl SymbolResolver for ObjectResolver {
+        fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
+            Ok(vec![Some("cached_module_object".into()); requests.len()])
+        }
+    }
+    let (root, _) = write_native_kcore_fixture("[a]");
+    let debug = root.path().join(".debug");
+    let object = pyroclast::symbols::perf_build_id_elf_path(&debug, "abcdef");
+    std::fs::create_dir_all(object.parent().unwrap()).unwrap();
+    // Symbol parsing is delegated to the mock above; this pins source routing.
+    std::fs::write(object, b"mock object source").unwrap();
+    let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+        ObjectResolver,
+        &root.path().join("perf.data"),
+        root.path(),
+        [],
+        &root.path().join("kallsyms"),
+    );
+    let module = SymbolRequest {
+        path: "[a]".into(),
+        relative_address: 0xffff_ffff_c100_0010,
+        kernel_mapping_range: Some((0xffff_ffff_c100_0000, 0xffff_ffff_c100_4000)),
+        build_id: Some("abcdef".into()),
+        file_identity: None,
+        kernel_relocation: None,
+    };
+    let initial = resolver
+        .resolve_frame_batch_with_metadata(std::slice::from_ref(&module))
+        .unwrap();
+    assert_eq!(initial[0].frames, ["cached_module_object"]);
+    assert_eq!(
+        initial[0].kernel_dso,
+        pyroclast::symbols::SymbolDsoName::Mapping
+    );
+    let core = SymbolRequest {
+        path: "[kernel.kallsyms]".into(),
+        relative_address: 0xffff_ffff_8100_0010,
+        kernel_mapping_range: Some((0xffff_ffff_8100_0000, 0xffff_ffff_8101_0000)),
+        build_id: None,
+        file_identity: None,
+        kernel_relocation: None,
+    };
+    assert_eq!(
+        resolver.resolve_frame_batch_with_metadata(&[core]).unwrap()[0].kernel_dso,
+        pyroclast::symbols::SymbolDsoName::KernelKallsyms
+    );
+    let later = resolver
+        .resolve_frame_batch_with_metadata(&[module])
+        .unwrap();
+    assert_eq!(later[0].frames, ["first+0x10"]);
+    assert_eq!(
+        later[0].kernel_dso,
+        pyroclast::symbols::SymbolDsoName::KernelKallsyms
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -6469,6 +7107,7 @@ impl SymbolResolver for SampleIpInlineSymbolResolver {
                     ResolvedSymbolFrames {
                         frames: vec!["app::main".to_string()],
                         source_state: pyroclast::symbols::SymbolSourceState::AddressDependent,
+                        kernel_dso: pyroclast::symbols::SymbolDsoName::Mapping,
                         has_base_symbol: true,
                         has_inline_frames: false,
                         has_non_inline_base_frame: true,
@@ -6731,5 +7370,108 @@ impl SymbolResolver for RecordingSymbolResolver {
                     })
             })
             .collect())
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn kcore_failed_cached_module_loading_preserves_first_cursor_then_replaces_maps() {
+    let (root, _) = write_native_kcore_fixture("[a]");
+    let debug = root.path().join(".debug");
+    let object = pyroclast::symbols::perf_build_id_elf_path(&debug, "abcdef");
+    std::fs::create_dir_all(object.parent().unwrap()).unwrap();
+    std::fs::write(object, b"malformed ELF").unwrap();
+    let module = SymbolRequest {
+        path: "[a]".into(),
+        relative_address: 0xffff_ffff_c100_0010,
+        kernel_mapping_range: Some((0xffff_ffff_c100_0000, 0xffff_ffff_c100_4000)),
+        build_id: Some("abcdef".into()),
+        file_identity: None,
+        kernel_relocation: None,
+    };
+    for scalar in [false, true] {
+        let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+            pyroclast::symbols::RustAddr2lineResolver::new(),
+            &root.path().join("perf.data"),
+            root.path(),
+            [],
+            &root.path().join("kallsyms"),
+        );
+        if scalar {
+            assert_eq!(
+                resolver
+                    .resolve_batch(std::slice::from_ref(&module))
+                    .unwrap(),
+                [None]
+            );
+            assert_eq!(
+                resolver
+                    .resolve_batch(std::slice::from_ref(&module))
+                    .unwrap(),
+                [Some("first+0x10".into())]
+            );
+        } else {
+            assert!(
+                resolver
+                    .resolve_frame_batch_with_metadata(std::slice::from_ref(&module))
+                    .unwrap()[0]
+                    .frames
+                    .is_empty()
+            );
+            assert_eq!(
+                resolver
+                    .resolve_frame_batch_with_metadata(std::slice::from_ref(&module))
+                    .unwrap()[0]
+                    .frames,
+                ["first+0x10"]
+            );
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_kcore_rejects_replacement_after_a_shared_module_object_load() {
+    use inferno::collapse::Collapse as _;
+    let (root, bytes) = write_native_cached_module_fixture(true, false);
+    let native = Command::new("perf")
+        .arg("--buildid-dir")
+        .arg(root.path().join(".debug"))
+        .args(["script", "--force", "-vvvv", "--kallsyms"])
+        .arg(root.path().join("kallsyms"))
+        .arg("-i")
+        .arg(root.path().join("perf.data"))
+        .output()
+        .unwrap();
+    assert!(native.status.success());
+    assert!(!String::from_utf8_lossy(&native.stderr).contains("/kcore for kernel data"));
+    let script = String::from_utf8(native.stdout).unwrap();
+    assert_eq!(
+        script.matches("cached_module_object+0x10 ([a])").count(),
+        3,
+        "{script}"
+    );
+    let mut expected = Vec::new();
+    inferno::collapse::perf::Folder::default()
+        .collapse(script.as_bytes(), &mut expected)
+        .unwrap();
+    for inline in [false, true] {
+        let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+            pyroclast::symbols::RustAddr2lineResolver::new(),
+            &root.path().join("perf.data"),
+            root.path(),
+            [],
+            &root.path().join("kallsyms"),
+        );
+        let actual = fold_perfdata_callchains_with_symbols(
+            &bytes,
+            FoldOptions {
+                inline,
+                count_periods: true,
+            },
+            &resolver,
+        )
+        .unwrap();
+        assert_eq!(actual.as_bytes(), expected, "{script}");
     }
 }

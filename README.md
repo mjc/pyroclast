@@ -145,8 +145,12 @@ tool failures, empty oracle output, and script, folded-stack, or SVG differences
 Mandatory compiled C fixtures cover inline frames and non-PIE PLT addresses;
 the checked-in Xcode fixture covers native referenced CPU rows and cycle units.
 
+Kernel text parity validates bracketed module mappings against host kcore.
+Absolute or compressed module paths and an initially loaded ET_DYN module keep
+their original sources instead of using host kcore. These fallbacks can differ
+from native text exports; broader kernel/version parity remains tracked work.
+
 Process completed recordings: keep the input file unchanged until analysis
-finishes. Folding reads the data section through sequential positioned reads.
-Timestamp-ordered records retain references to those read windows until delivery,
-so the input bytes are not copied or read a second time. This is not a snapshot
-protected against concurrent writes or truncation.
+finishes. Timestamp-ordered records retain read windows until delivery, avoiding
+per-record payload copies and backward rereads. Metadata preparation can make
+separate passes. Input is not protected against concurrent writes or truncation.

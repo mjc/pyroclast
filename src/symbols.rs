@@ -1,3 +1,5 @@
+mod kcore;
+
 use std::borrow::{Borrow, Cow};
 use std::cell::Cell;
 use std::cmp::Ordering;
@@ -114,6 +116,11 @@ impl Ord for SymbolRequest {
 }
 
 pub trait SymbolResolver {
+    /// Kernel map initialization can change the source between callchain nodes.
+    fn requires_kernel_cursor_order(&self) -> bool {
+        false
+    }
+
     /// Resolves a batch of object-relative addresses.
     ///
     /// # Errors
@@ -153,6 +160,28 @@ pub trait SymbolResolver {
         })
     }
 
+    /// Resolves a cursor through the original module ELF after kcore replaces
+    /// its map. Used only while consecutive nodes retain perf's previous map.
+    ///
+    /// # Errors
+    /// Returns an error when the object resolver fails.
+    fn resolve_original_kernel_module_frames(
+        &self,
+        request: &SymbolRequest,
+        inline: bool,
+    ) -> Result<ResolvedSymbolFrames, String> {
+        let requests = std::slice::from_ref(request);
+        let frames = if inline {
+            self.resolve_frame_batch_with_metadata(requests)?
+        } else {
+            self.resolve_base_frame_batch_with_metadata(requests)?
+        };
+        frames
+            .into_iter()
+            .next()
+            .ok_or_else(|| "missing original module frame result".into())
+    }
+
     /// Resolves a batch to only the base object symbol frame perf would use
     /// before expanding inline frames.
     ///
@@ -175,12 +204,26 @@ pub enum SymbolSourceState {
     /// a symbol gap. perf `util/symbol.c:dso__load` records `dso__set_loaded`
     /// on failure as well as success.
     Unavailable,
+    /// The current cursor keeps its old module source before core map replacement.
+    /// Drop its cache entry after printing this cursor so later nodes can change source.
+    KernelMapReplaced,
+    /// The original module ELF remains the current cursor source.
+    KernelObjectMapReplaced,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SymbolDsoName {
+    #[default]
+    Mapping,
+    KernelKallsyms,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ResolvedSymbolFrames {
     pub frames: Vec<String>,
     pub source_state: SymbolSourceState,
+    /// This result came from validated shared kcore replacement maps.
+    pub kernel_dso: SymbolDsoName,
     pub has_base_symbol: bool,
     pub has_inline_frames: bool,
     pub has_non_inline_base_frame: bool,
@@ -202,6 +245,7 @@ impl ResolvedSymbolFrames {
         Self {
             frames,
             source_state: SymbolSourceState::AddressDependent,
+            kernel_dso: SymbolDsoName::Mapping,
             has_base_symbol,
             has_inline_frames,
             has_non_inline_base_frame,
@@ -223,6 +267,8 @@ pub struct SymbolFrameCache<'a, R> {
     scratch_seen_mapping: FxHashSet<MappingFrameKey>,
     scratch_missing_keys: Vec<MappingFrameKey>,
     scratch_missing_requests: Vec<SymbolRequest>,
+    replaced_kernel_entries: SmallVec<[(bool, MappingFrameKey, bool); 2]>,
+    kernel_cursor_hint: Option<(MappingFrameKey, bool)>,
 }
 
 type ResolvedFrameSlice<'a> = (&'a [String], Option<u64>, bool, bool);
@@ -240,9 +286,45 @@ pub(crate) struct CachedMappingFrames {
     pub(crate) literal_ends: Vec<Option<usize>>,
     pub(crate) has_base_symbol: bool,
     pub(crate) render_mode: SymbolFrameRenderMode,
-    has_inline_frames: bool,
-    has_non_inline_base_frame: bool,
-    base_offset: Option<u64>,
+    pub(crate) kernel_dso: SymbolDsoName,
+    pub(crate) has_inline_frames: bool,
+    pub(crate) has_non_inline_base_frame: bool,
+    pub(crate) base_offset: Option<u64>,
+}
+
+impl CachedMappingFrames {
+    fn from_resolved(frames: ResolvedSymbolFrames) -> Self {
+        Self {
+            kernel_dso: frames.kernel_dso,
+            revision: 0,
+            literal_ends: frames
+                .frames
+                .iter()
+                .map(|frame| crate::folded::inferno_perf_raw_function_literal_end(frame))
+                .collect(),
+            // symbol_fprintf.c prints names verbatim. Inferno splits
+            // LF before stack_line_parts trims rawfunc, so these labels
+            // require row parsing, not folded-label escaping. Classify
+            // once on cache insertion, not on each sampled stack.
+            render_mode: if matches!(
+                frames.source_state,
+                SymbolSourceState::KernelMapReplaced | SymbolSourceState::KernelObjectMapReplaced
+            ) || frames
+                .frames
+                .iter()
+                .any(|name| name.contains('\n') || name.trim().len() != name.len())
+            {
+                SymbolFrameRenderMode::PerfScript
+            } else {
+                SymbolFrameRenderMode::Direct
+            },
+            frames: frames.frames,
+            has_base_symbol: frames.has_base_symbol,
+            has_inline_frames: frames.has_inline_frames,
+            has_non_inline_base_frame: frames.has_non_inline_base_frame,
+            base_offset: frames.base_offset,
+        }
+    }
 }
 
 /// Opaque projection key scoped to one `SymbolFrameCache` session.
@@ -409,6 +491,7 @@ impl UserFrameTable {
 }
 
 static UNRESOLVED_MAPPING_FRAMES: CachedMappingFrames = CachedMappingFrames {
+    kernel_dso: SymbolDsoName::Mapping,
     revision: 0,
     frames: Vec::new(),
     literal_ends: Vec::new(),
@@ -426,6 +509,7 @@ impl CachedMappingFrames {
             && !self.has_inline_frames
             && !self.has_non_inline_base_frame
             && self.base_offset.is_none()
+            && self.kernel_dso == SymbolDsoName::Mapping
     }
 }
 
@@ -693,6 +777,7 @@ pub struct PerfSymbolResolver<O> {
     live_kallsyms: Option<Kallsyms>,
     live_kallsyms_path: Option<PathBuf>,
     live_kallsyms_cache: OnceLock<Option<Kallsyms>>,
+    kcore_symbols: OnceLock<Option<kcore::KcoreSymbols>>,
     live_module_kallsyms_cache: OnceLock<FxHashMap<String, Arc<Kallsyms>>>,
     system_map_kallsyms: Option<Kallsyms>,
     system_map_candidates: Vec<PathBuf>,
@@ -1295,6 +1380,7 @@ where
             live_kallsyms: None,
             live_kallsyms_path: None,
             live_kallsyms_cache: OnceLock::new(),
+            kcore_symbols: OnceLock::new(),
             live_module_kallsyms_cache: OnceLock::new(),
             system_map_kallsyms: None,
             system_map_candidates: Vec::new(),
@@ -1837,7 +1923,87 @@ where
             scratch_seen_mapping: FxHashSet::default(),
             scratch_missing_keys: Vec::new(),
             scratch_missing_requests: Vec::new(),
+            replaced_kernel_entries: SmallVec::new(),
+            kernel_cursor_hint: None,
         }
+    }
+
+    pub(crate) fn requires_kernel_cursor_order(&self) -> bool {
+        self.resolver.requires_kernel_cursor_order()
+    }
+
+    pub(crate) fn finish_kernel_cursor(&mut self) {
+        // Keep pre-core positive object results cached until replacement
+        // actually occurs. Repeated module-only samples must not symbolize
+        // the same object address again on every cursor.
+        if self.kernel_cursor_hint.is_some()
+            || self.replaced_kernel_entries.is_empty()
+            || self.resolver.requires_kernel_cursor_order()
+        {
+            return;
+        }
+        for (inline, key, _) in self.replaced_kernel_entries.drain(..) {
+            let table = if inline {
+                &mut self.resolved_by_mapping
+            } else {
+                &mut self.resolved_base_by_mapping
+            };
+            // These entries are old host-kernel module cursors only. Their
+            // rendered projections stay valid; later lookups get a new revision.
+            table.kernel.remove(&key);
+        }
+    }
+
+    pub(crate) fn finish_kernel_sample(&mut self) {
+        self.kernel_cursor_hint = None;
+        self.finish_kernel_cursor();
+    }
+
+    pub(crate) fn resolve_script_mapping_ref(
+        &mut self,
+        mapping: &ResolvedMappingRef<'_>,
+        inline: bool,
+    ) -> Result<&CachedMappingFrames, String> {
+        let key = mapping_frame_key(mapping);
+        if let Some((previous, object)) = self.kernel_cursor_hint {
+            if previous.symbol_source_id == key.symbol_source_id
+                && previous.kernel_mapping_range == key.kernel_mapping_range
+            {
+                let table = if inline {
+                    &self.resolved_by_mapping
+                } else {
+                    &self.resolved_base_by_mapping
+                };
+                if table.slot(&key).is_none() {
+                    let frames = if object {
+                        self.resolver.resolve_original_kernel_module_frames(
+                            &symbol_request_from_mapping_ref(mapping),
+                            inline,
+                        )?
+                    } else {
+                        ResolvedSymbolFrames::default()
+                    };
+                    self.replaced_kernel_entries.push((inline, key, object));
+                    let table = if inline {
+                        &mut self.resolved_by_mapping
+                    } else {
+                        &mut self.resolved_base_by_mapping
+                    };
+                    table.insert(key, CachedMappingFrames::from_resolved(frames));
+                }
+            } else {
+                self.finish_kernel_sample();
+            }
+        }
+        self.prefetch_mapping_refs_with_mode(std::slice::from_ref(mapping), inline)?;
+        if let Some((_, _, object)) = self
+            .replaced_kernel_entries
+            .iter()
+            .find(|(entry_inline, entry_key, _)| *entry_inline == inline && *entry_key == key)
+        {
+            self.kernel_cursor_hint = Some((key, *object));
+        }
+        self.resolve_cached_mapping(mapping, inline)
     }
 
     /// Resolves one object-relative address through the cache.
@@ -2117,33 +2283,19 @@ where
                 ));
             }
             for (key, frames) in keys.drain(..).zip(resolved) {
+                if matches!(
+                    frames.source_state,
+                    SymbolSourceState::KernelMapReplaced
+                        | SymbolSourceState::KernelObjectMapReplaced
+                ) {
+                    self.replaced_kernel_entries.push((
+                        inline,
+                        key,
+                        frames.source_state == SymbolSourceState::KernelObjectMapReplaced,
+                    ));
+                }
                 let unavailable = frames.source_state == SymbolSourceState::Unavailable;
-                let frames = CachedMappingFrames {
-                    revision: 0,
-                    literal_ends: frames
-                        .frames
-                        .iter()
-                        .map(|frame| crate::folded::inferno_perf_raw_function_literal_end(frame))
-                        .collect(),
-                    // symbol_fprintf.c prints names verbatim. Inferno splits
-                    // LF before stack_line_parts trims rawfunc, so these labels
-                    // require row parsing, not folded-label escaping. Classify
-                    // once on cache insertion, not on each sampled stack.
-                    render_mode: if frames
-                        .frames
-                        .iter()
-                        .any(|name| name.contains('\n') || name.trim().len() != name.len())
-                    {
-                        SymbolFrameRenderMode::PerfScript
-                    } else {
-                        SymbolFrameRenderMode::Direct
-                    },
-                    frames: frames.frames,
-                    has_base_symbol: frames.has_base_symbol,
-                    has_inline_frames: frames.has_inline_frames,
-                    has_non_inline_base_frame: frames.has_non_inline_base_frame,
-                    base_offset: frames.base_offset,
-                };
+                let frames = CachedMappingFrames::from_resolved(frames);
                 if unavailable && key.kernel_mapping_range.is_none() && frames.is_fully_unresolved()
                 {
                     self.resolved_by_mapping
@@ -2202,19 +2354,61 @@ impl<O> SymbolResolver for PerfSymbolResolver<O>
 where
     O: SymbolResolver,
 {
+    fn requires_kernel_cursor_order(&self) -> bool {
+        self.kcore_symbols_ref()
+            .is_some_and(|symbols| !symbols.is_active())
+    }
+
+    fn resolve_original_kernel_module_frames(
+        &self,
+        request: &SymbolRequest,
+        inline: bool,
+    ) -> Result<ResolvedSymbolFrames, String> {
+        let object_request = self.cached_object_symbol_request(
+            request,
+            &mut self
+                .address_cache
+                .lock()
+                .expect("object address cache lock"),
+        );
+        let Some(object_request) = object_request else {
+            return Ok(ResolvedSymbolFrames::default());
+        };
+        self.resolve_object_frame_batch(std::slice::from_ref(&object_request), inline)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "missing original module frame result".into())
+    }
+
     fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
         let mut resolved = vec![None; requests.len()];
         let mut kernel_elf_requests = Vec::new();
         let mut kernel_elf_indexes = Vec::new();
         let mut user_requests = Vec::new();
         let mut user_indexes = Vec::new();
+        let mut old_module_objects = Vec::new();
         let mut address_cache = self
             .address_cache
             .lock()
             .expect("object address cache lock");
 
         for (index, request) in requests.iter().enumerate() {
-            if is_kernel_module_symbol_path(&request.path) {
+            if is_kernel_symbol_path(&request.path)
+                && let Some(symbols) = self.kcore_symbols_ref()
+                && symbols.contains(request.relative_address)
+            {
+                if is_kernel_module_symbol_path(&request.path)
+                    && !symbols.is_active()
+                    && let Some(object_request) =
+                        self.cached_object_symbol_request(request, &mut address_cache)
+                {
+                    old_module_objects.push(index);
+                    user_indexes.push(index);
+                    user_requests.push(object_request);
+                } else if symbols.activate(is_kernel_module_symbol_path(&request.path)) {
+                    resolved[index] = symbols.resolve(request.relative_address);
+                }
+            } else if is_kernel_module_symbol_path(&request.path) {
                 if let Some(object_request) =
                     self.cached_object_symbol_request(request, &mut address_cache)
                 {
@@ -2251,12 +2445,25 @@ where
 
         if !user_requests.is_empty() {
             let user_symbols = self.object_resolver.resolve_batch(&user_requests)?;
-            for (index, symbol) in user_indexes.into_iter().zip(user_symbols) {
-                resolved[index] = symbol.or_else(|| {
-                    is_kernel_module_symbol_path(&requests[index].path)
-                        .then(|| self.resolve_kernel_symbol(&requests[index]))
-                        .flatten()
-                });
+            for ((index, symbol), object_request) in user_indexes
+                .into_iter()
+                .zip(user_symbols)
+                .zip(&user_requests)
+            {
+                if old_module_objects.contains(&index) {
+                    // Loading a module also initializes the core maps, but this
+                    // cursor keeps its original module source.
+                    if let Some(symbols) = self.kcore_symbols_ref() {
+                        symbols.finish_module_load(&object_request.path);
+                    }
+                    resolved[index] = symbol;
+                } else {
+                    resolved[index] = symbol.or_else(|| {
+                        is_kernel_module_symbol_path(&requests[index].path)
+                            .then(|| self.resolve_kernel_symbol(&requests[index]))
+                            .flatten()
+                    });
+                }
             }
         }
         Ok(resolved)
@@ -2301,13 +2508,37 @@ where
         let mut kernel_elf_indexes = RequestIndexes::new();
         let mut user_requests = SmallVec::<[SymbolRequest; 16]>::new();
         let mut user_indexes = RequestIndexes::new();
+        let mut old_module_objects = SmallVec::<[usize; 4]>::new();
         let mut address_cache = self
             .address_cache
             .lock()
             .expect("object address cache lock");
 
         for (index, request) in requests.iter().enumerate() {
-            if is_kernel_module_symbol_path(&request.path) {
+            if is_kernel_symbol_path(&request.path)
+                && let Some(symbols) = self.kcore_symbols_ref()
+                && symbols.contains(request.relative_address)
+            {
+                if is_kernel_module_symbol_path(&request.path)
+                    && !symbols.is_active()
+                    && let Some(object_request) =
+                        self.cached_object_symbol_request(request, &mut address_cache)
+                {
+                    old_module_objects.push(index);
+                    user_indexes.push(index);
+                    user_requests.push(object_request);
+                } else if symbols.activate(is_kernel_module_symbol_path(&request.path)) {
+                    resolved[index] = ResolvedSymbolFrames::from_frames(
+                        symbols
+                            .resolve(request.relative_address)
+                            .into_iter()
+                            .collect(),
+                    );
+                    resolved[index].kernel_dso = SymbolDsoName::KernelKallsyms;
+                } else {
+                    resolved[index].source_state = SymbolSourceState::KernelMapReplaced;
+                }
+            } else if is_kernel_module_symbol_path(&request.path) {
                 if let Some(object_request) =
                     self.cached_object_symbol_request(request, &mut address_cache)
                 {
@@ -2345,9 +2576,14 @@ where
 
         if !user_requests.is_empty() {
             let user_frames = self.resolve_object_frame_batch(&user_requests, inline)?;
-            for (index, frames) in user_indexes.into_iter().zip(user_frames) {
+            for ((index, frames), object_request) in user_indexes
+                .into_iter()
+                .zip(user_frames)
+                .zip(&user_requests)
+            {
                 let module = is_kernel_module_symbol_path(&requests[index].path);
-                let mut frames = if frames.frames.is_empty() && module {
+                let old_module = old_module_objects.contains(&index);
+                let mut frames = if frames.frames.is_empty() && module && !old_module {
                     self.resolve_kernel_symbol(&requests[index])
                         .map(|symbol| ResolvedSymbolFrames::from_frames(vec![symbol]))
                         .unwrap_or(frames)
@@ -2357,6 +2593,14 @@ where
                 // A missing module ELF does not rule out its kallsyms source.
                 if module {
                     frames.source_state = SymbolSourceState::AddressDependent;
+                }
+                if old_module {
+                    // Even a successful module ELF load initializes the core
+                    // maps after resolving this cursor with its original DSO.
+                    if let Some(symbols) = self.kcore_symbols_ref() {
+                        symbols.finish_module_load(&object_request.path);
+                    }
+                    frames.source_state = SymbolSourceState::KernelObjectMapReplaced;
                 }
                 resolved[index] = frames;
             }
@@ -2483,6 +2727,22 @@ where
                 })
                 .as_ref()
         })
+    }
+
+    fn kcore_symbols_ref(&self) -> Option<&kcore::KcoreSymbols> {
+        self.kcore_symbols
+            .get_or_init(|| {
+                // Explicit/cached sources keep their own map identity. Host kcore
+                // is consulted only for the actual file-backed live kallsyms path.
+                if self.kallsyms_ref().is_some() || self.kernel_elf_ref().is_some() {
+                    return None;
+                }
+                let kallsyms_path = self.live_kallsyms_path.as_deref()?;
+                let recording = &self.file_kernel_cache.as_ref()?.perfdata;
+                kcore::KcoreSymbols::load(recording, kallsyms_path)
+            })
+            .as_ref()
+            .filter(|symbols| !symbols.is_rejected())
     }
 
     fn resolve_kernel_symbol(&self, request: &SymbolRequest) -> Option<String> {
@@ -2694,6 +2954,7 @@ where
                 resolved[index] = ResolvedSymbolFrames {
                     frames,
                     source_state: SymbolSourceState::AddressDependent,
+                    kernel_dso: SymbolDsoName::Mapping,
                     has_base_symbol,
                     has_inline_frames,
                     has_non_inline_base_frame,
@@ -2870,6 +3131,7 @@ impl SymbolResolver for RustAddr2lineResolver {
                 resolved[index] = ResolvedSymbolFrames {
                     frames,
                     source_state: SymbolSourceState::AddressDependent,
+                    kernel_dso: SymbolDsoName::Mapping,
                     has_base_symbol,
                     has_inline_frames,
                     has_non_inline_base_frame,
@@ -2958,6 +3220,7 @@ fn resolve_base_frames_from_object_metadata(
             resolved[index] = ResolvedSymbolFrames {
                 frames,
                 source_state: SymbolSourceState::AddressDependent,
+                kernel_dso: SymbolDsoName::Mapping,
                 has_base_symbol: true,
                 has_inline_frames: false,
                 has_non_inline_base_frame: true,
@@ -4949,8 +5212,8 @@ mod tests {
         CachedObjectMetadata, Kallsyms, PerfAddressRange, PerfDwarfDieKind, PerfDwarfDieNode,
         PerfDwarfFrameNames, PerfDwarfIndexCache, PerfDwarfNameInterner, PerfObjectSymbolIndex,
         PerfSymbolBinding, PerfSymbolCandidate, PerfSymbolScope, PreparedObjectMetadata,
-        ResolvedMappingRef, ResolvedSymbolFrames, RustAddr2lineResolver, SymbolFrameCache,
-        SymbolRequest, SymbolResolver, clean_object_symbol_request,
+        ResolvedMappingRef, ResolvedSymbolFrames, RustAddr2lineResolver, SymbolDsoName,
+        SymbolFrameCache, SymbolRequest, SymbolResolver, clean_object_symbol_request,
         demangle_addr2line_name_qualified, fixup_object_symbol_ends_like_perf,
         gnu_build_id_from_notes, perf_best_duplicate_symbol, perf_dwarf_frame_names_from_index,
         perf_dwarf_frame_ranges_from_roots, perf_frames_with_object_alias,
@@ -6055,6 +6318,7 @@ mod tests {
                     "alloc::collections::btree::map::IntoIter<K,V,A>::dying_next+0x180".to_string()
                 ],
                 source_state: super::SymbolSourceState::AddressDependent,
+                kernel_dso: SymbolDsoName::Mapping,
                 has_base_symbol: true,
                 has_inline_frames: false,
                 has_non_inline_base_frame: true,
@@ -6667,6 +6931,7 @@ mod tests {
             results[0],
             ResolvedSymbolFrames {
                 source_state: super::SymbolSourceState::Unavailable,
+                kernel_dso: SymbolDsoName::Mapping,
                 ..ResolvedSymbolFrames::default()
             }
         );
@@ -7329,6 +7594,7 @@ mod tests {
     fn cached_table_frames(label: String, offset: u64) -> super::CachedMappingFrames {
         let literal_end = crate::folded::inferno_perf_raw_function_literal_end(&label);
         super::CachedMappingFrames {
+            kernel_dso: SymbolDsoName::Mapping,
             revision: 0,
             frames: vec![label],
             literal_ends: vec![literal_end],
@@ -7342,6 +7608,7 @@ mod tests {
 
     fn empty_cached_table_frames() -> super::CachedMappingFrames {
         super::CachedMappingFrames {
+            kernel_dso: SymbolDsoName::Mapping,
             revision: 0,
             frames: Vec::new(),
             literal_ends: Vec::new(),
@@ -8629,6 +8896,7 @@ mod tests {
             Ok(vec![
                 ResolvedSymbolFrames {
                     source_state: super::SymbolSourceState::Unavailable,
+                    kernel_dso: SymbolDsoName::Mapping,
                     ..ResolvedSymbolFrames::default()
                 };
                 requests.len()
@@ -8749,6 +9017,7 @@ mod tests {
                     .iter()
                     .map(|_| ResolvedSymbolFrames {
                         source_state: super::SymbolSourceState::Unavailable,
+                        kernel_dso: SymbolDsoName::Mapping,
                         ..ResolvedSymbolFrames::from_frames(vec!["present".into()])
                     })
                     .collect())

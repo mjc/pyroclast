@@ -2813,6 +2813,7 @@ ffffffffc0e38940 t nvs_xdr_nvp_op [zfs]
         vec![pyroclast::symbols::ResolvedSymbolFrames {
             frames: vec!["nvs_xdr_nvp_op+0x231".to_string()],
             source_state: pyroclast::symbols::SymbolSourceState::AddressDependent,
+            kernel_dso: pyroclast::symbols::SymbolDsoName::Mapping,
             has_base_symbol: true,
             has_inline_frames: false,
             has_non_inline_base_frame: true,

@@ -1,5 +1,7 @@
 mod metadata;
-pub(crate) use metadata::{PerfSampleMetadata, visit_perfdata_file_metadata};
+pub(crate) use metadata::{
+    PerfSampleMetadata, recorded_kernel_maps_file, visit_perfdata_file_metadata,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
@@ -1759,6 +1761,9 @@ where
                 self.writer,
             )?;
         }
+        if let Some(cache) = self.symbol_cache.as_deref_mut() {
+            cache.finish_kernel_sample();
+        }
         self.writer
             .write_all(b"\n")
             .map_err(|error| format!("failed to write perf script output: {error}"))
@@ -3391,6 +3396,16 @@ fn append_pending_folded_frames<R: SymbolResolver>(
     }) {
         return Ok(FoldedRenderStatus::RequiresPerfText);
     }
+    // A native kernel source can replace module maps between cursor nodes.
+    // Until initialized, use the existing ordered script path, before reversed
+    // folded-frame prefetch can resolve a later node ahead of an earlier one.
+    if pending.iter().any(|(_, decision, _)| {
+        matches!(decision,
+        FrameMappingDecision::Mapped(mapping) if mapping.is_kernel())
+    }) && cache.requires_kernel_cursor_order()
+    {
+        return Ok(FoldedRenderStatus::RequiresPerfText);
+    }
     prefetch_sample_symbols(pending, cache, inline)?;
     for &(frame, decision, repeats) in pending {
         let segment_start = if repeats > 1 { buffers.stack_len() } else { 0 };
@@ -3738,6 +3753,32 @@ fn write_perf_script_mapped_decision_frame<R, W>(
     address: u64,
     is_cookie: bool,
     mapping: &ResolvedMappingRef<'_>,
+    mut symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+    inline: bool,
+) -> Result<(), String>
+where
+    R: SymbolResolver,
+    W: IoWrite + ?Sized,
+{
+    let result = write_perf_script_mapped_decision_cursor(
+        writer,
+        address,
+        is_cookie,
+        mapping,
+        symbol_cache.as_deref_mut(),
+        inline,
+    );
+    if let Some(cache) = symbol_cache {
+        cache.finish_kernel_cursor();
+    }
+    result
+}
+
+fn write_perf_script_mapped_decision_cursor<R, W>(
+    writer: &mut W,
+    address: u64,
+    is_cookie: bool,
+    mapping: &ResolvedMappingRef<'_>,
     symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
     inline: bool,
 ) -> Result<(), String>
@@ -3753,40 +3794,39 @@ where
         }
         return Ok(());
     };
-    // Base-only mode resolves one object symbol and prints it with the mapping's
-    // full DSO name (map__fprintf_dsoname). The CLI parity path keeps inline on
-    // so DWARF data can emit the inline rows that real perf prints.
+    let cached = cache.resolve_script_mapping_ref(mapping, inline)?;
+    let dso_name = if cached.kernel_dso == crate::symbols::SymbolDsoName::KernelKallsyms {
+        "[kernel.kallsyms]"
+    } else {
+        mapping.path
+    };
     if !inline {
         if is_cookie {
-            let _ = cache.resolve_mapping_ref_with_base_symbol(mapping)?;
-            return write_perf_script_mapped_symbol_frame(
-                writer,
-                address,
-                "(cookie)",
-                mapping.path,
-            );
+            return write_perf_script_mapped_symbol_frame(writer, address, "(cookie)", dso_name);
         }
-        return match cache.resolve_mapping_ref_with_base_symbol(mapping)? {
-            Some([label, ..]) => {
-                write_perf_script_mapped_symbol_frame(writer, address, label, mapping.path)
+        return match (cached.has_base_symbol, cached.frames.first()) {
+            (true, Some(label)) => {
+                write_perf_script_mapped_symbol_frame(writer, address, label, dso_name)
             }
-            _ => write_perf_script_mapped_unknown_symbol_frame(writer, address, mapping.path),
+            _ => write_perf_script_mapped_unknown_symbol_frame(writer, address, dso_name),
         };
     }
-    let (frames, base_offset, has_inline_frames, has_non_inline_base_frame) =
-        cache.resolve_mapping_ref_with_offset(mapping)?;
+    let frames = &cached.frames;
+    let base_offset = cached.base_offset;
+    let has_inline_frames = cached.has_inline_frames;
+    let has_non_inline_base_frame = cached.has_non_inline_base_frame;
     if frames.is_empty() {
         if is_cookie {
-            write_perf_script_mapped_symbol_frame(writer, address, "(cookie)", mapping.path)?;
+            write_perf_script_mapped_symbol_frame(writer, address, "(cookie)", dso_name)?;
         } else {
-            write_perf_script_mapped_unknown_symbol_frame(writer, address, mapping.path)?;
+            write_perf_script_mapped_unknown_symbol_frame(writer, address, dso_name)?;
         }
-    } else if frames.len() == 1 && !has_inline_frames && !is_kernel_space_frame(address) {
+    } else if frames.len() == 1 && !has_inline_frames {
         // A single non-inline base frame already carries its +0x<off> baked in
         // by perf_frames_with_object_alias_and_offset (the symtab with_offset
         // form), so print it verbatim with the DSO path.
         let label = if is_cookie { "(cookie)" } else { &frames[0] };
-        write_perf_script_mapped_symbol_frame(writer, address, label, mapping.path)?;
+        write_perf_script_mapped_symbol_frame(writer, address, label, dso_name)?;
     } else {
         let last = frames.len() - 1;
         for (printed_index, label) in frames.iter().rev().enumerate() {
@@ -3804,7 +3844,7 @@ where
                 address,
                 label,
                 base_offset,
-                mapping.path,
+                dso_name,
                 is_inlined,
             )?;
         }
@@ -3862,6 +3902,28 @@ fn write_perf_script_inline_mapped_decision_frame<R, W>(
     writer: &mut W,
     address: u64,
     mapping: &ResolvedMappingRef<'_>,
+    mut symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+) -> Result<(), String>
+where
+    R: SymbolResolver,
+    W: IoWrite + ?Sized,
+{
+    let result = write_perf_script_inline_mapped_decision_cursor(
+        writer,
+        address,
+        mapping,
+        symbol_cache.as_deref_mut(),
+    );
+    if let Some(cache) = symbol_cache {
+        cache.finish_kernel_cursor();
+    }
+    result
+}
+
+fn write_perf_script_inline_mapped_decision_cursor<R, W>(
+    writer: &mut W,
+    address: u64,
+    mapping: &ResolvedMappingRef<'_>,
     symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
 ) -> Result<(), String>
 where
@@ -3869,21 +3931,19 @@ where
     W: IoWrite + ?Sized,
 {
     if let Some(cache) = symbol_cache {
-        let frames = cache.resolve_mapping_ref_with_base_symbol(mapping)?;
-        if let Some([label, ..]) = frames {
+        let cached = cache.resolve_script_mapping_ref(mapping, false)?;
+        let dso_name = if cached.kernel_dso == crate::symbols::SymbolDsoName::KernelKallsyms {
+            "[kernel.kallsyms]"
+        } else {
+            mapping.path
+        };
+        if let (true, Some(label)) = (cached.has_base_symbol, cached.frames.first()) {
             return write_perf_script_mapped_symbol_frame_fragment(
-                writer,
-                "",
-                address,
-                label,
-                mapping.path,
+                writer, "", address, label, dso_name,
             );
         }
         return write_perf_script_mapped_unknown_symbol_frame_fragment(
-            writer,
-            "",
-            address,
-            mapping.path,
+            writer, "", address, dso_name,
         );
     }
     write_perf_script_mapped_unknown_symbol_frame_fragment(writer, "", address, mapping.path)
@@ -5713,6 +5773,7 @@ mod tests {
                 ResolvedSymbolFrames {
                     frames: self.frames.clone(),
                     source_state: crate::symbols::SymbolSourceState::AddressDependent,
+                    kernel_dso: crate::symbols::SymbolDsoName::Mapping,
                     has_base_symbol: self.has_base_symbol,
                     has_inline_frames: self.has_inline_frames,
                     has_non_inline_base_frame: self.has_non_inline_base_frame,
@@ -5738,6 +5799,7 @@ mod tests {
                 ResolvedSymbolFrames {
                     frames: vec!["wrong_dwarf_leaf".to_string()],
                     source_state: crate::symbols::SymbolSourceState::AddressDependent,
+                    kernel_dso: crate::symbols::SymbolDsoName::Mapping,
                     has_base_symbol: true,
                     has_inline_frames: false,
                     has_non_inline_base_frame: true,
@@ -5757,6 +5819,7 @@ mod tests {
                         "pyroclast::parsers::strace::parse_strace_summary+0xaa0".to_string(),
                     ],
                     source_state: crate::symbols::SymbolSourceState::AddressDependent,
+                    kernel_dso: crate::symbols::SymbolDsoName::Mapping,
                     has_base_symbol: true,
                     has_inline_frames: false,
                     has_non_inline_base_frame: true,
@@ -5799,6 +5862,7 @@ mod tests {
                 .map(|request| ResolvedSymbolFrames {
                     frames: vec![format!("symbol_{:x}", request.relative_address)],
                     source_state: crate::symbols::SymbolSourceState::AddressDependent,
+                    kernel_dso: crate::symbols::SymbolDsoName::Mapping,
                     has_base_symbol: true,
                     has_inline_frames: false,
                     has_non_inline_base_frame: true,
@@ -6262,6 +6326,58 @@ mod tests {
             .expect("render folded stack");
 
         assert_eq!(buffers.rendered(), "pyroclast;[pyroclast]");
+    }
+
+    #[test]
+    fn script_frames_use_the_resolvers_validated_kernel_dso_name_in_both_inline_modes() {
+        struct KcoreResolver;
+        impl SymbolResolver for KcoreResolver {
+            fn resolve_batch(
+                &self,
+                requests: &[SymbolRequest],
+            ) -> Result<Vec<Option<String>>, String> {
+                Ok(vec![Some("module_function+0x10".into()); requests.len()])
+            }
+            fn resolve_frame_batch_with_metadata(
+                &self,
+                requests: &[SymbolRequest],
+            ) -> Result<Vec<ResolvedSymbolFrames>, String> {
+                Ok(vec![
+                    ResolvedSymbolFrames {
+                        kernel_dso: crate::symbols::SymbolDsoName::KernelKallsyms,
+                        ..ResolvedSymbolFrames::from_frames(vec!["module_function+0x10".into()])
+                    };
+                    requests.len()
+                ])
+            }
+        }
+        let mapping = crate::perfdata::mappings::ResolvedMappingRef {
+            symbol_source_id: 1,
+            path: "[module]",
+            relative_address: 0xffff_ffff_c100_0010,
+            start: 0xffff_ffff_c100_0000,
+            end: 0xffff_ffff_c100_1000,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        };
+        for inline in [false, true] {
+            let mut cache = SymbolFrameCache::new(&KcoreResolver);
+            let mut output = Vec::new();
+            super::write_perf_script_mapped_decision_frame(
+                &mut output,
+                mapping.relative_address,
+                false,
+                &mapping,
+                Some(&mut cache),
+                inline,
+            )
+            .unwrap();
+            assert_eq!(
+                String::from_utf8(output).unwrap(),
+                "\tffffffffc1000010 module_function+0x10 ([kernel.kallsyms])\n"
+            );
+        }
     }
 
     #[test]
