@@ -42,6 +42,335 @@ fn render_unknown_folded_callchain(frames: &[u64], count: u64) -> String {
     rendered
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+enum LiveCfiSource {
+    WithCfi,
+    WithoutCfi,
+    Missing,
+    Invalid,
+    Unreadable,
+    NonRegular,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+struct CfiSourceFixture {
+    _root: tempfile::TempDir,
+    home: std::path::PathBuf,
+    data: std::path::PathBuf,
+    expected_ips: Vec<u64>,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn compile_cfi_source_elf(source: &std::path::Path, binary: &std::path::Path, cached: bool) {
+    let mut compiler = Command::new("cc");
+    compiler.args([
+        "-nostdlib",
+        "-no-pie",
+        "-Wl,-e,identity_leaf",
+        "-Wl,-Ttext=0x401000",
+        "-Wl,--eh-frame-hdr",
+    ]);
+    if cached {
+        compiler.args(["-DCACHE_CFI", "-Wl,--build-id=0xaabbccdd"]);
+    } else {
+        compiler.arg("-Wl,--build-id=0x11223344");
+    }
+    let output = compiler
+        .arg(source)
+        .arg("-o")
+        .arg(binary)
+        .output()
+        .expect("compile CFI source fixture");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn replace_live_cfi_source(live_source: LiveCfiSource, live: &std::path::Path) {
+    match live_source {
+        LiveCfiSource::WithCfi | LiveCfiSource::WithoutCfi => {}
+        LiveCfiSource::Missing => {
+            std::fs::remove_file(live).expect("remove live ELF");
+        }
+        LiveCfiSource::Invalid => {
+            std::fs::write(live, b"not an ELF").expect("invalidate live ELF");
+        }
+        LiveCfiSource::Unreadable => {
+            std::fs::remove_file(live).expect("remove live ELF");
+            // ELOOP makes the live path unreadable even when tests run as root.
+            std::os::unix::fs::symlink(live, live).expect("unreadable live path");
+            assert!(std::fs::read(live).is_err());
+        }
+        LiveCfiSource::NonRegular => {
+            std::fs::remove_file(live).expect("remove live ELF");
+            std::fs::create_dir(live).expect("non-regular live path");
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn cfi_source_fixture(live_source: LiveCfiSource) -> CfiSourceFixture {
+    let root = tempfile::tempdir().expect("CFI source fixture");
+    let home = root.path().join("home");
+    let live = root.path().join("live.elf");
+    let cached = pyroclast::symbols::perf_build_id_elf_path(&home.join(".debug"), "aabbccdd");
+    std::fs::create_dir_all(cached.parent().expect("cache parent")).expect("cache directory");
+    let source = root.path().join("identity.S");
+    std::fs::write(&source, ".text\n.globl identity_leaf\n.type identity_leaf,@function\nidentity_leaf:\n.cfi_startproc\n#ifdef CACHE_CFI\n.cfi_def_cfa %rsp,16\n#else\n.cfi_def_cfa %rsp,8\n#endif\n.cfi_offset %rip,-8\n.fill 16,1,0x90\nret\n.cfi_endproc\n.size identity_leaf,.-identity_leaf\n.p2align 5\n.globl caller_live\n.type caller_live,@function\ncaller_live:\n.cfi_startproc\n.cfi_def_cfa %rsp,8\n.cfi_undefined %rip\n.fill 16,1,0x90\nret\n.cfi_endproc\n.size caller_live,.-caller_live\n.p2align 5\n.globl caller_cache\n.type caller_cache,@function\ncaller_cache:\n.cfi_startproc\n.cfi_def_cfa %rsp,8\n.cfi_undefined %rip\n.fill 16,1,0x90\nret\n.cfi_endproc\n.size caller_cache,.-caller_cache\n.section .note.GNU-stack,\"\",@progbits\n").expect("CFI assembly");
+    compile_cfi_source_elf(&source, &live, false);
+    compile_cfi_source_elf(&source, &cached, true);
+    if matches!(live_source, LiveCfiSource::WithoutCfi) {
+        let output = Command::new("objcopy")
+            .args([
+                "--remove-section=.eh_frame",
+                "--remove-section=.eh_frame_hdr",
+            ])
+            .arg(&live)
+            .output()
+            .expect("strip live CFI");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let bytes = std::fs::read(&live).expect("live ELF");
+    let elf = object::File::parse(bytes.as_slice()).expect("parse live ELF");
+    assert_eq!(elf.kind(), object::ObjectKind::Executable);
+    assert_ne!(
+        elf.build_id().expect("live ID"),
+        Some(&[0xaa, 0xbb, 0xcc, 0xdd][..])
+    );
+    let symbol = |name| {
+        elf.symbols()
+            .find(|s| s.name() == Ok(name))
+            .expect("fixture symbol")
+            .address()
+    };
+    let ip = symbol("identity_leaf") + 1;
+    let caller_live = symbol("caller_live");
+    let caller_cache = symbol("caller_cache");
+    let mut stack = [0; 64];
+    stack[..8].copy_from_slice(&(caller_live + 1).to_le_bytes());
+    stack[8..16].copy_from_slice(&(caller_cache + 1).to_le_bytes());
+    let data = root.path().join("perf.data");
+    let recording = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            (1 << 6) | (1 << 7) | (1 << 8),
+        )],
+        [
+            record_bytes_with_misc(
+                10,
+                PERF_RECORD_MISC_CPUMODE_USER | PERF_RECORD_MISC_MMAP_BUILD_ID,
+                &mmap2_build_id_payload(
+                    11,
+                    12,
+                    0x0040_0000,
+                    0x0001_0000,
+                    0,
+                    live.to_str().expect("live path"),
+                ),
+            ),
+            record_bytes_with_misc(
+                9,
+                PERF_RECORD_MISC_CPUMODE_USER,
+                &sample_payload_with_user_stack(
+                    ip,
+                    11,
+                    12,
+                    [0xffff_ffff_ffff_fe00, ip],
+                    2,
+                    [0, 0x7000_0000, ip],
+                    stack,
+                ),
+            ),
+        ],
+    );
+    std::fs::write(&data, recording).expect("write recording");
+    // perf util/unwind-libdw.c:108-123 selects a reported live module even if
+    // its ID is wrong or it has no CFI (libdwfl/dwfl_report_elf.c:302-325).
+    replace_live_cfi_source(live_source, &live);
+    let mut expected_ips = vec![ip, ip];
+    match live_source {
+        LiveCfiSource::WithCfi => expected_ips.push(caller_live),
+        LiveCfiSource::WithoutCfi => {}
+        _ => expected_ips.push(caller_cache),
+    }
+    CfiSourceFixture {
+        _root: root,
+        home,
+        data,
+        expected_ips,
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+struct CfiAddressResolver;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl SymbolResolver for CfiAddressResolver {
+    fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
+        Ok(requests
+            .iter()
+            .map(|request| Some(format!("ip_{:x}", request.relative_address)))
+            .collect())
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn check_cfi_source_byte_and_file_routes(name: &str, live_source: LiveCfiSource) {
+    if let Some(data) = std::env::var_os("PYROCLAST_CFI_SOURCE_DATA") {
+        let data = std::path::PathBuf::from(data);
+        let expected =
+            std::env::var("PYROCLAST_CFI_SOURCE_EXPECTED").expect("expected folded frames");
+        let bytes = std::fs::read(&data).expect("recording bytes");
+        assert_eq!(
+            fold_perfdata_callchains_with_symbols(
+                &bytes,
+                FoldOptions::default(),
+                &CfiAddressResolver
+            )
+            .expect("byte fold"),
+            expected
+        );
+        assert_eq!(
+            pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(
+                &data,
+                FoldOptions::default(),
+                &CfiAddressResolver
+            )
+            .expect("file fold"),
+            expected
+        );
+        return;
+    }
+    let fixture = cfi_source_fixture(live_source);
+    let labels = fixture
+        .expected_ips
+        .iter()
+        .rev()
+        .map(|ip| format!("ip_{:x}", ip - 0x0040_0000))
+        .collect::<Vec<_>>()
+        .join(";");
+    let expected = format!(":12;{labels} 1\n");
+    let output = Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", name, "--nocapture"])
+        .env("HOME", &fixture.home)
+        .env("PYROCLAST_CFI_SOURCE_DATA", &fixture.data)
+        .env("PYROCLAST_CFI_SOURCE_EXPECTED", expected)
+        .output()
+        .expect("isolated byte/file routes");
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn check_cfi_source_perf_script(live_source: LiveCfiSource) {
+    let fixture = cfi_source_fixture(live_source);
+    for symbolizer in ["addr2line", "rust-addr2line"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pyroclast"))
+            .args([
+                "plumbing",
+                "perf-script",
+                "--no-inline",
+                "--symbolizer",
+                symbolizer,
+            ])
+            .arg(&fixture.data)
+            .env("HOME", &fixture.home)
+            .env("DEBUGINFOD_URLS", "")
+            .output()
+            .expect("public perf-script route");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let script = String::from_utf8(output.stdout).expect("script UTF-8");
+        let ips = script
+            .lines()
+            .filter_map(|line| {
+                line.split_whitespace()
+                    .next()
+                    .and_then(|word| u64::from_str_radix(word, 16).ok())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ips, fixture.expected_ips, "{symbolizer}: {script}");
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn byte_and_file_routes_prefer_live_cfi_over_recorded_build_id_cache() {
+    check_cfi_source_byte_and_file_routes(
+        "byte_and_file_routes_prefer_live_cfi_over_recorded_build_id_cache",
+        LiveCfiSource::WithCfi,
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn byte_and_file_routes_do_not_replace_valid_live_elf_without_cfi_with_cache() {
+    check_cfi_source_byte_and_file_routes(
+        "byte_and_file_routes_do_not_replace_valid_live_elf_without_cfi_with_cache",
+        LiveCfiSource::WithoutCfi,
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn perf_script_prefers_live_cfi_over_recorded_build_id_cache() {
+    check_cfi_source_perf_script(LiveCfiSource::WithCfi);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn perf_script_does_not_replace_valid_live_elf_without_cfi_with_cache() {
+    check_cfi_source_perf_script(LiveCfiSource::WithoutCfi);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn byte_and_file_routes_use_cache_cfi_when_live_module_cannot_be_reported() {
+    for source in [
+        LiveCfiSource::Missing,
+        LiveCfiSource::Invalid,
+        LiveCfiSource::Unreadable,
+        LiveCfiSource::NonRegular,
+    ] {
+        check_cfi_source_byte_and_file_routes(
+            "byte_and_file_routes_use_cache_cfi_when_live_module_cannot_be_reported",
+            source,
+        );
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn perf_script_uses_cache_cfi_when_live_module_cannot_be_reported() {
+    for source in [
+        LiveCfiSource::Missing,
+        LiveCfiSource::Invalid,
+        LiveCfiSource::Unreadable,
+        LiveCfiSource::NonRegular,
+    ] {
+        check_cfi_source_perf_script(source);
+    }
+}
+
 #[test]
 fn audit_regression_rejects_maximal_attr_section_before_allocation() {
     let mut bytes = perfdata_with_records_and_attrs([], []);

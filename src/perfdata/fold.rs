@@ -228,6 +228,7 @@ struct PidUnwindState {
     object_unwinder: FramehopUnwinder,
     live_vdso_elf: OnceLock<Option<LiveVdsoElf>>,
     attempted_unwind_mappings: BTreeSet<UnwindMappingKey>,
+    /// Original DSO path and load base, recorded only after source reporting.
     loaded_unwind_modules: BTreeSet<UnwindModuleKey>,
     /// Memo of the ip-intrinsic leaf-only eligibility per sampled IP. Only the
     /// `(pid, ip)`-stable facts are cached here: whether the module covering
@@ -2562,20 +2563,10 @@ impl SessionState {
         let Some(unwind_state) = self.unwind_states.get(&pid) else {
             return false;
         };
-        let object_path = mapping.build_id.map_or_else(
-            || PathBuf::from(mapping.path),
-            |build_id| {
-                unwind_object_path_for_build_id(
-                    mapping.path,
-                    build_id,
-                    self.unwind_debug_dir.as_deref(),
-                )
-            },
-        );
         unwind_state
             .loaded_unwind_modules
             .contains(&unwind_module_key(
-                object_path.to_string_lossy().as_ref(),
+                mapping.path,
                 mapping.start,
                 mapping.pgoff,
             ))
@@ -4784,6 +4775,10 @@ fn load_unwind_mapping_for_user_mapping_like_perf(
     mapping: UserMapping<'_>,
     unwind_debug_dir: Option<&Path>,
 ) -> bool {
+    let module_key = unwind_module_key(mapping.path, mapping.start, mapping.pgoff);
+    if state.loaded_unwind_modules.contains(&module_key) {
+        return false;
+    }
     let path = mapping.path.to_string();
     let build_id = mapping
         .build_id
@@ -4802,29 +4797,41 @@ fn load_unwind_mapping_for_user_mapping_like_perf(
     // cache object is available. Symbolization already follows this fallback;
     // unwinding must report the same module before accepting the initial IP.
     // Compat names need their own recorded object and cannot use the host image.
-    if request.path == "[vdso]"
+    let reported = if request.path == "[vdso]"
         && request.build_id.is_none_or(|id| {
-            unwind_object_path_for_build_id(request.path, id, unwind_debug_dir)
+            cached_unwind_object_path_for_build_id(request.path, id, unwind_debug_dir)
                 == Path::new(request.path)
-        })
-    {
-        return load_live_vdso_unwind_mapping(state, request);
-    }
-    if build_id.is_some() {
-        load_build_id_unwind_mapping(
-            &mut state.object_unwinder,
-            &mut state.attempted_unwind_mappings,
-            &mut state.loaded_unwind_modules,
-            request,
-            unwind_debug_dir,
-        )
-    } else {
+        }) {
+        load_live_vdso_unwind_mapping(state, request)
+    } else if load_unwind_mapping(
+        &mut state.object_unwinder,
+        &mut state.attempted_unwind_mappings,
+        request,
+    ) {
+        // perf unwind-libdw.c reports the live regular ELF first. A reported
+        // module wins even with a different build ID or no CFI at all.
+        true
+    } else if let Some(build_id) = request.build_id {
+        let cached =
+            cached_unwind_object_path_for_build_id(request.path, build_id, unwind_debug_dir);
+        let cached = cached.to_string_lossy();
         load_unwind_mapping(
             &mut state.object_unwinder,
             &mut state.attempted_unwind_mappings,
-            &mut state.loaded_unwind_modules,
-            request,
+            UnwindMappingRequest {
+                path: &cached,
+                ..request
+            },
         )
+    } else {
+        false
+    };
+    if reported {
+        // Track the original DSO mapping, not a separately reselected filename.
+        // This also keeps cached and copied-vDSO sources visible to queries.
+        state.loaded_unwind_modules.insert(module_key)
+    } else {
+        false
     }
 }
 
@@ -4854,7 +4861,6 @@ fn load_live_vdso_unwind_mapping(
     load_unwind_mapping(
         &mut state.object_unwinder,
         &mut state.attempted_unwind_mappings,
-        &mut state.loaded_unwind_modules,
         UnwindMappingRequest {
             path: &path,
             pgoff: 0,
@@ -4988,7 +4994,6 @@ fn perf_accepted_object_unwind_frames(
 fn load_unwind_mapping(
     object_unwinder: &mut FramehopUnwinder,
     attempted_unwind_mappings: &mut BTreeSet<UnwindMappingKey>,
-    loaded_unwind_modules: &mut BTreeSet<UnwindModuleKey>,
     request: UnwindMappingRequest<'_>,
 ) -> bool {
     if !should_load_unwind_object(request.path, request.file_identity) {
@@ -5001,7 +5006,7 @@ fn load_unwind_mapping(
     if !attempted_unwind_mappings.insert(key.clone()) {
         return false;
     }
-    if object_unwinder
+    object_unwinder
         .add_object_mapping(
             Path::new(request.path),
             request.start,
@@ -5009,58 +5014,6 @@ fn load_unwind_mapping(
             request.pgoff,
         )
         .is_ok_and(|loaded| loaded || object_unwinder.has_reported_module_for_ip(request.start))
-    {
-        loaded_unwind_modules.insert(unwind_module_key(
-            request.path,
-            request.start,
-            request.pgoff,
-        ))
-    } else {
-        false
-    }
-}
-
-fn load_build_id_unwind_mapping(
-    object_unwinder: &mut FramehopUnwinder,
-    attempted_unwind_mappings: &mut BTreeSet<UnwindMappingKey>,
-    loaded_unwind_modules: &mut BTreeSet<UnwindModuleKey>,
-    request: UnwindMappingRequest<'_>,
-    debug_dir: Option<&Path>,
-) -> bool {
-    let Some(build_id) = request.build_id else {
-        return false;
-    };
-    let object_path = unwind_object_path_for_build_id(request.path, build_id, debug_dir);
-    if object_path.to_string_lossy().starts_with('[') {
-        return false;
-    }
-    let object_path = object_path.to_string_lossy();
-    let key = unwind_mapping_key(
-        object_path.as_ref(),
-        request.start,
-        request.len,
-        request.pgoff,
-    );
-    if !attempted_unwind_mappings.insert(key.clone()) {
-        return false;
-    }
-    if object_unwinder
-        .add_object_mapping(
-            Path::new(object_path.as_ref()),
-            request.start,
-            request.len,
-            request.pgoff,
-        )
-        .is_ok_and(|loaded| loaded || object_unwinder.has_reported_module_for_ip(request.start))
-    {
-        loaded_unwind_modules.insert(unwind_module_key(
-            object_path.as_ref(),
-            request.start,
-            request.pgoff,
-        ))
-    } else {
-        false
-    }
 }
 
 fn unwind_mapping_key(path: &str, start: u64, len: u64, pgoff: u64) -> UnwindMappingKey {
@@ -5071,7 +5024,7 @@ fn unwind_module_key(path: &str, start: u64, pgoff: u64) -> UnwindModuleKey {
     (path.to_string(), start.saturating_sub(pgoff))
 }
 
-fn unwind_object_path_for_build_id(
+fn cached_unwind_object_path_for_build_id(
     path: &str,
     build_id: &[u8],
     debug_dir: Option<&Path>,
@@ -5088,7 +5041,7 @@ fn unwind_object_path_for_build_id(
 }
 
 fn should_load_unwind_object(path: &str, _file_identity: Option<FileIdentity>) -> bool {
-    !path.starts_with('[')
+    !path.starts_with('[') && std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
 }
 
 fn current_perf_debug_dir() -> Option<PathBuf> {
@@ -6000,6 +5953,28 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejects_non_regular_unwind_sources_before_opening_like_perf_libdw() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let fifo = root.path().join("fifo");
+        let output = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .output()
+            .expect("create FIFO");
+        assert!(output.status.success(), "{output:?}");
+        for path in [
+            root.path(),
+            fifo.as_path(),
+            std::path::Path::new("/dev/zero"),
+        ] {
+            assert!(!super::should_load_unwind_object(
+                path.to_str().unwrap(),
+                None
+            ));
+        }
+    }
+
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn reports_live_vdso_for_unwinding_without_a_recorded_build_id() {
@@ -6023,6 +5998,11 @@ mod tests {
             state
                 .object_unwinder
                 .has_reported_module_for_ip(start + 0x400)
+        );
+        assert!(
+            state
+                .loaded_unwind_modules
+                .contains(&super::unwind_module_key("[vdso]", start, 0,))
         );
     }
 
@@ -6148,6 +6128,15 @@ mod tests {
             state.live_vdso_elf.get().is_none(),
             "the recorded cache must win without consulting host ELF"
         );
+        assert!(
+            state
+                .loaded_unwind_modules
+                .contains(&super::unwind_module_key(
+                    "[vdso]",
+                    mapping.start,
+                    mapping.pgoff,
+                ))
+        );
     }
 
     #[test]
@@ -6168,7 +6157,7 @@ mod tests {
     }
 
     #[test]
-    fn chooses_perf_build_id_cache_for_build_id_unwind_mappings() {
+    fn prefers_live_elf_to_build_id_cache_for_unwind_module_reporting() {
         let root = tempfile::tempdir().expect("tempdir");
         let debug_dir = root.path().join(".debug");
         let cached = debug_dir
@@ -6177,15 +6166,109 @@ mod tests {
             .join("bbcc")
             .join("elf");
         std::fs::create_dir_all(cached.parent().expect("parent")).expect("cache dir");
-        std::fs::write(&cached, b"cached elf").expect("cached elf");
-
-        let resolved = super::unwind_object_path_for_build_id(
-            "/tmp/stale-app",
-            &[0xaa, 0xbb, 0xcc],
-            Some(&debug_dir),
+        let live = root.path().join("live.elf");
+        let executable = std::env::current_exe().expect("live ELF");
+        std::fs::copy(&executable, &live).expect("live ELF");
+        std::fs::copy(&executable, &cached).expect("cached ELF");
+        let mut accumulator = super::SessionState::new(std::collections::BTreeMap::new());
+        accumulator.unwind_debug_dir = Some(debug_dir);
+        accumulator.mmap_table.insert_mmap2_build_id(
+            crate::perfdata::records::Mmap2BuildIdRecord {
+                pid: 11,
+                tid: 11,
+                start: 0x1000,
+                len: 0x1000_0000,
+                pgoff: 0,
+                build_id_size: 3,
+                build_id: vec![0xaa, 0xbb, 0xcc],
+                prot: super::PROT_EXEC,
+                flags: 2,
+                path: live.to_str().expect("live path").into(),
+            },
         );
 
-        assert_eq!(resolved, cached);
+        // perf util/unwind-libdw.c:108-123 reports live before cache, without
+        // checking the symbol build-ID or requiring that the ELF contain CFI.
+        accumulator.ensure_unwind_mapping_for_ip(Some(11), 0x2000);
+        assert!(accumulator.has_loaded_unwind_mapping_for_ip(Some(11), 0x2000));
+        let state = accumulator.unwind_states.get(&11).expect("unwind state");
+        assert!(
+            state
+                .attempted_unwind_mappings
+                .contains(&super::unwind_mapping_key(
+                    live.to_str().unwrap(),
+                    0x1000,
+                    0x1000_0000,
+                    0,
+                ))
+        );
+        assert!(
+            !state
+                .attempted_unwind_mappings
+                .contains(&super::unwind_mapping_key(
+                    cached.to_str().unwrap(),
+                    0x1000,
+                    0x1000_0000,
+                    0,
+                ))
+        );
+        std::fs::remove_file(&live).expect("remove reported live path");
+        assert!(accumulator.has_loaded_unwind_mapping_for_ip(Some(11), 0x2000));
+        accumulator.ensure_unwind_mapping_for_ip(Some(11), 0x2000);
+        assert_eq!(
+            accumulator.unwind_states[&11]
+                .object_unwinder
+                .module_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn cached_unwind_reporting_tracks_original_mapping_without_reselecting_source() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let debug_dir = root.path().join(".debug");
+        let cached = debug_dir.join(".build-id/aa/bbcc/elf");
+        std::fs::create_dir_all(cached.parent().unwrap()).expect("cache dir");
+        std::fs::copy(std::env::current_exe().unwrap(), &cached).expect("cached ELF");
+        let live = root.path().join("invalid.elf");
+        std::fs::write(&live, b"not an ELF").expect("invalid live ELF");
+        let mut accumulator = super::SessionState::new(std::collections::BTreeMap::new());
+        accumulator.unwind_debug_dir = Some(debug_dir);
+        accumulator.mmap_table.insert_mmap2_build_id(
+            crate::perfdata::records::Mmap2BuildIdRecord {
+                pid: 11,
+                tid: 11,
+                start: 0x1000,
+                len: 0x1000_0000,
+                pgoff: 0,
+                build_id_size: 3,
+                build_id: vec![0xaa, 0xbb, 0xcc],
+                prot: super::PROT_EXEC,
+                flags: 2,
+                path: live.to_str().unwrap().into(),
+            },
+        );
+        accumulator.ensure_unwind_mapping_for_ip(Some(11), 0x2000);
+        assert!(accumulator.has_loaded_unwind_mapping_for_ip(Some(11), 0x2000));
+        assert!(
+            accumulator.unwind_states[&11]
+                .attempted_unwind_mappings
+                .contains(&super::unwind_mapping_key(
+                    cached.to_str().unwrap(),
+                    0x1000,
+                    0x1000_0000,
+                    0
+                ))
+        );
+        std::fs::remove_file(&cached).expect("remove reported cache path");
+        assert!(accumulator.has_loaded_unwind_mapping_for_ip(Some(11), 0x2000));
+        accumulator.ensure_unwind_mapping_for_ip(Some(11), 0x2000);
+        assert_eq!(
+            accumulator.unwind_states[&11]
+                .object_unwinder
+                .module_count(),
+            1
+        );
     }
 
     #[test]
