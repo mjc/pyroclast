@@ -21,7 +21,7 @@ framehop = "0.16.0"
 framehop-object = "0.2.0"
 gimli = "0.33.0"
 hashbrown = "0.17.1"
-inferno = "0.12.7"
+inferno = { version = "0.12.7", path = "vendor/inferno" }
 memchr = "2"
 memmap2 = "0.9.11"
 object = "0.39.1"

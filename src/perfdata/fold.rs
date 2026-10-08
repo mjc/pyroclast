@@ -545,6 +545,8 @@ impl SampleEventLayout {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FoldOptions {
+    /// Weight stacks by periods. Stack aggregation saturates at
+    /// `u64::MAX`, consistently with thread and timeline summaries.
     pub count_periods: bool,
     /// Internal renderer switch for tests and specialized callers. The CLI
     /// parity paths keep this on: real `perf script` emits DWARF inline frames
@@ -617,7 +619,10 @@ where
 {
     let hash = stacks.hasher().hash_one(key);
     match stacks.raw_entry_mut().from_key_hashed_nocheck(hash, key) {
-        hashbrown::hash_map::RawEntryMut::Occupied(entry) => *entry.into_mut() += count,
+        hashbrown::hash_map::RawEntryMut::Occupied(entry) => {
+            let total = entry.into_mut();
+            *total = total.saturating_add(count);
+        }
         hashbrown::hash_map::RawEntryMut::Vacant(entry) => {
             // Borrow<Q> requires owned and borrowed keys to hash and compare
             // identically. Keep full equality checks even when hashes collide.

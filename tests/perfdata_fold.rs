@@ -4591,6 +4591,115 @@ fn callchains_without_tid_follow_native_inferno_header_parsing() {
     }
 }
 
+fn overflowing_period_fixture() -> Vec<u8> {
+    period_accumulation_fixture([u64::MAX, 1], None)
+}
+
+fn period_accumulation_fixture(periods: [u64; 2], comm: Option<&str>) -> Vec<u8> {
+    let mut records = Vec::new();
+    if let Some(comm) = comm {
+        records.push(record_bytes(3, &comm_payload(11, 12, comm)));
+    }
+    records.extend(periods.map(|period| {
+        record_bytes_with_misc(
+            PERF_RECORD_SAMPLE,
+            PERF_RECORD_MISC_CPUMODE_USER,
+            &sample_payload_with_optional_timestamp(
+                sample_payload_with_period(0x2000, 11, 12, period, [0x2000]),
+                true,
+            ),
+        )
+    }));
+    perfdata_with_records_and_attrs_vec(
+        vec![file_attr_bytes(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_TIME
+                | PERF_SAMPLE_PERIOD
+                | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        records,
+    )
+}
+
+#[test]
+fn period_overflow_saturates_byte_folding_like_profile_summaries() {
+    let bytes = overflowing_period_fixture();
+    let folded = fold_perfdata_callchains_with_options(
+        &bytes,
+        FoldOptions {
+            count_periods: true,
+            inline: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(folded, format!(":12;[unknown] {}\n", u64::MAX));
+    let summary =
+        pyroclast::summary::summarize_perfdata_profile(&bytes, 1_000_000_000, 10).unwrap();
+    assert_eq!(summary.weighted_samples, u64::MAX);
+    assert_eq!(summary.threads[0].weighted_samples, u64::MAX);
+}
+
+#[test]
+fn period_overflow_saturates_file_folding_like_streamed_profile_summaries() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), overflowing_period_fixture()).unwrap();
+    let folded = fold_perfdata_file_with_options(
+        file.path(),
+        FoldOptions {
+            count_periods: true,
+            inline: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(folded, format!(":12;[unknown] {}\n", u64::MAX));
+    let summary =
+        pyroclast::summary::summarize_perfdata_profile_file(file.path(), 1_000_000_000, 10)
+            .unwrap();
+    assert_eq!(summary.weighted_samples, u64::MAX);
+    assert_eq!(summary.threads[0].weighted_samples, u64::MAX);
+}
+
+#[test]
+fn whole_stream_period_overflow_saturates_byte_folding_like_direct_folding() {
+    // A COMM newline requires one continuous Inferno parser. Its perf.rs
+    // after_event (574-597) reaches common.rs insert_or_add (410-416): the
+    // same documented saturation policy must apply there, not just directly.
+    let options = FoldOptions {
+        count_periods: true,
+        inline: false,
+    };
+    for (periods, total) in [([7, 3], 10), ([u64::MAX, 1], u64::MAX)] {
+        let bytes = period_accumulation_fixture(periods, Some("worker\ntask"));
+        assert_eq!(
+            fold_perfdata_callchains_with_options(&bytes, options).unwrap(),
+            format!("task;[unknown] {total}\n"),
+        );
+    }
+}
+
+#[test]
+fn whole_stream_period_overflow_saturates_file_folding_like_direct_folding() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let options = FoldOptions {
+        count_periods: true,
+        inline: false,
+    };
+    for (periods, total) in [([7, 3], 10), ([u64::MAX, 1], u64::MAX)] {
+        std::fs::write(
+            file.path(),
+            period_accumulation_fixture(periods, Some("worker\ntask")),
+        )
+        .unwrap();
+        assert_eq!(
+            fold_perfdata_file_with_options(file.path(), options).unwrap(),
+            format!("task;[unknown] {total}\n"),
+        );
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn absent_sample_period_uses_event_attribute_default_like_real_perf() {

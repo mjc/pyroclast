@@ -3,6 +3,14 @@ use proptest::string::string_regex;
 use pyroclast::summary::threads::summarize_folded_stacks;
 
 #[test]
+fn folded_summary_total_saturates_when_distinct_stack_counts_overflow() {
+    let summary = summarize_folded_stacks(&format!("main;work {}\nmain;idle 1\n", u64::MAX));
+    assert_eq!(summary.total_count, u64::MAX);
+    assert_eq!(summary.top_stacks[0].count, u64::MAX);
+    assert_eq!(summary.top_stacks[1].count, 1);
+}
+
+#[test]
 fn summarizes_folded_stack_counts() {
     let summary = summarize_folded_stacks("main;work 2\nmain;idle 3\n");
 

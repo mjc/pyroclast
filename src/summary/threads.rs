@@ -77,6 +77,7 @@ pub struct TopFoldedStack {
 pub struct FoldedStackSummary {
     pub folded_lines: usize,
     pub folded_bytes: usize,
+    /// Sum of valid stack counts, saturating at `u64::MAX` like other profile summaries.
     pub total_count: u64,
     pub top_stacks: Vec<TopFoldedStack>,
 }
@@ -101,7 +102,9 @@ pub fn summarize_folded_stacks(folded_stacks: &str) -> FoldedStackSummary {
     FoldedStackSummary {
         folded_lines: folded_stacks.lines().count(),
         folded_bytes: folded_stacks.len(),
-        total_count: parsed_stacks.iter().map(|stack| stack.count).sum(),
+        total_count: parsed_stacks
+            .iter()
+            .fold(0_u64, |total, stack| total.saturating_add(stack.count)),
         top_stacks: parsed_stacks,
     }
 }
