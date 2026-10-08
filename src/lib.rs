@@ -31,8 +31,8 @@ use cli::{
     ParsePerfCommand, PlumbingCommand,
 };
 use flamegraph::analysis::{
-    FlamegraphCategory, FlamegraphDelta, FlamegraphEntry, FlamegraphProfile, diff_flamegraphs,
-    parse_flamegraph, search_entries, top_entries,
+    FlamegraphCategory, FlamegraphDelta, FlamegraphEntry, FlamegraphProfile, categorize_profile,
+    diff_flamegraphs, parse_category_rules, parse_flamegraph, search_entries, top_entries,
 };
 use flamegraph::{FlamegraphRenderer, FlamegraphRequest, InfernoFlamegraphRenderer};
 pub use output::{CliOutput, write_cli_output};
@@ -616,6 +616,18 @@ fn analyze_svg_report_for_cli(command: &FlamegraphReportArgs) -> backends::Backe
         Some(FlamegraphReportCommand::Diff { .. }) => 0.01,
         _ => 1.0,
     });
+    let rules = command
+        .categories
+        .as_ref()
+        .map(|path| {
+            let json = std::fs::read_to_string(path)?;
+            parse_category_rules(&json)
+        })
+        .transpose()?
+        .unwrap_or_default();
+    if matches!(command.mode, None | Some(FlamegraphReportCommand::Summary)) {
+        categorize_profile(&mut profile, &rules, command.limit, min_percent);
+    }
     if let Some(mode) = &command.mode {
         let entries = if mode.uses_self_samples() {
             &profile.self_samples
@@ -731,6 +743,7 @@ fn analyze_flamegraph_for_cli(command: &AnalyzeFlamegraphArgs) -> backends::Back
             },
         ),
         mode: Some(mode),
+        categories: None,
     })
 }
 
@@ -765,6 +778,13 @@ fn render_flamegraph_categories(
         for category in categories {
             use std::fmt::Write as _;
             writeln!(output, "{:>6.2}%  {}", category.percent, category.name)?;
+            for entry in &category.inclusive_functions {
+                writeln!(
+                    output,
+                    "    {:>6.2}% inclusive {:>10}  {}",
+                    entry.percent, entry.samples, entry.name
+                )?;
+            }
         }
         Ok(output)
     }

@@ -3,7 +3,7 @@ use std::io;
 
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct FlamegraphEntry {
@@ -27,6 +27,15 @@ pub struct FlamegraphCategory {
     pub name: String,
     pub samples: u64,
     pub percent: f64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub inclusive_functions: Vec<FlamegraphEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CategoryRule {
+    pub name: String,
+    pub contains: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -103,34 +112,99 @@ pub fn parse_flamegraph(svg: &str) -> io::Result<FlamegraphProfile> {
     let syscalls = range_entries(syscalls, total_samples);
     let any_syscall_samples = covered_samples(&mut syscall_ranges);
     let self_counts = deepest_samples(&frames, total_samples, inverted);
-    let mut categories = BTreeMap::<&str, u64>::new();
-    for (name, samples) in &self_counts {
-        *categories
-            .entry(categorize_flamegraph_frame(name))
-            .or_default() += samples;
+    let mut profile = FlamegraphProfile {
+        total_samples,
+        inclusive,
+        self_samples: count_entries(self_counts, total_samples),
+        categories: Vec::new(),
+        syscalls,
+        any_syscall_samples,
+    };
+    categorize_profile(&mut profile, &[], 0, 0.0);
+    Ok(profile)
+}
+
+/// Parses ordered, case-insensitive substring rules for project categories.
+///
+/// # Errors
+///
+/// Rejects invalid JSON, unknown fields and empty labels or match patterns.
+pub fn parse_category_rules(json: &str) -> io::Result<Vec<CategoryRule>> {
+    let mut rules: Vec<CategoryRule> = serde_json::from_str(json).map_err(invalid_data)?;
+    for rule in &mut rules {
+        if rule.name.trim().is_empty()
+            || rule.contains.is_empty()
+            || rule
+                .contains
+                .iter()
+                .any(|pattern| pattern.trim().is_empty())
+        {
+            return Err(invalid_data(
+                "category rules require a name and nonempty contains patterns",
+            ));
+        }
+        for pattern in &mut rule.contains {
+            *pattern = pattern.to_lowercase();
+        }
     }
-    let mut categories = categories
-        .into_iter()
-        .map(|(name, samples)| FlamegraphCategory {
-            name: name.to_owned(),
-            samples,
-            percent: percentage(samples, total_samples),
+    Ok(rules)
+}
+
+/// Rebuilds exclusive categories and their inclusive key functions before any
+/// report-level truncation. First project rule wins; built-ins are the fallback.
+pub fn categorize_profile(
+    profile: &mut FlamegraphProfile,
+    rules: &[CategoryRule],
+    limit: usize,
+    min_percent: f64,
+) {
+    let mut categories = BTreeMap::<&str, FlamegraphCategory>::new();
+    for entry in &profile.self_samples {
+        let name = category_name(&entry.name, rules);
+        let category = categories
+            .entry(name)
+            .or_insert_with(|| FlamegraphCategory {
+                name: name.to_owned(),
+                samples: 0,
+                percent: 0.0,
+                inclusive_functions: Vec::new(),
+            });
+        category.samples += entry.samples;
+    }
+    for entry in &profile.inclusive {
+        if entry.percent >= min_percent
+            && let Some(category) = categories.get_mut(category_name(&entry.name, rules))
+            && category.inclusive_functions.len() < limit
+        {
+            category.inclusive_functions.push(entry.clone());
+        }
+    }
+    profile.categories = categories
+        .into_values()
+        .map(|mut category| {
+            category.percent = percentage(category.samples, profile.total_samples);
+            category
         })
-        .collect::<Vec<_>>();
-    categories.sort_by(|left, right| {
+        .collect();
+    profile.categories.sort_by(|left, right| {
         right
             .samples
             .cmp(&left.samples)
             .then_with(|| left.name.cmp(&right.name))
     });
-    Ok(FlamegraphProfile {
-        total_samples,
-        inclusive,
-        self_samples: count_entries(self_counts, total_samples),
-        categories,
-        syscalls,
-        any_syscall_samples,
-    })
+}
+
+fn category_name<'a>(name: &str, rules: &'a [CategoryRule]) -> &'a str {
+    if !rules.is_empty() {
+        let lower = name.to_lowercase();
+        if let Some(rule) = rules
+            .iter()
+            .find(|rule| rule.contains.iter().any(|pattern| lower.contains(pattern)))
+        {
+            return &rule.name;
+        }
+    }
+    categorize_flamegraph_frame(name)
 }
 
 #[must_use]

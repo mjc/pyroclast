@@ -78,6 +78,22 @@ Search is a case-insensitive substring match, including small functions by
 default. Diff defaults to a 0.01 percentage-point threshold; compare equivalent
 workloads, since coverage changes are not elapsed-time speedups.
 
+Use `--categories categories.json` to adapt the full report or `summary` to a
+project without forking the analyzer. Rules are ordered, case-insensitive
+substring matches; the first match wins, then built-in categories are the fallback:
+
+```json
+[
+  {"name": "Writer", "contains": ["build::writer", "copy_from_archive"]},
+  {"name": "Archive", "contains": ["r7z", "zstd", "libarchive"]},
+  {"name": "SQLite", "contains": ["sqlite", "diesel"]}
+]
+```
+
+Category rows cover all samples regardless of `--limit` or `--min-percent`.
+Each category also lists its top inclusive functions, with those controls
+applied per category. Their coverage overlaps and must not be added together.
+
 ## Outputs
 
 Profile runs write a Pyroclast artifact directory containing the command, stdout/stderr logs,

@@ -361,6 +361,10 @@ pub struct FlamegraphReportArgs {
     #[arg(long, global = true, value_parser = parse_coverage_percent)]
     pub min_percent: Option<f64>,
 
+    /// Ordered JSON category rules for summaries and full reports.
+    #[arg(long, global = true)]
+    pub categories: Option<PathBuf>,
+
     #[command(subcommand)]
     pub mode: Option<FlamegraphReportCommand>,
 }
