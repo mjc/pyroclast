@@ -47,14 +47,14 @@ impl CommandRunner for MissingTools {
 #[test]
 fn every_recording_backend_invalidates_previous_success_before_preflight() {
     let runner = MissingTools;
-    let backends: Vec<Box<dyn ProfilerBackend + '_>> = vec![
-        Box::new(LinuxPerfBackend::new(&runner)),
-        Box::new(HeaptrackBackend::new(&runner)),
-        Box::new(StraceBackend::new(&runner)),
-        Box::new(MacosXctraceBackend::new(&runner)),
-        Box::new(OffcpuBackend::new(&runner)),
+    let backends: Vec<(Box<dyn ProfilerBackend + '_>, bool)> = vec![
+        (Box::new(LinuxPerfBackend::new(&runner)), false),
+        (Box::new(HeaptrackBackend::new(&runner)), false),
+        (Box::new(StraceBackend::new(&runner)), false),
+        (Box::new(MacosXctraceBackend::new(&runner)), true),
+        (Box::new(OffcpuBackend::new(&runner)), false),
     ];
-    for backend in backends {
+    for (backend, xctrace) in backends {
         let root = tempfile::tempdir().unwrap();
         let layout = ArtifactLayout::new(root.path().to_path_buf());
         for path in [
@@ -66,9 +66,13 @@ fn every_recording_backend_invalidates_previous_success_before_preflight() {
             std::fs::write(path, "old success").unwrap();
         }
 
-        let error = backend
-            .profile(&request(root.path().to_path_buf()))
-            .unwrap_err();
+        let mut request = request(root.path().to_path_buf());
+        if xctrace {
+            request.kind = ProfileKind::Cpu;
+            request.symbols = true;
+            request.duration_secs = 3600;
+        }
+        let error = backend.profile(&request).unwrap_err();
         assert!(error.to_string().contains("missing tool"));
         assert!(!layout.run_json().exists());
         assert!(!layout.summary_json().exists());

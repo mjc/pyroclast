@@ -1718,15 +1718,33 @@ fn top_level_cpu_command_uses_injected_perf_runner() {
     pyroclast::run_parsed_cli_with_runner_on_platform(cli, &runner, "linux").expect("run cli");
 
     assert_eq!(runner.programs(), vec!["perf"]);
-    let run_json = std::fs::read_to_string(out.join("run.json")).expect("run json");
-    assert!(run_json.contains("\"actual_backend\": \"linux_perf\""));
-    assert!(run_json.contains("\"sample_frequency\": 997"));
-    assert!(run_json.contains("\"sample_event\": \"default\""));
-    assert!(run_json.contains("\"call_graph\": \"dwarf\""));
-    assert!(run_json.contains("\"record_target\": \"command\""));
-    assert!(run_json.contains("\"duration_secs\": null"));
-    assert!(run_json.contains("\"symbols\": true"));
-    assert!(run_json.contains("\"tool_versions\""));
+    let run_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("run.json")).expect("run json"))
+            .expect("valid run json");
+    assert_eq!(run_json["actual_backend"], "linux_perf");
+    assert_eq!(
+        run_json["requested_controls"],
+        serde_json::json!({
+            "frequency": 997,
+            "event": "default",
+            "call_graph": "dwarf",
+            "symbols": true,
+            "symbolizer": "rust-addr2line",
+            "duration_secs": 3600,
+        })
+    );
+    assert_eq!(
+        run_json["measurement"],
+        serde_json::json!({
+            "source": "perf",
+            "frequency": 997,
+            "event": "default",
+            "call_graph": "dwarf",
+        })
+    );
+    assert_eq!(run_json["record_target"], "command");
+    assert!(run_json["duration_secs"].is_null());
+    assert!(run_json["tool_versions"].is_array());
     let summary_json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(out.join("summary.json")).unwrap())
             .expect("summary json");

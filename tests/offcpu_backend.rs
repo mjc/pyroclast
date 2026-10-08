@@ -56,7 +56,8 @@ fn offcpu_backend_defaults_to_perf_sched_summary_artifacts() {
         "99.000000 [0000] sh[42] 0.000 0.000 0.000\n100.000000 [0000] app[42] 10.000 2.000 1.000\n100.001000 [0001] worker[43/42] 4.000 1.000 2.000\n100.002000 [0000] unrelated[99] 500.000 0.000 1.000\n"
     );
     assert_eq!(result.manifest.duration_secs, None);
-    assert_eq!(result.manifest.sample_event, PerfEvent::Default);
+    assert_eq!(result.manifest.requested_controls.event, request.event);
+    assert_eq!(result.manifest.measurement, None);
     assert_eq!(
         result
             .manifest

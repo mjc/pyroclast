@@ -4,7 +4,8 @@ use proptest::prelude::*;
 use proptest::string::string_regex;
 use pyroclast::artifacts::ArtifactLayout;
 use pyroclast::cli::{PerfCallGraph, PerfEvent, ProfileKind};
-use pyroclast::manifest::{BackendName, RunManifest};
+use pyroclast::manifest::{BackendName, NativeMeasurement, RequestedControls, RunManifest};
+use pyroclast::symbols::SymbolizerKind;
 use pyroclast::tools::{ToolSource, ToolVersion};
 
 #[test]
@@ -81,12 +82,21 @@ fn manifest_serializes_core_run_fields() {
         started_at_unix_ms: 10,
         ended_at_unix_ms: Some(20),
         exit_status: Some(0),
-        sample_frequency: 997,
-        sample_event: PerfEvent::CpuClock,
-        call_graph: PerfCallGraph::Dwarf,
+        requested_controls: RequestedControls {
+            frequency: 997,
+            event: PerfEvent::CpuClock,
+            call_graph: PerfCallGraph::Dwarf,
+            symbols: true,
+            symbolizer: SymbolizerKind::RustAddr2line,
+            duration_secs: 3600,
+        },
+        measurement: Some(NativeMeasurement::Perf {
+            frequency: 997,
+            event: PerfEvent::CpuClock,
+            call_graph: PerfCallGraph::Dwarf,
+        }),
         record_target: "command".to_string(),
         duration_secs: None,
-        symbols: true,
         tool_versions: vec![ToolVersion {
             name: "perf".to_string(),
             path: Some("/usr/bin/perf".to_string()),
@@ -106,12 +116,18 @@ fn manifest_serializes_core_run_fields() {
     assert_eq!(json["actual_backend"], "linux_perf");
     assert_eq!(json["fallback_reason"], serde_json::Value::Null);
     assert_eq!(json["exit_status"], 0);
-    assert_eq!(json["sample_frequency"], 997);
-    assert_eq!(json["sample_event"], "cpu-clock");
-    assert_eq!(json["call_graph"], "dwarf");
+    assert_eq!(json["requested_controls"]["frequency"], 997);
+    assert_eq!(json["requested_controls"]["event"], "cpu-clock");
+    assert_eq!(json["requested_controls"]["call_graph"], "dwarf");
+    assert_eq!(json["measurement"]["source"], "perf");
+    assert_eq!(json["measurement"]["frequency"], 997);
+    assert_eq!(json["measurement"]["event"], "cpu-clock");
+    assert_eq!(json["measurement"]["call_graph"], "dwarf");
     assert_eq!(json["record_target"], "command");
     assert_eq!(json["duration_secs"], serde_json::Value::Null);
-    assert_eq!(json["symbols"], true);
+    assert_eq!(json["requested_controls"]["symbols"], true);
+    assert_eq!(json["requested_controls"]["symbolizer"], "rust-addr2line");
+    assert_eq!(json["requested_controls"]["duration_secs"], 3600);
     assert_eq!(json["tool_versions"][0]["name"], "perf");
     assert_eq!(json["tool_versions"][0]["path"], "/usr/bin/perf");
     assert_eq!(json["tool_versions"][0]["source"], "path");
@@ -264,12 +280,17 @@ proptest! {
             started_at_unix_ms: 10,
             ended_at_unix_ms: Some(20),
             exit_status,
-            sample_frequency: 997,
-            sample_event,
-            call_graph,
+            requested_controls: RequestedControls {
+                frequency: 997,
+                event: sample_event,
+                call_graph,
+                symbols,
+                symbolizer: SymbolizerKind::RustAddr2line,
+                duration_secs: duration_secs.unwrap_or(3600),
+            },
+            measurement: None,
             record_target: "command".to_string(),
             duration_secs,
-            symbols,
             tool_versions: vec![ToolVersion {
                 name: "perf".to_string(),
                 path: Some("/usr/bin/perf".to_string()),
@@ -292,12 +313,13 @@ proptest! {
             json["actual_backend"].as_str(),
             Some(backend_name_json(actual_backend))
         );
-        prop_assert_eq!(json["sample_event"].as_str(), Some(perf_event_json(sample_event)));
+        prop_assert_eq!(json["requested_controls"]["event"].as_str(), Some(perf_event_json(sample_event)));
         prop_assert_eq!(
-            json["call_graph"].as_str(),
+            json["requested_controls"]["call_graph"].as_str(),
             Some(perf_call_graph_json(call_graph))
         );
-        prop_assert_eq!(json["symbols"].as_bool(), Some(symbols));
+        prop_assert_eq!(json["requested_controls"]["symbols"].as_bool(), Some(symbols));
+        prop_assert!(json.get("measurement").is_none());
         prop_assert_eq!(
             json["fallback_reason"].as_str(),
             fallback_reason.as_deref()

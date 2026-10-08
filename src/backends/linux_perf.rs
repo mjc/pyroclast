@@ -200,12 +200,14 @@ where
             started_at_unix_ms,
             ended_at_unix_ms: Some(unix_ms_now()),
             exit_status: output.status_code,
-            sample_frequency: request.frequency,
-            sample_event: request.event,
-            call_graph: request.call_graph,
+            requested_controls: request.requested_controls(),
+            measurement: Some(crate::manifest::NativeMeasurement::Perf {
+                frequency: request.frequency,
+                event: request.event,
+                call_graph: request.call_graph,
+            }),
             record_target: record_target_label(request).to_string(),
             duration_secs: attach_duration(request),
-            symbols: request.symbols,
             tool_versions,
             artifacts: {
                 let mut artifacts = layout.standard_manifest_artifacts();

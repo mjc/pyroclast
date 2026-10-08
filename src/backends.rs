@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use crate::artifacts::ArtifactLayout;
 use crate::backends::offcpu::OffcpuMethod;
 use crate::cli::{PerfCallGraph, PerfEvent, ProfileKind};
-use crate::manifest::RunManifest;
+use crate::manifest::{RequestedControls, RunManifest};
 use crate::symbols::SymbolizerKind;
 
 pub type BackendResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -35,6 +35,17 @@ pub struct ProfileRequest {
 }
 
 impl ProfileRequest {
+    pub(crate) fn requested_controls(&self) -> RequestedControls {
+        RequestedControls {
+            frequency: self.frequency,
+            event: self.event,
+            call_graph: self.call_graph,
+            symbols: self.symbols,
+            symbolizer: self.symbolizer,
+            duration_secs: self.duration_secs,
+        }
+    }
+
     pub(crate) fn ensure_command_target(&self, backend: &str) -> BackendResult<()> {
         if self.pid.is_some() || self.threads_of_pid.is_some() || !self.tids.is_empty() {
             return Err(

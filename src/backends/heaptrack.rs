@@ -113,12 +113,10 @@ where
             started_at_unix_ms,
             ended_at_unix_ms: Some(unix_ms_now()),
             exit_status: output.status_code,
-            sample_frequency: request.frequency,
-            sample_event: request.event,
-            call_graph: request.call_graph,
+            requested_controls: request.requested_controls(),
+            measurement: None,
             record_target: "command".to_string(),
             duration_secs: None,
-            symbols: request.symbols,
             tool_versions,
             artifacts: {
                 let mut artifacts = layout.standard_manifest_artifacts();

@@ -39,9 +39,20 @@ fn linux_perf_backend_records_with_perf_and_writes_artifacts() {
     let result = backend.profile(&request).expect("profile");
 
     assert_eq!(result.manifest.actual_backend, BackendName::LinuxPerf);
-    assert_eq!(result.manifest.sample_frequency, 199);
-    assert_eq!(result.manifest.call_graph, PerfCallGraph::Dwarf);
-    assert!(!result.manifest.symbols);
+    assert_eq!(result.manifest.requested_controls.frequency, 199);
+    assert_eq!(
+        result.manifest.requested_controls.call_graph,
+        PerfCallGraph::Dwarf
+    );
+    assert!(!result.manifest.requested_controls.symbols);
+    assert_eq!(
+        result.manifest.measurement,
+        Some(pyroclast::manifest::NativeMeasurement::Perf {
+            frequency: 199,
+            event: PerfEvent::CpuClock,
+            call_graph: PerfCallGraph::Dwarf,
+        })
+    );
     assert_eq!(
         result
             .manifest

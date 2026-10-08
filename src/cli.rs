@@ -5,6 +5,9 @@ use std::path::PathBuf;
 
 pub use crate::symbols::SymbolizerKind;
 
+pub const DEFAULT_SAMPLE_FREQUENCY: u32 = 997;
+pub const DEFAULT_PROFILE_DURATION_SECS: u32 = 3600;
+
 #[derive(Debug, Parser)]
 #[command(name = "pyroclast", version)]
 #[command(about = "Profile any application with the appropriate native OS tools")]
@@ -153,7 +156,7 @@ pub struct RunArgs {
     #[arg(long, value_enum, default_value_t = SymbolizerKind::RustAddr2line)]
     pub symbolizer: SymbolizerKind,
 
-    #[arg(long, default_value_t = 997)]
+    #[arg(long, default_value_t = DEFAULT_SAMPLE_FREQUENCY)]
     pub frequency: u32,
 
     #[arg(long, value_enum, default_value_t = PerfEvent::Default)]
@@ -171,7 +174,7 @@ pub struct RunArgs {
     #[arg(long, conflicts_with_all = ["pid", "tids"])]
     pub threads_of_pid: Option<u32>,
 
-    #[arg(long, default_value_t = 3600)]
+    #[arg(long, default_value_t = DEFAULT_PROFILE_DURATION_SECS)]
     pub duration_secs: u32,
 
     #[arg(last = true, required_unless_present_any = ["pid", "tids", "threads_of_pid"])]
@@ -277,7 +280,7 @@ pub struct ProfileArgs {
     #[arg(long, value_enum, default_value_t = SymbolizerKind::RustAddr2line)]
     pub symbolizer: SymbolizerKind,
 
-    #[arg(long, default_value_t = 997)]
+    #[arg(long, default_value_t = DEFAULT_SAMPLE_FREQUENCY)]
     pub frequency: u32,
 
     #[arg(long, value_enum, default_value_t = PerfEvent::Default)]
@@ -295,7 +298,7 @@ pub struct ProfileArgs {
     #[arg(long, conflicts_with_all = ["pid", "tids"])]
     pub threads_of_pid: Option<u32>,
 
-    #[arg(long, default_value_t = 3600)]
+    #[arg(long, default_value_t = DEFAULT_PROFILE_DURATION_SECS)]
     pub duration_secs: u32,
 
     #[arg(last = true, required_unless_present_any = ["pid", "tids", "threads_of_pid"])]

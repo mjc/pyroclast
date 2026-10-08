@@ -3,6 +3,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::artifacts::ArtifactLayout;
 use crate::backends::{BackendResult, ProfileRequest, ProfileResult, ProfilerBackend};
+use crate::cli::{
+    DEFAULT_PROFILE_DURATION_SECS, DEFAULT_SAMPLE_FREQUENCY, PerfCallGraph, PerfEvent, ProfileKind,
+    SymbolizerKind,
+};
 use crate::manifest::{BackendName, RunManifest};
 use crate::parsers::xctrace::{parse_cpu_profile_for_pid, render_cpu_profile_summary_text};
 use crate::process::CommandRunner;
@@ -66,10 +70,11 @@ where
     R: CommandRunner,
 {
     fn profile(&self, request: &ProfileRequest) -> BackendResult<ProfileResult> {
-        request.ensure_command_target("macos_xctrace")?;
         let started_at_unix_ms = unix_ms_now();
         let layout = ArtifactLayout::new(request.out_dir.clone());
         layout.prepare()?;
+        request.ensure_command_target("macos_xctrace")?;
+        validate_controls(request)?;
         let tool_versions = resolve_required_tools(self.runner, &[XCTRACE])?;
 
         let trace_path = layout.raw_profile("xctrace.trace");
@@ -142,12 +147,13 @@ where
             started_at_unix_ms,
             ended_at_unix_ms: Some(unix_ms_now()),
             exit_status: record_output.status_code,
-            sample_frequency: request.frequency,
-            sample_event: request.event,
-            call_graph: request.call_graph,
+            requested_controls: request.requested_controls(),
+            measurement: Some(crate::manifest::NativeMeasurement::Xctrace {
+                template: "CPU Profiler".into(),
+                weight_unit: profile.weight_unit,
+            }),
             record_target: "command".to_string(),
             duration_secs: None,
-            symbols: request.symbols,
             tool_versions,
             artifacts: {
                 let mut artifacts = layout.standard_manifest_artifacts();
@@ -161,6 +167,34 @@ where
 
         Ok(ProfileResult { layout, manifest })
     }
+}
+
+fn validate_controls(request: &ProfileRequest) -> BackendResult<()> {
+    if request.kind != ProfileKind::Cpu {
+        return Err("macos_xctrace supports CPU profiling only".into());
+    }
+    // Shared CLI defaults select the native template, not equivalent perf settings.
+    let unsupported = if request.frequency != DEFAULT_SAMPLE_FREQUENCY {
+        Some("--frequency")
+    } else if request.event != PerfEvent::Default {
+        Some("--event")
+    } else if request.call_graph != PerfCallGraph::Dwarf {
+        Some("--call-graph")
+    } else if !request.symbols {
+        Some("--no-symbols")
+    } else if request.symbolizer != SymbolizerKind::RustAddr2line {
+        Some("--symbolizer")
+    } else if request.duration_secs != DEFAULT_PROFILE_DURATION_SECS {
+        Some("--duration-secs")
+    } else if request.offcpu_method.is_some() {
+        Some("--offcpu-method")
+    } else {
+        None
+    };
+    if let Some(control) = unsupported {
+        return Err(format!("macos_xctrace does not support overriding {control}; CPU Profiler controls sampling, unwinding, and symbolication").into());
+    }
+    Ok(())
 }
 
 fn unix_ms_now() -> u128 {

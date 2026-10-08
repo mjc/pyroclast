@@ -103,6 +103,9 @@ applied per category. Their coverage overlaps and must not be added together.
 
 Profile runs write a Pyroclast artifact directory containing the command, stdout/stderr logs,
 raw profiler output, summaries, tool diagnostics, and a `run.json` manifest.
+The manifest separates `requested_controls` from native `measurement` metadata.
+For xctrace, measurement records the CPU Profiler template and exported weight unit,
+not perf sampling or unwinding settings. Unsupported overrides are rejected before recording.
 
 CPU profiling on Linux records with `perf`; on macOS it uses Apple's `xctrace`. Memory
 profiling currently uses `heaptrack`, and syscall latency uses `strace` on Linux. Blocked-time

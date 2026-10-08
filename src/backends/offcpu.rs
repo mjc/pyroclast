@@ -244,12 +244,10 @@ where
             started_at_unix_ms,
             ended_at_unix_ms: Some(unix_ms_now()),
             exit_status: run.exit_status,
-            sample_frequency: request.frequency,
-            sample_event: run.sample_event,
-            call_graph: request.call_graph,
+            requested_controls: request.requested_controls(),
+            measurement: None,
             record_target: "command".to_string(),
             duration_secs: run.duration_secs,
-            symbols: request.symbols,
             tool_versions,
             artifacts: {
                 let mut artifacts = layout.standard_manifest_artifacts();
@@ -335,7 +333,6 @@ where
         );
         Ok(OffcpuRun {
             exit_status: record_output.status_code,
-            sample_event: PerfEvent::Default,
             duration_secs: None,
             stdout: [record_output.stdout, timehist_output.stdout].concat(),
             stderr: [record_output.stderr, timehist_output.stderr].concat(),
@@ -431,7 +428,6 @@ where
             output,
             raw_bpftrace,
             folded_stacks,
-            request.event,
             Some(request.duration_secs),
         )?;
         run.summary_json["workload_outcome"] = outcome.into();
@@ -458,7 +454,6 @@ fn offcpu_tool_specs(method: OffcpuMethod) -> Vec<ToolSpec> {
 
 struct OffcpuRun {
     exit_status: Option<i32>,
-    sample_event: PerfEvent,
     duration_secs: Option<u32>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
@@ -473,13 +468,11 @@ fn folded_offcpu_run(
     output: crate::process::CommandOutput,
     raw_profile: PathBuf,
     folded_stacks: String,
-    sample_event: PerfEvent,
     duration_secs: Option<u32>,
 ) -> BackendResult<OffcpuRun> {
     let folded_summary = summarize_folded_stacks(&folded_stacks);
     Ok(OffcpuRun {
         exit_status: output.status_code,
-        sample_event,
         duration_secs,
         stdout: output.stdout,
         stderr: output.stderr,
