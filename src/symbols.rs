@@ -688,11 +688,13 @@ struct PerfDwarfUnitIndex {
 }
 
 #[derive(Debug)]
-struct PerfDwarfDieNode {
-    kind: PerfDwarfDieKind,
+struct PerfDwarfScope {
+    depth: isize,
     ranges: Vec<PerfAddressRange>,
-    name: Option<PerfDwarfNameId>,
-    children: Vec<PerfDwarfDieNode>,
+    frames: Arc<[PerfDwarfNameId]>,
+    has_inline_frames: bool,
+    suppressed: bool,
+    child_coverage: Vec<PerfAddressRange>,
 }
 
 #[derive(Debug)]
@@ -4339,10 +4341,14 @@ impl PerfDwarfNameResolver {
                 continue;
             }
             let source_line_ranges = perf_dwarf_source_line_ranges(&unit);
-            let roots = perf_dwarf_unit_roots(&dwarf, &unit, &mut names);
             units.push(PerfDwarfUnitIndex {
                 ranges,
-                segments: perf_dwarf_frame_ranges_from_roots(&roots, &source_line_ranges),
+                segments: perf_dwarf_unit_frame_ranges(
+                    &dwarf,
+                    &unit,
+                    &mut names,
+                    &source_line_ranges,
+                ),
             });
         }
         Ok(Self {
@@ -4493,9 +4499,10 @@ fn build_dwarf_index_cache_for_addresses(
             let source_line_ranges = cached_unit
                 .source_line_ranges
                 .get_or_insert_with(|| perf_dwarf_source_line_ranges(&unit));
-            let roots = perf_dwarf_unit_roots(&dwarf, &unit, &mut cache.names);
-            cached_unit.segments = Some(perf_dwarf_frame_ranges_from_roots(
-                &roots,
+            cached_unit.segments = Some(perf_dwarf_unit_frame_ranges(
+                &dwarf,
+                &unit,
+                &mut cache.names,
                 source_line_ranges.as_slice(),
             ));
         }
@@ -4551,87 +4558,102 @@ where
     perf_dwarf_merge_ranges(ranges)
 }
 
-fn perf_dwarf_unit_roots<R>(
+fn perf_dwarf_unit_frame_ranges<R>(
     dwarf: &gimli::Dwarf<R>,
     unit: &gimli::Unit<R>,
     names: &mut PerfDwarfNameInterner,
-) -> Vec<PerfDwarfDieNode>
+    source_line_ranges: &[PerfAddressRange],
+) -> Vec<PerfDwarfFrameRange>
 where
     R: gimli::Reader,
 {
-    let Ok(mut tree) = unit.entries_tree(None) else {
+    let mut entries = unit.entries();
+    let Ok(true) = entries.next_entry() else {
         return Vec::new();
     };
-    let Ok(root) = tree.root() else {
+    let Some(root) = entries.current() else {
         return Vec::new();
     };
-    let mut roots = Vec::new();
-    let mut children = root.children();
-    while let Ok(Some(child)) = children.next() {
-        perf_dwarf_collect_relevant_nodes(dwarf, unit, child, names, &mut roots);
+    if !root.has_children() {
+        return Vec::new();
     }
-    roots
-}
-
-fn perf_dwarf_collect_relevant_nodes<R>(
-    dwarf: &gimli::Dwarf<R>,
-    unit: &gimli::Unit<R>,
-    node: gimli::EntriesTreeNode<'_, '_, R>,
-    names: &mut PerfDwarfNameInterner,
-    out: &mut Vec<PerfDwarfDieNode>,
-) where
-    R: gimli::Reader,
-{
-    let tag = node.entry().tag();
-    let kind = match tag {
-        gimli::DW_TAG_subprogram => Some(PerfDwarfDieKind::Subprogram),
-        gimli::DW_TAG_inlined_subroutine => Some(PerfDwarfDieKind::Inline),
-        _ => None,
-    };
-    let collect_children = match kind {
-        Some(PerfDwarfDieKind::Subprogram | PerfDwarfDieKind::Inline) => {
-            perf_dwarf_collect_inline_children
+    let root_depth = root.depth();
+    let mut scopes = Vec::<PerfDwarfScope>::new();
+    let root_frames: Arc<[PerfDwarfNameId]> = Arc::from([]);
+    let mut segments = Vec::new();
+    let mut next_order = 0;
+    let mut skip_subtree = false;
+    loop {
+        // Retain the sibling fast path when pruning a direct subprogram child.
+        // A null sibling terminator must be consumed before resuming DFS.
+        let skipping = std::mem::take(&mut skip_subtree);
+        let next = if skipping {
+            entries.next_sibling().map(|entry| entry.is_some())
+        } else {
+            entries.next_dfs().map(|entry| entry.is_some())
+        };
+        let entry = match next {
+            Ok(true) => entries
+                .current()
+                .expect("cursor advanced to a non-null DIE"),
+            Ok(false) if skipping => continue,
+            _ => break,
+        };
+        let depth = entry.depth();
+        if depth <= root_depth {
+            break;
         }
-        None => perf_dwarf_collect_relevant_nodes,
-    };
-    let ranges = kind
-        .map(|_| perf_dwarf_ranges(dwarf.die_ranges(unit, node.entry()).ok()).unwrap_or_default());
-    let name = kind.and_then(|_| {
-        perf_dwarf_die_frame_name(dwarf, unit, node.entry()).map(|name| names.intern(name))
-    });
-    if let Some(kind) = kind {
-        let mut children = Vec::new();
-        let mut child_iter = node.children();
-        while let Ok(Some(child)) = child_iter.next() {
-            collect_children(dwarf, unit, child, names, &mut children);
+        while scopes.last().is_some_and(|scope| scope.depth >= depth) {
+            perf_dwarf_finish_scope(
+                &mut scopes,
+                source_line_ranges,
+                &mut segments,
+                &mut next_order,
+            );
         }
-        out.push(PerfDwarfDieNode {
-            kind,
-            ranges: ranges.unwrap_or_default(),
-            name,
-            children,
+        let kind = match entry.tag() {
+            gimli::DW_TAG_subprogram => PerfDwarfDieKind::Subprogram,
+            gimli::DW_TAG_inlined_subroutine => PerfDwarfDieKind::Inline,
+            _ => continue,
+        };
+        let parent = scopes.last();
+        if kind == PerfDwarfDieKind::Subprogram
+            && parent.is_some_and(|scope| scope.depth + 1 == depth)
+        {
+            skip_subtree = true;
+            continue;
+        }
+        let ranges = perf_dwarf_ranges(dwarf.die_ranges(unit, entry).ok()).unwrap_or_default();
+        let name = perf_dwarf_die_frame_name(dwarf, unit, entry).map(|name| names.intern(name));
+        // A subprogram behind a transparent wrapper was previously collected
+        // (including its names), but flattening excluded its entire subtree.
+        let suppressed =
+            parent.is_some_and(|scope| scope.suppressed || kind == PerfDwarfDieKind::Subprogram);
+        scopes.push(PerfDwarfScope {
+            depth,
+            ranges,
+            frames: if suppressed {
+                root_frames.clone()
+            } else {
+                perf_dwarf_node_frames(parent.map_or(&root_frames, |scope| &scope.frames), name)
+            },
+            has_inline_frames: kind == PerfDwarfDieKind::Inline
+                || parent.is_some_and(|scope| scope.has_inline_frames),
+            suppressed,
+            child_coverage: Vec::new(),
         });
-        return;
     }
-    let mut child_iter = node.children();
-    while let Ok(Some(child)) = child_iter.next() {
-        collect_children(dwarf, unit, child, names, out);
+    // Parsing errors previously retained partial nodes. Finalize them too.
+    while !scopes.is_empty() {
+        perf_dwarf_finish_scope(
+            &mut scopes,
+            source_line_ranges,
+            &mut segments,
+            &mut next_order,
+        );
     }
-}
-
-fn perf_dwarf_collect_inline_children<R>(
-    dwarf: &gimli::Dwarf<R>,
-    unit: &gimli::Unit<R>,
-    node: gimli::EntriesTreeNode<'_, '_, R>,
-    names: &mut PerfDwarfNameInterner,
-    out: &mut Vec<PerfDwarfDieNode>,
-) where
-    R: gimli::Reader,
-{
-    if node.entry().tag() == gimli::DW_TAG_subprogram {
-        return;
-    }
-    perf_dwarf_collect_relevant_nodes(dwarf, unit, node, names, out);
+    segments.sort_by_key(|segment| segment.range.begin);
+    segments
 }
 
 fn perf_dwarf_ranges<R>(ranges: Option<gimli::RangeIter<R>>) -> Option<Vec<PerfAddressRange>>
@@ -4661,54 +4683,20 @@ fn perf_dwarf_ranges_contain(ranges: &[PerfAddressRange], address: u64) -> bool 
         .any(|range| range.begin <= address && address < range.end)
 }
 
-fn perf_dwarf_frame_ranges_from_roots(
-    roots: &[PerfDwarfDieNode],
-    source_line_ranges: &[PerfAddressRange],
-) -> Vec<PerfDwarfFrameRange> {
-    let mut segments = Vec::new();
-    let root_frames: Arc<[PerfDwarfNameId]> = Arc::from([]);
-    let mut next_order = 0;
-    for root in roots {
-        perf_dwarf_collect_frame_ranges(
-            root,
-            &root_frames,
-            false,
-            source_line_ranges,
-            &mut segments,
-            &mut next_order,
-        );
-    }
-    segments.sort_by_key(|segment| segment.range.begin);
-    segments
-}
-
-fn perf_dwarf_collect_frame_ranges(
-    node: &PerfDwarfDieNode,
-    parent_frames: &Arc<[PerfDwarfNameId]>,
-    parent_has_inline_frames: bool,
+fn perf_dwarf_finish_scope(
+    scopes: &mut Vec<PerfDwarfScope>,
     source_line_ranges: &[PerfAddressRange],
     out: &mut Vec<PerfDwarfFrameRange>,
     next_order: &mut usize,
-) -> Vec<PerfAddressRange> {
-    let frames = perf_dwarf_node_frames(parent_frames, node.name);
-    let has_inline_frames = parent_has_inline_frames || node.kind == PerfDwarfDieKind::Inline;
-    let mut child_coverage = Vec::new();
-    for child in &node.children {
-        if child.kind == PerfDwarfDieKind::Subprogram {
-            continue;
-        }
-        child_coverage.extend(perf_dwarf_collect_frame_ranges(
-            child,
-            &frames,
-            has_inline_frames,
-            source_line_ranges,
-            out,
-            next_order,
-        ));
+) {
+    let Some(scope) = scopes.pop() else {
+        return;
+    };
+    if scope.suppressed {
+        return;
     }
-
-    if !frames.is_empty() {
-        for range in perf_dwarf_subtract_ranges(&node.ranges, &child_coverage) {
+    if !scope.frames.is_empty() {
+        for range in perf_dwarf_subtract_ranges(&scope.ranges, &scope.child_coverage) {
             let order = *next_order;
             *next_order += 1;
             // libdw requires a source line at the queried address, not merely
@@ -4729,8 +4717,8 @@ fn perf_dwarf_collect_frame_ranges(
             {
                 out.push(PerfDwarfFrameRange {
                     range,
-                    frames: frames.clone(),
-                    has_inline_frames,
+                    frames: scope.frames.clone(),
+                    has_inline_frames: scope.has_inline_frames,
                     has_source_line,
                     order,
                 });
@@ -4738,7 +4726,11 @@ fn perf_dwarf_collect_frame_ranges(
         }
     }
 
-    perf_dwarf_merge_ranges(node.ranges.clone())
+    if let Some(parent) = scopes.last_mut() {
+        parent
+            .child_coverage
+            .extend(perf_dwarf_merge_ranges(scope.ranges));
+    }
 }
 
 fn perf_dwarf_node_frames(
@@ -4882,54 +4874,9 @@ where
     perf_dwarf_die_name(dwarf, unit, entry)
         .map(|name| perf_dwarf_function_name(&name))
         .or_else(|| {
-            perf_dwarf_die_linkage_name(dwarf, unit, entry, 16)
+            perf_dwarf_inherited_string(dwarf, unit, entry, gimli::DW_AT_linkage_name, 16)
                 .map(|linkage| demangle_addr2line_name_qualified(&linkage))
         })
-}
-
-fn perf_dwarf_die_linkage_name<R>(
-    dwarf: &gimli::Dwarf<R>,
-    unit: &gimli::Unit<R>,
-    entry: &gimli::DebuggingInformationEntry<R>,
-    recursion_limit: usize,
-) -> Option<String>
-where
-    R: gimli::Reader,
-{
-    if recursion_limit == 0 {
-        return None;
-    }
-    entry
-        .attr(gimli::DW_AT_linkage_name)
-        .and_then(|attr| dwarf.attr_string(unit, attr.value()).ok())
-        .and_then(|name| name.to_string_lossy().ok().map(Cow::into_owned))
-        .or_else(|| {
-            entry.attr(gimli::DW_AT_abstract_origin).and_then(|attr| {
-                perf_dwarf_origin_linkage_name(dwarf, unit, &attr.value(), recursion_limit - 1)
-            })
-        })
-        .or_else(|| {
-            entry.attr(gimli::DW_AT_specification).and_then(|attr| {
-                perf_dwarf_origin_linkage_name(dwarf, unit, &attr.value(), recursion_limit - 1)
-            })
-        })
-}
-
-fn perf_dwarf_origin_linkage_name<R>(
-    dwarf: &gimli::Dwarf<R>,
-    unit: &gimli::Unit<R>,
-    value: &gimli::AttributeValue<R>,
-    recursion_limit: usize,
-) -> Option<String>
-where
-    R: gimli::Reader,
-{
-    let gimli::AttributeValue::UnitRef(offset) = value else {
-        return None;
-    };
-    let mut entries = unit.entries_tree(Some(*offset)).ok()?;
-    let root = entries.root().ok()?;
-    perf_dwarf_die_linkage_name(dwarf, unit, root.entry(), recursion_limit)
 }
 
 fn perf_dwarf_die_name<R>(
@@ -4940,54 +4887,53 @@ fn perf_dwarf_die_name<R>(
 where
     R: gimli::Reader,
 {
-    entry
-        .attr(gimli::DW_AT_name)
-        .and_then(|attr| dwarf.attr_string(unit, attr.value()).ok())
-        .and_then(|name| name.to_string_lossy().ok().map(Cow::into_owned))
-        .or_else(|| {
-            entry
-                .attr(gimli::DW_AT_abstract_origin)
-                .and_then(|attr| perf_dwarf_origin_name(dwarf, unit, &attr.value(), 16))
-        })
-        .or_else(|| {
-            entry
-                .attr(gimli::DW_AT_specification)
-                .and_then(|attr| perf_dwarf_origin_name(dwarf, unit, &attr.value(), 16))
-        })
+    // Keep the existing root plus sixteen referenced DIEs for DW_AT_name.
+    perf_dwarf_inherited_string(dwarf, unit, entry, gimli::DW_AT_name, 17)
 }
 
-fn perf_dwarf_origin_name<R>(
+fn perf_dwarf_inherited_string<R>(
     dwarf: &gimli::Dwarf<R>,
     unit: &gimli::Unit<R>,
-    value: &gimli::AttributeValue<R>,
-    recursion_limit: usize,
+    entry: &gimli::DebuggingInformationEntry<R>,
+    attribute: gimli::DwAt,
+    entry_limit: usize,
 ) -> Option<String>
 where
     R: gimli::Reader,
 {
-    if recursion_limit == 0 {
-        return None;
+    let mut pending = Vec::new();
+    let mut entry = Cow::Borrowed(entry);
+    let mut remaining = entry_limit;
+    loop {
+        if remaining > 0 {
+            if let Some(name) = entry
+                .attr(attribute)
+                .and_then(|attr| dwarf.attr_string(unit, attr.value()).ok())
+                .and_then(|name| name.to_string_lossy().ok().map(Cow::into_owned))
+            {
+                return Some(name);
+            }
+            // LIFO preserves the abstract-origin subtree before specification,
+            // including when a reference is bad or cyclic.
+            for attr in [gimli::DW_AT_specification, gimli::DW_AT_abstract_origin] {
+                if let Some(gimli::AttributeValue::UnitRef(offset)) =
+                    entry.attr(attr).map(gimli::Attribute::value)
+                {
+                    pending.push((offset, remaining - 1));
+                }
+            }
+        }
+        loop {
+            let (offset, limit) = pending.pop()?;
+            if limit > 0
+                && let Ok(next) = unit.entry(offset)
+            {
+                entry = Cow::Owned(next);
+                remaining = limit;
+                break;
+            }
+        }
     }
-    let gimli::AttributeValue::UnitRef(offset) = value else {
-        return None;
-    };
-    let mut entries = unit.entries_tree(Some(*offset)).ok()?;
-    let root = entries.root().ok()?;
-    let entry = root.entry();
-    entry
-        .attr(gimli::DW_AT_name)
-        .and_then(|attr| dwarf.attr_string(unit, attr.value()).ok())
-        .and_then(|name| name.to_string_lossy().ok().map(Cow::into_owned))
-        .or_else(|| {
-            entry.attr(gimli::DW_AT_abstract_origin).and_then(|attr| {
-                perf_dwarf_origin_name(dwarf, unit, &attr.value(), recursion_limit - 1)
-            })
-        })
-        .or_else(|| {
-            entry.attr(gimli::DW_AT_specification).and_then(|attr| {
-                perf_dwarf_origin_name(dwarf, unit, &attr.value(), recursion_limit - 1)
-            })
-        })
 }
 
 #[derive(Default)]
@@ -5386,14 +5332,13 @@ mod tests {
     use object::{Object, ObjectSegment, ObjectSymbol, build, elf};
 
     use super::{
-        CachedObjectMetadata, Kallsyms, PerfAddressRange, PerfDwarfDieKind, PerfDwarfDieNode,
-        PerfDwarfFrameNames, PerfDwarfIndexCache, PerfDwarfNameInterner, PerfObjectSymbolIndex,
-        PerfSymbolBinding, PerfSymbolCandidate, PerfSymbolScope, PreparedObjectMetadata,
-        ResolvedMappingRef, ResolvedSymbolFrames, RustAddr2lineResolver, SymbolDsoName,
-        SymbolFrameCache, SymbolRequest, SymbolResolver, clean_object_symbol_request,
-        demangle_addr2line_name_qualified, fixup_object_symbol_ends_like_perf,
-        gnu_build_id_from_notes, perf_best_duplicate_symbol, perf_dwarf_frame_names_from_index,
-        perf_dwarf_frame_ranges_from_roots, perf_frames_with_object_alias,
+        CachedObjectMetadata, Kallsyms, PerfAddressRange, PerfDwarfFrameNames, PerfDwarfIndexCache,
+        PerfDwarfNameInterner, PerfObjectSymbolIndex, PerfSymbolBinding, PerfSymbolCandidate,
+        PerfSymbolScope, PreparedObjectMetadata, ResolvedMappingRef, ResolvedSymbolFrames,
+        RustAddr2lineResolver, SymbolDsoName, SymbolFrameCache, SymbolRequest, SymbolResolver,
+        clean_object_symbol_request, demangle_addr2line_name_qualified,
+        fixup_object_symbol_ends_like_perf, gnu_build_id_from_notes, perf_best_duplicate_symbol,
+        perf_dwarf_frame_names_from_index, perf_frames_with_object_alias,
         perf_symbol_candidate_search_end, resolve_base_frames_from_object_metadata,
     };
 
@@ -7537,22 +7482,421 @@ mod tests {
         );
     }
 
+    type TestDwarfDie<'a> = (usize, gimli::DwTag, Option<&'a str>, &'a [PerfAddressRange]);
+
+    fn test_dwarf_frame_ranges(
+        dies: &[TestDwarfDie<'_>],
+        source_line_ranges: &[PerfAddressRange],
+        names: &mut PerfDwarfNameInterner,
+    ) -> Vec<super::PerfDwarfFrameRange> {
+        let mut abbrev = vec![1, 0x11, 1, 0, 0];
+        let mut info = vec![0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 8, 1];
+        let mut ranges = Vec::new();
+        let mut open_depth = 0;
+        for (index, &(depth, tag, name, die_ranges)) in dies.iter().enumerate() {
+            assert!(depth > 0 && depth <= open_depth + 1);
+            while open_depth >= depth {
+                info.push(0);
+                open_depth -= 1;
+            }
+            let code = u8::try_from(index + 2).unwrap();
+            assert!(code < 128 && tag.0 < 128);
+            abbrev.extend_from_slice(&[code, u8::try_from(tag.0).unwrap(), 1]);
+            if name.is_some() {
+                abbrev.extend_from_slice(&[0x03, 0x08]); // name: string
+            }
+            abbrev.extend_from_slice(&[0x55, 0x17, 0, 0]); // ranges: sec_offset
+            info.push(code);
+            if let Some(name) = name {
+                info.extend_from_slice(name.as_bytes());
+                info.push(0);
+            }
+            info.extend_from_slice(&u32::try_from(ranges.len()).unwrap().to_le_bytes());
+            for range in die_ranges {
+                ranges.extend_from_slice(&range.begin.to_le_bytes());
+                ranges.extend_from_slice(&range.end.to_le_bytes());
+            }
+            ranges.extend_from_slice(&[0; 16]);
+            open_depth = depth;
+        }
+        info.extend(std::iter::repeat_n(0, open_depth + 1));
+        abbrev.push(0);
+        let length = u32::try_from(info.len() - 4).unwrap();
+        info[..4].copy_from_slice(&length.to_le_bytes());
+        let dwarf = gimli::Dwarf::load(|id| {
+            let bytes = match id {
+                gimli::SectionId::DebugAbbrev => abbrev.as_slice(),
+                gimli::SectionId::DebugInfo => info.as_slice(),
+                gimli::SectionId::DebugRanges => ranges.as_slice(),
+                _ => &[],
+            };
+            Ok::<_, gimli::Error>(gimli::EndianSlice::new(bytes, gimli::LittleEndian))
+        })
+        .unwrap();
+        let header = dwarf.units().next().unwrap().unwrap();
+        let unit = dwarf.unit(header).unwrap();
+        super::perf_dwarf_unit_frame_ranges(&dwarf, &unit, names, source_line_ranges)
+    }
+
+    fn pyroc50_raw_nested_dwarf(depth: usize, unnamed_inline: bool) -> Vec<u8> {
+        // DWARF32 v4, 8-byte addresses. Every DIE has children; null records
+        // close them iteratively, including the named leaves and CU.
+        let abbrev = vec![
+            1, 0x11, 1, 0x11, 0x01, 0x12, 0x06, 0, 0, // CU: low/high PC
+            2, 0x2e, 1, 0x03, 0x08, 0x11, 0x01, 0x12, 0x06, 0, 0, // named function
+            3, 0x0b, 1, 0, 0, // lexical block
+            4, 0x1d, 1, 0x11, 0x01, 0x12, 0x06, 0, 0, // unnamed inline
+            5, 0x1d, 1, 0x03, 0x08, 0x11, 0x01, 0x12, 0x06, 0, 0, // named inline
+            0,
+        ];
+        let mut info = vec![0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 8];
+        pyroc50_push_die(&mut info, 1, None, Some((0x1000, 0x40)));
+        pyroc50_push_die(&mut info, 2, Some("outer"), Some((0x1000, 0x40)));
+        for _ in 0..depth {
+            if unnamed_inline {
+                pyroc50_push_die(&mut info, 4, None, Some((0x1010, 0x10)));
+            } else {
+                pyroc50_push_die(&mut info, 3, None, None);
+            }
+        }
+        pyroc50_push_die(&mut info, 5, Some("leaf"), Some((0x1018, 4)));
+        info.extend(std::iter::repeat_n(0, depth + 1));
+        for name in ["trailing", "later"] {
+            pyroc50_push_die(&mut info, 5, Some(name), Some((0x1028, 8)));
+            info.push(0);
+        }
+        info.extend_from_slice(&[0, 0]);
+        let length = u32::try_from(info.len() - 4).expect("fixture unit length");
+        info[..4].copy_from_slice(&length.to_le_bytes());
+
+        let base = elf_with_text_symbol_fixtures(
+            elf::EM_X86_64,
+            &[(b"base_symbol", 0x1000, 0x40, elf::STB_GLOBAL, elf::STT_FUNC)],
+        );
+        let mut builder = build::elf::Builder::read(base.as_slice()).expect("fixture ELF");
+        for (name, data) in [
+            (b".debug_abbrev".as_slice(), abbrev),
+            (b".debug_info", info),
+        ] {
+            let section = builder.sections.add();
+            section.name = name.into();
+            section.sh_type = elf::SHT_PROGBITS;
+            section.sh_addralign = 1;
+            section.data = build::elf::SectionData::Data(data.into());
+        }
+        builder.set_section_sizes();
+        let mut bytes = Vec::new();
+        builder.write(&mut bytes).expect("raw nested DWARF ELF");
+        bytes
+    }
+
+    fn pyroc50_push_die(
+        info: &mut Vec<u8>,
+        code: u8,
+        name: Option<&str>,
+        range: Option<(u64, u32)>,
+    ) {
+        info.push(code);
+        if let Some(name) = name {
+            info.extend_from_slice(name.as_bytes());
+            info.push(0);
+        }
+        if let Some((begin, size)) = range {
+            info.extend_from_slice(&begin.to_le_bytes());
+            info.extend_from_slice(&size.to_le_bytes());
+        }
+    }
+
+    fn pyroc50_assert_raw_layout(bytes: &[u8], depth: usize, unnamed_inline: bool) {
+        use object::ObjectSection as _;
+
+        let object = object::File::parse(bytes).expect("parse raw fixture ELF");
+        let dwarf = gimli::Dwarf::load(|id| {
+            let data = object
+                .section_by_name(id.name())
+                .map_or(&[][..], |section| {
+                    section.data().expect("raw DWARF section")
+                });
+            Ok::<_, gimli::Error>(gimli::EndianSlice::new(data, gimli::LittleEndian))
+        })
+        .expect("load raw DWARF");
+        let mut headers = dwarf.units();
+        let header = headers.next().expect("unit header").expect("one CU");
+        assert!(headers.next().expect("end of units").is_none());
+        let unit = dwarf.unit(header).expect("valid fixture CU");
+        assert!(unit.line_program.is_none());
+        let mut cursor = unit.entries();
+        let mut dies = 0;
+        let mut nulls = 0;
+        let mut lexical = 0;
+        let mut inlines = 0;
+        let mut max_depth = 0;
+        let mut names = Vec::new();
+        while cursor.next_entry().expect("iteratively parse every DIE") {
+            let Some(entry) = cursor.current() else {
+                nulls += 1;
+                continue;
+            };
+            dies += 1;
+            max_depth = max_depth.max(entry.depth());
+            lexical += usize::from(entry.tag() == gimli::DW_TAG_lexical_block);
+            inlines += usize::from(entry.tag() == gimli::DW_TAG_inlined_subroutine);
+            assert!(entry.has_children());
+            if let Some(attr) = entry.attr(gimli::DW_AT_name) {
+                names.push(
+                    dwarf
+                        .attr_string(&unit, attr.value())
+                        .expect("fixture name")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+        assert_eq!(dies, depth + 5);
+        assert_eq!(nulls, dies);
+        assert_eq!(cursor.next_depth(), 0);
+        assert_eq!(max_depth, isize::try_from(depth + 2).unwrap());
+        assert_eq!(lexical, if unnamed_inline { 0 } else { depth });
+        assert_eq!(inlines, 3 + if unnamed_inline { depth } else { 0 });
+        assert_eq!(names, ["outer", "leaf", "trailing", "later"]);
+    }
+
+    fn pyroc50_assert_product_frames(bytes: &[u8], unnamed_inline: bool) {
+        let addresses = [
+            0x1000, 0x100f, 0x1010, 0x1017, 0x1018, 0x101b, 0x101c, 0x101f, 0x1020, 0x1028, 0x102f,
+            0x1030, 0x103f, 0x1040,
+        ];
+        let resolver =
+            super::PerfDwarfNameResolver::from_object_bytes_for_addresses(bytes, &addresses)
+                .expect("prepare standalone DWARF index");
+        assert_eq!(resolver.units.len(), 1);
+        assert!(
+            resolver.units[0]
+                .segments
+                .iter()
+                .all(|segment| !segment.has_source_line)
+        );
+        let mut cache = PerfDwarfIndexCache::default();
+        super::build_dwarf_index_cache_for_addresses(&mut cache, bytes, &addresses)
+            .expect("prepare cached DWARF index");
+        let units = cache.units.as_ref().expect("cached units");
+        assert_eq!(units.len(), 1);
+        let segments = units[0].segments.as_ref().expect("cached segments");
+        for address in addresses {
+            let names: Option<Vec<String>> = match address {
+                0x1018 | 0x101b => Some(vec!["leaf".into(), "outer".into()]),
+                0x1028 | 0x102f => Some(vec!["trailing".into(), "outer".into()]),
+                0x1010 | 0x1017 | 0x101c | 0x101f if unnamed_inline => Some(vec!["outer".into()]),
+                _ => None,
+            };
+            let expected = names.map(|frames| PerfDwarfFrameNames {
+                frames,
+                has_inline_frames: true,
+            });
+            assert_eq!(
+                resolver.frame_names_for_base_symbol(address, Some("base_symbol")),
+                expected,
+                "standalone lookup at {address:#x}"
+            );
+            assert_eq!(
+                perf_dwarf_frame_names_from_index(
+                    segments,
+                    &cache.names.names,
+                    address,
+                    Some("base_symbol"),
+                ),
+                expected,
+                "cached lookup at {address:#x}"
+            );
+        }
+        assert_eq!(
+            super::perf_dwarf_frame_names_from_object_bytes(bytes, 0x1018),
+            Some(vec!["leaf".into(), "outer".into()])
+        );
+        assert_eq!(
+            super::perf_dwarf_frame_names_from_object_bytes(bytes, 0x100f),
+            Some(vec!["base_symbol".into()])
+        );
+        // All indexes must be destroyed on the small product thread.
+        drop(cache);
+        drop(resolver);
+    }
+
+    fn pyroc50_assert_file_resolver_frames(path: &std::path::Path, unnamed_inline: bool) {
+        let resolver = RustAddr2lineResolver::new();
+        let leaf = super::clean_object_symbol_request(path.to_path_buf(), 0x1018);
+        let first = resolver
+            .resolve_frame_batch_with_metadata(&[leaf])
+            .expect("resolve deep DWARF from file");
+        assert_eq!(first[0].frames, ["outer", "leaf"]);
+        assert!(first[0].has_base_symbol && first[0].has_inline_frames);
+        assert!(!first[0].has_non_inline_base_frame);
+        assert_eq!(first[0].base_offset, Some(0x18));
+        let metadata = resolver
+            .object_metadata(path)
+            .expect("cached file metadata");
+        let segment_pointer = {
+            let cache = metadata.dwarf_index.lock().unwrap();
+            let units = cache.units.as_ref().expect("file resolver prepared units");
+            assert_eq!(units.len(), 1);
+            assert_eq!(cache.names.names, ["outer", "leaf", "trailing", "later"]);
+            units[0].segments.as_ref().expect("prepared CU").as_ptr()
+        };
+        // Different addresses must reuse the loaded file and prepared CU.
+        std::fs::remove_file(path).expect("unlink deep fixture after loading");
+        let requests = [0x101b, 0x1010, 0x1028, 0x100f]
+            .map(|address| super::clean_object_symbol_request(path.to_path_buf(), address));
+        let second = resolver
+            .resolve_frame_batch_with_metadata(&requests)
+            .expect("resolve cached deep DWARF after unlink");
+        assert_eq!(second[0].frames, ["outer", "leaf"]);
+        if unnamed_inline {
+            assert_eq!(second[1].frames, ["outer"]);
+            assert!(second[1].has_inline_frames);
+        } else {
+            assert_eq!(second[1].frames, ["base_symbol+0x10"]);
+            assert!(!second[1].has_inline_frames);
+        }
+        assert_eq!(second[2].frames, ["outer", "trailing"]);
+        assert!(second[2].has_inline_frames);
+        assert_eq!(second[3].frames, ["base_symbol+0xf"]);
+        assert!(!second[3].has_inline_frames);
+        assert!(second[3].has_non_inline_base_frame);
+        assert!(second.iter().all(|frames| {
+            frames.has_base_symbol
+                && frames.source_state == super::SymbolSourceState::AddressDependent
+        }));
+        assert_eq!(resolver.cached_object_count(), 1);
+        assert!(Arc::ptr_eq(
+            &metadata,
+            &resolver.object_metadata(path).unwrap()
+        ));
+        {
+            let cache = metadata.dwarf_index.lock().unwrap();
+            assert_eq!(
+                cache.units.as_ref().unwrap()[0]
+                    .segments
+                    .as_ref()
+                    .unwrap()
+                    .as_ptr(),
+                segment_pointer,
+            );
+        }
+        drop(metadata);
+        drop(resolver);
+    }
+
+    fn pyroc50_nested_dwarf_subprocess(test: &str, depth: usize, unnamed_inline: bool) {
+        const WORKER: &str = "PYROCLAST_PYROC50_WORKER";
+        if std::env::var(WORKER).as_deref() == Ok(test) {
+            #[cfg(unix)]
+            {
+                let limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                // This process is an isolated worker; suppress abort core files.
+                assert_eq!(
+                    unsafe { libc::setrlimit(libc::RLIMIT_CORE, &raw const limit) },
+                    0
+                );
+            }
+            let bytes = pyroc50_raw_nested_dwarf(depth, unnamed_inline);
+            pyroc50_assert_raw_layout(&bytes, depth, unnamed_inline);
+            let file = tempfile::NamedTempFile::new().expect("deep DWARF fixture file");
+            std::fs::write(file.path(), &bytes).expect("write raw deep DWARF fixture");
+            std::thread::Builder::new()
+                .name("pyroc50-product".into())
+                .stack_size(256 * 1024)
+                .spawn(move || {
+                    pyroc50_assert_product_frames(&bytes, unnamed_inline);
+                    pyroc50_assert_file_resolver_frames(file.path(), unnamed_inline);
+                    drop(file);
+                    drop(bytes);
+                })
+                .expect("small-stack product thread")
+                .join()
+                .expect("small-stack product assertions");
+            return;
+        }
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("symbols::tests::{test}"), "--nocapture"])
+            .env(WORKER, test)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("isolated DWARF worker");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let timed_out = loop {
+            if child.try_wait().expect("poll DWARF worker").is_some() {
+                break false;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().expect("stop timed-out DWARF worker");
+                break true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        let output = child.wait_with_output().expect("reap DWARF worker");
+        assert!(
+            !timed_out && output.status.success(),
+            "{test}: timeout={timed_out}, status={}\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+            "worker must execute exactly one test: {}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+    }
+
+    #[test]
+    fn pyroc50_deep_lexical_dwarf_is_stack_safe() {
+        pyroc50_nested_dwarf_subprocess("pyroc50_deep_lexical_dwarf_is_stack_safe", 16_384, false);
+    }
+
+    #[test]
+    fn pyroc50_deep_unnamed_inline_dwarf_is_stack_safe() {
+        pyroc50_nested_dwarf_subprocess(
+            "pyroc50_deep_unnamed_inline_dwarf_is_stack_safe",
+            16_384,
+            true,
+        );
+    }
+
+    #[test]
+    fn pyroc50_shallow_lexical_dwarf_control() {
+        pyroc50_nested_dwarf_subprocess("pyroc50_shallow_lexical_dwarf_control", 8, false);
+    }
+
+    #[test]
+    fn pyroc50_shallow_unnamed_inline_dwarf_control() {
+        pyroc50_nested_dwarf_subprocess("pyroc50_shallow_unnamed_inline_dwarf_control", 8, true);
+    }
+
     #[test]
     fn flattened_dwarf_ranges_share_frame_slices_for_the_same_node() {
         let mut names = PerfDwarfNameInterner::default();
-        let segments = perf_dwarf_frame_ranges_from_roots(
-            &[PerfDwarfDieNode {
-                kind: PerfDwarfDieKind::Subprogram,
-                ranges: vec![test_range(0, 100)],
-                name: Some(names.intern("outer".to_string())),
-                children: vec![PerfDwarfDieNode {
-                    kind: PerfDwarfDieKind::Inline,
-                    ranges: vec![test_range(10, 20)],
-                    name: Some(names.intern("inner".to_string())),
-                    children: Vec::new(),
-                }],
-            }],
+        let segments = test_dwarf_frame_ranges(
+            &[
+                (
+                    1,
+                    gimli::DW_TAG_subprogram,
+                    Some("outer"),
+                    &[test_range(0, 100)],
+                ),
+                (
+                    2,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("inner"),
+                    &[test_range(10, 20)],
+                ),
+            ],
             &[],
+            &mut names,
         );
 
         assert_eq!(segments.len(), 3);
@@ -7573,21 +7917,254 @@ mod tests {
     }
 
     #[test]
+    fn pyroc50_wrapped_subprogram_interns_names_without_frames_or_coverage() {
+        let mut names = PerfDwarfNameInterner::default();
+        let segments = test_dwarf_frame_ranges(
+            &[
+                (
+                    1,
+                    gimli::DW_TAG_subprogram,
+                    Some("outer"),
+                    &[test_range(0, 100)],
+                ),
+                (
+                    2,
+                    gimli::DW_TAG_subprogram,
+                    Some("direct_skipped"),
+                    &[test_range(10, 20)],
+                ),
+                (
+                    3,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("direct_inline_skipped"),
+                    &[test_range(10, 20)],
+                ),
+                (2, gimli::DW_TAG_lexical_block, None, &[]),
+                (
+                    3,
+                    gimli::DW_TAG_subprogram,
+                    Some("wrapped"),
+                    &[test_range(20, 30)],
+                ),
+                (
+                    4,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("wrapped_inline"),
+                    &[test_range(20, 30)],
+                ),
+                (
+                    4,
+                    gimli::DW_TAG_subprogram,
+                    Some("wrapped_direct_skipped"),
+                    &[test_range(20, 30)],
+                ),
+                (
+                    2,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("real_inline"),
+                    &[test_range(40, 50)],
+                ),
+                (
+                    1,
+                    gimli::DW_TAG_subprogram,
+                    Some("second_root"),
+                    &[test_range(100, 200)],
+                ),
+                (
+                    2,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("root_inline"),
+                    &[test_range(110, 120)],
+                ),
+            ],
+            &[],
+            &mut names,
+        );
+        assert_eq!(
+            names.names,
+            [
+                "outer",
+                "wrapped",
+                "wrapped_inline",
+                "real_inline",
+                "second_root",
+                "root_inline"
+            ]
+        );
+        assert!(segments.iter().any(|segment| {
+            segment.range.begin <= 25
+                && 25 < segment.range.end
+                && frame_names(&names, &segment.frames) == ["outer"]
+        }));
+        assert_eq!(
+            perf_dwarf_frame_names_from_index(&segments, &names.names, 25, Some("outer")),
+            None
+        );
+        for (address, expected) in [
+            (45, ["real_inline", "outer"]),
+            (115, ["root_inline", "second_root"]),
+        ] {
+            assert_eq!(
+                perf_dwarf_frame_names_from_index(&segments, &names.names, address, None)
+                    .unwrap()
+                    .frames,
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn pyroc50_pruned_last_child_resumes_at_parent_sibling() {
+        let mut names = PerfDwarfNameInterner::default();
+        let segments = test_dwarf_frame_ranges(
+            &[
+                (
+                    1,
+                    gimli::DW_TAG_subprogram,
+                    Some("first"),
+                    &[test_range(0, 100)],
+                ),
+                (
+                    2,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("early"),
+                    &[test_range(10, 20)],
+                ),
+                (
+                    2,
+                    gimli::DW_TAG_subprogram,
+                    Some("skipped"),
+                    &[test_range(40, 50)],
+                ),
+                (
+                    3,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("skipped_inline"),
+                    &[test_range(40, 50)],
+                ),
+                (
+                    1,
+                    gimli::DW_TAG_subprogram,
+                    Some("second"),
+                    &[test_range(100, 200)],
+                ),
+                (
+                    2,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("last"),
+                    &[test_range(110, 120)],
+                ),
+            ],
+            &[],
+            &mut names,
+        );
+        assert_eq!(names.names, ["first", "early", "second", "last"]);
+        assert_eq!(
+            perf_dwarf_frame_names_from_index(&segments, &names.names, 115, None)
+                .unwrap()
+                .frames,
+            ["last", "second"],
+        );
+        assert_eq!(
+            perf_dwarf_frame_names_from_index(&segments, &names.names, 45, Some("first")),
+            None
+        );
+    }
+
+    #[test]
+    fn pyroc50_own_coverage_and_postorder_survive_missing_and_external_ranges() {
+        let mut names = PerfDwarfNameInterner::default();
+        let segments = test_dwarf_frame_ranges(
+            &[
+                (
+                    1,
+                    gimli::DW_TAG_subprogram,
+                    Some("outer"),
+                    &[test_range(0, 100)],
+                ),
+                (
+                    2,
+                    gimli::DW_TAG_inlined_subroutine,
+                    None,
+                    &[test_range(20, 40)],
+                ),
+                (
+                    3,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("leaf"),
+                    &[test_range(30, 50)],
+                ),
+                (2, gimli::DW_TAG_inlined_subroutine, Some("range_less"), &[]),
+                (
+                    3,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("outside"),
+                    &[test_range(110, 120)],
+                ),
+            ],
+            &[test_range(0, 5), test_range(42, 46), test_range(115, 118)],
+            &mut names,
+        );
+        for (address, expected) in [
+            (45, vec!["leaf", "outer"]),
+            (25, vec!["outer"]),
+            (115, vec!["outside", "range_less", "outer"]),
+        ] {
+            assert_eq!(
+                perf_dwarf_frame_names_from_index(&segments, &names.names, address, None)
+                    .unwrap()
+                    .frames,
+                expected,
+            );
+        }
+        // Descendant coverage is neither clipped to the parent nor promoted
+        // into the parent's own coverage when returning to its caller.
+        assert!(segments.iter().any(|segment| {
+            segment.range.begin <= 45
+                && 45 < segment.range.end
+                && frame_names(&names, &segment.frames) == ["outer"]
+        }));
+        for segment in &segments {
+            let expected_order = match frame_names(&names, &segment.frames).as_slice() {
+                [_, leaf] if leaf == "leaf" => 0,
+                [_, _, outside] if outside == "outside" => 2,
+                [_] if segment.range.begin >= 20 && segment.range.end <= 30 => 1,
+                [_] if segment.range.end <= 20 => 3,
+                [_] => 4,
+                frames => panic!("unexpected frames: {frames:?}"),
+            };
+            assert_eq!(segment.order, expected_order);
+            assert_eq!(
+                segment.has_source_line,
+                [test_range(0, 5), test_range(42, 46), test_range(115, 118)]
+                    .iter()
+                    .any(|line| {
+                        line.begin <= segment.range.begin && segment.range.end <= line.end
+                    })
+            );
+        }
+    }
+
+    #[test]
     fn flattened_dwarf_lookup_keeps_inline_and_base_symbol_rules() {
         let mut names = PerfDwarfNameInterner::default();
-        let segments = perf_dwarf_frame_ranges_from_roots(
-            &[PerfDwarfDieNode {
-                kind: PerfDwarfDieKind::Subprogram,
-                ranges: vec![test_range(0, 100)],
-                name: Some(names.intern("outer".to_string())),
-                children: vec![PerfDwarfDieNode {
-                    kind: PerfDwarfDieKind::Inline,
-                    ranges: vec![test_range(10, 20)],
-                    name: Some(names.intern("inner".to_string())),
-                    children: Vec::new(),
-                }],
-            }],
+        let segments = test_dwarf_frame_ranges(
+            &[
+                (
+                    1,
+                    gimli::DW_TAG_subprogram,
+                    Some("outer"),
+                    &[test_range(0, 100)],
+                ),
+                (
+                    2,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("inner"),
+                    &[test_range(10, 20)],
+                ),
+            ],
             &[],
+            &mut names,
         );
 
         assert_eq!(
@@ -7617,19 +8194,18 @@ mod tests {
         // new_inline_sym() then marks that symbol as inlined, so script output
         // suppresses the DSO and appends "(inlined)".
         let mut names = PerfDwarfNameInterner::default();
-        let segments = perf_dwarf_frame_ranges_from_roots(
-            &[PerfDwarfDieNode {
-                kind: PerfDwarfDieKind::Subprogram,
-                ranges: vec![test_range(0, 100)],
-                name: None,
-                children: vec![PerfDwarfDieNode {
-                    kind: PerfDwarfDieKind::Inline,
-                    ranges: vec![test_range(10, 20)],
-                    name: Some(names.intern("next_remote_task".to_string())),
-                    children: Vec::new(),
-                }],
-            }],
+        let segments = test_dwarf_frame_ranges(
+            &[
+                (1, gimli::DW_TAG_subprogram, None, &[test_range(0, 100)]),
+                (
+                    2,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("next_remote_task"),
+                    &[test_range(10, 20)],
+                ),
+            ],
             &[],
+            &mut names,
         );
 
         assert_eq!(
@@ -7648,14 +8224,15 @@ mod tests {
         // line information. That leaves perf script printing the original
         // symtab symbol, as in the verified `float`/`f` fixture.
         let mut names = PerfDwarfNameInterner::default();
-        let segments = perf_dwarf_frame_ranges_from_roots(
-            &[PerfDwarfDieNode {
-                kind: PerfDwarfDieKind::Subprogram,
-                ranges: vec![test_range(0, 100)],
-                name: Some(names.intern("next_remote_task".to_string())),
-                children: Vec::new(),
-            }],
+        let segments = test_dwarf_frame_ranges(
+            &[(
+                1,
+                gimli::DW_TAG_subprogram,
+                Some("next_remote_task"),
+                &[test_range(0, 100)],
+            )],
             &[],
+            &mut names,
         );
 
         assert_eq!(
@@ -7678,19 +8255,23 @@ mod tests {
         // die_find_realfunc(), and srcline.c new_inline_sym() marks it inlined
         // when dwarf_diename(die) differs from the symtab base symbol.
         let mut names = PerfDwarfNameInterner::default();
-        let segments = perf_dwarf_frame_ranges_from_roots(
-            &[PerfDwarfDieNode {
-                kind: PerfDwarfDieKind::Subprogram,
-                ranges: vec![test_range(0, 100)],
-                name: Some(names.intern("default_read_to_end<std::fs::File>".to_string())),
-                children: vec![PerfDwarfDieNode {
-                    kind: PerfDwarfDieKind::Inline,
-                    ranges: vec![test_range(40, 50)],
-                    name: Some(names.intern("read".to_string())),
-                    children: Vec::new(),
-                }],
-            }],
+        let segments = test_dwarf_frame_ranges(
+            &[
+                (
+                    1,
+                    gimli::DW_TAG_subprogram,
+                    Some("default_read_to_end<std::fs::File>"),
+                    &[test_range(0, 100)],
+                ),
+                (
+                    2,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("read"),
+                    &[test_range(40, 50)],
+                ),
+            ],
             &[test_range(0, 100)],
+            &mut names,
         );
 
         assert_eq!(
@@ -7710,14 +8291,15 @@ mod tests {
     #[test]
     fn symbol_parity_single_function_die_with_line_replaces_base_without_children() {
         let mut names = PerfDwarfNameInterner::default();
-        let segments = perf_dwarf_frame_ranges_from_roots(
-            &[PerfDwarfDieNode {
-                kind: PerfDwarfDieKind::Subprogram,
-                ranges: vec![test_range(0, 100)],
-                name: Some(names.intern("f".to_string())),
-                children: Vec::new(),
-            }],
+        let segments = test_dwarf_frame_ranges(
+            &[(
+                1,
+                gimli::DW_TAG_subprogram,
+                Some("f"),
+                &[test_range(0, 100)],
+            )],
             &[test_range(0, 100)],
+            &mut names,
         );
         assert_eq!(
             perf_dwarf_frame_names_from_index(&segments, &names.names, 15, Some("float")),
@@ -7735,19 +8317,23 @@ mod tests {
     #[test]
     fn symbol_parity_realfunc_line_guard_checks_the_lookup_address() {
         let mut names = PerfDwarfNameInterner::default();
-        let segments = perf_dwarf_frame_ranges_from_roots(
-            &[PerfDwarfDieNode {
-                kind: PerfDwarfDieKind::Subprogram,
-                ranges: vec![test_range(0, 100)],
-                name: Some(names.intern("f".to_string())),
-                children: vec![PerfDwarfDieNode {
-                    kind: PerfDwarfDieKind::Inline,
-                    ranges: vec![test_range(70, 80)],
-                    name: Some(names.intern("child".to_string())),
-                    children: Vec::new(),
-                }],
-            }],
+        let segments = test_dwarf_frame_ranges(
+            &[
+                (
+                    1,
+                    gimli::DW_TAG_subprogram,
+                    Some("f"),
+                    &[test_range(0, 100)],
+                ),
+                (
+                    2,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("child"),
+                    &[test_range(70, 80)],
+                ),
+            ],
             &[test_range(20, 30), test_range(50, 60)],
+            &mut names,
         );
         for address in [0, 19, 30, 49, 60, 69, 80, 99, 100] {
             assert_eq!(
@@ -7777,19 +8363,23 @@ mod tests {
         // entropy_burn fixture requires modeling the external protocol at a
         // higher layer, not special-casing this DIE name here.
         let mut names = PerfDwarfNameInterner::default();
-        let segments = perf_dwarf_frame_ranges_from_roots(
-            &[PerfDwarfDieNode {
-                kind: PerfDwarfDieKind::Subprogram,
-                ranges: vec![test_range(0, 100)],
-                name: Some(names.intern("fn0".to_string())),
-                children: vec![PerfDwarfDieNode {
-                    kind: PerfDwarfDieKind::Inline,
-                    ranges: vec![test_range(10, 20)],
-                    name: Some(names.intern("mix".to_string())),
-                    children: Vec::new(),
-                }],
-            }],
+        let segments = test_dwarf_frame_ranges(
+            &[
+                (
+                    1,
+                    gimli::DW_TAG_subprogram,
+                    Some("fn0"),
+                    &[test_range(0, 100)],
+                ),
+                (
+                    2,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("mix"),
+                    &[test_range(10, 20)],
+                ),
+            ],
             &[],
+            &mut names,
         );
 
         assert_eq!(
@@ -7808,24 +8398,29 @@ mod tests {
         // to libdw DIE names. Real Rust functions named `eq` therefore remain
         // inline frames instead of terminating the chain.
         let mut names = PerfDwarfNameInterner::default();
-        let segments = perf_dwarf_frame_ranges_from_roots(
-            &[PerfDwarfDieNode {
-                kind: PerfDwarfDieKind::Subprogram,
-                ranges: vec![test_range(0, 100)],
-                name: Some(names.intern("fmt".to_string())),
-                children: vec![PerfDwarfDieNode {
-                    kind: PerfDwarfDieKind::Inline,
-                    ranges: vec![test_range(10, 90)],
-                    name: Some(names.intern("eq".to_string())),
-                    children: vec![PerfDwarfDieNode {
-                        kind: PerfDwarfDieKind::Inline,
-                        ranges: vec![test_range(20, 80)],
-                        name: Some(names.intern("eq<anstyle::color::Color>".to_string())),
-                        children: Vec::new(),
-                    }],
-                }],
-            }],
+        let segments = test_dwarf_frame_ranges(
+            &[
+                (
+                    1,
+                    gimli::DW_TAG_subprogram,
+                    Some("fmt"),
+                    &[test_range(0, 100)],
+                ),
+                (
+                    2,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("eq"),
+                    &[test_range(10, 90)],
+                ),
+                (
+                    3,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("eq<anstyle::color::Color>"),
+                    &[test_range(20, 80)],
+                ),
+            ],
             &[],
+            &mut names,
         );
 
         assert_eq!(
@@ -7842,14 +8437,15 @@ mod tests {
     #[test]
     fn flattened_dwarf_lookup_keeps_symtab_base_for_standalone_fn0_like_perf() {
         let mut names = PerfDwarfNameInterner::default();
-        let segments = perf_dwarf_frame_ranges_from_roots(
-            &[PerfDwarfDieNode {
-                kind: PerfDwarfDieKind::Subprogram,
-                ranges: vec![test_range(0, 100)],
-                name: Some(names.intern("fn0".to_string())),
-                children: Vec::new(),
-            }],
+        let segments = test_dwarf_frame_ranges(
+            &[(
+                1,
+                gimli::DW_TAG_subprogram,
+                Some("fn0"),
+                &[test_range(0, 100)],
+            )],
             &[],
+            &mut names,
         );
 
         assert_eq!(
@@ -7861,24 +8457,29 @@ mod tests {
     #[test]
     fn flattened_dwarf_lookup_ignores_unnamed_intermediate_nodes() {
         let mut names = PerfDwarfNameInterner::default();
-        let segments = perf_dwarf_frame_ranges_from_roots(
-            &[PerfDwarfDieNode {
-                kind: PerfDwarfDieKind::Subprogram,
-                ranges: vec![test_range(0, 100)],
-                name: Some(names.intern("outer".to_string())),
-                children: vec![PerfDwarfDieNode {
-                    kind: PerfDwarfDieKind::Inline,
-                    ranges: vec![test_range(20, 80)],
-                    name: None,
-                    children: vec![PerfDwarfDieNode {
-                        kind: PerfDwarfDieKind::Inline,
-                        ranges: vec![test_range(30, 40)],
-                        name: Some(names.intern("inner".to_string())),
-                        children: Vec::new(),
-                    }],
-                }],
-            }],
+        let segments = test_dwarf_frame_ranges(
+            &[
+                (
+                    1,
+                    gimli::DW_TAG_subprogram,
+                    Some("outer"),
+                    &[test_range(0, 100)],
+                ),
+                (
+                    2,
+                    gimli::DW_TAG_inlined_subroutine,
+                    None,
+                    &[test_range(20, 80)],
+                ),
+                (
+                    3,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("inner"),
+                    &[test_range(30, 40)],
+                ),
+            ],
             &[],
+            &mut names,
         );
 
         assert_eq!(
@@ -7895,27 +8496,29 @@ mod tests {
         // the address. A later overlapping sibling must not win just because
         // its flattened range has the same start address.
         let mut names = PerfDwarfNameInterner::default();
-        let segments = perf_dwarf_frame_ranges_from_roots(
-            &[PerfDwarfDieNode {
-                kind: PerfDwarfDieKind::Subprogram,
-                ranges: vec![test_range(0, 100)],
-                name: Some(names.intern("outer".to_string())),
-                children: vec![
-                    PerfDwarfDieNode {
-                        kind: PerfDwarfDieKind::Inline,
-                        ranges: vec![test_range(10, 30)],
-                        name: Some(names.intern("first".to_string())),
-                        children: Vec::new(),
-                    },
-                    PerfDwarfDieNode {
-                        kind: PerfDwarfDieKind::Inline,
-                        ranges: vec![test_range(10, 30)],
-                        name: Some(names.intern("second".to_string())),
-                        children: Vec::new(),
-                    },
-                ],
-            }],
+        let segments = test_dwarf_frame_ranges(
+            &[
+                (
+                    1,
+                    gimli::DW_TAG_subprogram,
+                    Some("outer"),
+                    &[test_range(0, 100)],
+                ),
+                (
+                    2,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("first"),
+                    &[test_range(10, 30)],
+                ),
+                (
+                    2,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("second"),
+                    &[test_range(10, 30)],
+                ),
+            ],
             &[],
+            &mut names,
         );
 
         assert_eq!(
@@ -7932,32 +8535,35 @@ mod tests {
         // die_find_child() searches only accept DW_TAG_inlined_subroutine.
         // A nested DW_TAG_subprogram must not become part of the inline chain.
         let mut names = PerfDwarfNameInterner::default();
-        let segments = perf_dwarf_frame_ranges_from_roots(
-            &[PerfDwarfDieNode {
-                kind: PerfDwarfDieKind::Subprogram,
-                ranges: vec![test_range(0, 100)],
-                name: Some(names.intern("outer".to_string())),
-                children: vec![
-                    PerfDwarfDieNode {
-                        kind: PerfDwarfDieKind::Subprogram,
-                        ranges: vec![test_range(10, 90)],
-                        name: Some(names.intern("nested_subprogram".to_string())),
-                        children: vec![PerfDwarfDieNode {
-                            kind: PerfDwarfDieKind::Inline,
-                            ranges: vec![test_range(20, 30)],
-                            name: Some(names.intern("nested_inline".to_string())),
-                            children: Vec::new(),
-                        }],
-                    },
-                    PerfDwarfDieNode {
-                        kind: PerfDwarfDieKind::Inline,
-                        ranges: vec![test_range(40, 50)],
-                        name: Some(names.intern("real_inline".to_string())),
-                        children: Vec::new(),
-                    },
-                ],
-            }],
+        let segments = test_dwarf_frame_ranges(
+            &[
+                (
+                    1,
+                    gimli::DW_TAG_subprogram,
+                    Some("outer"),
+                    &[test_range(0, 100)],
+                ),
+                (
+                    2,
+                    gimli::DW_TAG_subprogram,
+                    Some("nested_subprogram"),
+                    &[test_range(10, 90)],
+                ),
+                (
+                    3,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("nested_inline"),
+                    &[test_range(20, 30)],
+                ),
+                (
+                    2,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("real_inline"),
+                    &[test_range(40, 50)],
+                ),
+            ],
             &[],
+            &mut names,
         );
 
         assert_eq!(
