@@ -378,6 +378,7 @@ fn read_frames(svg: &str) -> io::Result<(Vec<Frame>, Option<u64>)> {
                     && metadata.ends_with(')')
                     && metadata.contains('%')
                 {
+                    validate_title_metadata(metadata)?;
                     container.title = Some(name.to_owned());
                 }
             }
@@ -445,6 +446,32 @@ fn read_frames(svg: &str) -> io::Result<(Vec<Frame>, Option<u64>)> {
         return Err(invalid_data("truncated SVG"));
     }
     Ok((frames, total))
+}
+
+fn validate_title_metadata(metadata: &str) -> io::Result<()> {
+    // Inferno flamegraph/mod.rs emits "count units, percent%" followed by
+    // an optional "; signed-delta%". Weights still come from exact fg:w,
+    // never from the rounded or scaled numbers in the title.
+    let malformed = || invalid_data("malformed flamegraph title metadata");
+    let (_, percentages) = metadata
+        .strip_suffix(')')
+        .and_then(|text| text.rsplit_once(", "))
+        .ok_or_else(malformed)?;
+    let mut fields = percentages.split("; ");
+    for _ in 0..2 {
+        let Some(field) = fields.next() else {
+            return Ok(());
+        };
+        field
+            .strip_suffix('%')
+            .and_then(|text| text.parse::<f64>().ok())
+            .filter(|value| value.is_finite())
+            .ok_or_else(malformed)?;
+    }
+    if fields.next().is_some() {
+        return Err(malformed());
+    }
+    Ok(())
 }
 
 fn attribute(element: &BytesStart<'_>, name: &[u8]) -> io::Result<Option<String>> {

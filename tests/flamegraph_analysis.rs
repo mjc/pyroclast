@@ -449,6 +449,72 @@ fn keeps_full_u64_weights_even_when_percentages_require_rounding() {
     assert_eq!(profile.categories[0].samples, total);
 }
 
+#[test]
+fn malformed_percentages_and_differentials_are_rejected() {
+    for metadata in [
+        "1 samples, 50%, junk",
+        "1 samples, 50%, junk%",
+        "1 samples, NaN%",
+        "1 samples, inf%",
+        "1 samples, 50%; junk%",
+        "1 samples, 50%; +1%; +2%",
+    ] {
+        let svg = ranged_svg(&format!(
+            r#"<g><title>foo ({metadata})</title><rect fg:x="0" fg:w="1" y="80"/></g>"#,
+        ));
+        let error = parse_flamegraph(&svg).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("malformed flamegraph title metadata"),
+            "{metadata}: {error}"
+        );
+    }
+}
+
+#[test]
+fn malformed_title_metadata_never_panics_in_analyzer_modes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("malformed.svg");
+    std::fs::write(
+        &path,
+        ranged_svg(
+            r#"<g><title>foo (1 samples, 50%, junk)</title><rect fg:x="0" fg:w="1" y="80"/></g>"#,
+        ),
+    )
+    .unwrap();
+    for mode in ["top", "search", "syscalls", "summary", "diff", "analyze"] {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pyroclast"));
+        if mode == "analyze" {
+            command.arg("analyze");
+        } else {
+            command.args(["plumbing", "parse", "flamegraph", mode]);
+        }
+        command.arg(&path).arg("--json");
+        if mode == "search" {
+            command.arg("foo");
+        }
+        if mode == "diff" {
+            command.arg(&path);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            !output.status.success(),
+            "{mode} must reject malformed metadata"
+        );
+        assert_ne!(output.status.code(), Some(101), "{mode} must not panic");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("malformed flamegraph title metadata"),
+            "{mode}: {stderr}"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "{mode} must not emit a success report"
+        );
+    }
+}
+
 fn ranged_svg(frames: &str) -> String {
     format!(
         r#"<svg xmlns:fg="http://github.com/jonhoo/inferno"><svg id="frames" total_samples="100">
