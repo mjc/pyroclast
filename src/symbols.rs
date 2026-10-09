@@ -5671,30 +5671,120 @@ fn perf_dwarf_inherited_string<'a, R>(
 where
     R: gimli::Reader,
 {
-    let mut entry = Cow::Borrowed(entry);
+    let mut offset = entry.offset();
     for _ in 0..entry_limit {
-        if let Some(name) = entry
-            .attr(attribute)
-            .and_then(|attr| dwarf.attr_string(unit, attr.value()).ok())
-            .filter(|name| name.to_string_lossy().is_ok())
-        {
-            return Some(name);
+        let attr = |name| perf_dwarf_raw_attribute(unit, offset, name);
+        if let Some(value) = attr(attribute) {
+            let name = dwarf.attr_string(unit, value.ok()?.value()).ok()?;
+            return name.to_string_lossy().is_ok().then_some(name);
         }
         // libdw dwarf_attr_integrate.c:43-63 uses specification only when
         // abstract_origin is absent, never after that reference fails.
-        let reference = entry
-            .attr(gimli::DW_AT_abstract_origin)
-            .or_else(|| entry.attr(gimli::DW_AT_specification))?
+        let reference = attr(gimli::DW_AT_abstract_origin)
+            .or_else(|| attr(gimli::DW_AT_specification))?
+            .ok()?
             .value();
-        let (owner, offset) = match reference {
+        let (owner, reference_offset) = match reference {
             gimli::AttributeValue::UnitRef(offset) => (unit, offset),
             gimli::AttributeValue::DebugInfoRef(offset) => directory.resolve_reference(offset)?,
             _ => return None,
         };
         unit = owner;
-        entry = Cow::Owned(owner.entry(offset).ok()?);
+        offset = reference_offset;
     }
     None
+}
+
+fn perf_dwarf_raw_attribute<R: gimli::Reader>(
+    unit: &gimli::Unit<R>,
+    offset: gimli::UnitOffset<R::Offset>,
+    name: gimli::DwAt,
+) -> Option<Result<gimli::Attribute<R>, gimli::Error>> {
+    let mut entries = unit.entries_raw(Some(offset)).ok()?;
+    let abbreviation = entries.read_abbreviation().ok()??;
+    for &spec in abbreviation.attributes() {
+        let mut spec = spec;
+        if spec.form() == gimli::DW_FORM_indirect {
+            let offset = entries.next_offset();
+            let mut value = unit.header.range_from(offset..).ok()?;
+            if value.is_empty() {
+                return None;
+            }
+            let length = value.len();
+            let form = match perf_dwarf_uleb128(&mut value) {
+                Ok(form) => form & u64::from(u32::MAX),
+                Err(error) => return (spec.name() == name).then_some(Err(error)),
+            };
+            // dwarf_child.c resolves one indirect form before the name match.
+            // Gimli permits nesting, but libdw rejects indirect/implicit_const.
+            if form == u64::from(gimli::DW_FORM_indirect.0)
+                || form == u64::from(gimli::DW_FORM_implicit_const.0)
+            {
+                return None;
+            }
+            let form = match u16::try_from(form) {
+                Ok(form) => gimli::DwForm(form),
+                Err(_) => {
+                    return (spec.name() == name).then_some(Err(gimli::Error::BadUnsignedLeb128));
+                }
+            };
+            let offset = gimli::UnitOffset(offset.0 + (length - value.len()));
+            entries =
+                gimli::EntriesRaw::new(value, unit.header.encoding(), &unit.abbreviations, offset);
+            spec = gimli::AttributeSpecification::new(spec.name(), form, None);
+        }
+        if spec.name() == name {
+            // libdw dwarf_child.c:__libdw_find_attr stops at the match.
+            // A present invalid value is distinct from an absent attribute.
+            return Some(entries.read_attribute(spec));
+        }
+        if matches!(
+            spec.form(),
+            gimli::DW_FORM_udata
+                | gimli::DW_FORM_sdata
+                | gimli::DW_FORM_ref_udata
+                | gimli::DW_FORM_addrx
+                | gimli::DW_FORM_loclistx
+                | gimli::DW_FORM_rnglistx
+                | gimli::DW_FORM_strx
+                | gimli::DW_FORM_GNU_addr_index
+                | gimli::DW_FORM_GNU_str_index
+        ) {
+            // libdw_form.c uses the bounded unsigned decoder to skip these,
+            // even for signed values; do not consume beyond ten bytes.
+            let offset = entries.next_offset();
+            let mut value = unit.header.range_from(offset..).ok()?;
+            if value.is_empty() {
+                return None;
+            }
+            let length = value.len();
+            perf_dwarf_uleb128(&mut value).ok()?;
+            let offset = gimli::UnitOffset(offset.0 + (length - value.len()));
+            entries =
+                gimli::EntriesRaw::new(value, unit.header.encoding(), &unit.abbreviations, offset);
+        } else if spec.form().0 != 0 {
+            // dwarf_child.c skips a value only when attr_form is nonzero.
+            entries.skip_attributes(std::slice::from_ref(&spec)).ok()?;
+        }
+    }
+    None
+}
+
+fn perf_dwarf_uleb128<R: gimli::Reader>(value: &mut R) -> Result<u64, gimli::Error> {
+    // libdw memory-access.h consumes at most ten bytes, accepting any
+    // terminating tenth byte and returning UINT64_MAX if none terminates.
+    let mut result = 0;
+    for index in 0..10 {
+        if value.is_empty() {
+            break;
+        }
+        let byte = value.read_u8()?;
+        result |= u64::from(byte & 0x7f) << (index * 7);
+        if byte & 0x80 == 0 {
+            return Ok(result);
+        }
+    }
+    Ok(u64::MAX)
 }
 
 enum PerfDwarfDieName<R> {
@@ -9458,18 +9548,56 @@ mod tests {
         Invalid,
         Cyclic,
         Nameless,
+        InvalidLocalString,
+        NamedWithMalformedTail,
+        OriginBeforeMalformedTail,
+        InvalidInheritedString,
+        NameAfterBlock,
+        ImplicitConstOrigin,
+        NestedIndirectOrigin,
+        MissingIndirectOrigin,
+        ValidIndirectOrigin,
+        NestedIndirectLocalName,
+        ValidIndirectLocalName,
+        WideNestedIndirectOrigin,
+        WideImplicitConstOrigin,
+        WideValidIndirectOrigin,
+        WideIndirectName,
+        ZeroIndirectBeforeName,
+        OverflowIndirectOrigin,
+        OverflowIndirectName,
+        LebBeforeName(gimli::DwForm, &'static [u8]),
     }
 
     fn inherited_name_fixture(kind: InheritedNameOrigin) -> (Vec<u8>, usize) {
-        let abbrev = vec![
+        let mut abbrev = vec![
             1, 0x11, 1, 0x11, 1, 0x12, 6, 0x10, 0x17, 0, 0, // CU ranges/stmt_list.
-            2, 0x2e, 1, 0x03, 8, 0x11, 1, 0x12, 6, 0, 0, // Named outer subprogram.
+            2, 0x2e, 0, 0x03, 8, 0x11, 1, 0x12, 6, 0, 0, // Named preceding subprogram.
             3, 0x2e, 0, 0x31, 0x13, 0x47, 0x13, 0x11, 1, 0x12, 6, 0, 0, 4, 0x2e, 0, 0x03, 8, 0,
             0, // Named specification.
             5, 0x2e, 0, 0, 0, // Nameless abstract origin.
             6, 0x2e, 0, 0x47, 0x13, 0x11, 1, 0x12, 6, 0, 0, // Specification only.
+            7, 0x2e, 0, 0x03, 0x0e, 0x31, 0x13, 0x47, 0x13, 0x11, 1, 0x12, 6, 0, 0,
+            // Invalid local name (strp), origin, specification, range.
+            8, 0x2e, 0, 0x03, 8, 0x1c, 0x0a, 0, 0, // Name before malformed block1.
+            9, 0x2e, 0, 0x31, 0x13, 0x1c, 0x0a, 0, 0, // Origin before malformed block1.
+            10, 0x2e, 0, 0x03, 0x0e, 0x31, 0x13, 0, 0, // Invalid strp before origin.
+            11, 0x2e, 0, 0x1c, 0x0a, 0x03, 8, 0, 0, // Name after valid block1.
+            12, 0x2e, 0, 0x47, 0x13, 0x31, 0x16, 0, 0, // Specification, indirect origin.
+            13, 0x2e, 0, 0x11, 1, 0x12, 6, 0x03, 0x16, 0x31, 0x13, 0x47, 0x13, 0, 0,
+            // Range before indirect local name, origin, specification.
+            14, 0x2e, 0, 0x03, 0x16, 0, 0, // Indirect name only.
+            15, 0x2e, 0, 0x1c, 0x16, 0x03, 8, 0, 0, // Zero indirect form before name.
             0,
         ];
+        if let InheritedNameOrigin::LebBeforeName(form, _) = kind {
+            abbrev.pop();
+            abbrev.extend_from_slice(&[16, 0x2e, 0, 0x1c]);
+            let mut encoded = gimli::write::EndianVec::new(gimli::LittleEndian);
+            gimli::write::Writer::write_uleb128(&mut encoded, u64::from(form.0)).unwrap();
+            abbrev.extend_from_slice(encoded.slice());
+            abbrev.extend_from_slice(&[0x03, 8, 0, 0, 0]);
+        }
         let mut info = vec![0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 8];
         info.push(1);
         info.extend_from_slice(&0x1000_u64.to_le_bytes());
@@ -9477,15 +9605,35 @@ mod tests {
         info.extend_from_slice(&0_u32.to_le_bytes());
         info.extend_from_slice(b"\x02outer\0");
         info.extend_from_slice(&0x1000_u64.to_le_bytes());
-        info.extend_from_slice(&0x40_u32.to_le_bytes());
+        info.extend_from_slice(&0x10_u32.to_le_bytes());
         // A concrete subprogram exercises naming without dwarf_getscopes'
         // separate requirement that inline scopes have a valid abstract origin.
         let function_offset = info.len();
-        info.push(if matches!(kind, InheritedNameOrigin::Absent) {
-            6
-        } else {
-            3
+        info.push(match kind {
+            InheritedNameOrigin::Absent => 6,
+            InheritedNameOrigin::InvalidLocalString => 7,
+            InheritedNameOrigin::NestedIndirectLocalName
+            | InheritedNameOrigin::ValidIndirectLocalName => 13,
+            _ => 3,
         });
+        let indirect_local_name = matches!(
+            kind,
+            InheritedNameOrigin::NestedIndirectLocalName
+                | InheritedNameOrigin::ValidIndirectLocalName
+        );
+        if indirect_local_name {
+            info.extend_from_slice(&0x1010_u64.to_le_bytes());
+            info.extend_from_slice(&0x10_u32.to_le_bytes());
+        }
+        if matches!(kind, InheritedNameOrigin::InvalidLocalString) {
+            info.extend_from_slice(&u32::MAX.to_le_bytes());
+        }
+        if indirect_local_name {
+            if matches!(kind, InheritedNameOrigin::NestedIndirectLocalName) {
+                info.push(0x16);
+            }
+            info.extend_from_slice(b"\x08local_name\0");
+        }
         let origin_reference = if matches!(kind, InheritedNameOrigin::Absent) {
             None
         } else {
@@ -9495,26 +9643,122 @@ mod tests {
         };
         let specification_reference = info.len();
         info.extend_from_slice(&0_u32.to_le_bytes());
-        info.extend_from_slice(&0x1010_u64.to_le_bytes());
-        info.extend_from_slice(&0x10_u32.to_le_bytes());
-        info.push(0); // End outer's children.
+        if !indirect_local_name {
+            info.extend_from_slice(&0x1010_u64.to_le_bytes());
+            info.extend_from_slice(&0x10_u32.to_le_bytes());
+        }
         let specification = u32::try_from(info.len()).unwrap();
         info.extend_from_slice(b"\x04spec_name\0");
-        let nameless = u32::try_from(info.len()).unwrap();
-        info.extend_from_slice(&[5, 0]);
+        let origin_entry = inherited_origin_entry(&mut info, kind, specification);
         info[specification_reference..specification_reference + 4]
             .copy_from_slice(&specification.to_le_bytes());
         if let Some(reference) = origin_reference {
             let origin = match kind {
                 InheritedNameOrigin::Invalid => u32::MAX,
                 InheritedNameOrigin::Cyclic => u32::try_from(function_offset).unwrap(),
-                InheritedNameOrigin::Nameless => nameless,
+                InheritedNameOrigin::InvalidLocalString
+                | InheritedNameOrigin::NestedIndirectLocalName
+                | InheritedNameOrigin::ValidIndirectLocalName => specification,
                 InheritedNameOrigin::Absent => unreachable!(),
+                _ => origin_entry,
             };
             info[reference..reference + 4].copy_from_slice(&origin.to_le_bytes());
         }
         let length = u32::try_from(info.len() - 4).unwrap();
         info[..4].copy_from_slice(&length.to_le_bytes());
+        (inherited_name_elf(info, abbrev), function_offset)
+    }
+
+    fn inherited_origin_entry(
+        info: &mut Vec<u8>,
+        kind: InheritedNameOrigin,
+        specification: u32,
+    ) -> u32 {
+        let offset = u32::try_from(info.len()).unwrap();
+        match kind {
+            InheritedNameOrigin::NamedWithMalformedTail => {
+                info.extend_from_slice(b"\x08origin_name\0\xff\x00");
+            }
+            InheritedNameOrigin::OriginBeforeMalformedTail => {
+                info.push(9);
+                info.extend_from_slice(&specification.to_le_bytes());
+                info.extend_from_slice(&[0xff, 0]);
+            }
+            InheritedNameOrigin::InvalidInheritedString => {
+                info.push(10);
+                info.extend_from_slice(&u32::MAX.to_le_bytes());
+                info.extend_from_slice(&specification.to_le_bytes());
+                info.push(0);
+            }
+            InheritedNameOrigin::NameAfterBlock => {
+                info.extend_from_slice(b"\x0b\x03\x01\x02\x03origin_name\0\x00");
+            }
+            InheritedNameOrigin::WideIndirectName => {
+                info.extend_from_slice(b"\x0e\x88\x80\x80\x80\x10origin_name\0\x00");
+            }
+            InheritedNameOrigin::OverflowIndirectName => {
+                info.extend_from_slice(
+                    b"\x0e\x88\x80\x80\x80\x80\x80\x80\x80\x80\x02origin_name\0\x00",
+                );
+            }
+            InheritedNameOrigin::ZeroIndirectBeforeName => {
+                info.extend_from_slice(b"\x0f\x00origin_name\0\x00");
+            }
+            InheritedNameOrigin::LebBeforeName(_, value) => {
+                info.push(16);
+                info.extend_from_slice(value);
+                info.extend_from_slice(b"Xname\0\x00");
+            }
+            InheritedNameOrigin::ImplicitConstOrigin
+            | InheritedNameOrigin::NestedIndirectOrigin
+            | InheritedNameOrigin::MissingIndirectOrigin
+            | InheritedNameOrigin::ValidIndirectOrigin
+            | InheritedNameOrigin::WideNestedIndirectOrigin
+            | InheritedNameOrigin::WideImplicitConstOrigin
+            | InheritedNameOrigin::WideValidIndirectOrigin
+            | InheritedNameOrigin::OverflowIndirectOrigin => {
+                info.extend_from_slice(b"\x04origin_name\0");
+                let origin = u32::try_from(info.len()).unwrap();
+                info.push(12);
+                info.extend_from_slice(&specification.to_le_bytes());
+                match kind {
+                    InheritedNameOrigin::ImplicitConstOrigin => info.extend_from_slice(&[0x21, 0]),
+                    InheritedNameOrigin::MissingIndirectOrigin => info.push(0x80),
+                    InheritedNameOrigin::WideNestedIndirectOrigin => {
+                        info.extend_from_slice(&[0x96, 0x80, 0x80, 0x80, 0x10, 0]);
+                    }
+                    InheritedNameOrigin::WideImplicitConstOrigin => {
+                        info.extend_from_slice(&[0xa1, 0x80, 0x80, 0x80, 0x10, 0]);
+                    }
+                    InheritedNameOrigin::WideValidIndirectOrigin => {
+                        info.extend_from_slice(&[0x93, 0x80, 0x80, 0x80, 0x10]);
+                        info.extend_from_slice(&offset.to_le_bytes());
+                        info.push(0);
+                    }
+                    InheritedNameOrigin::OverflowIndirectOrigin => {
+                        info.extend_from_slice(&[
+                            0x93, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02,
+                        ]);
+                        info.extend_from_slice(&offset.to_le_bytes());
+                        info.push(0);
+                    }
+                    _ => {
+                        if matches!(kind, InheritedNameOrigin::NestedIndirectOrigin) {
+                            info.push(0x16);
+                        }
+                        info.push(0x13);
+                        info.extend_from_slice(&offset.to_le_bytes());
+                        info.push(0);
+                    }
+                }
+                return origin;
+            }
+            _ => info.extend_from_slice(&[5, 0]),
+        }
+        offset
+    }
+
+    fn inherited_name_elf(info: Vec<u8>, abbrev: Vec<u8>) -> Vec<u8> {
         let base = elf_with_text_symbol_fixtures(
             elf::EM_X86_64,
             &[(b"base_symbol", 0x1000, 0x40, elf::STB_GLOBAL, elf::STT_FUNC)],
@@ -9550,7 +9794,7 @@ mod tests {
         builder.header.e_phoff = 64;
         let mut bytes = Vec::new();
         builder.write(&mut bytes).unwrap();
-        (bytes, function_offset)
+        bytes
     }
 
     fn assert_inherited_name_origin(kind: InheritedNameOrigin, expected: Option<&str>) {
@@ -9597,6 +9841,188 @@ mod tests {
             expected,
             "{kind:?}"
         );
+        assert_eq!(
+            super::perf_dwarf_frame_names_from_object_bytes(&bytes, 0x1018),
+            Some(vec![expected.unwrap_or("base_symbol").to_owned()]),
+            "production frame index: {kind:?}"
+        );
+    }
+
+    #[test]
+    fn present_invalid_dwarf_name_does_not_inherit_like_libdw() {
+        // dwarf_attr_integrate returns a present attribute before
+        // dwarf_formstring validates it; invalid text is not absence.
+        assert_inherited_name_origin(InheritedNameOrigin::InvalidLocalString, None);
+    }
+
+    #[test]
+    fn inherited_dwarf_name_ignores_malformed_later_attributes_like_libdw() {
+        // dwarf_child.c:__libdw_find_attr returns the matched attribute
+        // before consuming later values in the DIE.
+        assert_inherited_name_origin(
+            InheritedNameOrigin::NamedWithMalformedTail,
+            Some("origin_name"),
+        );
+    }
+
+    #[test]
+    fn absent_dwarf_name_can_follow_origin_before_malformed_tail_like_libdw() {
+        assert_inherited_name_origin(
+            InheritedNameOrigin::OriginBeforeMalformedTail,
+            Some("spec_name"),
+        );
+    }
+
+    #[test]
+    fn present_invalid_inherited_dwarf_name_stops_reference_chain_like_libdw() {
+        assert_inherited_name_origin(InheritedNameOrigin::InvalidInheritedString, None);
+    }
+
+    #[test]
+    fn inherited_dwarf_name_skips_preceding_block_value_like_libdw() {
+        assert_inherited_name_origin(InheritedNameOrigin::NameAfterBlock, Some("origin_name"));
+    }
+
+    #[test]
+    fn implicit_const_indirect_origin_uses_specification_like_libdw() {
+        assert_inherited_name_origin(InheritedNameOrigin::ImplicitConstOrigin, Some("spec_name"));
+    }
+
+    #[test]
+    fn nested_indirect_origin_uses_specification_like_libdw() {
+        assert_inherited_name_origin(InheritedNameOrigin::NestedIndirectOrigin, Some("spec_name"));
+    }
+
+    #[test]
+    fn truncated_indirect_origin_value_does_not_use_specification_like_libdw() {
+        // libdw memory-access.h:get_uleb128 returns UINT64_MAX for this
+        // unterminated encoding; the selected unsupported form is present.
+        assert_inherited_name_origin(InheritedNameOrigin::MissingIndirectOrigin, None);
+    }
+
+    #[test]
+    fn valid_indirect_origin_takes_precedence_over_specification_like_libdw() {
+        assert_inherited_name_origin(
+            InheritedNameOrigin::ValidIndirectOrigin,
+            Some("origin_name"),
+        );
+    }
+
+    #[test]
+    fn nested_indirect_local_name_is_not_accepted_like_libdw() {
+        assert_inherited_name_origin(InheritedNameOrigin::NestedIndirectLocalName, None);
+    }
+
+    #[test]
+    fn valid_indirect_local_name_precedes_origin_like_libdw() {
+        assert_inherited_name_origin(
+            InheritedNameOrigin::ValidIndirectLocalName,
+            Some("local_name"),
+        );
+    }
+
+    #[test]
+    fn wide_indirect_origin_form_uses_native_u32_restrictions() {
+        assert_inherited_name_origin(
+            InheritedNameOrigin::WideNestedIndirectOrigin,
+            Some("spec_name"),
+        );
+    }
+
+    #[test]
+    fn wide_implicit_const_origin_form_uses_native_u32_restrictions() {
+        assert_inherited_name_origin(
+            InheritedNameOrigin::WideImplicitConstOrigin,
+            Some("spec_name"),
+        );
+    }
+
+    #[test]
+    fn wide_valid_indirect_origin_is_decoded_like_libdw() {
+        assert_inherited_name_origin(
+            InheritedNameOrigin::WideValidIndirectOrigin,
+            Some("origin_name"),
+        );
+    }
+
+    #[test]
+    fn wide_indirect_name_is_decoded_like_libdw() {
+        assert_inherited_name_origin(InheritedNameOrigin::WideIndirectName, Some("origin_name"));
+    }
+
+    #[test]
+    fn zero_indirect_form_before_name_consumes_no_value_like_libdw() {
+        assert_inherited_name_origin(
+            InheritedNameOrigin::ZeroIndirectBeforeName,
+            Some("origin_name"),
+        );
+    }
+
+    #[test]
+    fn terminating_overflow_indirect_origin_uses_native_u32_form() {
+        // libdw memory-access.h:get_uleb128_step accepts a terminating tenth
+        // byte; dwarf_child.c then narrows the accumulated form to unsigned int.
+        assert_inherited_name_origin(
+            InheritedNameOrigin::OverflowIndirectOrigin,
+            Some("origin_name"),
+        );
+    }
+
+    #[test]
+    fn terminating_overflow_indirect_name_uses_native_u32_form() {
+        assert_inherited_name_origin(
+            InheritedNameOrigin::OverflowIndirectName,
+            Some("origin_name"),
+        );
+    }
+
+    #[test]
+    fn preceding_leb_values_stop_after_ten_bytes_like_libdw() {
+        // libdw_form.c:__libdw_form_val_len uses the bounded unsigned decoder
+        // even for sdata; skipping must not consume the next name's first byte.
+        for form in [
+            gimli::DW_FORM_udata,
+            gimli::DW_FORM_sdata,
+            gimli::DW_FORM_ref_udata,
+            gimli::DW_FORM_addrx,
+            gimli::DW_FORM_loclistx,
+            gimli::DW_FORM_rnglistx,
+            gimli::DW_FORM_strx,
+            gimli::DW_FORM_GNU_addr_index,
+            gimli::DW_FORM_GNU_str_index,
+        ] {
+            assert_inherited_name_origin(
+                InheritedNameOrigin::LebBeforeName(form, &[0x80; 10]),
+                Some("Xname"),
+            );
+        }
+    }
+
+    #[test]
+    fn preceding_leb_values_consume_only_their_encoding_like_libdw() {
+        for value in [&[0x01][..], &[0x81, 0x80, 0x80, 0x80, 0x01][..]] {
+            for form in [gimli::DW_FORM_udata, gimli::DW_FORM_sdata] {
+                assert_inherited_name_origin(
+                    InheritedNameOrigin::LebBeforeName(form, value),
+                    Some("Xname"),
+                );
+            }
+        }
+        for (form, value) in [
+            (
+                gimli::DW_FORM_udata,
+                &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01],
+            ),
+            (
+                gimli::DW_FORM_sdata,
+                &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x7f],
+            ),
+        ] {
+            assert_inherited_name_origin(
+                InheritedNameOrigin::LebBeforeName(form, value),
+                Some("Xname"),
+            );
+        }
     }
 
     #[test]
