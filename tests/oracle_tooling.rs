@@ -213,6 +213,7 @@ fn oracle_comparison_rejects_a_missing_required_recording() {
     std::fs::create_dir(&tools).unwrap();
     executable(&tools.join("cargo"), "#!/bin/sh\nexit 0\n");
     executable(&tools.join("readelf"), "#!/bin/sh\nexit 0\n");
+    executable(&tools.join("perf"), "#!/bin/sh\nexit 0\n");
     let output = std::process::Command::new("bash")
         .arg("scripts/oracle/compare-in-container.sh")
         .env(
@@ -220,6 +221,7 @@ fn oracle_comparison_rejects_a_missing_required_recording() {
             format!("{}:{}", tools.display(), std::env::var("PATH").unwrap()),
         )
         .env("REPO", root.path())
+        .env("PERF_BIN", tools.join("perf"))
         .env("ORACLE_OUT", root.path().join("missing"))
         .env("ORACLE_NAMES", "required")
         .output()

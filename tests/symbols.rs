@@ -3040,9 +3040,12 @@ fn perf_symbol_resolver_accepts_pluggable_object_resolver() {
 
 #[test]
 fn perf_symbol_resolver_translates_live_object_file_offsets_to_virtual_addresses() {
-    let path = std::env::current_exe().expect("current test binary");
-    let bytes = std::fs::read(&path).expect("current test binary bytes");
-    let object = object::File::parse(bytes.as_slice()).expect("current test binary object");
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let path = file.path().to_path_buf();
+    let bytes = elf_with_dynamic_text_symbol(b"pie_function", 0x5000, 32);
+    std::fs::write(&path, &bytes).unwrap();
+    let object = object::File::parse(bytes.as_slice()).expect("fixture ELF");
+    assert_eq!(object.kind(), object::ObjectKind::Dynamic);
     let (file_offset, virtual_address) = object
         .segments()
         .find_map(|segment| {
@@ -3051,7 +3054,7 @@ fn perf_symbol_resolver_translates_live_object_file_offsets_to_virtual_addresses
             (file_size > 8 && virtual_address != file_offset)
                 .then_some((file_offset + 8, virtual_address + 8))
         })
-        .expect("current test binary has a biased load segment");
+        .expect("fixture ELF has a biased load segment");
     let object_resolver = RecordingResolver::with_symbols([(
         SymbolRequest {
             path: path.clone(),

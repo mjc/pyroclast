@@ -116,7 +116,7 @@ fn real_runner_can_inherit_stderr_while_capturing_stdout() {
 
 #[cfg(unix)]
 #[test]
-fn cli_owned_writer_restores_shared_descriptor_flags_after_success() {
+fn cli_owned_writer_restores_nonblocking_flags_and_matches_native_write_status() {
     use pyroclast::process::CliWriter;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::fd::AsRawFd;
@@ -125,14 +125,20 @@ fn cli_owned_writer_restores_shared_descriptor_flags_after_success() {
     // SAFETY: The file descriptor remains owned throughout both queries.
     let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
     assert!(flags >= 0);
+    // XNU bsd/sys/fcntl.h:FWASWRITTEN is kernel-managed, not F_SETFL state.
+    // Compare a plain native write so that bit is not mistaken for our flags.
+    let mut control = tempfile::tempfile().unwrap();
+    control.write_all(b"final output").unwrap();
+    // SAFETY: control stays owned throughout the file-status query.
+    let native_flags = unsafe { libc::fcntl(control.as_raw_fd(), libc::F_GETFL) };
+    assert!(native_flags >= 0);
     let mut writer = CliWriter::new(file.try_clone().unwrap().into());
     writer.write_all(b"final output").unwrap();
     writer.flush().unwrap();
     // SAFETY: file is still live; its duplicate shares the file-status flags.
-    assert_eq!(
-        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) },
-        flags
-    );
+    let actual = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(actual & libc::O_NONBLOCK, flags & libc::O_NONBLOCK);
+    assert_eq!(actual, native_flags);
     file.seek(SeekFrom::Start(0)).unwrap();
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).unwrap();

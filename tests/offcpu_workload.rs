@@ -205,8 +205,13 @@ fn offcpu_workload_arguments_remain_literal_in_logs() {
 }
 
 #[test]
-fn offcpu_workload_missing_executable_is_not_success() {
+fn offcpu_workload_preserves_native_shell_missing_executable_failure() {
     let root = tempfile::tempdir().unwrap();
+    let native = std::process::Command::new("sh")
+        .args(["-c", "exec /pyroclast-nonexistent-executable"])
+        .output()
+        .unwrap();
+    assert!(!native.status.success());
     let request = request(
         root.path(),
         vec!["/pyroclast-nonexistent-executable".into()],
@@ -214,7 +219,7 @@ fn offcpu_workload_missing_executable_is_not_success() {
     let result = OffcpuBackend::new(&Recorder { stop: None })
         .profile(&request)
         .unwrap();
-    assert_eq!(result.manifest.exit_status, Some(127));
+    assert_eq!(result.manifest.exit_status, native.status.code());
     assert!(
         !std::fs::read(result.layout.stderr_log())
             .unwrap()
