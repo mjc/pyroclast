@@ -5,6 +5,7 @@ pub mod endian;
 pub mod fold;
 pub mod header;
 pub mod mappings;
+mod memory;
 pub mod records;
 pub mod samples;
 mod source;

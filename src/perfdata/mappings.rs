@@ -6,6 +6,7 @@ use crate::symbols::KernelRelocation;
 use hashbrown::{HashMap, HashSet};
 use rustc_hash::FxBuildHasher;
 use std::cell::Cell;
+use std::cmp::Ordering;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -38,6 +39,7 @@ pub struct MmapTable {
     mappings: MappingArena,
     mappings_by_pid: HashMap<u32, Vec<IndexedMapping>, FxBuildHasher>,
     symbol_source_ids: HashMap<SymbolSourceKey, usize, FxBuildHasher>,
+    native_dsos: NativeDsoRegistry,
     display_path_ids: HashMap<String, usize, FxBuildHasher>,
     pids_with_mappings: HashSet<u32, FxBuildHasher>,
     executable_pids: HashSet<u32, FxBuildHasher>,
@@ -76,6 +78,13 @@ pub struct ResolvedMappingRef<'a> {
     pub build_id: Option<&'a [u8]>,
     pub file_identity: Option<FileIdentity>,
     pub kernel_relocation: Option<KernelRelocation>,
+}
+
+pub(super) struct DsoMemoryMapping<'a> {
+    pub(super) source_id: usize,
+    pub(super) path: &'a str,
+    pub(super) relative_address: u64,
+    pub(super) build_id: Option<&'a [u8]>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -389,6 +398,185 @@ pub struct FileIdentity {
     pub inode_generation: u64,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct NativeDsoRegistry {
+    entries: Vec<NativeDso>,
+    order: Vec<usize>,
+    sorted: bool,
+    header_paths: HashSet<String, FxBuildHasher>,
+    headers_initialized: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeDso {
+    id: usize,
+    path: String,
+    build_id: Option<Vec<u8>>,
+    file_identity: Option<FileIdentity>,
+}
+
+impl NativeDso {
+    fn compare(
+        &self,
+        path: &str,
+        file_identity: Option<FileIdentity>,
+        build_id: Option<&[u8]>,
+    ) -> Ordering {
+        // dso.c:__dso_id__cmp skips fields missing from either identity.
+        // Inode fields sort descending; build IDs sort by size, then bytes.
+        self.path.as_str().cmp(path).then_with(|| {
+            let file_order = self
+                .file_identity
+                .zip(file_identity)
+                .map_or(Ordering::Equal, |(a, b)| b.cmp(&a));
+            file_order.then_with(|| {
+                self.build_id
+                    .as_deref()
+                    .zip(build_id)
+                    .map_or(Ordering::Equal, |(a, b)| {
+                        a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+                    })
+            })
+        })
+    }
+
+    fn enrich(&mut self, file_identity: Option<FileIdentity>, build_id: Option<&[u8]>) -> bool {
+        let mut changed = false;
+        if self.file_identity.is_none() && file_identity.is_some() {
+            self.file_identity = file_identity;
+            changed = true;
+        }
+        if self.build_id.is_none() && build_id.is_some() {
+            self.build_id = build_id.map(<[u8]>::to_vec);
+            changed = true;
+        }
+        changed
+    }
+}
+
+impl NativeDsoRegistry {
+    fn register_header(&mut self, path: &str, build_id: &[u8]) {
+        if build_id.iter().all(|byte| *byte == 0) || !self.header_paths.insert(path.to_string()) {
+            return;
+        }
+        // header.c:__event_process_build_id finds by empty identity, then
+        // sets the DSO build ID before mapping records are processed.
+        let id = self.intern(path, None, None);
+        self.entries[id].build_id = Some(build_id.to_vec());
+    }
+
+    fn intern(
+        &mut self,
+        path: &str,
+        file_identity: Option<FileIdentity>,
+        build_id: Option<&[u8]>,
+    ) -> usize {
+        let build_id = build_id.filter(|id| id.iter().any(|byte| *byte != 0));
+        if !self.sorted {
+            self.sort();
+        }
+        // dsos.c uses bsearch: stop at the first equal midpoint. Wildcards
+        // are non-transitive, so neither hash interning nor Rust's duplicate
+        // selection in binary_search_by implements this lookup.
+        let (mut low, mut high) = (0, self.order.len());
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let id = self.order[mid];
+            match self.entries[id]
+                .compare(path, file_identity, build_id)
+                .reverse()
+            {
+                Ordering::Less => high = mid,
+                Ordering::Greater => low = mid + 1,
+                Ordering::Equal => {
+                    if self.entries[id].enrich(file_identity, build_id) {
+                        self.sorted = false;
+                    }
+                    return id;
+                }
+            }
+        }
+        // __dsos__add uses a lower-bound search with an inclusive high end,
+        // whose midpoint differs from bsearch for even-length arrays.
+        let (mut low, mut high) = (0, self.order.len());
+        while low < high {
+            let mid = low + (high - low - 1) / 2;
+            if self.entries[self.order[mid]]
+                .compare(path, file_identity, build_id)
+                .is_lt()
+            {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        let id = self.entries.len();
+        self.entries.push(NativeDso {
+            id,
+            path: path.to_string(),
+            build_id: build_id.map(<[u8]>::to_vec),
+            file_identity,
+        });
+        self.order.insert(low, id);
+        id
+    }
+
+    fn sort(&mut self) {
+        let mut ordered = self
+            .order
+            .iter()
+            .map(|&id| &self.entries[id])
+            .collect::<Vec<_>>();
+        // Match perf's pointer-array qsort on Unix. The wildcard comparator
+        // is not a total order, which Rust's slice sorting APIs require.
+        #[cfg(unix)]
+        unsafe {
+            // SAFETY: qsort only rearranges initialized references in this
+            // exclusive buffer. Their referents remain live and immutable;
+            // compare_native_dsos uses this exact element type and cannot panic.
+            libc::qsort(
+                ordered.as_mut_ptr().cast(),
+                ordered.len(),
+                std::mem::size_of::<&NativeDso>(),
+                Some(compare_native_dsos),
+            );
+        }
+        #[cfg(not(unix))]
+        for index in 1..ordered.len() {
+            let mut position = index;
+            while position > 0
+                && ordered[position]
+                    .compare(
+                        &ordered[position - 1].path,
+                        ordered[position - 1].file_identity,
+                        ordered[position - 1].build_id.as_deref(),
+                    )
+                    .is_lt()
+            {
+                ordered.swap(position - 1, position);
+                position -= 1;
+            }
+        }
+        self.order = ordered.iter().map(|dso| dso.id).collect();
+        self.sorted = true;
+    }
+}
+
+#[cfg(unix)]
+unsafe extern "C" fn compare_native_dsos(
+    a: *const libc::c_void,
+    b: *const libc::c_void,
+) -> libc::c_int {
+    // SAFETY: only NativeDsoRegistry::sort calls this with pointers to live
+    // elements of its Vec<&NativeDso>.
+    let (a, b) = unsafe { (*a.cast::<&NativeDso>(), *b.cast::<&NativeDso>()) };
+    match a.compare(&b.path, b.file_identity, b.build_id.as_deref()) {
+        Ordering::Less => -1,
+        Ordering::Equal => 0,
+        Ordering::Greater => 1,
+    }
+}
+
 /// Reports whether the on-disk file at `path` carries the same backing-storage
 /// identity (device major/minor + inode, and inode generation when recorded)
 /// that perf captured in the `PERF_RECORD_MMAP2` event.
@@ -459,9 +647,11 @@ struct Mapping {
     len: u64,
     pgoff: u64,
     symbol_source_id: usize,
+    native_dso_id: usize,
     path: String,
     path_layout: MappingPathLayout,
     build_id: Option<Vec<u8>>,
+    mmap_build_id: bool,
     file_identity: Option<FileIdentity>,
     prot: Option<u32>,
     cpumode: u16,
@@ -629,31 +819,33 @@ impl MmapTable {
     }
 
     pub fn insert_mmap(&mut self, record: MmapRecord) {
-        self.insert_mapping(Mapping {
-            pid: record.pid,
-            start: record.start,
-            len: record.len,
-            pgoff: record.pgoff,
-            symbol_source_id: 0,
-            path: record.path,
-            path_layout: MappingPathLayout::default(),
-            build_id: None,
-            file_identity: None,
-            prot: None,
-            cpumode: PERF_RECORD_MISC_CPUMODE_USER,
-        });
+        self.insert_mmap_with_misc(record, PERF_RECORD_MISC_CPUMODE_USER);
     }
 
     pub(crate) fn insert_mmap_with_misc(&mut self, record: MmapRecord, misc: u16) {
+        self.insert_mmap_with_build_id_and_misc(record, None, misc);
+    }
+
+    pub(crate) fn insert_mmap_with_build_id_and_misc(
+        &mut self,
+        record: MmapRecord,
+        build_id: Option<Vec<u8>>,
+        misc: u16,
+    ) {
+        if let Some(id) = build_id.as_deref() {
+            self.native_dsos.register_header(&record.path, id);
+        }
         self.insert_mapping(Mapping {
             pid: record.pid,
             start: record.start,
             len: record.len,
             pgoff: record.pgoff,
             symbol_source_id: 0,
+            native_dso_id: 0,
             path: record.path,
             path_layout: MappingPathLayout::default(),
-            build_id: None,
+            build_id,
+            mmap_build_id: false,
             file_identity: None,
             prot: None,
             cpumode: mapping_cpumode_from_misc(misc),
@@ -678,15 +870,20 @@ impl MmapTable {
         build_id: Option<Vec<u8>>,
         misc: u16,
     ) {
+        if let Some(id) = build_id.as_deref() {
+            self.native_dsos.register_header(&record.path, id);
+        }
         self.insert_mapping(Mapping {
             pid: record.pid,
             start: record.start,
             len: record.len,
             pgoff: record.pgoff,
             symbol_source_id: 0,
+            native_dso_id: 0,
             path: record.path,
             path_layout: MappingPathLayout::default(),
             build_id,
+            mmap_build_id: false,
             file_identity: Some(FileIdentity {
                 major: record.major,
                 minor: record.minor,
@@ -713,9 +910,11 @@ impl MmapTable {
             len: record.len,
             pgoff: record.pgoff,
             symbol_source_id: 0,
+            native_dso_id: 0,
             path: record.path,
             path_layout: MappingPathLayout::default(),
             build_id: Some(record.build_id),
+            mmap_build_id: true,
             file_identity: None,
             prot: Some(record.prot),
             cpumode: mapping_cpumode_from_misc(misc),
@@ -792,6 +991,17 @@ impl MmapTable {
     }
 
     fn insert_mapping(&mut self, mut mapping: Mapping) {
+        // map.c:map__new binds a DSO before inserting/splitting maps. Splits
+        // and fork copies retain that ID without repeating wildcard lookup.
+        mapping.native_dso_id = self.native_dsos.intern(
+            &mapping.path,
+            mapping.file_identity,
+            if mapping.mmap_build_id {
+                mapping.build_id.as_deref()
+            } else {
+                None
+            },
+        );
         mapping.path_layout = MappingPathLayout::new(&mapping.path);
         let next_id = self.display_path_ids.len();
         mapping.path_layout.display_path_id = *self
@@ -1053,6 +1263,35 @@ impl MmapTable {
             .map(MappedFrame::resolved_ref)
     }
 
+    pub(super) fn resolve_user_memory_cached(
+        &self,
+        pid: u32,
+        ip: u64,
+        cache: &mut MappingResolveCache,
+    ) -> Option<DsoMemoryMapping<'_>> {
+        let frame = self.resolve_user_frame_cached(pid, ip, cache)?;
+        let dso = &self.native_dsos.entries[frame.mapping.native_dso_id];
+        Some(DsoMemoryMapping {
+            source_id: dso.id,
+            path: &dso.path,
+            relative_address: frame.relative_address,
+            build_id: dso.build_id.as_deref(),
+        })
+    }
+
+    pub(super) fn initialize_native_dso_headers<'a>(
+        &mut self,
+        headers: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+    ) {
+        if self.native_dsos.headers_initialized {
+            return;
+        }
+        for (path, id) in headers {
+            self.native_dsos.register_header(path, id);
+        }
+        self.native_dsos.headers_initialized = true;
+    }
+
     pub(crate) fn resolve_user_frame_cached(
         &self,
         pid: u32,
@@ -1075,17 +1314,6 @@ impl MmapTable {
     #[must_use]
     pub fn has_mapping_for_pid(&self, pid: u32, ip: u64) -> bool {
         self.resolve_mapping(pid, ip).is_some()
-    }
-
-    #[must_use]
-    pub(crate) fn has_overlapping_user_mapping_for_pid(
-        &self,
-        pid: u32,
-        start: u64,
-        len: u64,
-    ) -> bool {
-        let end = start.saturating_add(len);
-        self.any_indexed_mapping_in_range(pid, start, end, Mapping::is_user_file_mapping)
     }
 
     #[must_use]
@@ -1436,6 +1664,112 @@ fn is_perf_data_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
+
+    #[test]
+    fn native_dso_enrichment_resorts_lookup_without_rebinding_forks_or_splits() {
+        let mut table = super::MmapTable::default();
+        let mut first = churn_mapping(7, 0x1000, 0x100, 0, "/object");
+        first.file_identity.inode = 1;
+        first.insert_into(&mut table);
+        // Enrich the first entry's build ID, then add a distinct build-ID
+        // entry with no inode: initial order is [inode 1/id 11, id 22].
+        let build_map = |pid, byte| super::Mmap2BuildIdRecord {
+            pid,
+            tid: pid,
+            start: 0x1000,
+            len: 0x100,
+            pgoff: 0,
+            build_id_size: 20,
+            build_id: vec![byte; 20],
+            prot: 5,
+            flags: 2,
+            path: "/object".into(),
+        };
+        table.insert_mmap2_build_id(build_map(7, 0x11));
+        table.insert_mmap2_build_id(build_map(8, 0x22));
+        let second_id = table
+            .resolve_user_memory_cached(8, 0x1000, &mut super::MappingResolveCache::default())
+            .unwrap()
+            .source_id;
+        let mut enriched = first.clone();
+        enriched.pid = 9;
+        enriched.file_identity.inode = 2;
+        table.insert_mmap2_with_build_id(
+            super::Mmap2Record {
+                pid: 9,
+                tid: 9,
+                start: enriched.start,
+                len: enriched.len,
+                pgoff: enriched.pgoff,
+                major: enriched.file_identity.major,
+                minor: enriched.file_identity.minor,
+                inode: enriched.file_identity.inode,
+                inode_generation: enriched.file_identity.inode_generation,
+                prot: enriched.prot,
+                flags: 2,
+                path: enriched.path,
+            },
+            Some(vec![0x22; 20]),
+        );
+        assert!(!table.native_dsos.sorted);
+        table.insert_mmap(mutation_record(10, 0x1000, 0x100, 0, "/object"));
+        // Enrichment changes order to [inode 2/id 22, inode 1/id 11].
+        let wildcard = table
+            .resolve_user_memory_cached(10, 0x1000, &mut super::MappingResolveCache::default())
+            .unwrap();
+        assert_eq!(wildcard.build_id, Some([0x11; 20].as_slice()));
+        assert_ne!(wildcard.source_id, second_id);
+        table.clone_pid_mappings(8, 11);
+        table.insert_mmap(mutation_record(8, 0x1040, 0x20, 0, "/replacement"));
+        for (pid, address) in [(8, 0x1000), (8, 0x1060), (9, 0x1000), (11, 0x1000)] {
+            let bound = table
+                .resolve_user_memory_cached(
+                    pid,
+                    address,
+                    &mut super::MappingResolveCache::default(),
+                )
+                .unwrap();
+            assert_eq!(bound.source_id, second_id);
+            assert_eq!(bound.build_id, Some([0x22; 20].as_slice()));
+        }
+        // Enriched memory metadata must not rewrite recorded symbol identity.
+        assert_eq!(table.resolve_ref(8, 0x1000).unwrap().file_identity, None);
+    }
+
+    #[test]
+    fn native_dso_identity_wildcards_are_non_transitive_and_zero_inodes_are_known() {
+        let file = |inode| super::FileIdentity {
+            major: 0,
+            minor: 0,
+            inode,
+            inode_generation: 0,
+        };
+        let dso = |inode: Option<u64>, byte| super::NativeDso {
+            id: 0,
+            path: "/object".into(),
+            file_identity: inode.map(file),
+            build_id: Some(vec![byte; 20]),
+        };
+        let a = dso(Some(2), 0x33);
+        let b = dso(Some(1), 0x11);
+        let c = dso(None, 0x22);
+        for (left, right) in [(&a, &b), (&b, &c), (&c, &a)] {
+            assert!(
+                left.compare(&right.path, right.file_identity, right.build_id.as_deref())
+                    .is_lt()
+            );
+        }
+        let mut registry = super::NativeDsoRegistry::default();
+        let zero = registry.intern("/object", Some(file(0)), Some(&[0; 20]));
+        assert_eq!(registry.entries[zero].build_id, None);
+        assert_ne!(zero, registry.intern("/object", Some(file(1)), None));
+        // An absent build ID is compatible, but known zero inode fields
+        // still distinguish a source from nonzero inode fields.
+        assert_eq!(zero, registry.intern("/object", Some(file(0)), Some(&[])));
+        let known = registry.intern("/other", None, Some(&[0x11; 20]));
+        assert_eq!(known, registry.intern("/other", None, Some(&[0; 20])));
+        assert_ne!(known, registry.intern("/other", None, Some(&[0x11; 19])));
+    }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct ChurnMapping {
@@ -4300,20 +4634,28 @@ mod tests {
             path: "/other-pid".to_string(),
         });
 
-        assert!(!table.has_overlapping_user_mapping_for_pid(7, 0x1100, 0x100));
-        assert!(!table.has_overlapping_user_mapping_for_pid(7, 0x2000, 0x800));
-        assert!(table.has_overlapping_user_mapping_for_pid(7, 0x10ff, 0x100));
-        assert!(table.has_overlapping_user_mapping_for_pid(7, 0x3080, 0x100));
+        let overlaps = |pid, start, end| {
+            table.any_indexed_mapping_in_range(
+                pid,
+                start,
+                end,
+                super::Mapping::is_user_file_mapping,
+            )
+        };
+        assert!(!overlaps(7, 0x1100, 0x1200));
+        assert!(!overlaps(7, 0x2000, 0x2800));
+        assert!(overlaps(7, 0x10ff, 0x11ff));
+        assert!(overlaps(7, 0x3080, 0x3180));
         // Adjacency is not overlap (half-open ranges).
-        assert!(!table.has_overlapping_user_mapping_for_pid(7, 0x1100, 0x10));
+        assert!(!overlaps(7, 0x1100, 0x1110));
         // Different pid's mapping must not count.
-        assert!(!table.has_overlapping_user_mapping_for_pid(8, 0x1000, 0x100));
+        assert!(!overlaps(8, 0x1000, 0x1100));
         assert_eq!(table.resolve(7, 0x1050).expect("/a").path, "/a");
         assert_eq!(table.resolve(7, 0x3050).expect("/b").path, "/b");
     }
 
     #[test]
-    fn has_overlapping_user_mapping_matches_linear_scan_oracle() {
+    fn indexed_user_mapping_overlap_matches_linear_scan_oracle() {
         // The index-based overlap query must agree with an exhaustive linear
         // scan across a dense, multi-pid set of mappings (including bracket
         // paths that are not user-file mappings).
@@ -4348,7 +4690,12 @@ mod tests {
                         seg_pid == pid && is_user && start < seg_end && seg_start < end
                     });
                     assert_eq!(
-                        table.has_overlapping_user_mapping_for_pid(pid, start, len),
+                        table.any_indexed_mapping_in_range(
+                            pid,
+                            start,
+                            end,
+                            super::Mapping::is_user_file_mapping,
+                        ),
                         expected,
                         "pid={pid} start={start:#x} len={len:#x}"
                     );

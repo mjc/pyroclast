@@ -619,7 +619,7 @@ fn framehop_unwinder_implements_pluggable_user_stack_unwinder_boundary() {
 }
 
 #[test]
-fn rejects_overlapping_module_base_like_dwfl_report_elf() {
+fn accepts_overlapping_distinct_module_ranges_like_dwfl_report_elf() {
     let current_exe = std::env::current_exe().expect("current exe");
     let first_start = 0x5555_0000;
     let gap = adjacent_mapping_gap_for_overlapping_module_ranges(&current_exe);
@@ -633,12 +633,16 @@ fn rejects_overlapping_module_base_like_dwfl_report_elf() {
         .expect("load overlapping object mapping");
 
     assert!(first);
-    assert!(!second);
-    assert_eq!(unwinder.module_count(), 1);
+    // dwfl_report_module matches (name, low, high), not geometric overlap.
+    assert!(second);
+    assert_eq!(unwinder.module_count(), 2);
+    assert!(unwinder.has_reported_module_for_ip(first_start));
+    assert!(unwinder.has_reported_module_for_ip(first_start + gap));
+    assert!(!unwinder.has_rejected_mapping_for_ip(first_start + gap));
 }
 
 #[test]
-fn rejected_overlapping_module_range_does_not_unwind_through_prior_module() {
+fn accepted_overlapping_module_range_unwinds_frame_pointer_stack_like_libdw() {
     let current_exe = std::env::current_exe().expect("current exe");
     let first_start = 0x5555_0000;
     let gap = adjacent_mapping_gap_for_overlapping_module_ranges(&current_exe);
@@ -661,19 +665,22 @@ fn rejected_overlapping_module_range_does_not_unwind_through_prior_module() {
             .expect("load first object mapping")
     );
     assert!(
-        !unwinder
+        unwinder
             .add_object_mapping(&current_exe, first_start + gap, gap, 0)
-            .expect("reject overlapping object mapping")
+            .expect("load overlapping object mapping")
     );
 
+    // The second module's ELF header has no CFI; native libdw uses RBP.
+    assert!(unwinder.has_reported_module_for_ip(regs.ip));
+    assert!(!unwinder.has_unwind_info_for_ip(regs.ip));
     assert_eq!(
         unwinder.unwind_stack(PerfUserRegs::X86_64(regs), &stack, 4),
-        Vec::<u64>::new()
+        vec![regs.ip, 0x1233]
     );
 }
 
 #[test]
-fn overlapping_raw_mapping_keeps_prior_reported_module_like_libdw() {
+fn shifted_overlapping_raw_mapping_is_accepted_but_same_identity_rereport_is_rejected() {
     let current_exe = std::env::current_exe().expect("current exe");
     let first_start = 0x5555_0000;
     let first_len = adjacent_mapping_gap_for_overlapping_module_ranges(&current_exe) * 4;
@@ -688,10 +695,26 @@ fn overlapping_raw_mapping_keeps_prior_reported_module_like_libdw() {
     );
 
     assert!(
+        unwinder
+            .add_object_mapping(&current_exe, second_start, 0x1000, second_pgoff)
+            .expect("load shifted overlapping object mapping")
+    );
+    assert_eq!(unwinder.module_count(), 2);
+    let second_base = second_start - second_pgoff;
+    assert!(unwinder.has_reported_module_for_ip(second_base));
+    assert!(!unwinder.has_rejected_mapping_for_ip(second_base));
+
+    // Public dwfl_report_elf(-1) opens a fresh FD for the same identity;
+    // that conflict marks only the re-reported module GC, retaining the first.
+    assert!(
         !unwinder
             .add_object_mapping(&current_exe, second_start, 0x1000, second_pgoff)
-            .expect("reject shifted overlapping object mapping")
+            .expect("reject same-identity fresh-FD report")
     );
+    assert!(unwinder.has_rejected_mapping_for_ip(second_base));
+    assert!(unwinder.has_reported_module_for_ip(second_base));
+    assert!(unwinder.has_reported_module_for_ip(first_start));
+    assert!(!unwinder.has_rejected_mapping_for_ip(first_start));
 }
 
 fn adjacent_mapping_gap_for_overlapping_module_ranges(path: &std::path::Path) -> u64 {

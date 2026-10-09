@@ -30,6 +30,7 @@ use crate::perfdata::mappings::{
     FileIdentity, FrameMappingContext, MappedFrame, MappingPathLayout, MappingResolveCache,
     MmapTable, ModuleFallbackKind, ResolvedMappingRef, UserMapping,
 };
+use crate::perfdata::memory::{DsoMemorySources, MappedMemory};
 use crate::perfdata::records::{
     PERF_RECORD_FINISHED_ROUND, PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_CPUMODE_KERNEL,
     PERF_RECORD_MISC_CPUMODE_MASK, PERF_RECORD_MISC_CPUMODE_USER, PERF_RECORD_MISC_FORK_EXEC,
@@ -51,10 +52,12 @@ use crate::perfdata::source::{
     FileSource, QueuedPerfRecord, RecordSource, SliceSource, WindowStore,
 };
 use crate::perfdata::unwind::{
-    FramehopUnwinder, PerfArch, PerfUserRegs, UserStackUnwindResult, UserStackUnwinder,
+    FramehopUnwinder, ObjectMappingResult, PerfArch, PerfUserRegs,
     unwind_aarch64_frame_pointer_stack_like_elfutils,
     unwind_x86_64_frame_pointer_stack_like_elfutils,
 };
+#[cfg(test)]
+use crate::perfdata::unwind::{UserStackUnwindResult, UserStackUnwinder};
 use crate::symbols::{
     CachedMappingFrames, LiveVdsoElf, SymbolFrameCache, SymbolRequest, SymbolResolver,
     copy_live_vdso_elf_like_perf, perf_build_id_elf_path_for_dso,
@@ -214,6 +217,7 @@ struct SessionState {
     mmap_table: MmapTable,
     mapping_cache: MappingResolveCache,
     unwind_states: HashMap<u32, PidUnwindState, FxBuildHasher>,
+    unwind_memory: DsoMemorySources,
     header_build_ids: BTreeMap<String, Vec<u8>>,
     deferred_samples: Vec<DeferredFoldSample>,
     unwind_debug_dir: Option<PathBuf>,
@@ -228,18 +232,17 @@ struct PidUnwindState {
     object_unwinder: FramehopUnwinder,
     live_vdso_elf: OnceLock<Option<LiveVdsoElf>>,
     attempted_unwind_mappings: BTreeSet<UnwindMappingKey>,
-    /// Original DSO path and load base, recorded only after source reporting.
-    loaded_unwind_modules: BTreeSet<UnwindModuleKey>,
+    /// Original DSO path/load base to the reported module's stable identity.
+    /// Entries never suppress reporting and are checked against current IP ownership.
+    loaded_unwind_modules: BTreeMap<UnwindModuleKey, usize>,
     /// Memo of the ip-intrinsic leaf-only eligibility per sampled IP. Only the
     /// `(pid, ip)`-stable facts are cached here: whether the module covering
     /// `ip` is reported and whether any CFI covers `ip`. The per-sample register
-    /// condition (`bp < sp` on `x86_64` / `lr == 0` on aarch64) and the sample's
+    /// condition (caller-SP advancement on `x86_64` / `lr == 0` on aarch64) and the sample's
     /// callchain state are combined fresh at query time, since both vary across
-    /// samples at the same IP. The whole `PidUnwindState` (and thus this memo) is
-    /// dropped when the pid's mappings change or the pid forks (see
-    /// `invalidate_pid_unwinder_if_mapping_overlaps_like_perf` /
-    /// `apply_fork_record`), which is exactly when reported-module / CFI facts
-    /// could change.
+    /// samples at the same IP. Mmap mutations clear this mapping-dependent memo
+    /// while retaining reported modules, like perf's inline overlap insertion.
+    /// New module reports also clear it; fork resets the whole unwind state.
     leaf_only_eligibility: HashMap<u64, LeafOnlyEligibility, FxBuildHasher>,
 }
 
@@ -250,7 +253,7 @@ impl PidUnwindState {
             object_unwinder: FramehopUnwinder::with_arch(arch),
             live_vdso_elf: OnceLock::new(),
             attempted_unwind_mappings: BTreeSet::new(),
-            loaded_unwind_modules: BTreeSet::new(),
+            loaded_unwind_modules: BTreeMap::new(),
             leaf_only_eligibility: HashMap::with_hasher(FxBuildHasher),
         }
     }
@@ -355,6 +358,7 @@ struct UnwindMappingRequest<'a> {
     pgoff: u64,
     prot: Option<u32>,
     path: &'a str,
+    module_name: &'a str,
     file_identity: Option<FileIdentity>,
     build_id: Option<&'a [u8]>,
 }
@@ -2229,6 +2233,7 @@ impl SessionState {
             mmap_table: MmapTable::default(),
             mapping_cache: MappingResolveCache::default(),
             unwind_states: HashMap::with_hasher(FxBuildHasher),
+            unwind_memory: DsoMemorySources::default(),
             header_build_ids,
             deferred_samples: Vec::new(),
             unwind_debug_dir: current_perf_debug_dir(),
@@ -2270,6 +2275,7 @@ impl SessionState {
         }
     }
 
+    #[cfg(test)]
     fn unwind_state_mut(&mut self, pid: u32) -> &mut PidUnwindState {
         let arch = self.arch;
         self.unwind_states
@@ -2277,20 +2283,11 @@ impl SessionState {
             .or_insert_with(|| PidUnwindState::with_arch(arch))
     }
 
-    fn invalidate_pid_unwinder_if_mapping_overlaps_like_perf(
-        &mut self,
-        pid: u32,
-        start: u64,
-        len: u64,
-    ) {
-        if self
-            .mmap_table
-            .has_overlapping_user_mapping_for_pid(pid, start, len)
-        {
-            // perf's map removal path invalidates the per-maps DWFL address
-            // space. Its overlap-fix insert path replaces/removes maps inline,
-            // so stale modules must not survive into later report_module calls.
-            self.unwind_states.remove(&pid);
+    fn clear_mapping_dependent_unwind_memo(&mut self, pid: u32) {
+        if let Some(state) = self.unwind_states.get_mut(&pid) {
+            // maps.c __maps__fixup_overlap_and_insert does not call the DWFL
+            // invalidation in maps__remove, even when it removes maps inline.
+            state.leaf_only_eligibility.clear();
         }
     }
 }
@@ -2417,6 +2414,11 @@ fn upsert_comm(map: &mut BTreeMap<u32, String>, id: u32, comm: &str) {
 
 impl SessionState {
     fn apply_metadata(&mut self, record: FoldRecord<'_>) {
+        self.mmap_table.initialize_native_dso_headers(
+            self.header_build_ids
+                .iter()
+                .map(|(path, id)| (path.as_str(), id.as_slice())),
+        );
         match record {
             FoldRecord::Comm(record) => {
                 update_comm_tables(
@@ -2427,20 +2429,16 @@ impl SessionState {
                 );
             }
             FoldRecord::Mmap { misc, record } => {
-                self.invalidate_pid_unwinder_if_mapping_overlaps_like_perf(
-                    record.pid,
-                    record.start,
-                    record.len,
-                );
-                self.mmap_table.insert_mmap_with_misc(record, misc);
+                self.clear_mapping_dependent_unwind_memo(record.pid);
+                // map.c:map__new reuses the DSO populated from HEADER_BUILD_ID
+                // even for MMAP records, which carry no build ID themselves.
+                let build_id = self.header_build_ids.get(&record.path).cloned();
+                self.mmap_table
+                    .insert_mmap_with_build_id_and_misc(record, build_id, misc);
                 self.mapping_cache = MappingResolveCache::default();
             }
             FoldRecord::Mmap2 { misc, record } => {
-                self.invalidate_pid_unwinder_if_mapping_overlaps_like_perf(
-                    record.pid,
-                    record.start,
-                    record.len,
-                );
+                self.clear_mapping_dependent_unwind_memo(record.pid);
                 let build_id = self.header_build_ids.get(&record.path).cloned();
                 if let Some(build_id) = build_id {
                     self.mmap_table.insert_mmap2_with_build_id_and_misc(
@@ -2454,11 +2452,7 @@ impl SessionState {
                 self.mapping_cache = MappingResolveCache::default();
             }
             FoldRecord::Mmap2BuildId { misc, record } => {
-                self.invalidate_pid_unwinder_if_mapping_overlaps_like_perf(
-                    record.pid,
-                    record.start,
-                    record.len,
-                );
+                self.clear_mapping_dependent_unwind_memo(record.pid);
                 self.mmap_table
                     .insert_mmap2_build_id_with_misc(record, misc);
                 self.mapping_cache = MappingResolveCache::default();
@@ -2499,31 +2493,21 @@ fn inherit_fork_comm_tables(
 }
 
 impl SessionState {
+    #[cfg(test)]
     fn ensure_unwind_mapping_for_ip(&mut self, pid: Option<u32>, ip: u64) {
         let Some(pid) = pid else {
             return;
         };
-        let Some(mapping) = self.mmap_table.user_mapping_for_pid_ip(pid, ip) else {
-            return;
-        };
-        let path = mapping.path.to_string();
-        let build_id = mapping.build_id.map(<[u8]>::to_vec);
-        let mapping = UserMapping {
-            pid: mapping.pid,
-            start: mapping.start,
-            len: mapping.len,
-            pgoff: mapping.pgoff,
-            prot: mapping.prot,
-            path: &path,
-            build_id: build_id.as_deref(),
-            file_identity: mapping.file_identity,
-        };
-        let unwind_debug_dir = self.unwind_debug_dir.clone();
-        let unwind_state = self.unwind_state_mut(pid);
-        load_unwind_mapping_for_user_mapping_like_perf(
-            unwind_state,
-            mapping,
-            unwind_debug_dir.as_deref(),
+        let state = self
+            .unwind_states
+            .entry(pid)
+            .or_insert_with(|| PidUnwindState::with_arch(self.arch));
+        report_unwind_module_for_ip_like_perf(
+            state,
+            &self.mmap_table,
+            pid,
+            ip,
+            self.unwind_debug_dir.as_deref(),
         );
     }
 
@@ -2568,13 +2552,13 @@ impl SessionState {
         let Some(unwind_state) = self.unwind_states.get(&pid) else {
             return false;
         };
+        let key = unwind_module_key(mapping.path, mapping.start, mapping.pgoff);
         unwind_state
             .loaded_unwind_modules
-            .contains(&unwind_module_key(
-                mapping.path,
-                mapping.start,
-                mapping.pgoff,
-            ))
+            .get(&key)
+            .is_some_and(|&module| {
+                unwind_state.object_unwinder.reported_module_for_ip(ip) == Some(module)
+            })
     }
 }
 
@@ -4345,7 +4329,6 @@ fn append_perf_user_unwind_frames(
     ) else {
         return;
     };
-    accumulator.ensure_unwind_mapping_for_ip(sample.pid, regs.ip());
     let context =
         build_user_unwind_context(accumulator, misc, event, sample, &regs, !frames.is_empty());
     let mut unwound_frames = unwind_user_stack_like_perf(accumulator, sample, &regs, context);
@@ -4473,8 +4456,12 @@ fn unwind_object_stack_like_perf(
     let frames = unwind_object_frame_addresses_like_perf(
         &mut state,
         pid_value,
-        &accumulator.mmap_table,
-        unwind_debug_dir.as_deref(),
+        &mut MappedMemory::new(
+            pid_value,
+            &accumulator.mmap_table,
+            &mut accumulator.unwind_memory,
+            unwind_debug_dir.as_deref(),
+        ),
         regs,
         stack_bytes,
         context,
@@ -4496,19 +4483,23 @@ fn unwind_object_stack_like_perf(
 fn unwind_object_frame_addresses_like_perf(
     state: &mut PidUnwindState,
     pid: u32,
-    mmap_table: &MmapTable,
-    unwind_debug_dir: Option<&Path>,
+    memory: &mut MappedMemory<'_>,
     regs: &PerfUserRegs,
     stack_bytes: &[u8],
-    context: UserUnwindContext,
+    mut context: UserUnwindContext,
 ) -> Vec<u64> {
+    let mmap_table = memory.table;
+    let unwind_debug_dir = memory.debug_dir;
     // perf's unwind__get_entries reports the module for the initial IP up front
     // (tools/perf/util/unwind-libdw.c): a hard report failure (scenario B)
     // abandons the whole unwind with zero entries.
-    if report_unwind_module_for_ip_like_perf(state, mmap_table, pid, regs.ip(), unwind_debug_dir)
-        == ReportModuleResult::Failed
+    match report_unwind_module_for_ip_like_perf(state, mmap_table, pid, regs.ip(), unwind_debug_dir)
     {
-        return Vec::new();
+        ReportModuleResult::Failed => return Vec::new(),
+        ReportModuleResult::NewlyReported | ReportModuleResult::AlreadyReported => {
+            context.initial_ip_mapping = InitialIpMappingState::RecordedMappingLoaded;
+        }
+        ReportModuleResult::NoDso => {}
     }
 
     // Evaluate perf/libdw's skip and leaf-only cases before framehop. The result
@@ -4523,39 +4514,10 @@ fn unwind_object_frame_addresses_like_perf(
         ObjectUnwindClass::MustUnwind => {}
     }
 
-    let mut object_unwind =
-        unwind_user_stack_with_diagnostics(&mut state.object_unwinder, *regs, stack_bytes, 256);
-    for _ in 0..MAX_LIBDW_CALLBACK_REPORT_PASSES {
-        // PERF-4: only re-unwind when this pass actually loaded a new module.
-        // report_unwind_modules_for_frame_callbacks_like_perf returns whether
-        // anything was newly reported; when it returns false there is nothing
-        // new for framehop to traverse, so the previous unwind is final and the
-        // redundant re-unwind (and its Vec/diagnostics comparison) is skipped.
-        if !report_unwind_modules_for_frame_callbacks_like_perf(
-            state,
-            mmap_table,
-            pid,
-            &object_unwind.accepted_frames,
-            unwind_debug_dir,
-        ) {
-            break;
-        }
-        let next_unwind =
-            unwind_user_stack_with_diagnostics(&mut state.object_unwinder, *regs, stack_bytes, 256);
-        if next_unwind == object_unwind {
-            break;
-        }
-        object_unwind = next_unwind;
-    }
-    let mut raw_frames = object_unwind.accepted_frames;
-    // perf's frame_callback reports each module, then entry() calls
-    // __report_module() again and aborts at the first hard failure.
-    let first_unreportable = raw_frames.iter().position(|address| {
-        report_unwind_module_for_ip_like_perf(state, mmap_table, pid, *address, unwind_debug_dir)
-            == ReportModuleResult::Failed
-    });
-    if let Some(index) = first_unreportable {
-        raw_frames.truncate(index);
+    let (raw_frames, failed) =
+        unwind_reported_frame_addresses_like_perf(state, pid, memory, regs, stack_bytes);
+    if failed {
+        return perf_accepted_object_unwind_frames(regs, context.callchain, false, raw_frames);
     }
     let initial_ip_has_reported_module = initial_ip_mapping_has_reported_unwind_module(
         Some(pid),
@@ -4567,12 +4529,13 @@ fn unwind_object_frame_addresses_like_perf(
         context,
         initial_ip_has_reported_module,
     );
-    let raw_frames = libdw_arch_fallback_after_empty_object_unwind(
+    let mut raw_frames = libdw_arch_fallback_after_empty_object_unwind(
         raw_frames,
         regs,
         stack_bytes,
         use_libdw_arch_fallback,
     );
+    report_callback_entries_like_perf(state, mmap_table, pid, &mut raw_frames, unwind_debug_dir);
     let raw_frames = truncate_syscall_return_unwind_after_first_executable_frame(
         raw_frames,
         Some(pid),
@@ -4582,13 +4545,84 @@ fn unwind_object_frame_addresses_like_perf(
     perf_accepted_object_unwind_frames(regs, context.callchain, leaf_only, raw_frames)
 }
 
+fn unwind_reported_frame_addresses_like_perf(
+    state: &mut PidUnwindState,
+    pid: u32,
+    memory: &mut MappedMemory<'_>,
+    regs: &PerfUserRegs,
+    stack: &[u8],
+) -> (Vec<u64>, bool) {
+    let mut unwind = state
+        .object_unwinder
+        .unwind_stack_with_diagnostics_and_memory(*regs, stack, 256, |address| {
+            memory.read_u64(address)
+        });
+    for _ in 0..MAX_LIBDW_CALLBACK_REPORT_PASSES {
+        let (added, failed) = report_callback_entries_like_perf(
+            state,
+            memory.table,
+            pid,
+            &mut unwind.accepted_frames,
+            memory.debug_dir,
+        );
+        if failed {
+            return (unwind.accepted_frames, true);
+        }
+        if !added {
+            break;
+        }
+        let next = state
+            .object_unwinder
+            .unwind_stack_with_diagnostics_and_memory(*regs, stack, 256, |address| {
+                memory.read_u64(address)
+            });
+        if next == unwind {
+            break;
+        }
+        unwind = next;
+    }
+    (unwind.accepted_frames, false)
+}
+
+fn report_callback_entries_like_perf(
+    state: &mut PidUnwindState,
+    mmap_table: &MmapTable,
+    pid: u32,
+    frames: &mut Vec<u64>,
+    debug_dir: Option<&Path>,
+) -> (bool, bool) {
+    let mut added = false;
+    for (index, &ip) in frames.iter().enumerate() {
+        // framehop's accepted caller PCs have already been decremented. perf
+        // first reports the raw callback PC, ignores failure, then entry reports
+        // the adjusted PC and gates acceptance (unwind-libdw.c:326-338,158).
+        let callback_ip = if index == 0 { ip } else { ip.saturating_add(1) };
+        added |= report_unwind_modules_for_frame_callbacks_like_perf(
+            state,
+            mmap_table,
+            pid,
+            &[callback_ip],
+            debug_dir,
+        );
+        match report_unwind_module_for_ip_like_perf(state, mmap_table, pid, ip, debug_dir) {
+            ReportModuleResult::Failed => {
+                frames.truncate(index);
+                return (added, true);
+            }
+            ReportModuleResult::NewlyReported => added = true,
+            ReportModuleResult::NoDso | ReportModuleResult::AlreadyReported => {}
+        }
+    }
+    (added, false)
+}
+
 /// Whether perf/libdw would fire the initial-frame callback exactly once and
 /// stop: the sampled IP reported into a module, no CFI covers it, and the
 /// arch-specific `ebl_unwind` fallback provably cannot advance.
 ///
 /// The `(pid, ip)`-stable half (module reported + no CFI) is memoized in
 /// `state.leaf_only_eligibility`; the per-sample register condition
-/// (`bp < sp` on `x86_64`, `lr == 0` on aarch64) is combined here fresh.
+/// (caller-SP advancement on `x86_64`, `lr == 0` on aarch64) is combined here fresh.
 fn sample_is_leaf_only(
     state: &mut PidUnwindState,
     pid: u32,
@@ -4602,6 +4636,16 @@ fn sample_is_leaf_only(
         return false;
     }
     let ip = regs.ip();
+    if !mmap_table
+        .user_mapping_for_pid_ip(pid, ip)
+        .is_some_and(|mapping| {
+            reported_unwind_module_for_mapping(&state.object_unwinder, mapping, ip).is_some()
+        })
+    {
+        // A no-CFI leaf still runs callback reporting. It cannot take this
+        // shortcut when a base mismatch would reopen and GC the seed module.
+        return false;
+    }
     let eligibility = *state
         .leaf_only_eligibility
         .entry(ip)
@@ -4633,17 +4677,15 @@ fn leaf_only_eligibility(
 /// The per-sample half of the leaf-only predicate: whether the arch-specific
 /// `ebl_unwind` fallback can never produce a caller from these registers.
 ///
-/// `x86_64` (`backends/x86_64_unwind.c`): the rbp fallback is only attempted by
-/// pyroclast when `bp >= sp` (the elfutils final guard `if (sp >= fp) return
-/// false;` rejects a frame pointer that does not sit above the stack pointer).
-/// So `bp < sp` means the fallback contributes nothing.
+/// `x86_64` (`backends/x86_64_unwind.c:54,79-91`): a zero frame pointer stops
+/// immediately; otherwise the caller SP after popping both words must advance.
 ///
 /// aarch64 (`backends/aarch64_unwind.c`): the caller pc comes from `lr`; the
 /// fallback returns false immediately when `lr == 0`. So `lr == 0` means no
 /// caller.
 fn arch_fallback_provably_cannot_advance(regs: &PerfUserRegs) -> bool {
     match *regs {
-        PerfUserRegs::X86_64(regs) => regs.bp < regs.sp,
+        PerfUserRegs::X86_64(regs) => regs.bp == 0 || regs.sp >= regs.bp.wrapping_add(16),
         PerfUserRegs::Aarch64(regs) => regs.lr == 0,
     }
 }
@@ -4765,26 +4807,59 @@ fn report_unwind_module_for_ip_like_perf(
     let Some(mapping) = mmap_table.user_mapping_for_pid_ip(pid, ip) else {
         return ReportModuleResult::NoDso;
     };
-    if state.object_unwinder.has_reported_module_for_ip(ip) {
-        return ReportModuleResult::AlreadyReported;
-    }
-    if load_unwind_mapping_for_user_mapping_like_perf(state, mapping, unwind_debug_dir) {
-        ReportModuleResult::NewlyReported
+    let module_key = unwind_module_key(mapping.path, mapping.start, mapping.pgoff);
+    let result = if let Some(module) =
+        reported_unwind_module_for_mapping(&state.object_unwinder, mapping, ip)
+    {
+        ObjectMappingResult::Reused(module)
     } else {
-        ReportModuleResult::Failed
+        load_unwind_mapping_for_user_mapping_like_perf(state, mapping, unwind_debug_dir)
+    };
+    // unwind-libdw.c:133 compares the returned module with addrmodule(ip), not
+    // addrmodule(map.start): the map can start in a PT_LOAD prefix or gap.
+    if result.module().is_none()
+        || result.module() != state.object_unwinder.reported_module_for_ip(ip)
+    {
+        return ReportModuleResult::Failed;
     }
+    state
+        .loaded_unwind_modules
+        .insert(module_key, result.module().expect("reported module"));
+    match result {
+        ObjectMappingResult::Added(_) => {
+            state.leaf_only_eligibility.clear();
+            ReportModuleResult::NewlyReported
+        }
+        ObjectMappingResult::Reused(_) => ReportModuleResult::AlreadyReported,
+        ObjectMappingResult::Rejected => ReportModuleResult::Failed,
+    }
+}
+
+fn reported_unwind_module_for_mapping(
+    unwinder: &FramehopUnwinder,
+    mapping: UserMapping<'_>,
+    ip: u64,
+) -> Option<usize> {
+    let base = if mapping.path.starts_with("/tmp/jitted-") {
+        mapping.start
+    } else {
+        mapping.start.wrapping_sub(mapping.pgoff)
+    };
+    unwinder
+        .reported_module_for_ip(ip)
+        .filter(|&module| unwinder.reported_module_start(module) == base)
 }
 
 fn load_unwind_mapping_for_user_mapping_like_perf(
     state: &mut PidUnwindState,
     mapping: UserMapping<'_>,
     unwind_debug_dir: Option<&Path>,
-) -> bool {
-    let module_key = unwind_module_key(mapping.path, mapping.start, mapping.pgoff);
-    if state.loaded_unwind_modules.contains(&module_key) {
-        return false;
-    }
+) -> ObjectMappingResult {
     let path = mapping.path.to_string();
+    let name = Path::new(mapping.path)
+        .file_name()
+        .unwrap_or(std::ffi::OsStr::new(mapping.path))
+        .to_string_lossy();
     let build_id = mapping
         .build_id
         .filter(|id| id.iter().any(|byte| *byte != 0))
@@ -4795,28 +4870,52 @@ fn load_unwind_mapping_for_user_mapping_like_perf(
         pgoff: mapping.pgoff,
         prot: mapping.prot,
         path: &path,
+        module_name: &name,
         file_identity: mapping.file_identity,
         build_id: build_id.as_deref(),
     };
+    // Actual reporting can add or GC a module even when its result is failure.
+    state.leaf_only_eligibility.clear();
+    let result = report_unwind_mapping_source(state, request, unwind_debug_dir);
+    let key = unwind_module_key(mapping.path, mapping.start, mapping.pgoff);
+    if let Some(module) = result.module() {
+        state.loaded_unwind_modules.insert(key, module);
+    } else {
+        state.loaded_unwind_modules.remove(&key);
+    }
+    result
+}
+
+fn report_unwind_mapping_source(
+    state: &mut PidUnwindState,
+    request: UnwindMappingRequest<'_>,
+    unwind_debug_dir: Option<&Path>,
+) -> ObjectMappingResult {
     // perf reports the native vDSO from its live ELF image when no recorded
     // cache object is available. Symbolization already follows this fallback;
     // unwinding must report the same module before accepting the initial IP.
     // Compat names need their own recorded object and cannot use the host image.
-    let reported = if request.path == "[vdso]"
+    if request.path == "[vdso]"
         && request.build_id.is_none_or(|id| {
             cached_unwind_object_path_for_build_id(request.path, id, unwind_debug_dir)
                 == Path::new(request.path)
-        }) {
+        })
+    {
         load_live_vdso_unwind_mapping(state, request)
-    } else if load_unwind_mapping(
-        &mut state.object_unwinder,
-        &mut state.attempted_unwind_mappings,
-        request,
-    ) {
+    } else {
+        let reported = load_unwind_mapping(
+            &mut state.object_unwinder,
+            &mut state.attempted_unwind_mappings,
+            request,
+        );
         // perf unwind-libdw.c reports the live regular ELF first. A reported
         // module wins even with a different build ID or no CFI at all.
-        true
-    } else if let Some(build_id) = request.build_id {
+        if reported.module().is_some() {
+            return reported;
+        }
+        let Some(build_id) = request.build_id else {
+            return ObjectMappingResult::Rejected;
+        };
         let cached =
             cached_unwind_object_path_for_build_id(request.path, build_id, unwind_debug_dir);
         let cached = cached.to_string_lossy();
@@ -4828,28 +4927,19 @@ fn load_unwind_mapping_for_user_mapping_like_perf(
                 ..request
             },
         )
-    } else {
-        false
-    };
-    if reported {
-        // Track the original DSO mapping, not a separately reselected filename.
-        // This also keeps cached and copied-vDSO sources visible to queries.
-        state.loaded_unwind_modules.insert(module_key)
-    } else {
-        false
     }
 }
 
 fn load_live_vdso_unwind_mapping(
     state: &mut PidUnwindState,
     request: UnwindMappingRequest<'_>,
-) -> bool {
+) -> ObjectMappingResult {
     let Some(image) = state
         .live_vdso_elf
         .get_or_init(copy_live_vdso_elf_like_perf)
         .as_ref()
     else {
-        return false;
+        return ObjectMappingResult::Rejected;
     };
     let architecture = match state.arch {
         PerfArch::X86_64 => object::Architecture::X86_64,
@@ -4860,7 +4950,7 @@ fn load_live_vdso_unwind_mapping(
             .build_id
             .is_some_and(|id| image.build_id.as_deref() != Some(id))
     {
-        return false;
+        return ObjectMappingResult::Rejected;
     }
     let path = image.path.to_string_lossy();
     load_unwind_mapping(
@@ -4875,6 +4965,7 @@ fn load_live_vdso_unwind_mapping(
     )
 }
 
+#[cfg(test)]
 fn unwind_user_stack_with_diagnostics(
     unwinder: &mut impl UserStackUnwinder,
     regs: PerfUserRegs,
@@ -4987,7 +5078,8 @@ fn perf_accepted_object_unwind_frames(
     }
     // When the leaf-only predicate holds, perf/libdwfl fires frame_callback for
     // the seeded IP and then stops. No FDE row covers the IP, so advancement
-    // depends on `ebl_unwind`; the x86_64 backend returns false when `bp < sp`,
+    // depends on `ebl_unwind`; the x86_64 backend rejects zero BP or a caller
+    // SP that does not advance after popping both saved words,
     // and the aarch64 backend returns false when `lr == 0`. In that state perf
     // prints exactly the sampled-IP leaf, so a framehop-only caller is discarded.
     if leaf_only {
@@ -5000,25 +5092,26 @@ fn load_unwind_mapping(
     object_unwinder: &mut FramehopUnwinder,
     attempted_unwind_mappings: &mut BTreeSet<UnwindMappingKey>,
     request: UnwindMappingRequest<'_>,
-) -> bool {
+) -> ObjectMappingResult {
     if !should_load_unwind_object(request.path, request.file_identity) {
-        return false;
+        return ObjectMappingResult::Rejected;
     }
     if request.prot.is_some_and(|prot| prot & PROT_EXEC == 0) {
-        return false;
+        return ObjectMappingResult::Rejected;
     }
     let key = unwind_mapping_key(request.path, request.start, request.len, request.pgoff);
-    if !attempted_unwind_mappings.insert(key.clone()) {
-        return false;
-    }
+    // This is attempt bookkeeping, not a report-result cache. A genuine
+    // re-report must reopen the ELF and can GC an existing DWFL identity.
+    attempted_unwind_mappings.insert(key);
     object_unwinder
-        .add_object_mapping(
+        .report_object_mapping(
             Path::new(request.path),
+            request.module_name,
             request.start,
             request.len,
             request.pgoff,
         )
-        .is_ok_and(|loaded| loaded || object_unwinder.has_reported_module_for_ip(request.start))
+        .unwrap_or(ObjectMappingResult::Rejected)
 }
 
 fn unwind_mapping_key(path: &str, start: u64, len: u64, pgoff: u64) -> UnwindMappingKey {
@@ -6002,7 +6095,10 @@ mod tests {
         let mapping = maps.user_mapping_for_pid_ip(11, start + 0x400).unwrap();
         let mut state = super::PidUnwindState::with_arch(PerfArch::X86_64);
         assert!(
-            super::load_unwind_mapping_for_user_mapping_like_perf(&mut state, mapping, None),
+            matches!(
+                super::load_unwind_mapping_for_user_mapping_like_perf(&mut state, mapping, None),
+                super::ObjectMappingResult::Added(_)
+            ),
             "perf reports the live vDSO before unwinding a sampled vDSO IP"
         );
         assert!(
@@ -6013,7 +6109,7 @@ mod tests {
         assert!(
             state
                 .loaded_unwind_modules
-                .contains(&super::unwind_module_key("[vdso]", start, 0,))
+                .contains_key(&super::unwind_module_key("[vdso]", start, 0,))
         );
     }
 
@@ -6034,8 +6130,9 @@ mod tests {
             let mut state = super::PidUnwindState::with_arch(PerfArch::X86_64);
             // tools/perf/util/build-id.c:build_id__is_defined rejects empty
             // and all-zero IDs; neither constrains the native vDSO image.
-            assert!(super::load_unwind_mapping_for_user_mapping_like_perf(
-                &mut state, mapping, None
+            assert!(matches!(
+                super::load_unwind_mapping_for_user_mapping_like_perf(&mut state, mapping, None),
+                super::ObjectMappingResult::Added(_)
             ));
         }
     }
@@ -6054,18 +6151,22 @@ mod tests {
             file_identity: None,
         };
         let mut state = super::PidUnwindState::with_arch(PerfArch::X86_64);
-        assert!(!super::load_unwind_mapping_for_user_mapping_like_perf(
-            &mut state, mapping, None
-        ));
+        assert_eq!(
+            super::load_unwind_mapping_for_user_mapping_like_perf(&mut state, mapping, None),
+            super::ObjectMappingResult::Rejected
+        );
         let mut foreign = super::PidUnwindState::with_arch(PerfArch::Aarch64);
-        assert!(!super::load_unwind_mapping_for_user_mapping_like_perf(
-            &mut foreign,
-            super::UserMapping {
-                build_id: None,
-                ..mapping
-            },
-            None
-        ));
+        assert_eq!(
+            super::load_unwind_mapping_for_user_mapping_like_perf(
+                &mut foreign,
+                super::UserMapping {
+                    build_id: None,
+                    ..mapping
+                },
+                None
+            ),
+            super::ObjectMappingResult::Rejected
+        );
     }
 
     #[test]
@@ -6130,10 +6231,13 @@ mod tests {
             file_identity: None,
         };
         let mut state = super::PidUnwindState::with_arch(PerfArch::X86_64);
-        assert!(super::load_unwind_mapping_for_user_mapping_like_perf(
-            &mut state,
-            mapping,
-            Some(root.path())
+        assert!(matches!(
+            super::load_unwind_mapping_for_user_mapping_like_perf(
+                &mut state,
+                mapping,
+                Some(root.path())
+            ),
+            super::ObjectMappingResult::Added(_)
         ));
         assert!(
             state.live_vdso_elf.get().is_none(),
@@ -6142,7 +6246,7 @@ mod tests {
         assert!(
             state
                 .loaded_unwind_modules
-                .contains(&super::unwind_module_key(
+                .contains_key(&super::unwind_module_key(
                     "[vdso]",
                     mapping.start,
                     mapping.pgoff,
@@ -10353,10 +10457,25 @@ mod tests {
                 pgoff: 0x28000,
                 path: path.to_string(),
             });
-        accumulator
-            .unwind_state_mut(11)
+        let state = accumulator.unwind_state_mut(11);
+        assert!(
+            state
+                .object_unwinder
+                .add_object_mapping(
+                    &std::env::current_exe().unwrap(),
+                    0x7fff_f7d8_2000,
+                    0x1000_0000,
+                    0,
+                )
+                .unwrap()
+        );
+        let module = state
+            .object_unwinder
+            .reported_module_for_ip(0x7fff_f7e3_2455)
+            .unwrap();
+        state
             .loaded_unwind_modules
-            .insert((path.to_string(), 0x7fff_f7d8_2000));
+            .insert((path.to_string(), 0x7fff_f7d8_2000), module);
 
         assert!(accumulator.has_loaded_unwind_mapping_for_ip(11.into(), 0x7fff_f7e3_2455));
     }
@@ -10421,12 +10540,12 @@ mod tests {
         assert!(accumulator.unwind_states.get(&11).is_none());
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
-    fn overlapping_mmap_insert_invalidates_stale_unwind_modules_like_perf_dwfl() {
-        // tools/perf/util/maps.c invalidates libdw's per-maps DWFL state when
-        // map removals happen. Its overlap-fix insert path removes/replaces
-        // maps inline, so the broad synthesized MMAP must not leave a stale
-        // module that rejects the later executable MMAP2 split.
+    fn overlapping_mmap_replacement_preserves_dwfl_and_reports_pie_split_like_perf() {
+        // maps.c:844-1030 fixes overlaps inline without maps__remove's DWFL
+        // invalidation. Native perf accepts this exact PIE split with both
+        // reports retained (native-replacement-20261008/pie-overlap.data).
         let current_exe = std::env::current_exe().expect("current exe");
         let current_exe = current_exe.to_string_lossy().into_owned();
         let mut accumulator = super::SessionState::new(std::collections::BTreeMap::new());
@@ -10461,8 +10580,8 @@ mod tests {
         ));
 
         assert!(
-            accumulator.unwind_states.get(&11).is_none(),
-            "overlap fix should invalidate stale DWFL-like module state"
+            accumulator.unwind_states.contains_key(&11),
+            "inline overlap insertion must preserve the reported address space"
         );
         accumulator.ensure_unwind_mapping_for_ip(Some(11), 0x5555_5567_66de);
         let state = accumulator.unwind_states.get(&11).expect("reloaded state");
@@ -10470,14 +10589,244 @@ mod tests {
             state
                 .object_unwinder
                 .has_reported_module_for_ip(0x5555_5567_66de),
-            "later executable split should load after invalidation"
+            "native reports the later PIE executable split without resetting DWFL"
         );
         assert!(
             !state
                 .object_unwinder
                 .has_rejected_mapping_for_ip(0x5555_5567_66de),
-            "later executable split must not inherit the stale broad-module overlap"
+            "native accepts this overlapping PIE report"
         );
+        assert_eq!(state.object_unwinder.module_count(), 2);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    struct FixedUnwindReplacementFixture {
+        _root: tempfile::TempDir,
+        accumulator: super::SessionState,
+        old: String,
+        replacement: std::path::PathBuf,
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn fixed_unwind_replacement_fixture(vdso: bool, valid: bool) -> FixedUnwindReplacementFixture {
+        let root = tempfile::tempdir().expect("replacement fixture");
+        let debug_dir = root.path().join(".debug");
+        let old = if vdso {
+            "[vdso]".to_string()
+        } else {
+            root.path().join("old-missing.elf").to_str().unwrap().into()
+        };
+        let cached = crate::symbols::perf_build_id_elf_path_for_dso(
+            &debug_dir,
+            std::path::Path::new(&old),
+            "aabbccdd",
+        );
+        std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        let source = root.path().join("fixed.S");
+        std::fs::write(&source, ".text\n.globl leaf\nleaf:\n.cfi_startproc\n.cfi_def_cfa %rsp,16\n.cfi_offset %rip,-8\n.fill 16,1,0x90\nret\n.cfi_endproc\n.section .note.GNU-stack,\"\",@progbits\n").unwrap();
+        let output = std::process::Command::new("cc")
+            .args([
+                "-nostdlib",
+                "-no-pie",
+                "-Wl,-e,leaf",
+                "-Wl,-Ttext=0x401000",
+                "-Wl,--build-id=0xaabbccdd",
+            ])
+            .arg(&source)
+            .arg("-o")
+            .arg(&cached)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let replacement = root.path().join("replacement.elf");
+        if valid {
+            std::fs::copy(&cached, &replacement).unwrap();
+        }
+        let mut accumulator = super::SessionState::new(std::collections::BTreeMap::new());
+        accumulator.unwind_debug_dir = Some(debug_dir);
+        accumulator.apply_record(fixed_unwind_replacement_record(
+            2,
+            old.clone(),
+            0x0040_0000,
+            vec![0xaa, 0xbb, 0xcc, 0xdd],
+        ));
+        FixedUnwindReplacementFixture {
+            _root: root,
+            accumulator,
+            old,
+            replacement,
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn fixed_unwind_replacement_record(
+        form: usize,
+        path: String,
+        start: u64,
+        build_id: Vec<u8>,
+    ) -> crate::perfdata::records::ParsedRecord {
+        use crate::perfdata::records::{Mmap2BuildIdRecord, Mmap2Record, MmapRecord, ParsedRecord};
+        match form {
+            0 => ParsedRecord::Mmap(MmapRecord {
+                pid: 11,
+                tid: 11,
+                start,
+                len: 0x0041_0000 - start,
+                pgoff: 0,
+                path,
+            }),
+            1 => ParsedRecord::Mmap2(Mmap2Record {
+                pid: 11,
+                tid: 11,
+                start,
+                len: 0x0041_0000 - start,
+                pgoff: 0,
+                major: 0,
+                minor: 0,
+                inode: 0,
+                inode_generation: 0,
+                prot: super::PROT_EXEC,
+                flags: 2,
+                path,
+            }),
+            _ => ParsedRecord::Mmap2BuildId {
+                misc: super::PERF_RECORD_MISC_CPUMODE_USER | super::PERF_RECORD_MISC_MMAP_BUILD_ID,
+                record: Mmap2BuildIdRecord {
+                    pid: 11,
+                    tid: 11,
+                    start,
+                    len: 0x0041_0000 - start,
+                    pgoff: 0,
+                    build_id_size: 4,
+                    build_id,
+                    prot: super::PROT_EXEC,
+                    flags: 2,
+                    path,
+                },
+            },
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn assert_fixed_unwind_replacement_report(
+        accumulator: &mut super::SessionState,
+        original: usize,
+        changed_base: bool,
+        valid: bool,
+    ) {
+        let state = accumulator
+            .unwind_states
+            .get_mut(&11)
+            .expect("inline mmap replacement must retain DWFL state");
+        assert_eq!(state.object_unwinder.module_count(), 1);
+        assert!(state.leaf_only_eligibility.is_empty());
+        let result = super::report_unwind_module_for_ip_like_perf(
+            state,
+            &accumulator.mmap_table,
+            11,
+            0x0040_1001,
+            accumulator.unwind_debug_dir.as_deref(),
+        );
+        assert_eq!(
+            result,
+            if changed_base && valid {
+                super::ReportModuleResult::NewlyReported
+            } else if changed_base {
+                super::ReportModuleResult::Failed
+            } else {
+                super::ReportModuleResult::AlreadyReported
+            }
+        );
+        if changed_base {
+            assert_eq!(
+                super::report_unwind_module_for_ip_like_perf(
+                    state,
+                    &accumulator.mmap_table,
+                    11,
+                    0x0040_1001,
+                    accumulator.unwind_debug_dir.as_deref(),
+                ),
+                super::ReportModuleResult::Failed
+            );
+            assert_eq!(
+                state.object_unwinder.reported_module_for_ip(0x0040_1001),
+                Some(original)
+            );
+            assert!(state.object_unwinder.has_unwind_info_for_ip(0x0040_1001));
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn check_fixed_unwind_replacement_reporting(vdso: bool, changed_base: bool) {
+        for valid in [false, true] {
+            for form in 0..3 {
+                let mut fixture = fixed_unwind_replacement_fixture(vdso, valid);
+                let accumulator = &mut fixture.accumulator;
+                accumulator.ensure_unwind_mapping_for_ip(Some(11), 0x0040_1001);
+                assert!(accumulator.has_loaded_unwind_mapping_for_ip(Some(11), 0x0040_1001));
+                let original = accumulator.unwind_states[&11]
+                    .object_unwinder
+                    .reported_module_for_ip(0x0040_1001)
+                    .unwrap();
+                accumulator
+                    .unwind_states
+                    .get_mut(&11)
+                    .unwrap()
+                    .leaf_only_eligibility
+                    .insert(0x0040_1001, super::LeafOnlyEligibility::Ineligible);
+                let start = if changed_base {
+                    0x0040_1000
+                } else {
+                    0x0040_0000
+                };
+                accumulator.apply_record(fixed_unwind_replacement_record(
+                    form,
+                    fixture.replacement.to_str().unwrap().into(),
+                    start,
+                    vec![0x11; 4],
+                ));
+                assert_fixed_unwind_replacement_report(accumulator, original, changed_base, valid);
+                accumulator.apply_record(fixed_unwind_replacement_record(
+                    form,
+                    fixture.old.clone(),
+                    0x0040_0000,
+                    vec![0xaa, 0xbb, 0xcc, 0xdd],
+                ));
+                accumulator.ensure_unwind_mapping_for_ip(Some(11), 0x0040_1001);
+                assert_eq!(
+                    accumulator.unwind_states[&11]
+                        .object_unwinder
+                        .reported_module_for_ip(0x0040_1001),
+                    Some(original)
+                );
+                assert!(accumulator.has_loaded_unwind_mapping_for_ip(Some(11), 0x0040_1001));
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn ordinary_same_base_replacement_retains_cached_module_like_perf_dwfl() {
+        check_fixed_unwind_replacement_reporting(false, false);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn ordinary_changed_base_replacement_rejects_fixed_module_like_perf_dwfl() {
+        check_fixed_unwind_replacement_reporting(false, true);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn vdso_changed_base_replacement_rejects_fixed_module_like_perf_dwfl() {
+        check_fixed_unwind_replacement_reporting(true, true);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn vdso_same_base_replacement_retains_cached_module_like_perf_dwfl() {
+        check_fixed_unwind_replacement_reporting(true, false);
     }
 
     #[test]
@@ -11145,25 +11494,27 @@ mod tests {
     }
 
     #[test]
-    fn arch_fallback_cannot_advance_only_when_x86_bp_below_sp() {
-        // backends/x86_64_unwind.c: the rbp fallback writes new_sp = fp + 16
-        // and rejects the frame with `if (sp >= fp) return false;` — i.e. it
-        // advances only when the frame pointer sits above the stack pointer.
-        // pyroclast attempts the fallback only when `bp >= sp`, so `bp < sp`
-        // means the fallback can never produce a caller.
-        let mut below = test_x86_regs(0x4000);
-        below.sp = 0x7fff_0000;
-        below.bp = 0x7ffe_ff00; // bp < sp
-        assert!(super::arch_fallback_provably_cannot_advance(
-            &PerfUserRegs::X86_64(below)
-        ));
-
-        let mut at_or_above = test_x86_regs(0x4000);
-        at_or_above.sp = 0x7fff_0000;
-        at_or_above.bp = 0x7fff_0008; // bp > sp
-        assert!(!super::arch_fallback_provably_cannot_advance(
-            &PerfUserRegs::X86_64(at_or_above)
-        ));
+    fn arch_fallback_cannot_advance_when_x86_bp_is_zero_or_caller_sp_does_not_advance() {
+        // elfutils 0.195 backends/x86_64_unwind.c:54,79-91 rejects fp == 0,
+        // then checks old_sp >= (fp + 16), after popping both saved words.
+        let sp = 0x7fff_0000;
+        for (bp, cannot_advance) in [
+            (0, true),
+            (sp - 16, true),
+            (sp - 8, false),
+            (sp, false),
+            (sp + 8, false),
+            (u64::MAX - 7, true),
+        ] {
+            let mut regs = test_x86_regs(0x4000);
+            regs.sp = sp;
+            regs.bp = bp;
+            assert_eq!(
+                super::arch_fallback_provably_cannot_advance(&PerfUserRegs::X86_64(regs)),
+                cannot_advance,
+                "bp={bp:#x}, sp={sp:#x}"
+            );
+        }
     }
 
     #[test]

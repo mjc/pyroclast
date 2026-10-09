@@ -22,6 +22,10 @@ use pyroclast::symbols::{
     perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources,
 };
 use std::cell::RefCell;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "support/perfdata_memory_sources.rs"]
+mod memory_sources;
+
 #[cfg(target_os = "linux")]
 use std::io::Write as _;
 #[cfg(target_os = "linux")]
@@ -369,6 +373,482 @@ fn perf_script_uses_cache_cfi_when_live_module_cannot_be_reported() {
     ] {
         check_cfi_source_perf_script(source);
     }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug)]
+enum UnwindReplacementMmap {
+    Mmap,
+    Mmap2,
+    BuildId,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+struct UnwindReplacementFixture {
+    root: tempfile::TempDir,
+    home: std::path::PathBuf,
+    data: std::path::PathBuf,
+    expected_ips: [Vec<u64>; 3],
+    replacement_base: u64,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn compile_unwind_replacement_elf(
+    source: &std::path::Path,
+    binary: &std::path::Path,
+    cached: bool,
+) {
+    let output = Command::new("cc")
+        .args([
+            "-nostdlib",
+            "-no-pie",
+            "-Wl,-e,identity_leaf",
+            "-Wl,-Ttext=0x401000",
+            "-Wl,--eh-frame-hdr",
+        ])
+        .arg(if cached { "-DCACHE_CFI" } else { "-DLIVE_CFI" })
+        .arg(if cached {
+            "-Wl,--build-id=0x2222222222222222222222222222222222222222"
+        } else {
+            "-Wl,--build-id=0x1111111111111111111111111111111111111111"
+        })
+        .arg(source)
+        .arg("-o")
+        .arg(binary)
+        .output()
+        .expect("compile replacement ELF");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn unwind_replacement_record(
+    form: UnwindReplacementMmap,
+    path: &str,
+    start: u64,
+    id: u8,
+    time: u64,
+) -> Vec<u8> {
+    let len = 0x0041_0000 - start;
+    let (kind, misc, mut payload) = match form {
+        UnwindReplacementMmap::Mmap => (
+            1,
+            PERF_RECORD_MISC_CPUMODE_USER,
+            mmap_payload(11, 12, start, len, 0, path),
+        ),
+        UnwindReplacementMmap::Mmap2 => (
+            10,
+            PERF_RECORD_MISC_CPUMODE_USER,
+            mmap2_payload(11, 12, start, len, 0, 5, path),
+        ),
+        UnwindReplacementMmap::BuildId => {
+            let mut payload = mmap_range_payload(11, 12, start, len, 0);
+            payload.extend([20, 0, 0, 0]);
+            payload.extend([id; 20]);
+            payload.extend(5_u32.to_le_bytes());
+            payload.extend(2_u32.to_le_bytes());
+            payload.extend(path.as_bytes());
+            payload.push(0);
+            (
+                10,
+                PERF_RECORD_MISC_CPUMODE_USER | PERF_RECORD_MISC_MMAP_BUILD_ID,
+                payload,
+            )
+        }
+    };
+    payload.resize(payload.len().next_multiple_of(8), 0);
+    payload.extend(11_u32.to_le_bytes());
+    payload.extend(12_u32.to_le_bytes());
+    payload.extend(time.to_le_bytes());
+    record_bytes_with_misc(kind, misc, &payload)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn unwind_replacement_samples() -> [Vec<u8>; 3] {
+    let mut stack = [0; 64];
+    stack[..8].copy_from_slice(&0x0040_1021_u64.to_le_bytes());
+    stack[8..16].copy_from_slice(&0x0040_1041_u64.to_le_bytes());
+    [1_000_000_000_u64, 3_000_000_000, 5_000_000_000].map(|time| {
+        let mut payload = sample_payload_with_optional_timestamp(
+            sample_payload_with_user_stack(
+                0x0040_1001,
+                11,
+                12,
+                [0xffff_ffff_ffff_fe00, 0x0040_1001],
+                2,
+                [0, 0x7000_0000, 0x0040_1001],
+                stack,
+            ),
+            true,
+        );
+        put_u64(&mut payload, 16, time);
+        record_bytes_with_misc(PERF_RECORD_SAMPLE, PERF_RECORD_MISC_CPUMODE_USER, &payload)
+    })
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn unwind_replacement_assembly() -> &'static str {
+    r#".text
+.globl identity_leaf
+.type identity_leaf,@function
+identity_leaf:
+.cfi_startproc
+#ifdef CACHE_CFI
+.cfi_def_cfa %rsp,16
+#else
+.cfi_def_cfa %rsp,8
+#endif
+.cfi_offset %rip,-8
+.fill 16,1,0x90
+ret
+.cfi_endproc
+.size identity_leaf,.-identity_leaf
+.p2align 5
+.globl caller_live
+.type caller_live,@function
+caller_live:
+.cfi_startproc
+.cfi_def_cfa %rsp,8
+.cfi_undefined %rip
+.fill 16,1,0x90
+ret
+.cfi_endproc
+.size caller_live,.-caller_live
+.p2align 5
+.globl caller_cache
+.type caller_cache,@function
+caller_cache:
+.cfi_startproc
+.cfi_def_cfa %rsp,8
+.cfi_undefined %rip
+.fill 16,1,0x90
+ret
+.cfi_endproc
+.size caller_cache,.-caller_cache
+.section .note.GNU-stack,"",@progbits
+"#
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn unwind_replacement_fixture(
+    vdso: bool,
+    changed_base: bool,
+    valid: bool,
+    form: UnwindReplacementMmap,
+) -> UnwindReplacementFixture {
+    let root = tempfile::tempdir().expect("replacement fixture");
+    let home = root.path().join("home");
+    let old = if vdso {
+        "[vdso]".to_string()
+    } else {
+        root.path().join("old-missing.elf").to_str().unwrap().into()
+    };
+    let id = "2222222222222222222222222222222222222222";
+    let cached = pyroclast::symbols::perf_build_id_elf_path_for_dso(
+        &home.join(".debug"),
+        std::path::Path::new(&old),
+        id,
+    );
+    std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
+    let source = root.path().join("identity.S");
+    std::fs::write(&source, unwind_replacement_assembly()).unwrap();
+    compile_unwind_replacement_elf(&source, &cached, true);
+    let bytes = std::fs::read(&cached).unwrap();
+    let elf = object::File::parse(bytes.as_slice()).unwrap();
+    assert_eq!(elf.kind(), object::ObjectKind::Executable);
+    for (name, address) in [
+        ("identity_leaf", 0x0040_1000),
+        ("caller_live", 0x0040_1020),
+        ("caller_cache", 0x0040_1040),
+    ] {
+        assert_eq!(
+            elf.symbols()
+                .find(|s| s.name() == Ok(name))
+                .unwrap()
+                .address(),
+            address
+        );
+    }
+    let replacement = root.path().join("replacement.elf");
+    if valid {
+        compile_unwind_replacement_elf(&source, &replacement, false);
+    }
+    let replacement_base = if changed_base {
+        0x0040_1000
+    } else {
+        0x0040_0000
+    };
+    let data = root.path().join("perf.data");
+    write_unwind_replacement_recording(&data, &old, &replacement, replacement_base, form);
+    // Native lifecycle trace: the first changed-valid report succeeds, but its
+    // fresh-FD callback re-report GCs it. Mapping back reuses the original CFI.
+    let before = vec![0x0040_1001, 0x0040_1001, 0x0040_1040];
+    let after = if changed_base {
+        vec![0x0040_1001]
+    } else {
+        before.clone()
+    };
+    UnwindReplacementFixture {
+        root,
+        home,
+        data,
+        expected_ips: [before.clone(), after, before],
+        replacement_base,
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn write_unwind_replacement_recording(
+    data: &std::path::Path,
+    old: &str,
+    replacement: &std::path::Path,
+    replacement_base: u64,
+    form: UnwindReplacementMmap,
+) {
+    let mut attr = file_attr_bytes_with_regs(
+        PERF_SAMPLE_IP
+            | PERF_SAMPLE_TID
+            | PERF_SAMPLE_TIME
+            | PERF_SAMPLE_CALLCHAIN
+            | PERF_SAMPLE_REGS_USER
+            | PERF_SAMPLE_STACK_USER,
+        (1 << 6) | (1 << 7) | (1 << 8),
+    );
+    put_u64(&mut attr, 40, 1 << 18); // sample_id_all: keep replacement between samples.
+    let [before, after, recovered] = unwind_replacement_samples();
+    let records = [
+        unwind_replacement_record(
+            UnwindReplacementMmap::BuildId,
+            old,
+            0x0040_0000,
+            0x22,
+            500_000_000,
+        ),
+        before,
+        unwind_replacement_record(
+            form,
+            replacement.to_str().unwrap(),
+            replacement_base,
+            0x11,
+            2_000_000_000,
+        ),
+        after,
+        unwind_replacement_record(form, old, 0x0040_0000, 0x22, 4_000_000_000),
+        recovered,
+    ];
+    let mut build_id = u32::MAX.to_le_bytes().to_vec();
+    build_id.extend([0x22; 20]);
+    build_id.extend([0; 4]);
+    build_id.extend(old.as_bytes());
+    build_id.push(0);
+    build_id.resize((8 + build_id.len()).next_multiple_of(8) - 8, 0);
+    let build_id = record_bytes_with_misc(67, PERF_RECORD_MISC_CPUMODE_USER, &build_id);
+    std::fs::write(
+        data,
+        perfdata_with_records_attrs_and_build_id_feature([attr], records, &build_id),
+    )
+    .unwrap();
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn unwind_replacement_expected_fold(fixture: &UnwindReplacementFixture) -> String {
+    use std::fmt::Write as _;
+
+    let mut counts = std::collections::BTreeMap::<String, u64>::new();
+    for (ips, base) in
+        fixture
+            .expected_ips
+            .iter()
+            .zip([0x0040_0000, fixture.replacement_base, 0x0040_0000])
+    {
+        let labels = ips
+            .iter()
+            .rev()
+            .map(|ip| format!("ip_{:x}", ip - base))
+            .collect::<Vec<_>>()
+            .join(";");
+        *counts.entry(format!(":12;{labels}")).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .fold(String::new(), |mut output, (stack, count)| {
+            writeln!(output, "{stack} {count}").unwrap();
+            output
+        })
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn check_unwind_replacement_byte_file_matrix(name: &str, vdso: bool, changed_base: bool) {
+    if let Some(data) = std::env::var_os("PYROCLAST_UNWIND_REPLACEMENT_DATA") {
+        let data = std::path::PathBuf::from(data);
+        let expected = std::env::var("PYROCLAST_UNWIND_REPLACEMENT_FOLDED").unwrap();
+        let bytes = std::fs::read(&data).unwrap();
+        assert_eq!(
+            fold_perfdata_callchains_with_symbols(
+                &bytes,
+                FoldOptions::default(),
+                &CfiAddressResolver
+            )
+            .unwrap(),
+            expected,
+            "byte route"
+        );
+        assert_eq!(
+            pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(
+                &data,
+                FoldOptions::default(),
+                &CfiAddressResolver
+            )
+            .unwrap(),
+            expected,
+            "file route"
+        );
+        return;
+    }
+    for form in [
+        UnwindReplacementMmap::Mmap,
+        UnwindReplacementMmap::Mmap2,
+        UnwindReplacementMmap::BuildId,
+    ] {
+        for valid in [false, true] {
+            let fixture = unwind_replacement_fixture(vdso, changed_base, valid, form);
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env("HOME", &fixture.home)
+                .env("PYROCLAST_UNWIND_REPLACEMENT_DATA", &fixture.data)
+                .env(
+                    "PYROCLAST_UNWIND_REPLACEMENT_FOLDED",
+                    unwind_replacement_expected_fold(&fixture),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{form:?} valid={valid}: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn check_unwind_replacement_perf_script_matrix(vdso: bool, changed_base: bool) {
+    for form in [
+        UnwindReplacementMmap::Mmap,
+        UnwindReplacementMmap::Mmap2,
+        UnwindReplacementMmap::BuildId,
+    ] {
+        for valid in [false, true] {
+            let fixture = unwind_replacement_fixture(vdso, changed_base, valid, form);
+            for symbolizer in ["addr2line", "rust-addr2line"] {
+                let output = Command::new(env!("CARGO_BIN_EXE_pyroclast"))
+                    .args([
+                        "plumbing",
+                        "perf-script",
+                        "--no-inline",
+                        "--symbolizer",
+                        symbolizer,
+                    ])
+                    .arg(&fixture.data)
+                    .env("HOME", &fixture.home)
+                    .env("DEBUGINFOD_URLS", "")
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let script = String::from_utf8(output.stdout).unwrap();
+                let stacks = script
+                    .trim()
+                    .split("\n\n")
+                    .map(|block| {
+                        block
+                            .lines()
+                            .filter_map(|line| {
+                                line.split_whitespace()
+                                    .next()
+                                    .and_then(|word| u64::from_str_radix(word, 16).ok())
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    stacks, fixture.expected_ips,
+                    "{form:?} valid={valid} {symbolizer}: {script}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn byte_file_ordinary_same_base_replacement_retains_cached_cfi() {
+    check_unwind_replacement_byte_file_matrix(
+        "byte_file_ordinary_same_base_replacement_retains_cached_cfi",
+        false,
+        false,
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn byte_file_ordinary_changed_base_replacement_rejects_fixed_elf() {
+    check_unwind_replacement_byte_file_matrix(
+        "byte_file_ordinary_changed_base_replacement_rejects_fixed_elf",
+        false,
+        true,
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn byte_file_vdso_changed_base_replacement_rejects_fixed_elf() {
+    check_unwind_replacement_byte_file_matrix(
+        "byte_file_vdso_changed_base_replacement_rejects_fixed_elf",
+        true,
+        true,
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn byte_file_vdso_same_base_replacement_retains_cached_cfi() {
+    check_unwind_replacement_byte_file_matrix(
+        "byte_file_vdso_same_base_replacement_retains_cached_cfi",
+        true,
+        false,
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn perf_script_ordinary_same_base_replacement_retains_cached_cfi() {
+    check_unwind_replacement_perf_script_matrix(false, false);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn perf_script_ordinary_changed_base_replacement_rejects_fixed_elf() {
+    check_unwind_replacement_perf_script_matrix(false, true);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn perf_script_vdso_changed_base_replacement_rejects_fixed_elf() {
+    check_unwind_replacement_perf_script_matrix(true, true);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn perf_script_vdso_same_base_replacement_retains_cached_cfi() {
+    check_unwind_replacement_perf_script_matrix(true, false);
 }
 
 #[test]
@@ -1150,11 +1630,13 @@ fn drops_dwarf_user_stack_when_current_mapping_replaces_broad_loaded_mapping_lik
 }
 
 #[test]
-fn keeps_dwarf_user_stack_when_newer_mapping_overlaps_before_first_report_like_perf_script() {
+fn keeps_rbp_caller_when_newer_mapping_overlaps_before_first_report_like_perf_script() {
     // perf's libdw module reporting is lazy: tools/perf/util/unwind-libdw.c
     // does not call report_module() until a sample enters the unwind path.
     // Overlapping MMAP records before that first report update the maps, but
     // there is no prior DWFL module yet for the later mapping to conflict with.
+    // No FDE covers the sampled PC, so libdw reads [RBP+8] and emits 0x1233.
+    // That caller is unmapped and remains an [unknown] frame.
     let current_exe = std::env::current_exe().expect("current exe");
     let current_exe = current_exe.to_string_lossy();
     let bytes = perfdata_with_records_and_attrs(
@@ -1195,7 +1677,7 @@ fn keeps_dwarf_user_stack_when_newer_mapping_overlaps_before_first_report_like_p
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
-    let expected = format!(":12;[{}] 1\n", current_exe_file_name());
+    let expected = format!(":12;[unknown];[{}] 1\n", current_exe_file_name());
 
     assert_eq!(folded, expected);
 }
@@ -1249,11 +1731,12 @@ fn skips_unwind_when_build_id_mapping_cannot_report_initial_module_like_perf_scr
 }
 
 #[test]
-fn keeps_dwarf_user_stack_when_header_build_id_mmap2_overlaps_before_first_report_like_perf_script()
-{
+fn keeps_rbp_caller_when_header_build_id_mmap2_overlaps_before_first_report_like_perf_script() {
     // Header FEATURE_BUILD_ID resolution also happens when the mapping is
     // reported to DWFL. Without a sample before the overlap, there is no prior
     // reported module to reject this mapping.
+    // The sampled PC has no covering FDE; [RBP+8] recovers caller 0x1233.
+    // entry() retains that caller even though no recorded mapping covers it.
     let build_id = [
         0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90,
         0xa0, 0xb0, 0xc0, 0xd0, 0xe0,
@@ -1299,7 +1782,7 @@ fn keeps_dwarf_user_stack_when_header_build_id_mmap2_overlaps_before_first_repor
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
-    let expected = format!(":12;[{}] 1\n", fixture.file_name());
+    let expected = format!(":12;[unknown];[{}] 1\n", fixture.file_name());
 
     assert_eq!(folded, expected);
 }
@@ -1723,11 +2206,9 @@ fn skips_unwind_with_short_stack_when_sampled_ip_is_unmapped() {
 }
 
 #[test]
-fn keeps_current_ip_only_object_unwind_for_mapped_dwarf_user_stack_like_perf_libdw() {
-    // elfutils dwfl_thread_getframes() invokes the callback for the initial
-    // state before attempting to unwind callers. perf's frame_callback() then
-    // calls entry(pc), so a single current-IP callback is a real frame, not
-    // something to drop.
+fn keeps_rbp_caller_for_mapped_dwarf_user_stack_like_perf_libdw() {
+    // libdw emits the initial frame, then uses RBP when no FDE covers its PC.
+    // The broad mapping labels both the initial IP and caller with this DSO.
     let fixture = SyntheticX86_64Object::create();
     let current_exe = fixture.path_string();
     let bytes = perfdata_with_records_and_attrs(
@@ -1764,7 +2245,7 @@ fn keeps_current_ip_only_object_unwind_for_mapped_dwarf_user_stack_like_perf_lib
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
-    let expected = format!(":12;[{}] 1\n", fixture.file_name());
+    let expected = format!(":12;[{0}];[{0}] 1\n", fixture.file_name());
 
     assert_eq!(folded, expected);
 }
@@ -1864,10 +2345,9 @@ fn keeps_unwind_frame_for_valid_elf_named_perf_data_like_perf_libdw_and_inferno(
 }
 
 #[test]
-fn keeps_current_ip_only_object_unwind_after_first_non_text_mapping_like_perf_libdw() {
-    // perf reports the module selected by thread__find_symbol() for the
-    // callback PC. If that report succeeds, entry() stores the current IP even
-    // when no caller is recovered.
+fn keeps_rbp_caller_after_first_non_text_mapping_like_perf_libdw() {
+    // The register IP selects the second mapping when perf reports the DSO.
+    // No FDE covers it; libdw retains the unmapped caller read from [RBP+8].
     let fixture = SyntheticX86_64Object::create();
     let current_exe = fixture.path_string();
     let bytes = perfdata_with_records_and_attrs(
@@ -1908,13 +2388,15 @@ fn keeps_current_ip_only_object_unwind_after_first_non_text_mapping_like_perf_li
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
-    let expected = format!(":12;[{}] 1\n", fixture.file_name());
+    let expected = format!(":12;[unknown];[{}] 1\n", fixture.file_name());
 
     assert_eq!(folded, expected);
 }
 
 #[test]
-fn keeps_current_ip_only_object_unwind_from_executable_mmap2_like_perf_libdw() {
+fn keeps_rbp_caller_from_executable_mmap2_like_perf_libdw() {
+    // The executable mapping selects the DSO, but its FDE does not cover IP.
+    // libdw's RBP fallback retains caller 0x1233 outside the recorded maps.
     let fixture = SyntheticX86_64Object::create();
     let current_exe = fixture.path_string();
     let bytes = perfdata_with_records_and_attrs(
@@ -1963,13 +2445,15 @@ fn keeps_current_ip_only_object_unwind_from_executable_mmap2_like_perf_libdw() {
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
-    let expected = format!(":12;[{}] 1\n", fixture.file_name());
+    let expected = format!(":12;[unknown];[{}] 1\n", fixture.file_name());
 
     assert_eq!(folded, expected);
 }
 
 #[test]
-fn keeps_current_ip_only_object_unwind_from_pid_specific_modules_like_perf_libdw() {
+fn keeps_rbp_caller_from_pid_specific_modules_like_perf_libdw() {
+    // Only the sampled PID's mapping supplies the module for the initial IP.
+    // Its missing-FDE RBP fallback also retains the unmapped caller 0x1233.
     let fixture = SyntheticX86_64Object::create();
     let current_exe = fixture.path_string();
     let bytes = perfdata_with_records_and_attrs(
@@ -2010,7 +2494,7 @@ fn keeps_current_ip_only_object_unwind_from_pid_specific_modules_like_perf_libdw
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
-    let expected = format!(":12;[{}] 1\n", fixture.file_name());
+    let expected = format!(":12;[unknown];[{}] 1\n", fixture.file_name());
 
     assert_eq!(folded, expected);
 }
@@ -2067,19 +2551,10 @@ fn emits_scenario_d_leaf_when_no_cfi_and_bp_below_sp_like_perf_libdw() {
 }
 
 #[test]
-fn does_not_take_leaf_only_path_when_bp_at_or_above_sp_is_fallback_territory_like_perf_libdw() {
-    // bp >= sp is exactly when elfutils attempts the rbp fallback
-    // (backends/x86_64_unwind.c only fails on the *final* `if (sp >= fp)`
-    // guard), so the leaf-only predicate's register clause is false and this
-    // sample is MustUnwind, not LeafOnly: framehop is authoritative and the
-    // result is whatever it (and the elfutils fp fallback) recover, never a
-    // truncated synthetic leaf. Here framehop yields the seeded IP and the
-    // elfutils fallback only runs when framehop returned nothing, so the result
-    // is the genuine single seed frame — identical bytes to case 1's output,
-    // but reached through the full unwind path rather than leaf-only
-    // truncation. (The companion unit test
-    // `arch_fallback_cannot_advance_only_when_x86_bp_below_sp` pins the
-    // predicate edge directly.)
+fn unwinds_rbp_caller_when_bp_at_or_above_sp_and_no_cfi_like_perf_libdw() {
+    // With no covering FDE, elfutils falls back to [RBP+8], not [SP].
+    // The return slot is 0x1234, so perf emits adjusted caller 0x1233.
+    // The broad mapping gives both frames the same DSO fallback label.
     let fixture = SyntheticX86_64Object::create();
     let bytes = x86_leaf_only_perfdata(
         &fixture.path_string(),
@@ -2092,7 +2567,7 @@ fn does_not_take_leaf_only_path_when_bp_at_or_above_sp_is_fallback_territory_lik
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
-    assert_eq!(folded, format!(":12;[{}] 1\n", fixture.file_name()));
+    assert_eq!(folded, format!(":12;[{0}];[{0}] 1\n", fixture.file_name()));
 }
 
 #[test]

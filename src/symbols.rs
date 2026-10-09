@@ -5092,7 +5092,7 @@ fn update_symbol_request_from_mapping_ref(
         .clone_from(&mapping.kernel_relocation);
 }
 
-fn build_id_hex(bytes: &[u8]) -> String {
+pub(crate) fn build_id_hex(bytes: &[u8]) -> String {
     let mut hex = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         write!(&mut hex, "{byte:02x}").expect("writing to a string cannot fail");
