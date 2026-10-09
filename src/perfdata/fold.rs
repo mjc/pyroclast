@@ -285,18 +285,6 @@ enum LeafOnlyEligibility {
     Ineligible,
 }
 
-/// Outcome of classifying a sample's object unwind before running framehop.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ObjectUnwindClass {
-    /// perf/libdw would emit zero unwound frames.
-    SkipUnwind,
-    /// perf/libdw fires the initial-frame callback exactly once and stops
-    /// after the arch fallback cannot advance: emit the sampled-IP leaf.
-    LeafOnly,
-    /// Could be 1-or-N frames; framehop must run.
-    MustUnwind,
-}
-
 type UnwindMappingKey = (String, u64, u64, u64);
 type UnwindModuleKey = (String, u64);
 const MAX_LIBDW_CALLBACK_REPORT_PASSES: usize = 8;
@@ -4681,16 +4669,12 @@ fn unwind_object_frame_addresses_like_perf(
         None => state.attached_tid = Some(tid),
     }
 
-    // Evaluate perf/libdw's skip and leaf-only cases before framehop. The result
-    // is byte-identical to running framehop because the shared acceptance tail
-    // applies the same libdw callback rules to the sampled IP.
+    // unwind-libdw.c:84-85 succeeds with no user DSO. Once attachment is
+    // available, an unmapped initial PC still receives its frame callback
+    // (elfutils dwfl_frame.c:465-473). Only the no-CFI leaf shortcut remains.
     let leaf_only = sample_is_leaf_only(state, pid, mmap_table, regs);
-    match classify_object_unwind(context, leaf_only) {
-        ObjectUnwindClass::SkipUnwind => return Vec::new(),
-        ObjectUnwindClass::LeafOnly => {
-            return perf_accepted_object_unwind_frames(regs, true, Vec::new());
-        }
-        ObjectUnwindClass::MustUnwind => {}
+    if leaf_only {
+        return perf_accepted_object_unwind_frames(regs, true, Vec::new());
     }
 
     let (raw_frames, failed) =
@@ -4860,22 +4844,6 @@ fn arch_fallback_provably_cannot_advance(regs: &PerfUserRegs) -> bool {
     match *regs {
         PerfUserRegs::X86_64(regs) => regs.bp == 0 || regs.sp >= regs.bp.wrapping_add(16),
         PerfUserRegs::Aarch64(regs) => regs.lr == 0,
-    }
-}
-
-/// Classifies a sample's object unwind before framehop runs.
-fn classify_object_unwind(context: UserUnwindContext, leaf_only: bool) -> ObjectUnwindClass {
-    // tools/perf/util/machine.c thread__resolve_callchain_unwind() gates on
-    // captured regs/stack, not on user PCs already in the recorded callchain.
-    // Without a mapping for the sampled IP, perf's libdw path has no initial
-    // module to seed DWFL and emits no object-unwind entries.
-    if context.initial_ip_mapping == InitialIpMappingState::NoRecordedMapping {
-        return ObjectUnwindClass::SkipUnwind;
-    }
-    if leaf_only {
-        ObjectUnwindClass::LeafOnly
-    } else {
-        ObjectUnwindClass::MustUnwind
     }
 }
 
@@ -11684,8 +11652,14 @@ mod tests {
         ));
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
-    fn classify_object_unwind_keeps_kernel_user_callchains_eligible_like_perf() {
+    fn attached_object_unwind_keeps_mixed_and_unmapped_pcs_like_perf() {
+        let object = std::env::current_exe().unwrap();
+        let mut table = super::MmapTable::default();
+        insert_test_mapping(&mut table, 11, 0x4000, 0x1000, object.to_str().unwrap());
+        let mut state = super::PidUnwindState::with_arch(super::PerfArch::X86_64);
+        let mut sources = super::DsoMemorySources::default();
         let leaf_only_ctx = super::UserUnwindContext {
             sample_callchain: super::SampleCallchainPresence::Present,
             callchain: other_callchain(),
@@ -11694,29 +11668,38 @@ mod tests {
             frame_pointer_at_or_above_stack_pointer: false,
             syscall_return_state: false,
         };
-        assert_eq!(
-            super::classify_object_unwind(leaf_only_ctx, true),
-            super::ObjectUnwindClass::LeafOnly
-        );
-        assert_eq!(
-            super::classify_object_unwind(leaf_only_ctx, false),
-            super::ObjectUnwindClass::MustUnwind
-        );
-
         // tools/perf/util/machine.c __thread__resolve_callchain() does not
         // suppress the register/stack unwind after a recorded user frame.
         let kernel_user = super::UserUnwindContext {
             callchain: super::SampleCallchainState::KernelWithUserFrame,
             ..leaf_only_ctx
         };
-        assert_eq!(
-            super::classify_object_unwind(kernel_user, true),
-            super::ObjectUnwindClass::LeafOnly
-        );
-        assert_eq!(
-            super::classify_object_unwind(kernel_user, false),
-            super::ObjectUnwindClass::MustUnwind
-        );
+        // unwind-libdw.c:84-85: no user DSO is a successful report, not a
+        // failure. An existing DWFL attachment still delivers this seed PC.
+        let unmapped = super::UserUnwindContext {
+            initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
+            ..leaf_only_ctx
+        };
+        for (context, ip) in [
+            (leaf_only_ctx, 0x4000),
+            (kernel_user, 0x4000),
+            (unmapped, 0x1_0000_0000),
+        ] {
+            let mut regs = test_x86_regs(ip);
+            regs.bp = 0;
+            regs.sp = 0x7fff_0000;
+            assert_eq!(
+                super::unwind_object_frame_addresses_like_perf(
+                    &mut state,
+                    (11, 12),
+                    &mut super::MappedMemory::new(11, &table, &mut sources, None),
+                    &PerfUserRegs::X86_64(regs),
+                    &[0; 24],
+                    context,
+                ),
+                [ip]
+            );
+        }
     }
 
     #[test]

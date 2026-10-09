@@ -5,9 +5,10 @@ Status as of 2026-06-11. Goal: `pyroclast plumbing fold|flamegraph` fully replac
 
 ## 2026-10-09 recorded kernel/user callchains still receive user unwinds
 
-A fresh C thread workload exposed a leader sample with recorded kernel and
-user frames followed by a DWARF caller in native perf, but not Pyroclast.
-A lossless synthetic ELF/recording reproduced the missing frames. The native
+Investigation of a fresh C thread workload found an unsupported mixed-callchain
+skip. Its real leader sample had only recorded kernel frames; the distinct
+mixed kernel/user deviation was proved with a lossless synthetic ELF/recording.
+The native
 folded comparison was red, and the previously green classifier test was
 converted to expect `LeafOnly`/`MustUnwind` rather than `SkipUnwind`.
 
@@ -101,6 +102,23 @@ Fresh replay of the real C recording now matches native perf for full text,
 Inferno folded stacks, and SVG in inline/no-inline modes through both
 symbolizers. That recording has substantial capture loss and is correctness
 evidence only, not performance evidence.
+
+## 2026-10-09 attached threads retain unmapped initial PCs
+
+A further source review found a separate initial-PC gate. Native
+`unwind-libdw.c:79-85` returns success when the user lookup has no DSO.
+After a previous module supplied the architecture and DWFL attached to this
+TID, `dwfl_frame.c:435-473` still invokes the initial callback at an unmapped
+PC. The absence of a current mapping is not itself an unwind-report failure.
+
+A native recording with a mapped sample followed by an unmapped same-TID
+sample was red: Pyroclast omitted the unknown leaf. Controls include an
+unmapped sample before attachment (no callbacks) and a different TID after
+attachment (still rejected). Byte and file replay now match native folding.
+The old classifier unit test was converted and renamed to exercise the actual
+private unwind path; it was separately red before the fix. The redundant
+classifier and enum are removed. Initial module-report errors and attachment
+failures still return early; the existing no-CFI leaf shortcut is unchanged.
 
 ## 2026-10-09 kernel module section maps, not ELF-type rejection
 

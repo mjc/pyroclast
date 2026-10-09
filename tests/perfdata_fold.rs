@@ -2523,6 +2523,66 @@ fn extends_recorded_kernel_user_callchain_with_dwarf_frames_like_native_perf() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn attached_thread_keeps_unmapped_initial_pc_like_native_perf_libdw() {
+    // unwind-libdw.c:79-85 succeeds with no user DSO; :377-408 reuses the
+    // existing DWFL attachment. dwfl_frame.c delivers the initial callback.
+    let fixture = SyntheticX86_64Object::create();
+    for unmapped_first in [false, true] {
+        for tid in [12, 13] {
+            let mut mmap = mmap_payload(11, 12, 0x4000, 0x1000, 0x4000, &fixture.path_string());
+            mmap.resize(mmap.len().next_multiple_of(8), 0);
+            let sample = |tid, ip| {
+                record_bytes_with_misc(
+                    9,
+                    PERF_RECORD_MISC_CPUMODE_USER,
+                    &sample_payload_with_user_stack(
+                        ip,
+                        11,
+                        tid,
+                        [],
+                        1,
+                        [0, 0x7fff_0000, ip],
+                        [0; 24],
+                    ),
+                )
+            };
+            let mut records = vec![record_bytes(1, &mmap)];
+            if unmapped_first {
+                records.push(sample(12, 0x20000));
+            }
+            records.extend([sample(12, 0x4000), sample(tid, 0x20000)]);
+            let bytes = perfdata_with_records_and_attrs_vec(
+                vec![file_attr_bytes_with_regs(
+                    PERF_SAMPLE_IP
+                        | PERF_SAMPLE_TID
+                        | PERF_SAMPLE_CALLCHAIN
+                        | PERF_SAMPLE_REGS_USER
+                        | PERF_SAMPLE_STACK_USER,
+                    (1 << 6) | (1 << 7) | (1 << 8),
+                )],
+                records,
+            );
+            let (script, expected) = native_script_and_fold(&bytes);
+            assert_eq!(script.contains("20000 [unknown]"), tid == 12, "{script}");
+            assert!(!expected.is_empty());
+            assert_eq!(
+                fold_perfdata_callchains(&bytes).unwrap(),
+                expected,
+                "{script}"
+            );
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), &bytes).unwrap();
+            assert_eq!(
+                fold_perfdata_file_with_options(file.path(), FoldOptions::default()).unwrap(),
+                expected,
+                "{script}"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn shared_process_unwind_attachment_keeps_first_tid_like_native_perf_libdw() {
     // unwind-libdw.c stores DWFL on shared maps and next_thread() enumerates
     // only dwfl_pid(). dwfl_frame.c rejects reattachment and reports ESRCH
