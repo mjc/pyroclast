@@ -823,13 +823,34 @@ mod tests {
 
     #[test]
     fn owned_group_sigint_reaches_leader_once() {
-        let mut command = Command::new("sh");
-        command
+        // A shell trap can be deferred until its builtin read finishes. A
+        // native async-signal-safe acknowledgment measures delivery itself.
+        let root = tempfile::tempdir().unwrap();
+        let recorder = root.path().join("signal-recorder");
+        let output = Command::new("cc")
             .args([
-                "-c",
-                "trap 'printf I' INT; printf R; while :; do read -r line || :; done",
+                "-std=c11",
+                "-D_POSIX_C_SOURCE=200809L",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
             ])
-            .stdin(Stdio::piped())
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/signal_recorder.c"
+            ))
+            .arg("-o")
+            .arg(&recorder)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut command = Command::new(recorder);
+        command
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .process_group(0);
