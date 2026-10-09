@@ -1511,16 +1511,23 @@ impl MmapTable {
     }
 
     pub(crate) fn user_mapping_for_pid_ip(&self, pid: u32, ip: u64) -> Option<UserMapping<'_>> {
-        self.resolve_mapping(pid, ip).map(|mapping| UserMapping {
-            pid: mapping.pid,
-            start: mapping.start,
-            len: mapping.len,
-            pgoff: mapping.pgoff,
-            prot: mapping.prot,
-            path: &mapping.path,
-            build_id: mapping.build_id.as_deref(),
-            file_identity: mapping.file_identity,
-        })
+        // perf unwind-libdw.c:79 resolves PERF_RECORD_MISC_USER; event.c:696-745
+        // keeps that lookup in thread__maps(), without kernel-map fallback.
+        let mut cache = MappingResolveCache::default();
+        self.resolve_user_frame_cached(pid, ip, &mut cache)
+            .map(|frame| {
+                let mapping = frame.mapping;
+                UserMapping {
+                    pid: mapping.pid,
+                    start: mapping.start,
+                    len: mapping.len,
+                    pgoff: mapping.pgoff,
+                    prot: mapping.prot,
+                    path: &mapping.path,
+                    build_id: mapping.build_id.as_deref(),
+                    file_identity: mapping.file_identity,
+                }
+            })
     }
 
     #[must_use]
@@ -3888,6 +3895,30 @@ mod tests {
                 (expected_path, expected)
             );
         }
+    }
+
+    #[test]
+    fn unwind_user_mapping_ignores_global_and_kernel_buckets_like_perf() {
+        // perf unwind-libdw.c:79 uses PERF_RECORD_MISC_USER; event.c:696-745
+        // searches thread__maps(), not machine__kernel_maps().
+        let mut table = MmapTable::default();
+        table.insert_mmap_with_misc(
+            mutation_record(u32::MAX, 0, 0x2000, 0, "[kernel-test]"),
+            crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_KERNEL,
+        );
+        assert!(table.user_mapping_for_pid_ip(7, 2).is_none());
+        table.insert_mmap(mutation_record(u32::MAX, 0x1000, 0x100, 0, "/foreign"));
+        assert!(table.user_mapping_for_pid_ip(7, 0x1010).is_none());
+        table.insert_mmap(mutation_record(7, 0x1000, 0x100, 0, "/user"));
+        assert_eq!(
+            table.user_mapping_for_pid_ip(7, 0x1010).unwrap().path,
+            "/user"
+        );
+        table.insert_mmap_with_misc(
+            mutation_record(7, 0x1000, 0x100, 0, "/non-user"),
+            crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_KERNEL,
+        );
+        assert!(table.user_mapping_for_pid_ip(7, 0x1010).is_none());
     }
 
     #[test]

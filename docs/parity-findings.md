@@ -82,9 +82,25 @@ preserves a leader's group in place. The native parent-COMM byte/file comparison
 and the source-derived leader-identity unit regression now follow those rules.
 
 Replaying the real C workload after these attachment changes removed worker
-stack differences, but one native caller (`2` after `_start`) is still absent.
-That recording has substantial capture loss and is not performance evidence;
-the remaining CFI/architecture fallback mismatch is not resolved here.
+stack differences. The final missing caller (`2` after `_start`) was not a CFI
+decoding error: debugger inspection confirmed CFI recovered the recorded return
+address `3`, then callback module reporting truncated the adjusted PC `2`.
+`user_mapping_for_pid_ip` incorrectly merged global kernel maps into the user
+lookup. A kernel module recorded at zero overlapped that unmapped user PC and
+caused a hard module-report failure.
+
+Native `unwind-libdw.c:79` explicitly uses `PERF_RECORD_MISC_USER`, and
+`event.c:696-745` searches the thread's maps without consulting kernel maps.
+The lookup now uses the existing user-only selector. An upstream mapping test
+and an independent native byte/file regression both failed before this change.
+The latter checks early and later CFI rows, a compiled CRT entry, and controls
+with and without a global zero-address kernel map. No rule depends on the
+function name, module name, or numerical return address.
+
+Fresh replay of the real C recording now matches native perf for full text,
+Inferno folded stacks, and SVG in inline/no-inline modes through both
+symbolizers. That recording has substantial capture loss and is correctness
+evidence only, not performance evidence.
 
 ## 2026-10-09 kernel module section maps, not ELF-type rejection
 

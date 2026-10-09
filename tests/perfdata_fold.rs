@@ -2328,6 +2328,99 @@ fn native_vdso_dwarf_leaf_is_not_dropped_without_build_id_metadata() {
     );
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn kernel_only_recorded_chain_uses_user_maps_and_current_cfi_row_like_native_perf() {
+    // libdwfl/frame_unwind.c:529-675 evaluates the row at the current PC;
+    // perf unwind-libdw.c:314-338 retains an unmapped return PC minus one.
+    // A later DW_CFA_undefined must not affect the earlier row.
+    let fixture = SyntheticX86_64Object::create_with_stack_cfi();
+    let mut elf = std::fs::read(&fixture.path).unwrap();
+    elf[0x124..0x128].copy_from_slice(&8_u32.to_le_bytes());
+    elf[0x129..0x12c].copy_from_slice(&[0x44, 0x07, 16]);
+    std::fs::write(&fixture.path, elf).unwrap();
+    let (startup, entry) = SyntheticX86_64Object::create_compiled_startup();
+    for (path, linked_ip, has_caller) in [
+        (fixture.path.as_path(), 0x100_u64, true),
+        (fixture.path.as_path(), 0x103, true),
+        (fixture.path.as_path(), 0x104, false),
+        (fixture.path.as_path(), 0x107, false),
+        (startup.path.as_path(), entry, true),
+    ] {
+        for kernel_mapping in [false, true] {
+            let base = 0x5555_0000;
+            let ip = base + linked_ip;
+            let mut mmap = mmap_payload(11, 12, base, 0x10000, 0, &path.to_string_lossy());
+            mmap.resize(mmap.len().next_multiple_of(8), 0);
+            let mut records = Vec::new();
+            if kernel_mapping {
+                let mut kernel = mmap_payload(u32::MAX, 0, 0, 0x2000, 0, "[kernel-test]");
+                kernel.resize(kernel.len().next_multiple_of(8), 0);
+                records.push(record_bytes_with_misc(
+                    1,
+                    PERF_RECORD_MISC_CPUMODE_KERNEL,
+                    &kernel,
+                ));
+            }
+            records.extend([
+                record_bytes(1, &mmap),
+                record_bytes_with_misc(
+                    9,
+                    PERF_RECORD_MISC_CPUMODE_KERNEL,
+                    &sample_payload_with_user_stack(
+                        0xffff_ffff_8100_0000,
+                        11,
+                        12,
+                        [0xffff_ffff_ffff_ff80, 0xffff_ffff_8100_0000],
+                        1,
+                        [0, 0x7fff_0000, ip],
+                        3_u64.to_le_bytes(),
+                    ),
+                ),
+            ]);
+            let mut bytes = perfdata_with_records_and_attrs_vec(
+                vec![file_attr_bytes_with_regs(
+                    PERF_SAMPLE_IP
+                        | PERF_SAMPLE_TID
+                        | PERF_SAMPLE_CALLCHAIN
+                        | PERF_SAMPLE_REGS_USER
+                        | PERF_SAMPLE_STACK_USER,
+                    (1 << 6) | (1 << 7) | (1 << 8),
+                )],
+                records,
+            );
+            put_u64(&mut bytes, 16, 144);
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), &bytes).unwrap();
+            let (script, expected) = native_script_and_fold(&bytes);
+            assert_eq!(script.contains("2 [unknown]"), has_caller, "{script}");
+            assert!(!expected.is_empty());
+            let resolver = pyroclast::symbols::PerfSymbolResolver::from_object_resolver(
+                pyroclast::symbols::RustAddr2lineResolver::new(),
+            );
+            let options = FoldOptions {
+                inline: true,
+                count_periods: false,
+            };
+            assert_eq!(
+                fold_perfdata_callchains_with_symbols(&bytes, options, &resolver).unwrap(),
+                expected,
+                "ip={ip:x}"
+            );
+            assert_eq!(
+                pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(
+                    file.path(),
+                    options,
+                    &resolver
+                )
+                .unwrap(),
+                expected,
+                "ip={ip:x}"
+            );
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn extends_recorded_kernel_user_callchain_with_dwarf_frames_like_native_perf() {
@@ -8970,6 +9063,34 @@ struct SyntheticX86_64Object {
 }
 
 impl SyntheticX86_64Object {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn create_compiled_startup() -> (Self, u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("startup.c");
+        let path = dir.path().join("startup");
+        std::fs::write(&source, "int main(void) { return 0; }\n").unwrap();
+        let output = Command::new("cc")
+            .args(["-g", "-O2", "-fPIE", "-pie"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        let elf = object::File::parse(bytes.as_slice()).unwrap();
+        let entry = elf
+            .symbols()
+            .find(|symbol| symbol.name() == Ok("_start"))
+            .unwrap()
+            .address();
+        (Self { _dir: dir, path }, entry)
+    }
+
     #[cfg(target_os = "linux")]
     fn create_with_stack_cfi() -> Self {
         let fixture = Self::create();
