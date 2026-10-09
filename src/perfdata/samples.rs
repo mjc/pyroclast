@@ -82,6 +82,8 @@ pub struct SampleRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SampleCallchain<'a> {
+    /// Event IP, independent of the recorded chain (perf `event.c:machine__resolve`).
+    pub sample_ip: Option<u64>,
     pub pid: Option<u32>,
     pub tid: Option<u32>,
     pub time: Option<u64>,
@@ -289,6 +291,7 @@ fn parse_sample_callchain(
     if !layout.has(PERF_SAMPLE_CALLCHAIN) && !retain_metadata {
         cursor.skip_non_callchain_tail(layout)?;
         return Ok(sample_ip.map(|ip| SampleCallchain {
+            sample_ip,
             pid,
             tid,
             time,
@@ -336,6 +339,7 @@ fn parse_sample_callchain(
     }
 
     Ok(Some(SampleCallchain {
+        sample_ip,
         pid,
         tid,
         time,

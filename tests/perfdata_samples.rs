@@ -505,7 +505,7 @@ fn rejects_truncated_weight_struct_sample_payload() {
 }
 
 #[test]
-fn parses_sample_callchain_without_building_sample_record() {
+fn parses_borrowed_callchain_without_dropping_the_independent_event_ip() {
     let mut payload = Vec::new();
     payload.extend(0x1000u64.to_le_bytes());
     payload.extend(123u32.to_le_bytes());
@@ -522,6 +522,9 @@ fn parses_sample_callchain_without_building_sample_record() {
     .expect("sample")
     .expect("callchain");
 
+    // perf builtin-script.c:process_sample_event preprocesses sample->ip in
+    // machine__resolve before thread__resolve_callchain uses chain->ips.
+    assert_eq!(sample.sample_ip, Some(0x1000));
     assert_eq!(sample.pid, Some(123));
     assert_eq!(sample.tid, Some(456));
     assert_eq!(sample.period, Some(9));
