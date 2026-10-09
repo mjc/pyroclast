@@ -12,6 +12,10 @@ path = "src/main.rs"
 name = "cargo-pyroclast"
 path = "src/bin/cargo_pyroclast.rs"
 
+[[example]]
+name = "measure-workflows"
+test = true
+
 [dependencies]
 addr2line = { version = "0.26.1", path = "vendor/addr2line" }
 blake3 = "1"

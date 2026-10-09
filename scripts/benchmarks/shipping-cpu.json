@@ -1,0 +1,25 @@
+{
+  "repetitions": 10,
+  "inputs": ["WORKLOAD"],
+  "conditions": "Declare host, tool versions, affinity, CPU load and cache policy before measuring. Linux CPU: cpu-clock, 997 Hz, dwarf,64000, inline enabled. Shipping generates summaries as well as SVG; native generates SVG. Independent captures are not expected to contain identical samples.",
+  "rows": [
+    {
+      "name": "baseline",
+      "stages": [{"name": "workload", "argv": ["WORKLOAD"]}]
+    },
+    {
+      "name": "shipping",
+      "required_artifacts": ["shipping/profile.raw.perf.data", "shipping/stacks.folded", "shipping/flamegraph.svg", "shipping/run.json", "shipping/summary.json"],
+      "stages": [{"name": "profile_total", "argv": ["{pyroclast}", "cpu", "--json", "--event", "cpu-clock", "--frequency", "997", "--call-graph", "dwarf", "--out", "{run_dir}/shipping", "--", "WORKLOAD"]}]
+    },
+    {
+      "name": "native",
+      "required_artifacts": ["native.perf.data", "native.svg"],
+      "stages": [
+        {"name": "capture", "argv": ["perf", "record", "-e", "cpu-clock", "-F", "997", "-g", "--call-graph", "dwarf,64000", "-o", "{run_dir}/native.perf.data", "--", "WORKLOAD"]},
+        {"name": "analysis_render", "argv": ["bash", "-o", "pipefail", "-c", "perf script --inline -i \"$1\" | inferno-collapse-perf | inferno-flamegraph > \"$2\"", "bash", "{run_dir}/native.perf.data", "{run_dir}/native.svg"]}
+      ]
+    }
+  ],
+  "comparisons": []
+}

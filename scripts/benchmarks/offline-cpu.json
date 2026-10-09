@@ -1,0 +1,24 @@
+{
+  "repetitions": 10,
+  "inputs": ["PERF_DATA"],
+  "conditions": "Declare host, tool versions, affinity, CPU load and cache policy. Completed offline analysis of one shared immutable recording; not capture-to-result or a cold-cache benchmark. Inline enabled, period counting as in perf script/Inferno.",
+  "rows": [
+    {
+      "name": "shipping",
+      "required_artifacts": ["shipping.folded", "shipping.svg"],
+      "stages": [
+        {"name": "fold", "argv": ["{pyroclast}", "plumbing", "fold", "--inline", "--count-periods", "PERF_DATA"], "stdout": "shipping.folded"},
+        {"name": "analysis_render", "argv": ["{pyroclast}", "plumbing", "flamegraph", "--inline", "--title", "CPU profile", "-o", "{run_dir}/shipping.svg", "PERF_DATA"]}
+      ]
+    },
+    {
+      "name": "native",
+      "required_artifacts": ["native.folded", "native.svg"],
+      "stages": [
+        {"name": "fold", "argv": ["bash", "-o", "pipefail", "-c", "perf script --inline -i \"$1\" | inferno-collapse-perf", "bash", "PERF_DATA"], "stdout": "native.folded"},
+        {"name": "analysis_render", "argv": ["bash", "-o", "pipefail", "-c", "perf script --inline -i \"$1\" | inferno-collapse-perf | inferno-flamegraph --title 'CPU profile'", "bash", "PERF_DATA"], "stdout": "native.svg"}
+      ]
+    }
+  ],
+  "comparisons": [{"left": "shipping.folded", "right": "native.folded"}, {"left": "shipping.svg", "right": "native.svg"}]
+}

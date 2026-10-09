@@ -27,6 +27,7 @@ in
       libxslt
       nixfmt
       shellcheck
+      time
       tokio-console
     ]
     ++ lib.optionals pkgs.stdenv.isLinux (
