@@ -507,7 +507,10 @@ impl NativeDsoRegistry {
         if mapping_cpumode_from_misc(misc) == PERF_RECORD_MISC_CPUMODE_KERNEL
             && let name = crate::symbols::kcore::module_dso_short_name(&self.entries[id].path)
             && name.starts_with('[')
-            && ![
+            && let basename = self.entries[id].path.rsplit('/').next().unwrap_or_default()
+            // dso.c:436 applies reserved prefixes only to an originally
+            // bracketed basename, not to a canonicalized ordinary .ko name.
+            && (!basename.starts_with('[') || ![
                 "[kernel.kallsyms]",
                 "[guest.kernel.kallsyms",
                 "[vdso]",
@@ -516,7 +519,7 @@ impl NativeDsoRegistry {
                 "[vsyscall]",
             ]
             .iter()
-            .any(|prefix| name.starts_with(prefix))
+            .any(|prefix| basename.starts_with(prefix)))
         {
             self.entries[id].short_name = name.into_owned();
             // dso.c:dso__set_short_name invalidates the array sort order.

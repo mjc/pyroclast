@@ -106,6 +106,22 @@ Both native fixtures compare folded output across Rust/GNU providers, inline
 modes, and byte/file replay. This proves pre-load DSO reuse, not post-load
 per-map text offsets or general split-debug/runtime source selection.
 
+Review exposed two additional native red cases. File-backed kallsyms fallback
+still rejected a relative module DSO filename after core loading; it now uses
+the DSO name already parsed for the other module routes. An ordinary
+`vsyscall.ko` header was incorrectly excluded because its canonical name is
+`[vsyscall]`. Native applies reserved-prefix exclusions only when the original
+basename begins with `[` (`dso.c:436`), and the registry now does the same.
+Fresh native regressions for both cases failed before these fixes and passed
+afterward across all eight folding routes.
+
+A subsequent native comparison was red for ordinary `vdso.ko`: after binding
+the correct module name, the file-backed kallsyms helper classified that name
+again and discarded it. It now looks up the already-bound short name directly,
+as `symbol.c:maps__split_kallsyms` does at line 914. The regression checks
+`vdso.ko`, `vdso32.ko`, `vdsox32.ko`, and `kernel_test.ko` with missing ELFs and
+core loaded first, across the same eight folding routes.
+
 ## 2026-10-09 retained GNU helper and auxiliary lifetime
 
 External symbol-only batches previously launched a new helper each time. The

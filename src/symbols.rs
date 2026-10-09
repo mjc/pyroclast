@@ -3153,13 +3153,12 @@ where
             .as_ref()
     }
 
-    fn live_module_kallsyms_for_path(&self, module_path: &str) -> Option<Arc<Kallsyms>> {
-        if !is_kernel_module_symbol_path_str(module_path) {
-            return None;
-        }
+    fn live_module_kallsyms_for_name(&self, module_name: &str) -> Option<Arc<Kallsyms>> {
+        // symbol.c:maps__split_kallsyms (914) looks up the bound DSO short
+        // name. Do not reinterpret it as a raw MMAP filename here.
         self.live_kallsyms_snapshot()?
             .modules
-            .get(module_path)
+            .get(module_name)
             .cloned()
     }
 
@@ -3224,11 +3223,7 @@ where
                         .and_then(|kallsyms| resolve_module_kallsyms(kallsyms, request))
                 })
                 .or_else(|| {
-                    request
-                        .path
-                        .to_str()
-                        .and_then(kcore::module_short_name)
-                        .and_then(|module_name| self.live_module_kallsyms_for_path(&module_name))
+                    self.live_module_kallsyms_for_name(&module_name)
                         .and_then(|kallsyms| resolve_module_kallsyms(kallsyms.as_ref(), request))
                 })
         } else {
@@ -8243,19 +8238,19 @@ mod tests {
         super::MODULE_KALLSYMS_SYMBOL_INSERTIONS.with(|count| count.set(0));
         super::MODULE_KALLSYMS_END_FIXUP_PASSES.with(|count| count.set(0));
 
-        let alpha = resolver.live_module_kallsyms_for_path("[alpha]").unwrap();
+        let alpha = resolver.live_module_kallsyms_for_name("[alpha]").unwrap();
         // The source lifetime already retains its first successful read.
         // New module views must not reread or reparse that source snapshot.
         std::fs::write(&path, "0000000000001000 T replacement [alpha]\n").unwrap();
-        let beta = resolver.live_module_kallsyms_for_path("[beta]").unwrap();
-        let gamma = resolver.live_module_kallsyms_for_path("[gamma]").unwrap();
+        let beta = resolver.live_module_kallsyms_for_name("[beta]").unwrap();
+        let gamma = resolver.live_module_kallsyms_for_name("[gamma]").unwrap();
         assert_multi_module_kallsyms_views(&alpha, &beta, &gamma);
         for module in ["[missing-one]", "[missing-two]", "[missing-one]"] {
-            assert!(resolver.live_module_kallsyms_for_path(module).is_none());
+            assert!(resolver.live_module_kallsyms_for_name(module).is_none());
         }
         assert!(Arc::ptr_eq(
             &alpha,
-            &resolver.live_module_kallsyms_for_path("[alpha]").unwrap()
+            &resolver.live_module_kallsyms_for_name("[alpha]").unwrap()
         ));
         assert_eq!(
             (
@@ -8282,11 +8277,11 @@ mod tests {
         let (_root, path) = live_module_kallsyms_fixture(MULTI_MODULE_KALLSYMS);
         let first = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
             .with_system_kallsyms_from_path(&path);
-        let first_alpha = first.live_module_kallsyms_for_path("[alpha]").unwrap();
+        let first_alpha = first.live_module_kallsyms_for_name("[alpha]").unwrap();
         std::fs::write(&path, "0000000000001000 T replacement [alpha]\n").unwrap();
         let second = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
             .with_system_kallsyms_from_path(&path);
-        let second_alpha = second.live_module_kallsyms_for_path("[alpha]").unwrap();
+        let second_alpha = second.live_module_kallsyms_for_name("[alpha]").unwrap();
         assert_eq!(first_alpha.address_of("alias_last"), Some(0x1000));
         assert_eq!(first_alpha.address_of("replacement"), None);
         assert_eq!(second_alpha.address_of("replacement"), Some(0x1000));
@@ -8294,12 +8289,12 @@ mod tests {
         assert!(!Arc::ptr_eq(&first_alpha, &second_alpha));
         assert_eq!(
             first
-                .live_module_kallsyms_for_path("[beta]")
+                .live_module_kallsyms_for_name("[beta]")
                 .unwrap()
                 .address_of("shared"),
             Some(0x2010)
         );
-        assert!(second.live_module_kallsyms_for_path("[beta]").is_none());
+        assert!(second.live_module_kallsyms_for_name("[beta]").is_none());
     }
 
     #[test]
