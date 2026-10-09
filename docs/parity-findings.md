@@ -22,7 +22,9 @@ The mixed-callchain guards in classification, leaf-only eligibility, and
 accepted-frame handling are removed. The acceptance helper no longer takes
 a callchain state that cannot affect its result. The native regression covers
 both a caller-producing RBP fallback and a zero-BP leaf-only stack, through
-byte and file replay. Three older tests with no module mappings retain their
+byte and file replay. A covering-CFI control also unwinds a mapped caller
+with zero RBP, preserving the same duplicate recorded/unwound leaf. Three
+older tests with no module mappings retain their
 assertions but now name the actual missing-module precondition.
 
 The workload also exposed empty native stacks for other TIDs. That is a

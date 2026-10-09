@@ -2337,9 +2337,28 @@ fn extends_recorded_kernel_user_callchain_with_dwarf_frames_like_native_perf() {
     // unwind after the recorded callchain, even when it contains user PCs.
     // unwind-libdw.c frame_callback() also retains the unmapped caller.
     let fixture = SyntheticX86_64Object::create();
-    for bp in [0, 0x7fff_0008] {
-        let mut mmap = mmap_payload(11, 12, 0x4000, 0x1000, 0x4000, &fixture.path_string());
+    for (fixture, ip, bp, return_slot, caller) in [
+        (fixture, 0x4000_u64, 0, 16, 0x1233_u64),
+        (
+            SyntheticX86_64Object::create(),
+            0x4000,
+            0x7fff_0008,
+            16,
+            0x1233,
+        ),
+        (
+            SyntheticX86_64Object::create_with_stack_cfi(),
+            0x100,
+            0,
+            0,
+            0x102,
+        ),
+    ] {
+        let base = ip & !0xfff;
+        let mut mmap = mmap_payload(11, 12, base, 0x1000, base, &fixture.path_string());
         mmap.resize(mmap.len().next_multiple_of(8), 0);
+        let mut stack = [0; 24];
+        stack[return_slot..return_slot + 8].copy_from_slice(&(caller + 1).to_le_bytes());
         let mut bytes = perfdata_with_records_and_attrs(
             [file_attr_bytes_with_regs(
                 PERF_SAMPLE_IP
@@ -2362,14 +2381,11 @@ fn extends_recorded_kernel_user_callchain_with_dwarf_frames_like_native_perf() {
                             0xffff_ffff_ffff_ff80,
                             0xffff_ffff_8100_0000,
                             0xffff_ffff_ffff_fe00,
-                            0x4000,
+                            ip,
                         ],
                         1,
-                        [bp, 0x7fff_0000, 0x4000],
-                        [
-                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x34, 0x12, 0, 0, 0, 0,
-                            0, 0,
-                        ],
+                        [bp, 0x7fff_0000, ip],
+                        stack,
                     ),
                 ),
             ],
@@ -2388,9 +2404,13 @@ fn extends_recorded_kernel_user_callchain_with_dwarf_frames_like_native_perf() {
             String::from_utf8_lossy(&native.stderr)
         );
         let script = String::from_utf8(native.stdout).unwrap();
-        assert_eq!(script.contains("1233 [unknown]"), bp != 0, "{script}");
         assert_eq!(
-            script.matches("4000 [unknown]").count(),
+            script.contains(&format!("{caller:x} [unknown]")),
+            bp != 0 || ip == 0x100,
+            "{script}"
+        );
+        assert_eq!(
+            script.matches(&format!("{ip:x} [unknown]")).count(),
             2,
             "native retains both the recorded and unwound leaf: {script}"
         );
@@ -8650,6 +8670,17 @@ struct SyntheticX86_64Object {
 }
 
 impl SyntheticX86_64Object {
+    fn create_with_stack_cfi() -> Self {
+        let fixture = Self::create();
+        let mut bytes = std::fs::read(&fixture.path).unwrap();
+        // DW_CFA_def_cfa RSP+8, DW_CFA_offset RIP=[CFA-8]. The existing
+        // FDE covers [0x100, 0x104), so captured words unwind mapped callers
+        // independently of RBP (elfutils libdwfl/frame_unwind.c CFI path).
+        bytes[0x111..0x118].copy_from_slice(&[0x0c, 7, 8, 0x90, 1, 0, 0]);
+        std::fs::write(&fixture.path, bytes).unwrap();
+        fixture
+    }
+
     /// Minimal `x86_64` ELF with one `PT_LOAD` covering [0, 0x10000) and a
     /// nops-only FDE covering [0x100, 0x104). Fixed ELF bytes keep CFI and RBP
     /// fallback behavior independent of the host test binary's architecture
