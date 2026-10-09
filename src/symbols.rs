@@ -3517,23 +3517,14 @@ fn retain_object_snapshot(bytes: Vec<u8>) -> Arc<Vec<u8>> {
 }
 
 fn read_snapshot_with_size(reader: impl Read, len: u64) -> Option<Vec<u8>> {
-    let mut reader = reader.take(len);
+    let size = usize::try_from(len).ok()?;
     let mut bytes = Vec::new();
-    let mut chunk = [0; 8 * 1024];
-    loop {
-        // Match elfutils lib/system.h:pread_retry's TEMP_FAILURE_RETRY.
-        let count = match reader.read(&mut chunk) {
-            Ok(count) => count,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return None,
-        };
-        if count == 0 {
-            break;
-        }
-        bytes.try_reserve(count).ok()?;
-        bytes.extend_from_slice(&chunk[..count]);
-    }
-    (u64::try_from(bytes.len()).ok()? == len).then_some(bytes)
+    // Reserve the frozen extent, not a geometrically grown read buffer.
+    bytes.try_reserve_exact(size).ok()?;
+    // Like elfutils lib/system.h:pread_retry, read_to_end retries interrupted
+    // reads; Take excludes growth and the length check rejects truncation.
+    reader.take(len).read_to_end(&mut bytes).ok()?;
+    (bytes.len() == size).then_some(bytes)
 }
 
 fn read_object_with_size(mut reader: impl Read + std::io::Seek, len: u64) -> Option<Vec<u8>> {
@@ -7201,6 +7192,77 @@ mod tests {
                 .is_none()
         );
         assert!(super::read_object_with_size(std::io::Cursor::new(b"not ELF"), 7).is_none());
+    }
+
+    #[test]
+    fn object_snapshot_retains_only_the_known_extent_capacity() {
+        for len in [0, 1, 8191, 8192, 8193, 65537, 1_048_577] {
+            let bytes = vec![0x5a; len];
+            let snapshot = super::read_snapshot_with_size(bytes.as_slice(), len as u64).unwrap();
+            assert_eq!(snapshot, bytes);
+            assert_eq!(
+                snapshot.capacity(),
+                len,
+                "a known-size snapshot must not retain geometric growth slack"
+            );
+        }
+    }
+
+    #[test]
+    fn classified_object_snapshot_retains_only_the_known_extent_capacity() {
+        let mut bytes = regression_elf_with_build_id();
+        bytes.resize(1_048_577, 0);
+        let snapshot =
+            super::read_object_with_size(std::io::Cursor::new(&bytes), bytes.len() as u64).unwrap();
+        assert_eq!(snapshot, bytes);
+        assert_eq!(snapshot.capacity(), bytes.len());
+    }
+
+    #[test]
+    fn short_snapshot_reads_preserve_bytes_and_exact_capacity() {
+        struct ShortReader<'a> {
+            bytes: &'a [u8],
+            chunk: usize,
+        }
+        impl std::io::Read for ShortReader<'_> {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                let len = self.chunk.min(output.len());
+                self.bytes.read(&mut output[..len])
+            }
+        }
+        let bytes = vec![0xa5; 65537];
+        for chunk in [1, 3, 8191, 8192, 8193, 65537] {
+            let mut reader = ShortReader {
+                bytes: &bytes,
+                chunk,
+            };
+            let snapshot = super::read_snapshot_with_size(&mut reader, bytes.len() as u64).unwrap();
+            assert_eq!(snapshot, bytes);
+            assert_eq!(snapshot.capacity(), bytes.len());
+            assert!(reader.bytes.is_empty());
+        }
+    }
+
+    #[test]
+    fn empty_and_unrepresentable_snapshots_do_not_read_the_source() {
+        struct MustNotRead;
+        impl std::io::Read for MustNotRead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("empty or unrepresentable snapshots must not consume input");
+            }
+        }
+        let empty = super::read_snapshot_with_size(MustNotRead, 0).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(empty.capacity(), 0);
+        for len in [u64::MAX, isize::MAX as u64 + 1] {
+            assert!(super::read_snapshot_with_size(MustNotRead, len).is_none());
+        }
+    }
+
+    #[test]
+    fn truncated_snapshot_rejects_early_eof_after_short_reads() {
+        let bytes = b"short";
+        assert!(super::read_snapshot_with_size(bytes.as_slice(), 8193).is_none());
     }
 
     #[test]
