@@ -965,7 +965,7 @@ impl FileKernelCache {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Kallsyms {
     symbols: BTreeMap<u64, KallsymsSymbol>,
-    addresses_by_name: BTreeMap<String, u64>,
+    addresses_by_name: FxHashMap<Arc<str>, u64>,
     module_indexes: FxHashMap<String, ModuleKallsymsIndex>,
 }
 
@@ -1076,15 +1076,15 @@ impl ModuleKallsymsIndex {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct KallsymsSymbol {
-    name: String,
+    name: Arc<str>,
     end: Option<u64>,
     module: Option<String>,
 }
 
 impl KallsymsSymbol {
-    fn kernel(name: String) -> Self {
+    fn kernel(name: &str) -> Self {
         Self {
-            name,
+            name: Arc::from(name),
             end: None,
             module: None,
         }
@@ -1104,7 +1104,7 @@ struct BorrowedKallsymsRow<'a> {
 impl BorrowedKallsymsRow<'_> {
     fn into_module_symbol(self, module: &str) -> KallsymsSymbol {
         KallsymsSymbol {
-            name: self.name.to_owned(),
+            name: Arc::from(self.name),
             end: Some(self.end),
             module: Some(module.to_owned()),
         }
@@ -1791,7 +1791,7 @@ impl Kallsyms {
     /// Returns an error when no valid symbols are present.
     pub fn parse(text: &str) -> Result<Self, String> {
         let mut symbols = BTreeMap::new();
-        let mut addresses_by_name = BTreeMap::new();
+        let mut addresses_by_name = FxHashMap::default();
         for (address, symbol) in text
             .lines()
             .filter_map(parse_kallsyms_line)
@@ -1801,7 +1801,7 @@ impl Kallsyms {
                 &mut symbols,
                 Some(&mut addresses_by_name),
                 address,
-                KallsymsSymbol::kernel(symbol.to_owned()),
+                KallsymsSymbol::kernel(symbol),
             );
         }
         if symbols.is_empty() {
@@ -1820,15 +1820,16 @@ impl Kallsyms {
     ///
     /// Returns an error when no valid module symbols are present.
     pub fn parse_modules(text: &str) -> Result<Self, String> {
-        let mut addresses_by_name = BTreeMap::new();
+        let mut addresses_by_name = FxHashMap::default();
         let symbols = Self::parse_module_symbols(text)
             .into_iter()
             .filter_map(|row| {
                 let module = row.module?;
+                let symbol = row.into_module_symbol(module);
                 addresses_by_name
-                    .entry(row.name.to_owned())
+                    .entry(Arc::clone(&symbol.name))
                     .or_insert(row.address);
-                Some((row.address, row.into_module_symbol(module)))
+                Some((row.address, symbol))
             })
             .collect::<BTreeMap<_, _>>();
         if symbols.is_empty() {
@@ -1859,10 +1860,10 @@ impl Kallsyms {
                 "kallsyms did not contain any parseable module symbols for {module_path}"
             ));
         }
-        let mut addresses_by_name = BTreeMap::new();
+        let mut addresses_by_name = FxHashMap::default();
         for (address, symbol) in &symbols {
             addresses_by_name
-                .entry(symbol.name.clone())
+                .entry(Arc::clone(&symbol.name))
                 .or_insert(*address);
         }
         let mut result = Self {
@@ -1880,7 +1881,7 @@ impl Kallsyms {
 
     fn parse_global_kallsyms<'a>(
         text: &'a str,
-        mut relocation_addresses: Option<&mut BTreeMap<String, u64>>,
+        mut relocation_addresses: Option<&mut FxHashMap<Arc<str>, u64>>,
     ) -> Vec<BorrowedKallsymsRow<'a>> {
         #[cfg(test)]
         MODULE_KALLSYMS_TREE_BUILDS.with(|count| count.set(count.get() + 1));
@@ -1897,8 +1898,9 @@ impl Kallsyms {
                 && (matches!(row.symbol_type.to_ascii_uppercase(), 'T' | 'W')
                     || row.symbol_type == 'A')
                 && let Some(addresses) = relocation_addresses.as_deref_mut()
+                && let RawEntryMut::Vacant(entry) = addresses.raw_entry_mut().from_key(row.name)
             {
-                addresses.entry(row.name.to_owned()).or_insert(row.address);
+                entry.insert(Arc::from(row.name), row.address);
             }
             // symbol.c:dso__load_all_kallsyms filters before tree insertion;
             // event.c:find_func_symbol_cb separately accepts A references.
@@ -1942,11 +1944,11 @@ impl Kallsyms {
             };
             // Ascending global addresses preserve the path API's first-by-IP
             // name index, even when the input rows were not address ordered.
+            let symbol = row.into_module_symbol(module);
             view.addresses_by_name
-                .entry(row.name.to_owned())
+                .entry(Arc::clone(&symbol.name))
                 .or_insert(row.address);
-            view.symbols
-                .insert(row.address, row.into_module_symbol(module));
+            view.symbols.insert(row.address, symbol);
         }
         modules
             .into_iter()
@@ -1999,7 +2001,7 @@ impl Kallsyms {
         self.symbols
             .range(..=address)
             .next_back()
-            .map(|(_, symbol)| symbol.name.clone())
+            .map(|(_, symbol)| symbol.name.to_string())
     }
 
     /// Resolves an address to `name+0x<off>`, matching perf-script kernel
@@ -3176,10 +3178,14 @@ where
                 let rows =
                     Kallsyms::parse_global_kallsyms(&text, Some(&mut core.addresses_by_name));
                 for row in rows.iter().filter(|row| row.module.is_none()) {
+                    let name = core
+                        .addresses_by_name
+                        .get_key_value(row.name)
+                        .map_or_else(|| Arc::from(row.name), |(name, _)| Arc::clone(name));
                     core.symbols.insert(
                         row.address,
                         KallsymsSymbol {
-                            name: row.name.to_owned(),
+                            name,
                             end: Some(row.end),
                             module: None,
                         },
@@ -6171,7 +6177,7 @@ fn is_kernel_module_symbol_path_str(path: &str) -> bool {
 
 fn insert_kallsyms_symbol(
     symbols: &mut BTreeMap<u64, KallsymsSymbol>,
-    addresses_by_name: Option<&mut BTreeMap<String, u64>>,
+    addresses_by_name: Option<&mut FxHashMap<Arc<str>, u64>>,
     address: u64,
     symbol: KallsymsSymbol,
 ) {
@@ -6179,7 +6185,7 @@ fn insert_kallsyms_symbol(
     MODULE_KALLSYMS_SYMBOL_INSERTIONS.with(|count| count.set(count.get() + 1));
     if let Some(addresses_by_name) = addresses_by_name {
         addresses_by_name
-            .entry(symbol.name.clone())
+            .entry(Arc::clone(&symbol.name))
             .or_insert(address);
     }
     // Preserve the existing last-at-address selection while moving the symbol.
@@ -8559,7 +8565,7 @@ mod tests {
             (gamma, 0x5000, 0x6000, "gamma_tail"),
         ] {
             let symbol = &view.symbols[&start];
-            assert_eq!(symbol.name, name);
+            assert_eq!(symbol.name.as_ref(), name);
             assert_eq!(symbol.end, Some(end), "{name} at {start:#x}");
             assert_eq!(
                 view.resolve_module_with_offset(start + 1),
@@ -8718,7 +8724,7 @@ mod tests {
                     0000000000001000 W weak [b]\n\
                     0000000000001100 T next [b]\n";
         let strong = Kallsyms::parse_modules_for_path(text, "[a]").unwrap();
-        assert_eq!(strong.symbols[&0x1000].name, "strong");
+        assert_eq!(strong.symbols[&0x1000].name.as_ref(), "strong");
         assert_eq!(strong.symbols[&0x1000].end, Some(0x2000));
         let other = Kallsyms::parse_modules_for_path(text, "[b]").unwrap();
         assert_eq!(other.address_of("weak"), None);
@@ -8740,9 +8746,160 @@ mod tests {
         )
         .unwrap();
         assert_eq!(view.symbols[&0x1000].end, Some(0x2000));
-        assert_eq!(view.symbols[&0x1100].name, "winner");
+        assert_eq!(view.symbols[&0x1100].name.as_ref(), "winner");
         assert_eq!(view.symbols[&0x1100].end, Some(0x1200));
         assert_eq!(view.address_of("losing"), None);
+    }
+
+    #[test]
+    fn kallsyms_core_name_index_shares_symbol_storage() {
+        // perf symbol.c:symbol__new retains one name in the symbol;
+        // __symbols__insert indexes that symbol, not a second name copy.
+        let symbols = Kallsyms::parse("1000 T retained\n2000 T next\n").unwrap();
+        let name = &symbols.symbols[&0x1000].name;
+        let indexed = symbols
+            .addresses_by_name
+            .get_key_value("retained")
+            .unwrap()
+            .0;
+        assert_eq!(name.as_ptr(), indexed.as_ptr());
+    }
+
+    #[test]
+    fn kallsyms_module_name_index_shares_symbol_storage() {
+        let symbols =
+            Kallsyms::parse_modules("1000 T retained [alpha]\n2000 T next [alpha]\n").unwrap();
+        let name = &symbols.symbols[&0x1000].name;
+        let indexed = symbols
+            .addresses_by_name
+            .get_key_value("retained")
+            .unwrap()
+            .0;
+        assert_eq!(name.as_ptr(), indexed.as_ptr());
+    }
+
+    #[test]
+    fn kallsyms_module_path_name_index_shares_symbol_storage() {
+        let symbols = Kallsyms::parse_modules_for_path(
+            "1000 T retained [alpha]\n2000 T next [alpha]\n",
+            "[alpha]",
+        )
+        .unwrap();
+        let name = &symbols.symbols[&0x1000].name;
+        let indexed = symbols
+            .addresses_by_name
+            .get_key_value("retained")
+            .unwrap()
+            .0;
+        assert_eq!(name.as_ptr(), indexed.as_ptr());
+    }
+
+    #[test]
+    fn kallsyms_live_core_name_index_shares_symbol_storage() {
+        let (_root, path) = live_module_kallsyms_fixture("1000 T retained\n2000 T next\n");
+        let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
+            .with_system_kallsyms_from_path(&path);
+        let symbols = resolver
+            .live_kallsyms_snapshot()
+            .unwrap()
+            .core
+            .as_ref()
+            .unwrap();
+        let name = &symbols.symbols[&0x1000].name;
+        let indexed = symbols
+            .addresses_by_name
+            .get_key_value("retained")
+            .unwrap()
+            .0;
+        assert_eq!(name.as_ptr(), indexed.as_ptr());
+    }
+
+    #[test]
+    fn kallsyms_live_module_name_index_shares_symbol_storage() {
+        let (_root, path) =
+            live_module_kallsyms_fixture("1000 T retained [alpha]\n2000 T next [alpha]\n");
+        let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
+            .with_system_kallsyms_from_path(&path);
+        let symbols = resolver.live_module_kallsyms_for_name("[alpha]").unwrap();
+        let name = &symbols.symbols[&0x1000].name;
+        let indexed = symbols
+            .addresses_by_name
+            .get_key_value("retained")
+            .unwrap()
+            .0;
+        assert_eq!(name.as_ptr(), indexed.as_ptr());
+    }
+
+    #[test]
+    fn kallsyms_shared_names_outlive_input_and_release_with_final_view() {
+        let text = "1000 T retained\n2000 T next\n".to_owned();
+        let symbols = Kallsyms::parse(&text).unwrap();
+        let name = Arc::downgrade(&symbols.symbols[&0x1000].name);
+        let clone = symbols.clone();
+        assert!(Arc::ptr_eq(
+            &symbols.symbols[&0x1000].name,
+            &clone.symbols[&0x1000].name,
+        ));
+        drop(text);
+        drop(symbols);
+        assert!(name.upgrade().is_some());
+        assert_eq!(clone.address_of("retained"), Some(0x1000));
+        assert_eq!(
+            clone.resolve_with_offset(0x1003).as_deref(),
+            Some("retained+0x3")
+        );
+        drop(clone);
+        assert!(name.upgrade().is_none());
+    }
+
+    #[test]
+    fn kallsyms_name_index_growth_keeps_shared_storage_and_exact_names() {
+        use std::fmt::Write;
+
+        let mut text = String::new();
+        for i in 0..2048 {
+            writeln!(text, "{:x} T name_{i}", 0x1000 + i * 16).unwrap();
+        }
+        let symbols = Kallsyms::parse(&text).unwrap();
+        drop(text);
+        for i in 0..2048 {
+            let name = format!("name_{i}");
+            let address = 0x1000 + i * 16;
+            let (indexed, &indexed_address) = symbols
+                .addresses_by_name
+                .get_key_value(name.as_str())
+                .unwrap();
+            assert_eq!(indexed_address, address);
+            assert_eq!(indexed.as_ptr(), symbols.symbols[&address].name.as_ptr());
+        }
+        for missing in ["name", "name_2048", "name_0_suffix", "Name_0", ""] {
+            assert_eq!(symbols.address_of(missing), None);
+        }
+    }
+
+    #[test]
+    fn kallsyms_live_relocation_names_keep_physical_order_and_losing_aliases() {
+        // perf symbol.c:kallsyms__delta uses event.c:find_func_symbol_cb,
+        // before the symbol tree sorts, fixes ends, and removes aliases.
+        let (_root, path) = live_module_kallsyms_fixture(
+            "2000 T repeat\n1000 T repeat\n3000 W losing\n3000 T winner\n4000 A absolute\n5000 D data\n",
+        );
+        let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
+            .with_system_kallsyms_from_path(&path);
+        let snapshot = resolver.live_kallsyms_snapshot().unwrap();
+        std::fs::remove_file(path).unwrap();
+        let core = snapshot.core.as_ref().unwrap();
+        assert_eq!(core.address_of("repeat"), Some(0x2000));
+        assert_eq!(core.address_of("losing"), Some(0x3000));
+        assert_eq!(core.address_of("absolute"), Some(0x4000));
+        assert_eq!(core.address_of("data"), None);
+        assert_eq!(core.symbols[&0x3000].name.as_ref(), "winner");
+        assert!(!core.symbols.contains_key(&0x4000));
+        assert_eq!(core.symbols[&0x5000].name.as_ref(), "data");
+        let indexed = core.addresses_by_name.get_key_value("repeat").unwrap().0;
+        for address in [0x1000, 0x2000] {
+            assert!(Arc::ptr_eq(indexed, &core.symbols[&address].name));
+        }
     }
 
     #[test]

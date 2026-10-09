@@ -74,7 +74,7 @@ impl KcoreSymbols {
                 Some((
                     row.address,
                     KallsymsSymbol {
-                        name: row.name.to_owned(),
+                        name: row.name.into(),
                         end: Some(row.end.min(*end)),
                         module: None,
                     },
