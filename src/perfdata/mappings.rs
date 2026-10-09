@@ -11,6 +11,7 @@ use std::cmp::Ordering;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::sync::Arc;
 
 const PROT_EXEC: u32 = 4;
 
@@ -171,8 +172,12 @@ impl<'a> MappedFrame<'a> {
     pub(crate) fn display_path_id(self) -> usize {
         self.mapping.path_layout.display_path_id
     }
+    #[cfg(test)]
     pub(crate) fn path(self) -> &'a str {
         &self.mapping.path
+    }
+    pub(crate) fn display_path(self) -> &'a str {
+        self.mapping.display_path()
     }
     pub(crate) fn kernel_range(self) -> Option<(u64, u64)> {
         self.is_kernel()
@@ -676,6 +681,7 @@ struct Mapping {
     native_dso_id: usize,
     path: String,
     path_layout: MappingPathLayout,
+    module_display: Option<Arc<str>>,
     build_id: Option<Vec<u8>>,
     mmap_build_id: bool,
     file_identity: Option<FileIdentity>,
@@ -870,6 +876,7 @@ impl MmapTable {
             native_dso_id: 0,
             path: record.path,
             path_layout: MappingPathLayout::default(),
+            module_display: None,
             build_id,
             mmap_build_id: false,
             file_identity: None,
@@ -908,6 +915,7 @@ impl MmapTable {
             native_dso_id: 0,
             path: record.path,
             path_layout: MappingPathLayout::default(),
+            module_display: None,
             build_id,
             mmap_build_id: false,
             file_identity: Some(FileIdentity {
@@ -939,6 +947,7 @@ impl MmapTable {
             native_dso_id: 0,
             path: record.path,
             path_layout: MappingPathLayout::default(),
+            module_display: None,
             build_id: Some(record.build_id),
             mmap_build_id: true,
             file_identity: None,
@@ -1028,11 +1037,19 @@ impl MmapTable {
                 None
             },
         );
-        mapping.path_layout = MappingPathLayout::new(&mapping.path);
+        // perf util/machine.c:870 and util/dsos.c:420-449 register the
+        // util/dso.c:412-475 short name while retaining the long ELF path.
+        // addr2line.c:444 opens file_name; libdwfl/dwfl_module_getdwarf.c:55
+        // opens the selected file too. Neither should receive display metadata.
+        if mapping.kernel_module_address(mapping.start).is_some() {
+            mapping.module_display = crate::symbols::kcore::module_short_name(&mapping.path)
+                .map(|name| Arc::from(name.as_ref()));
+        }
+        mapping.path_layout = MappingPathLayout::new(mapping.display_path());
         let next_id = self.display_path_ids.len();
         mapping.path_layout.display_path_id = *self
             .display_path_ids
-            .entry_ref(mapping.path.as_str())
+            .entry_ref(mapping.display_path())
             .or_insert(next_id);
         // Common case: the new mapping does not overlap any existing mapping for
         // its pid. Detect this in O(log n + matches) using the per-pid interval
@@ -1649,6 +1666,10 @@ fn mapping_cpumode_from_misc(misc: u16) -> u16 {
 }
 
 impl Mapping {
+    fn display_path(&self) -> &str {
+        self.module_display.as_deref().unwrap_or(&self.path)
+    }
+
     fn kernel_module_address(&self, ip: u64) -> Option<u64> {
         // machine.c:machine__process_kernel_mmap_event creates a module map
         // for an absolute kernel path even when its name has no .ko suffix.
@@ -3074,6 +3095,19 @@ mod tests {
                 misc,
             );
             let frame = super::MappedFrame::new(&table.mappings[0], start + 0x10);
+            assert_eq!(frame.resolved_ref().path, "/lib/modules/a.ko");
+            assert_eq!(
+                frame.display_path(),
+                if expected { "[a]" } else { "/lib/modules/a.ko" }
+            );
+            assert_eq!(
+                frame.display_path().as_ptr(),
+                table.mappings[0].display_path().as_ptr()
+            );
+            assert_eq!(
+                frame.path_layout().basename_start,
+                if expected { 0 } else { 13 }
+            );
             assert_eq!(frame.relative_address, 0x10);
             assert_eq!(
                 frame.resolved_ref().kernel_module_address,

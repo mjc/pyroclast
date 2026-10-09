@@ -338,6 +338,8 @@ struct DeferredFoldSample {
 
 struct PreparedFoldSample<'layout, 'frames> {
     pid: Option<u32>,
+    sample_ip: Option<u64>,
+    cpumode: u16,
     tid: Option<u32>,
     time: Option<u64>,
     cpu: Option<u32>,
@@ -1366,7 +1368,7 @@ impl<'a, 'cache, R: SymbolResolver> FoldedOutput<'a, 'cache, R> {
             event_name_width: self.event_name_width,
             inline: self.inline,
         }
-        .write_sample_event(accumulator, sample)?;
+        .write_preprocessed_sample_event(accumulator, sample)?;
         let mut options = inferno::collapse::perf::Options::default();
         options.nthreads = 1;
         options.event_filter = self.event_filter.as_deref().map(str::to_owned);
@@ -1469,6 +1471,7 @@ impl<R: SymbolResolver> SampleOutput for FoldedOutput<'_, '_, R> {
         accumulator: &SessionState,
         sample: &PreparedFoldSample,
     ) -> Result<(), String> {
+        preprocess_sample_ip(accumulator, sample, self.symbol_cache.as_deref());
         if self.requires_stream_parser {
             return Ok(());
         }
@@ -1693,6 +1696,54 @@ where
     W: IoWrite + ?Sized,
 {
     fn write_sample_event(
+        &mut self,
+        accumulator: &SessionState,
+        sample: &PreparedFoldSample,
+    ) -> Result<(), String> {
+        preprocess_sample_ip(accumulator, sample, self.symbol_cache.as_deref());
+        self.write_preprocessed_sample_event(accumulator, sample)
+    }
+}
+
+fn preprocess_sample_ip<R: SymbolResolver>(
+    accumulator: &SessionState,
+    sample: &PreparedFoldSample,
+    cache: Option<&SymbolFrameCache<'_, R>>,
+) {
+    // event.c:thread__find_map selects kernel DSOs only in kernel CPU mode.
+    // User event IPs cannot affect this kernel source-loading state.
+    if sample.cpumode != PERF_RECORD_MISC_CPUMODE_KERNEL {
+        return;
+    }
+    let (Some(cache), Some(address), Some(pid)) = (cache, sample.sample_ip, sample.pid) else {
+        return;
+    };
+    // perf builtin-script.c:2645 (process_sample_event, call at 2686) and
+    // util/event.c:804 (machine__resolve) resolve sample->ip
+    // using sample->cpumode before expanding the independently recorded chain.
+    // This is load ordering only: never resolve frames or advance cursor hints.
+    let mut mapping_cache = MappingResolveCache::default();
+    let context = accumulator
+        .mmap_table
+        .frame_context(pid, &mut mapping_cache);
+    let frame = FoldFrame::SampleIp {
+        address,
+        cpumode: sample.cpumode,
+    };
+    if let Some(mapping) =
+        resolve_frame_in_context(Some(&context), frame, address, &mut mapping_cache)
+        && mapping.is_kernel()
+    {
+        cache.preprocess_sample_ip(&mapping.resolved_ref());
+    }
+}
+
+impl<R, W> PerfScriptOutput<'_, '_, R, W>
+where
+    R: SymbolResolver,
+    W: IoWrite + ?Sized,
+{
+    fn write_preprocessed_sample_event(
         &mut self,
         accumulator: &SessionState,
         sample: &PreparedFoldSample,
@@ -3181,6 +3232,7 @@ impl<'a> FoldFrameResolver<'a> {
                 write_perf_script_inline_mapped_decision_frame(
                     writer,
                     address,
+                    mapping.display_path(),
                     &self.mmap_table.symbol_mapping_ref(
                         mapping,
                         symbol_cache.as_ref().map(|cache| cache.resolver()),
@@ -3225,6 +3277,7 @@ impl<'a> FoldFrameResolver<'a> {
                     writer,
                     address,
                     is_cookie,
+                    mapping.display_path(),
                     &self.mmap_table.symbol_mapping_ref(
                         mapping,
                         symbol_cache.as_ref().map(|cache| cache.resolver()),
@@ -3601,7 +3654,9 @@ fn cache_frame_mapping_fallback(
 }
 
 fn render_frame_mapping_fallback(buffers: &mut FoldedRenderBuffers, mapping: &MappedFrame<'_>) {
-    let raw_path = mapping.path();
+    // Inferno src/collapse/perf.rs:450,610 consumes perf's displayed DSO,
+    // not the long source path retained for ELF selection.
+    let raw_path = mapping.display_path();
     let kernel = mapping.is_kernel();
     let path = if kernel {
         perf_script_dso_name(raw_path)
@@ -3726,6 +3781,7 @@ fn write_perf_script_mapped_decision_frame<R, W>(
     writer: &mut W,
     address: u64,
     is_cookie: bool,
+    display_path: &str,
     mapping: &ResolvedMappingRef<'_>,
     mut symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
     inline: bool,
@@ -3738,6 +3794,7 @@ where
         writer,
         address,
         is_cookie,
+        display_path,
         mapping,
         symbol_cache.as_deref_mut(),
         inline,
@@ -3752,6 +3809,7 @@ fn write_perf_script_mapped_decision_cursor<R, W>(
     writer: &mut W,
     address: u64,
     is_cookie: bool,
+    display_path: &str,
     mapping: &ResolvedMappingRef<'_>,
     symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
     inline: bool,
@@ -3762,9 +3820,9 @@ where
 {
     let Some(cache) = symbol_cache else {
         if is_cookie {
-            write_perf_script_mapped_symbol_frame(writer, address, "(cookie)", mapping.path)?;
+            write_perf_script_mapped_symbol_frame(writer, address, "(cookie)", display_path)?;
         } else {
-            write_perf_script_mapped_unknown_symbol_frame(writer, address, mapping.path)?;
+            write_perf_script_mapped_unknown_symbol_frame(writer, address, display_path)?;
         }
         return Ok(());
     };
@@ -3772,7 +3830,7 @@ where
     let dso_name = if cached.kernel_dso == crate::symbols::SymbolDsoName::KernelKallsyms {
         "[kernel.kallsyms]"
     } else {
-        mapping.path
+        display_path
     };
     if !inline {
         if is_cookie {
@@ -3875,6 +3933,7 @@ where
 fn write_perf_script_inline_mapped_decision_frame<R, W>(
     writer: &mut W,
     address: u64,
+    display_path: &str,
     mapping: &ResolvedMappingRef<'_>,
     mut symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
 ) -> Result<(), String>
@@ -3885,6 +3944,7 @@ where
     let result = write_perf_script_inline_mapped_decision_cursor(
         writer,
         address,
+        display_path,
         mapping,
         symbol_cache.as_deref_mut(),
     );
@@ -3897,6 +3957,7 @@ where
 fn write_perf_script_inline_mapped_decision_cursor<R, W>(
     writer: &mut W,
     address: u64,
+    display_path: &str,
     mapping: &ResolvedMappingRef<'_>,
     symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
 ) -> Result<(), String>
@@ -3909,7 +3970,7 @@ where
         let dso_name = if cached.kernel_dso == crate::symbols::SymbolDsoName::KernelKallsyms {
             "[kernel.kallsyms]"
         } else {
-            mapping.path
+            display_path
         };
         if let (true, Some(label)) = (cached.has_base_symbol, cached.frames.first()) {
             return write_perf_script_mapped_symbol_frame_fragment(
@@ -3920,7 +3981,7 @@ where
             writer, "", address, dso_name,
         );
     }
-    write_perf_script_mapped_unknown_symbol_frame_fragment(writer, "", address, mapping.path)
+    write_perf_script_mapped_unknown_symbol_frame_fragment(writer, "", address, display_path)
 }
 
 fn write_perf_script_unknown_frame<W>(writer: &mut W, address: u64) -> Result<(), String>
@@ -4192,6 +4253,8 @@ fn prepare_parsed_sample_for_fold<'layout, 'frames>(
     append_perf_user_unwind_frames(accumulator, misc, event, sample, frames);
     PreparedFoldSample {
         pid: sample.pid,
+        sample_ip: sample.sample_ip,
+        cpumode: misc & PERF_RECORD_MISC_CPUMODE_MASK,
         tid: sample.tid,
         time: sample.time,
         cpu: sample.cpu,
@@ -6618,6 +6681,7 @@ mod tests {
                 &mut output,
                 mapping.relative_address,
                 false,
+                mapping.path,
                 &mapping,
                 Some(&mut cache),
                 inline,
@@ -9667,6 +9731,8 @@ mod tests {
     ) -> super::PreparedFoldSample<'layout, 'frames> {
         super::PreparedFoldSample {
             pid: Some(7),
+            sample_ip: None,
+            cpumode: super::PERF_RECORD_MISC_CPUMODE_USER,
             tid: Some(7),
             time: (event.layout.sample_type & super::PERF_SAMPLE_TIME != 0)
                 .then_some(1_000_000_000),

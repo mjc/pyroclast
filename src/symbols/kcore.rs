@@ -130,7 +130,7 @@ impl KcoreSymbols {
     }
 }
 
-fn module_short_name(path: &str) -> Option<Cow<'_, str>> {
+pub(crate) fn module_short_name(path: &str) -> Option<Cow<'_, str>> {
     // perf machine.c:machine__process_kernel_mmap_event creates module DSOs
     // for absolute kernel paths. dso.c:__kmod_path__parse keeps bracketed
     // names, recognizes .ko with gzip/xz suffixes, and maps '-' to '_'.

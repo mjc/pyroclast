@@ -1,6 +1,6 @@
 #[cfg(unix)]
 mod gnu;
-mod kcore;
+pub(crate) mod kcore;
 
 use std::borrow::{Borrow, Cow};
 use std::cell::Cell;
@@ -148,6 +148,10 @@ pub trait SymbolResolver {
     fn requires_kernel_cursor_order(&self) -> bool {
         false
     }
+
+    /// perf `builtin-script.c:process_sample_event` loads the event IP's map
+    /// before resolving any callchain nodes (`event.c:machine__resolve`).
+    fn preprocess_sample_ip(&self, _mapping: &ResolvedMappingRef<'_>) {}
 
     /// Resolves a batch of object-relative addresses.
     ///
@@ -843,9 +847,9 @@ pub struct PerfSymbolResolver<O> {
     kallsyms: Option<Kallsyms>,
     live_kallsyms: Option<Kallsyms>,
     live_kallsyms_path: Option<PathBuf>,
-    live_kallsyms_cache: OnceLock<Option<Kallsyms>>,
+    live_kallsyms_cache: OnceLock<Option<LiveKallsymsSnapshot>>,
     kcore_symbols: OnceLock<Option<kcore::KcoreSymbols>>,
-    live_module_kallsyms_cache: OnceLock<FxHashMap<String, Arc<Kallsyms>>>,
+    ordinary_kernel_load: Mutex<OrdinaryKernelLoad>,
     system_map_kallsyms: Option<Kallsyms>,
     system_map_candidates: Vec<PathBuf>,
     system_map_kallsyms_cache: OnceLock<Option<Kallsyms>>,
@@ -856,6 +860,17 @@ pub struct PerfSymbolResolver<O> {
     /// relocates it through the recorded reference symbol.
     live_kernel_notes_path: Option<PathBuf>,
     live_kernel_build_id_cache: OnceLock<Option<String>>,
+}
+
+#[derive(Default)]
+struct OrdinaryKernelLoad {
+    core_loaded: bool,
+    modules_loaded_before_core: FxHashSet<String>,
+}
+
+struct LiveKallsymsSnapshot {
+    core: Option<Kallsyms>,
+    modules: FxHashMap<String, Arc<Kallsyms>>,
 }
 
 struct FileKernelCache {
@@ -1540,7 +1555,7 @@ where
             live_kallsyms_path: None,
             live_kallsyms_cache: OnceLock::new(),
             kcore_symbols: OnceLock::new(),
-            live_module_kallsyms_cache: OnceLock::new(),
+            ordinary_kernel_load: Mutex::new(OrdinaryKernelLoad::default()),
             system_map_kallsyms: None,
             system_map_candidates: Vec::new(),
             system_map_kallsyms_cache: OnceLock::new(),
@@ -1802,14 +1817,36 @@ impl Kallsyms {
     }
 
     fn parse_module_symbols(text: &str) -> Vec<BorrowedKallsymsRow<'_>> {
+        Self::parse_global_kallsyms(text, None)
+    }
+
+    fn parse_global_kallsyms<'a>(
+        text: &'a str,
+        mut relocation_addresses: Option<&mut BTreeMap<String, u64>>,
+    ) -> Vec<BorrowedKallsymsRow<'a>> {
         #[cfg(test)]
         MODULE_KALLSYMS_TREE_BUILDS.with(|count| count.set(count.get() + 1));
         let mut symbols = Vec::new();
         for row in text
             .lines()
-            .filter_map(parse_module_kallsyms_line)
+            .filter_map(parse_global_kallsyms_row)
             .filter(|row| row.address != 0)
         {
+            // perf symbol.c:kallsyms__delta calls event.c:
+            // kallsyms__get_function_start on the physical input. Relocation
+            // references survive even when symbol-tree alias selection loses them.
+            if row.module.is_none()
+                && (matches!(row.symbol_type.to_ascii_uppercase(), 'T' | 'W')
+                    || row.symbol_type == 'A')
+                && let Some(addresses) = relocation_addresses.as_deref_mut()
+            {
+                addresses.entry(row.name.to_owned()).or_insert(row.address);
+            }
+            // symbol.c:dso__load_all_kallsyms filters before tree insertion;
+            // event.c:find_func_symbol_cb separately accepts A references.
+            if !perf_kallsyms_type_is_kept(row.symbol_type) || row.name.starts_with('$') {
+                continue;
+            }
             #[cfg(test)]
             MODULE_KALLSYMS_SYMBOL_INSERTIONS.with(|count| count.set(count.get() + 1));
             symbols.push(row);
@@ -1833,9 +1870,11 @@ impl Kallsyms {
         symbols
     }
 
-    fn parse_module_views(text: &str) -> FxHashMap<String, Arc<Self>> {
+    fn module_views_from_symbols<'a>(
+        symbols: impl IntoIterator<Item = BorrowedKallsymsRow<'a>>,
+    ) -> FxHashMap<String, Arc<Self>> {
         let mut modules = FxHashMap::<String, Self>::default();
-        for row in Self::parse_module_symbols(text) {
+        for row in symbols {
             let Some(module) = row.module else {
                 continue;
             };
@@ -2098,6 +2137,10 @@ where
 
     pub(crate) fn requires_kernel_cursor_order(&self) -> bool {
         self.resolver.requires_kernel_cursor_order()
+    }
+
+    pub(crate) fn preprocess_sample_ip(&self, mapping: &ResolvedMappingRef<'_>) {
+        self.resolver.preprocess_sample_ip(mapping);
     }
 
     pub(crate) fn finish_kernel_cursor(&mut self) {
@@ -2526,6 +2569,22 @@ impl<O> SymbolResolver for PerfSymbolResolver<O>
 where
     O: SymbolResolver,
 {
+    fn preprocess_sample_ip(&self, mapping: &ResolvedMappingRef<'_>) {
+        if is_kernel_module_symbol_path_str(mapping.path) || mapping.kernel_module_address.is_some()
+        {
+            self.record_ordinary_module_path(mapping.path);
+        } else if is_kernel_symbol_path(Path::new(mapping.path)) {
+            if let Some(symbols) = self.kcore_symbols_ref() {
+                symbols.activate(false);
+            } else if self.kallsyms_ref().is_none() && self.kernel_elf_ref().is_none() {
+                self.live_kallsyms_ref();
+            }
+            self.ordinary_kernel_load
+                .lock()
+                .expect("kernel DSO load lock")
+                .core_loaded = true;
+        }
+    }
     fn selected_object_is_shared(&self, path: &Path) -> bool {
         self.object_resolver.selected_object_is_shared(path)
     }
@@ -2542,8 +2601,14 @@ where
     }
 
     fn requires_kernel_cursor_order(&self) -> bool {
-        self.kcore_symbols_ref()
-            .is_some_and(|symbols| !symbols.is_active())
+        if let Some(symbols) = self.kcore_symbols_ref() {
+            return !symbols.is_active();
+        }
+        !self
+            .ordinary_kernel_load
+            .lock()
+            .expect("kernel DSO load lock")
+            .core_loaded
     }
 
     fn resolve_original_kernel_module_frames(
@@ -2587,8 +2652,7 @@ where
                 && let Some(symbols) = self.kcore_symbols_ref()
                 && symbols.contains(kernel_address)
             {
-                let module = is_kernel_module_symbol_path(&request.path)
-                    || request.kernel_module_address.is_some();
+                let module = is_kernel_module_request(request);
                 if module
                     && !symbols.is_active()
                     && let Some(object_request) =
@@ -2600,9 +2664,10 @@ where
                 } else if symbols.activate(module) {
                     resolved[index] = symbols.resolve(kernel_address);
                 }
-            } else if is_kernel_module_symbol_path(&request.path) {
+            } else if is_kernel_module_request(request) {
+                self.record_ordinary_module_load(request);
                 if let Some(object_request) =
-                    self.cached_object_symbol_request(request, &mut address_cache)
+                    self.module_object_symbol_request(request, &mut address_cache)
                 {
                     user_indexes.push(index);
                     user_requests.push(object_request);
@@ -2660,7 +2725,7 @@ where
                     resolved[index] = symbol;
                 } else {
                     resolved[index] = symbol.or_else(|| {
-                        is_kernel_module_symbol_path(&requests[index].path)
+                        is_kernel_module_request(&requests[index])
                             .then(|| self.resolve_kernel_symbol(&requests[index]))
                             .flatten()
                     });
@@ -2723,8 +2788,7 @@ where
                 && let Some(symbols) = self.kcore_symbols_ref()
                 && symbols.contains(kernel_address)
             {
-                let module = is_kernel_module_symbol_path(&request.path)
-                    || request.kernel_module_address.is_some();
+                let module = is_kernel_module_request(request);
                 if module
                     && !symbols.is_active()
                     && let Some(object_request) =
@@ -2741,9 +2805,10 @@ where
                 } else {
                     resolved[index].source_state = SymbolSourceState::KernelMapReplaced;
                 }
-            } else if is_kernel_module_symbol_path(&request.path) {
+            } else if is_kernel_module_request(request) {
+                self.record_ordinary_module_load(request);
                 if let Some(object_request) =
-                    self.cached_object_symbol_request(request, &mut address_cache)
+                    self.module_object_symbol_request(request, &mut address_cache)
                 {
                     user_indexes.push(index);
                     user_requests.push(object_request);
@@ -2811,7 +2876,7 @@ where
         path: &Path,
         old_module: bool,
     ) -> ResolvedSymbolFrames {
-        let module = is_kernel_module_symbol_path(&request.path);
+        let module = is_kernel_module_request(request);
         let mut frames = if frames.frames.is_empty() && module && !old_module {
             self.resolve_kernel_symbol(request)
                 .map(|symbol| ResolvedSymbolFrames::from_frames(vec![symbol]))
@@ -2855,6 +2920,20 @@ where
         self.cached_object_symbol_request(request, address_cache)
             .or_else(|| self.live_vdso_symbol_request(request, address_cache))
             .unwrap_or_else(|| Self::live_object_symbol_request(request, address_cache))
+    }
+
+    fn module_object_symbol_request(
+        &self,
+        request: &SymbolRequest,
+        address_cache: &mut ObjectAddressCache,
+    ) -> Option<SymbolRequest> {
+        // perf symbol.c:dso__load tries the regular system module pathname
+        // after build-ID sources. Bracketed paths have no live object name.
+        if request.kernel_module_address.is_some() {
+            Some(self.object_symbol_request(request, address_cache))
+        } else {
+            self.cached_object_symbol_request(request, address_cache)
+        }
     }
 
     fn cached_object_symbol_request(
@@ -2911,31 +2990,45 @@ where
     }
 
     fn live_kallsyms_ref(&self) -> Option<&Kallsyms> {
-        self.live_kallsyms.as_ref().or_else(|| {
-            self.live_kallsyms_cache
-                .get_or_init(|| {
-                    self.live_kallsyms_path.as_ref().and_then(|path| {
-                        std::fs::read_to_string(path)
-                            .ok()
-                            .and_then(|text| Kallsyms::parse(&text).ok())
-                    })
+        self.live_kallsyms
+            .as_ref()
+            .or_else(|| self.live_kallsyms_snapshot()?.core.as_ref())
+    }
+
+    fn live_kallsyms_snapshot(&self) -> Option<&LiveKallsymsSnapshot> {
+        self.live_kallsyms_cache
+            .get_or_init(|| {
+                let text = std::fs::read_to_string(self.live_kallsyms_path.as_ref()?).ok()?;
+                // perf symbol.c:__dso__load_kallsyms (1494-1523) reads and
+                // splits the complete tree during core loading, not during
+                // each module's later first query. Both views own one snapshot.
+                let mut core = Kallsyms::default();
+                let rows =
+                    Kallsyms::parse_global_kallsyms(&text, Some(&mut core.addresses_by_name));
+                for row in rows.iter().filter(|row| row.module.is_none()) {
+                    core.symbols.insert(
+                        row.address,
+                        KallsymsSymbol {
+                            name: row.name.to_owned(),
+                            end: Some(row.end),
+                            module: None,
+                        },
+                    );
+                }
+                Some(LiveKallsymsSnapshot {
+                    core: (!core.symbols.is_empty()).then_some(core),
+                    modules: Kallsyms::module_views_from_symbols(rows),
                 })
-                .as_ref()
-        })
+            })
+            .as_ref()
     }
 
     fn live_module_kallsyms_for_path(&self, module_path: &str) -> Option<Arc<Kallsyms>> {
         if !is_kernel_module_symbol_path_str(module_path) {
             return None;
         }
-        self.live_module_kallsyms_cache
-            .get_or_init(|| {
-                self.live_kallsyms_path
-                    .as_ref()
-                    .and_then(|path| std::fs::read_to_string(path).ok())
-                    .map(|text| Kallsyms::parse_module_views(&text))
-                    .unwrap_or_default()
-            })
+        self.live_kallsyms_snapshot()?
+            .modules
             .get(module_path)
             .cloned()
     }
@@ -2969,7 +3062,26 @@ where
     }
 
     fn resolve_kernel_symbol(&self, request: &SymbolRequest) -> Option<String> {
-        if is_kernel_module_symbol_path(&request.path) {
+        if is_kernel_module_request(request) {
+            let module_name = kcore::module_short_name(request.path.to_str()?)?;
+            {
+                // perf symbol.c:dso__load sets loaded even on failure (1866).
+                // maps__split_kallsyms (913) discards those DSO rows when the
+                // core source is loaded later; a module cannot load it itself.
+                let load = self
+                    .ordinary_kernel_load
+                    .lock()
+                    .expect("kernel DSO load lock");
+                if !load.core_loaded {
+                    return None;
+                }
+                if load
+                    .modules_loaded_before_core
+                    .contains(module_name.as_ref())
+                {
+                    return None;
+                }
+            }
             self.kallsyms_ref()
                 .and_then(|kallsyms| resolve_module_kallsyms(kallsyms, request))
                 .or_else(|| {
@@ -2985,10 +3097,15 @@ where
                     request
                         .path
                         .to_str()
-                        .and_then(|module_path| self.live_module_kallsyms_for_path(module_path))
+                        .and_then(kcore::module_short_name)
+                        .and_then(|module_name| self.live_module_kallsyms_for_path(&module_name))
                         .and_then(|kallsyms| resolve_module_kallsyms(kallsyms.as_ref(), request))
                 })
         } else {
+            self.ordinary_kernel_load
+                .lock()
+                .expect("kernel DSO load lock")
+                .core_loaded = true;
             self.kallsyms_ref()
                 .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
                 .or_else(|| {
@@ -3005,6 +3122,26 @@ where
                     self.system_map_kallsyms_ref()
                         .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
                 })
+        }
+    }
+
+    fn record_ordinary_module_load(&self, request: &SymbolRequest) {
+        if let Some(path) = request.path.to_str() {
+            self.record_ordinary_module_path(path);
+        }
+    }
+
+    fn record_ordinary_module_path(&self, path: &str) {
+        let mut load = self
+            .ordinary_kernel_load
+            .lock()
+            .expect("kernel DSO load lock");
+        if !load.core_loaded
+            && let Some(name) = kcore::module_short_name(path)
+        {
+            // Both successful and failed dso__load attempts set loaded; a
+            // selected ELF must not gain kallsyms symbols in its address gaps.
+            load.modules_loaded_before_core.insert(name.into_owned());
         }
     }
 
@@ -5355,10 +5492,13 @@ fn resolve_kernel_kallsyms(kallsyms: &Kallsyms, request: &SymbolRequest) -> Opti
 }
 
 fn resolve_module_kallsyms(kallsyms: &Kallsyms, request: &SymbolRequest) -> Option<String> {
+    let module_name = kcore::module_short_name(request.path.to_str()?)?;
     kallsyms.resolve_module_with_offset_for_path(
-        request.relative_address,
+        request
+            .kernel_module_address
+            .unwrap_or(request.relative_address),
         request.kernel_mapping_range,
-        request.path.to_str()?,
+        &module_name,
     )
 }
 
@@ -5404,6 +5544,10 @@ fn is_kernel_symbol_path(path: &Path) -> bool {
 
 fn is_kernel_module_symbol_path(path: &Path) -> bool {
     path.to_str().is_some_and(is_kernel_module_symbol_path_str)
+}
+
+fn is_kernel_module_request(request: &SymbolRequest) -> bool {
+    is_kernel_module_symbol_path(&request.path) || request.kernel_module_address.is_some()
 }
 
 fn is_kernel_module_symbol_path_str(path: &str) -> bool {
@@ -5508,24 +5652,16 @@ fn parse_kallsyms_line(line: &str) -> Option<(u64, String)> {
     Some((address, symbol.to_string()))
 }
 
-fn parse_module_kallsyms_line(line: &str) -> Option<BorrowedKallsymsRow<'_>> {
+fn parse_global_kallsyms_row(line: &str) -> Option<BorrowedKallsymsRow<'_>> {
     #[cfg(test)]
     MODULE_KALLSYMS_ROW_VISITS.with(|count| count.set(count.get() + 1));
     let (address, rest) = line.trim_start().split_once(char::is_whitespace)?;
     let address = u64::from_str_radix(address, 16).ok()?;
     let (symbol_type, full_name) = rest.trim_start().split_once(char::is_whitespace)?;
     let symbol_type = symbol_type.chars().next()?;
-    if !perf_kallsyms_type_is_kept(symbol_type) {
-        return None;
-    }
     let full_name = full_name.trim_start();
     let mut fields = full_name.split_whitespace();
     let name = fields.next()?;
-    // tools/perf/util/symbol.c:774 rejects these before global insertion,
-    // so they must not influence end-fixup, duplicate selection, or tree shape.
-    if name.starts_with('$') {
-        return None;
-    }
     let module = fields.next();
     if module.is_some_and(|module| !module.starts_with('[') || !module.ends_with(']')) {
         return None;
@@ -7689,7 +7825,7 @@ mod tests {
             "0000000000001200 T $alias [a]",
         ];
         for line in rejected {
-            assert!(super::parse_module_kallsyms_line(line).is_none(), "{line}");
+            assert!(Kallsyms::parse_module_symbols(line).is_empty(), "{line}");
         }
         let text = "0000000000001000 T first [a]\n\
                     0000000000001100 T $core\n\
@@ -10807,9 +10943,10 @@ mod tests {
     }
 
     #[test]
-    fn missing_module_object_does_not_hide_kallsyms_symbols_at_other_addresses() {
-        // perf util/symbol.c:dso__find_kallsyms is an alternate source even
-        // when an object load failed. Only the complete source can be negative.
+    fn module_first_object_failure_stays_unknown_after_core_load_at_other_addresses() {
+        // perf symbol.c:dso__load (1866) marks failed module sources loaded;
+        // maps__split_kallsyms (913) then discards their module rows, not just
+        // the first queried address. Core-first loading is a separate case.
         let root = tempfile::tempdir().unwrap();
         let build_id = "0102";
         let elf = super::perf_build_id_elf_path_for_dso(
@@ -10839,8 +10976,14 @@ mod tests {
                 relative_address: 0x1010,
                 ..first
             };
+            cache
+                .resolve_cached_mapping(
+                    &test_mapping_ref("[kernel.kallsyms]", 0xffff_ffff_8100_0010),
+                    inline,
+                )
+                .unwrap();
             assert!(
-                !cache
+                cache
                     .resolve_cached_mapping(&second, inline)
                     .unwrap()
                     .frames

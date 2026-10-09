@@ -2131,11 +2131,39 @@ ffffffff88000080 t asm_exc_page_fault
     );
 }
 
+fn load_module_test_core(resolver: &impl SymbolResolver) {
+    // perf util/symbol.c:dso__load:1866 marks even failed DSOs loaded;
+    // maps__split_kallsyms:918-920 excludes those modules from the core split.
+    // Core-first may populate module DSOs; no later per-address resurrection.
+    let symbols = resolver
+        .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
+            path: PathBuf::from("[kernel.kallsyms]"),
+            relative_address: 0xffff_ffff_8469_97a0,
+            kernel_mapping_range: None,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        }])
+        .expect("core symbols");
+    assert_eq!(symbols, vec![Some("__pi_memcpy+0x0".to_string())]);
+}
+
 #[test]
-fn perf_symbol_resolver_uses_bounded_live_module_kallsyms_for_kernel_module_paths_like_perf_script()
-{
-    let cached =
-        Kallsyms::parse("ffffffff8501cd2c R xen_elfnote_phys32_entry\n").expect("cached kallsyms");
+fn perf_symbol_resolver_module_first_does_not_use_bounded_live_kallsyms() {
+    check_bounded_live_module_kallsyms(false);
+}
+
+#[test]
+fn perf_symbol_resolver_core_first_uses_bounded_live_module_kallsyms() {
+    check_bounded_live_module_kallsyms(true);
+}
+
+fn check_bounded_live_module_kallsyms(core_first: bool) {
+    let cached = Kallsyms::parse(
+        "ffffffff846997a0 T __pi_memcpy\nffffffff8501cd2c R xen_elfnote_phys32_entry\n",
+    )
+    .expect("cached kallsyms");
     let live = Kallsyms::parse_modules(
         "\
 ffffffff8501cd2c R xen_elfnote_phys32_entry
@@ -2148,6 +2176,10 @@ ffffffffc0e66200 t zpl_iter_read_next [zfs]
     let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
         .with_kallsyms(cached)
         .with_live_kallsyms(live);
+
+    if core_first {
+        load_module_test_core(&resolver);
+    }
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
@@ -2162,7 +2194,28 @@ ffffffffc0e66200 t zpl_iter_read_next [zfs]
         .expect("symbols");
 
     // perf-script kernel frames carry the +0x<off> offset (symbol_fprintf.c).
-    assert_eq!(symbols, vec![Some("zpl_iter_read+0xe9".to_string())]);
+    assert_eq!(
+        symbols,
+        vec![core_first.then(|| "zpl_iter_read+0xe9".to_string())]
+    );
+    if !core_first {
+        load_module_test_core(&resolver);
+    }
+    let symbols = resolver
+        .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
+            path: PathBuf::from("[zfs]"),
+            relative_address: 0xffff_ffff_c0e6_61ea,
+            kernel_mapping_range: None,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        }])
+        .expect("another module address after core loading");
+    assert_eq!(
+        symbols,
+        vec![core_first.then(|| "zpl_iter_read+0xea".to_string())]
+    );
     assert!(runner.commands().is_empty());
 }
 
@@ -2464,13 +2517,25 @@ fn perf_symbol_resolver_does_not_use_system_map_for_recorded_kernel_build_id_wit
 }
 
 #[test]
-fn perf_symbol_resolver_uses_live_module_kallsyms_for_recorded_module_build_id_without_cache_like_perf_script()
- {
+fn perf_symbol_resolver_module_first_build_id_without_cache_stays_unknown() {
+    check_live_module_build_id_without_cache(false);
+}
+
+#[test]
+fn perf_symbol_resolver_core_first_uses_live_module_kallsyms_without_build_id_cache() {
+    check_live_module_build_id_without_cache(true);
+}
+
+fn check_live_module_build_id_without_cache(core_first: bool) {
     let home = tempfile::tempdir().expect("home");
     let perfdata = home.path().join("perf.data");
     std::fs::write(&perfdata, perfdata_with_kernel_build_id()).expect("perfdata");
     let live_kallsyms = home.path().join("kallsyms");
-    std::fs::write(&live_kallsyms, "ffffffffc0ed5900 t arc_read [zfs]\n").expect("kallsyms");
+    std::fs::write(
+        &live_kallsyms,
+        "ffffffff846997a0 T __pi_memcpy\nffffffffc0ed5900 t arc_read [zfs]\n",
+    )
+    .expect("kallsyms");
 
     let runner = Addr2lineRunner::new(b"");
     let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
@@ -2481,39 +2546,65 @@ fn perf_symbol_resolver_uses_live_module_kallsyms_for_recorded_module_build_id_w
         &live_kallsyms,
     );
 
+    if core_first {
+        load_module_test_core(&resolver);
+    }
+
+    let request = SymbolRequest {
+        kernel_module_address: None,
+        path: PathBuf::from("[zfs]"),
+        relative_address: 0xffff_ffff_c0ed_5ffa,
+        kernel_mapping_range: Some((0xffff_ffff_c0e0_0000, 0xffff_ffff_c10f_0000)),
+        build_id: Some("25c900692553622cb73db68330349ea739893267".to_string()),
+        file_identity: None,
+        kernel_relocation: None,
+    };
     let symbols = resolver
-        .resolve_batch(&[SymbolRequest {
-            kernel_module_address: None,
-            path: PathBuf::from("[zfs]"),
-            relative_address: 0xffff_ffff_c0ed_5ffa,
-            kernel_mapping_range: Some((0xffff_ffff_c0e0_0000, 0xffff_ffff_c10f_0000)),
-            build_id: Some("25c900692553622cb73db68330349ea739893267".to_string()),
-            file_identity: None,
-            kernel_relocation: None,
-        }])
+        .resolve_batch(std::slice::from_ref(&request))
         .expect("symbols");
 
-    // perf's tools/perf/util/symbol.c dso__find_kallsyms() does not reject
-    // /proc/kallsyms for kernel/module maps merely because the DSO has a
-    // build-id; after build-id/kcore attempts it falls through to
-    // machine->root_dir/proc/kallsyms.
-    assert_eq!(symbols, vec![Some("arc_read+0x6fa".to_string())]);
+    // A recorded module build-ID does not prevent core-first kallsyms use,
+    // but it does not let a failed module-first load repopulate its DSO.
+    assert_eq!(
+        symbols,
+        vec![core_first.then(|| "arc_read+0x6fa".to_string())]
+    );
+    if !core_first {
+        load_module_test_core(&resolver);
+        assert_eq!(
+            resolver.resolve_batch(&[request]).expect("retry"),
+            vec![None]
+        );
+    }
     assert!(runner.commands().is_empty());
 }
 
 #[test]
 fn perf_symbol_resolver_uses_relocated_live_kallsyms_despite_recorded_build_id_like_perf_script() {
+    check_relocated_live_kallsyms_reference('T');
+}
+
+#[test]
+fn perf_symbol_resolver_accepts_absolute_relocation_alias_without_inserting_it_as_a_symbol() {
+    // perf event.c:find_func_symbol_cb accepts uppercase A as a relocation
+    // alias, but symbol.c:symbol_type__filter excludes it from the DSO tree.
+    check_relocated_live_kallsyms_reference('A');
+}
+
+fn check_relocated_live_kallsyms_reference(reference_type: char) {
     let root = tempfile::tempdir().expect("root");
     let perfdata = root.path().join("perf.data");
     std::fs::write(&perfdata, perfdata_with_kernel_build_id()).expect("perfdata");
     let live_kallsyms = root.path().join("kallsyms");
     std::fs::write(
         &live_kallsyms,
-        "\
-ffffffff91200000 T _text
+        format!(
+            "\
+ffffffff91200000 {reference_type} _text
 ffffffff91200000 T _stext
 ffffffff914e8fa0 t mp_map_pin_to_irq
-",
+"
+        ),
     )
     .expect("kallsyms");
     let live_notes = root.path().join("notes");
@@ -2739,7 +2830,16 @@ ffffffff846997a0 T memcpy
 }
 
 #[test]
-fn perf_symbol_resolver_loads_live_kallsyms_lazily_for_modules() {
+fn perf_symbol_resolver_module_first_does_not_load_live_kallsyms() {
+    check_lazy_live_module_kallsyms(false);
+}
+
+#[test]
+fn perf_symbol_resolver_core_first_loads_live_module_kallsyms_lazily() {
+    check_lazy_live_module_kallsyms(true);
+}
+
+fn check_lazy_live_module_kallsyms(core_first: bool) {
     let root = tempfile::tempdir().expect("root");
     let live_kallsyms = root.path().join("kallsyms");
 
@@ -2761,6 +2861,9 @@ ffffffffc0e17dae t zfs_read [zfs]
     )
     .expect("modules");
 
+    if core_first {
+        load_module_test_core(&resolver);
+    }
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
             kernel_module_address: None,
@@ -2774,17 +2877,45 @@ ffffffffc0e17dae t zfs_read [zfs]
         .expect("symbols");
 
     // perf-script kernel/module frames carry +0x<off> (symbol_fprintf.c).
-    assert_eq!(symbols, vec![Some("zfs_read+0x0".to_string())]);
+    assert_eq!(
+        symbols,
+        vec![core_first.then(|| "zfs_read+0x0".to_string())]
+    );
+    if !core_first {
+        load_module_test_core(&resolver);
+        let symbols = resolver
+            .resolve_batch(&[SymbolRequest {
+                kernel_module_address: None,
+                path: PathBuf::from("[zfs]"),
+                relative_address: 0xffff_ffff_c0e1_7dae,
+                kernel_mapping_range: None,
+                build_id: None,
+                file_identity: None,
+                kernel_relocation: None,
+            }])
+            .expect("retry after core loading");
+        assert_eq!(symbols, vec![None]);
+    }
     assert!(runner.commands().is_empty());
 }
 
 #[test]
-fn perf_symbol_resolver_rejects_live_module_symbol_start_before_recorded_map_like_perf_script() {
+fn perf_symbol_resolver_module_first_stays_unknown_regardless_of_recorded_bounds() {
+    check_live_module_recorded_bounds(false);
+}
+
+#[test]
+fn perf_symbol_resolver_core_first_rejects_live_module_symbol_start_before_recorded_map() {
+    check_live_module_recorded_bounds(true);
+}
+
+fn check_live_module_recorded_bounds(core_first: bool) {
     let root = tempfile::tempdir().expect("root");
     let live_kallsyms = root.path().join("kallsyms");
     std::fs::write(
         &live_kallsyms,
         "\
+ffffffff846997a0 T __pi_memcpy
 ffffffffc11dc2b0 T nft_chain_route_init [nf_tables]
 ffffffffc1800000 T later_nf_tables_symbol [nf_tables]
 ",
@@ -2800,6 +2931,10 @@ ffffffffc1800000 T later_nf_tables_symbol [nf_tables]
     let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
         .with_system_kallsyms_from_path(&live_kallsyms);
 
+    if core_first {
+        load_module_test_core(&resolver);
+    }
+
     let request = SymbolRequest {
         kernel_module_address: None,
         path: PathBuf::from("[nf_tables]"),
@@ -2812,26 +2947,45 @@ ffffffffc1800000 T later_nf_tables_symbol [nf_tables]
     // perf util/maps.c:maps__find and symbol.c:maps__split_kallsyms keep
     // module symbols in their map. The address is in this recorded map, but
     // the live symbol starts before it; neither module bounds nor a symbol
-    // gap may independently reject the positive control.
+    // gap may independently reject the core-first positive control.
     let symbols = resolver
         .resolve_batch(&[
             request.clone(),
             SymbolRequest {
                 kernel_mapping_range: Some((0xffff_ffff_c11d_c2b8, 0xffff_ffff_c11d_c300)),
-                ..request
+                ..request.clone()
             },
         ])
         .expect("symbols");
 
     assert_eq!(
         symbols,
-        vec![Some("nft_chain_route_init+0x10".to_string()), None]
+        vec![
+            core_first.then(|| "nft_chain_route_init+0x10".to_string()),
+            None
+        ]
     );
+    if !core_first {
+        load_module_test_core(&resolver);
+        assert_eq!(
+            resolver.resolve_batch(&[request]).expect("retry"),
+            vec![None]
+        );
+    }
     assert!(runner.commands().is_empty());
 }
 
 #[test]
-fn perf_symbol_resolver_uses_a_single_live_kallsyms_snapshot_for_module_paths() {
+fn perf_symbol_resolver_module_first_stays_unknown_across_core_snapshot_loading() {
+    check_live_module_kallsyms_snapshot(false);
+}
+
+#[test]
+fn perf_symbol_resolver_core_first_uses_a_single_live_kallsyms_snapshot_for_modules() {
+    check_live_module_kallsyms_snapshot(true);
+}
+
+fn check_live_module_kallsyms_snapshot(core_first: bool) {
     let root = tempfile::tempdir().expect("root");
     let live_kallsyms = root.path().join("kallsyms");
 
@@ -2857,6 +3011,9 @@ igb 4096 0 - Live 0xffffffffc1e17000
     )
     .expect("modules");
 
+    if core_first {
+        load_module_test_core(&resolver);
+    }
     let zfs = SymbolRequest {
         kernel_module_address: None,
         path: PathBuf::from("[zfs]"),
@@ -2870,7 +3027,15 @@ igb 4096 0 - Live 0xffffffffc1e17000
         .resolve_batch(std::slice::from_ref(&zfs))
         .expect("symbols");
     // perf-script kernel/module frames carry +0x<off> (symbol_fprintf.c).
-    assert_eq!(symbols, vec![Some("zfs_read+0x0".to_string())]);
+    assert_eq!(
+        symbols,
+        vec![core_first.then(|| "zfs_read+0x0".to_string())]
+    );
+    if !core_first {
+        // Capture the core snapshot only after zfs has completed its failed
+        // load. igb is still unattempted and can receive rows from this split.
+        load_module_test_core(&resolver);
+    }
 
     std::fs::write(
         &live_kallsyms,
@@ -2895,7 +3060,7 @@ ffffffffc2e17dae t unrelated_module_symbol [mlx5]
     assert_eq!(
         symbols,
         vec![
-            Some("zfs_read+0x0".to_string()),
+            core_first.then(|| "zfs_read+0x0".to_string()),
             Some("igb_clean_rx_irq+0x0".to_string())
         ]
     );
@@ -2903,7 +3068,16 @@ ffffffffc2e17dae t unrelated_module_symbol [mlx5]
 }
 
 #[test]
-fn perf_symbol_resolver_base_module_request_falls_back_to_kallsyms_after_build_id_miss_like_perf() {
+fn perf_symbol_resolver_base_module_first_build_id_miss_stays_unknown() {
+    check_base_module_build_id_miss(false);
+}
+
+#[test]
+fn perf_symbol_resolver_base_core_first_uses_module_kallsyms_after_build_id_miss() {
+    check_base_module_build_id_miss(true);
+}
+
+fn check_base_module_build_id_miss(core_first: bool) {
     let root = tempfile::tempdir().expect("root");
     let debug_dir = perf_debug_dir(root.path());
     let live_kallsyms = root.path().join("kallsyms");
@@ -2914,6 +3088,7 @@ fn perf_symbol_resolver_base_module_request_falls_back_to_kallsyms_after_build_i
     std::fs::write(
         &live_kallsyms,
         "\
+ffffffff846997a0 T __pi_memcpy
 ffffffffc0e38940 t nvs_xdr_nvp_op [zfs]
 ",
     )
@@ -2924,30 +3099,45 @@ ffffffffc0e38940 t nvs_xdr_nvp_op [zfs]
         .with_debug_dir(debug_dir)
         .with_system_kallsyms_from_path(&live_kallsyms);
 
+    if core_first {
+        load_module_test_core(&resolver);
+    }
+
+    let request = SymbolRequest {
+        kernel_module_address: None,
+        path: PathBuf::from("[zfs]"),
+        relative_address: 0xffff_ffff_c0e3_8b71,
+        kernel_mapping_range: None,
+        build_id: Some(build_id.to_string()),
+        file_identity: None,
+        kernel_relocation: None,
+    };
     let frames = resolver
-        .resolve_base_frame_batch_with_metadata(&[SymbolRequest {
-            kernel_module_address: None,
-            path: PathBuf::from("[zfs]"),
-            relative_address: 0xffff_ffff_c0e3_8b71,
-            kernel_mapping_range: None,
-            build_id: Some(build_id.to_string()),
-            file_identity: None,
-            kernel_relocation: None,
-        }])
+        .resolve_base_frame_batch_with_metadata(std::slice::from_ref(&request))
         .expect("frames");
 
     assert_eq!(
         frames,
         vec![pyroclast::symbols::ResolvedSymbolFrames {
-            frames: vec!["nvs_xdr_nvp_op+0x231".to_string()],
+            frames: core_first
+                .then(|| "nvs_xdr_nvp_op+0x231".to_string())
+                .into_iter()
+                .collect(),
             source_state: pyroclast::symbols::SymbolSourceState::AddressDependent,
             kernel_dso: pyroclast::symbols::SymbolDsoName::Mapping,
-            has_base_symbol: true,
+            has_base_symbol: core_first,
             has_inline_frames: false,
-            has_non_inline_base_frame: true,
+            has_non_inline_base_frame: core_first,
             base_offset: None,
         }]
     );
+    if !core_first {
+        load_module_test_core(&resolver);
+        let retry = resolver
+            .resolve_base_frame_batch_with_metadata(&[request])
+            .expect("retry");
+        assert_eq!(retry, frames);
+    }
 }
 
 #[test]

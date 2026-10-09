@@ -3772,6 +3772,31 @@ fn write_native_module_kallsyms_fixture(
     distinct_queries: bool,
     module_paths: [&str; 2],
 ) -> (tempfile::TempDir, Vec<u8>) {
+    // Kernel-first fixtures initialize ordinary kallsyms before module queries.
+    let ordered = std::iter::once(0xffff_ffff_8100_0010)
+        .chain(sampled_ips.iter().copied())
+        .collect::<Vec<_>>();
+    write_native_ordered_module_kallsyms_fixture(kallsyms, &ordered, distinct_queries, module_paths)
+}
+
+#[cfg(target_os = "linux")]
+fn write_native_ordered_module_kallsyms_fixture(
+    kallsyms: &str,
+    sampled_ips: &[u64],
+    distinct_queries: bool,
+    module_paths: [&str; 2],
+) -> (tempfile::TempDir, Vec<u8>) {
+    let queries = sampled_ips.iter().map(|&ip| (ip, ip)).collect::<Vec<_>>();
+    write_native_module_sample_and_chain_fixture(kallsyms, &queries, distinct_queries, module_paths)
+}
+
+#[cfg(target_os = "linux")]
+fn write_native_module_sample_and_chain_fixture(
+    kallsyms: &str,
+    queries: &[(u64, u64)],
+    distinct_queries: bool,
+    module_paths: [&str; 2],
+) -> (tempfile::TempDir, Vec<u8>) {
     const KERNEL_START: u64 = 0xffff_ffff_8100_0000;
     const MODULE_START: u64 = 0xffff_ffff_c100_0000;
 
@@ -3811,12 +3836,7 @@ fn write_native_module_kallsyms_fixture(
             &payload,
         ));
     }
-    // Resolve _stext first: dso__load_kernel_sym honors --kallsyms, and
-    // __dso__load_kallsyms fixes the complete tree before splitting modules.
-    for (index, ip) in std::iter::once(KERNEL_START + 0x10)
-        .chain(sampled_ips.iter().copied())
-        .enumerate()
-    {
+    for (index, (sample_ip, chain_ip)) in queries.iter().copied().enumerate() {
         if distinct_queries {
             // Distinct comms keep each query separate in the folded oracle,
             // so swapped lookup results cannot cancel in aggregate counts.
@@ -3828,11 +3848,11 @@ fn write_native_module_kallsyms_fixture(
             PERF_RECORD_SAMPLE,
             PERF_RECORD_MISC_CPUMODE_KERNEL,
             &sample_payload_with_time(
-                ip,
+                sample_ip,
                 11,
                 12,
                 1_000_000_000 + u64::try_from(index).expect("sample index"),
-                [0xffff_ffff_ffff_ff80, ip],
+                [0xffff_ffff_ffff_ff80, chain_ip],
             ),
         ));
     }
@@ -3884,6 +3904,49 @@ fn query_native_module_kallsyms(
         .collapse(std::io::Cursor::new(script.as_bytes()), &mut native)
         .expect("collapse native script");
     (script, stderr.into_owned(), native)
+}
+
+#[cfg(target_os = "linux")]
+fn assert_module_symbol_routes_match_native(
+    root: &std::path::Path,
+    bytes: &[u8],
+    script: &str,
+    native: &[u8],
+) {
+    use pyroclast::symbols::{SelectedObjectResolver, SymbolizerKind};
+    let runner = pyroclast::process::RealCommandRunner::default();
+    let input = root.join("perf.data");
+    for symbolizer in [SymbolizerKind::RustAddr2line, SymbolizerKind::Addr2line] {
+        for inline in [false, true] {
+            for file_route in [false, true] {
+                let resolver =
+                    perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+                        SelectedObjectResolver::new(&runner, symbolizer),
+                        &input,
+                        root,
+                        [],
+                        &root.join("kallsyms"),
+                    );
+                let options = FoldOptions {
+                    inline,
+                    count_periods: true,
+                };
+                let actual = if file_route {
+                    pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(
+                        &input, options, &resolver,
+                    )
+                } else {
+                    fold_perfdata_callchains_with_symbols(bytes, options, &resolver)
+                }
+                .unwrap();
+                assert_eq!(
+                    actual.as_bytes(),
+                    native,
+                    "{symbolizer:?}, inline={inline}, file={file_route}: {script}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -3986,14 +4049,21 @@ fn resolved_kernel_dso<'a>(
 
 #[cfg(target_os = "linux")]
 fn write_native_kcore_fixture(module_path: &str) -> (tempfile::TempDir, Vec<u8>) {
-    const MODULE_IP: u64 = 0xffff_ffff_c100_0010;
-    let (root, bytes) = write_native_module_kallsyms_fixture(
+    write_native_ordered_kcore_fixture(module_path, &[0xffff_ffff_8100_0010, 0xffff_ffff_c100_0010])
+}
+
+#[cfg(target_os = "linux")]
+fn write_native_ordered_kcore_fixture(
+    module_path: &str,
+    sampled_ips: &[u64],
+) -> (tempfile::TempDir, Vec<u8>) {
+    let (root, bytes) = write_native_ordered_module_kallsyms_fixture(
         "ffffffff81000000 T _stext\n\
          ffffffff81000100 T _etext\n\
          ffffffffc1000000 T first\t[a]\n\
          ffffffffc1000200 T next\t[a]\n\
          ffffffffc1010000 T sentinel\t[b]\n",
-        &[MODULE_IP],
+        sampled_ips,
         false,
         [module_path, "[b]"],
     );
@@ -4192,6 +4262,199 @@ fn native_kcore_accepts_matching_absolute_and_compressed_module_addresses() {
             );
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn absolute_module_kallsyms_fallback_matches_native_with_missing_or_rejected_kcore() {
+    use pyroclast::symbols::{SelectedObjectResolver, SymbolizerKind};
+    let runner = pyroclast::process::RealCommandRunner::default();
+    for (module_path, missing) in [
+        ("/lib/modules/a.ko", true),
+        ("/lib/modules/a.ko.gz", true),
+        ("/lib/modules/a.ko.xz", true),
+        ("/lib/modules/a.ko", false),
+        ("/lib/modules/a.ko.gz", false),
+        ("/lib/modules/a.ko.xz", false),
+    ] {
+        let (root, bytes) = write_native_kcore_fixture(module_path);
+        let kcore = root.path().join("kcore");
+        if missing {
+            std::fs::remove_file(kcore).unwrap();
+        } else {
+            std::fs::write(kcore, b"truncated").unwrap();
+        }
+        let (script, stderr, native) = query_native_module_kallsyms(root.path(), &[]);
+        assert!(!stderr.contains("/kcore for kernel data"), "{stderr}");
+        assert!(script.contains("first+0x10 ([a])"), "{script}\n{stderr}");
+        let input = root.path().join("perf.data");
+        for (symbolizer, inline, file_route) in [
+            (SymbolizerKind::RustAddr2line, false, false),
+            (SymbolizerKind::RustAddr2line, false, true),
+            (SymbolizerKind::RustAddr2line, true, false),
+            (SymbolizerKind::RustAddr2line, true, true),
+            (SymbolizerKind::Addr2line, false, false),
+            (SymbolizerKind::Addr2line, false, true),
+            (SymbolizerKind::Addr2line, true, false),
+            (SymbolizerKind::Addr2line, true, true),
+        ] {
+            let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+                SelectedObjectResolver::new(&runner, symbolizer),
+                &input,
+                root.path(),
+                [],
+                &root.path().join("kallsyms"),
+            );
+            let options = FoldOptions {
+                inline,
+                count_periods: true,
+            };
+            let actual = if file_route {
+                pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(
+                    &input, options, &resolver,
+                )
+            } else {
+                fold_perfdata_callchains_with_symbols(&bytes, options, &resolver)
+            }
+            .unwrap();
+            assert_eq!(
+                actual.as_bytes(),
+                native,
+                "{module_path}, missing={missing}, {symbolizer:?}, inline={inline}, file={file_route}: {script}"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn absolute_kernel_module_elf_precedes_kallsyms_when_kcore_is_missing() {
+    assert_native_module_object_queries(&[0xffff_ffff_8100_0010, 0xffff_ffff_c100_0010]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn module_object_loaded_before_core_does_not_gain_kallsyms_at_uncovered_addresses() {
+    assert_native_module_object_queries(&[
+        0xffff_ffff_c100_0010,
+        0xffff_ffff_8100_0010,
+        0xffff_ffff_c100_0040,
+    ]);
+}
+
+#[cfg(target_os = "linux")]
+fn assert_native_module_object_queries(sampled_ips: &[u64]) {
+    use object::{Architecture, BinaryFormat, Endianness, SectionKind, SymbolKind, SymbolScope};
+    let parent =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/native-kallsyms-fixtures");
+    std::fs::create_dir_all(&parent).unwrap();
+    let object_root = tempfile::tempdir_in(parent).unwrap();
+    let module = object_root.path().join("a.ko");
+    let mut object =
+        object::write::Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+    let text = object.add_section(Vec::new(), b".text".to_vec(), SectionKind::Text);
+    object.section_mut(text).set_data(vec![0x90; 128], 1);
+    object.add_symbol(object::write::Symbol {
+        name: b"loaded_module_function".to_vec(),
+        value: 0,
+        size: 32,
+        kind: SymbolKind::Text,
+        scope: SymbolScope::Linkage,
+        weak: false,
+        section: object::write::SymbolSection::Section(text),
+        flags: object::SymbolFlags::None,
+    });
+    let elf = object.write().unwrap();
+    std::fs::write(&module, &elf).unwrap();
+    let (root, bytes) = write_native_ordered_kcore_fixture(module.to_str().unwrap(), sampled_ips);
+    let native_module = root
+        .path()
+        .join("symfs")
+        .join(module.strip_prefix("/").unwrap());
+    std::fs::create_dir_all(native_module.parent().unwrap()).unwrap();
+    std::fs::write(native_module, elf).unwrap();
+    std::fs::remove_file(root.path().join("kcore")).unwrap();
+    let (script, _, native) = query_native_module_kallsyms(root.path(), &[]);
+    assert!(
+        script.contains("loaded_module_function+0x10 ([a])"),
+        "{script}"
+    );
+    assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &native);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bracketed_module_first_failed_load_stays_unknown_after_ordinary_core_loading() {
+    assert_module_first_queries_match_native("[a]", false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn independent_module_sample_ip_loads_before_core_callchain_like_native_perf() {
+    assert_native_independent_sample_ip(0xffff_ffff_c100_0010, 0xffff_ffff_8100_0010);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn independent_core_sample_ip_populates_modules_before_module_callchain_like_native_perf() {
+    assert_native_independent_sample_ip(0xffff_ffff_8100_0010, 0xffff_ffff_c100_0010);
+}
+
+#[cfg(target_os = "linux")]
+fn assert_native_independent_sample_ip(sample_ip: u64, chain_ip: u64) {
+    // builtin-script.c:process_sample_event calls machine__resolve before
+    // thread__resolve_callchain. The event IP need not be any chain node.
+    let (root, bytes) = write_native_module_sample_and_chain_fixture(
+        "ffffffff81000000 T _stext\nffffffff81000100 T _etext\n\
+         ffffffffc1000000 T first\t[a]\nffffffffc1010000 T sentinel\t[b]\n",
+        &[
+            (sample_ip, chain_ip),
+            (0xffff_ffff_c100_0010, 0xffff_ffff_c100_0010),
+        ],
+        false,
+        ["[a]", "[b]"],
+    );
+    let (script, _, native) = query_native_module_kallsyms(root.path(), &[]);
+    assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &native);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn absolute_module_first_failed_load_stays_unknown_after_ordinary_core_loading() {
+    assert_module_first_queries_match_native("/lib/modules/a.ko", false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bracketed_module_first_queries_follow_kcore_map_replacement() {
+    assert_module_first_queries_match_native("[a]", true);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn absolute_module_first_queries_follow_kcore_map_replacement() {
+    assert_module_first_queries_match_native("/lib/modules/a.ko", true);
+}
+
+#[cfg(target_os = "linux")]
+fn assert_module_first_queries_match_native(module_path: &str, kcore: bool) {
+    let (root, bytes) = write_native_ordered_kcore_fixture(
+        module_path,
+        &[
+            0xffff_ffff_c100_0010,
+            0xffff_ffff_c100_0010,
+            0xffff_ffff_8100_0010,
+            0xffff_ffff_c100_0010,
+            0xffff_ffff_c100_0020,
+        ],
+    );
+    if !kcore {
+        std::fs::remove_file(root.path().join("kcore")).unwrap();
+    }
+    // Native dso__load marks even failed module loads as loaded;
+    // maps__split_kallsyms discards rows for already-loaded modules.
+    let (script, _, native) = query_native_module_kallsyms(root.path(), &[]);
+    assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &native);
 }
 
 #[cfg(target_os = "linux")]
@@ -6841,7 +7104,7 @@ fn symbolized_fold_carries_mmap2_build_ids_to_symbol_requests() {
 }
 
 #[test]
-fn symbolized_fold_resolves_build_id_kernel_module_from_live_kallsyms_like_perf_script() {
+fn module_only_fold_without_core_loading_does_not_resurrect_failed_build_id_module() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes(
             PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
@@ -6892,9 +7155,10 @@ fn symbolized_fold_resolves_build_id_kernel_module_from_live_kallsyms_like_perf_
     let folded = fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
         .expect("folded");
 
-    // perf's tools/perf/util/symbol.c dso__find_kallsyms() falls through to
-    // /proc/kallsyms for kernel/module maps even when the DSO has a build-id.
-    assert_eq!(folded, ":12;arc_read 1\n");
+    // perf symbol.c:dso__load marks the module loaded even on failure (1866);
+    // ordinary kallsyms is loaded through the core DSO, not by a module query.
+    // maps__split_kallsyms (913) skips this DSO if core is later loaded.
+    assert_eq!(folded, ":12;[[zfs]] 1\n");
 }
 
 #[test]
