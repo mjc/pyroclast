@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+    echo "usage: $0 SHIPPING_ARTIFACT_DIR [OUTPUT_DIR]" >&2
+    exit 2
+fi
+root=$(cd "$(dirname "$0")/.." && pwd)
+input=$(cd "$1" && pwd)
+output=${2:-"$root/target/heaptrack-parity"}
+mkdir -p "$output"
+result=$(mktemp -d "$output/check.XXXXXX")
+echo "Parity evidence: $result"
+exec 2> >(tee "$result/check.stderr" >&2)
+for tool in jq sha256sum heaptrack_print realpath; do
+    command -v "$tool" >/dev/null || { echo "missing tool: $tool" >&2; exit 1; }
+done
+raw=$(jq -ers --arg input "$input" '
+    if length == 1 then .[0] else error("expected one run document") end
+    | . as $manifest
+    |
+    if .actual_backend != "heaptrack" or .exit_status != 0 then
+        error("run must be successful heaptrack")
+    else .artifacts end
+    | if type != "array" then error("invalid artifacts") else . end
+    | map(select(type == "string") | select(test("(^|/)profile\\.raw\\.heaptrack(\\.(zst|gz))?$")))
+    | if length == 1 then .[0] else error("expected exactly one raw heaptrack artifact") end
+    | if startswith("/") then .
+      elif ($manifest | has("cwd")) then
+        if ($manifest.cwd | type) != "string" then error("invalid manifest cwd")
+        elif ($manifest.cwd | startswith("/")) then $manifest.cwd + "/" + .
+        else error("manifest cwd must be absolute") end
+      elif contains("/") then error("relative artifact path requires manifest cwd")
+      else $input + "/" + . end
+' "$input/run.json")
+# Backend artifacts retain out_dir; relative paths are anchored at recorded cwd.
+raw=$(realpath -e "$raw")
+[[ -f $raw && -s $raw ]] || { echo "raw artifact missing or empty" >&2; exit 1; }
+before=$(sha256sum "$raw")
+before=${before%% *}
+native_status=0
+LC_ALL=C heaptrack_print -f "$raw" > "$result/native.report" 2> "$result/native.stderr" || native_status=$?
+after=$(sha256sum "$raw")
+after=${after%% *}
+report_hash=$(sha256sum "$result/native.report")
+report_hash=${report_hash%% *}
+jq -n --arg raw "$raw" --arg before "$before" --arg after "$after" \
+    --arg report_hash "$report_hash" --arg reporter "$(command -v heaptrack_print)" \
+    --arg report "$(realpath "$result/native.report")" --argjson status "$native_status" \
+    '{raw_input:$raw,sha256_before:$before,sha256_after:$after,native_report:$report,
+      report_sha256:$report_hash,native_reporter:$reporter,native_exit_status:$status}' \
+    > "$result/identity.json"
+[[ $before == "$after" ]] || { echo "native reporter modified raw input" >&2; exit 1; }
+[[ $native_status == 0 ]] || { echo "heaptrack_print failed: $native_status" >&2; exit 1; }
+# Parse only native footer labels, requiring one complete value for each.
+jq -eRs '
+    split("\n") | map(sub("\r$"; "")) as $lines
+    | def field($prefix; $pattern):
+        [$lines[] | select(startswith($prefix))] as $found
+        | if ($found | length) != 1 then error("missing or duplicate footer: " + $prefix)
+          else $found[0] end
+        | [capture($pattern)]
+        | if length != 1 then error("malformed footer: " + $prefix) else .[0] end;
+      # Native scaled units have two decimal places and represent whole bytes.
+      # Round away floating multiplication noise, not native display precision.
+      def bytes:
+        if .unit == "B" then
+            if (.n | test("^[0-9]+$")) then .n | tonumber
+            else error("native B values must be integers") end
+        elif (.n | test("^[0-9]+\\.[0-9]{2}$")) then
+            (.n | tonumber) * ({K:1000,M:1000000,G:1000000000,T:1000000000000}[.unit]) | round
+        else error("native scaled byte values require two fractional digits")
+        end;
+      "(?<n>[0-9]+(?:\\.[0-9]+)?)" as $decimal
+    | {
+        total_allocations: (field("calls to allocation functions:";
+            "^calls to allocation functions: (?<n>[0-9]+) \\([0-9]+/s\\)$") | .n | tonumber),
+        temporary_allocations: (field("temporary memory allocations:";
+            "^temporary memory allocations: (?<n>[0-9]+) \\([0-9]+/s\\)$") | .n | tonumber),
+        peak_heap_bytes: (field("peak heap memory consumption:";
+            "^peak heap memory consumption: " + $decimal + "(?<unit>[BKMGT])$") | bytes),
+        leaked_bytes: (field("total memory leaked:";
+            "^total memory leaked: " + $decimal + "(?<unit>[BKMGT])$") | bytes),
+        peak_rss_bytes: (field("peak RSS (including heaptrack overhead):";
+            "^peak RSS \\(including heaptrack overhead\\): " + $decimal + "(?<unit>[BKMGT])$") | bytes),
+        runtime_seconds: (field("total runtime:";
+            "^total runtime: " + $decimal + "s\\.$") | .n | tonumber)
+      }
+' "$result/native.report" > "$result/native.summary.json"
+jq -es --slurpfile native "$result/native.summary.json" '
+    if length == 1 then .[0] else error("expected one summary document") end
+    |
+    . as $summary
+    | if type != "object" then error("summary must be an object") else . end
+    | $native[0] | keys as $keys
+    | reduce $keys[] as $key ({};
+        if ($summary[$key] | type) != "number" or $summary[$key] < 0 then
+            error("invalid summary field: " + $key)
+        else .[$key] = $summary[$key] end)
+    | if . == $native[0] then . else error("native footer differs from summary.json") end
+' "$input/summary.json" > "$result/matched.summary.json"
+echo "Native heap summary parity passed: $raw"

@@ -190,6 +190,17 @@ Set `XCTRACE_PARITY_OUT` to retain capture evidence. Existing traces cannot repl
 the Darwin recording. Missing tools, failed recordings/exports, empty target
 samples, and mismatches fail the gate; unsupported platforms fail rather than skip.
 
+Check a successful heaptrack artifact directory against a fresh native report:
+
+```sh
+bash scripts/check-heaptrack-parity <artifact-dir> [<evidence-dir>]
+```
+
+The checker compares all six heap summary fields with `heaptrack_print` on the
+manifest's raw recording and verifies that its SHA-256 stays unchanged. Evidence
+defaults to `target/heaptrack-parity`. Byte totals reflect heaptrack's rounded
+decimal display units, not exact raw allocation sizes.
+
 The Linux test suite requires `cc`, `objcopy`, `addr2line`,
 `pyroclast-addr2line`, and `perf` in `PATH`.
 The development shell supplies them. Native-oracle tests compile ELF fixtures
