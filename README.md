@@ -171,9 +171,24 @@ scripts/pyroclast-bench [<perf.data>] [--perf-script <perf.script>] [--export-pe
 
 The pre-commit hook uses the current project environment, entering `devenv shell`
 when necessary, and runs rustfmt, Clippy pedantic,
-`cargo nextest run`, the `perf script | Inferno` parity check, and `nix flake check`.
-The parity check uses `/mnt/downloads/inferno-slow-collapse.perf.data` by default;
-set `PERF_PARITY_DATA` to select another recording.
+`cargo nextest run`, `scripts/check-native-parity`, and `nix flake check`.
+On Linux, the parity check builds the oracle workload and captures fresh DWARF
+and frame-pointer recordings under `target`, without changing host permissions.
+Native perf capture must be permitted; set `PERF_PARITY_DATA` to check an existing
+recording instead. Capture failures and parity mismatches fail the gate.
+Linux checks remain exact comparisons of native `perf script`, Inferno folded
+stacks, and rendered SVGs for both symbolizers and inline modes.
+
+On Darwin, the gate records a fresh CPU Profiler trace through Pyroclast, then
+independently exports that trace with Apple's `xctrace`. An XSLT oracle run by
+`xsltproc`, not Pyroclast's XML parser, resolves native cell references and filters
+by the independently verified workload PID. Structured JSON comparison checks
+every leaf symbol and raw sample weight in order, total weight, and units; numeric
+encodings such as `189279` and `189279.0` compare equally without rounding.
+Xcode, recording permission, a C compiler, `xsltproc`, and `jq` are required.
+Set `XCTRACE_PARITY_OUT` to retain capture evidence. Existing traces cannot replace
+the Darwin recording. Missing tools, failed recordings/exports, empty target
+samples, and mismatches fail the gate; unsupported platforms fail rather than skip.
 
 The Linux test suite requires `cc`, `objcopy`, `addr2line`, and `perf` in `PATH`.
 The development shell supplies them. Native-oracle tests compile ELF fixtures
@@ -184,7 +199,8 @@ shell, install a C toolchain, binutils, and perf first.
 Some older symbol tests optionally inspect `target/profiling/pyroclast` or
 historical store binaries. A passing test count does not prove those optional
 fixtures were exercised. The required native parity gate rejects missing inputs,
-tool failures, empty oracle output, and script, folded-stack, or SVG differences.
+tool failures and empty oracle output. Linux rejects script, folded-stack, or SVG
+differences; Darwin rejects target-PID leaf-row, weight, or unit differences.
 Mandatory compiled C fixtures cover inline frames and non-PIE PLT addresses;
 the checked-in Xcode fixture covers native referenced CPU rows and cycle units.
 

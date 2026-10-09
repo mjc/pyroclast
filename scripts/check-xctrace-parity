@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Record through Pyroclast; independently export and query Apple's trace with XSLT.
+set -euo pipefail
+export LC_ALL=C
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+[ "$(uname -s)" = Darwin ] || { echo 'xctrace parity requires a native Darwin host' >&2; exit 1; }
+[ "$#" = 0 ] || { echo 'xctrace parity requires a fresh recording, not an existing trace' >&2; exit 1; }
+target=${CARGO_TARGET_DIR:-$repo/target}
+pyroclast=${PYROCLAST_BIN:-$target/release/pyroclast}
+[ -x "$pyroclast" ] || { echo "missing release binary: $pyroclast" >&2; exit 1; }
+for tool in cc xctrace xsltproc jq; do
+    command -v "$tool" >/dev/null || { echo "missing xctrace parity tool: $tool" >&2; exit 1; }
+done
+if [ -n "${XCTRACE_PARITY_OUT:-}" ]; then
+    mkdir -p "$XCTRACE_PARITY_OUT"
+    scratch=$(mktemp -d "$XCTRACE_PARITY_OUT/capture.XXXXXX")
+else
+    mkdir -p "$target"
+    scratch=$(mktemp -d "$target/xctrace-parity.XXXXXX")
+    trap 'rm -rf "$scratch"' EXIT
+fi
+echo "native xctrace parity capture: $scratch" >&2
+cc -O2 -g -fno-omit-frame-pointer "$repo/scripts/oracle/xctrace-workload.c" -o "$scratch/workload"
+"$pyroclast" cpu --json --out "$scratch/run" -- "$scratch/workload" "$scratch/workload.pid" > "$scratch/manifest.json"
+trace="$scratch/run/profile.raw.xctrace.trace"
+[ -d "$trace" ] || { echo 'Pyroclast produced no native trace bundle' >&2; exit 1; }
+pid=$(cat "$scratch/run/xctrace-target.pid")
+case "$pid" in ''|*[!0-9]*) echo 'invalid recorded target PID' >&2; exit 1 ;; esac
+[ "$pid" -gt 0 ] && [ "$pid" = "$(cat "$scratch/workload.pid")" ] || {
+    echo 'recorded target PID differs from the independently reported workload PID' >&2; exit 1;
+}
+jq -e '.actual_backend == "macos_xctrace" and .platform == "macos" and
+    .exit_status == 0 and .measurement.source == "xctrace" and
+    .measurement.template == "CPU Profiler"' "$scratch/run/run.json" >/dev/null
+# Use a second Apple export, not Pyroclast's XML or its XML parser.
+xctrace export --input "$trace" --output "$scratch/native.xml" \
+    --xpath '//table[@schema="cpu-profile" or @schema="time-profile"]'
+if ! xsltproc --nonet --stringparam target-pid "$pid" \
+    "$repo/scripts/oracle/xctrace-cpu.xsl" "$scratch/native.xml" |
+    jq -s -S -e '
+        if length == 0 then error("no native target CPU samples") else . end |
+        (map(.weight_unit) | unique) as $units |
+        if ($units | length) != 1 then error("mixed native CPU weight units") else . end |
+        {rows: map({symbol, weight}), total_weight: (map(.weight) | add), weight_unit: $units[0]} |
+        if .total_weight <= 0 then error("zero native CPU weight") else . end |
+        if any(.rows[]; .symbol == "pyroclast_parity_hot_loop" and .weight > 0) then .
+        else error("native export did not symbolicate the hot workload leaf") end
+    ' > "$scratch/native-summary.json"; then
+    echo "independent xctrace XML oracle failed: $scratch" >&2
+    exit 1
+fi
+jq -S '{rows, total_weight, weight_unit}' "$scratch/run/summary.json" > "$scratch/pyro-summary.json"
+if ! jq -n -e --slurpfile native "$scratch/native-summary.json" \
+    --slurpfile pyro "$scratch/pyro-summary.json" '$native == $pyro' > "$scratch/comparison.json"; then
+    echo "native xctrace target-PID/leaf/weight mismatch: $scratch" >&2
+    echo 'compare native-summary.json and pyro-summary.json in the capture directory' >&2
+    exit 1
+fi
+unit=$(jq -r .weight_unit "$scratch/native-summary.json")
+jq -e --arg unit "$unit" '.measurement.weight_unit == $unit' "$scratch/run/run.json" >/dev/null
+echo "native-xctrace-parity pid=$pid rows=true leaf-symbols=true weights=true unit=$unit"

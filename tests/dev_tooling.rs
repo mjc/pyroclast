@@ -14,7 +14,6 @@ fn devenv_and_precommit_use_nextest() {
     assert!(!flake.contains("devShells ="));
     assert!(devenv.contains("languages.rust"));
     assert!(devenv.contains("cargo-nextest"));
-    assert!(devenv.contains("cargo-nextest"));
     assert!(!devenv.contains("rust-src"));
     assert!(!devenv.contains("/home/"));
     assert!(hook.contains("devenv shell"));
@@ -47,6 +46,51 @@ fn agents_documents_nextest_for_local_tests() {
 fn precommit_uses_current_project_environment_and_preserves_required_gates() {
     let output = std::process::Command::new("bash")
         .arg("scripts/tests/hook-environment.sh")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn native_parity_generates_fresh_portable_inputs_and_preserves_explicit_failures() {
+    let output = std::process::Command::new("bash")
+        .arg("scripts/tests/native-parity-inputs.sh")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn native_parity_dispatches_platform_and_requires_darwin_record_export_comparison() {
+    let output = std::process::Command::new("bash")
+        .arg("scripts/tests/native-platform-parity.sh")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn independent_xctrace_oracle_resolves_native_cells_and_rejects_invalid_exports() {
+    let output = std::process::Command::new("bash")
+        .arg("scripts/tests/xctrace-oracle.sh")
         .output()
         .unwrap();
     assert!(

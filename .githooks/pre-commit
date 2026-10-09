@@ -14,8 +14,8 @@ echo "pre-commit: clippy pedantic" >&2
 cargo clippy --all-targets -- -D warnings -W clippy::pedantic
 echo "pre-commit: nextest" >&2
 cargo nextest run
-echo "pre-commit: independent native perf parity" >&2
+echo "pre-commit: independent native platform parity" >&2
 cargo build --quiet --release --bin pyroclast
-scripts/check-perf-parity
+scripts/check-native-parity
 echo "pre-commit: flake check" >&2
 nix flake check --no-build

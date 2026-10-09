@@ -21,6 +21,7 @@
       hyperfine
       inferno
       jq
+      libxslt
       nixfmt
       shellcheck
       tokio-console

@@ -15,11 +15,11 @@ printf '%s\n' '#!/bin/sh' "printf 'cargo %s\\n' \"\$*\" >> \"\$HOOK_LOG\"" \
     "[ \"\${FAIL_CARGO:-no}\" != yes ]" > "$tools/cargo"
 printf '%s\n' '#!/bin/sh' "printf 'nix %s\\n' \"\$*\" >> \"\$HOOK_LOG\"" > "$tools/nix"
 printf '%s\n' '#!/bin/sh' "echo parity >> \"\$HOOK_LOG\"" \
-    "[ \"\${FAIL_PARITY:-no}\" != yes ]" > "$fixture/scripts/check-perf-parity"
+    "[ \"\${FAIL_PARITY:-no}\" != yes ]" > "$fixture/scripts/check-native-parity"
 printf '%s\n' '#!/bin/sh' "echo devenv >> \"\$HOOK_LOG\"" \
     "[ \"\$1\" = shell ] && [ \"\$2\" = -- ] || exit 90" 'shift 2' \
     "export DEVENV_ROOT=\"\$EXPECTED_ROOT\"" "exec \"\$@\"" > "$tools/devenv"
-chmod +x "$tools/"* "$fixture/scripts/check-perf-parity"
+chmod +x "$tools/"* "$fixture/scripts/check-native-parity"
 export PATH="$tools:$PATH" EXPECTED_ROOT="$fixture" HOOK_LOG="$root/calls"
 cd "$fixture"
 

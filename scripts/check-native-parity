@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+case "$(uname -s)" in
+    Linux) exec bash "$repo/scripts/check-perf-parity" "$@" ;;
+    Darwin) exec bash "$repo/scripts/check-xctrace-parity" "$@" ;;
+    *) echo 'native parity requires Linux perf or Darwin xctrace; no platform skip' >&2; exit 1 ;;
+esac

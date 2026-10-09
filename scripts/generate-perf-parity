@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Generate native inputs without changing host perf permissions or sysctls.
+set -euo pipefail
+
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+output=${1:?usage: generate-perf-parity OUTPUT_DIRECTORY}
+perf=${PERF_BIN:-perf}
+mkdir -p "$output"
+rustc -C opt-level=2 -C debuginfo=2 -C force-frame-pointers=yes \
+    "$repo/scripts/oracle/workload.rs" -o "$output/workload"
+for mode in dwarf fp; do
+    callgraph=$mode
+    if [ "$mode" = dwarf ]; then
+        callgraph=dwarf,8192
+    fi
+    status=0
+    "$perf" record --quiet --buildid-all -F 997 -e cpu-clock:u \
+        --call-graph "$callgraph" -o "$output/$mode.perf.data" \
+        -- "$output/workload" > /dev/null || status=$?
+    if [ "$status" != 0 ]; then
+        echo "native $mode capture failed; configure perf permissions or pass an existing recording via PERF_PARITY_DATA" >&2
+        exit "$status"
+    fi
+done
