@@ -5,7 +5,7 @@ use crate::perfdata::records::{
 use crate::symbols::KernelRelocation;
 use hashbrown::{HashMap, HashSet};
 use rustc_hash::FxBuildHasher;
-use std::cell::Cell;
+use std::cell::{Cell, OnceCell};
 use std::cmp::Ordering;
 
 #[cfg(unix)]
@@ -412,6 +412,7 @@ struct NativeDso {
     id: usize,
     path: String,
     build_id: Option<Vec<u8>>,
+    symbol_build_id: OnceCell<Option<Vec<u8>>>,
     file_identity: Option<FileIdentity>,
 }
 
@@ -515,6 +516,7 @@ impl NativeDsoRegistry {
             id,
             path: path.to_string(),
             build_id: build_id.map(<[u8]>::to_vec),
+            symbol_build_id: OnceCell::new(),
             file_identity,
         });
         self.order.insert(low, id);
@@ -1292,6 +1294,30 @@ impl MmapTable {
         self.native_dsos.headers_initialized = true;
     }
 
+    pub(super) fn update_native_dso_build_id(&mut self, path: &str, build_id: &[u8]) {
+        // header.c:__event_process_build_id finds with empty file/build identity,
+        // then sets the ID on the existing DSO; maps keep their DSO binding.
+        let id = self.native_dsos.intern(path, None, None);
+        self.native_dsos.entries[id].build_id = Some(build_id.to_vec());
+        self.native_dsos.header_paths.insert(path.to_owned());
+        self.native_dsos.sorted = false;
+    }
+
+    pub(crate) fn symbol_mapping_ref<'a>(
+        &'a self,
+        frame: MappedFrame<'a>,
+    ) -> ResolvedMappingRef<'a> {
+        // symbol.c:1705/1866 loads a DSO once, including failed loads. Later
+        // stream metadata changes the current DSO ID, not its loaded symbols.
+        let dso = &self.native_dsos.entries[frame.mapping.native_dso_id];
+        let mut mapping = frame.resolved_ref();
+        mapping.build_id = dso
+            .symbol_build_id
+            .get_or_init(|| dso.build_id.clone())
+            .as_deref();
+        mapping
+    }
+
     pub(crate) fn resolve_user_frame_cached(
         &self,
         pid: u32,
@@ -1749,6 +1775,7 @@ mod tests {
             path: "/object".into(),
             file_identity: inode.map(file),
             build_id: Some(vec![byte; 20]),
+            symbol_build_id: std::cell::OnceCell::new(),
         };
         let a = dso(Some(2), 0x33);
         let b = dso(Some(1), 0x11);

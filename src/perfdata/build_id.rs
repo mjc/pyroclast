@@ -20,8 +20,20 @@ const BUILD_ID_RECORD_PAYLOAD_MIN_SIZE: usize = 28;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BuildIdEvent {
     pub pid: u32,
+    pub misc: u16,
     pub build_id: String,
     pub filename: String,
+}
+
+impl BuildIdEvent {
+    pub(super) fn has_valid_cpu_mode(&self) -> bool {
+        // header.c:__event_process_build_id accepts KERNEL, USER,
+        // GUEST_KERNEL and GUEST_USER (include/uapi/linux/perf_event.h).
+        matches!(
+            self.misc & crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_MASK,
+            1 | 2 | 4 | 5
+        )
+    }
 }
 
 /// Parses `HEADER_BUILD_ID` feature payload records.
@@ -67,7 +79,16 @@ pub fn build_id_events_from_perfdata(bytes: &[u8]) -> Result<Vec<BuildIdEvent>, 
     Ok(events)
 }
 
-pub(super) fn build_id_events_from_reader(
+pub(super) fn header_build_id_events_from_perfdata(
+    bytes: &[u8],
+) -> Result<Vec<BuildIdEvent>, String> {
+    build_id_feature_payload(bytes)?
+        .map(parse_build_id_events)
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+pub(super) fn header_build_id_events_from_reader(
     reader: &mut (impl Read + Seek),
 ) -> Result<Vec<BuildIdEvent>, String> {
     reader
@@ -97,21 +118,11 @@ pub(super) fn build_id_events_from_reader(
             section.size,
             file_size,
             true,
-            false,
             &mut collect,
         )?;
     }
-    // This prepass supplies optional metadata. Replay owns malformed data-stream
-    // framing errors so streaming consumers receive valid earlier samples first.
-    visit_build_id_record_section(
-        reader,
-        header.data_offset,
-        header.data_size,
-        file_size,
-        false,
-        true,
-        &mut collect,
-    )?;
+    // perf header.c:2714 reads feature metadata here. session.c:1649 applies
+    // stream HEADER_BUILD_ID during replay; never pre-read the data section.
     Ok(events)
 }
 
@@ -183,7 +194,7 @@ fn kernel_build_id_from_record_section(
     feature: bool,
 ) -> Result<Option<String>, String> {
     let mut kernel_build_id = None;
-    visit_build_id_record_section(reader, offset, size, file_size, feature, false, |event| {
+    visit_build_id_record_section(reader, offset, size, file_size, feature, |event| {
         if kernel_build_id.is_none() && is_defined_kernel_build_id(&event) {
             kernel_build_id = Some(event.build_id);
         }
@@ -199,7 +210,6 @@ fn visit_build_id_record_section(
     size: u64,
     file_size: u64,
     feature: bool,
-    stop_on_invalid_framing: bool,
     mut visit: impl FnMut(BuildIdEvent) -> bool,
 ) -> Result<(), String> {
     let end = offset
@@ -215,9 +225,6 @@ fn visit_build_id_record_section(
     let mut bytes = Vec::new();
     while offset < end {
         if end - offset < 8 {
-            if stop_on_invalid_framing {
-                return Ok(());
-            }
             return Err(format!("truncated perf record header at offset {offset}"));
         }
         let mut header_bytes = [0_u8; 8];
@@ -226,9 +233,6 @@ fn visit_build_id_record_section(
         })?;
         let header = parse_record_header(&header_bytes)?;
         if header.size < 8 || (feature && usize::from(header.size) < BUILD_ID_EVENT_MIN_SIZE) {
-            if stop_on_invalid_framing {
-                return Ok(());
-            }
             return Err(format!(
                 "invalid build-id record section record size {} at offset {offset}",
                 header.size
@@ -238,9 +242,6 @@ fn visit_build_id_record_section(
             .checked_add(u64::from(header.size))
             .ok_or_else(|| "build-id record size overflows u64".to_string())?;
         if next > end {
-            if stop_on_invalid_framing {
-                return Ok(());
-            }
             return Err(format!(
                 "build-id record overruns section at offset {offset}"
             ));
@@ -259,6 +260,7 @@ fn visit_build_id_record_section(
                 let mmap = parse_mmap2_build_id_record(&bytes[8..])?;
                 BuildIdEvent {
                     pid: mmap.pid,
+                    misc: header.misc,
                     build_id: build_id_hex(&mmap.build_id),
                     filename: mmap.path,
                 }
@@ -292,6 +294,7 @@ fn build_id_events_from_record_stream(bytes: &[u8]) -> Result<Vec<BuildIdEvent>,
                 let mmap = parse_mmap2_build_id_record(record.payload)?;
                 events.push(BuildIdEvent {
                     pid: mmap.pid,
+                    misc: record.header.misc,
                     build_id: build_id_hex(&mmap.build_id),
                     filename: mmap.path,
                 });
@@ -349,12 +352,13 @@ fn parse_build_id_event(record: &[u8]) -> Result<BuildIdEvent, String> {
 
     Ok(BuildIdEvent {
         pid: read_u32(record, 8)?,
+        misc,
         build_id: build_id_hex(&record[12..12 + build_id_size]),
         filename: filename(&record[BUILD_ID_EVENT_MIN_SIZE..])?,
     })
 }
 
-fn parse_build_id_record(misc: u16, payload: &[u8]) -> Result<BuildIdEvent, String> {
+pub(super) fn parse_build_id_record(misc: u16, payload: &[u8]) -> Result<BuildIdEvent, String> {
     if payload.len() < BUILD_ID_RECORD_PAYLOAD_MIN_SIZE {
         return Err("PERF_RECORD_HEADER_BUILD_ID payload is shorter than 28 bytes".to_string());
     }
@@ -371,6 +375,7 @@ fn parse_build_id_record(misc: u16, payload: &[u8]) -> Result<BuildIdEvent, Stri
 
     Ok(BuildIdEvent {
         pid: read_u32(payload, 0)?,
+        misc,
         build_id: build_id_hex(&payload[4..4 + build_id_size]),
         filename: filename(&payload[BUILD_ID_RECORD_PAYLOAD_MIN_SIZE..])?,
     })
@@ -429,6 +434,36 @@ mod tests {
         fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
             self.cursor.seek(position)
         }
+    }
+
+    #[test]
+    fn replay_build_id_initialization_does_not_read_sample_data_like_perf_header() {
+        // perf header.c:2714 reads HEADER_BUILD_ID features. session.c:1649
+        // handles stream IDs during replay, not a recording-wide prepass.
+        let data_size = 1024 * 1024;
+        let mut bytes = vec![0; 104 + data_size];
+        bytes[..8].copy_from_slice(b"PERFILE2");
+        bytes[8..16].copy_from_slice(&104_u64.to_le_bytes());
+        bytes[40..48].copy_from_slice(&104_u64.to_le_bytes());
+        bytes[48..56].copy_from_slice(&(data_size as u64).to_le_bytes());
+        for record in bytes[104..].as_chunks_mut::<8>().0 {
+            record[..4]
+                .copy_from_slice(&crate::perfdata::records::PERF_RECORD_SAMPLE.to_le_bytes());
+            record[6..8].copy_from_slice(&8_u16.to_le_bytes());
+        }
+        let mut reader = CountingReader {
+            cursor: Cursor::new(bytes),
+            bytes_read: 0,
+        };
+        assert!(
+            super::header_build_id_events_from_reader(&mut reader)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            reader.bytes_read, 104,
+            "replay initialization read the data section"
+        );
     }
 
     #[test]

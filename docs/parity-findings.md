@@ -3,6 +3,46 @@
 Status as of 2026-06-11. Goal: `pyroclast plumbing fold|flamegraph` fully replaces
 `perf script | inferno-collapse-perf | inferno-flamegraph`.
 
+## 2026-10-09 build-ID initialization versus stream delivery
+
+Replay previously collected build IDs from the entire data section before
+delivering any samples. This both reread the recording and incorrectly applied
+future stream IDs to earlier samples. A two-minute Rust-default CPU capture on
+the 121.6 GB recording spent 99.11% of sampled CPU under that metadata walk;
+this was not a profile of the folding hot path.
+
+Perf initializes header-feature IDs in `tools/perf/util/header.c:2714`
+(`process_build_id`). Stream `PERF_RECORD_HEADER_BUILD_ID` instead dispatches
+through `tools/perf/util/session.c:1649`; `header.c:2505-2575`
+(`__event_process_build_id`) rejects unknown CPU modes and updates the existing
+DSO. User records are handled before timestamp-ordered sample delivery. Thus a
+later file record can affect an earlier queued sample, but cannot retroactively
+change a sample already delivered. `tools/perf/util/symbol.c:1705,1866`
+(`dso__load`) loads symbols only once, including failed loads: changing a DSO's
+recorded ID does not reload its symbols.
+
+Initialization now reads only header features. Replay applies stream IDs at
+their delivery point, while symbol requests preserve the first loaded identity.
+The explicit whole-recording build-ID extraction API remains separate. Borrowed
+mapping frames retain their two-word representation. The default symbolizer
+remains in-process Rust addr2line, with no automatic GNU fallback.
+
+Native fixtures compile two real ELFs with distinct build IDs and symbol names.
+Fresh `perf script` and Inferno output are compared exactly with both public
+symbolizers, both inline modes, and file/byte library replay. Cases cover IDs
+before mapping, between mapping and first lookup, after a delivered lookup,
+before queued delivery, and invalid CPU mode. The old implementation failed the
+late-ID case by selecting the cached ELF for both samples rather than retaining
+the live ELF. Two formerly green tests that expected future IDs during
+initialization were renamed and corrected; both were observed failing on the
+old preload behavior before keeping the fix. A counting-reader regression also
+requires header-only initialization to leave the sample data unread.
+
+No libdw unwind, binutils `addr2line.c:translate_addresses`, or Inferno
+`src/collapse/perf.rs:on_stack_line` normalization rules change here. Passing
+these fixtures does not establish universal parity or completed throughput for
+the 121.6 GB recording.
+
 ## 2026-09-30 streaming replay and folded storage
 
 Replay delivers samples against the maps visible at their ordered delivery,

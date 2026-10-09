@@ -1206,7 +1206,9 @@ fn audit_regression_summary_retains_metadata_without_callchain() {
 }
 
 #[test]
-fn audit_regression_file_and_bytes_share_stream_build_ids() {
+fn file_and_bytes_do_not_apply_future_stream_build_ids_to_earlier_samples() {
+    // perf session.c:1649 dispatches stream HEADER_BUILD_ID when encountered;
+    // header.c:5232/__event_process_build_id updates that DSO, not past samples.
     use pyroclast::perfdata::fold::fold_perfdata_file_with_symbols;
     let attr = file_attr_bytes(
         PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
@@ -1218,11 +1220,14 @@ fn audit_regression_file_and_bytes_share_stream_build_ids() {
     for (header_id, stream_id) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut records = vec![mapping.clone(), sample.clone()];
         if stream_id {
-            records.push(build_id_event_payload(11, &[0xbb; 20], "/bin/app"));
+            let mut event = build_id_event_payload(11, &[0xbb; 20], "/bin/app");
+            event[4..6].copy_from_slice(&PERF_RECORD_MISC_CPUMODE_USER.to_le_bytes());
+            records.push(event);
         }
         let mut bytes = perfdata_with_records_and_attrs_vec(vec![attr], records);
         if header_id {
-            let payload = build_id_event_payload(11, &[0xaa; 20], "/bin/app");
+            let mut payload = build_id_event_payload(11, &[0xaa; 20], "/bin/app");
+            payload[4..6].copy_from_slice(&PERF_RECORD_MISC_CPUMODE_USER.to_le_bytes());
             put_u64(&mut bytes, 72, 1 << 2);
             let offset = bytes.len() + 16;
             bytes.extend(u64::try_from(offset).unwrap().to_le_bytes());
@@ -1247,14 +1252,49 @@ fn audit_regression_file_and_bytes_share_stream_build_ids() {
         assert!(!requests.is_empty());
         assert_eq!(
             requests[0][0].build_id,
-            if stream_id {
-                Some("bb".repeat(20))
-            } else if header_id {
+            if header_id {
                 Some("aa".repeat(20))
             } else {
                 None
             }
         );
+    }
+}
+
+#[test]
+fn file_and_bytes_ignore_build_id_records_with_invalid_cpu_mode_like_perf() {
+    // header.c:__event_process_build_id rejects misc=0 in its cpumode switch.
+    let attr = file_attr_bytes(
+        PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+        0,
+        0,
+    );
+    let mut stream = build_id_event_payload(11, &[0xbb; 20], "/bin/app");
+    stream[4..6].copy_from_slice(&0_u16.to_le_bytes());
+    let mut feature = build_id_event_payload(11, &[0xaa; 20], "/bin/app");
+    feature[4..6].copy_from_slice(&0_u16.to_le_bytes());
+    let records = [
+        stream,
+        record_bytes(10, &mmap2_payload(11, 12, 0x1000, 0x100, 0, 5, "/bin/app")),
+        record_bytes(9, &sample_payload(0x1010, 11, 12, [0x1010])),
+    ];
+    let bytes = perfdata_with_records_attrs_and_build_id_feature([attr], records, &feature);
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), &bytes).unwrap();
+    for file_route in [false, true] {
+        let resolver = RecordingSymbolResolver::default();
+        if file_route {
+            pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(
+                file.path(),
+                FoldOptions::default(),
+                &resolver,
+            )
+            .unwrap();
+        } else {
+            fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
+                .unwrap();
+        }
+        assert_eq!(resolver.calls()[0][0].build_id, None);
     }
 }
 
@@ -7971,7 +8011,7 @@ fn build_id_event_payload(pid: u32, build_id: &[u8; 20], filename: &str) -> Vec<
     let size = 36 + filename.len() + 1;
     let mut payload = Vec::new();
     payload.extend(67_u32.to_le_bytes());
-    payload.extend(0_u16.to_le_bytes());
+    payload.extend(PERF_RECORD_MISC_CPUMODE_USER.to_le_bytes());
     payload.extend(u16::try_from(size).expect("event size").to_le_bytes());
     payload.extend(pid.to_le_bytes());
     payload.extend(build_id);

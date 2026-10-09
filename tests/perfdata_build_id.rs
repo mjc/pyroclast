@@ -57,6 +57,7 @@ fn parses_build_id_events_from_header_feature_payload() {
         events,
         vec![BuildIdEvent {
             pid: 123,
+            misc: 0,
             build_id: "16ed3d5317ad219c89d0e3c5ea0ea2caa3cd4949".to_string(),
             filename: "[kernel.kallsyms]".to_string(),
         }]
@@ -86,6 +87,7 @@ fn parses_build_id_events_written_by_perf_write_buildid() {
         events,
         vec![BuildIdEvent {
             pid: u32::MAX,
+            misc: 1 << 15,
             build_id: "5aebdcbbc24de5f637eab44b9d162c84f1a89338".to_string(),
             filename: "/tmp/oracle-workload".to_string(),
         }]
@@ -165,11 +167,13 @@ fn extracts_all_build_id_events_from_perfdata_header_feature() {
         vec![
             BuildIdEvent {
                 pid: u32::MAX,
+                misc: 0,
                 build_id: "16ed3d5317ad219c89d0e3c5ea0ea2caa3cd4949".to_string(),
                 filename: "[kernel.kallsyms]".to_string(),
             },
             BuildIdEvent {
                 pid: 42,
+                misc: 0,
                 build_id: "aabbccddeeff102030405060708090a0b0c0d0e0".to_string(),
                 filename: "/tmp/stale-app".to_string(),
             },
@@ -296,6 +300,7 @@ proptest! {
             .iter()
             .map(|spec| BuildIdEvent {
                 pid: spec.pid,
+                misc: 0,
                 build_id: build_id_hex(&spec.build_id),
                 filename: spec.filename.clone(),
             })

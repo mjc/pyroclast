@@ -20,7 +20,8 @@ use crate::folded::{
 };
 use crate::perfdata::attrs::{PerfFileAttr, parse_file_attr_ids, parse_file_attrs};
 use crate::perfdata::build_id::{
-    BuildIdEvent, build_id_events_from_perfdata, build_id_events_from_reader,
+    BuildIdEvent, header_build_id_events_from_perfdata, header_build_id_events_from_reader,
+    parse_build_id_record,
 };
 use crate::perfdata::endian::{read_u32, read_u64};
 use crate::perfdata::header::{
@@ -34,13 +35,9 @@ use crate::perfdata::memory::{DsoMemorySources, MappedMemory};
 use crate::perfdata::records::{
     PERF_RECORD_FINISHED_ROUND, PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_CPUMODE_KERNEL,
     PERF_RECORD_MISC_CPUMODE_MASK, PERF_RECORD_MISC_CPUMODE_USER, PERF_RECORD_MISC_FORK_EXEC,
-    PERF_RECORD_MISC_MMAP_BUILD_ID, ParsedRecord, PerfRecord, parse_aux_output_hw_id_record,
-    parse_aux_record, parse_bpf_event_record, parse_callchain_deferred_record, parse_cgroup_record,
-    parse_comm_record, parse_exit_record, parse_fork_record, parse_itrace_start_record,
-    parse_ksymbol_record, parse_lost_record, parse_lost_samples_record, parse_mmap_record,
-    parse_mmap2_build_id_record, parse_mmap2_record, parse_namespaces_record, parse_read_record,
-    parse_record, parse_switch_cpu_wide_record, parse_switch_record, parse_text_poke_record,
-    parse_throttle_record, parse_unthrottle_record,
+    PERF_RECORD_MISC_MMAP_BUILD_ID, ParsedRecord, PerfRecord, parse_callchain_deferred_record,
+    parse_comm_record, parse_fork_record, parse_mmap_record, parse_mmap2_build_id_record,
+    parse_mmap2_record, parse_record,
 };
 use crate::perfdata::samples::{
     PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_ID,
@@ -293,6 +290,7 @@ type UnwindModuleKey = (String, u64);
 const MAX_LIBDW_CALLBACK_REPORT_PASSES: usize = 8;
 
 enum FoldRecord<'a> {
+    BuildId(BuildIdEvent),
     Comm(crate::perfdata::records::CommRecord),
     Mmap {
         misc: u16,
@@ -962,25 +960,17 @@ fn parse_record_with_context(record: PerfRecord<'_>) -> Result<ParsedRecord, Str
 
 fn parse_fold_record(record: PerfRecord<'_>) -> Result<FoldRecord<'_>, String> {
     let parsed = match record.header.record_type {
+        crate::perfdata::records::PERF_RECORD_HEADER_BUILD_ID => {
+            FoldRecord::BuildId(parse_build_id_record(record.header.misc, record.payload)?)
+        }
         crate::perfdata::records::PERF_RECORD_MMAP => FoldRecord::Mmap {
             misc: record.header.misc,
             record: parse_mmap_record(record.payload)?,
         },
-        crate::perfdata::records::PERF_RECORD_LOST => {
-            parse_lost_record(record.payload).map(|_| FoldRecord::Ignored)?
-        }
         crate::perfdata::records::PERF_RECORD_COMM => {
             let mut comm = parse_comm_record(record.payload)?;
             comm.is_exec = record.header.misc & PERF_RECORD_MISC_COMM_EXEC != 0;
             FoldRecord::Comm(comm)
-        }
-        crate::perfdata::records::PERF_RECORD_THROTTLE => {
-            parse_throttle_record(record.payload)?;
-            FoldRecord::Ignored
-        }
-        crate::perfdata::records::PERF_RECORD_UNTHROTTLE => {
-            parse_unthrottle_record(record.payload)?;
-            FoldRecord::Ignored
         }
         crate::perfdata::records::PERF_RECORD_MMAP2
             if record.header.misc & PERF_RECORD_MISC_MMAP_BUILD_ID != 0 =>
@@ -994,71 +984,22 @@ fn parse_fold_record(record: PerfRecord<'_>) -> Result<FoldRecord<'_>, String> {
             misc: record.header.misc,
             record: parse_mmap2_record(record.payload)?,
         },
-        crate::perfdata::records::PERF_RECORD_LOST_SAMPLES => {
-            parse_lost_samples_record(record.payload)?;
-            FoldRecord::Ignored
-        }
-        crate::perfdata::records::PERF_RECORD_EXIT => {
-            parse_exit_record(record.payload)?;
-            FoldRecord::Ignored
-        }
         crate::perfdata::records::PERF_RECORD_FORK => FoldRecord::Fork({
             let mut fork = parse_fork_record(record.payload)?;
             fork.clone_maps = record.header.misc & PERF_RECORD_MISC_FORK_EXEC == 0;
             fork
         }),
-        crate::perfdata::records::PERF_RECORD_READ => {
-            parse_read_record(record.payload)?;
-            FoldRecord::Ignored
-        }
         crate::perfdata::records::PERF_RECORD_SAMPLE => FoldRecord::Sample {
             misc: record.header.misc,
             payload: record.payload,
         },
-        crate::perfdata::records::PERF_RECORD_AUX => {
-            parse_aux_record(record.payload)?;
-            FoldRecord::Ignored
-        }
-        crate::perfdata::records::PERF_RECORD_ITRACE_START => {
-            parse_itrace_start_record(record.payload)?;
-            FoldRecord::Ignored
-        }
-        crate::perfdata::records::PERF_RECORD_SWITCH => {
-            parse_switch_record(record.payload)?;
-            FoldRecord::Ignored
-        }
-        crate::perfdata::records::PERF_RECORD_SWITCH_CPU_WIDE => {
-            parse_switch_cpu_wide_record(record.payload)?;
-            FoldRecord::Ignored
-        }
-        crate::perfdata::records::PERF_RECORD_NAMESPACES => {
-            parse_namespaces_record(record.payload)?;
-            FoldRecord::Ignored
-        }
-        crate::perfdata::records::PERF_RECORD_KSYMBOL => {
-            parse_ksymbol_record(record.payload)?;
-            FoldRecord::Ignored
-        }
-        crate::perfdata::records::PERF_RECORD_BPF_EVENT => {
-            parse_bpf_event_record(record.payload)?;
-            FoldRecord::Ignored
-        }
-        crate::perfdata::records::PERF_RECORD_CGROUP => {
-            parse_cgroup_record(record.payload)?;
-            FoldRecord::Ignored
-        }
-        crate::perfdata::records::PERF_RECORD_TEXT_POKE => {
-            parse_text_poke_record(record.payload)?;
-            FoldRecord::Ignored
-        }
-        crate::perfdata::records::PERF_RECORD_AUX_OUTPUT_HW_ID => {
-            parse_aux_output_hw_id_record(record.payload)?;
-            FoldRecord::Ignored
-        }
         crate::perfdata::records::PERF_RECORD_CALLCHAIN_DEFERRED => {
             FoldRecord::CallchainDeferred(parse_callchain_deferred_record(record.payload)?)
         }
-        _ => FoldRecord::Ignored,
+        _ => {
+            parse_record(record)?;
+            FoldRecord::Ignored
+        }
     };
     Ok(parsed)
 }
@@ -1270,7 +1211,7 @@ fn deliver_record<O: SampleOutput>(
 }
 
 fn header_build_ids_by_filename(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, String> {
-    recorded_build_ids_by_filename(build_id_events_from_perfdata(bytes)?)
+    recorded_build_ids_by_filename(header_build_id_events_from_perfdata(bytes)?)
 }
 
 fn recorded_build_ids_by_filename(
@@ -1278,6 +1219,7 @@ fn recorded_build_ids_by_filename(
 ) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let mut ids = events
         .into_iter()
+        .filter(BuildIdEvent::has_valid_cpu_mode)
         // tools/perf/util/build-id.c:build_id__is_defined: empty and all-zero
         // recorded IDs are absent, not identities to require from an ELF.
         .filter(|event| event.build_id.bytes().any(|byte| byte != b'0'))
@@ -2078,7 +2020,7 @@ fn header_build_ids_by_filename_from_file(
     let mut reader = file
         .try_clone()
         .map_err(|error| format!("failed to clone perf.data handle: {error}"))?;
-    recorded_build_ids_by_filename(build_id_events_from_reader(&mut reader)?)
+    recorded_build_ids_by_filename(header_build_id_events_from_reader(&mut reader)?)
 }
 
 // HEADER_ARCH feature bit (tools/perf/util/header.h enum HEADER_*).
@@ -2420,6 +2362,17 @@ impl SessionState {
                 .map(|(path, id)| (path.as_str(), id.as_slice())),
         );
         match record {
+            FoldRecord::BuildId(event) => {
+                // session.c:1649 processes these user records before timestamp
+                // queuing. header.c:__event_process_build_id updates that DSO.
+                if event.has_valid_cpu_mode() {
+                    let id =
+                        hex_build_id_bytes(&event.build_id).expect("parsed build-ID hexadecimal");
+                    self.mmap_table
+                        .update_native_dso_build_id(&event.filename, &id);
+                    self.header_build_ids.insert(event.filename, id);
+                }
+            }
             FoldRecord::Comm(record) => {
                 update_comm_tables(
                     &mut self.process_comms,
@@ -2694,6 +2647,7 @@ where
 }
 
 fn prefetch_sample_symbols<R: SymbolResolver>(
+    table: &MmapTable,
     frames: &[(FoldFrame, FrameMappingDecision<'_>, usize)],
     cache: &mut SymbolFrameCache<'_, R>,
     inline: bool,
@@ -2709,7 +2663,7 @@ fn prefetch_sample_symbols<R: SymbolResolver>(
                 return None;
             };
             (expand == (inline && !matches!(frame, FoldFrame::SampleIp { .. })))
-                .then(|| mapping.resolved_ref())
+                .then(|| table.symbol_mapping_ref(*mapping))
         });
         cache.prefetch_mapping_refs_with_mode(mappings, expand)?;
     }
@@ -3131,8 +3085,13 @@ impl<'a> FoldFrameResolver<'a> {
                             );
                             (frame, decision, repeats)
                         }));
-                        let status =
-                            append_pending_folded_frames(&pending, buffers, cache, self.inline)?;
+                        let status = append_pending_folded_frames(
+                            self.mmap_table,
+                            &pending,
+                            buffers,
+                            cache,
+                            self.inline,
+                        )?;
                         if matches!(status, FoldedRenderStatus::RequiresPerfText) {
                             return Ok(status);
                         }
@@ -3234,7 +3193,7 @@ impl<'a> FoldFrameResolver<'a> {
                 write_perf_script_inline_mapped_decision_frame(
                     writer,
                     address,
-                    &mapping.resolved_ref(),
+                    &self.mmap_table.symbol_mapping_ref(mapping),
                     symbol_cache,
                 )?;
             }
@@ -3275,7 +3234,7 @@ impl<'a> FoldFrameResolver<'a> {
                     writer,
                     address,
                     is_cookie,
-                    &mapping.resolved_ref(),
+                    &self.mmap_table.symbol_mapping_ref(mapping),
                     symbol_cache,
                     self.inline,
                 )?;
@@ -3406,6 +3365,7 @@ impl<'a> FoldFrameResolver<'a> {
 }
 
 fn append_pending_folded_frames<R: SymbolResolver>(
+    table: &MmapTable,
     pending: &[(FoldFrame, FrameMappingDecision<'_>, usize)],
     buffers: &mut FoldedRenderBuffers,
     cache: &mut SymbolFrameCache<'_, R>,
@@ -3426,7 +3386,7 @@ fn append_pending_folded_frames<R: SymbolResolver>(
     {
         return Ok(FoldedRenderStatus::RequiresPerfText);
     }
-    prefetch_sample_symbols(pending, cache, inline)?;
+    prefetch_sample_symbols(table, pending, cache, inline)?;
     for &(frame, decision, repeats) in pending {
         let segment_start = if repeats > 1 { buffers.stack_len() } else { 0 };
         let status = append_prefetched_folded_frame(buffers, frame, decision, cache, inline)?;
@@ -6176,6 +6136,7 @@ mod tests {
             .enumerate()
             .map(|(index, build_id)| super::BuildIdEvent {
                 pid: 11,
+                misc: crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_USER,
                 filename: format!("/object-{index}"),
                 build_id: build_id.into(),
             })
@@ -6188,18 +6149,19 @@ mod tests {
     }
 
     #[test]
-    fn associates_perf_temporary_vdso_build_id_alias_with_the_vdso_mapping() {
+    fn header_build_ids_do_not_preload_vdso_aliases_from_later_stream_records() {
         let filename = b"/tmp/perf-vdso.so-ABC123\0";
         let mut record = Vec::new();
         record.extend(67_u32.to_le_bytes());
-        record.extend(0_u16.to_le_bytes());
+        record.extend(crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_USER.to_le_bytes());
         record.extend(
-            u16::try_from(8 + 4 + 20 + filename.len())
+            u16::try_from(8 + 4 + 24 + filename.len())
                 .unwrap()
                 .to_le_bytes(),
         );
         record.extend(0_u32.to_le_bytes());
         record.extend([0xaa; 20]);
+        record.extend([0; 4]);
         record.extend(filename);
         let mut bytes = vec![0_u8; 104];
         bytes[..8].copy_from_slice(b"PERFILE2");
@@ -6210,7 +6172,10 @@ mod tests {
         bytes[48..56].copy_from_slice(&u64::try_from(record.len()).unwrap().to_le_bytes());
         bytes.extend(record);
         let ids = super::header_build_ids_by_filename(&bytes).unwrap();
-        assert_eq!(ids.get("[vdso]"), Some(&vec![0xaa; 20]));
+        assert!(
+            ids.is_empty(),
+            "stream IDs are applied during replay, not header loading"
+        );
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -6259,11 +6224,13 @@ mod tests {
         let events = [
             crate::perfdata::build_id::BuildIdEvent {
                 pid: 1,
+                misc: crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_USER,
                 filename: "/tmp/perf-vdso.so-ABC123".into(),
                 build_id: "aa".into(),
             },
             crate::perfdata::build_id::BuildIdEvent {
                 pid: 2,
+                misc: crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_USER,
                 filename: "/tmp/perf-vdso.so-XYZ987".into(),
                 build_id: "bb".into(),
             },
@@ -9892,7 +9859,7 @@ mod tests {
                     )
                 })
                 .collect::<Vec<_>>();
-            super::prefetch_sample_symbols(&decisions, &mut cache, true).unwrap();
+            super::prefetch_sample_symbols(&table, &decisions, &mut cache, true).unwrap();
         }
         assert_eq!(*resolver.full_requests.borrow(), vec![0x10, 0x20]);
         assert!(resolver.base_requests.borrow().is_empty());
