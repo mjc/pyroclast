@@ -99,11 +99,30 @@ impl Drop for FinalizationScope {
     }
 }
 
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub struct InheritedFile {
+    name: String,
+    file: std::sync::Arc<std::fs::File>,
+}
+
+#[cfg(unix)]
+impl PartialEq for InheritedFile {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && std::sync::Arc::ptr_eq(&self.file, &other.file)
+    }
+}
+
+#[cfg(unix)]
+impl Eq for InheritedFile {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandSpec {
     pub program: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    #[cfg(unix)]
+    pub inherited_files: Vec<InheritedFile>,
     pub stdin: Option<Vec<u8>>,
     pub interactive: bool,
     pub capture_output: bool,
@@ -118,6 +137,8 @@ impl CommandSpec {
             program: program.into(),
             args: Vec::new(),
             env: Vec::new(),
+            #[cfg(unix)]
+            inherited_files: Vec::new(),
             stdin: None,
             interactive: false,
             capture_output: false,
@@ -141,6 +162,22 @@ impl CommandSpec {
     #[must_use]
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.push((key.into(), value.into()));
+        self
+    }
+
+    /// Passes an owned file to the child; the named environment variable holds
+    /// its descriptor. Parent descriptors retain their close-on-exec flags.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn inherit_file(
+        mut self,
+        name: impl Into<String>,
+        file: std::sync::Arc<std::fs::File>,
+    ) -> Self {
+        self.inherited_files.push(InheritedFile {
+            name: name.into(),
+            file,
+        });
         self
     }
 
@@ -343,8 +380,11 @@ fn run_process(command: &CommandSpec) -> std::io::Result<CommandOutput> {
     {
         use std::os::unix::process::CommandExt;
         std_command.process_group(0);
+        let inherited_files = configure_inherited_files(&mut std_command, command)?;
         check_cancellation(command)?;
-        run_owned_process(std_command.spawn()?, command, &scope)
+        let child = std_command.spawn()?;
+        drop(inherited_files);
+        run_owned_process(child, command, &scope)
     }
     #[cfg(not(unix))]
     let mut child = std_command.spawn()?;
@@ -385,6 +425,45 @@ fn run_process(command: &CommandSpec) -> std::io::Result<CommandOutput> {
         stdout: output.stdout,
         stderr: output.stderr,
     })
+}
+
+#[cfg(unix)]
+fn configure_inherited_files(
+    child: &mut std::process::Command,
+    command: &CommandSpec,
+) -> std::io::Result<Vec<std::os::fd::OwnedFd>> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+
+    let mut files = Vec::with_capacity(command.inherited_files.len());
+    for inherited in &command.inherited_files {
+        // Allocate before fork, above stdio and without choosing a fixed FD
+        // that might collide with Rust's exec-error pipe. Parent FDs stay CLOEXEC.
+        let fd = unsafe { libc::fcntl(inherited.file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let file = unsafe { OwnedFd::from_raw_fd(fd) };
+        child.env(&inherited.name, fd.to_string());
+        files.push(file);
+    }
+    if !files.is_empty() {
+        let descriptors = files.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>();
+        // The child only calls async-signal-safe fcntl; allocations and
+        // environment construction are complete before fork.
+        unsafe {
+            child.pre_exec(move || {
+                for fd in &descriptors {
+                    let flags = libc::fcntl(*fd, libc::F_GETFD);
+                    if flags < 0 || libc::fcntl(*fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
+    Ok(files)
 }
 
 #[cfg(unix)]

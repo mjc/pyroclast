@@ -1,5 +1,46 @@
 use pyroclast::process::{CommandRunner, CommandSpec, RealCommandRunner};
 
+#[cfg(unix)]
+#[test]
+fn inherited_file_survives_exec_without_reopening_its_deleted_path() {
+    use std::os::fd::AsRawFd;
+
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("selected");
+    std::fs::write(&path, b"selected bytes").unwrap();
+    let file = std::sync::Arc::new(std::fs::File::open(&path).unwrap());
+    std::fs::remove_file(path).unwrap();
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+    assert_ne!(flags & libc::FD_CLOEXEC, 0);
+    let output = RealCommandRunner::default()
+        .run(
+            &CommandSpec::new("sh")
+                .args(["-c", "cat \"/dev/fd/$SELECTED_INPUT\"; cat"])
+                .inherit_file("SELECTED_INPUT", file.clone())
+                .stdin(b"\naddress protocol".to_vec()),
+        )
+        .unwrap();
+    assert_eq!(output.status_code, Some(0));
+    assert_eq!(output.stdout, b"selected bytes\naddress protocol");
+    assert_eq!(
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) },
+        flags
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn inherited_files_do_not_break_exec_failure_reporting() {
+    let file = std::sync::Arc::new(tempfile::tempfile().unwrap());
+    let error = RealCommandRunner::default()
+        .run(
+            &CommandSpec::new("/definitely/missing/pyroclast-test-command")
+                .inherit_file("SELECTED_INPUT", file),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+}
+
 #[test]
 fn real_runner_captures_status_stdout_and_stderr() {
     let output = RealCommandRunner::default()
