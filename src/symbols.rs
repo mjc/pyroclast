@@ -26,7 +26,7 @@ use serde::Serialize;
 use smallvec::SmallVec;
 
 use crate::perfdata::build_id::{
-    kernel_build_id_from_perfdata, kernel_build_id_from_perfdata_file,
+    hex_build_id_bytes, kernel_build_id_from_perfdata, kernel_build_id_from_perfdata_file,
 };
 use crate::perfdata::mappings::{FileIdentity, MappedFrame, ResolvedMappingRef};
 use crate::process::{CommandRunner, CommandSpec};
@@ -125,6 +125,12 @@ impl Ord for SymbolRequest {
 }
 
 pub trait SymbolResolver {
+    /// Reports the live ELF's ID before a DSO's first symbol lookup, as perf's
+    /// `symbol.c:dso__load` does before selecting build-ID cache candidates.
+    fn object_build_id(&self, _path: &Path) -> Option<Vec<u8>> {
+        None
+    }
+
     /// Kernel map initialization can change the source between callchain nodes.
     fn requires_kernel_cursor_order(&self) -> bool {
         false
@@ -2294,6 +2300,10 @@ where
         table.get_frame(mapping)
     }
 
+    pub(crate) fn resolver(&self) -> &'a R {
+        self.resolver
+    }
+
     /// Returns a session-local projection identity and borrowed frames in one lookup.
     /// A miss is outer `None`; fully unresolved frames have no identity.
     #[inline]
@@ -2429,6 +2439,17 @@ impl<O> SymbolResolver for PerfSymbolResolver<O>
 where
     O: SymbolResolver,
 {
+    fn object_build_id(&self, path: &Path) -> Option<Vec<u8>> {
+        let mut cache = self
+            .address_cache
+            .lock()
+            .expect("object address cache lock");
+        let id = object_address_metadata(path, &mut cache)?
+            .build_id
+            .as_deref()?;
+        Some(hex_build_id_bytes(id).expect("ELF build-ID hexadecimal"))
+    }
+
     fn requires_kernel_cursor_order(&self) -> bool {
         self.kcore_symbols_ref()
             .is_some_and(|symbols| !symbols.is_active())
@@ -3069,6 +3090,10 @@ impl<R> SymbolResolver for Addr2lineResolver<'_, R>
 where
     R: CommandRunner,
 {
+    fn object_build_id(&self, path: &Path) -> Option<Vec<u8>> {
+        self.object_metadata(path)?.build_id()
+    }
+
     fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
         let mut resolved = vec![None; requests.len()];
         for (path, indexes) in grouped_request_indexes(requests) {
@@ -3186,6 +3211,13 @@ impl<R> SymbolResolver for SelectedObjectResolver<'_, R>
 where
     R: CommandRunner,
 {
+    fn object_build_id(&self, path: &Path) -> Option<Vec<u8>> {
+        match self {
+            Self::Addr2line(resolver) => resolver.object_build_id(path),
+            Self::RustAddr2line(resolver) => resolver.object_build_id(path),
+        }
+    }
+
     fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
         match self {
             Self::Addr2line(resolver) => resolver.resolve_batch(requests),
@@ -3224,6 +3256,10 @@ where
 }
 
 impl SymbolResolver for RustAddr2lineResolver {
+    fn object_build_id(&self, path: &Path) -> Option<Vec<u8>> {
+        self.object_metadata(path)?.build_id()
+    }
+
     fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
         let mut resolved = vec![None; requests.len()];
         for (path, indexes) in grouped_request_indexes(requests) {
@@ -4424,6 +4460,11 @@ impl PerfDwarfNameResolver {
 }
 
 impl CachedObjectMetadata {
+    fn build_id(&self) -> Option<Vec<u8>> {
+        let object = object::File::parse(self.object_bytes.as_ref()).ok()?;
+        object.build_id().ok()?.map(<[u8]>::to_vec)
+    }
+
     /// Builds frame indexes for every DWARF unit covering `addresses` that has
     /// not been indexed by an earlier batch.
     fn prepare_dwarf_frames_for_addresses(&self, addresses: &[u64]) {

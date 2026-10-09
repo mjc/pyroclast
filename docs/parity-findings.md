@@ -3,6 +3,44 @@
 Status as of 2026-06-11. Goal: `pyroclast plumbing fold|flamegraph` fully replaces
 `perf script | inferno-collapse-perf | inferno-flamegraph`.
 
+## 2026-10-09 live ELF build-ID discovery and DSO lookup order
+
+`tools/perf/util/symbol.c:1739-1746` (`dso__load`) reads a missing build ID
+from the live ELF before selecting a symbol source. That ID participates in
+both build-ID cache selection and subsequent MMAP2 DSO identity comparisons.
+Pyroclast previously left the DSO identity undefined. Two fresh native tests
+proved this wrong: a cache entry matching the discovered ID was ignored, and
+a later mapping with a different ID incorrectly reused the loaded live ELF.
+Both tests failed before the fix. They compare exact native text and Inferno
+folded output with both symbolizers, both inline modes, and file/byte replay.
+
+The first symbol request now discovers a missing ID using the resolver's
+existing object metadata, publishes it to the DSO identity, and freezes the
+symbol source separately. Later requests borrow that frozen identity. A
+counting resolver checks that discovery happens once per DSO, not per frame,
+and that metadata updates, clearing, and fork copies do not reload symbols.
+Native tests also cover failed loads and later clearing followed by MMAP2
+identity enrichment. The default remains Rust addr2line with no GNU fallback.
+
+A third native red test exposed an unnecessary re-sort in the previous
+stream-ID fix. `tools/perf/util/dso.c:1739-1742` (`dso__set_build_id`) only
+writes the ID; it does not invalidate `dsos->sorted`. In contrast,
+`dso.c:1509-1537` (`__dso__improve_id`) invalidates the order when a mapping
+enriches missing identity fields. These differ because the wildcard identity
+comparator is non-transitive. With two loaded same-path DSOs, a stream ID
+update that reverses their ID ordering must leave subsequent wildcard lookup
+on the same middle entry. Native perf kept the second DSO's symbols, while
+Pyroclast's extra sort selected the first. Removing that sort fixes the red
+test; automatic ELF discovery likewise does not invalidate the order.
+
+These are DSO loading and identity fixes. Libdw's retained module handling in
+`tools/perf/util/unwind-libdw.c:80-135`, elfutils
+`libdwfl/dwfl_report_elf.c:241-328`, binutils
+`binutils/addr2line.c:287-418` (`translate_addresses`), and Inferno
+`src/collapse/perf.rs:450-591` were reread. Their unwind, inline iteration,
+and normalization algorithms are unchanged. This coverage does not establish
+universal parity across recordings or backend versions.
+
 ## 2026-10-09 build-ID initialization versus stream delivery
 
 Replay previously collected build IDs from the entire data section before

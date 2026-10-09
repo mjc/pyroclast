@@ -21,7 +21,7 @@ use crate::folded::{
 use crate::perfdata::attrs::{PerfFileAttr, parse_file_attr_ids, parse_file_attrs};
 use crate::perfdata::build_id::{
     BuildIdEvent, header_build_id_events_from_perfdata, header_build_id_events_from_reader,
-    parse_build_id_record,
+    hex_build_id_bytes, parse_build_id_record,
 };
 use crate::perfdata::endian::{read_u32, read_u64};
 use crate::perfdata::header::{
@@ -2153,19 +2153,6 @@ fn read_file_range(
     Ok(bytes)
 }
 
-fn hex_build_id_bytes(hex: &str) -> Result<Vec<u8>, String> {
-    if !hex.len().is_multiple_of(2) {
-        return Err(format!("build-id hex has odd length: {}", hex.len()));
-    }
-    (0..hex.len())
-        .step_by(2)
-        .map(|index| {
-            u8::from_str_radix(&hex[index..index + 2], 16)
-                .map_err(|error| format!("build-id hex is invalid at offset {index}: {error}"))
-        })
-        .collect()
-}
-
 impl SessionState {
     fn new(header_build_ids: BTreeMap<String, Vec<u8>>) -> Self {
         Self {
@@ -2652,6 +2639,7 @@ fn prefetch_sample_symbols<R: SymbolResolver>(
     cache: &mut SymbolFrameCache<'_, R>,
     inline: bool,
 ) -> Result<(), String> {
+    let resolver = cache.resolver();
     // Batch only the currently delivered sample. Future samples may observe a
     // different map; SymbolFrameCache deduplicates already resolved addresses.
     for expand in [true, false] {
@@ -2663,7 +2651,7 @@ fn prefetch_sample_symbols<R: SymbolResolver>(
                 return None;
             };
             (expand == (inline && !matches!(frame, FoldFrame::SampleIp { .. })))
-                .then(|| table.symbol_mapping_ref(*mapping))
+                .then(|| table.symbol_mapping_ref(*mapping, Some(resolver)))
         });
         cache.prefetch_mapping_refs_with_mode(mappings, expand)?;
     }
@@ -3193,7 +3181,10 @@ impl<'a> FoldFrameResolver<'a> {
                 write_perf_script_inline_mapped_decision_frame(
                     writer,
                     address,
-                    &self.mmap_table.symbol_mapping_ref(mapping),
+                    &self.mmap_table.symbol_mapping_ref(
+                        mapping,
+                        symbol_cache.as_ref().map(|cache| cache.resolver()),
+                    ),
                     symbol_cache,
                 )?;
             }
@@ -3234,7 +3225,10 @@ impl<'a> FoldFrameResolver<'a> {
                     writer,
                     address,
                     is_cookie,
-                    &self.mmap_table.symbol_mapping_ref(mapping),
+                    &self.mmap_table.symbol_mapping_ref(
+                        mapping,
+                        symbol_cache.as_ref().map(|cache| cache.resolver()),
+                    ),
                     symbol_cache,
                     self.inline,
                 )?;

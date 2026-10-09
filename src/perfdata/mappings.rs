@@ -2,7 +2,7 @@ use crate::perfdata::records::{
     Mmap2BuildIdRecord, Mmap2Record, MmapRecord, PERF_RECORD_MISC_CPUMODE_MASK,
     PERF_RECORD_MISC_CPUMODE_USER,
 };
-use crate::symbols::KernelRelocation;
+use crate::symbols::{KernelRelocation, SymbolResolver};
 use hashbrown::{HashMap, HashSet};
 use rustc_hash::FxBuildHasher;
 use std::cell::{Cell, OnceCell};
@@ -411,12 +411,25 @@ struct NativeDsoRegistry {
 struct NativeDso {
     id: usize,
     path: String,
-    build_id: Option<Vec<u8>>,
+    build_id: OnceCell<Vec<u8>>,
     symbol_build_id: OnceCell<Option<Vec<u8>>>,
     file_identity: Option<FileIdentity>,
 }
 
 impl NativeDso {
+    fn build_id(&self) -> Option<&[u8]> {
+        self.build_id.get().map(Vec::as_slice)
+    }
+
+    fn set_build_id(&mut self, build_id: &[u8]) {
+        self.build_id.take();
+        if build_id.iter().any(|byte| *byte != 0) {
+            self.build_id
+                .set(build_id.to_vec())
+                .expect("DSO build ID was cleared");
+        }
+    }
+
     fn compare(
         &self,
         path: &str,
@@ -431,8 +444,7 @@ impl NativeDso {
                 .zip(file_identity)
                 .map_or(Ordering::Equal, |(a, b)| b.cmp(&a));
             file_order.then_with(|| {
-                self.build_id
-                    .as_deref()
+                self.build_id()
                     .zip(build_id)
                     .map_or(Ordering::Equal, |(a, b)| {
                         a.len().cmp(&b.len()).then_with(|| a.cmp(b))
@@ -447,8 +459,10 @@ impl NativeDso {
             self.file_identity = file_identity;
             changed = true;
         }
-        if self.build_id.is_none() && build_id.is_some() {
-            self.build_id = build_id.map(<[u8]>::to_vec);
+        if self.build_id.get().is_none()
+            && let Some(build_id) = build_id
+        {
+            self.set_build_id(build_id);
             changed = true;
         }
         changed
@@ -463,7 +477,7 @@ impl NativeDsoRegistry {
         // header.c:__event_process_build_id finds by empty identity, then
         // sets the DSO build ID before mapping records are processed.
         let id = self.intern(path, None, None);
-        self.entries[id].build_id = Some(build_id.to_vec());
+        self.entries[id].set_build_id(build_id);
     }
 
     fn intern(
@@ -515,7 +529,7 @@ impl NativeDsoRegistry {
         self.entries.push(NativeDso {
             id,
             path: path.to_string(),
-            build_id: build_id.map(<[u8]>::to_vec),
+            build_id: build_id.map_or_else(OnceCell::new, |id| OnceCell::from(id.to_vec())),
             symbol_build_id: OnceCell::new(),
             file_identity,
         });
@@ -551,7 +565,7 @@ impl NativeDsoRegistry {
                     .compare(
                         &ordered[position - 1].path,
                         ordered[position - 1].file_identity,
-                        ordered[position - 1].build_id.as_deref(),
+                        ordered[position - 1].build_id(),
                     )
                     .is_lt()
             {
@@ -572,7 +586,7 @@ unsafe extern "C" fn compare_native_dsos(
     // SAFETY: only NativeDsoRegistry::sort calls this with pointers to live
     // elements of its Vec<&NativeDso>.
     let (a, b) = unsafe { (*a.cast::<&NativeDso>(), *b.cast::<&NativeDso>()) };
-    match a.compare(&b.path, b.file_identity, b.build_id.as_deref()) {
+    match a.compare(&b.path, b.file_identity, b.build_id()) {
         Ordering::Less => -1,
         Ordering::Equal => 0,
         Ordering::Greater => 1,
@@ -1277,7 +1291,7 @@ impl MmapTable {
             source_id: dso.id,
             path: &dso.path,
             relative_address: frame.relative_address,
-            build_id: dso.build_id.as_deref(),
+            build_id: dso.build_id(),
         })
     }
 
@@ -1298,22 +1312,37 @@ impl MmapTable {
         // header.c:__event_process_build_id finds with empty file/build identity,
         // then sets the ID on the existing DSO; maps keep their DSO binding.
         let id = self.native_dsos.intern(path, None, None);
-        self.native_dsos.entries[id].build_id = Some(build_id.to_vec());
+        self.native_dsos.entries[id].set_build_id(build_id);
         self.native_dsos.header_paths.insert(path.to_owned());
-        self.native_dsos.sorted = false;
+        // dso.c:dso__set_build_id does not change dsos->sorted. Only identity
+        // enrichment through __dso__improve_id invalidates lookup order.
     }
 
-    pub(crate) fn symbol_mapping_ref<'a>(
+    pub(crate) fn symbol_mapping_ref<'a, R: SymbolResolver>(
         &'a self,
         frame: MappedFrame<'a>,
+        resolver: Option<&R>,
     ) -> ResolvedMappingRef<'a> {
+        let Some(resolver) = resolver else {
+            return frame.resolved_ref();
+        };
         // symbol.c:1705/1866 loads a DSO once, including failed loads. Later
         // stream metadata changes the current DSO ID, not its loaded symbols.
         let dso = &self.native_dsos.entries[frame.mapping.native_dso_id];
         let mut mapping = frame.resolved_ref();
         mapping.build_id = dso
             .symbol_build_id
-            .get_or_init(|| dso.build_id.clone())
+            .get_or_init(|| {
+                // symbol.c:dso__load fills an undefined ID from the live ELF
+                // before cache selection. Later MMAP2 comparisons see that ID.
+                if dso.build_id.get().is_none()
+                    && let Some(id) = resolver.object_build_id(std::path::Path::new(&dso.path))
+                    && id.iter().any(|byte| *byte != 0)
+                {
+                    dso.build_id.set(id).expect("undefined DSO build ID");
+                }
+                dso.build_id.get().cloned()
+            })
             .as_deref();
         mapping
     }
@@ -1691,6 +1720,90 @@ fn is_perf_data_path(path: &str) -> bool {
 mod tests {
     use proptest::prelude::*;
 
+    struct BuildIdProbe {
+        calls: std::cell::Cell<usize>,
+        id: Option<Vec<u8>>,
+    }
+
+    impl crate::symbols::SymbolResolver for BuildIdProbe {
+        fn object_build_id(&self, _path: &std::path::Path) -> Option<Vec<u8>> {
+            self.calls.set(self.calls.get() + 1);
+            self.id.clone()
+        }
+
+        fn resolve_batch(
+            &self,
+            _requests: &[crate::symbols::SymbolRequest],
+        ) -> Result<Vec<Option<String>>, String> {
+            unreachable!("this test only initializes DSO identity")
+        }
+    }
+
+    #[test]
+    fn dso_identity_discovery_runs_once_and_metadata_does_not_reload_symbols() {
+        // symbol.c:dso__load fills a missing ID, then sets loaded even on
+        // failure. header.c can update/clear that ID without reloading symbols.
+        for id in [None, Some(vec![0x11; 20])] {
+            let mut table = super::MmapTable::default();
+            table.insert_mmap(mutation_record(7, 0x1000, 0x100, 0, "/object"));
+            let resolver = BuildIdProbe {
+                calls: std::cell::Cell::new(0),
+                id: id.clone(),
+            };
+            let mut cache = super::MappingResolveCache::default();
+            let frame = table
+                .resolve_user_frame_cached(7, 0x1000, &mut cache)
+                .unwrap();
+            assert_eq!(
+                table
+                    .symbol_mapping_ref::<BuildIdProbe>(frame, None)
+                    .build_id,
+                None
+            );
+            assert_eq!(resolver.calls.get(), 0, "no-symbols must not load the ELF");
+            for address in 0x1000..0x1020 {
+                let frame = table
+                    .resolve_user_frame_cached(7, address, &mut cache)
+                    .unwrap();
+                assert_eq!(
+                    table.symbol_mapping_ref(frame, Some(&resolver)).build_id,
+                    id.as_deref()
+                );
+            }
+            assert_eq!(resolver.calls.get(), 1, "probe only the first DSO lookup");
+            assert_eq!(
+                table
+                    .resolve_user_memory_cached(7, 0x1000, &mut cache)
+                    .unwrap()
+                    .build_id,
+                id.as_deref(),
+                "the discovered ID must be published to the native DSO"
+            );
+            table.clone_pid_mappings(7, 8);
+            for replacement in [&[0x22; 20], &[0; 20]] {
+                table.update_native_dso_build_id("/object", replacement);
+                for pid in [7, 8] {
+                    let frame = table
+                        .resolve_user_frame_cached(pid, 0x1000, &mut cache)
+                        .unwrap();
+                    assert_eq!(
+                        table.symbol_mapping_ref(frame, Some(&resolver)).build_id,
+                        id.as_deref(),
+                        "forked maps retain the same loaded symbol source"
+                    );
+                }
+            }
+            assert_eq!(resolver.calls.get(), 1);
+            assert_eq!(
+                table
+                    .resolve_user_memory_cached(7, 0x1000, &mut cache)
+                    .unwrap()
+                    .build_id,
+                None
+            );
+        }
+    }
+
     #[test]
     fn native_dso_enrichment_resorts_lookup_without_rebinding_forks_or_splits() {
         let mut table = super::MmapTable::default();
@@ -1774,7 +1887,7 @@ mod tests {
             id: 0,
             path: "/object".into(),
             file_identity: inode.map(file),
-            build_id: Some(vec![byte; 20]),
+            build_id: std::cell::OnceCell::from(vec![byte; 20]),
             symbol_build_id: std::cell::OnceCell::new(),
         };
         let a = dso(Some(2), 0x33);
@@ -1782,13 +1895,13 @@ mod tests {
         let c = dso(None, 0x22);
         for (left, right) in [(&a, &b), (&b, &c), (&c, &a)] {
             assert!(
-                left.compare(&right.path, right.file_identity, right.build_id.as_deref())
+                left.compare(&right.path, right.file_identity, right.build_id())
                     .is_lt()
             );
         }
         let mut registry = super::NativeDsoRegistry::default();
         let zero = registry.intern("/object", Some(file(0)), Some(&[0; 20]));
-        assert_eq!(registry.entries[zero].build_id, None);
+        assert_eq!(registry.entries[zero].build_id.get(), None);
         assert_ne!(zero, registry.intern("/object", Some(file(1)), None));
         // An absent build ID is compatible, but known zero inode fields
         // still distinguish a source from nonzero inode fields.

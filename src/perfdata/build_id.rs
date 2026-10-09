@@ -17,6 +17,19 @@ const BUILD_ID_STORAGE_SIZE: usize = 24;
 const BUILD_ID_EVENT_MIN_SIZE: usize = 36;
 const BUILD_ID_RECORD_PAYLOAD_MIN_SIZE: usize = 28;
 
+pub(crate) fn hex_build_id_bytes(hex: &str) -> Result<Vec<u8>, String> {
+    if !hex.len().is_multiple_of(2) {
+        return Err(format!("build-id hex has odd length: {}", hex.len()));
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&hex[index..index + 2], 16)
+                .map_err(|error| format!("build-id hex is invalid at offset {index}: {error}"))
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BuildIdEvent {
     pub pid: u32,
