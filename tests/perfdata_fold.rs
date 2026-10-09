@@ -5374,6 +5374,83 @@ fn native_ordinary_kallsyms_updates_kernel_map_coverage_after_loading() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn native_ordinary_kallsyms_relocation_moves_resolution_and_both_map_boundaries() {
+    // perf symbol.c:kallsyms__delta gets the physical A reference separately
+    // from the display tree; maps__split_kallsyms and map.c:map__fixup_start/end
+    // subtract that same delta before later address-to-map lookups.
+    const BASE: u64 = 0xffff_ffff_8100_0000;
+    let queries = [
+        BASE + 0x1001,
+        BASE + 0xfff,
+        BASE + 0x1000,
+        BASE + 0x2fff,
+        BASE + 0x3000,
+    ];
+    let (root, bytes) = write_native_ordered_module_kallsyms_fixture(
+        "ffffffff81004000 A _stext\nffffffff81005000 T first\nffffffff81006000 T last\n",
+        &queries,
+        true,
+        ["[a]", "[b]"],
+    );
+    assert!(!root.path().join("kcore").exists());
+    let (script, _, native) = query_native_module_kallsyms(root.path(), &[]);
+    assert!(script.contains("first+0x1 ([kernel.kallsyms])"), "{script}");
+    assert!(script.contains("first+0x0 ([kernel.kallsyms])"), "{script}");
+    assert!(
+        script.contains("last+0xfff ([kernel.kallsyms])"),
+        "{script}"
+    );
+    assert_eq!(
+        std::str::from_utf8(&native).unwrap(),
+        "query_00;first 1\nquery_01;[unknown] 1\nquery_02;first 1\nquery_03;last 1\nquery_04;[unknown] 1\n"
+    );
+    assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &native);
+    let summary = summarize_perfdata(&bytes).unwrap();
+    for metadata in [false, true] {
+        let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+            StaticSymbolResolver,
+            &root.path().join("perf.data"),
+            root.path(),
+            [],
+            &root.path().join("kallsyms"),
+        );
+        for (ip, expected) in queries.into_iter().zip([
+            Some("first+0x1"),
+            None,
+            Some("first+0x0"),
+            Some("last+0xfff"),
+            None,
+        ]) {
+            let mapping = summary.mmap_table.resolve_ref(11, ip).unwrap();
+            assert!(mapping.build_id.is_none());
+            let request = SymbolRequest {
+                path: mapping.path.into(),
+                relative_address: mapping.relative_address,
+                kernel_module_address: None,
+                kernel_mapping_range: Some((mapping.start, mapping.end)),
+                build_id: None,
+                file_identity: mapping.file_identity,
+                kernel_relocation: mapping.kernel_relocation,
+            };
+            if metadata {
+                let frames = resolver
+                    .resolve_frame_batch_with_metadata(&[request])
+                    .unwrap();
+                assert_eq!(frames[0].frames.first().map(String::as_str), expected);
+                assert_eq!(
+                    frames[0].kernel_dso == pyroclast::symbols::SymbolDsoName::Unmapped,
+                    expected.is_none()
+                );
+            } else {
+                let symbols = resolver.resolve_batch(&[request]).unwrap();
+                assert_eq!(symbols[0].as_deref(), expected);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn native_kcore_reference_ignores_data_names_before_function_names() {
     assert_native_kcore_reference_selection(
         "ffffffff81001000 D _stext\nffffffff81000000 T _stext\n",
