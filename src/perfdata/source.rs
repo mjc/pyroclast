@@ -1,7 +1,6 @@
 use std::fs::File;
 #[cfg(not(unix))]
 use std::io::{Read, Seek, SeekFrom};
-use std::ops::Range;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
@@ -10,14 +9,17 @@ use super::records::{PerfRecord, PerfRecordHeader, parse_record_header};
 
 pub(super) struct QueuedPerfRecord {
     pub offset: usize,
-    pub header: PerfRecordHeader,
     pub(super) window: usize,
-    pub(super) payload: Range<usize>,
+}
+
+struct ReadWindow {
+    start: usize,
+    bytes: Arc<Vec<u8>>,
 }
 
 #[derive(Default)]
 pub(super) struct WindowStore {
-    windows: Vec<Option<Arc<Vec<u8>>>>,
+    windows: Vec<Option<ReadWindow>>,
     refs: Vec<usize>,
     free: Vec<usize>,
     last: Option<(usize, usize)>,
@@ -46,7 +48,10 @@ impl WindowStore {
             self.refs.push(0);
             self.windows.len() - 1
         });
-        self.windows[slot] = Some(backing());
+        self.windows[slot] = Some(ReadWindow {
+            start,
+            bytes: backing(),
+        });
         self.refs[slot] = 1;
         self.last = Some((start, slot));
         slot
@@ -56,10 +61,13 @@ impl WindowStore {
         let backing = self.windows[queued.window]
             .as_ref()
             .expect("queued record retains its read window");
+        let start = queued.offset - backing.start;
+        let header = parse_record_header(&backing.bytes[start..])
+            .expect("queued record header was validated before retaining its immutable window");
         PerfRecord {
             offset: queued.offset,
-            header: queued.header,
-            payload: &backing[queued.payload.clone()],
+            header,
+            payload: &backing.bytes[start + 8..start + usize::from(header.size)],
         }
     }
 
@@ -81,18 +89,13 @@ pub(super) trait RecordSource {
         &mut self,
         offset: usize,
         end: usize,
-        header: PerfRecordHeader,
+        _header: PerfRecordHeader,
         windows: &mut WindowStore,
     ) -> Result<QueuedPerfRecord, String> {
-        let payload = self.record_at(offset, end)?.payload.to_vec();
-        let payload_len = payload.len();
-        let window = windows.retain_with(offset, || Arc::new(payload));
-        Ok(QueuedPerfRecord {
-            offset,
-            header,
-            window,
-            payload: 0..payload_len,
-        })
+        let size = self.record_at(offset, end)?.header.size;
+        let bytes = self.bytes_at(offset, usize::from(size))?.to_vec();
+        let window = windows.retain_with(offset, || Arc::new(bytes));
+        Ok(QueuedPerfRecord { offset, window })
     }
 
     fn record_at(&mut self, offset: usize, end: usize) -> Result<PerfRecord<'_>, String> {
@@ -239,12 +242,7 @@ impl BufferedScanner<'_> {
             return Err(format!("truncated queued perf record at offset {offset}"));
         }
         let window = windows.retain_with(start, || Arc::clone(&self.bytes));
-        Ok(QueuedPerfRecord {
-            offset,
-            header,
-            window,
-            payload: payload_start..payload_start + payload_len,
-        })
+        Ok(QueuedPerfRecord { offset, window })
     }
 }
 
@@ -430,7 +428,74 @@ mod tests {
             .queue_record(offset, end, header, &mut windows)
             .unwrap();
         assert_eq!(windows.record(&queued).payload, payload);
-        assert_eq!(queued.header.size, u16::MAX);
+        assert_eq!(windows.record(&queued).header.size, u16::MAX);
+    }
+
+    #[test]
+    fn slice_queue_retains_the_complete_header_at_nonzero_offsets() {
+        let mut bytes = vec![0; 19];
+        let mut encoded = record(b"payload");
+        encoded[4..6].copy_from_slice(&37_u16.to_le_bytes());
+        bytes.extend(encoded);
+        let mut windows = WindowStore::default();
+        let mut source = SliceSource(&bytes);
+        let end = source.len();
+        let expected = source.record_at(19, end).unwrap();
+        let expected_header = expected.header;
+        let queued = source
+            .queue_record(19, end, expected_header, &mut windows)
+            .unwrap();
+        drop(bytes);
+        let retained = windows.record(&queued);
+        assert_eq!(retained.offset, 19);
+        assert_eq!(retained.header, expected_header);
+        assert_eq!(retained.payload, b"payload");
+    }
+
+    #[test]
+    fn retained_headers_survive_reverse_delivery_and_window_slot_reuse() {
+        use std::os::unix::fs::FileExt;
+
+        let size = super::SCAN_WINDOW_SIZE;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len((size * 3 + 64) as u64).unwrap();
+        for (offset, payload) in [
+            (0, b"first".as_slice()),
+            (size, b"second"),
+            (size * 2, b"third"),
+        ] {
+            file.as_file()
+                .write_all_at(&record(payload), offset as u64)
+                .unwrap();
+        }
+        let mut source = FileSource::new(file.as_file()).unwrap();
+        let end = source.len();
+        let mut windows = WindowStore::default();
+        let first_header = source.record_at(0, end).unwrap().header;
+        let first = source
+            .queue_record(0, end, first_header, &mut windows)
+            .unwrap();
+        let first_backing = std::sync::Arc::downgrade(&source.scanner.bytes);
+        let second_header = source.record_at(size, end).unwrap().header;
+        let second = source
+            .queue_record(size, end, second_header, &mut windows)
+            .unwrap();
+        assert_eq!(windows.record(&second).payload, b"second");
+        assert_eq!(windows.record(&first).payload, b"first");
+        windows.release(&first);
+        assert!(
+            first_backing.upgrade().is_none(),
+            "final queued owner releases the old window"
+        );
+        let third_header = source.record_at(size * 2, end).unwrap().header;
+        let third = source
+            .queue_record(size * 2, end, third_header, &mut windows)
+            .unwrap();
+        assert_eq!(third.window, first.window);
+        assert_eq!(windows.record(&third).payload, b"third");
+        assert_eq!(windows.record(&second).payload, b"second");
+        windows.release(&second);
+        windows.release(&third);
     }
 
     #[test]
