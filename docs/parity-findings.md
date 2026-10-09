@@ -109,6 +109,24 @@ unrelated CUs still do not receive inline frame indexes. This changes no
 backend default and introduces no automatic GNU fallback. Retaining temporary
 CU metadata needs memory measurement; it is not an allocation reduction claim.
 
+## 2026-10-09 inherited names follow one libdw reference chain
+
+The prior name walker searched both abstract-origin and specification subtrees.
+`libdw/dwarf_attr_integrate.c:43-63` instead selects abstract origin when present
+and uses specification only when that attribute is absent. A bad, cyclic, or
+nameless origin must not reveal a name from the alternative specification.
+Perf's `util/libdw.c:libdw_a2l_cb` calls `dwarf_diename` directly. BFD and
+vendored Rust addr2line have their own name-selection paths; those do not change
+the default perf/libdw contract we emulate.
+
+Three observed red regressions compare native `eu-addr2line` (libdw) with the
+production name walker, alongside a passing specification-only control. The
+fixture uses concrete subprogram DIEs to isolate naming from `dwarf_getscopes`'
+separate requirement that inline scopes contain a valid abstract origin. Earlier
+fixture/argument failures were not parity evidence. The production walker now
+follows only the selected chain within the existing reference budget, retaining
+the correct CU for cross-CU references and removing its backtracking vector.
+
 ## 2026-10-09 recorded kernel/user callchains still receive user unwinds
 
 Investigation of a fresh C thread workload found an unsupported mixed-callchain

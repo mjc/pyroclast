@@ -5665,45 +5665,30 @@ fn perf_dwarf_inherited_string<'a, R>(
 where
     R: gimli::Reader,
 {
-    let mut pending = Vec::new();
     let mut entry = Cow::Borrowed(entry);
-    let mut remaining = entry_limit;
-    loop {
-        if remaining > 0 {
-            if let Some(name) = entry
-                .attr(attribute)
-                .and_then(|attr| dwarf.attr_string(unit, attr.value()).ok())
-                .and_then(|name| name.to_string_lossy().ok().map(Cow::into_owned))
-            {
-                return Some(name);
-            }
-            // LIFO preserves the abstract-origin subtree before specification,
-            // including when a reference is bad or cyclic.
-            for attr in [gimli::DW_AT_specification, gimli::DW_AT_abstract_origin] {
-                let reference = match entry.attr(attr).map(gimli::Attribute::value) {
-                    Some(gimli::AttributeValue::UnitRef(offset)) => Some((unit, offset)),
-                    Some(gimli::AttributeValue::DebugInfoRef(offset)) => {
-                        directory.resolve_reference(offset)
-                    }
-                    _ => None,
-                };
-                if let Some((owner, offset)) = reference {
-                    pending.push((owner, offset, remaining - 1));
-                }
-            }
+    for _ in 0..entry_limit {
+        if let Some(name) = entry
+            .attr(attribute)
+            .and_then(|attr| dwarf.attr_string(unit, attr.value()).ok())
+            .and_then(|name| name.to_string_lossy().ok().map(Cow::into_owned))
+        {
+            return Some(name);
         }
-        loop {
-            let (owner, offset, limit) = pending.pop()?;
-            if limit > 0
-                && let Ok(next) = owner.entry(offset)
-            {
-                unit = owner;
-                entry = Cow::Owned(next);
-                remaining = limit;
-                break;
-            }
-        }
+        // libdw dwarf_attr_integrate.c:43-63 uses specification only when
+        // abstract_origin is absent, never after that reference fails.
+        let reference = entry
+            .attr(gimli::DW_AT_abstract_origin)
+            .or_else(|| entry.attr(gimli::DW_AT_specification))?
+            .value();
+        let (owner, offset) = match reference {
+            gimli::AttributeValue::UnitRef(offset) => (unit, offset),
+            gimli::AttributeValue::DebugInfoRef(offset) => directory.resolve_reference(offset)?,
+            _ => return None,
+        };
+        unit = owner;
+        entry = Cow::Owned(owner.entry(offset).ok()?);
     }
+    None
 }
 
 #[derive(Default)]
@@ -9052,6 +9037,168 @@ mod tests {
         let length = u32::try_from(line.len() - 4).unwrap();
         line[..4].copy_from_slice(&length.to_le_bytes());
         line
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum InheritedNameOrigin {
+        Absent,
+        Invalid,
+        Cyclic,
+        Nameless,
+    }
+
+    fn inherited_name_fixture(kind: InheritedNameOrigin) -> (Vec<u8>, usize) {
+        let abbrev = vec![
+            1, 0x11, 1, 0x11, 1, 0x12, 6, 0x10, 0x17, 0, 0, // CU ranges/stmt_list.
+            2, 0x2e, 1, 0x03, 8, 0x11, 1, 0x12, 6, 0, 0, // Named outer subprogram.
+            3, 0x2e, 0, 0x31, 0x13, 0x47, 0x13, 0x11, 1, 0x12, 6, 0, 0, 4, 0x2e, 0, 0x03, 8, 0,
+            0, // Named specification.
+            5, 0x2e, 0, 0, 0, // Nameless abstract origin.
+            6, 0x2e, 0, 0x47, 0x13, 0x11, 1, 0x12, 6, 0, 0, // Specification only.
+            0,
+        ];
+        let mut info = vec![0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 8];
+        info.push(1);
+        info.extend_from_slice(&0x1000_u64.to_le_bytes());
+        info.extend_from_slice(&0x40_u32.to_le_bytes());
+        info.extend_from_slice(&0_u32.to_le_bytes());
+        info.extend_from_slice(b"\x02outer\0");
+        info.extend_from_slice(&0x1000_u64.to_le_bytes());
+        info.extend_from_slice(&0x40_u32.to_le_bytes());
+        // A concrete subprogram exercises naming without dwarf_getscopes'
+        // separate requirement that inline scopes have a valid abstract origin.
+        let function_offset = info.len();
+        info.push(if matches!(kind, InheritedNameOrigin::Absent) {
+            6
+        } else {
+            3
+        });
+        let origin_reference = if matches!(kind, InheritedNameOrigin::Absent) {
+            None
+        } else {
+            let offset = info.len();
+            info.extend_from_slice(&0_u32.to_le_bytes());
+            Some(offset)
+        };
+        let specification_reference = info.len();
+        info.extend_from_slice(&0_u32.to_le_bytes());
+        info.extend_from_slice(&0x1010_u64.to_le_bytes());
+        info.extend_from_slice(&0x10_u32.to_le_bytes());
+        info.push(0); // End outer's children.
+        let specification = u32::try_from(info.len()).unwrap();
+        info.extend_from_slice(b"\x04spec_name\0");
+        let nameless = u32::try_from(info.len()).unwrap();
+        info.extend_from_slice(&[5, 0]);
+        info[specification_reference..specification_reference + 4]
+            .copy_from_slice(&specification.to_le_bytes());
+        if let Some(reference) = origin_reference {
+            let origin = match kind {
+                InheritedNameOrigin::Invalid => u32::MAX,
+                InheritedNameOrigin::Cyclic => u32::try_from(function_offset).unwrap(),
+                InheritedNameOrigin::Nameless => nameless,
+                InheritedNameOrigin::Absent => unreachable!(),
+            };
+            info[reference..reference + 4].copy_from_slice(&origin.to_le_bytes());
+        }
+        let length = u32::try_from(info.len() - 4).unwrap();
+        info[..4].copy_from_slice(&length.to_le_bytes());
+        let base = elf_with_text_symbol_fixtures(
+            elf::EM_X86_64,
+            &[(b"base_symbol", 0x1000, 0x40, elf::STB_GLOBAL, elf::STT_FUNC)],
+        );
+        let mut builder = build::elf::Builder::read(base.as_slice()).unwrap();
+        for (name, data) in [
+            (b".debug_abbrev".as_slice(), abbrev),
+            (b".debug_info", info),
+            (b".debug_line", cross_cu_line_fixture()),
+        ] {
+            let section = builder.sections.add();
+            section.name = name.into();
+            section.sh_type = elf::SHT_PROGBITS;
+            section.sh_addralign = 1;
+            section.data = build::elf::SectionData::Data(data.into());
+        }
+        builder.set_section_sizes();
+        let text = builder
+            .sections
+            .iter()
+            .find(|section| section.sh_flags & u64::from(elf::SHF_EXECINSTR) != 0)
+            .unwrap()
+            .id();
+        let segment = builder.segments.add();
+        segment.p_type = elf::PT_LOAD;
+        segment.p_flags = elf::PF_R | elf::PF_X;
+        segment.p_vaddr = 0x1000;
+        segment.p_paddr = 0x1000;
+        segment.p_filesz = 0x1000;
+        segment.p_memsz = 0x1000;
+        segment.p_align = 16;
+        segment.append_section(builder.sections.get_mut(text));
+        builder.header.e_phoff = 64;
+        let mut bytes = Vec::new();
+        builder.write(&mut bytes).unwrap();
+        (bytes, function_offset)
+    }
+
+    fn assert_inherited_name_origin(kind: InheritedNameOrigin, expected: Option<&str>) {
+        let (bytes, offset) = inherited_name_fixture(kind);
+        #[cfg(target_os = "linux")]
+        {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), &bytes).unwrap();
+            let output = std::process::Command::new("eu-addr2line")
+                .args(["-f", "--pretty-print", "-e"])
+                .arg(file.path())
+                .arg("0x1018")
+                .output()
+                .expect("native libdw name oracle");
+            assert!(output.status.success(), "{output:?}");
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert_eq!(
+                text.split_whitespace().next(),
+                Some(expected.unwrap_or("??")),
+                "{text}"
+            );
+        }
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        let dwarf = gimli::Dwarf::load(|section| {
+            let bytes = object
+                .section_by_name(section.name())
+                .map_or(&[][..], |section| section.data().unwrap());
+            Ok::<_, gimli::Error>(gimli::EndianSlice::new(bytes, gimli::LittleEndian))
+        })
+        .unwrap();
+        let directory = super::PerfDwarfUnitDirectory::new(&dwarf);
+        let unit = directory.units[0].unit.as_ref().unwrap();
+        let entry = unit.entry(gimli::UnitOffset(offset)).unwrap();
+        // perf util/libdw.c:libdw_a2l_cb calls dwarf_diename. libdw's
+        // dwarf_attr_integrate.c:43-63 follows one selected reference chain,
+        // not a backtracking search through both attributes.
+        assert_eq!(
+            super::perf_dwarf_die_frame_name(&dwarf, unit, &directory, &entry).as_deref(),
+            expected,
+            "{kind:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_abstract_origin_does_not_fall_back_to_specification_like_libdw() {
+        assert_inherited_name_origin(InheritedNameOrigin::Invalid, None);
+    }
+
+    #[test]
+    fn cyclic_abstract_origin_does_not_fall_back_to_specification_like_libdw() {
+        assert_inherited_name_origin(InheritedNameOrigin::Cyclic, None);
+    }
+
+    #[test]
+    fn nameless_abstract_origin_does_not_fall_back_to_specification_like_libdw() {
+        assert_inherited_name_origin(InheritedNameOrigin::Nameless, None);
+    }
+
+    #[test]
+    fn absent_abstract_origin_uses_specification_like_libdw() {
+        assert_inherited_name_origin(InheritedNameOrigin::Absent, Some("spec_name"));
     }
 
     fn cross_cu_reference_file(bytes: &[u8]) -> tempfile::NamedTempFile {
