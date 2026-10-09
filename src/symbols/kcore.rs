@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -100,18 +99,10 @@ impl KcoreSymbols {
         self.rejected.load(Ordering::Relaxed)
     }
 
-    pub(super) fn finish_module_load(&self, path: &Path) {
+    pub(super) fn finish_module_load(&self, shared: bool) {
         // Native adjusts ET_DYN module maps during object loading before
         // validating kcore addresses. Recorded starts alone cannot validate
         // that new map; keep the object source rather than substitute live data.
-        let mut header = [0_u8; 18];
-        let shared = File::open(path)
-            .ok()
-            .and_then(|mut file| {
-                file.read_exact(&mut header).ok()?;
-                Some(header[..6] == *b"\x7fELF\x02\x01" && header[16..18] == 3_u16.to_le_bytes())
-            })
-            .unwrap_or(false);
         if shared {
             self.rejected.store(true, Ordering::Relaxed);
         } else {

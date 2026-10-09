@@ -131,6 +131,14 @@ pub trait SymbolResolver {
         None
     }
 
+    /// Reports `ET_DYN` from the primary object retained by this symbol resolver.
+    /// perf `symbol-elf.c:symsrc__init` retains `ss->ehdr` with `ss->elf/fd`;
+    /// module map finalization must not use a separate pathname header probe.
+    /// Wrapping resolvers must forward this to the owner of the selected primary.
+    fn selected_object_is_shared(&self, _path: &Path) -> bool {
+        false
+    }
+
     /// Kernel map initialization can change the source between callchain nodes.
     fn requires_kernel_cursor_order(&self) -> bool {
         false
@@ -724,6 +732,7 @@ enum PerfDwarfDieKind {
 struct PreparedObjectMetadata {
     object_symbols: PerfObjectSymbolIndex,
     has_debug_line: bool,
+    shared: bool,
 }
 
 struct CachedObjectMetadata {
@@ -2512,6 +2521,10 @@ impl<O> SymbolResolver for PerfSymbolResolver<O>
 where
     O: SymbolResolver,
 {
+    fn selected_object_is_shared(&self, path: &Path) -> bool {
+        self.object_resolver.selected_object_is_shared(path)
+    }
+
     fn object_build_id(&self, path: &Path) -> Option<Vec<u8>> {
         let mut cache = self
             .address_cache
@@ -2629,7 +2642,10 @@ where
                     // Loading a module also initializes the core maps, but this
                     // cursor keeps its original module source.
                     if let Some(symbols) = self.kcore_symbols_ref() {
-                        symbols.finish_module_load(&object_request.path);
+                        symbols.finish_module_load(
+                            self.object_resolver
+                                .selected_object_is_shared(&object_request.path),
+                        );
                     }
                     resolved[index] = symbol;
                 } else {
@@ -2798,7 +2814,7 @@ where
         if old_module {
             // Initialize core maps after resolving this cursor's original DSO.
             if let Some(symbols) = self.kcore_symbols_ref() {
-                symbols.finish_module_load(path);
+                symbols.finish_module_load(self.object_resolver.selected_object_is_shared(path));
             }
             frames.source_state = SymbolSourceState::KernelObjectMapReplaced;
         }
@@ -3172,6 +3188,11 @@ where
         self.object_metadata(path)?.build_id()
     }
 
+    fn selected_object_is_shared(&self, path: &Path) -> bool {
+        self.object_metadata(path)
+            .is_some_and(|metadata| metadata.object_metadata.shared)
+    }
+
     fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
         let mut resolved = vec![None; requests.len()];
         for (path, indexes) in grouped_request_indexes(requests) {
@@ -3296,6 +3317,13 @@ where
         }
     }
 
+    fn selected_object_is_shared(&self, path: &Path) -> bool {
+        match self {
+            Self::Addr2line(resolver) => resolver.selected_object_is_shared(path),
+            Self::RustAddr2line(resolver) => resolver.selected_object_is_shared(path),
+        }
+    }
+
     fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
         match self {
             Self::Addr2line(resolver) => resolver.resolve_batch(requests),
@@ -3336,6 +3364,11 @@ where
 impl SymbolResolver for RustAddr2lineResolver {
     fn object_build_id(&self, path: &Path) -> Option<Vec<u8>> {
         self.object_metadata(path)?.build_id()
+    }
+
+    fn selected_object_is_shared(&self, path: &Path) -> bool {
+        self.object_metadata(path)
+            .is_some_and(|metadata| metadata.object_metadata.shared)
     }
 
     fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
@@ -3788,12 +3821,18 @@ fn leading_underscore_count(name: &str) -> usize {
 
 impl PreparedObjectMetadata {
     fn from_object_bytes(object_bytes: &[u8]) -> Self {
+        let object = object::File::parse(object_bytes).ok();
         Self {
             object_symbols: PerfObjectSymbolIndex::from_object_bytes(object_bytes),
             // perf addr2line.c:cmd__addr2line checks this literal section
             // before launching GNU's command fallback, not STT_FILE symbols.
-            has_debug_line: object::File::parse(object_bytes)
-                .is_ok_and(|object| object.section_by_name(".debug_line").is_some()),
+            has_debug_line: object
+                .as_ref()
+                .is_some_and(|object| object.section_by_name(".debug_line").is_some()),
+            shared: object.as_ref().is_some_and(|object| {
+                object.format() == object::BinaryFormat::Elf
+                    && object.kind() == object::ObjectKind::Dynamic
+            }),
         }
     }
 
@@ -5532,6 +5571,63 @@ mod tests {
             Some(&[0xaa, 0xbb, 0xcc, 0xdd][..])
         );
         output
+    }
+
+    #[test]
+    fn selected_object_type_uses_retained_primary_after_rewrite_and_unlink() {
+        struct NoCommands;
+        impl crate::process::CommandRunner for NoCommands {
+            fn run(
+                &self,
+                _: &crate::process::CommandSpec,
+            ) -> std::io::Result<crate::process::CommandOutput> {
+                panic!("selected type and base metadata must not launch a helper");
+            }
+        }
+
+        // perf symbol-elf.c:symsrc__init retains ss->ehdr with ss->elf/fd,
+        // just as libdwfl/offline.c retains the primary fd in mod->main.fd.
+        for kind in [
+            super::SymbolizerKind::Addr2line,
+            super::SymbolizerKind::RustAddr2line,
+        ] {
+            for shared in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let path = root.path().join("selected.elf");
+                let bytes = regression_elf_with_build_id();
+                let mut builder = build::elf::Builder::read(bytes.as_slice()).unwrap();
+                builder.header.e_type = if shared { elf::ET_DYN } else { elf::ET_EXEC };
+                let mut selected = Vec::new();
+                builder.write(&mut selected).unwrap();
+                std::fs::write(&path, selected).unwrap();
+                let runner = NoCommands;
+                let resolver = super::SelectedObjectResolver::new(&runner, kind);
+                let request = test_request(path.to_str().unwrap(), 0x1001);
+                assert!(
+                    !resolver
+                        .resolve_base_frame_batch_with_metadata(&[request])
+                        .unwrap()[0]
+                        .frames
+                        .is_empty()
+                );
+                assert_eq!(resolver.selected_object_is_shared(&path), shared);
+                let mut builder = build::elf::Builder::read(bytes.as_slice()).unwrap();
+                builder.header.e_type = if shared { elf::ET_EXEC } else { elf::ET_DYN };
+                let mut replacement = Vec::new();
+                builder.write(&mut replacement).unwrap();
+                std::fs::write(&path, replacement).unwrap();
+                assert_eq!(resolver.selected_object_is_shared(&path), shared);
+                std::fs::remove_file(&path).unwrap();
+                assert_eq!(resolver.selected_object_is_shared(&path), shared);
+                let missing = root.path().join("missing.elf");
+                assert!(!resolver.selected_object_is_shared(&missing));
+                std::fs::write(&missing, regression_elf_with_build_id()).unwrap();
+                assert!(
+                    !resolver.selected_object_is_shared(&missing),
+                    "failed selection is retained"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
