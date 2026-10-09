@@ -1,4 +1,4 @@
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod gnu;
 mod kcore;
 
@@ -736,9 +736,9 @@ struct SelectedGnuObject {
     metadata: Arc<CachedObjectMetadata>,
     #[cfg(unix)]
     helper: Mutex<GnuHelperState>,
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     canonical_name: PathBuf,
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     input: OnceLock<Result<Arc<std::fs::File>, String>>,
 }
 
@@ -1392,7 +1392,7 @@ where
             RawEntryMut::Occupied(entry) => entry.get().clone(),
             RawEntryMut::Vacant(entry) => {
                 let loaded = (|| {
-                    #[cfg(target_os = "linux")]
+                    #[cfg(unix)]
                     let canonical_name = std::fs::canonicalize(path).ok()?;
                     let bytes = read_regular_object(path)?;
                     Some(Arc::new(SelectedGnuObject {
@@ -1403,9 +1403,9 @@ where
                             object_bytes: bytes.into(),
                             dwarf_index: Mutex::new(PerfDwarfIndexCache::default()),
                         }),
-                        #[cfg(target_os = "linux")]
+                        #[cfg(unix)]
                         canonical_name,
-                        #[cfg(target_os = "linux")]
+                        #[cfg(unix)]
                         input: OnceLock::new(),
                     }))
                 })();
@@ -1427,7 +1427,7 @@ where
                 .iter()
                 .map(|index| requests[*index].relative_address),
         );
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         let command = selected.attach_input(path, command)?;
         #[cfg(not(unix))]
         let _ = selected;
@@ -5529,7 +5529,7 @@ mod tests {
         output
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn gnu_primary_transport_is_lazy_and_dropped_with_its_resolver() {
         struct NoCommands;

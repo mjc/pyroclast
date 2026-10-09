@@ -6,8 +6,9 @@ oracle, or change Pyroclast's in-process Rust default.
 
 Default symbolization remains in-process `rust-addr2line`. This helper is an
 optional GNU backend component, not a replacement default or an automatic
-fallback. On Linux, external GNU symbol-only batches pass the selected primary
-bytes through a sealed inherited descriptor. The helper is a Linux/Darwin development
+fallback. External GNU symbol-only batches pass the selected primary bytes
+through an inherited descriptor: sealed memfd on Linux, unlinked read-only
+backing on Darwin. The helper is a Linux/Darwin development
 test dependency, not a dependency of the default application package.
 
 ## Provenance
@@ -51,10 +52,10 @@ remain available without a primary. The existing GNU stdin address protocol
 is unchanged. Rust retains selected primary bytes and canonical names in its
 object cache and lazily starts one owned, cancellable helper per selected DSO
 for external symbol-only requests.
-It constructs the sealed transport once, lazily on the first external batch,
+It constructs the selected transport once, lazily on the first external batch,
 from those bytes, not by reopening the path. The selected DSO owns that
 transport until its resolver is dropped; subsequent batches borrow the same
-sealed file. Base-only and in-process lookups do not create the transport.
+file. Base-only and in-process lookups do not create the transport.
 The child receives a dedicated descriptor without changing the parent's
 close-on-exec flags. The helper retains its primary and auxiliary snapshots
 between batches and is killed/reaped when its selected DSO is dropped.
@@ -135,8 +136,17 @@ Linux or live-input fallback. This compile-time adapter is not a user option.
 The helper package is available on Linux and Darwin. Its build and installed
 checks compare full native stdout after live primary replacement and reject
 missing bootstrap data. Darwin also runs those checks for x86-64 and aarch64
-ELF objects, independently of its native Mach-O control. The Rust handoff is
-still Linux-only; package proofs do not establish Darwin Rust integration.
+ELF objects, independently of its native Mach-O control. Public Rust regressions
+run on both hosts and compare complete independently executed GNU stdout after
+pathname replacement or in-place overwrite, before and after metadata priming.
+They also verify transport reuse, logical debuglink discovery, retained
+auxiliaries across batches, request ordering, and no restart after failure.
+
+The Rust portable transport creates a private directory and read-only open
+description, verifies device/inode identity, and explicitly removes both names
+before writing selected bytes. It closes the writer before publishing the
+read-only descriptor. Tests verify unlinked backing, close-on-exec, rejected
+writes/truncation, binary and empty contents, and lazy resolver-owned lifetime.
 
 ## Bounds And Integration
 
@@ -151,8 +161,5 @@ tool probing/spawn, and uninterruptible kernel I/O are not bounded by that
 response timer; kill/reap cannot promise a hard real-time bound for kernel I/O.
 Trusted plugin code loading is not sandboxed; this is not a general BFD sandbox.
 
-Remaining integration: immutable backing where Linux memfd/procfs is unavailable
-and isolation for stalled parent-side filesystem acquisition.
-Non-Linux external GNU still has the legacy pathname handoff, without this
-provider's snapshot guarantee. The default in-process Rust path does not use
-that external handoff.
+Remaining integration: isolation for stalled parent-side filesystem acquisition.
+The default in-process Rust path does not use this external handoff.

@@ -1,4 +1,4 @@
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -25,10 +25,29 @@ impl CommandRunner for ReplacingRunner {
                 std::fs::rename(&self.replacement, &self.selected)?;
             }
         }
-        let output = self.native.run(command)?;
+        let output = run_native(&self.native, command)?;
         self.outputs.borrow_mut().push(output.clone());
         Ok(output)
     }
+}
+
+fn gnu_oracle() -> PathBuf {
+    std::env::var_os("PYRO_GNU_ORACLE")
+        .map(PathBuf::from)
+        .expect("run native GNU tests through the repository devenv shell")
+}
+
+fn run_native(runner: &RealCommandRunner, command: &CommandSpec) -> std::io::Result<CommandOutput> {
+    // Before the selected-input fix, Darwin invokes plain addr2line. Route that
+    // actual execution to GNU, not the compiler's LLVM shim, to prove its race.
+    let mut command = command.clone();
+    if command.program == "addr2line" {
+        gnu_oracle()
+            .to_str()
+            .unwrap()
+            .clone_into(&mut command.program);
+    }
+    runner.run(&command)
 }
 
 fn fixture(root: &Path, name: &str) -> PathBuf {
@@ -39,8 +58,12 @@ fn fixture(root: &Path, name: &str) -> PathBuf {
         format!("void {name}(void) {{ __asm__ volatile(\"nop\"); }}\n"),
     )
     .unwrap();
-    let output = std::process::Command::new("cc")
-        .args(["-g", "-O0", "-nostdlib", "-no-pie", "-Wl,-e,0"])
+    let mut compiler = std::process::Command::new("cc");
+    #[cfg(target_os = "linux")]
+    compiler.args(["-g", "-O0", "-nostdlib", "-no-pie", "-Wl,-e,0"]);
+    #[cfg(not(target_os = "linux"))]
+    compiler.args(["--target=x86_64-linux-gnu", "-g", "-O0", "-c"]);
+    let output = compiler
         .arg(&source)
         .arg("-o")
         .arg(&binary)
@@ -75,7 +98,7 @@ fn selected_request(path: &Path) -> SymbolRequest {
 }
 
 fn independent_gnu_output(request: &SymbolRequest) -> Vec<u8> {
-    let output = std::process::Command::new("addr2line")
+    let output = std::process::Command::new(gnu_oracle())
         .args(["-f", "-C", "-e"])
         .arg(&request.path)
         .arg(format!("0x{:x}", request.relative_address))
@@ -99,7 +122,7 @@ fn strip_with_debuglink(selected: &Path, debug: &Path) {
             selected.to_owned(),
         ],
     ] {
-        let output = std::process::Command::new("objcopy")
+        let output = std::process::Command::new(gnu_oracle().with_file_name("objcopy"))
             .args(args)
             .output()
             .unwrap();
@@ -180,7 +203,7 @@ fn gnu_batches_share_the_selected_primary_transport() {
     impl CommandRunner for RecordingRunner {
         fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
             self.commands.borrow_mut().push(command.clone());
-            self.native.run(command)
+            run_native(&self.native, command)
         }
     }
 
@@ -211,7 +234,7 @@ fn gnu_batches_share_the_selected_primary_transport() {
             command.inherited_files, commands[0].inherited_files,
             "each batch must borrow the same selected transport"
         );
-        let output = runner.native.run(command).unwrap();
+        let output = run_native(&runner.native, command).unwrap();
         assert_eq!(output.status_code, Some(0));
         assert_eq!(output.stdout, expected_stdout);
     }
@@ -301,7 +324,7 @@ fn gnu_backend_retains_loaded_debuglink_across_batches() {
     let request = selected_request(&selected);
     let debug = root.path().join("selected.debug");
     strip_with_debuglink(&selected, &debug);
-    let mut child = std::process::Command::new("addr2line")
+    let mut child = std::process::Command::new(gnu_oracle())
         .args(["-f", "-C", "-e"])
         .arg(&selected)
         .stdin(Stdio::piped())
@@ -340,7 +363,7 @@ fn gnu_sessions_preserve_distinct_objects_unknowns_and_batch_order() {
         ..request.clone()
     };
     let unknown = SymbolRequest {
-        relative_address: 0,
+        relative_address: u64::MAX,
         ..request.clone()
     };
     let first_debug = root.path().join("first.debug");
