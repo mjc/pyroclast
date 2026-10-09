@@ -14385,6 +14385,24 @@ mod tests {
 
     proptest::proptest! {
         #[test]
+        fn dwarf_range_merge_preserves_half_open_union_and_is_idempotent(
+            ranges in proptest::collection::vec((0_u64..64, 0_u64..64), 0..32),
+        ) {
+            let ranges = ranges.into_iter()
+                .map(|(a, b)| test_range(a.min(b), a.max(b)))
+                .collect::<Vec<_>>();
+            let actual = super::perf_dwarf_merge_ranges(ranges.clone());
+            proptest::prop_assert!(actual.windows(2).all(|pair| pair[0].end < pair[1].begin));
+            for address in 0..64 {
+                let contains = |ranges: &[PerfAddressRange]| {
+                    ranges.iter().any(|range| range.begin <= address && address < range.end)
+                };
+                proptest::prop_assert_eq!(contains(&actual), contains(&ranges));
+            }
+            proptest::prop_assert_eq!(super::perf_dwarf_merge_ranges(actual.clone()), actual);
+        }
+
+        #[test]
         fn dwarf_range_subtraction_matches_half_open_set_difference(
             ranges in proptest::collection::vec((0_u64..64, 0_u64..64), 0..12),
             covered in proptest::collection::vec((0_u64..64, 0_u64..64), 0..12),
