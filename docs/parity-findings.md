@@ -42,6 +42,25 @@ CLI perf-script text against a fresh native export. Frame names remain the
 symbolizer's responsibility (`binutils/addr2line.c:355-409`); Inferno retains
 the emitted stack entries (`collapse/perf.rs:580-599`).
 
+## 2026-10-09 callback reporting must not erase an accepted prefix
+
+A three-module native fixture reproduces the remaining lost sample: report a
+disjoint ELF first, then an executable mapping whose RBP caller enters the
+read-only prefix of another report base. Native preserves that sample's two
+frames and rejects later samples; Pyroclast incorrectly discarded the first
+sample too. The exact native folded comparison was red before the fix.
+
+Elfutils `libdwfl/segment.c:158-239` reifies module lookup in reporting order;
+the earlier disjoint module changes lookup in the overlapping layout. Perf
+`tools/perf/util/unwind-libdw.c:326-338` processes each frame callback once,
+and `libdwfl/dwfl_frame.c:465-482` preserves earlier callbacks while advancing.
+Pyroclast's outer unwind function repeated callback reporting after its helper
+had already processed the accepted frames. That extra pass reopened the seed
+ELF, hit `dwfl_report_elf.c:259-265`, and truncated the valid prefix. The
+redundant outer call is removed; no label, address, or sample-count exception
+is added. The regression checks byte and file replay. The two-module control
+still preserves both callers on all three samples.
+
 ## 2026-10-09 recorded kernel/user callchains still receive user unwinds
 
 Investigation of a fresh C thread workload found an unsupported mixed-callchain

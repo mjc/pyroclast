@@ -4652,8 +4652,9 @@ fn unwind_object_frame_addresses_like_perf(
     }
     // The iterator chooses CFI or EBL per frame. A seed-only vector may be a
     // decoded CFI stop, so it must not trigger a second architecture walk.
-    let mut raw_frames = raw_frames;
-    report_callback_entries_like_perf(state, mmap_table, pid, &mut raw_frames, unwind_debug_dir);
+    // The helper has already processed every accepted callback. Repeating
+    // reporting here can reopen/GC the seed module and erase the valid prefix
+    // (perf util/unwind-libdw.c:326-338 processes each callback only once).
     let raw_frames = truncate_syscall_return_unwind_after_first_executable_frame(
         raw_frames,
         Some(pid),

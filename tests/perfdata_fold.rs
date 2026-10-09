@@ -3495,6 +3495,72 @@ fn read_only_caller_mapping_is_reported_to_unwinder_like_native_perf_libdw() {
     );
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn callback_module_reporting_preserves_accepted_prefix_like_native_perf_libdw() {
+    // libdwfl/segment.c:158-239 reifies in reporting order, not address order.
+    // A prior disjoint module changes which overlapping ELF owns the seed.
+    // unwind-libdw.c:326-338 accepts each callback once; it never restarts an
+    // already accepted prefix after reporting the read-only caller's module.
+    let fixture = SyntheticX86_64Object::create();
+    let primer = SyntheticX86_64Object::create();
+    let primer_path = primer.path.with_file_name("primer-x86-64");
+    std::fs::rename(&primer.path, &primer_path).unwrap();
+    let mmap = |start, len, pgoff, prot, path: &str| {
+        let mut payload = mmap2_payload(11, 11, start, len, pgoff, prot, path);
+        payload.resize(payload.len().next_multiple_of(8), 0);
+        record_bytes(10, &payload)
+    };
+    let sample = |ip, bp, stack| {
+        record_bytes_with_misc(
+            9,
+            PERF_RECORD_MISC_CPUMODE_USER,
+            &sample_payload_with_user_stack(ip, 11, 11, [], 1, [bp, 0x7fff_0000, ip], stack),
+        )
+    };
+    let mut stack = [0_u8; 24];
+    stack[16..24].copy_from_slice(&0x1000_0500_u64.to_le_bytes());
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            (1 << 6) | (1 << 7) | (1 << 8),
+        )],
+        [
+            mmap(0x2000_0000, 0x10000, 0, 5, primer_path.to_str().unwrap()),
+            mmap(0x1000_0000, 0x1000, 0, 1, &fixture.path_string()),
+            mmap(0x1000_2000, 0x10000, 0x1000, 5, &fixture.path_string()),
+            sample(0x2000_4000, 0, [0; 24]),
+            sample(0x1000_5000, 0x7fff_0008, stack),
+            sample(0x1000_5000, 0x7fff_0008, stack),
+            sample(0x1000_5000, 0x7fff_0008, stack),
+        ],
+    );
+    let (script, expected) = native_script_and_fold(&bytes);
+    assert_eq!(
+        expected,
+        format!(
+            ":11;[{0}];[{0}] 1\n:11;[primer-x86-64] 1\n",
+            fixture.file_name()
+        ),
+        "{script}"
+    );
+    assert_eq!(
+        fold_perfdata_callchains(&bytes).unwrap(),
+        expected,
+        "{script}"
+    );
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), &bytes).unwrap();
+    assert_eq!(
+        fold_perfdata_file_with_options(file.path(), FoldOptions::default()).unwrap(),
+        expected
+    );
+}
+
 #[test]
 fn keeps_rbp_caller_from_pid_specific_modules_like_perf_libdw() {
     // Only the sampled PID's mapping supplies the module for the initial IP.
