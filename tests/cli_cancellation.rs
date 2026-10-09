@@ -541,11 +541,20 @@ fn check_pty_cancellation(direct: bool) {
 
     let root = tempfile::tempdir().unwrap();
     let (mut probe, mut master) = launch_pty(root.path());
+    let group = probe.owned[0].group;
     // SAFETY: master is the live test-owned PTY paired with the CLI's stdin.
-    let foreground = unsafe { libc::tcgetpgrp(master.as_raw_fd()) };
-    assert_eq!(
-        foreground, probe.owned[0].group,
-        "interactive recorder did not receive terminal foreground"
+    let foreground = || unsafe { libc::tcgetpgrp(master.as_raw_fd()) };
+    // The child's PID publication can precede the parent's PTY handoff.
+    // Wait for ownership itself before testing interactive input or signals.
+    let ready = wait_until(
+        || foreground() == group || probe.exited(),
+        Duration::from_secs(5),
+    );
+    assert!(
+        ready && !probe.exited() && foreground() == group,
+        "interactive recorder did not receive terminal foreground: actual={}, expected={group}, stderr={}",
+        foreground(),
+        std::fs::read_to_string(root.path().join("stderr")).unwrap()
     );
     master.write_all(b"terminal input\n").unwrap();
     let path = root.path().join("workload.pid");
