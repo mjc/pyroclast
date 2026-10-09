@@ -7,7 +7,7 @@ oracle, or change Pyroclast's in-process Rust default.
 Default symbolization remains in-process `rust-addr2line`. This helper is an
 optional GNU backend component, not a replacement default or an automatic
 fallback. On Linux, external GNU symbol-only batches pass the selected primary
-bytes through a sealed inherited descriptor. The helper is a Linux development
+bytes through a sealed inherited descriptor. The helper is a Linux/Darwin development
 test dependency, not a dependency of the default application package.
 
 ## Provenance
@@ -25,6 +25,12 @@ order, debuglink CRC checks, build-ID lookup, altlink behavior, DWARF parsing
 and output formatting remain GNU's. Only addr2line and its private shared
 libraries are installed; the sole executable is `pyroclast-addr2line`.
 
+Darwin additionally enables x86-64 and aarch64 ELF targets for Linux recordings.
+`bfd/config.bfd` otherwise selects only Mach-O for Darwin, while
+`bfd/configure.ac` accepts additional configurations through `--enable-targets`.
+The same recorded flag is applied to the separately built, unpatched oracle;
+native platform flags and the source patch set remain unchanged.
+
 `licenses/` contains verbatim upstream COPYING files and extracted component
 copyright/license notices from the exact archive. These notices describe the
 GNU components, not a license choice for Pyroclast or its newly authored files.
@@ -32,7 +38,8 @@ The project's license-policy decision remains separate.
 
 ## Bootstrap Contract
 
-Linux memfd/procfs is required. Before invoking the helper, the caller supplies:
+Linux uses memfd/procfs; Darwin uses unlinked, read-only temporary backing.
+Before invoking the helper, the caller supplies:
 
 - `PYRO_PRIMARY_FD`: inherited descriptor holding the already-selected primary
   bytes, not a request to reopen the pathname. The helper consumes this FD.
@@ -125,8 +132,11 @@ preserves independent offsets without relying on `/dev/fd` behaving like a
 new open-file description. It does add copy/storage work per consumer and is
 not a performance optimization. Invalid temporary storage fails without a
 Linux or live-input fallback. This compile-time adapter is not a user option.
-The public helper package and Rust handoff are still Linux-only; a native
-portable-adapter proof alone does not establish Darwin product integration.
+The helper package is available on Linux and Darwin. Its build and installed
+checks compare full native stdout after live primary replacement and reject
+missing bootstrap data. Darwin also runs those checks for x86-64 and aarch64
+ELF objects, independently of its native Mach-O control. The Rust handoff is
+still Linux-only; package proofs do not establish Darwin Rust integration.
 
 ## Bounds And Integration
 

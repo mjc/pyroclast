@@ -22,6 +22,22 @@
     "--enable-shared",
     "--disable-static"
   ],
+  "darwinConfigureFlags": [
+    "--enable-64-bit-bfd",
+    "--with-system-zlib",
+    "--enable-deterministic-archives",
+    "--disable-werror",
+    "--enable-fix-loongson2f-nop",
+    "--enable-new-dtags",
+    "--program-prefix=",
+    "--disable-gprofng",
+    "--with-lib-path=:",
+    "--enable-shared",
+    "--disable-static"
+  ],
+  "darwinExtraConfigureFlags": [
+    "--enable-targets=x86_64-linux-gnu,aarch64-linux-gnu"
+  ],
   "nixPatches": [
     { "name": "deterministic.patch", "sha256": "912815241d4f64f971b22deb456217b8288b44b2f96ae0e50289a911dbecddc8" },
     { "name": "0001-Revert-libtool.m4-fix-the-NM-nm-over-here-B-option-w.patch", "sha256": "188b6a3899a19d096848ebae8d8cba15900628c3d321f04efc155a3ab42c5b10" },

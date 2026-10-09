@@ -1,4 +1,7 @@
 { pkgs, lib, ... }:
+let
+  gnuProvider = pkgs.callPackage ./nix/binutils-provider.nix { };
+in
 {
   languages.rust = {
     enable = true;
@@ -40,9 +43,12 @@
     )
     # Native regression tests exercise the explicit GNU backend; application
     # packages and all public symbolizer defaults remain in-process Rust.
-    ++ lib.optional pkgs.stdenv.isLinux (pkgs.callPackage ./nix/binutils-provider.nix { });
+    ++ lib.optional (pkgs.stdenv.isLinux || pkgs.stdenv.isDarwin) gnuProvider;
 
   env.RUST_BACKTRACE = "1";
+
+  # Native tests must not mistake the Darwin compiler's LLVM addr2line for GNU.
+  env.PYRO_GNU_ORACLE = "${gnuProvider.independentOracle}/bin/addr2line";
 
   scripts.check-perf-parity.exec = ''
     exec "$DEVENV_ROOT/scripts/check-perf-parity" "$@"
