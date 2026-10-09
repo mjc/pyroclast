@@ -204,6 +204,42 @@ differences; Darwin rejects target-PID leaf-row, weight, or unit differences.
 Mandatory compiled C fixtures cover inline frames and non-PIE PLT addresses;
 the checked-in Xcode fixture covers native referenced CPU rows and cycle units.
 
+### ELF Unwinding
+
+The x86-64 ELF path uses Gimli to decode CFI and a shared evaluator matching
+perf's libdw register and fallback rules. This path follows the recording's
+architecture and object format, not the analysis host's OS. Mach-O platform
+unwind formats still use Framehop. Normal symbolization stays in-process with
+`rust-addr2line`; GNU `addr2line` is an explicit alternative, not an automatic
+fallback.
+
+The reference contract is perf `util/unwind-libdw.c` and elfutils 0.195:
+
+- `set_initial_registers` zero-fills unrecorded x86 registers through RIP;
+  `backends/x86_64_cfi.c:x86_64_abi_cfi` supplies initial CFI register rules.
+- `libdwfl/frame_unwind.c:handle_cfi` builds a fresh caller register file.
+  Failed register recovery does not retain a stale value from the callee.
+- `__libdwfl_frame_unwind` tries EH CFI, then debug CFI, then the architecture
+  fallback only if no CFI successor was created. A covering row's recovery
+  failure is not permission to try an unrelated RBP walk.
+- `libdwfl/dwfl_frame_pc.c:dwfl_frame_pc` and perf `frame_callback` determine
+  activation addresses and the caller PC-minus-one adjustment. Nops-only CFI
+  can recover unchanged RIP through ABI defaults; it need not mean leaf-only.
+- perf `__report_module` tries a regular live ELF before the build-ID cache.
+  Symbol identity rejection does not reject its CFI, and a valid live ELF
+  without CFI does not authorize substitution of cached CFI.
+
+`tests/perfdata_unwind_fallback.rs` covers recorded and recovered registers,
+undefined CFA, EH/debug selection and native expression policy with generated
+ELF fixtures. `tests/perfdata_fold.rs` covers public byte/file/text routes and
+the portable nops-only regression. The corrected regression was observed
+failing on both Linux and macOS before the shared evaluator fixed it.
+
+Fresh exact native comparisons have covered perf 7.2.5 with libdw unwinding,
+the 373 MiB recording, generated C DWARF/frame-pointer recordings and paired
+ELF identity/source-selection fixtures. These are workload/version-specific
+proofs, not a claim that every recording, architecture or perf backend matches.
+
 Kernel text parity validates bracketed module mappings against host kcore.
 Absolute or compressed module paths and an initially loaded ET_DYN module keep
 their original sources instead of using host kcore. These fallbacks can differ
