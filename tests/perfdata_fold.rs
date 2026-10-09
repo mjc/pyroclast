@@ -4661,11 +4661,21 @@ fn native_kcore_same_callchain_module_core_module_preserves_each_cursor_source()
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn write_cached_kernel_module_elf(root: &std::path::Path, shared: bool) -> Vec<u8> {
+fn write_cached_kernel_module_elf(
+    root: &std::path::Path,
+    shared: bool,
+    data_symbol: bool,
+) -> Vec<u8> {
     use std::fmt::Write as _;
     let source = root.join("module.S");
     let elf_path = root.join("module.elf");
-    std::fs::write(&source, ".text\n.globl cached_module_object\n.type cached_module_object,@function\ncached_module_object:\n.fill 512,1,0x90\n.size cached_module_object,.-cached_module_object\n").unwrap();
+    let mut assembly = String::from(
+        ".text\n.globl cached_module_object\n.type cached_module_object,@function\ncached_module_object:\n.fill 512,1,0x90\n.size cached_module_object,.-cached_module_object\n",
+    );
+    if data_symbol {
+        assembly.push_str(".data\n.globl module_data\n.type module_data,@object\nmodule_data:\n.quad 0\n.size module_data,.-module_data\n");
+    }
+    std::fs::write(&source, assembly).unwrap();
     let compiler = Command::new("cc")
         .args([
             "-nostdlib",
@@ -4703,10 +4713,19 @@ fn write_native_cached_module_fixture(
     shared: bool,
     single_callchain: bool,
 ) -> (tempfile::TempDir, Vec<u8>) {
+    write_native_cached_module_fixture_with_data(shared, single_callchain, false)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn write_native_cached_module_fixture_with_data(
+    shared: bool,
+    single_callchain: bool,
+    data_symbol: bool,
+) -> (tempfile::TempDir, Vec<u8>) {
     const MODULE: u64 = 0xffff_ffff_c100_0010;
     const CORE: u64 = 0xffff_ffff_8100_0010;
     let (root, _) = write_native_kcore_fixture("[a]");
-    let id = write_cached_kernel_module_elf(root.path(), shared);
+    let id = write_cached_kernel_module_elf(root.path(), shared, data_symbol);
     let mut comm = comm_payload(11, 12, "worker");
     comm.resize(comm.len().next_multiple_of(8), 0);
     let mut records = vec![record_bytes(3, &comm)];
@@ -4779,6 +4798,13 @@ fn native_kcore_preserves_cached_module_objects_until_core_replacement() {
         calls: std::cell::Cell<usize>,
     }
     impl SymbolResolver for CountedObjectResolver {
+        fn selected_object_module_maps(
+            &self,
+            path: &std::path::Path,
+        ) -> Vec<pyroclast::symbols::KernelModuleSectionMap> {
+            self.inner.selected_object_module_maps(path)
+        }
+
         fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
             self.calls.set(self.calls.get() + 1);
             self.inner.resolve_batch(requests)
@@ -4872,8 +4898,8 @@ fn kcore_module_object_resolution_precedes_initial_core_loading() {
     std::fs::create_dir_all(object.parent().unwrap()).unwrap();
     // Routing still validates ELF identity before delegating symbol parsing.
     let mut builder = object::build::elf::Builder::new(object::Endianness::Little, true);
-    // A relocatable .ko keeps its recorded map; ET_DYN module loading moves
-    // the map and intentionally rejects the subsequent live kcore source.
+    // This ELF introduces no section maps that could invalidate kcore.
+    // perf validates map names and starts, not the ELF type alone.
     builder.header.e_type = object::elf::ET_REL;
     builder.header.e_machine = object::elf::EM_X86_64;
     let names = builder.sections.add();
@@ -8793,7 +8819,7 @@ fn kcore_failed_cached_module_loading_preserves_first_cursor_then_replaces_maps(
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
-fn native_kcore_rejects_replacement_after_a_shared_module_object_load() {
+fn native_kcore_rejects_shared_module_with_a_separate_dynamic_map() {
     use inferno::collapse::Collapse as _;
     let (root, bytes) = write_native_cached_module_fixture(true, false);
     let native = Command::new("perf")
@@ -8836,4 +8862,106 @@ fn native_kcore_rejects_replacement_after_a_shared_module_object_load() {
         .unwrap();
         assert_eq!(actual.as_bytes(), expected, "{script}");
     }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_kcore_accepts_shared_module_with_only_text_symbols() {
+    use inferno::collapse::Collapse as _;
+    use std::fmt::Write as _;
+
+    let (root, bytes) = write_native_cached_module_fixture(true, false);
+    let original = std::fs::read(root.path().join("module.elf")).unwrap();
+    let elf = object::File::parse(original.as_slice()).unwrap();
+    let id = elf.build_id().unwrap().unwrap();
+    let hex = id.iter().fold(String::new(), |mut hex, byte| {
+        write!(hex, "{byte:02x}").unwrap();
+        hex
+    });
+    let mut builder = object::build::elf::Builder::read(original.as_slice()).unwrap();
+    let text = builder
+        .sections
+        .iter()
+        .find(|section| section.name.as_slice() == b".text")
+        .unwrap()
+        .id();
+    // Keep the same ET_DYN and all section headers. Only remove symbol rows
+    // which would make perf symbol-elf.c:dso__process_kernel_symbol create
+    // additional module maps; .text only changes the original map's pgoff.
+    for symbol in &mut builder.symbols {
+        symbol.delete = symbol.section != Some(text);
+    }
+    let mut selected = Vec::new();
+    builder.write(&mut selected).unwrap();
+    assert_eq!(
+        object::File::parse(selected.as_slice()).unwrap().kind(),
+        object::ObjectKind::Dynamic
+    );
+    std::fs::write(
+        pyroclast::symbols::perf_build_id_elf_path(&root.path().join(".debug"), &hex),
+        selected,
+    )
+    .unwrap();
+
+    let native = Command::new("perf")
+        .arg("--buildid-dir")
+        .arg(root.path().join(".debug"))
+        .args(["script", "--force", "-vvvv", "--kallsyms"])
+        .arg(root.path().join("kallsyms"))
+        .arg("-i")
+        .arg(root.path().join("perf.data"))
+        .output()
+        .unwrap();
+    assert!(
+        native.status.success(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    let script = String::from_utf8(native.stdout).unwrap();
+    assert!(
+        String::from_utf8_lossy(&native.stderr).contains("/kcore for kernel data"),
+        "script={script}\nstderr={}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_eq!(script.matches("cached_module_object+0x10 ([a])").count(), 1);
+    assert_eq!(script.matches("first+0x10 ([kernel.kallsyms])").count(), 2);
+    let mut expected = Vec::new();
+    inferno::collapse::perf::Folder::default()
+        .collapse(script.as_bytes(), &mut expected)
+        .unwrap();
+    assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &expected);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_kcore_rejects_executable_module_with_a_separate_data_map() {
+    use inferno::collapse::Collapse as _;
+
+    let (root, bytes) = write_native_cached_module_fixture_with_data(false, false, true);
+    let native = Command::new("perf")
+        .arg("--buildid-dir")
+        .arg(root.path().join(".debug"))
+        .args(["script", "--force", "-vvvv", "--kallsyms"])
+        .arg(root.path().join("kallsyms"))
+        .arg("-i")
+        .arg(root.path().join("perf.data"))
+        .output()
+        .unwrap();
+    assert!(
+        native.status.success(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    let script = String::from_utf8(native.stdout).unwrap();
+    assert!(
+        !String::from_utf8_lossy(&native.stderr).contains("/kcore for kernel data"),
+        "script={script}\nstderr={}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_eq!(script.matches("cached_module_object+0x10 ([a])").count(), 3);
+    let mut expected = Vec::new();
+    inferno::collapse::perf::Folder::default()
+        .collapse(script.as_bytes(), &mut expected)
+        .unwrap();
+    assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &expected);
 }

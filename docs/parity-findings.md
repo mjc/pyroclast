@@ -3,6 +3,33 @@
 Status as of 2026-06-11. Goal: `pyroclast plumbing fold|flamegraph` fully replaces
 `perf script | inferno-collapse-perf | inferno-flamegraph`.
 
+## 2026-10-09 kernel module section maps, not ELF-type rejection
+
+Two fresh native regressions disproved the blanket ET_DYN rejection. Keeping
+the same ET_DYN and section headers but removing non-text symbol rows lets
+native perf replace module maps with kcore. Conversely, an ET_EXEC containing
+a data object symbol creates a separate module map and rejects kcore. Both
+exact folded comparisons failed before the production change.
+
+Perf `tools/perf/util/symbol-elf.c:1397` changes only the original module
+map's pgoff for `.text`. Lines 1414-1460 reuse contiguous executable sections
+or create section DSOs with section-derived starts. Only eligible symbol rows
+create maps; an unused section header is insufficient. Kcore acceptance in
+`tools/perf/util/symbol.c:1171-1187` validates every resulting module map by
+short DSO name and start against the sibling `modules` snapshot.
+
+The resolver now derives these section maps lazily from its retained primary
+ELF bytes, applies the existing perf symbol filters, and validates names and
+starts. The ELF-type proxy and its misleading test name are gone. Tests cover
+both native acceptance directions across symbolizers, inline settings and
+byte/file replay, retained metadata after replacement/unlink, and map-name
+reuse when distinct ELF sections share a name. The duplicate-name test was
+also observed red before fixing section-index deduplication.
+
+This is not general split-debug parity: native can select distinct symbol and
+runtime sources and substitutes runtime headers for NOBITS sections. That
+source-selection behavior still needs its own native fixtures.
+
 ## 2026-10-09 retained GNU helper and auxiliary lifetime
 
 External symbol-only batches previously launched a new helper each time. The

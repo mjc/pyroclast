@@ -129,6 +129,13 @@ impl Ord for SymbolRequest {
     }
 }
 
+/// An additional module map created by perf's kernel ELF symbol loader.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelModuleSectionMap {
+    pub section: String,
+    pub start: u64,
+}
+
 pub trait SymbolResolver {
     /// Reports the live ELF's ID before a DSO's first symbol lookup, as perf's
     /// `symbol.c:dso__load` does before selecting build-ID cache candidates.
@@ -136,12 +143,12 @@ pub trait SymbolResolver {
         None
     }
 
-    /// Reports `ET_DYN` from the primary object retained by this symbol resolver.
-    /// perf `symbol-elf.c:symsrc__init` retains `ss->ehdr` with `ss->elf/fd`;
-    /// module map finalization must not use a separate pathname header probe.
+    /// Reports additional maps created by loading the retained primary ELF.
+    /// perf `symbol-elf.c:dso__process_kernel_symbol` uses eligible symbols and
+    /// section layout, not ELF type alone, to create these maps.
     /// Wrapping resolvers must forward this to the owner of the selected primary.
-    fn selected_object_is_shared(&self, _path: &Path) -> bool {
-        false
+    fn selected_object_module_maps(&self, _path: &Path) -> Vec<KernelModuleSectionMap> {
+        Vec::new()
     }
 
     /// Kernel map initialization can change the source between callchain nodes.
@@ -741,13 +748,13 @@ enum PerfDwarfDieKind {
 struct PreparedObjectMetadata {
     object_symbols: PerfObjectSymbolIndex,
     has_debug_line: bool,
-    shared: bool,
 }
 
 struct CachedObjectMetadata {
     object_metadata: PreparedObjectMetadata,
     object_bytes: Arc<[u8]>,
     dwarf_index: Mutex<PerfDwarfIndexCache>,
+    module_maps: OnceLock<Vec<KernelModuleSectionMap>>,
 }
 
 struct SelectedGnuObject {
@@ -1364,6 +1371,7 @@ impl RustAddr2lineResolver {
                         object_metadata: PreparedObjectMetadata::from_object_bytes(&bytes),
                         object_bytes: bytes.into(),
                         dwarf_index: Mutex::new(PerfDwarfIndexCache::default()),
+                        module_maps: OnceLock::new(),
                     })
                 });
                 entry.insert(path.as_os_str().to_owned(), loaded).1.clone()
@@ -1431,6 +1439,7 @@ where
                             object_metadata: PreparedObjectMetadata::from_object_bytes(&bytes),
                             object_bytes: bytes.into(),
                             dwarf_index: Mutex::new(PerfDwarfIndexCache::default()),
+                            module_maps: OnceLock::new(),
                         }),
                         #[cfg(unix)]
                         canonical_name,
@@ -2585,8 +2594,8 @@ where
                 .core_loaded = true;
         }
     }
-    fn selected_object_is_shared(&self, path: &Path) -> bool {
-        self.object_resolver.selected_object_is_shared(path)
+    fn selected_object_module_maps(&self, path: &Path) -> Vec<KernelModuleSectionMap> {
+        self.object_resolver.selected_object_module_maps(path)
     }
 
     fn object_build_id(&self, path: &Path) -> Option<Vec<u8>> {
@@ -2718,8 +2727,10 @@ where
                     // cursor keeps its original module source.
                     if let Some(symbols) = self.kcore_symbols_ref() {
                         symbols.finish_module_load(
-                            self.object_resolver
-                                .selected_object_is_shared(&object_request.path),
+                            &requests[index].path,
+                            &self
+                                .object_resolver
+                                .selected_object_module_maps(&object_request.path),
                         );
                     }
                     resolved[index] = symbol;
@@ -2891,7 +2902,10 @@ where
         if old_module {
             // Initialize core maps after resolving this cursor's original DSO.
             if let Some(symbols) = self.kcore_symbols_ref() {
-                symbols.finish_module_load(self.object_resolver.selected_object_is_shared(path));
+                symbols.finish_module_load(
+                    &request.path,
+                    &self.object_resolver.selected_object_module_maps(path),
+                );
             }
             frames.source_state = SymbolSourceState::KernelObjectMapReplaced;
         }
@@ -3338,9 +3352,9 @@ where
         self.object_metadata(path)?.build_id()
     }
 
-    fn selected_object_is_shared(&self, path: &Path) -> bool {
+    fn selected_object_module_maps(&self, path: &Path) -> Vec<KernelModuleSectionMap> {
         self.object_metadata(path)
-            .is_some_and(|metadata| metadata.object_metadata.shared)
+            .map_or_else(Vec::new, |metadata| metadata.module_maps().to_vec())
     }
 
     fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
@@ -3467,10 +3481,10 @@ where
         }
     }
 
-    fn selected_object_is_shared(&self, path: &Path) -> bool {
+    fn selected_object_module_maps(&self, path: &Path) -> Vec<KernelModuleSectionMap> {
         match self {
-            Self::Addr2line(resolver) => resolver.selected_object_is_shared(path),
-            Self::RustAddr2line(resolver) => resolver.selected_object_is_shared(path),
+            Self::Addr2line(resolver) => resolver.selected_object_module_maps(path),
+            Self::RustAddr2line(resolver) => resolver.selected_object_module_maps(path),
         }
     }
 
@@ -3516,9 +3530,9 @@ impl SymbolResolver for RustAddr2lineResolver {
         self.object_metadata(path)?.build_id()
     }
 
-    fn selected_object_is_shared(&self, path: &Path) -> bool {
+    fn selected_object_module_maps(&self, path: &Path) -> Vec<KernelModuleSectionMap> {
         self.object_metadata(path)
-            .is_some_and(|metadata| metadata.object_metadata.shared)
+            .map_or_else(Vec::new, |metadata| metadata.module_maps().to_vec())
     }
 
     fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
@@ -3900,6 +3914,108 @@ fn perf_symbol_is_candidate(object: &object::File<'_>, symbol: &object::Symbol<'
                 .is_ok_and(|name| name.contains("text") || name.contains("data")))
 }
 
+fn elf_section_file_offset(object: &object::File<'_>, index: object::SectionIndex) -> Option<u64> {
+    use object::read::elf::SectionHeader as _;
+    match object {
+        object::File::Elf32(elf) => Some(
+            elf.section_by_index(index)
+                .ok()?
+                .elf_section_header()
+                .sh_offset(elf.endian())
+                .into(),
+        ),
+        object::File::Elf64(elf) => Some(
+            elf.section_by_index(index)
+                .ok()?
+                .elf_section_header()
+                .sh_offset(elf.endian()),
+        ),
+        _ => None,
+    }
+}
+
+fn kernel_module_section_maps(bytes: &[u8]) -> Vec<KernelModuleSectionMap> {
+    let Ok(object) = object::File::parse(bytes) else {
+        return Vec::new();
+    };
+    // symbol-elf.c:dso__load_sym requires a kernel symtab before dynsym,
+    // and elf__needs_adjust_symbols accepts all three ordinary ELF kinds.
+    if object.format() != object::BinaryFormat::Elf
+        || object.symbol_table().is_none()
+        || !matches!(
+            object.kind(),
+            object::ObjectKind::Executable
+                | object::ObjectKind::Dynamic
+                | object::ObjectKind::Relocatable
+        )
+    {
+        return Vec::new();
+    }
+    let executable = |section: &object::Section<'_, '_>| {
+        matches!(section.flags(), object::SectionFlags::Elf { sh_flags }
+            if sh_flags & u64::from(object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR)
+                == u64::from(object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR))
+    };
+    // symbol-elf.c:max_text_section stops at init/exit or a noncontiguous
+    // executable section. Its offsets are file offsets, not section VMAs.
+    let mut max_text_offset = 0_u64;
+    if !matches!(
+        object.architecture(),
+        object::Architecture::Alpha | object::Architecture::Hppa
+    ) {
+        for section in object.sections().filter(executable) {
+            let Ok(name) = section.name() else {
+                break;
+            };
+            if name.starts_with(".init") || name.starts_with(".exit") {
+                break;
+            }
+            let Some(offset) = elf_section_file_offset(&object, section.index()) else {
+                break;
+            };
+            let align = section.align().max(1);
+            let aligned = max_text_offset
+                .checked_add(align - 1)
+                .map(|end| end & !(align - 1));
+            if max_text_offset != 0 && aligned != Some(offset) {
+                break;
+            }
+            max_text_offset = offset.saturating_add(section.size());
+        }
+    }
+    let mut maps = Vec::new();
+    let mut seen = FxHashSet::default();
+    for symbol in object.symbols().chain(object.dynamic_symbols()) {
+        if !perf_symbol_is_candidate(&object, &symbol) {
+            continue;
+        }
+        let Some(index) = symbol.section_index() else {
+            continue;
+        };
+        let Ok(section) = object.section_by_index(index) else {
+            continue;
+        };
+        let Ok(name) = section.name() else {
+            continue;
+        };
+        if name == ".text"
+            || (executable(&section)
+                && elf_section_file_offset(&object, index)
+                    .is_some_and(|offset| offset <= max_text_offset))
+            || !seen.insert(name)
+        {
+            continue;
+        }
+        // dso__process_kernel_symbol: additional module DSOs use the section
+        // suffix and sh_addr as their adjusted map start (module reloc is 0).
+        maps.push(KernelModuleSectionMap {
+            section: name.to_owned(),
+            start: section.address(),
+        });
+    }
+    maps
+}
+
 fn perf_symbol_candidate_search_end(candidate: &PerfSymbolCandidate) -> u64 {
     candidate.address.saturating_add(if candidate.size == 0 {
         1
@@ -3979,10 +4095,6 @@ impl PreparedObjectMetadata {
             has_debug_line: object
                 .as_ref()
                 .is_some_and(|object| object.section_by_name(".debug_line").is_some()),
-            shared: object.as_ref().is_some_and(|object| {
-                object.format() == object::BinaryFormat::Elf
-                    && object.kind() == object::ObjectKind::Dynamic
-            }),
         }
     }
 
@@ -4727,6 +4839,11 @@ impl PerfDwarfNameResolver {
 }
 
 impl CachedObjectMetadata {
+    fn module_maps(&self) -> &[KernelModuleSectionMap] {
+        self.module_maps
+            .get_or_init(|| kernel_module_section_maps(&self.object_bytes))
+    }
+
     fn build_id(&self) -> Option<Vec<u8>> {
         let object = object::File::parse(self.object_bytes.as_ref()).ok()?;
         object.build_id().ok()?.map(<[u8]>::to_vec)
@@ -5686,7 +5803,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
-    use object::{Object, ObjectSegment, ObjectSymbol, build, elf};
+    use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol, build, elf};
 
     use super::{
         CachedObjectMetadata, Kallsyms, PerfAddressRange, PerfDwarfFrameNames, PerfDwarfIndexCache,
@@ -5726,14 +5843,49 @@ mod tests {
     }
 
     #[test]
-    fn selected_object_type_uses_retained_primary_after_rewrite_and_unlink() {
+    fn selected_module_maps_use_retained_primary_after_rewrite_and_unlink() {
+        fn fixture(separate_map: bool) -> Vec<u8> {
+            let bytes = regression_elf_with_build_id();
+            let mut builder = build::elf::Builder::read(bytes.as_slice()).unwrap();
+            let section = builder
+                .sections
+                .iter_mut()
+                .find(|section| section.name.as_slice() == b".text")
+                .unwrap();
+            let text = section.id();
+            if separate_map {
+                section.name = b".data"[..].into();
+                section.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_WRITE);
+            }
+            let section = builder.sections.add();
+            section.name = b".symtab"[..].into();
+            section.sh_type = elf::SHT_SYMTAB;
+            section.sh_addralign = 8;
+            section.data = build::elf::SectionData::Symbol;
+            let section = builder.sections.add();
+            section.name = b".strtab"[..].into();
+            section.sh_type = elf::SHT_STRTAB;
+            section.sh_addralign = 1;
+            section.data = build::elf::SectionData::String;
+            let symbol = builder.symbols.add();
+            symbol.name = b"recorded_function"[..].into();
+            symbol.section = Some(text);
+            symbol.set_st_info(elf::STB_GLOBAL, elf::STT_FUNC);
+            symbol.st_value = 0x1000;
+            symbol.st_size = 16;
+            builder.set_section_sizes();
+            let mut output = Vec::new();
+            builder.write(&mut output).unwrap();
+            output
+        }
+
         struct NoCommands;
         impl crate::process::CommandRunner for NoCommands {
             fn run(
                 &self,
                 _: &crate::process::CommandSpec,
             ) -> std::io::Result<crate::process::CommandOutput> {
-                panic!("selected type and base metadata must not launch a helper");
+                panic!("selected module maps and base metadata must not launch a helper");
             }
         }
 
@@ -5743,14 +5895,21 @@ mod tests {
             super::SymbolizerKind::Addr2line,
             super::SymbolizerKind::RustAddr2line,
         ] {
-            for shared in [false, true] {
+            for separate_map in [false, true] {
                 let root = tempfile::tempdir().unwrap();
                 let path = root.path().join("selected.elf");
-                let bytes = regression_elf_with_build_id();
-                let mut builder = build::elf::Builder::read(bytes.as_slice()).unwrap();
-                builder.header.e_type = if shared { elf::ET_DYN } else { elf::ET_EXEC };
-                let mut selected = Vec::new();
-                builder.write(&mut selected).unwrap();
+                let selected = fixture(separate_map);
+                let elf = object::File::parse(selected.as_slice()).unwrap();
+                let expected = elf
+                    .section_by_name(".data")
+                    .map(|section| {
+                        vec![super::KernelModuleSectionMap {
+                            section: ".data".into(),
+                            start: section.address(),
+                        }]
+                    })
+                    .unwrap_or_default();
+                assert_eq!(!expected.is_empty(), separate_map);
                 std::fs::write(&path, selected).unwrap();
                 let runner = NoCommands;
                 let resolver = super::SelectedObjectResolver::new(&runner, kind);
@@ -5762,24 +5921,80 @@ mod tests {
                         .frames
                         .is_empty()
                 );
-                assert_eq!(resolver.selected_object_is_shared(&path), shared);
-                let mut builder = build::elf::Builder::read(bytes.as_slice()).unwrap();
-                builder.header.e_type = if shared { elf::ET_EXEC } else { elf::ET_DYN };
-                let mut replacement = Vec::new();
-                builder.write(&mut replacement).unwrap();
-                std::fs::write(&path, replacement).unwrap();
-                assert_eq!(resolver.selected_object_is_shared(&path), shared);
+                assert_eq!(resolver.selected_object_module_maps(&path), expected);
+                std::fs::write(&path, fixture(!separate_map)).unwrap();
+                assert_eq!(resolver.selected_object_module_maps(&path), expected);
                 std::fs::remove_file(&path).unwrap();
-                assert_eq!(resolver.selected_object_is_shared(&path), shared);
+                assert_eq!(resolver.selected_object_module_maps(&path), expected);
                 let missing = root.path().join("missing.elf");
-                assert!(!resolver.selected_object_is_shared(&missing));
+                assert!(resolver.selected_object_module_maps(&missing).is_empty());
                 std::fs::write(&missing, regression_elf_with_build_id()).unwrap();
                 assert!(
-                    !resolver.selected_object_is_shared(&missing),
+                    resolver.selected_object_module_maps(&missing).is_empty(),
                     "failed selection is retained"
                 );
             }
         }
+    }
+
+    #[test]
+    fn module_section_maps_reuse_the_first_map_with_the_same_section_name() {
+        // perf symbol-elf.c:dso__process_kernel_symbol calls maps__find_by_name
+        // before creating a section map, even when ELF section indexes differ.
+        let mut builder = build::elf::Builder::new(object::Endianness::Little, true);
+        builder.header.e_type = elf::ET_REL;
+        builder.header.e_machine = elf::EM_X86_64;
+        for (name, kind, data) in [
+            (
+                b".shstrtab".as_slice(),
+                elf::SHT_STRTAB,
+                build::elf::SectionData::SectionString,
+            ),
+            (
+                b".symtab".as_slice(),
+                elf::SHT_SYMTAB,
+                build::elf::SectionData::Symbol,
+            ),
+            (
+                b".strtab".as_slice(),
+                elf::SHT_STRTAB,
+                build::elf::SectionData::String,
+            ),
+        ] {
+            let section = builder.sections.add();
+            section.name = name.into();
+            section.sh_type = kind;
+            section.sh_addralign = 8;
+            section.data = data;
+        }
+        for (name, address) in [
+            (b"first".as_slice(), 0x2000),
+            (b"second".as_slice(), 0x3000),
+        ] {
+            let section = builder.sections.add();
+            section.name = b".data"[..].into();
+            section.sh_type = elf::SHT_PROGBITS;
+            section.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_WRITE);
+            section.sh_addr = address;
+            section.sh_addralign = 8;
+            section.data = build::elf::SectionData::Data(vec![0; 8].into());
+            let index = section.id();
+            let symbol = builder.symbols.add();
+            symbol.name = name.into();
+            symbol.section = Some(index);
+            symbol.set_st_info(elf::STB_GLOBAL, elf::STT_OBJECT);
+            symbol.st_size = 8;
+        }
+        builder.set_section_sizes();
+        let mut bytes = Vec::new();
+        builder.write(&mut bytes).unwrap();
+        assert_eq!(
+            super::kernel_module_section_maps(&bytes),
+            [super::KernelModuleSectionMap {
+                section: ".data".into(),
+                start: 0x2000,
+            }]
+        );
     }
 
     #[cfg(unix)]
@@ -7584,6 +7799,7 @@ mod tests {
             object_metadata: PreparedObjectMetadata::from_object_bytes(&object_bytes),
             object_bytes: object_bytes.into(),
             dwarf_index: Mutex::new(PerfDwarfIndexCache::default()),
+            module_maps: std::sync::OnceLock::new(),
         });
 
         let frames = resolve_base_frames_from_object_metadata(

@@ -4,13 +4,14 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::{Kallsyms, KallsymsSymbol, is_kernel_module_symbol_path_str};
+use super::{Kallsyms, KallsymsSymbol, KernelModuleSectionMap, is_kernel_module_symbol_path_str};
 use crate::perfdata::fold::recorded_kernel_maps_file;
 use crate::perfdata::unwind::PerfArch;
 
 pub(super) struct KcoreSymbols {
     ranges: Vec<(u64, u64)>,
     symbols: BTreeMap<u64, KallsymsSymbol>,
+    module_bases: BTreeMap<String, u64>,
     active: AtomicBool,
     rejected: AtomicBool,
 }
@@ -86,6 +87,7 @@ impl KcoreSymbols {
         Some(Self {
             ranges,
             symbols,
+            module_bases,
             active: AtomicBool::new(false),
             rejected: AtomicBool::new(false),
         })
@@ -95,11 +97,16 @@ impl KcoreSymbols {
         self.rejected.load(Ordering::Relaxed)
     }
 
-    pub(super) fn finish_module_load(&self, shared: bool) {
-        // Native adjusts ET_DYN module maps during object loading before
-        // validating kcore addresses. Recorded starts alone cannot validate
-        // that new map; keep the object source rather than substitute live data.
-        if shared {
+    pub(super) fn finish_module_load(&self, path: &Path, maps: &[KernelModuleSectionMap]) {
+        // perf symbol.c:do_validate_kcore_modules_cb checks every resulting
+        // module map against /proc/modules by DSO short name and start.
+        let module = module_short_name(path.to_str().unwrap_or_default());
+        if maps.iter().any(|map| {
+            let Some(module) = &module else {
+                return true;
+            };
+            self.module_bases.get(&format!("{module}{}", map.section)) != Some(&map.start)
+        }) {
             self.rejected.store(true, Ordering::Relaxed);
         } else {
             self.activate(true);

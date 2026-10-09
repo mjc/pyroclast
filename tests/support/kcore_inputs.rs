@@ -157,8 +157,11 @@ mod module_inputs {
     }
 
     impl SymbolResolver for ReplacingModuleResolver {
-        fn selected_object_is_shared(&self, path: &Path) -> bool {
-            self.inner.selected_object_is_shared(path)
+        fn selected_object_module_maps(
+            &self,
+            path: &Path,
+        ) -> Vec<pyroclast::symbols::KernelModuleSectionMap> {
+            self.inner.selected_object_module_maps(path)
         }
 
         fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
