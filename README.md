@@ -190,11 +190,14 @@ Set `XCTRACE_PARITY_OUT` to retain capture evidence. Existing traces cannot repl
 the Darwin recording. Missing tools, failed recordings/exports, empty target
 samples, and mismatches fail the gate; unsupported platforms fail rather than skip.
 
-The Linux test suite requires `cc`, `objcopy`, `addr2line`, and `perf` in `PATH`.
+The Linux test suite requires `cc`, `objcopy`, `addr2line`,
+`pyroclast-addr2line`, and `perf` in `PATH`.
 The development shell supplies them. Native-oracle tests compile ELF fixtures
 and compare against `perf script` and GNU addr2line; missing tools fail the tests
 rather than silently skipping parity checks. When running outside the development
-shell, install a C toolchain, binutils, and perf first.
+shell, install a C toolchain, binutils, perf, and the repository's optional
+`.#pyroclast-addr2line` package first. The private helper tests the explicit GNU
+backend; ordinary Rust-default analysis does not require either GNU executable.
 
 Some older symbol tests optionally inspect `target/profiling/pyroclast` or
 historical store binaries. A passing test count does not prove those optional
@@ -212,6 +215,14 @@ architecture and object format, not the analysis host's OS. Mach-O platform
 unwind formats still use Framehop. Normal symbolization stays in-process with
 `rust-addr2line`; GNU `addr2line` is an explicit alternative, not an automatic
 fallback.
+
+External GNU symbol-only batches on Linux use the separately named
+`pyroclast-addr2line` helper. The resolver passes its selected primary bytes in
+a sealed inherited descriptor, retaining the original logical filename for
+GNU debuglink discovery. A missing helper reports how to install it or keep
+the Rust default; there is no fallback to stock GNU. This immutable GNU
+transport is Linux-only. See [the provider contract](vendor/binutils-provider/README.md)
+for remaining platform, lifetime, and time-bound limitations.
 
 The reference contract is perf `util/unwind-libdw.c` and elfutils 0.195:
 

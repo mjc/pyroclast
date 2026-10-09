@@ -37,7 +37,10 @@
         strace
         valgrind
       ]
-    );
+    )
+    # Native regression tests exercise the explicit GNU backend; application
+    # packages and all public symbolizer defaults remain in-process Rust.
+    ++ lib.optional pkgs.stdenv.isLinux (pkgs.callPackage ./nix/binutils-provider.nix { });
 
   env.RUST_BACKTRACE = "1";
 

@@ -62,6 +62,35 @@ use pyroclast::tools::{
 };
 
 #[test]
+fn optional_gnu_backend_never_falls_back_to_system_addr2line_or_ephemeral_nix() {
+    struct NoLaunch;
+    impl CommandRunner for NoLaunch {
+        fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
+            panic!("missing private helper must not launch {}", command.program);
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    // Even available stock GNU and Nix must not be substituted for the
+    // private immutable-input protocol.
+    executable_stub(root.path().join("addr2line"));
+    executable_stub(root.path().join("nix"));
+    let mut resolver = SystemToolResolver::new(
+        NoLaunch,
+        ResolverContext::for_tests(
+            "linux",
+            root.path(),
+            Some(root.path().as_os_str().to_owned()),
+            false,
+        ),
+    );
+    let tool = tool_spec_named("pyroclast-addr2line").unwrap();
+    let error = resolver.resolve(&tool).unwrap_err().to_string();
+    assert!(error.contains(".#pyroclast-addr2line"));
+    assert!(error.contains("--symbolizer rust-addr2line"));
+    assert!(!required_tools("linux").contains(&tool));
+}
+
+#[test]
 fn linux_required_tools_include_nix_managed_profilers() {
     let tools = required_tools("linux");
     let names: Vec<_> = tools.iter().map(|tool| tool.name).collect();

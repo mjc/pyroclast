@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+mod gnu;
 mod kcore;
 
 use std::borrow::{Borrow, Cow};
@@ -632,7 +634,7 @@ impl MappingFrameTable {
 
 pub struct Addr2lineResolver<'a, R> {
     runner: &'a R,
-    metadata_cache: OnceLock<Mutex<FxHashMap<OsString, Option<Arc<CachedObjectMetadata>>>>>,
+    metadata_cache: OnceLock<Mutex<FxHashMap<OsString, Option<Arc<SelectedGnuObject>>>>>,
 }
 
 pub enum SelectedObjectResolver<'a, R> {
@@ -722,6 +724,12 @@ struct CachedObjectMetadata {
     object_metadata: PreparedObjectMetadata,
     object_bytes: Arc<[u8]>,
     dwarf_index: Mutex<PerfDwarfIndexCache>,
+}
+
+struct SelectedGnuObject {
+    metadata: Arc<CachedObjectMetadata>,
+    #[cfg(target_os = "linux")]
+    canonical_name: PathBuf,
 }
 
 /// Per-object memo of DWARF inline-frame indexes.
@@ -1351,6 +1359,11 @@ where
     }
 
     fn object_metadata(&self, path: &Path) -> Option<Arc<CachedObjectMetadata>> {
+        self.selected_object(path)
+            .map(|selected| selected.metadata.clone())
+    }
+
+    fn selected_object(&self, path: &Path) -> Option<Arc<SelectedGnuObject>> {
         let cache = self
             .metadata_cache
             .get_or_init(|| Mutex::new(FxHashMap::default()));
@@ -1358,13 +1371,20 @@ where
         match cache.raw_entry_mut().from_key(path.as_os_str()) {
             RawEntryMut::Occupied(entry) => entry.get().clone(),
             RawEntryMut::Vacant(entry) => {
-                let loaded = read_regular_object(path).map(|bytes| {
-                    Arc::new(CachedObjectMetadata {
-                        object_metadata: PreparedObjectMetadata::from_object_bytes(&bytes),
-                        object_bytes: bytes.into(),
-                        dwarf_index: Mutex::new(PerfDwarfIndexCache::default()),
-                    })
-                });
+                let loaded = (|| {
+                    #[cfg(target_os = "linux")]
+                    let canonical_name = std::fs::canonicalize(path).ok()?;
+                    let bytes = read_regular_object(path)?;
+                    Some(Arc::new(SelectedGnuObject {
+                        metadata: Arc::new(CachedObjectMetadata {
+                            object_metadata: PreparedObjectMetadata::from_object_bytes(&bytes),
+                            object_bytes: bytes.into(),
+                            dwarf_index: Mutex::new(PerfDwarfIndexCache::default()),
+                        }),
+                        #[cfg(target_os = "linux")]
+                        canonical_name,
+                    }))
+                })();
                 entry.insert(path.as_os_str().to_owned(), loaded).1.clone()
             }
         }
@@ -1373,21 +1393,23 @@ where
     fn resolve_group_symbols(
         &self,
         path: &Path,
+        selected: &SelectedGnuObject,
         requests: &[SymbolRequest],
         indexes: &[usize],
     ) -> Result<Vec<Option<String>>, String> {
-        let mut stdin = String::new();
-        for index in indexes {
-            writeln!(stdin, "0x{:x}", requests[*index].relative_address)
-                .expect("writing to a string cannot fail");
-        }
+        let command = addr2line_command(
+            path,
+            indexes
+                .iter()
+                .map(|index| requests[*index].relative_address),
+        );
+        #[cfg(target_os = "linux")]
+        let command = selected.attach_input(path, command)?;
+        #[cfg(not(target_os = "linux"))]
+        let _ = selected;
         let output = self
             .runner
-            .run(
-                &CommandSpec::new("addr2line")
-                    .args(["-f", "-C", "-e", path.to_string_lossy().as_ref()])
-                    .stdin(stdin.into_bytes()),
-            )
+            .run(&command)
             .map_err(|error| format!("failed to run addr2line: {error}"))?;
         if output.status_code == Some(0) {
             parse_addr2line_stdout(&output.stdout, indexes.len())
@@ -1869,10 +1891,16 @@ impl Kallsyms {
 
 #[must_use]
 pub fn build_addr2line_command(path: &Path, requests: &[SymbolRequest]) -> CommandSpec {
+    addr2line_command(
+        path,
+        requests.iter().map(|request| request.relative_address),
+    )
+}
+
+fn addr2line_command(path: &Path, addresses: impl Iterator<Item = u64>) -> CommandSpec {
     let mut stdin = String::new();
-    for request in requests {
-        writeln!(stdin, "0x{:x}", request.relative_address)
-            .expect("writing to a string cannot fail");
+    for address in addresses {
+        writeln!(stdin, "0x{address:x}").expect("writing to a string cannot fail");
     }
     CommandSpec::new("addr2line")
         .args(["-f", "-C", "-e", path.to_string_lossy().as_ref()])
@@ -3045,18 +3073,16 @@ where
         let mut resolved = vec![None; requests.len()];
         for (path, indexes) in grouped_request_indexes(requests) {
             let path = Path::new(path);
-            if std::fs::metadata(path).is_ok_and(|metadata| !metadata.is_file()) {
+            let Some(selected) = self.selected_object(path) else {
                 continue;
-            }
-            let symbols = self.resolve_group_symbols(path, requests, &indexes)?;
-            let object_metadata = self.object_metadata(path);
+            };
+            let symbols = self.resolve_group_symbols(path, &selected, requests, &indexes)?;
             for (index, symbol) in indexes.into_iter().zip(symbols) {
                 let request = &requests[index];
-                let object_symbol = object_metadata.as_ref().and_then(|metadata| {
-                    metadata
-                        .object_metadata
-                        .object_symbol(request.relative_address)
-                });
+                let object_symbol = selected
+                    .metadata
+                    .object_metadata
+                    .object_symbol(request.relative_address);
                 let symbol = perf_name_with_object_alias(symbol, object_symbol);
                 resolved[index] = symbol;
             }

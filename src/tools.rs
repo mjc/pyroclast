@@ -89,6 +89,9 @@ impl ToolSpec {
     }
 
     fn missing_tool_error(self) -> String {
+        if self.name == "pyroclast-addr2line" {
+            return "the optional GNU backend requires pyroclast-addr2line; install the repository's .#pyroclast-addr2line package, or use the default --symbolizer rust-addr2line".to_owned();
+        }
         match self.kind {
             ToolKind::AppleProvided => format!(
                 "{name} is required on macOS; install Xcode and select its developer directory with xcode-select",
@@ -522,7 +525,9 @@ fn resolution_error(tool: &ToolSpec, attempts: &[String], cwd: &Path) -> std::io
     if attempts.is_empty() {
         message.push_str("\n- no supported resolution sources were available");
     }
-    if tool.kind == ToolKind::NixManaged {
+    if tool.name == "pyroclast-addr2line" {
+        message.push_str("\nNext step: from the repository, run `nix profile install .#pyroclast-addr2line`, or keep --symbolizer rust-addr2line.");
+    } else if tool.kind == ToolKind::NixManaged {
         let _ = write!(
             message,
             "\nNext step: install `{}` using your OS package manager (project {}).",
@@ -545,6 +550,7 @@ pub const INFERNO_FLAMEGRAPH: ToolSpec = nix_utility("inferno-flamegraph", "infe
 pub const INFERNO_COLLAPSE_PERF: ToolSpec = nix_utility("inferno-collapse-perf", "inferno");
 pub const TOKIO_CONSOLE: ToolSpec = nix_utility("tokio-console", "tokio-console");
 pub const ADDR2LINE: ToolSpec = nix_utility("addr2line", "binutils");
+pub const PYROCLAST_ADDR2LINE: ToolSpec = nix_tool("pyroclast-addr2line");
 pub const PERF: ToolSpec = nix_tool("perf");
 pub const HEAPTRACK: ToolSpec = nix_utility("heaptrack", "heaptrack");
 pub const HEAPTRACK_PRINT: ToolSpec = nix_utility("heaptrack_print", "heaptrack");
@@ -588,6 +594,7 @@ pub fn tool_spec_named(name: &str) -> Option<ToolSpec> {
         "inferno-collapse-perf" => Some(INFERNO_COLLAPSE_PERF),
         "tokio-console" => Some(TOKIO_CONSOLE),
         "addr2line" => Some(ADDR2LINE),
+        "pyroclast-addr2line" => Some(PYROCLAST_ADDR2LINE),
         "perf" => Some(PERF),
         "heaptrack" => Some(HEAPTRACK),
         "heaptrack_print" => Some(HEAPTRACK_PRINT),

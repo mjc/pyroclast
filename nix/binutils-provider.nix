@@ -91,7 +91,8 @@ base.overrideAttrs (old: {
     description = "Private GNU addr2line with immutable Linux BFD input snapshots";
     longDescription = ''
       Separately named GNU addr2line for selected primary bytes and immutable
-      auxiliary snapshots. Linux memfd/procfs adapter; no Rust transport yet.
+      auxiliary snapshots. Linux memfd/procfs adapter for explicit GNU batches;
+      default application symbolization remains in-process Rust.
     '';
     mainProgram = "pyroclast-addr2line";
     platforms = lib.platforms.linux;

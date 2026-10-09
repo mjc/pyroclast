@@ -2,11 +2,13 @@
 
 `nix/binutils-provider.nix` packages `pyroclast-addr2line` separately from GNU
 `addr2line`. It does not override `pkgs.binutils`, shadow the independent
-oracle, or change Pyroclast's Rust transport or fallback behavior.
+oracle, or change Pyroclast's in-process Rust default.
 
 Default symbolization remains in-process `rust-addr2line`. This helper is an
 optional GNU backend component, not a replacement default or an automatic
-fallback; its production Rust transport is not implemented yet.
+fallback. On Linux, external GNU symbol-only batches pass the selected primary
+bytes through a sealed inherited descriptor. The helper is a Linux development
+test dependency, not a dependency of the default application package.
 
 ## Provenance
 
@@ -39,7 +41,11 @@ Linux memfd/procfs is required. Before invoking the helper, the caller supplies:
 
 Missing or invalid bootstrap data fails closed. Normal GNU help/version exits
 remain available without a primary. The existing GNU stdin address protocol
-can retain one provider session per DSO; Rust transport is not implemented here.
+is unchanged. Rust retains selected primary bytes and canonical names in its
+object cache and starts an owned, cancellable helper for each symbol-only batch.
+It constructs the sealed transport from those bytes, not by reopening the path.
+The child receives a dedicated descriptor without changing the parent's
+close-on-exec flags. Persistent per-DSO helper sessions are not implemented.
 
 Auxiliary candidates are opened once, nonblocking and without terminal
 acquisition; only regular files with finite observed lengths are copied.
@@ -94,9 +100,12 @@ growing file's EOF. Concurrent writes can affect acquisition: this is not an
 atomic filesystem snapshot, but the completed copy is immutable and shared by
 all CRC/parse/reopen consumers. `O_NONBLOCK` does not bound regular-file I/O on
 a stalled filesystem, and a very large finite file can consume time/storage.
-The owning production session must retain cancellation and wall-clock bounds.
+The Rust runner retains owned process-group cancellation; automatic wall-clock
+deadlines are not implemented yet.
 Trusted plugin code loading is not sandboxed; this is not a general BFD sandbox.
 
-Remaining integration: source-cache ownership of the selected bytes and names,
-the inherited-FD protocol, supervised persistent per-DSO helper sessions, and
-platform-specific immutable backing where Linux memfd/procfs is unavailable.
+Remaining integration: wall-clock deadlines, supervised persistent per-DSO
+helper sessions, and immutable backing where Linux memfd/procfs is unavailable.
+Non-Linux external GNU still has the legacy pathname handoff, without this
+provider's snapshot guarantee. The default in-process Rust path does not use
+that external handoff.

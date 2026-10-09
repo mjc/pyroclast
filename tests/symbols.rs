@@ -363,13 +363,17 @@ proptest! {
 
 #[test]
 fn addr2line_resolver_batches_requests_by_binary() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("app");
+    std::fs::write(&path, elf_with_dynamic_text_symbol(b"app", 0x1000, 46))
+        .expect("write regular object");
     let runner = Addr2lineRunner::new(b"app::main\n/bin/app.rs:10\napp::work\n/bin/app.rs:20\n");
     let resolver = Addr2lineResolver::new(&runner);
 
     let symbols = resolver
         .resolve_batch(&[
             SymbolRequest {
-                path: PathBuf::from("/bin/app"),
+                path: path.clone(),
                 relative_address: 0x10,
                 kernel_mapping_range: None,
                 build_id: None,
@@ -377,7 +381,7 @@ fn addr2line_resolver_batches_requests_by_binary() {
                 kernel_relocation: None,
             },
             SymbolRequest {
-                path: PathBuf::from("/bin/app"),
+                path,
                 relative_address: 0x20,
                 kernel_mapping_range: None,
                 build_id: None,
@@ -396,6 +400,25 @@ fn addr2line_resolver_batches_requests_by_binary() {
         runner.commands()[0].stdin.as_deref(),
         Some(&b"0x10\n0x20\n"[..])
     );
+}
+
+#[test]
+fn addr2line_resolver_does_not_spawn_for_missing_objects() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let runner = Addr2lineRunner::new(b"phantom\n??:0\n");
+    let resolver = Addr2lineResolver::new(&runner);
+    let symbols = resolver
+        .resolve_batch(&[SymbolRequest {
+            path: root.path().join("missing-object"),
+            relative_address: 0x10,
+            kernel_mapping_range: None,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        }])
+        .expect("missing source is unresolved");
+    assert_eq!(symbols, [None]);
+    assert!(runner.commands().is_empty());
 }
 
 #[test]
@@ -1702,14 +1725,18 @@ fn perf_inline_frame_order_matches_perf_script_root_to_leaf() {
 }
 
 #[test]
-fn addr2line_resolver_treats_failed_batches_as_unresolved() {
+fn addr2line_resolver_treats_failed_batches_without_object_aliases_as_unresolved() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("app");
+    std::fs::write(&path, elf_with_dynamic_text_symbol(b"app", 0x1000, 46))
+        .expect("write regular object");
     let runner = Addr2lineRunner::failed();
     let resolver = Addr2lineResolver::new(&runner);
 
     let symbols = resolver
         .resolve_batch(&[
             SymbolRequest {
-                path: PathBuf::from("/bin/app"),
+                path: path.clone(),
                 relative_address: 0x10,
                 kernel_mapping_range: None,
                 build_id: None,
@@ -1717,7 +1744,7 @@ fn addr2line_resolver_treats_failed_batches_as_unresolved() {
                 kernel_relocation: None,
             },
             SymbolRequest {
-                path: PathBuf::from("/bin/app"),
+                path,
                 relative_address: 0x20,
                 kernel_mapping_range: None,
                 build_id: None,
@@ -2011,6 +2038,10 @@ fn kallsyms_loads_first_parseable_system_map_candidate() {
 
 #[test]
 fn perf_symbol_resolver_routes_kernel_requests_to_kallsyms() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("app");
+    std::fs::write(&path, elf_with_dynamic_text_symbol(b"app", 0x1000, 46))
+        .expect("write regular object");
     let runner = Addr2lineRunner::new(b"app::main\n/bin/app.rs:10\n");
     let kallsyms = Kallsyms::parse(
         "\
@@ -2031,7 +2062,7 @@ ffffffff88000080 t asm_exc_page_fault
                 kernel_relocation: None,
             },
             SymbolRequest {
-                path: PathBuf::from("/bin/app"),
+                path,
                 relative_address: 0x10,
                 kernel_mapping_range: None,
                 build_id: None,
@@ -2052,7 +2083,11 @@ ffffffff88000080 t asm_exc_page_fault
         ]
     );
     assert_eq!(runner.commands().len(), 1);
-    assert_eq!(runner.commands()[0].stdin.as_deref(), Some(&b"0x10\n"[..]));
+    // The valid ELF fixture translates file-relative 0x10 to VA 0x1010.
+    assert_eq!(
+        runner.commands()[0].stdin.as_deref(),
+        Some(&b"0x1010\n"[..])
+    );
 }
 
 #[test]
@@ -2505,7 +2540,7 @@ fn perf_symbol_resolver_prefers_perfdata_kallsyms_over_kernel_elf() {
 }
 
 #[test]
-fn perf_symbol_resolver_uses_kernel_build_id_elf_when_kallsyms_is_missing() {
+fn perf_symbol_resolver_rejects_invalid_kernel_build_id_elf_when_kallsyms_is_missing() {
     let home = tempfile::tempdir().expect("home");
     let perfdata = home.path().join("perf.data");
     std::fs::write(&perfdata, perfdata_with_kernel_build_id()).expect("perfdata");
@@ -2531,6 +2566,37 @@ fn perf_symbol_resolver_uses_kernel_build_id_elf_when_kallsyms_is_missing() {
         }])
         .expect("symbols");
 
+    assert_eq!(symbols, vec![None]);
+    assert!(runner.commands().is_empty());
+}
+
+#[test]
+fn perf_symbol_resolver_uses_valid_kernel_build_id_elf_when_kallsyms_is_missing() {
+    let home = tempfile::tempdir().expect("home");
+    let perfdata = home.path().join("perf.data");
+    std::fs::write(&perfdata, perfdata_with_kernel_build_id()).expect("perfdata");
+    let build_id = "16ed3d5317ad219c89d0e3c5ea0ea2caa3cd4949";
+    let kernel_elf =
+        pyroclast::symbols::perf_build_id_elf_path(&perf_debug_dir(home.path()), build_id);
+    std::fs::create_dir_all(kernel_elf.parent().expect("kernel elf parent")).expect("cache dir");
+    std::fs::write(
+        &kernel_elf,
+        elf_with_dynamic_text_symbol(b"asm_exc_page_fault", 0xffff_ffff_8800_0080, 46),
+    )
+    .expect("regular kernel elf");
+    let runner = Addr2lineRunner::new(b"asm_exc_page_fault\n??:0\n");
+    let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
+        .with_perfdata_file_kernel_cache(&perfdata, &perf_debug_dir(home.path()));
+    let symbols = resolver
+        .resolve_batch(&[SymbolRequest {
+            path: PathBuf::from("[kernel.kallsyms]"),
+            relative_address: 0xffff_ffff_8800_008f,
+            kernel_mapping_range: None,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        }])
+        .expect("symbols");
     assert_eq!(symbols, vec![Some("asm_exc_page_fault".to_string())]);
     assert_eq!(
         runner.commands()[0].args,
