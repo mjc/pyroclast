@@ -548,9 +548,9 @@ fn rust_addr2line_resolver_reads_symbol_table_names() {
 #[test]
 fn rust_addr2line_resolver_preserves_qualified_symtab_name_like_perf() {
     // perf's event symbol path is machine__resolve() -> map__find_symbol();
-    // libdw inline names come from dwarf_diename(die)
-    // (tools/perf/util/libdw.c:libdw_a2l_cb), and elfutils' dwarf_diename()
-    // returns only the DIE's DW_AT_name. GNU addr2line similarly prints the
+    // Linux v7.2.9 tools/perf/util/libdw.c:99-108 obtains inline names from
+    // integrated DW_AT_linkage_name, falling back to DW_AT_name. GNU
+    // addr2line similarly prints the
     // functionname returned by bfd_find_nearest_line_discriminator(). None of
     // those paths scan unrelated .debug_str/object bytes to specialize a
     // symtab placeholder.
@@ -676,8 +676,8 @@ fn perf_symbol_name_preserves_demangled_symtab_names_like_perf_script() {
 
 #[test]
 fn perf_dwarf_function_name_preserves_unmangled_die_name_like_libdw() {
-    // tools/perf/util/libdw.c:libdw_a2l_cb passes dwarf_diename(die) to
-    // tools/perf/util/srcline.c:new_inline_sym, which only demangles it.
+    // Linux v7.2.9 tools/perf/util/libdw.c:99-108 falls back to die_name()
+    // without linkage; tools/perf/util/srcline.c:new_inline_sym demangles it.
     assert_eq!(
         perf_dwarf_function_name("pyroclast::perfdata::attrs::parse_file_attrs"),
         "pyroclast::perfdata::attrs::parse_file_attrs"
@@ -818,7 +818,8 @@ fn perf_dwarf_frame_names_can_use_existing_object_bytes() {
 #[test]
 #[cfg(target_os = "linux")]
 fn perf_dwarf_frame_names_keep_fn0_die_name() {
-    // perf/util/libdw.c passes dwarf_diename() to new_inline_sym(). The
+    // Linux v7.2.9 tools/perf/util/libdw.c:85-108 keeps the ELF outer symbol
+    // and otherwise uses linkage/name attributes in new_inline_sym(). The
     // zero-address sentinel in perf/util/addr2line.c is a child-process
     // protocol record, not a spelling rule for DW_AT_name.
     let (_root, binary, bytes) = compiled_c_fixture("int fn0(void) { return 7; }");

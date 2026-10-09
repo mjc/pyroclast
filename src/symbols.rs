@@ -14163,6 +14163,106 @@ mod tests {
         PerfAddressRange { begin, end }
     }
 
+    #[test]
+    fn closing_dwarf_scope_preserves_child_subtraction_and_source_line_segment_order() {
+        // dwarf-aux.c:cu_walk_functions_at follows the containing child chain;
+        // libdw.c:libdw__addr2line requires source coverage at the queried PC.
+        let mut scopes = vec![super::PerfDwarfScope {
+            depth: 1,
+            ranges: vec![test_range(0, 100)],
+            frame: std::num::NonZeroUsize::new(1),
+            frame_checkpoint: 0,
+            segment_checkpoint: 0,
+            has_inline_frames: true,
+            suppressed: false,
+            child_coverage: vec![test_range(40, 50), test_range(20, 30)],
+        }];
+        let mut index = super::PerfDwarfFrameIndex::default();
+        index.nodes.push(super::PerfDwarfFrameNode {
+            name: 0,
+            parent: None,
+            kind: super::PerfDwarfDieKind::Inline,
+        });
+        let lines = [test_range(10, 25), test_range(45, 60), test_range(70, 80)];
+        let mut order = 5;
+        super::perf_dwarf_finish_scope(&mut scopes, &lines, &mut index, &mut order);
+        assert_eq!(
+            index
+                .segments
+                .iter()
+                .map(|segment| (segment.range, segment.has_source_line, segment.order))
+                .collect::<Vec<_>>(),
+            [
+                (test_range(0, 10), false, 5),
+                (test_range(10, 20), true, 5),
+                (test_range(30, 40), false, 6),
+                (test_range(60, 70), false, 7),
+                (test_range(80, 100), false, 7),
+                (test_range(50, 60), true, 7),
+                (test_range(70, 80), true, 7),
+            ]
+        );
+        assert!(
+            index
+                .segments
+                .iter()
+                .all(|segment| segment.has_inline_frames)
+        );
+        assert_eq!(index.nodes.len(), 1);
+        assert!(scopes.is_empty());
+        assert_eq!(order, 8);
+    }
+
+    #[test]
+    fn dwarf_range_subtraction_preserves_half_open_extreme_and_empty_intervals() {
+        // elfutils libdw/dwarf_haspc.c:48-53 uses begin <= pc && pc < end.
+        for (ranges, covered, expected) in [
+            (vec![], vec![], vec![]),
+            (vec![test_range(2, 2)], vec![], vec![]),
+            (vec![test_range(8, 2)], vec![], vec![]),
+            (
+                vec![test_range(0, u64::MAX)],
+                vec![test_range(1, u64::MAX - 1)],
+                vec![test_range(0, 1), test_range(u64::MAX - 1, u64::MAX)],
+            ),
+            (
+                vec![test_range(5, 10), test_range(10, 15)],
+                vec![test_range(0, 5), test_range(15, 20)],
+                vec![test_range(5, 15)],
+            ),
+            (vec![test_range(0, 10)], vec![test_range(0, 20)], vec![]),
+        ] {
+            assert_eq!(
+                super::perf_dwarf_subtract_ranges(&ranges, &covered),
+                expected
+            );
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn dwarf_range_subtraction_matches_half_open_set_difference(
+            ranges in proptest::collection::vec((0_u64..64, 0_u64..64), 0..12),
+            covered in proptest::collection::vec((0_u64..64, 0_u64..64), 0..12),
+        ) {
+            let normalize = |ranges: Vec<(u64, u64)>| {
+                ranges.into_iter().map(|(a, b)| test_range(a.min(b), a.max(b)))
+                    .collect::<Vec<_>>()
+            };
+            let ranges = normalize(ranges);
+            let covered = normalize(covered);
+            let actual = super::perf_dwarf_subtract_ranges(&ranges, &covered);
+            proptest::prop_assert!(actual.iter().all(|range| range.begin < range.end));
+            proptest::prop_assert!(actual.windows(2).all(|pair| pair[0].end <= pair[1].begin));
+            for address in 0..64 {
+                let contains = |ranges: &[PerfAddressRange]| {
+                    ranges.iter().any(|range| range.begin <= address && address < range.end)
+                };
+                proptest::prop_assert_eq!(contains(&actual), contains(&ranges) && !contains(&covered));
+            }
+        }
+    }
+
     fn test_request(path: &str, relative_address: u64) -> SymbolRequest {
         SymbolRequest {
             addr2line_address: None,
