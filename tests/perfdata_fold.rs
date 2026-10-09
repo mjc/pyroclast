@@ -22,6 +22,9 @@ use pyroclast::symbols::{
     perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources,
 };
 use std::cell::RefCell;
+#[cfg(target_os = "linux")]
+#[path = "support/kcore_inputs.rs"]
+mod kcore_inputs;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[path = "support/perfdata_memory_sources.rs"]
 mod memory_sources;

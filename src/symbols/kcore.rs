@@ -62,7 +62,7 @@ impl KcoreSymbols {
                 return None;
             }
         }
-        let mut file = File::open(directory.join("kcore")).ok()?;
+        let mut file = super::open_regular_object(&directory.join("kcore"))?;
         let ranges = read_load_ranges(&mut file, core.prot & 4 != 0, arch)?;
         if ranges.is_empty() {
             return None;
