@@ -3271,6 +3271,129 @@ fn keeps_rbp_caller_from_executable_mmap2_like_perf_libdw() {
     assert_eq!(folded, expected);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn non_executable_user_mmap2_is_reported_to_unwinder_like_native_perf_libdw() {
+    // perf util/unwind-libdw.c:__report_module reports the covering user DSO
+    // without checking PROT_EXEC. The ELF's absent FDE uses the RBP fallback.
+    let fixture = SyntheticX86_64Object::create();
+    for prot in [0, 1, 3] {
+        let mut mmap = mmap2_payload(11, 11, 0, 0x10000, 0, prot, &fixture.path_string());
+        mmap.resize(mmap.len().next_multiple_of(8), 0);
+        let bytes = perfdata_with_records_and_attrs(
+            [file_attr_bytes_with_regs(
+                PERF_SAMPLE_IP
+                    | PERF_SAMPLE_TID
+                    | PERF_SAMPLE_CALLCHAIN
+                    | PERF_SAMPLE_REGS_USER
+                    | PERF_SAMPLE_STACK_USER,
+                (1 << 6) | (1 << 7) | (1 << 8),
+            )],
+            [
+                record_bytes(10, &mmap),
+                record_bytes_with_misc(
+                    9,
+                    PERF_RECORD_MISC_CPUMODE_USER,
+                    &sample_payload_with_user_stack(
+                        0x4000,
+                        11,
+                        11,
+                        [],
+                        1,
+                        [0x7fff_0008, 0x7fff_0000, 0x4000],
+                        [
+                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x34, 0x12, 0, 0, 0, 0,
+                            0, 0,
+                        ],
+                    ),
+                ),
+            ],
+        );
+        let (script, expected) = native_script_and_fold(&bytes);
+        assert_eq!(
+            expected,
+            format!(":11;[{0}];[{0}] 1\n", fixture.file_name()),
+            "prot={prot}: {script}"
+        );
+        assert_eq!(
+            fold_perfdata_callchains(&bytes).unwrap(),
+            expected,
+            "{script}"
+        );
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), &bytes).unwrap();
+        assert_eq!(
+            fold_perfdata_file_with_options(file.path(), FoldOptions::default()).unwrap(),
+            expected
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn read_only_caller_mapping_is_reported_to_unwinder_like_native_perf_libdw() {
+    // unwind-libdw.c reports start-pgoff for both mappings. Reaching the
+    // read-only prefix adds an overlapping whole-ELF module at another base.
+    // This two-module layout retains both callers on all three samples.
+    let fixture = SyntheticX86_64Object::create();
+    let mmap = |start, len, pgoff, prot| {
+        let mut payload = mmap2_payload(11, 11, start, len, pgoff, prot, &fixture.path_string());
+        payload.resize(payload.len().next_multiple_of(8), 0);
+        record_bytes(10, &payload)
+    };
+    let sample = || {
+        record_bytes_with_misc(
+            9,
+            PERF_RECORD_MISC_CPUMODE_USER,
+            &sample_payload_with_user_stack(
+                0x1000_5000,
+                11,
+                11,
+                [],
+                1,
+                [0x7fff_0008, 0x7fff_0000, 0x1000_5000],
+                [
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0x10, 0, 0, 0, 0,
+                ],
+            ),
+        )
+    };
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            (1 << 6) | (1 << 7) | (1 << 8),
+        )],
+        [
+            mmap(0x1000_0000, 0x1000, 0, 1),
+            mmap(0x1000_2000, 0x10000, 0x1000, 5),
+            sample(),
+            sample(),
+            sample(),
+        ],
+    );
+    let (script, expected) = native_script_and_fold(&bytes);
+    assert_eq!(
+        expected,
+        format!(":11;[{0}];[{0}] 3\n", fixture.file_name()),
+        "{script}"
+    );
+    assert_eq!(
+        fold_perfdata_callchains(&bytes).unwrap(),
+        expected,
+        "{script}"
+    );
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), &bytes).unwrap();
+    assert_eq!(
+        fold_perfdata_file_with_options(file.path(), FoldOptions::default()).unwrap(),
+        expected
+    );
+}
+
 #[test]
 fn keeps_rbp_caller_from_pid_specific_modules_like_perf_libdw() {
     // Only the sampled PID's mapping supplies the module for the initial IP.

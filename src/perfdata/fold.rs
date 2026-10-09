@@ -58,6 +58,7 @@ use crate::symbols::{
 };
 
 const UNKNOWN_FRAME: &str = "[unknown]";
+#[cfg(test)]
 const PROT_EXEC: u32 = 4;
 const PERF_CONTEXT_KERNEL: u64 = 0xffff_ffff_ffff_ff80;
 const PERF_CONTEXT_HV: u64 = 0xffff_ffff_ffff_ffe0;
@@ -360,7 +361,6 @@ struct UnwindMappingRequest<'a> {
     start: u64,
     len: u64,
     pgoff: u64,
-    prot: Option<u32>,
     path: &'a str,
     module_name: &'a str,
     file_identity: Option<FileIdentity>,
@@ -4945,7 +4945,6 @@ fn load_unwind_mapping_for_user_mapping_like_perf(
         start: mapping.start,
         len: mapping.len,
         pgoff: mapping.pgoff,
-        prot: mapping.prot,
         path: &path,
         module_name: &name,
         file_identity: mapping.file_identity,
@@ -5169,9 +5168,8 @@ fn load_unwind_mapping(
     if !should_load_unwind_object(request.path, request.file_identity) {
         return ObjectMappingResult::Rejected;
     }
-    if request.prot.is_some_and(|prot| prot & PROT_EXEC == 0) {
-        return ObjectMappingResult::Rejected;
-    }
+    // perf util/unwind-libdw.c:__report_module reports any covering user DSO;
+    // PROT_EXEC does not constrain callback module reporting.
     let key = unwind_mapping_key(request.path, request.start, request.len, request.pgoff);
     // This is attempt bookkeeping, not a report-result cache. A genuine
     // re-report must reopen the ELF and can GC an existing DWFL identity.

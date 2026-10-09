@@ -3,6 +3,27 @@
 Status as of 2026-06-11. Goal: `pyroclast plumbing fold|flamegraph` fully replaces
 `perf script | inferno-collapse-perf | inferno-flamegraph`.
 
+## 2026-10-09 non-executable user mappings participate in module reporting
+
+`tools/perf/util/unwind-libdw.c:75-133` selects the covering user DSO and
+reports its regular ELF without a `PROT_EXEC` check. Pyroclast instead rejected
+these mappings in `load_unwind_mapping`, before libdw-compatible module state
+could change. Independent native comparisons were red for both an initial PC
+in a non-executable mapping (native retained two frames, Pyroclast none) and
+an RBP caller in a read-only prefix (native retained the caller, Pyroclast
+truncated it). The rejection and its private protection-bit field are removed.
+The regressions compare freshly generated native folds through byte and file
+replay; the initial-PC control covers protection values 0, 1, and 3.
+
+The two-module prefix fixture retains both frames on three consecutive native
+samples. Overlap alone therefore does not imply rejection or justify dropping
+samples. A separate real profile encountered libdw overlap errors after a
+read-only caller; that larger module-state sequence still requires replay
+verification. Inferno `collapse/perf.rs:580-599` retains nonempty stacks and
+drops empty events; no output-label or sample-count workaround belongs here.
+GNU `binutils/addr2line.c:355-409` only supplies frame names and inline chains;
+it does not decide which user mappings the unwinder reports.
+
 ## 2026-10-09 recorded kernel/user callchains still receive user unwinds
 
 Investigation of a fresh C thread workload found an unsupported mixed-callchain
