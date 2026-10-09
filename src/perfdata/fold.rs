@@ -1554,10 +1554,10 @@ impl<R: SymbolResolver> SampleOutput for FoldedOutput<'_, '_, R> {
         {
             return self.fold_perf_text(accumulator, sample);
         }
-        let frames = sample.frames.iter().rev().copied().filter(|frame| {
-            let address = frame.address();
-            !is_perf_context_marker(address)
-        });
+        // Recorded context words are consumed during preparation. perf's
+        // unwind-libdw.c:frame_callback retains recovered PCs even when their
+        // numeric values overlap that recorded-callchain encoding.
+        let frames = sample.frames.iter().rev().copied();
         self.buffers.projecting = true;
         let status = FoldFrameResolver::new(&accumulator.mmap_table, self.inline)
             .render_folded_stack_for_stack(
@@ -3261,9 +3261,6 @@ impl<'a> FoldFrameResolver<'a> {
     {
         let mut mapping_cache = MappingResolveCache::default();
         for frame in callchain.iter().copied() {
-            if is_perf_context_marker(frame.address()) {
-                continue;
-            }
             if let FoldFrame::InlineCurrentIp(address) = frame {
                 // perf's machine.c unwind_entry() runs append_inlines() on
                 // EVERY accepted entry, including the initial sampled IP, so
@@ -8033,7 +8030,7 @@ mod tests {
     }
 
     #[test]
-    fn delivered_deep_stacks_reverse_once_and_filter_context_markers() {
+    fn delivered_deep_stacks_reverse_once_and_preserve_context_valued_dwarf_pcs() {
         use super::SampleOutput as _;
         use std::fmt::Write as _;
         let mut state = super::SessionState::new(std::collections::BTreeMap::new());
@@ -8052,7 +8049,10 @@ mod tests {
                 });
             frames.push(super::FoldFrame::UserUnwind(index * 0x1000 + 0x10));
             if index == 20 {
-                frames.push(super::FoldFrame::Callchain(super::PERF_CONTEXT_USER));
+                // unwind-libdw.c:frame_callback passes recovered addresses to
+                // entry; machine.c:add_callchain_ip handles recorded sentinels
+                // before preparation, not while these frames are rendered.
+                frames.push(super::FoldFrame::UserUnwind(super::PERF_CONTEXT_USER));
             }
         }
         let sample = prepared_sample(&frames);
@@ -8069,6 +8069,9 @@ mod tests {
         let expected = (1..=40)
             .rev()
             .fold(String::from("worker"), |mut text, index| {
+                if index == 20 {
+                    text.push_str(";[unknown]");
+                }
                 write!(text, ";[frame-{index}]").unwrap();
                 text
             });

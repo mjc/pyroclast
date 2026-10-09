@@ -3727,6 +3727,154 @@ fn lazy_cfi_reports_every_caller_before_acceptance_like_native_perf_libdw() {
     );
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_dwarf_caller_addresses_are_not_recorded_callchain_context_markers() {
+    assert_native_high_dwarf_callers(false);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn timestamp_ordered_dwarf_caller_addresses_are_not_recorded_context_markers() {
+    assert_native_high_dwarf_callers(true);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn assert_native_high_dwarf_callers(timed: bool) {
+    // perf unwind-libdw.c:frame_callback adjusts a recovered nonactivation PC
+    // then passes it to entry. That address is not a recorded callchain word,
+    // even when its numeric value overlaps PERF_CONTEXT_MAX or a context tag.
+    let fixture = SyntheticX86_64Object::create_with_stack_cfi();
+    for return_address in [
+        u64::MAX,
+        u64::MAX - 2,
+        0xffff_ffff_ffff_fe01,
+        0xffff_ffff_ffff_f002,
+        0x7a01,
+    ] {
+        let mut mmap = mmap_payload(11, 11, 0x10000, 0x10000, 0, &fixture.path_string());
+        mmap.resize(mmap.len().next_multiple_of(8), 0);
+        let mut stack = [0_u8; 16];
+        stack[..8].copy_from_slice(&return_address.to_le_bytes());
+        let mut attr = file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER
+                | if timed { PERF_SAMPLE_TIME } else { 0 },
+            (1 << 6) | (1 << 7) | (1 << 8),
+        );
+        put_u64(&mut attr, 16, 1);
+        let mut bytes = perfdata_with_records_and_attrs(
+            [attr],
+            [
+                record_bytes_with_misc(1, PERF_RECORD_MISC_CPUMODE_USER, &mmap),
+                record_bytes_with_misc(
+                    9,
+                    PERF_RECORD_MISC_CPUMODE_USER,
+                    &sample_payload_with_optional_timestamp(
+                        sample_payload_with_user_stack(
+                            0x10100,
+                            11,
+                            11,
+                            [],
+                            2,
+                            [0, 0x7fff_0000, 0x10100],
+                            stack,
+                        ),
+                        timed,
+                    ),
+                ),
+            ],
+        );
+        put_u64(&mut bytes, 16, 144);
+        let (script, native) = native_script_and_fold(&bytes);
+        assert!(
+            script.contains(&format!("{:x} [unknown] ([unknown])", return_address - 1)),
+            "{script}"
+        );
+        assert_eq!(
+            native,
+            format!(":11;[unknown];[{}] 1\n", fixture.file_name()),
+            "{script}"
+        );
+        assert_eq!(
+            fold_perfdata_callchains(&bytes).unwrap(),
+            native,
+            "return={return_address:#x}, native={script}"
+        );
+        let data = fixture.path.parent().unwrap().join("high-caller.perf.data");
+        std::fs::write(&data, &bytes).unwrap();
+        assert_eq!(
+            fold_perfdata_file_with_options(&data, FoldOptions::default()).unwrap(),
+            native
+        );
+        assert_high_dwarf_caller_symbol_routes(&data, &bytes, &script, &native);
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn assert_high_dwarf_caller_symbol_routes(
+    data: &std::path::Path,
+    bytes: &[u8],
+    native_script: &str,
+    native_folded: &str,
+) {
+    use pyroclast::symbols::{SelectedObjectResolver, SymbolizerKind};
+    let runner = pyroclast::process::RealCommandRunner::default();
+    let root = data.parent().unwrap();
+    for (symbolizer, name) in [
+        (SymbolizerKind::RustAddr2line, "rust-addr2line"),
+        (SymbolizerKind::Addr2line, "addr2line"),
+    ] {
+        for inline in [false, true] {
+            let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+                SelectedObjectResolver::new(&runner, symbolizer),
+                data,
+                root,
+                [],
+                &root.join("missing-kallsyms"),
+            );
+            let options = FoldOptions {
+                inline,
+                count_periods: false,
+            };
+            assert_eq!(
+                fold_perfdata_callchains_with_symbols(bytes, options, &resolver).unwrap(),
+                native_folded,
+                "{symbolizer:?}, inline={inline}: {native_script}"
+            );
+            assert_eq!(
+                pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(
+                    data, options, &resolver
+                )
+                .unwrap(),
+                native_folded
+            );
+            let output = Command::new(env!("CARGO_BIN_EXE_pyroclast"))
+                .args([
+                    "plumbing",
+                    "perf-script",
+                    if inline { "--inline" } else { "--no-inline" },
+                    "--symbolizer",
+                    name,
+                ])
+                .arg(data)
+                .env("HOME", root)
+                .env("DEBUGINFOD_URLS", "")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), native_script);
+        }
+    }
+}
+
 #[test]
 fn keeps_rbp_caller_from_pid_specific_modules_like_perf_libdw() {
     // Only the sampled PID's mapping supplies the module for the initial IP.
