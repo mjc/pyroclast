@@ -9198,6 +9198,107 @@ fn native_kcore_ignores_live_module_section_maps_when_build_id_is_wrong_or_missi
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_module_event_ip_discovers_live_build_id_before_cache_selection() {
+    use std::fmt::Write as _;
+    const MODULE: u64 = 0xffff_ffff_c100_0010;
+    const CORE: u64 = 0xffff_ffff_8100_0010;
+
+    for cache_data_symbol in [true, false] {
+        let (root, bytes) = write_native_module_object_queries(
+            false,
+            true,
+            &[(MODULE, &[CORE]), (MODULE, &[MODULE])],
+            true,
+        );
+        let original = std::fs::read(root.path().join("module.elf")).unwrap();
+        let elf = object::File::parse(original.as_slice()).unwrap();
+        let id = elf.build_id().unwrap().unwrap();
+        let hex = id.iter().fold(String::new(), |mut hex, byte| {
+            write!(hex, "{byte:02x}").unwrap();
+            hex
+        });
+        let mut builder = object::build::elf::Builder::read(original.as_slice()).unwrap();
+        let text = builder
+            .sections
+            .iter()
+            .find(|section| section.name.as_slice() == b".text")
+            .unwrap()
+            .id();
+        for symbol in &mut builder.symbols {
+            symbol.delete = symbol.section != Some(text);
+        }
+        let mut text_only = Vec::new();
+        builder.write(&mut text_only).unwrap();
+        assert_eq!(
+            object::File::parse(text_only.as_slice())
+                .unwrap()
+                .build_id()
+                .unwrap(),
+            Some(id)
+        );
+        let cache = pyroclast::symbols::perf_build_id_elf_path(&root.path().join(".debug"), &hex);
+        let (cached, live) = if cache_data_symbol {
+            (&original, &text_only)
+        } else {
+            (&text_only, &original)
+        };
+        std::fs::write(cache, cached).unwrap();
+        std::fs::write(root.path().join("a.ko"), live).unwrap();
+
+        // symbol.c:dso__load discovers an undefined ID from the live ELF
+        // before selecting the cache. Use an ordinary MMAP with no ID.
+        let header = pyroclast::perfdata::header::parse_header(&bytes).unwrap();
+        let data_offset = usize::try_from(header.data_offset).unwrap();
+        let mut no_id = bytes[..data_offset].to_vec();
+        for record in pyroclast::perfdata::records::iter_records(&bytes, header).unwrap() {
+            if record.header.record_type == 10 {
+                let mut payload = mmap_payload(
+                    u32::MAX,
+                    u32::MAX,
+                    0xffff_ffff_c100_0000,
+                    0x4000,
+                    0,
+                    root.path().join("a.ko").to_str().unwrap(),
+                );
+                payload.resize(payload.len().next_multiple_of(8), 0);
+                no_id.extend(record_bytes_with_misc(
+                    1,
+                    PERF_RECORD_MISC_CPUMODE_KERNEL,
+                    &payload,
+                ));
+            } else {
+                no_id.extend(record_bytes_with_misc(
+                    record.header.record_type,
+                    record.header.misc,
+                    record.payload,
+                ));
+            }
+        }
+        let data_size = u64::try_from(no_id.len() - data_offset).unwrap();
+        put_u64(&mut no_id, 48, data_size);
+        std::fs::write(root.path().join("perf.data"), &no_id).unwrap();
+        let summary = summarize_perfdata(&no_id).unwrap();
+        assert!(
+            summary
+                .mmap_table
+                .resolve_ref(11, MODULE)
+                .unwrap()
+                .build_id
+                .is_none()
+        );
+
+        let (script, stderr, native) = query_native_module_object(root.path());
+        assert_eq!(
+            stderr.contains("/kcore for kernel data"),
+            !cache_data_symbol,
+            "native must use cache maps rather than live maps\nscript={script}\nstderr={stderr}"
+        );
+        assert_module_symbol_routes_match_native(root.path(), &no_id, &script, &native);
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn query_native_module_object(root: &std::path::Path) -> (String, String, Vec<u8>) {
     use inferno::collapse::Collapse as _;
     let native = Command::new("perf")

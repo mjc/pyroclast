@@ -59,10 +59,26 @@ every sample; the counting regression was red at 100 loads instead of one.
 Native text/folded comparisons cover both providers, inline settings, byte/file
 replay, live/cache sources, ID failures, and data-map rejection/acceptance.
 
-Remaining review findings include ID-less event-IP discovery through frozen
-DSO identity and native short-name module binding across pathname changes.
-These are not covered by the above fixed-ID, stable-path proofs. General
-split-debug symbol/runtime selection remains outside this parity conclusion.
+The remaining native short-name module binding across pathname changes is
+not covered by these stable-path proofs. General split-debug symbol/runtime
+selection remains outside this parity conclusion.
+
+## 2026-10-09 ID discovery for an unrendered module event IP
+
+An ordinary module MMAP with no recorded ID exposed a separate red regression.
+The event IP referenced the module while its first callchain contained only a
+core frame. The live ELF and its matching-ID cache had opposite eligible data
+section-map layouts, preserving the same build ID. Native discovered the live
+ID before selecting the cache (`symbol.c:1745`, `symsrc__init` at
+`symbol-elf.c:1193`), so the cache determined kcore validation. Pyroclast bypassed
+the frozen DSO identity path during event-IP preprocessing, selected the live
+metadata, and emitted `first` instead of `cached_module_object` later.
+
+Event-IP preprocessing now uses the same `symbol_mapping_ref` as callchain
+symbol lookup, discovering and freezing identity at the actual first load.
+The native regression passed after this change for both cache/live map-layout
+controls across Rust/GNU providers, inline modes, and byte/file folding. This
+does not resolve pathname-changing native module DSO reuse.
 
 ## 2026-10-09 retained GNU helper and auxiliary lifetime
 

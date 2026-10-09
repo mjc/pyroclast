@@ -1734,7 +1734,13 @@ fn preprocess_sample_ip<R: SymbolResolver>(
         resolve_frame_in_context(Some(&context), frame, address, &mut mapping_cache)
         && mapping.is_kernel()
     {
-        cache.preprocess_sample_ip(&mapping.resolved_ref());
+        // symbol.c:dso__load discovers an undefined live build ID before
+        // choosing cached symbols. Freeze that identity at this first load,
+        // even when the independently recorded callchain omits the event IP.
+        let mapping = accumulator
+            .mmap_table
+            .symbol_mapping_ref(mapping, Some(cache.resolver()));
+        cache.preprocess_sample_ip(&mapping);
     }
 }
 
