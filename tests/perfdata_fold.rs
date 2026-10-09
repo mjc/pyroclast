@@ -3271,7 +3271,7 @@ fn keeps_rbp_caller_from_executable_mmap2_like_perf_libdw() {
     assert_eq!(folded, expected);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn non_executable_user_mmap2_is_reported_to_unwinder_like_native_perf_libdw() {
     // perf util/unwind-libdw.c:__report_module reports the covering user DSO
@@ -3329,7 +3329,7 @@ fn non_executable_user_mmap2_is_reported_to_unwinder_like_native_perf_libdw() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn read_only_caller_mapping_is_reported_to_unwinder_like_native_perf_libdw() {
     // unwind-libdw.c reports start-pgoff for both mappings. Reaching the
