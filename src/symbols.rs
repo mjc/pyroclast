@@ -3121,7 +3121,12 @@ fn read_snapshot_with_size(reader: impl Read, len: u64) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut chunk = [0; 8 * 1024];
     loop {
-        let count = reader.read(&mut chunk).ok()?;
+        // Match elfutils lib/system.h:pread_retry's TEMP_FAILURE_RETRY.
+        let count = match reader.read(&mut chunk) {
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        };
         if count == 0 {
             break;
         }
@@ -5908,6 +5913,79 @@ mod tests {
                 .is_none()
         );
         assert!(super::read_object_with_size(std::io::Cursor::new(b"not ELF"), 7).is_none());
+    }
+
+    #[test]
+    fn object_snapshot_retries_interrupted_reads_without_consuming_growth() {
+        assert_interrupted_snapshot_preserves_extent(false);
+    }
+
+    #[test]
+    fn classified_object_reader_retries_interrupted_reads_without_consuming_growth() {
+        assert_interrupted_snapshot_preserves_extent(true);
+    }
+
+    fn assert_interrupted_snapshot_preserves_extent(classify: bool) {
+        struct InterruptedReader {
+            cursor: std::io::Cursor<Vec<u8>>,
+            interrupt_next: bool,
+        }
+        impl std::io::Read for InterruptedReader {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                let interrupt = self.interrupt_next;
+                self.interrupt_next = !interrupt;
+                if interrupt {
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                let len = bytes.len().min(3);
+                self.cursor.read(&mut bytes[..len])
+            }
+        }
+        impl std::io::Seek for InterruptedReader {
+            fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.cursor.seek(position)
+            }
+        }
+
+        // elfutils lib/system.h:pread_retry wraps every pread in
+        // TEMP_FAILURE_RETRY; interruption is not EOF or a corrupt object.
+        let expected = regression_elf_with_build_id();
+        let mut bytes = expected.clone();
+        bytes.extend_from_slice(b"unrecorded growth");
+        let mut reader = InterruptedReader {
+            cursor: std::io::Cursor::new(bytes),
+            interrupt_next: true,
+        };
+        let result = if classify {
+            super::read_object_with_size(&mut reader, expected.len() as u64)
+        } else {
+            super::read_snapshot_with_size(&mut reader, expected.len() as u64)
+        };
+        assert_eq!(result.as_deref(), Some(expected.as_slice()));
+        assert_eq!(reader.cursor.position(), expected.len() as u64);
+    }
+
+    #[test]
+    fn object_snapshot_rejects_non_interrupted_errors_without_retry() {
+        struct FailingReader {
+            error: std::io::ErrorKind,
+            calls: usize,
+        }
+        impl std::io::Read for FailingReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                Err(self.error.into())
+            }
+        }
+        for error in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::WouldBlock,
+        ] {
+            let mut reader = FailingReader { error, calls: 0 };
+            assert!(super::read_snapshot_with_size(&mut reader, 1).is_none());
+            assert_eq!(reader.calls, 1);
+        }
     }
 
     #[test]
