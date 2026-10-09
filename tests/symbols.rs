@@ -24,6 +24,7 @@ use pyroclast::symbols::{
 
 fn test_symbol_request(path_index: u8, relative_address: u16) -> SymbolRequest {
     SymbolRequest {
+        kernel_module_address: None,
         path: PathBuf::from(format!("/bin/app{}", path_index % 4)),
         relative_address: u64::from(relative_address),
         kernel_mapping_range: None,
@@ -103,6 +104,7 @@ fn kallsyms_resolve_case() -> impl Strategy<Value = KallsymsResolveCase> {
 fn resolves_each_unique_symbol_address_once() {
     let resolver = RecordingResolver::with_symbols([(
         SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
             kernel_mapping_range: None,
@@ -116,6 +118,7 @@ fn resolves_each_unique_symbol_address_once() {
 
     let first = cache
         .resolve(&SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
             kernel_mapping_range: None,
@@ -126,6 +129,7 @@ fn resolves_each_unique_symbol_address_once() {
         .expect("first symbol");
     let second = cache
         .resolve(&SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
             kernel_mapping_range: None,
@@ -140,6 +144,7 @@ fn resolves_each_unique_symbol_address_once() {
     assert_eq!(
         resolver.batch_calls(),
         vec![vec![SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
             kernel_mapping_range: None,
@@ -154,6 +159,7 @@ fn resolves_each_unique_symbol_address_once() {
 fn symbol_resolver_frame_batch_defaults_to_single_symbol_frames() {
     let resolver = RecordingResolver::with_symbols([(
         SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
             kernel_mapping_range: None,
@@ -166,6 +172,7 @@ fn symbol_resolver_frame_batch_defaults_to_single_symbol_frames() {
 
     let frames = resolver
         .resolve_frame_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
             kernel_mapping_range: None,
@@ -183,6 +190,7 @@ fn batches_only_uncached_symbol_addresses() {
     let resolver = RecordingResolver::with_symbols([
         (
             SymbolRequest {
+                kernel_module_address: None,
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x10,
                 kernel_mapping_range: None,
@@ -194,6 +202,7 @@ fn batches_only_uncached_symbol_addresses() {
         ),
         (
             SymbolRequest {
+                kernel_module_address: None,
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x20,
                 kernel_mapping_range: None,
@@ -207,6 +216,7 @@ fn batches_only_uncached_symbol_addresses() {
     let mut cache = SymbolCache::new(&resolver);
     cache
         .resolve_many(&[SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
             kernel_mapping_range: None,
@@ -219,6 +229,7 @@ fn batches_only_uncached_symbol_addresses() {
     let symbols = cache
         .resolve_many(&[
             SymbolRequest {
+                kernel_module_address: None,
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x10,
                 kernel_mapping_range: None,
@@ -227,6 +238,7 @@ fn batches_only_uncached_symbol_addresses() {
                 kernel_relocation: None,
             },
             SymbolRequest {
+                kernel_module_address: None,
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x20,
                 kernel_mapping_range: None,
@@ -235,6 +247,7 @@ fn batches_only_uncached_symbol_addresses() {
                 kernel_relocation: None,
             },
             SymbolRequest {
+                kernel_module_address: None,
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x20,
                 kernel_mapping_range: None,
@@ -257,6 +270,7 @@ fn batches_only_uncached_symbol_addresses() {
         resolver.batch_calls(),
         vec![
             vec![SymbolRequest {
+                kernel_module_address: None,
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x10,
                 kernel_mapping_range: None,
@@ -265,6 +279,7 @@ fn batches_only_uncached_symbol_addresses() {
                 kernel_relocation: None,
             }],
             vec![SymbolRequest {
+                kernel_module_address: None,
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x20,
                 kernel_mapping_range: None,
@@ -373,6 +388,7 @@ fn addr2line_resolver_batches_requests_by_binary() {
     let symbols = resolver
         .resolve_batch(&[
             SymbolRequest {
+                kernel_module_address: None,
                 path: path.clone(),
                 relative_address: 0x10,
                 kernel_mapping_range: None,
@@ -381,6 +397,7 @@ fn addr2line_resolver_batches_requests_by_binary() {
                 kernel_relocation: None,
             },
             SymbolRequest {
+                kernel_module_address: None,
                 path,
                 relative_address: 0x20,
                 kernel_mapping_range: None,
@@ -409,6 +426,7 @@ fn addr2line_resolver_does_not_spawn_for_missing_objects() {
     let resolver = Addr2lineResolver::new(&runner);
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: root.path().join("missing-object"),
             relative_address: 0x10,
             kernel_mapping_range: None,
@@ -435,6 +453,7 @@ fn addr2line_resolver_prefers_perf_object_alias_over_underscored_addr2line_name(
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: object_path,
             relative_address: 0x1008,
             kernel_mapping_range: None,
@@ -465,6 +484,7 @@ fn rust_addr2line_resolver_reads_symbol_table_names() {
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: current_exe,
             relative_address: symbol.address(),
             kernel_mapping_range: None,
@@ -502,6 +522,7 @@ fn rust_addr2line_resolver_preserves_qualified_symtab_name_like_perf() {
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: object_path,
             relative_address: 0x1180,
             kernel_mapping_range: None,
@@ -545,6 +566,7 @@ fn symbolizer_selector_can_use_rust_addr2line_without_process_runner() {
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: current_exe,
             relative_address: symbol.address(),
             kernel_mapping_range: None,
@@ -777,6 +799,7 @@ fn symbol_parity_source_lined_function_replaces_symtab_alias_without_inline_chil
     );
 
     let request = SymbolRequest {
+        kernel_module_address: None,
         path: binary,
         relative_address: address,
         kernel_mapping_range: None,
@@ -827,6 +850,7 @@ fn rust_addr2line_resolver_keeps_perf_symtab_alias_without_debug_line() {
 
     let frames = RustAddr2lineResolver::new()
         .resolve_frame_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: binary,
             relative_address: address,
             kernel_mapping_range: None,
@@ -914,6 +938,7 @@ fn rust_addr2line_bfd_fallback_uses_raw_zero_sized_alias_extent_like_binutils() 
     );
     let frames = RustAddr2lineResolver::new()
         .resolve_frame_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: binary,
             relative_address: address,
             kernel_mapping_range: None,
@@ -1004,6 +1029,7 @@ fn bfd_fallback_without_file_symbols_preserves_debug_line_and_matches_native() {
         ["local_function", "??:?"]
     );
     let request = SymbolRequest {
+        kernel_module_address: None,
         path: binary,
         relative_address: address,
         kernel_mapping_range: None,
@@ -1153,6 +1179,7 @@ fn bfd_fallback_preserves_native_function_cache_across_address_order() {
             .all(|line| { line.ends_with(":?") || line.ends_with(":0") })
     );
     let requests = addresses.map(|address| SymbolRequest {
+        kernel_module_address: None,
         path: binary.clone(),
         relative_address: address,
         kernel_mapping_range: None,
@@ -1209,6 +1236,7 @@ fn assert_bfd_fallback_assembly_matches_native(
     );
     let frames = RustAddr2lineResolver::new()
         .resolve_frame_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: binary,
             relative_address: address,
             kernel_mapping_range: None,
@@ -1245,6 +1273,7 @@ fn rust_addr2line_resolver_uses_libdw_inline_die_name_for_cargo_read_to_end() {
     }
 
     let request = SymbolRequest {
+        kernel_module_address: None,
         path: cargo.clone(),
         // PERF_RECORD_MMAP2 maps cargo at 0x6231444cf000 with file offset
         // 0x6fc000. perf's `map__dso_map_ip` first forms 0x1763636, then
@@ -1299,6 +1328,7 @@ fn rust_addr2line_resolver_uses_addr2line_realfunc_record_for_rust_object_alias_
     assert_eq!(
         resolver
             .resolve_frame_batch(&[SymbolRequest {
+                kernel_module_address: None,
                 path: cargo,
                 relative_address: 0x0106_d883,
                 kernel_mapping_range: None,
@@ -1323,6 +1353,7 @@ fn rust_addr2line_resolver_uses_perf_dwarf_names_for_inline_frames() {
     let resolver = RustAddr2lineResolver::new();
     let frames = resolver
         .resolve_frame_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: profiling_binary.clone(),
             relative_address: address,
             kernel_mapping_range: None,
@@ -1353,6 +1384,7 @@ fn addr2line_resolver_uses_perf_dwarf_names_for_inline_frames() {
 
     let frames = resolver
         .resolve_frame_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: profiling_binary.clone(),
             relative_address: address,
             kernel_mapping_range: None,
@@ -1377,6 +1409,7 @@ fn addr2line_inline_resolver_requires_a_perf_base_symbol() {
     let runner = Addr2lineRunner::new(b"invented_without_a_base_symbol\n??:0\n");
     let resolver = Addr2lineResolver::new(&runner);
     let request = SymbolRequest {
+        kernel_module_address: None,
         path: object.path().to_path_buf(),
         relative_address: 0x1000,
         kernel_mapping_range: None,
@@ -1407,6 +1440,7 @@ fn rust_addr2line_resolver_uses_object_symbol_for_non_inline_frames_like_perf_sc
     let resolver = RustAddr2lineResolver::new();
     let frames = resolver
         .resolve_frame_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: profiling_binary.clone(),
             relative_address: address,
             kernel_mapping_range: None,
@@ -1435,6 +1469,7 @@ fn rust_addr2line_resolver_synthesizes_x86_64_plt_symbols_like_perf_script() {
     let resolver = RustAddr2lineResolver::new();
     let frames = resolver
         .resolve_frame_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: libc,
             relative_address: 0x287a4,
             kernel_mapping_range: None,
@@ -1511,6 +1546,7 @@ fn rust_addr2line_resolver_replaces_base_symbol_when_perf_inline_name_differs() 
     let resolver = RustAddr2lineResolver::new();
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: profiling_binary,
             relative_address: address,
             kernel_mapping_range: None,
@@ -1648,6 +1684,7 @@ fn symbol_requests(profiling_binary: &Path, addresses: &[u64]) -> Vec<SymbolRequ
     addresses
         .iter()
         .map(|address| SymbolRequest {
+            kernel_module_address: None,
             path: profiling_binary.to_path_buf(),
             relative_address: *address,
             kernel_mapping_range: None,
@@ -1736,6 +1773,7 @@ fn addr2line_resolver_treats_failed_batches_without_object_aliases_as_unresolved
     let symbols = resolver
         .resolve_batch(&[
             SymbolRequest {
+                kernel_module_address: None,
                 path: path.clone(),
                 relative_address: 0x10,
                 kernel_mapping_range: None,
@@ -1744,6 +1782,7 @@ fn addr2line_resolver_treats_failed_batches_without_object_aliases_as_unresolved
                 kernel_relocation: None,
             },
             SymbolRequest {
+                kernel_module_address: None,
                 path,
                 relative_address: 0x20,
                 kernel_mapping_range: None,
@@ -2054,6 +2093,7 @@ ffffffff88000080 t asm_exc_page_fault
     let symbols = resolver
         .resolve_batch(&[
             SymbolRequest {
+                kernel_module_address: None,
                 path: PathBuf::from("[kernel.kallsyms]"),
                 relative_address: 0xffff_ffff_8800_008f,
                 kernel_mapping_range: None,
@@ -2062,6 +2102,7 @@ ffffffff88000080 t asm_exc_page_fault
                 kernel_relocation: None,
             },
             SymbolRequest {
+                kernel_module_address: None,
                 path,
                 relative_address: 0x10,
                 kernel_mapping_range: None,
@@ -2110,6 +2151,7 @@ ffffffffc0e66200 t zpl_iter_read_next [zfs]
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("[zfs]"),
             relative_address: 0xffff_ffff_c0e6_61e9,
             kernel_mapping_range: None,
@@ -2139,6 +2181,7 @@ ffffffff82000000 T later_kernel_symbol
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]_text"),
             relative_address: 0xffff_ffff_8800_1280,
             kernel_mapping_range: None,
@@ -2174,6 +2217,7 @@ fn perf_symbol_resolver_loads_perfdata_kernel_build_id_cache() {
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]"),
             relative_address: 0xffff_ffff_8800_008f,
             kernel_mapping_range: None,
@@ -2208,6 +2252,7 @@ fn perf_symbol_resolver_loads_perfdata_kernel_build_id_cache_from_file() {
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]"),
             relative_address: 0xffff_ffff_8800_008f,
             kernel_mapping_range: None,
@@ -2241,6 +2286,7 @@ fn perf_symbol_resolver_opens_kernel_metadata_only_on_a_kernel_request() {
     std::fs::write(cached, "ffffffff88000080 t asm_exc_page_fault\n").unwrap();
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]"),
             relative_address: 0xffff_ffff_8800_008f,
             kernel_mapping_range: None,
@@ -2364,6 +2410,7 @@ fn perf_symbol_resolver_constructor_uses_perfdata_cache_before_system_kallsyms()
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]"),
             relative_address: 0xffff_ffff_8800_008f,
             kernel_mapping_range: None,
@@ -2402,6 +2449,7 @@ fn perf_symbol_resolver_does_not_use_system_map_for_recorded_kernel_build_id_wit
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]"),
             relative_address: 0xffff_ffff_8800_008f,
             kernel_mapping_range: None,
@@ -2435,6 +2483,7 @@ fn perf_symbol_resolver_uses_live_module_kallsyms_for_recorded_module_build_id_w
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("[zfs]"),
             relative_address: 0xffff_ffff_c0ed_5ffa,
             kernel_mapping_range: Some((0xffff_ffff_c0e0_0000, 0xffff_ffff_c10f_0000)),
@@ -2481,6 +2530,7 @@ ffffffff914e8fa0 t mp_map_pin_to_irq
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]"),
             relative_address: 0xffff_ffff_90ee_91f1,
             kernel_mapping_range: None,
@@ -2525,6 +2575,7 @@ fn perf_symbol_resolver_prefers_perfdata_kallsyms_over_kernel_elf() {
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]"),
             relative_address: 0xffff_ffff_8800_008f,
             kernel_mapping_range: None,
@@ -2557,6 +2608,7 @@ fn perf_symbol_resolver_rejects_invalid_kernel_build_id_elf_when_kallsyms_is_mis
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]"),
             relative_address: 0xffff_ffff_8800_008f,
             kernel_mapping_range: None,
@@ -2589,6 +2641,7 @@ fn perf_symbol_resolver_uses_valid_kernel_build_id_elf_when_kallsyms_is_missing(
         .with_perfdata_file_kernel_cache(&perfdata, &perf_debug_dir(home.path()));
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]"),
             relative_address: 0xffff_ffff_8800_008f,
             kernel_mapping_range: None,
@@ -2632,6 +2685,7 @@ ffffffff846997a0 T __pi_memcpy
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]"),
             relative_address: 0xffff_ffff_8469_97ac,
             kernel_mapping_range: None,
@@ -2668,6 +2722,7 @@ ffffffff846997a0 T memcpy
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]"),
             relative_address: 0xffff_ffff_8469_97ac,
             kernel_mapping_range: None,
@@ -2708,6 +2763,7 @@ ffffffffc0e17dae t zfs_read [zfs]
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("[zfs]"),
             relative_address: 0xffff_ffff_c0e1_7dae,
             kernel_mapping_range: None,
@@ -2745,6 +2801,7 @@ ffffffffc1800000 T later_nf_tables_symbol [nf_tables]
         .with_system_kallsyms_from_path(&live_kallsyms);
 
     let request = SymbolRequest {
+        kernel_module_address: None,
         path: PathBuf::from("[nf_tables]"),
         relative_address: 0xffff_ffff_c11d_c2c0,
         kernel_mapping_range: None,
@@ -2801,6 +2858,7 @@ igb 4096 0 - Live 0xffffffffc1e17000
     .expect("modules");
 
     let zfs = SymbolRequest {
+        kernel_module_address: None,
         path: PathBuf::from("[zfs]"),
         relative_address: 0xffff_ffff_c0e1_7dae,
         kernel_mapping_range: None,
@@ -2824,6 +2882,7 @@ ffffffffc2e17dae t unrelated_module_symbol [mlx5]
     .expect("kallsyms");
 
     let igb = SymbolRequest {
+        kernel_module_address: None,
         path: PathBuf::from("[igb]"),
         relative_address: 0xffff_ffff_c1e1_7dae,
         kernel_mapping_range: None,
@@ -2867,6 +2926,7 @@ ffffffffc0e38940 t nvs_xdr_nvp_op [zfs]
 
     let frames = resolver
         .resolve_base_frame_batch_with_metadata(&[SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("[zfs]"),
             relative_address: 0xffff_ffff_c0e3_8b71,
             kernel_mapping_range: None,
@@ -2910,6 +2970,7 @@ ffffffff846997a0 T memcpy
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]"),
             relative_address: 0xffff_ffff_8469_97ac,
             kernel_mapping_range: None,
@@ -2941,6 +3002,7 @@ fn perf_symbol_resolver_uses_module_build_id_elf() {
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("[igb]"),
             relative_address: 0x30,
             kernel_mapping_range: None,
@@ -2978,6 +3040,7 @@ fn perf_symbol_resolver_uses_vdso_build_id_cache_layout_like_perf_script() {
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("[vdso]"),
             relative_address: 0x970,
             kernel_mapping_range: None,
@@ -3008,6 +3071,7 @@ fn perf_symbol_resolver_uses_live_vdso_copy_without_build_id_like_perf_script() 
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("[vdso]"),
             relative_address: 0x129a,
             kernel_mapping_range: None,
@@ -3038,6 +3102,7 @@ fn perf_symbol_resolver_does_not_use_native_vdso_for_compat_requests() {
     let requests: Vec<_> = ["[vdso]", "[vdso32]", "[vdsox32]"]
         .into_iter()
         .map(|path| SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from(path),
             relative_address: 0x100,
             kernel_mapping_range: None,
@@ -3068,6 +3133,7 @@ fn perf_symbol_resolver_does_not_use_native_vdso_for_compat_requests() {
 fn perf_symbol_resolver_accepts_pluggable_object_resolver() {
     let object_resolver = RecordingResolver::with_symbols([(
         SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
             kernel_mapping_range: None,
@@ -3081,6 +3147,7 @@ fn perf_symbol_resolver_accepts_pluggable_object_resolver() {
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
             kernel_mapping_range: None,
@@ -3094,6 +3161,7 @@ fn perf_symbol_resolver_accepts_pluggable_object_resolver() {
     assert_eq!(
         resolver.object_resolver().batch_calls(),
         vec![vec![SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
             kernel_mapping_range: None,
@@ -3123,6 +3191,7 @@ fn perf_symbol_resolver_translates_live_object_file_offsets_to_virtual_addresses
         .expect("fixture ELF has a biased load segment");
     let object_resolver = RecordingResolver::with_symbols([(
         SymbolRequest {
+            kernel_module_address: None,
             path: path.clone(),
             relative_address: virtual_address,
             kernel_mapping_range: None,
@@ -3136,6 +3205,7 @@ fn perf_symbol_resolver_translates_live_object_file_offsets_to_virtual_addresses
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: path.clone(),
             relative_address: file_offset,
             kernel_mapping_range: None,
@@ -3149,6 +3219,7 @@ fn perf_symbol_resolver_translates_live_object_file_offsets_to_virtual_addresses
     assert_eq!(
         resolver.object_resolver().batch_calls(),
         vec![vec![SymbolRequest {
+            kernel_module_address: None,
             path,
             relative_address: virtual_address,
             kernel_mapping_range: None,
@@ -3163,6 +3234,7 @@ fn perf_symbol_resolver_translates_live_object_file_offsets_to_virtual_addresses
 fn perf_symbol_resolver_preserves_pluggable_object_frame_lists() {
     let object_resolver = RecordingResolver::with_frames([(
         SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
             kernel_mapping_range: None,
@@ -3176,6 +3248,7 @@ fn perf_symbol_resolver_preserves_pluggable_object_frame_lists() {
 
     let frames = resolver
         .resolve_frame_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("/bin/app"),
             relative_address: 0x10,
             kernel_mapping_range: None,
@@ -3196,6 +3269,7 @@ fn perf_symbol_resolver_uses_live_user_object_despite_recorded_identity_mismatch
     let object_path = tempfile::NamedTempFile::new().expect("object file");
     let object_resolver = RecordingResolver::with_symbols([(
         SymbolRequest {
+            kernel_module_address: None,
             path: object_path.path().to_path_buf(),
             relative_address: 0x10,
             kernel_mapping_range: None,
@@ -3209,6 +3283,7 @@ fn perf_symbol_resolver_uses_live_user_object_despite_recorded_identity_mismatch
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: object_path.path().to_path_buf(),
             relative_address: 0x10,
             kernel_mapping_range: None,
@@ -3227,6 +3302,7 @@ fn perf_symbol_resolver_uses_live_user_object_despite_recorded_identity_mismatch
     assert_eq!(
         resolver.object_resolver().batch_calls(),
         vec![vec![SymbolRequest {
+            kernel_module_address: None,
             path: object_path.path().to_path_buf(),
             relative_address: 0x10,
             kernel_mapping_range: None,
@@ -3251,6 +3327,7 @@ fn perf_symbol_resolver_uses_system_map_candidates_when_cache_is_missing() {
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]_text"),
             relative_address: 0xffff_ffff_8100_1280,
             kernel_mapping_range: None,
@@ -3292,6 +3369,7 @@ fn perf_symbol_resolver_keeps_live_kallsyms_for_modules_when_system_map_exists()
     let symbols = resolver
         .resolve_batch(&[
             SymbolRequest {
+                kernel_module_address: None,
                 path: PathBuf::from("[kernel.kallsyms]_text"),
                 relative_address: 0xffff_ffff_8100_1280,
                 kernel_mapping_range: None,
@@ -3300,6 +3378,7 @@ fn perf_symbol_resolver_keeps_live_kallsyms_for_modules_when_system_map_exists()
                 kernel_relocation: None,
             },
             SymbolRequest {
+                kernel_module_address: None,
                 path: PathBuf::from("[zfs]"),
                 relative_address: 0xffff_ffff_c0e1_7dae,
                 kernel_mapping_range: None,

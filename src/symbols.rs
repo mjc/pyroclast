@@ -57,6 +57,8 @@ pub struct KernelRelocation {
 pub struct SymbolRequest {
     pub path: PathBuf,
     pub relative_address: u64,
+    /// Original kernel IP when an absolute module mapping supplied this request.
+    pub kernel_module_address: Option<u64>,
     pub kernel_mapping_range: Option<(u64, u64)>,
     pub build_id: Option<String>,
     pub file_identity: Option<FileIdentity>,
@@ -81,6 +83,7 @@ impl SymbolRequest {
 impl PartialEq for SymbolRequest {
     fn eq(&self, other: &Self) -> bool {
         self.relative_address == other.relative_address
+            && self.kernel_module_address == other.kernel_module_address
             && self.kernel_mapping_range == other.kernel_mapping_range
             && self.recorded_build_id() == other.recorded_build_id()
             && self.identity_file_identity() == other.identity_file_identity()
@@ -95,6 +98,7 @@ impl Hash for SymbolRequest {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.path.as_os_str().hash(state);
         self.relative_address.hash(state);
+        self.kernel_module_address.hash(state);
         self.kernel_mapping_range.hash(state);
         self.recorded_build_id().hash(state);
         self.identity_file_identity().hash(state);
@@ -114,6 +118,7 @@ impl Ord for SymbolRequest {
             .as_os_str()
             .cmp(other.path.as_os_str())
             .then_with(|| self.relative_address.cmp(&other.relative_address))
+            .then_with(|| self.kernel_module_address.cmp(&other.kernel_module_address))
             .then_with(|| self.kernel_mapping_range.cmp(&other.kernel_mapping_range))
             .then_with(|| self.recorded_build_id().cmp(&other.recorded_build_id()))
             .then_with(|| {
@@ -2575,11 +2580,16 @@ where
             .expect("object address cache lock");
 
         for (index, request) in requests.iter().enumerate() {
-            if is_kernel_symbol_path(&request.path)
+            let kernel_address = request
+                .kernel_module_address
+                .unwrap_or(request.relative_address);
+            if (is_kernel_symbol_path(&request.path) || request.kernel_module_address.is_some())
                 && let Some(symbols) = self.kcore_symbols_ref()
-                && symbols.contains(request.relative_address)
+                && symbols.contains(kernel_address)
             {
-                if is_kernel_module_symbol_path(&request.path)
+                let module = is_kernel_module_symbol_path(&request.path)
+                    || request.kernel_module_address.is_some();
+                if module
                     && !symbols.is_active()
                     && let Some(object_request) =
                         self.cached_object_symbol_request(request, &mut address_cache)
@@ -2587,8 +2597,8 @@ where
                     old_module_objects.push(index);
                     user_indexes.push(index);
                     user_requests.push(object_request);
-                } else if symbols.activate(is_kernel_module_symbol_path(&request.path)) {
-                    resolved[index] = symbols.resolve(request.relative_address);
+                } else if symbols.activate(module) {
+                    resolved[index] = symbols.resolve(kernel_address);
                 }
             } else if is_kernel_module_symbol_path(&request.path) {
                 if let Some(object_request) =
@@ -2706,11 +2716,16 @@ where
             .expect("object address cache lock");
 
         for (index, request) in requests.iter().enumerate() {
-            if is_kernel_symbol_path(&request.path)
+            let kernel_address = request
+                .kernel_module_address
+                .unwrap_or(request.relative_address);
+            if (is_kernel_symbol_path(&request.path) || request.kernel_module_address.is_some())
                 && let Some(symbols) = self.kcore_symbols_ref()
-                && symbols.contains(request.relative_address)
+                && symbols.contains(kernel_address)
             {
-                if is_kernel_module_symbol_path(&request.path)
+                let module = is_kernel_module_symbol_path(&request.path)
+                    || request.kernel_module_address.is_some();
+                if module
                     && !symbols.is_active()
                     && let Some(object_request) =
                         self.cached_object_symbol_request(request, &mut address_cache)
@@ -2718,12 +2733,9 @@ where
                     old_module_objects.push(index);
                     user_indexes.push(index);
                     user_requests.push(object_request);
-                } else if symbols.activate(is_kernel_module_symbol_path(&request.path)) {
+                } else if symbols.activate(module) {
                     resolved[index] = ResolvedSymbolFrames::from_frames(
-                        symbols
-                            .resolve(request.relative_address)
-                            .into_iter()
-                            .collect(),
+                        symbols.resolve(kernel_address).into_iter().collect(),
                     );
                     resolved[index].kernel_dso = SymbolDsoName::KernelKallsyms;
                 } else {
@@ -3022,6 +3034,7 @@ fn clean_object_symbol_request_with_cache(
         object_virtual_address_for_file_offset_cached(&path, relative_address, address_cache)
             .unwrap_or(relative_address);
     SymbolRequest {
+        kernel_module_address: None,
         path,
         relative_address,
         kernel_mapping_range: None,
@@ -5227,12 +5240,14 @@ fn mapping_frame_key(mapping: &ResolvedMappingRef<'_>) -> MappingFrameKey {
 }
 
 fn is_kernel_mapping_ref(mapping: &ResolvedMappingRef<'_>) -> bool {
-    crate::perfdata::samples::is_kernel_space_frame(mapping.relative_address)
-        && mapping.path.starts_with('[')
+    mapping.kernel_module_address.is_some()
+        || crate::perfdata::samples::is_kernel_space_frame(mapping.relative_address)
+            && mapping.path.starts_with('[')
 }
 
 fn symbol_request_from_mapping_ref(mapping: &ResolvedMappingRef<'_>) -> SymbolRequest {
     let mut request = SymbolRequest {
+        kernel_module_address: None,
         path: PathBuf::new(),
         relative_address: 0,
         kernel_mapping_range: None,
@@ -5257,6 +5272,7 @@ fn update_symbol_request_from_mapping_ref(
         },
     );
     request.relative_address = mapping.relative_address;
+    request.kernel_module_address = mapping.kernel_module_address;
     request.kernel_mapping_range = kernel_mapping_range_from_ref(mapping);
     if let Some(build_id) = mapping
         .build_id
@@ -5762,6 +5778,34 @@ mod tests {
                 .is_empty()
             );
         }
+    }
+
+    #[test]
+    fn absolute_kernel_mapping_requests_keep_object_offsets_and_original_ips_separate() {
+        // perf machine.c:machine__process_kernel_mmap_event distinguishes the
+        // kernel module map from map.h:map__map_ip's object-relative offset.
+        let start = 0xffff_ffff_c100_0000;
+        let mut mapping = test_mapping_ref("/lib/modules/a.ko", 0x10);
+        mapping.start = start;
+        mapping.end = start + 0x4000;
+        mapping.kernel_module_address = Some(start + 0x10);
+        let mut request = super::symbol_request_from_mapping_ref(&mapping);
+        assert_eq!(request.relative_address, 0x10);
+        assert_eq!(request.kernel_module_address, Some(start + 0x10));
+        assert_eq!(request.kernel_mapping_range, Some((start, start + 0x4000)));
+        let mut object_only = request.clone();
+        object_only.kernel_module_address = None;
+        assert_ne!(request, object_only);
+        assert_ne!(request.cmp(&object_only), std::cmp::Ordering::Equal);
+        assert_eq!(
+            std::collections::HashSet::from([request.clone(), object_only]).len(),
+            2
+        );
+        mapping.kernel_module_address = None;
+        super::update_symbol_request_from_mapping_ref(&mut request, &mapping);
+        assert_eq!(request.relative_address, 0x10);
+        assert_eq!(request.kernel_module_address, None);
+        assert_eq!(request.kernel_mapping_range, None);
     }
 
     #[test]
@@ -6420,6 +6464,7 @@ mod tests {
         // Conservatively keep these separate rather than introducing a
         // non-transitive missing-identity wildcard into cache equality.
         let inline = SymbolRequest {
+            kernel_module_address: None,
             path: PathBuf::from("/usr/lib/libc.so.6"),
             relative_address: 0x1234,
             kernel_mapping_range: None,
@@ -7407,6 +7452,7 @@ mod tests {
 
         let frames = resolve_base_frames_from_object_metadata(
             &[SymbolRequest {
+                kernel_module_address: None,
                 path: PathBuf::from("/tmp/pyroclast-generic-symbol"),
                 relative_address: 0x1180,
                 kernel_mapping_range: None,
@@ -9187,6 +9233,7 @@ mod tests {
         let resolver = RustAddr2lineResolver::new();
         resolver
             .resolve_frame_batch(&[SymbolRequest {
+                kernel_module_address: None,
                 path: path.clone(),
                 relative_address: addresses[0],
                 kernel_mapping_range: None,
@@ -9199,6 +9246,7 @@ mod tests {
 
         resolver
             .resolve_frame_batch(&[SymbolRequest {
+                kernel_module_address: None,
                 path,
                 relative_address: addresses[1],
                 kernel_mapping_range: None,
@@ -10472,6 +10520,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(i, path)| SymbolRequest {
+                    kernel_module_address: None,
                     path: PathBuf::from(path),
                     relative_address: i as u64,
                     kernel_mapping_range: None,
@@ -10508,6 +10557,7 @@ mod tests {
 
     fn test_request(path: &str, relative_address: u64) -> SymbolRequest {
         SymbolRequest {
+            kernel_module_address: None,
             path: path.into(),
             relative_address,
             kernel_mapping_range: None,
@@ -10892,6 +10942,7 @@ mod tests {
             symbol_source_id: 1,
             path,
             relative_address,
+            kernel_module_address: None,
             start: relative_address,
             end: relative_address.saturating_add(1),
             build_id: None,

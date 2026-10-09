@@ -73,6 +73,8 @@ pub struct ResolvedMappingRef<'a> {
     pub symbol_source_id: usize,
     pub path: &'a str,
     pub relative_address: u64,
+    /// Original IP for an absolute module path recorded in kernel CPU mode.
+    pub kernel_module_address: Option<u64>,
     pub start: u64,
     pub end: u64,
     pub build_id: Option<&'a [u8]>,
@@ -177,11 +179,18 @@ impl<'a> MappedFrame<'a> {
             .then(|| (self.mapping.start, self.mapping.end()))
     }
     pub(crate) fn is_kernel(self) -> bool {
-        self.mapping.path_layout.bracketed && {
-            #[cfg(test)]
-            MAPPED_FRAME_KERNEL_CLASSIFICATIONS.with(|count| count.set(count.get() + 1));
-            crate::perfdata::samples::is_kernel_space_frame(self.relative_address)
-        }
+        self.kernel_module_address().is_some()
+            || self.mapping.path_layout.bracketed && {
+                #[cfg(test)]
+                MAPPED_FRAME_KERNEL_CLASSIFICATIONS.with(|count| count.set(count.get() + 1));
+                crate::perfdata::samples::is_kernel_space_frame(self.relative_address)
+            }
+    }
+    fn kernel_module_address(self) -> Option<u64> {
+        self.mapping.kernel_module_address(
+            self.relative_address
+                .wrapping_sub(self.mapping.translation_bias()),
+        )
     }
     pub(crate) fn path_layout(self) -> &'a MappingPathLayout {
         &self.mapping.path_layout
@@ -191,6 +200,7 @@ impl<'a> MappedFrame<'a> {
             symbol_source_id: self.mapping.symbol_source_id,
             path: &self.mapping.path,
             relative_address: self.relative_address,
+            kernel_module_address: self.kernel_module_address(),
             start: self.mapping.start,
             end: self.mapping.end(),
             build_id: self.mapping.build_id.as_deref(),
@@ -1239,6 +1249,7 @@ impl MmapTable {
                 symbol_source_id: mapping.symbol_source_id,
                 path: mapping.path.as_str(),
                 relative_address: mapping.relative_address(ip),
+                kernel_module_address: mapping.kernel_module_address(ip),
                 start: mapping.start,
                 end: mapping.end(),
                 build_id: mapping.build_id.as_deref(),
@@ -1638,6 +1649,14 @@ fn mapping_cpumode_from_misc(misc: u16) -> u16 {
 }
 
 impl Mapping {
+    fn kernel_module_address(&self, ip: u64) -> Option<u64> {
+        // machine.c:machine__process_kernel_mmap_event creates a module map
+        // for an absolute kernel path even when its name has no .ko suffix.
+        (self.cpumode == crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_KERNEL
+            && self.path.starts_with('/'))
+        .then_some(ip)
+    }
+
     fn end(&self) -> u64 {
         self.start.saturating_add(self.len)
     }
@@ -3028,6 +3047,51 @@ mod tests {
             mapping_identity_snapshot(&table, 100, 0x1410, &mut cache),
             mapping_identity_snapshot(&table, 7, 0x1410, &mut cache)
         );
+    }
+
+    #[test]
+    fn absolute_kernel_module_frames_preserve_kernel_range_but_user_paths_do_not() {
+        // perf machine.c:machine__process_kernel_mmap_event recognizes absolute
+        // kernel paths independently of their extension or bracket spelling.
+        let start = 0xffff_ffff_c100_0000;
+        for (misc, expected) in [
+            (
+                crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_KERNEL,
+                true,
+            ),
+            (super::PERF_RECORD_MISC_CPUMODE_USER, false),
+        ] {
+            let mut table = super::MmapTable::default();
+            table.insert_mmap_with_misc(
+                super::MmapRecord {
+                    pid: u32::MAX,
+                    tid: u32::MAX,
+                    start,
+                    len: 0x4000,
+                    pgoff: 0,
+                    path: "/lib/modules/a.ko".into(),
+                },
+                misc,
+            );
+            let frame = super::MappedFrame::new(&table.mappings[0], start + 0x10);
+            assert_eq!(frame.relative_address, 0x10);
+            assert_eq!(
+                frame.resolved_ref().kernel_module_address,
+                expected.then_some(start + 0x10)
+            );
+            assert_eq!(
+                table
+                    .resolve_ref(u32::MAX, start + 0x10)
+                    .unwrap()
+                    .kernel_module_address,
+                expected.then_some(start + 0x10)
+            );
+            assert_eq!(frame.is_kernel(), expected);
+            assert_eq!(
+                frame.kernel_range(),
+                expected.then_some((start, start + 0x4000))
+            );
+        }
     }
 
     #[test]

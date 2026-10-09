@@ -3964,6 +3964,7 @@ fn resolved_kernel_dso<'a>(
     mapping: &pyroclast::perfdata::mappings::ResolvedMappingRef<'a>,
 ) -> &'a str {
     let request = SymbolRequest {
+        kernel_module_address: None,
         path: mapping.path.into(),
         relative_address: mapping.relative_address,
         kernel_mapping_range: Some((mapping.start, mapping.end)),
@@ -4065,6 +4066,7 @@ fn native_kcore_replaces_module_dso_names_only_when_recorded_addresses_match() {
         "[kernel.kallsyms]"
     );
     let request = SymbolRequest {
+        kernel_module_address: None,
         path: "[a]".into(),
         relative_address: MODULE_IP,
         kernel_mapping_range: Some((mapping.start, mapping.end)),
@@ -4129,6 +4131,67 @@ fn native_kcore_replaces_module_dso_names_only_when_recorded_addresses_match() {
     std::fs::write(root.path().join("perf.data"), &bytes).unwrap();
     std::fs::write(root.path().join("kcore"), b"truncated").unwrap();
     assert_eq!(resolved_kernel_dso(&new_resolver(), &mapping), "[a]");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_kcore_accepts_matching_absolute_and_compressed_module_addresses() {
+    use pyroclast::symbols::{SelectedObjectResolver, SymbolizerKind};
+    let runner = pyroclast::process::RealCommandRunner::default();
+    for module_path in [
+        "/lib/modules/a.ko",
+        "/lib/modules/a.ko.gz",
+        "/lib/modules/a.ko.xz",
+    ] {
+        let (root, bytes) = write_native_kcore_fixture(module_path);
+        // The fixture loads core first. Native validates the module's canonical
+        // short DSO name (symbol.c:do_validate_kcore_modules_cb, dso.c:__kmod_path__parse).
+        let (script, stderr, native) = query_native_module_kallsyms(root.path(), &[]);
+        assert!(
+            stderr.contains("/kcore for kernel data"),
+            "{module_path}: {stderr}"
+        );
+        assert!(
+            script.contains("first+0x10 ([kernel.kallsyms])"),
+            "{module_path}: {script}"
+        );
+        let input = root.path().join("perf.data");
+        for (symbolizer, inline, file_route) in [
+            (SymbolizerKind::RustAddr2line, false, false),
+            (SymbolizerKind::RustAddr2line, false, true),
+            (SymbolizerKind::RustAddr2line, true, false),
+            (SymbolizerKind::RustAddr2line, true, true),
+            (SymbolizerKind::Addr2line, false, false),
+            (SymbolizerKind::Addr2line, false, true),
+            (SymbolizerKind::Addr2line, true, false),
+            (SymbolizerKind::Addr2line, true, true),
+        ] {
+            let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+                SelectedObjectResolver::new(&runner, symbolizer),
+                &input,
+                root.path(),
+                [],
+                &root.path().join("kallsyms"),
+            );
+            let options = FoldOptions {
+                inline,
+                count_periods: true,
+            };
+            let actual = if file_route {
+                pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(
+                    &input, options, &resolver,
+                )
+            } else {
+                fold_perfdata_callchains_with_symbols(&bytes, options, &resolver)
+            }
+            .unwrap();
+            assert_eq!(
+                actual.as_bytes(),
+                native,
+                "{module_path}, {symbolizer:?}, inline={inline}, file={file_route}: {script}"
+            );
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -4584,6 +4647,7 @@ fn kcore_module_object_resolution_precedes_initial_core_loading() {
         &root.path().join("kallsyms"),
     );
     let module = SymbolRequest {
+        kernel_module_address: None,
         path: "[a]".into(),
         relative_address: 0xffff_ffff_c100_0010,
         kernel_mapping_range: Some((0xffff_ffff_c100_0000, 0xffff_ffff_c100_4000)),
@@ -4600,6 +4664,7 @@ fn kcore_module_object_resolution_precedes_initial_core_loading() {
         pyroclast::symbols::SymbolDsoName::Mapping
     );
     let core = SymbolRequest {
+        kernel_module_address: None,
         path: "[kernel.kallsyms]".into(),
         relative_address: 0xffff_ffff_8100_0010,
         kernel_mapping_range: Some((0xffff_ffff_8100_0000, 0xffff_ffff_8101_0000)),
@@ -6764,6 +6829,7 @@ fn symbolized_fold_carries_mmap2_build_ids_to_symbol_requests() {
     assert_eq!(
         resolver.calls(),
         vec![vec![SymbolRequest {
+            kernel_module_address: None,
             path: std::path::PathBuf::from("[igb]"),
             relative_address: 0x30,
             kernel_mapping_range: None,
@@ -6856,6 +6922,7 @@ fn symbolized_fold_carries_mmap2_file_identity_to_symbol_requests() {
     assert_eq!(
         resolver.calls(),
         vec![vec![SymbolRequest {
+            kernel_module_address: None,
             path: std::path::PathBuf::from("/bin/app"),
             relative_address: 0x30,
             kernel_mapping_range: None,
@@ -6901,6 +6968,7 @@ fn symbolized_fold_carries_header_build_ids_to_mmap2_symbol_requests() {
     assert_eq!(
         resolver.calls(),
         vec![vec![SymbolRequest {
+            kernel_module_address: None,
             path: std::path::PathBuf::from("/tmp/stale-app"),
             relative_address: 0x30,
             kernel_mapping_range: None,
@@ -7389,6 +7457,7 @@ fn resolves_unique_addresses_once_per_delivered_sample() {
         requests,
         vec![
             SymbolRequest {
+                kernel_module_address: None,
                 path: std::path::PathBuf::from("/bin/app"),
                 relative_address: 0x10,
                 kernel_mapping_range: None,
@@ -7397,6 +7466,7 @@ fn resolves_unique_addresses_once_per_delivered_sample() {
                 kernel_relocation: None,
             },
             SymbolRequest {
+                kernel_module_address: None,
                 path: std::path::PathBuf::from("/bin/app"),
                 relative_address: 0x20,
                 kernel_mapping_range: None,
@@ -8409,6 +8479,7 @@ fn kcore_failed_cached_module_loading_preserves_first_cursor_then_replaces_maps(
     std::fs::create_dir_all(object.parent().unwrap()).unwrap();
     std::fs::write(object, b"malformed ELF").unwrap();
     let module = SymbolRequest {
+        kernel_module_address: None,
         path: "[a]".into(),
         relative_address: 0xffff_ffff_c100_0010,
         kernel_mapping_range: Some((0xffff_ffff_c100_0000, 0xffff_ffff_c100_4000)),

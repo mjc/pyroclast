@@ -88,6 +88,7 @@ fn selected_request(path: &Path) -> SymbolRequest {
         .unwrap()
         .address();
     SymbolRequest {
+        kernel_module_address: None,
         path: path.to_owned(),
         relative_address: address,
         kernel_mapping_range: None,

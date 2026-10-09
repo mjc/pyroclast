@@ -256,10 +256,12 @@ the 373 MiB recording, generated C DWARF/frame-pointer recordings and paired
 ELF identity/source-selection fixtures. These are workload/version-specific
 proofs, not a claim that every recording, architecture or perf backend matches.
 
-Kernel text parity validates bracketed module mappings against host kcore.
-Absolute or compressed module paths and an initially loaded ET_DYN module keep
-their original sources instead of using host kcore. These fallbacks can differ
-from native text exports; broader kernel/version parity remains tracked work.
+Kernel parity validates bracketed and absolute module mappings against host
+kcore by perf's canonical DSO name, including `.ko.gz` and `.ko.xz` paths.
+Borrowed mapping views retain the original kernel IP separately from the
+object-relative offset. Native perf 7.2.5 rejects `.ko.zst` in these fixtures.
+Initially loaded ET_DYN modules and unavailable/rejected kcore still have
+source-selection limitations; broader kernel/version parity remains tracked work.
 
 Process completed recordings: keep the input file unchanged until analysis
 finishes. Timestamp-ordered records retain read windows until delivery, avoiding

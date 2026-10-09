@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -50,13 +51,8 @@ impl KcoreSymbols {
             })
             .collect::<BTreeMap<_, _>>();
         for mapping in &recorded {
-            // Absolute/compressed module paths need the separate object-relative
-            // kernel mapping route. Never silently omit them from validation.
-            if mapping.path.starts_with('/') {
-                return None;
-            }
-            if is_kernel_module_symbol_path_str(&mapping.path)
-                && module_bases.get(&mapping.path) != Some(&mapping.start)
+            if let Some(module) = module_short_name(&mapping.path)
+                && module_bases.get(module.as_ref()) != Some(&mapping.start)
             {
                 return None;
             }
@@ -132,6 +128,34 @@ impl KcoreSymbols {
         (address < end || (address == end && *start == end))
             .then(|| format!("{}+0x{:x}", symbol.name, address - start))
     }
+}
+
+fn module_short_name(path: &str) -> Option<Cow<'_, str>> {
+    // perf machine.c:machine__process_kernel_mmap_event creates module DSOs
+    // for absolute kernel paths. dso.c:__kmod_path__parse keeps bracketed
+    // names, recognizes .ko with gzip/xz suffixes, and maps '-' to '_'.
+    if is_kernel_module_symbol_path_str(path) {
+        return Some(Cow::Borrowed(path));
+    }
+    if !path.starts_with('/') {
+        return None;
+    }
+    let name = path.rsplit('/').next()?;
+    if name.starts_with('[') {
+        return Some(Cow::Borrowed(name));
+    }
+    let Some(mut extension) = name.rfind('.') else {
+        return Some(Cow::Borrowed(name));
+    };
+    if matches!(name.get(extension + 1..), Some("gz" | "xz")) {
+        extension = extension.saturating_sub(3);
+    }
+    let short = if extension > 0 && name.as_bytes()[extension..].starts_with(b".ko") {
+        format!("[{}]", &name[..extension])
+    } else {
+        name.to_owned()
+    };
+    Some(Cow::Owned(short.replace('-', "_")))
 }
 
 /// Read only ELF/program headers: /proc/kcore can describe terabytes. Supported

@@ -321,6 +321,7 @@ fn builds_batched_addr2line_command() {
         &PathBuf::from("/bin/app"),
         &[
             SymbolRequest {
+                kernel_module_address: None,
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x10,
                 kernel_mapping_range: None,
@@ -329,6 +330,7 @@ fn builds_batched_addr2line_command() {
                 kernel_relocation: None,
             },
             SymbolRequest {
+                kernel_module_address: None,
                 path: PathBuf::from("/bin/app"),
                 relative_address: 0x20,
                 kernel_mapping_range: None,
@@ -694,6 +696,7 @@ proptest! {
         let requests = addresses
             .iter()
             .map(|relative_address| SymbolRequest {
+                kernel_module_address: None,
                 path: path.clone(),
                 relative_address: *relative_address,
                 kernel_mapping_range: None,

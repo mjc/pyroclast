@@ -338,6 +338,7 @@ mod module_inputs {
                 hex
             });
         let module = SymbolRequest {
+            kernel_module_address: None,
             path: mapping.path.into(),
             relative_address: mapping.relative_address,
             kernel_mapping_range: Some((mapping.start, mapping.end)),
