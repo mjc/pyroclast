@@ -2668,18 +2668,6 @@ impl SessionState {
     }
 }
 
-fn is_valid_unwound_user_frame(
-    _pid: Option<u32>,
-    frame: FoldFrame,
-    _mmap_table: &MmapTable,
-    _mapping_cache: &mut MappingResolveCache,
-) -> bool {
-    let (FoldFrame::UserUnwind(address) | FoldFrame::InlineCurrentIp(address)) = frame else {
-        return true;
-    };
-    address != 0
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CommSyntax {
     Ordinary,
@@ -3184,16 +3172,6 @@ impl<'a> FoldFrameResolver<'a> {
         let mut callchain = fold_frame_runs(callchain);
         while let Some((frame, repeats)) = callchain.next() {
             let segment_start = if repeats > 1 { buffers.stack_len() } else { 0 };
-            if symbol_cache.is_none()
-                && !is_valid_unwound_user_frame(
-                    pid,
-                    frame,
-                    self.mmap_table,
-                    &mut buffers.mapping_cache,
-                )
-            {
-                continue;
-            }
             let decision = Self::mapping_decision_for_folded_frame(
                 context.as_ref(),
                 frame,
@@ -3282,12 +3260,6 @@ impl<'a> FoldFrameResolver<'a> {
         let mut mapping_cache = MappingResolveCache::default();
         for frame in callchain.iter().copied() {
             if is_perf_context_marker(frame.address()) {
-                continue;
-            }
-            if symbol_cache.is_none()
-                && self.cookie_to_suppress != Some(frame.address())
-                && !is_valid_unwound_user_frame(pid, frame, self.mmap_table, &mut mapping_cache)
-            {
                 continue;
             }
             if let FoldFrame::InlineCurrentIp(address) = frame {
@@ -5146,7 +5118,7 @@ fn truncate_user_unwind_at_first_unmapped_frame(
 fn perf_accepted_object_unwind_frames(
     regs: &PerfUserRegs,
     leaf_only: bool,
-    unwound_frames: Vec<u64>,
+    mut unwound_frames: Vec<u64>,
 ) -> Vec<u64> {
     // When the leaf-only predicate holds, perf/libdwfl fires frame_callback for
     // the seeded IP and then stops. No FDE row covers the IP, so advancement
@@ -5155,8 +5127,11 @@ fn perf_accepted_object_unwind_frames(
     // and the aarch64 backend returns false when `lr == 0`. In that state perf
     // prints exactly the sampled-IP leaf, so a framehop-only caller is discarded.
     if leaf_only {
-        return vec![regs.ip()];
+        unwound_frames = vec![regs.ip()];
     }
+    // perf util/unwind-libdw.c:427 suppresses zero entry IPs only when
+    // invoking output callbacks, after all module reporting and recovery.
+    unwound_frames.retain(|ip| *ip != 0);
     unwound_frames
 }
 
@@ -11598,6 +11573,23 @@ mod tests {
                 [ip]
             );
         }
+    }
+
+    #[test]
+    fn accepted_unwind_entries_skip_zero_ips_like_perf_libdw_output_callback() {
+        // util/unwind-libdw.c:427 tests entries[j].ip after the walk, without
+        // removing it from module-report processing or stopping later frames.
+        assert_eq!(
+            super::perf_accepted_object_unwind_frames(
+                &test_regs(0x4000),
+                false,
+                vec![0x4000, 0, 0x1233],
+            ),
+            vec![0x4000, 0x1233]
+        );
+        assert!(
+            super::perf_accepted_object_unwind_frames(&test_regs(0), true, Vec::new()).is_empty()
+        );
     }
 
     #[test]

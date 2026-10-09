@@ -3273,6 +3273,107 @@ fn keeps_rbp_caller_from_executable_mmap2_like_perf_libdw() {
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
+fn zero_unwind_entries_are_suppressed_without_stopping_like_native_perf_libdw() {
+    // unwind-libdw.c:427 skips entries with ip==0 only when invoking the
+    // output callback. Module reporting and later frame recovery still occur.
+    let fixture = SyntheticX86_64Object::create();
+    for initial_pc in [0x4000_u64, 0] {
+        let mut mmap = mmap_payload(11, 11, 0, 0x10000, 0, &fixture.path_string());
+        mmap.resize(mmap.len().next_multiple_of(8), 0);
+        let mut stack = [0_u8; 40];
+        stack[8..16].copy_from_slice(&0x7fff_0018_u64.to_le_bytes());
+        stack[16..24].copy_from_slice(&1_u64.to_le_bytes());
+        stack[32..40].copy_from_slice(&0x1234_u64.to_le_bytes());
+        let bytes = perfdata_with_records_and_attrs(
+            [file_attr_bytes_with_regs(
+                PERF_SAMPLE_IP
+                    | PERF_SAMPLE_TID
+                    | PERF_SAMPLE_CALLCHAIN
+                    | PERF_SAMPLE_REGS_USER
+                    | PERF_SAMPLE_STACK_USER,
+                (1 << 6) | (1 << 7) | (1 << 8),
+            )],
+            [
+                record_bytes(1, &mmap),
+                record_bytes_with_misc(
+                    9,
+                    PERF_RECORD_MISC_CPUMODE_USER,
+                    &sample_payload_with_user_stack(
+                        initial_pc,
+                        11,
+                        11,
+                        [],
+                        1,
+                        [0x7fff_0008, 0x7fff_0000, initial_pc],
+                        stack,
+                    ),
+                ),
+            ],
+        );
+        let (script, expected) = native_script_and_fold(&bytes);
+        let label = format!("[{}]", fixture.file_name());
+        let frames = if initial_pc == 0 {
+            label.clone()
+        } else {
+            format!("{label};{label}")
+        };
+        assert_eq!(expected, format!(":11;{frames} 1\n"), "{script}");
+        assert_eq!(
+            fold_perfdata_callchains(&bytes).unwrap(),
+            expected,
+            "{script}"
+        );
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), &bytes).unwrap();
+        assert_eq!(
+            fold_perfdata_file_with_options(file.path(), FoldOptions::default()).unwrap(),
+            expected
+        );
+        let object_root = fixture.path.parent().unwrap();
+        let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+            pyroclast::symbols::RustAddr2lineResolver::new(),
+            file.path(),
+            object_root,
+            [],
+            &object_root.join("missing-kallsyms"),
+        );
+        assert_eq!(
+            fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver)
+                .unwrap(),
+            expected,
+            "symbolized byte replay: {script}"
+        );
+        assert_eq!(
+            pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(
+                file.path(),
+                FoldOptions::default(),
+                &resolver,
+            )
+            .unwrap(),
+            expected
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_pyroclast"))
+            .args([
+                "plumbing",
+                "perf-script",
+                "--no-inline",
+                "--symbolizer",
+                "rust-addr2line",
+            ])
+            .arg(file.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), script);
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
 fn non_executable_user_mmap2_is_reported_to_unwinder_like_native_perf_libdw() {
     // perf util/unwind-libdw.c:__report_module reports the covering user DSO
     // without checking PROT_EXEC. The ELF's absent FDE uses the RBP fallback.

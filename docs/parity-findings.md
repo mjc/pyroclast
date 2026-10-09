@@ -24,6 +24,24 @@ drops empty events; no output-label or sample-count workaround belongs here.
 GNU `binutils/addr2line.c:355-409` only supplies frame names and inline chains;
 it does not decide which user mappings the unwinder reports.
 
+## 2026-10-09 zero unwind entries are suppressed at the shared output boundary
+
+Perf `tools/perf/util/unwind-libdw.c:412-427` finishes the walk before invoking
+output callbacks, skipping entries whose adjusted IP is zero. This does not
+stop recovery, skip module reporting, or remove recorded callchain entries.
+Pyroclast previously implemented this only in renderers without a symbol
+cache. A native folded regression was green without symbols but red with the
+Rust resolver: it emitted an extra frame for a zero adjusted caller between
+two nonzero frames. A source-derived acceptance test independently failed.
+
+The rule now runs once when converting accepted unwind entries to output,
+including the leaf-only path. The renderer-only predicate and its duplicated
+guards are deleted. The public control checks initial and middle zero entries,
+continued caller recovery, symbolized and unsymbolized byte/file folding, and
+CLI perf-script text against a fresh native export. Frame names remain the
+symbolizer's responsibility (`binutils/addr2line.c:355-409`); Inferno retains
+the emitted stack entries (`collapse/perf.rs:580-599`).
+
 ## 2026-10-09 recorded kernel/user callchains still receive user unwinds
 
 Investigation of a fresh C thread workload found an unsupported mixed-callchain
