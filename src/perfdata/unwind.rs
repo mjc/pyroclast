@@ -16,6 +16,9 @@ use rustc_hash::FxBuildHasher;
 
 use super::memory::open_regular_object;
 
+#[cfg(target_os = "linux")]
+mod dwarf;
+
 // The gap-2 skip gate queries `has_unwind_info_for_ip` once per sampled IP,
 // and the same hot leaves (libc `malloc`/`memmove`/`memcmp`) recur across
 // millions of samples. Memoizing collapses the otherwise-linear FDE-range scan
@@ -328,6 +331,8 @@ enum ArchUnwinder {
     X86_64 {
         unwinder: Box<UnwinderX86_64<ModuleBytes>>,
         cache: CacheX86_64,
+        #[cfg(target_os = "linux")]
+        dwarf_cache: dwarf::Cache,
     },
     Aarch64 {
         unwinder: Box<UnwinderAarch64<ModuleBytes>>,
@@ -360,6 +365,8 @@ struct ReportedModule {
     sections: ExplicitModuleSectionInfo<ModuleBytes>,
     memory_segments: Vec<ModuleMemorySegment>,
     unwind_ranges: Vec<Range<u64>>,
+    #[cfg(target_os = "linux")]
+    dwarf: Option<dwarf::Module>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -464,6 +471,8 @@ impl FramehopUnwinder {
             PerfArch::X86_64 => ArchUnwinder::X86_64 {
                 unwinder: Box::new(UnwinderX86_64::new()),
                 cache: CacheX86_64::new(),
+                #[cfg(target_os = "linux")]
+                dwarf_cache: dwarf::Cache::new(),
             },
             PerfArch::Aarch64 => ArchUnwinder::Aarch64 {
                 unwinder: Box::new(UnwinderAarch64::new()),
@@ -535,6 +544,9 @@ impl FramehopUnwinder {
         let sections = explicit_module_section_info(&object, addresses.base_svma);
         let memory_segments = module_memory_segments(&file, file_len, &object, addresses);
         let unwind_ranges = object_unwind_ranges(&object, addresses);
+        #[cfg(target_os = "linux")]
+        let dwarf = (object.format() == object::BinaryFormat::Elf)
+            .then(|| dwarf::Module::new(&sections, addresses, object_cfi_base_addresses(&object)));
         let module = Module::<ModuleBytes>::new(
             path.to_string_lossy().into_owned(),
             module_range.clone(),
@@ -551,6 +563,8 @@ impl FramehopUnwinder {
             sections,
             memory_segments,
             unwind_ranges,
+            #[cfg(target_os = "linux")]
+            dwarf,
         });
         let position = self
             .module_order
@@ -726,7 +740,8 @@ impl FramehopUnwinder {
             regs,
             stack,
             max_frames,
-            |ip| module_has_unwind_info(reported_modules, &lookup, ip),
+            reported_modules,
+            &lookup,
             |address| read_reported_module_u64(reported_modules, address),
         )
     }
@@ -741,13 +756,8 @@ impl FramehopUnwinder {
         self.refresh_framehop_modules();
         let modules = &self.reported_modules;
         let lookup = self.segment_lookup.borrow();
-        self.arch.unwind_stack(
-            regs,
-            stack,
-            max_frames,
-            |ip| module_has_unwind_info(modules, &lookup, ip),
-            memory,
-        )
+        self.arch
+            .unwind_stack(regs, stack, max_frames, modules, &lookup, memory)
     }
 }
 
@@ -768,7 +778,8 @@ impl ArchUnwinder {
         regs: PerfUserRegs,
         stack: &[u8],
         max_frames: usize,
-        has_unwind_info: impl Fn(u64) -> bool,
+        modules: &[ReportedModule],
+        lookup: &DwflSegmentLookup,
         memory: impl FnMut(u64) -> Option<u64>,
     ) -> UserStackUnwindResult {
         let mut memory_reader = PerfUserMemoryReader::new(regs.sp(), stack, memory);
@@ -778,7 +789,8 @@ impl ArchUnwinder {
             regs,
             &mut read_stack,
             max_frames,
-            &has_unwind_info,
+            modules,
+            lookup,
         );
         let framehop_frame_count = frames.len();
         UserStackUnwindResult {
@@ -789,7 +801,9 @@ impl ArchUnwinder {
 
     fn clear_modules(&mut self) {
         match self {
-            Self::X86_64 { unwinder, cache } => {
+            Self::X86_64 {
+                unwinder, cache, ..
+            } => {
                 **unwinder = UnwinderX86_64::new();
                 *cache = CacheX86_64::new();
             }
@@ -812,14 +826,26 @@ impl ArchUnwinder {
         regs: PerfUserRegs,
         read_stack: &mut impl FnMut(u64) -> Result<u64, ()>,
         max_frames: usize,
-        has_unwind_info: &impl Fn(u64) -> bool,
+        modules: &[ReportedModule],
+        lookup: &DwflSegmentLookup,
     ) -> Vec<u64> {
+        #[cfg(target_os = "linux")]
+        if matches!(self, Self::X86_64 { .. })
+            && let PerfUserRegs::X86_64(regs) = regs
+        {
+            return self.iter_dwarf_addresses(regs, modules, lookup, read_stack, max_frames);
+        }
         let mut frames = Vec::new();
         // The seeded register file must match the active arch; a mismatch means
         // the file header arch and the regs decode disagreed, which cannot
         // happen because both flow from the same PerfArch.
         match (self, regs) {
-            (Self::X86_64 { unwinder, cache }, PerfUserRegs::X86_64(regs)) => {
+            (
+                Self::X86_64 {
+                    unwinder, cache, ..
+                },
+                PerfUserRegs::X86_64(regs),
+            ) => {
                 let mut regs = regs.to_framehop_regs();
                 let mut address = FrameAddress::from_instruction_pointer(ip);
                 while frames.len() < max_frames {
@@ -827,14 +853,15 @@ impl ArchUnwinder {
                     // libdwfl/frame_unwind.c:738-788 falls back to ebl_unwind
                     // when no FDE covers this PC. Framehop's uncovered-FDE rule
                     // instead pops SP on the initial frame (x86_64/dwarf.rs:87).
-                    let next = if has_unwind_info(address.address_for_lookup()) {
-                        unwinder
-                            .unwind_frame(address, &mut regs, cache, read_stack)
-                            .ok()
-                            .flatten()
-                    } else {
-                        unwind_x86_64_frame_pointer(&mut regs, read_stack)
-                    };
+                    let next =
+                        if module_has_unwind_info(modules, lookup, address.address_for_lookup()) {
+                            unwinder
+                                .unwind_frame(address, &mut regs, cache, read_stack)
+                                .ok()
+                                .flatten()
+                        } else {
+                            unwind_x86_64_frame_pointer(&mut regs, read_stack)
+                        };
                     let Some(next) = next.and_then(FrameAddress::from_return_address) else {
                         break;
                     };
@@ -851,6 +878,90 @@ impl ArchUnwinder {
                 }
             }
             _ => {}
+        }
+        frames
+    }
+
+    #[cfg(target_os = "linux")]
+    fn iter_dwarf_addresses(
+        &mut self,
+        regs: PerfX86_64Regs,
+        modules: &[ReportedModule],
+        lookup: &DwflSegmentLookup,
+        read: &mut impl FnMut(u64) -> Result<u64, ()>,
+        max_frames: usize,
+    ) -> Vec<u64> {
+        let Self::X86_64 {
+            unwinder,
+            cache,
+            dwarf_cache,
+        } = self
+        else {
+            unreachable!()
+        };
+        let mut regs = dwarf::Registers::new(regs);
+        let mut signal = false;
+        let mut frames = Vec::new();
+        while frames.len() < max_frames {
+            let Some(pc) = regs.pc() else {
+                break;
+            };
+            let initial = frames.is_empty();
+            let address = if initial || signal {
+                pc
+            } else {
+                pc.wrapping_sub(1)
+            };
+            let module = lookup
+                .module_for_ip(address, |id| modules[id].range.end)
+                .map(|id| &modules[id]);
+            let step = if let Some(module) = module {
+                if let Some(dwarf) = &module.dwarf {
+                    dwarf.step(address, regs, dwarf_cache, read)
+                } else {
+                    // Keep Framehop for non-ELF platform unwind formats.
+                    let mut platform_regs = regs.framehop_regs();
+                    let address = if initial || signal {
+                        Some(FrameAddress::from_instruction_pointer(pc))
+                    } else {
+                        FrameAddress::from_return_address(pc)
+                    };
+                    match address.and_then(|address| {
+                        unwinder
+                            .unwind_frame(address, &mut platform_regs, cache, read)
+                            .ok()
+                            .flatten()
+                    }) {
+                        Some(_) => dwarf::Step::Caller(
+                            dwarf::Registers::from_framehop(platform_regs),
+                            false,
+                        ),
+                        None => dwarf::Step::Stop,
+                    }
+                }
+            } else {
+                dwarf::Step::NoRow
+            };
+            let step = if matches!(step, dwarf::Step::NoRow) {
+                regs.frame_pointer_step(read)
+            } else {
+                step
+            };
+            // dwfl_frame_pc.c:43-59: either adjacent frame being a signal
+            // frame makes this PC an activation address (no return adjustment).
+            let next_signal = matches!(step, dwarf::Step::Caller(_, true));
+            frames.push(if initial || signal || next_signal {
+                pc
+            } else {
+                pc.wrapping_sub(1)
+            });
+            match step {
+                dwarf::Step::Caller(caller, is_signal) => {
+                    regs = caller;
+                    signal = is_signal;
+                }
+                dwarf::Step::NoRow | dwarf::Step::Stop => break,
+            }
         }
         frames
     }
@@ -1290,7 +1401,8 @@ impl PerfX86_64Regs {
         Ok(Self {
             ip: ip.ok_or_else(|| "perf sample is missing x86_64 IP register".to_string())?,
             sp: sp.ok_or_else(|| "perf sample is missing x86_64 SP register".to_string())?,
-            bp: bp.ok_or_else(|| "perf sample is missing x86_64 BP register".to_string())?,
+            // perf unwind-libdw.c:252-302 zero-fills omitted BP through RIP.
+            bp: bp.unwrap_or(0),
             registers,
         })
     }

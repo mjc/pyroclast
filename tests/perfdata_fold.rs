@@ -2571,15 +2571,13 @@ fn unwinds_rbp_caller_when_bp_at_or_above_sp_and_no_cfi_like_perf_libdw() {
 }
 
 #[test]
-fn does_not_truncate_to_leaf_when_cfi_covers_ip_like_perf_libdw() {
-    // When an FDE covers the sampled IP, handle_cfi (libdwfl/frame_unwind.c)
-    // may yield either PC_UNDEFINED (clean end-of-stack -> leaf only) or a
-    // PC_SET caller, and the two are indistinguishable a priori — so this case
-    // is MustUnwind and framehop is authoritative. The fixture's FDE covers
-    // [0x100, 0x104); sample at vaddr 0x100 (mapping base 0) with bp < sp. The
-    // leaf-only predicate's `!has_unwind_info_for_ip` clause is false here, so
-    // no leaf-only truncation occurs and framehop's own result (the seed IP,
-    // since the FDE has only nops and recovers no usable caller) stands.
+fn nops_only_cfi_recovers_same_rip_with_perf_libdw_abi_defaults() {
+    // elfutils backends/x86_64_cfi.c:x86_64_abi_cfi initializes register 16
+    // (RIP) to DW_CFA_same_value. This covering FDE has only nops, so it
+    // recovers the sampled RIP despite having no explicit register rules.
+    // libdwfl/dwfl_frame_pc.c:dwfl_frame_pc marks this caller non-activation;
+    // perf util/unwind-libdw.c:frame_callback subtracts one, yielding 0xff.
+    // That address has no covering FDE and BP < SP stops the RBP fallback.
     let fixture = SyntheticX86_64Object::create();
     let bytes = x86_leaf_only_perfdata(
         &fixture.path_string(),
@@ -2588,10 +2586,7 @@ fn does_not_truncate_to_leaf_when_cfi_covers_ip_like_perf_libdw() {
     );
 
     let folded = fold_perfdata_callchains(&bytes).expect("folded");
-    // CFI covers the IP, so this is not leaf-only; framehop runs and yields the
-    // seed. The output is the single covered-IP frame produced by the real
-    // unwind, NOT a leaf-only-truncated synthetic.
-    assert_eq!(folded, format!(":12;[{}] 1\n", fixture.file_name()));
+    assert_eq!(folded, format!(":12;[{0}];[{0}] 1\n", fixture.file_name()));
 }
 
 #[test]
@@ -8121,12 +8116,11 @@ struct SyntheticX86_64Object {
 }
 
 impl SyntheticX86_64Object {
-    /// Minimal `x86_64` ELF with one `PT_LOAD` covering [0, 0x10000) and no unwind
-    /// info. The current-IP-only tests previously mapped the host test binary,
-    /// which made framehop's unwind host-dependent (a Mach-O/arm64 test binary
-    /// recovers callers through `__unwind_info` that a Linux `x86_64` binary does
-    /// not have at these offsets). A synthetic ELF pins the libdw scenario the
-    /// tests encode: module reports, framehop yields only the seeded IP.
+    /// Minimal `x86_64` ELF with one `PT_LOAD` covering [0, 0x10000) and a
+    /// nops-only FDE covering [0x100, 0x104). Fixed ELF bytes keep CFI and RBP
+    /// fallback behavior independent of the host test binary's architecture
+    /// and unwind sections. Tests outside that FDE exercise native fallback;
+    /// tests inside it exercise the x86 ABI's initial CFI register rules.
     fn create() -> Self {
         let mut bytes = vec![0_u8; 0x240];
         bytes[0..4].copy_from_slice(b"\x7fELF");
@@ -8150,10 +8144,8 @@ impl SyntheticX86_64Object {
         bytes[104..112].copy_from_slice(&0x1_0000_u64.to_le_bytes()); // p_memsz
         bytes[112..120].copy_from_slice(&0x1000_u64.to_le_bytes()); // p_align
         // .eh_frame at vaddr/offset 0x100: one CIE and one FDE covering only
-        // [0x100, 0x104), so the module HAS unwind info but none of the
-        // sampled IPs are covered — the configuration where framehop stops
-        // after the seeded IP instead of taking a frame-pointer fallback,
-        // matching a real Linux binary sampled outside its FDE ranges.
+        // [0x100, 0x104). Outside that range libdw uses the architecture
+        // fallback; inside it the nops preserve its initial ABI CFI rules.
         let eh_frame: [u8; 52] = [
             0x14, 0, 0, 0, // CIE length
             0, 0, 0, 0, // CIE id
