@@ -749,14 +749,10 @@ fn perf_dwarf_function_name_preserves_unmangled_die_name_like_libdw() {
 }
 
 #[test]
-fn perf_dwarf_frame_names_prefer_libdw_die_names_over_linkage_names_like_perf_script() {
-    // perf's default srcline backend tries libdw first
-    // (tools/perf/util/srcline.c addr2line fallback order). Its inline callback
-    // names frames with dwarf_diename(die), then new_inline_sym() demangles only
-    // if that returned name is mangled (tools/perf/util/libdw.c libdw_a2l_cb ->
-    // tools/perf/util/srcline.c new_inline_sym). It must not force every frame
-    // through DW_AT_linkage_name: that prints fully-qualified Rust v0 names that
-    // `perf script --inline` does not emit for the sampled sftp/pyroclast cases.
+fn perf_dwarf_frame_names_prefer_qualified_linkage_names_like_perf_script() {
+    // Linux v7.2.9 tools/perf/util/libdw.c:99-108 prefers integrated
+    // DW_AT_linkage_name, then new_inline_sym() demangles it. Rust inline
+    // frames therefore retain their namespace/type qualification.
     let Some((profiling_binary, object_bytes)) = profiling_binary_fixture() else {
         return;
     };
@@ -785,18 +781,18 @@ fn perf_dwarf_frame_names_prefer_libdw_die_names_over_linkage_names_like_perf_sc
     let linkage_names = external_addr2line_linkage_frames_root_to_leaf(&profiling_binary, address)
         .expect("linkage-name frames");
 
-    assert_ne!(frames, linkage_names);
+    assert_eq!(frames.len(), linkage_names.len());
     assert!(
-        frames.iter().any(
-            |frame| frame.starts_with("deallocating_next<") || frame.starts_with("dying_next<")
-        ),
-        "expected at least one perf/libdw-style DIE leaf name, got {frames:?}"
+        frames
+            .iter()
+            .any(|frame| frame.contains("::deallocating_next") || frame.contains("::dying_next")),
+        "expected a qualified linkage name, got {frames:?}"
     );
     assert!(
-        !frames
-            .iter()
-            .any(|frame| frame.starts_with("alloc::collections::btree::navigate::<impl")),
-        "linkage-style qualified frame leaked into libdw-style names: {frames:?}"
+        !frames.iter().any(
+            |frame| frame.starts_with("deallocating_next<") || frame.starts_with("dying_next<")
+        ),
+        "unqualified DIE name leaked into linkage-style names: {frames:?}"
     );
 }
 
@@ -835,16 +831,16 @@ fn perf_dwarf_frame_names_keep_fn0_die_name() {
 
 #[test]
 #[cfg(target_os = "linux")]
-fn symbol_parity_source_lined_function_replaces_symtab_alias_without_inline_children() {
-    // libdw.c:libdw__addr2line and dwarf-aux.c:cu_walk_functions_at visit
-    // the real function even without inlined-subroutine children.
+fn symbol_parity_source_lined_function_keeps_symtab_alias_without_inline_children() {
+    // Linux v7.2.9 tools/perf/util/libdw.c:85-96 reuses args->sym for the
+    // outer subprogram, even if its DWARF name differs from the ELF symbol.
     let (_root, binary, bytes) =
         compiled_c_fixture("void f(void) __asm__(\"float\"); void f(void) {}");
     let address = text_symbol_addresses_matching_name(&bytes, |name| name == "float")[0];
 
     assert_eq!(
         perf_dwarf_frame_names_from_object(&binary, address),
-        Some(vec!["f".to_string()])
+        Some(vec!["float".to_string()])
     );
 
     let request = SymbolRequest {
@@ -861,9 +857,9 @@ fn symbol_parity_source_lined_function_replaces_symtab_alias_without_inline_chil
     let frames = resolver
         .resolve_frame_batch_with_metadata(&[request])
         .unwrap();
-    assert_eq!(frames[0].frames, ["f"]);
-    assert!(frames[0].has_inline_frames);
-    assert!(!frames[0].has_non_inline_base_frame);
+    assert_eq!(frames[0].frames, ["float+0x0"]);
+    assert!(!frames[0].has_inline_frames);
+    assert!(frames[0].has_non_inline_base_frame);
     assert_eq!(frames[0].base_offset, Some(0));
 }
 
@@ -1304,22 +1300,9 @@ fn assert_bfd_fallback_assembly_matches_native(
 }
 
 #[test]
-fn rust_addr2line_resolver_uses_libdw_inline_die_name_for_cargo_read_to_end() {
-    // Reference fixture:
-    //   perf script --inline -i /tmp/backend768.perf.data
-    // prints `default_read_to_end<std::fs::File>+0xe6 (inlined)` for this
-    // object-relative cargo address.
-    //
-    // Relevant perf/libdw source:
-    // - tools/perf/util/libdw.c libdw__addr2line() only unwinds inlines after
-    //   dwfl_module_getsrc() finds a source line for the address.
-    // - tools/perf/util/dwarf-aux.c cu_walk_functions_at() starts at the real
-    //   function DIE and repeatedly descends into DW_TAG_inlined_subroutine
-    //   children containing the PC.
-    // - tools/perf/util/libdw.c libdw_a2l_cb() names each frame with
-    //   dwarf_diename(), which elfutils implements as integrated DW_AT_name.
-    // - inferno src/collapse/perf.rs folds exactly the frame names perf script
-    //   emitted, after stripping symbol offsets.
+fn rust_addr2line_resolver_keeps_elf_outer_name_for_cargo_read_to_end() {
+    // Linux v7.2.9 tools/perf/util/libdw.c:85-96 retains the ELF outer
+    // symbol, rather than falsely marking the shorter DIE name as inlined.
     let cargo = PathBuf::from(
         "/nix/store/wy162cxyays1rj57blywar8y5ybvjx8l-cargo-1.95.0-x86_64-unknown-linux-gnu/bin/cargo",
     );
@@ -1341,7 +1324,7 @@ fn rust_addr2line_resolver_uses_libdw_inline_die_name_for_cargo_read_to_end() {
         kernel_relocation: None,
     };
 
-    let expected = vec!["default_read_to_end<std::fs::File>".to_string()];
+    let expected = vec!["std::io::default_read_to_end::<std::fs::File>".to_string()];
     assert_eq!(
         perf_dwarf_frame_names_from_object(&cargo, request.relative_address),
         Some(expected.clone())
@@ -1352,7 +1335,9 @@ fn rust_addr2line_resolver_uses_libdw_inline_die_name_for_cargo_read_to_end() {
         resolver
             .resolve_frame_batch(&[request])
             .expect("resolve cargo frame"),
-        vec![expected]
+        vec![vec![
+            "std::io::default_read_to_end::<std::fs::File>+0xe6".to_string()
+        ]]
     );
 }
 

@@ -779,6 +779,7 @@ struct PerfDwarfFrameIndex {
 struct PerfDwarfFrameNode {
     name: PerfDwarfNameId,
     parent: Option<std::num::NonZeroUsize>,
+    kind: PerfDwarfDieKind,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4061,7 +4062,7 @@ impl SymbolResolver for RustAddr2lineResolver {
                     has_inline_frames,
                 );
                 // No .debug_str generic specialization here: inline-frame names
-                // already follow perf's libdw `dwarf_diename` path. Rewriting
+                // already follow perf's libdw attribute/demangling path. Rewriting
                 // them again can invent spellings perf never printed.
                 resolved[index] = ResolvedSymbolFrames {
                     frames,
@@ -5617,6 +5618,7 @@ where
             index.nodes.push(PerfDwarfFrameNode {
                 name,
                 parent: parent_frame,
+                kind,
             });
             std::num::NonZeroUsize::new(index.nodes.len())
         } else {
@@ -5805,46 +5807,44 @@ fn perf_dwarf_frame_names_from_index(
         .iter()
         .filter(|segment| segment.range.begin <= address && address < segment.range.end)
         .min_by_key(|segment| segment.order)?;
+    // libdw__addr2line (Linux v7.2.9 util/libdw.c:183-185) cannot walk
+    // inline DIEs unless dwfl_module_getsrc resolves this address.
+    if !segment.has_inline_frames || !segment.has_source_line {
+        return None;
+    }
     let mut frames = Vec::new();
     let mut frame = Some(segment.frame);
+    let mut has_outer_frame = false;
     while let Some(id) = frame {
         let node = &index.nodes[id.get() - 1];
-        if let Some(name) = names.get(usize::try_from(node.name).ok()?) {
+        let name = names.get(usize::try_from(node.name).ok()?);
+        let name = if node.kind == PerfDwarfDieKind::Subprogram {
+            has_outer_frame = true;
+            base_symbol.or(name)
+        } else {
+            name
+        };
+        if let Some(name) = name {
             frames.push(name.to_owned());
         }
         frame = node.parent;
     }
-    let mut has_inline_frames = segment.has_inline_frames;
-    if !has_inline_frames {
-        let replaces_base_symbol = segment.has_source_line
-            && base_symbol.is_some_and(|base_symbol| {
-                frames
-                    .last()
-                    .is_some_and(|frame| frame.as_str() != base_symbol)
-            });
-        if !replaces_base_symbol {
-            return None;
-        }
-        has_inline_frames = true;
+    // Linux v7.2.9 tools/perf/util/libdw.c:85-108 always emits args->sym
+    // for the outer subprogram, including a DIE without a printable name.
+    if !has_outer_frame && let Some(base_symbol) = base_symbol {
+        frames.push(base_symbol.to_owned());
     }
     Some(PerfDwarfFrameNames {
         frames,
-        has_inline_frames,
+        has_inline_frames: true,
     })
 }
 
 /// Resolves the printed frame name for one subprogram/inlined-subroutine DIE.
 ///
-/// perf's default libdw inline path names each frame from `dwarf_diename(die)`
-/// (`tools/perf/util/libdw.c` `libdw_a2l_cb`) and then passes that name through
-/// `new_inline_sym` (`tools/perf/util/srcline.c`). That means Rust DIE names
-/// from `DW_AT_name` / abstract origins retain their supplied spelling
-/// unless the name itself is mangled and `dso__demangle_sym` can demangle it.
-///
-/// The installed perf-script oracle for this branch uses libdw first; tests
-/// that assert perf-script output must be checked against that runtime path.
-/// This helper still keeps command-backend spellings for cases where the
-/// linkage name is the only perf-compatible spelling available.
+/// Linux v7.2.9 tools/perf/util/libdw.c:99-108 prefers integrated
+/// `DW_AT_linkage_name` and falls back to `die_name()`. `new_inline_sym()` demangles
+/// that spelling; the outer subprogram uses the ELF symbol at lookup time.
 fn perf_dwarf_die_frame_name<R>(
     dwarf: &gimli::Dwarf<R>,
     unit: &gimli::Unit<R>,
@@ -5854,25 +5854,15 @@ fn perf_dwarf_die_frame_name<R>(
 where
     R: gimli::Reader,
 {
-    perf_dwarf_die_name(dwarf, unit, directory, entry)
-        .map(PerfDwarfDieName::Raw)
-        .or_else(|| {
-            perf_dwarf_inherited_string(
-                dwarf,
-                unit,
-                directory,
-                entry,
-                gimli::DW_AT_linkage_name,
-                16,
-            )
-            .and_then(|linkage| {
-                let text = linkage.to_string_lossy().ok()?;
-                Some(match addr2line::demangle_auto(text, None) {
-                    Cow::Borrowed(_) => PerfDwarfDieName::Raw(linkage),
-                    Cow::Owned(name) => PerfDwarfDieName::Rendered(name),
-                })
+    perf_dwarf_inherited_string(dwarf, unit, directory, entry, gimli::DW_AT_linkage_name, 17)
+        .and_then(|linkage| {
+            let text = linkage.to_string_lossy().ok()?;
+            Some(match addr2line::demangle_auto(text, None) {
+                Cow::Borrowed(_) => PerfDwarfDieName::Raw(linkage),
+                Cow::Owned(name) => PerfDwarfDieName::Rendered(name),
             })
         })
+        .or_else(|| perf_dwarf_die_name(dwarf, unit, directory, entry).map(PerfDwarfDieName::Raw))
 }
 
 fn perf_dwarf_die_name<R>(
@@ -10262,7 +10252,15 @@ mod tests {
         names: &mut PerfDwarfNameInterner,
     ) -> super::PerfDwarfFrameIndex {
         let (abbrev, info, ranges) = test_dwarf_sections(dies);
-        test_dwarf_frame_index_from_sections(&abbrev, &info, &ranges, source_line_ranges, names)
+        // These are function-walk fixtures, with source coverage unless a
+        // narrower line table is supplied. Line-less cases use raw sections.
+        let default_lines = [test_range(0, u64::MAX)];
+        let lines = if source_line_ranges.is_empty() {
+            &default_lines[..]
+        } else {
+            source_line_ranges
+        };
+        test_dwarf_frame_index_from_sections(&abbrev, &info, &ranges, lines, names)
     }
 
     fn test_dwarf_sections(dies: &[TestDwarfDie<'_>]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
@@ -10323,6 +10321,41 @@ mod tests {
         let directory = super::PerfDwarfUnitDirectory::new(&dwarf);
         let unit = directory.units[0].unit.as_ref().unwrap();
         super::perf_dwarf_unit_frame_index(&dwarf, unit, &directory, names, source_line_ranges)
+    }
+
+    #[test]
+    fn inline_frames_prefer_linkage_names_and_keep_the_outer_elf_symbol_like_perf() {
+        // Linux v7.2.9 tools/perf/util/libdw.c:85-108: the subprogram uses
+        // args->sym; inline DIEs prefer die_get_linkage_name() over die_name().
+        let abbrev = [
+            1, 0x11, 1, 0, 0, 2, 0x2e, 1, 0x03, 0x08, 0x6e, 0x08, 0x11, 0x01, 0x12, 0x06, 0, 0, 3,
+            0x1d, 0, 0x03, 0x08, 0x6e, 0x08, 0x11, 0x01, 0x12, 0x06, 0, 0, 0,
+        ];
+        let mut info = vec![0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 8, 1];
+        info.extend_from_slice(b"\x02outer\0_ZN2ns5outerEv\0");
+        info.extend_from_slice(&0_u64.to_le_bytes());
+        info.extend_from_slice(&100_u32.to_le_bytes());
+        info.extend_from_slice(b"\x03inner\0_ZN2ns5innerEv\0");
+        info.extend_from_slice(&10_u64.to_le_bytes());
+        info.extend_from_slice(&10_u32.to_le_bytes());
+        info.extend_from_slice(&[0, 0]);
+        let length = u32::try_from(info.len() - 4).unwrap();
+        info[..4].copy_from_slice(&length.to_le_bytes());
+        let mut names = PerfDwarfNameInterner::default();
+        let index = test_dwarf_frame_index_from_sections(
+            &abbrev,
+            &info,
+            &[],
+            &[test_range(0, 100)],
+            &mut names,
+        );
+        assert_eq!(
+            perf_dwarf_frame_names_from_index(&index, &names.names, 15, Some("outer.constprop.0")),
+            Some(PerfDwarfFrameNames {
+                frames: vec!["ns::inner()".into(), "outer.constprop.0".into()],
+                has_inline_frames: true,
+            })
+        );
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -10754,7 +10787,7 @@ mod tests {
         let directory = super::PerfDwarfUnitDirectory::new(&dwarf);
         let unit = directory.units[0].unit.as_ref().unwrap();
         let entry = unit.entry(gimli::UnitOffset(offset)).unwrap();
-        // perf util/libdw.c:libdw_a2l_cb calls dwarf_diename. libdw's
+        // Linux v7.2.9 libdw_a2l_cb uses die_name when linkage is absent. libdw's
         // dwarf_attr_integrate.c:43-63 follows one selected reference chain,
         // not a backtracking search through both attributes.
         assert_eq!(
@@ -10769,7 +10802,7 @@ mod tests {
         );
         assert_eq!(
             super::perf_dwarf_frame_names_from_object_bytes(&bytes, 0x1018),
-            Some(vec![expected.unwrap_or("base_symbol").to_owned()]),
+            Some(vec!["base_symbol".to_owned()]),
             "production frame index: {kind:?}"
         );
     }
@@ -11094,7 +11127,7 @@ mod tests {
                 )
                 .unwrap()
                 .frames,
-                ["read_at", "read_at", "read_at", "outer"]
+                ["read_at", "read_at", "read_at", "base_symbol"]
             );
         }
     }
@@ -11256,7 +11289,7 @@ mod tests {
                 )
                 .unwrap()
                 .frames,
-                ["read_at", "read_at", "read_at", "outer"]
+                ["read_at", "read_at", "read_at", "base_symbol"]
             );
         }
     }
@@ -11329,7 +11362,7 @@ mod tests {
                 "read_at".into(),
                 "read_at".into(),
                 "read_at".into(),
-                "outer".into()
+                "base_symbol".into()
             ])
         );
     }
@@ -11344,7 +11377,7 @@ mod tests {
                 "read_at".into(),
                 "read_at".into(),
                 "read_at".into(),
-                "outer".into()
+                "base_symbol".into()
             ])
         );
     }
@@ -11359,7 +11392,7 @@ mod tests {
                 "read_at".into(),
                 "read_at".into(),
                 "read_at".into(),
-                "outer".into()
+                "base_symbol".into()
             ])
         );
     }
@@ -11380,7 +11413,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 first[0].frames,
-                ["outer", "read_at", "read_at", "read_at"],
+                ["base_symbol", "read_at", "read_at", "read_at"],
                 "{kind:?}"
             );
             assert!(first[0].has_base_symbol && first[0].has_inline_frames);
@@ -11405,7 +11438,7 @@ mod tests {
             for frames in warm {
                 assert_eq!(
                     frames.frames,
-                    ["outer", "read_at", "read_at", "read_at"],
+                    ["base_symbol", "read_at", "read_at", "read_at"],
                     "{kind:?}"
                 );
                 assert!(frames.has_base_symbol && frames.has_inline_frames);
@@ -11428,7 +11461,7 @@ mod tests {
         // DWARF32 v4, 8-byte addresses. Every DIE has children; null records
         // close them iteratively, including the named leaves and CU.
         let abbrev = vec![
-            1, 0x11, 1, 0x11, 0x01, 0x12, 0x06, 0, 0, // CU: low/high PC
+            1, 0x11, 1, 0x11, 0x01, 0x12, 0x06, 0x10, 0x17, 0, 0, // CU: PCs, stmt_list
             2, 0x2e, 1, 0x03, 0x08, 0x11, 0x01, 0x12, 0x06, 0, 0, // named function
             3, 0x0b, 1, 0, 0, // lexical block
             4, 0x1d, 1, 0x11, 0x01, 0x12, 0x06, 0, 0, // unnamed inline
@@ -11437,6 +11470,7 @@ mod tests {
         ];
         let mut info = vec![0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 8];
         pyroc50_push_die(&mut info, 1, None, Some((0x1000, 0x40)));
+        info.extend_from_slice(&0_u32.to_le_bytes());
         pyroc50_push_die(&mut info, 2, Some("outer"), Some((0x1000, 0x40)));
         for _ in 0..depth {
             if unnamed_inline {
@@ -11463,6 +11497,7 @@ mod tests {
         for (name, data) in [
             (b".debug_abbrev".as_slice(), abbrev),
             (b".debug_info", info),
+            (b".debug_line", cross_cu_line_fixture(0x1000)),
         ] {
             let section = builder.sections.add();
             section.name = name.into();
@@ -11513,7 +11548,7 @@ mod tests {
         let header = headers.next().expect("unit header").expect("one CU");
         assert!(headers.next().expect("end of units").is_none());
         let unit = dwarf.unit(header).expect("valid fixture CU");
-        assert!(unit.line_program.is_none());
+        assert!(unit.line_program.is_some());
         let mut cursor = unit.entries();
         let mut dies = 0;
         let mut nulls = 0;
@@ -11564,7 +11599,7 @@ mod tests {
                 .frame_index
                 .segments
                 .iter()
-                .all(|segment| !segment.has_source_line)
+                .all(|segment| segment.has_source_line)
         );
         let mut cache = PerfDwarfIndexCache::default();
         super::build_dwarf_index_cache_for_addresses(
@@ -11578,9 +11613,11 @@ mod tests {
         let segments = units[0].frame_index.as_ref().expect("cached segments");
         for address in addresses {
             let names: Option<Vec<String>> = match address {
-                0x1018 | 0x101b => Some(vec!["leaf".into(), "outer".into()]),
-                0x1028 | 0x102f => Some(vec!["trailing".into(), "outer".into()]),
-                0x1010 | 0x1017 | 0x101c | 0x101f if unnamed_inline => Some(vec!["outer".into()]),
+                0x1018 | 0x101b => Some(vec!["leaf".into(), "base_symbol".into()]),
+                0x1028 | 0x102f => Some(vec!["trailing".into(), "base_symbol".into()]),
+                0x1010 | 0x1017 | 0x101c | 0x101f if unnamed_inline => {
+                    Some(vec!["base_symbol".into()])
+                }
                 _ => None,
             };
             let expected = names.map(|frames| PerfDwarfFrameNames {
@@ -11605,7 +11642,7 @@ mod tests {
         }
         assert_eq!(
             super::perf_dwarf_frame_names_from_object_bytes(bytes, 0x1018),
-            Some(vec!["leaf".into(), "outer".into()])
+            Some(vec!["leaf".into(), "base_symbol".into()])
         );
         assert_eq!(
             super::perf_dwarf_frame_names_from_object_bytes(bytes, 0x100f),
@@ -11622,9 +11659,9 @@ mod tests {
         let first = resolver
             .resolve_frame_batch_with_metadata(&[leaf])
             .expect("resolve deep DWARF from file");
-        assert_eq!(first[0].frames, ["outer", "leaf"]);
+        assert_eq!(first[0].frames, ["base_symbol", "leaf"]);
         assert!(first[0].has_base_symbol && first[0].has_inline_frames);
-        assert!(!first[0].has_non_inline_base_frame);
+        assert!(first[0].has_non_inline_base_frame);
         assert_eq!(first[0].base_offset, Some(0x18));
         let metadata = resolver
             .object_metadata(path)
@@ -11651,15 +11688,15 @@ mod tests {
         let second = resolver
             .resolve_frame_batch_with_metadata(&requests)
             .expect("resolve cached deep DWARF after unlink");
-        assert_eq!(second[0].frames, ["outer", "leaf"]);
+        assert_eq!(second[0].frames, ["base_symbol", "leaf"]);
         if unnamed_inline {
-            assert_eq!(second[1].frames, ["outer"]);
+            assert_eq!(second[1].frames, ["base_symbol"]);
             assert!(second[1].has_inline_frames);
         } else {
             assert_eq!(second[1].frames, ["base_symbol+0x10"]);
             assert!(!second[1].has_inline_frames);
         }
-        assert_eq!(second[2].frames, ["outer", "trailing"]);
+        assert_eq!(second[2].frames, ["base_symbol", "trailing"]);
         assert!(second[2].has_inline_frames);
         assert_eq!(second[3].frames, ["base_symbol+0xf"]);
         assert!(!second[3].has_inline_frames);
@@ -11972,8 +12009,13 @@ mod tests {
             let tail = info.len() - 3;
             info[tail] = 127;
             let mut names = PerfDwarfNameInterner::default();
-            let index =
-                test_dwarf_frame_index_from_sections(&abbrev, &info, &ranges, &[], &mut names);
+            let index = test_dwarf_frame_index_from_sections(
+                &abbrev,
+                &info,
+                &ranges,
+                &[test_range(0, 100)],
+                &mut names,
+            );
             assert_eq!(
                 perf_dwarf_frame_names_from_index(&index, &names.names, 35, None)
                     .unwrap()
@@ -12024,8 +12066,13 @@ mod tests {
                 let directory = super::PerfDwarfUnitDirectory::new(&dwarf);
                 let unit = directory.units[0].unit.as_ref().unwrap();
                 let mut names = PerfDwarfNameInterner::default();
-                let index =
-                    super::perf_dwarf_unit_frame_index(&dwarf, unit, &directory, &mut names, &[]);
+                let index = super::perf_dwarf_unit_frame_index(
+                    &dwarf,
+                    unit,
+                    &directory,
+                    &mut names,
+                    &[test_range(0x1000, 0x1040)],
+                );
                 assert_eq!(index.nodes.len(), depth + 1);
                 assert_eq!(index.segments.len(), 1);
                 let frames =
@@ -12272,15 +12319,14 @@ mod tests {
             &mut names,
         );
         for (address, expected) in [
-            (45, vec!["leaf", "outer"]),
-            (25, vec!["outer"]),
-            (115, vec!["outside", "range_less", "outer"]),
+            (45, Some(vec!["leaf", "outer"])),
+            (25, None),
+            (115, Some(vec!["outside", "range_less", "outer"])),
         ] {
             assert_eq!(
                 perf_dwarf_frame_names_from_index(&segments, &names.names, address, None)
-                    .unwrap()
-                    .frames,
-                expected,
+                    .map(|frames| frames.frames),
+                expected.map(|frames| frames.into_iter().map(str::to_owned).collect()),
             );
         }
         // Descendant coverage is neither clipped to the parent nor promoted
@@ -12377,7 +12423,7 @@ mod tests {
         assert_eq!(
             perf_dwarf_frame_names_from_index(&segments, &names.names, 15, Some("base_symbol")),
             Some(PerfDwarfFrameNames {
-                frames: vec!["next_remote_task".to_string()],
+                frames: vec!["next_remote_task".to_string(), "base_symbol".to_string()],
                 has_inline_frames: true,
             })
         );
@@ -12390,16 +12436,15 @@ mod tests {
         // line information. That leaves perf script printing the original
         // symtab symbol, as in the verified `float`/`f` fixture.
         let mut names = PerfDwarfNameInterner::default();
-        let segments = test_dwarf_frame_index(
-            &[(
-                1,
-                gimli::DW_TAG_subprogram,
-                Some("next_remote_task"),
-                &[test_range(0, 100)],
-            )],
-            &[],
-            &mut names,
-        );
+        let dies = [(
+            1,
+            gimli::DW_TAG_subprogram,
+            Some("next_remote_task"),
+            &[test_range(0, 100)][..],
+        )];
+        let (abbrev, info, ranges) = test_dwarf_sections(&dies);
+        let segments =
+            test_dwarf_frame_index_from_sections(&abbrev, &info, &ranges, &[], &mut names);
 
         assert_eq!(
             perf_dwarf_frame_names_from_index(
@@ -12415,11 +12460,9 @@ mod tests {
     }
 
     #[test]
-    fn flattened_dwarf_lookup_replaces_realfunc_name_when_source_line_exists_like_perf_libdw() {
-        // When libdw has a source line, tools/perf/util/libdw.c calls
-        // cu_walk_functions_at(). The first callback is the real function from
-        // die_find_realfunc(), and srcline.c new_inline_sym() marks it inlined
-        // when dwarf_diename(die) differs from the symtab base symbol.
+    fn flattened_dwarf_lookup_keeps_outer_elf_symbol_when_source_line_exists_like_perf_libdw() {
+        // Linux v7.2.9 tools/perf/util/libdw.c:85-96 reuses args->sym for
+        // DW_TAG_subprogram instead of manufacturing an inlined outer frame.
         let mut names = PerfDwarfNameInterner::default();
         let segments = test_dwarf_frame_index(
             &[
@@ -12447,15 +12490,12 @@ mod tests {
                 15,
                 Some("std::io::default_read_to_end::<std::fs::File>"),
             ),
-            Some(PerfDwarfFrameNames {
-                frames: vec!["default_read_to_end<std::fs::File>".to_string()],
-                has_inline_frames: true,
-            })
+            None
         );
     }
 
     #[test]
-    fn symbol_parity_single_function_die_with_line_replaces_base_without_children() {
+    fn symbol_parity_single_function_die_with_line_keeps_base_without_children() {
         let mut names = PerfDwarfNameInterner::default();
         let segments = test_dwarf_frame_index(
             &[(
@@ -12469,10 +12509,7 @@ mod tests {
         );
         assert_eq!(
             perf_dwarf_frame_names_from_index(&segments, &names.names, 15, Some("float")),
-            Some(PerfDwarfFrameNames {
-                frames: vec!["f".to_string()],
-                has_inline_frames: true,
-            })
+            None
         );
         assert_eq!(
             perf_dwarf_frame_names_from_index(&segments, &names.names, 15, Some("f")),
@@ -12481,7 +12518,7 @@ mod tests {
     }
 
     #[test]
-    fn symbol_parity_realfunc_line_guard_checks_the_lookup_address() {
+    fn symbol_parity_inline_line_guard_checks_the_lookup_address() {
         let mut names = PerfDwarfNameInterner::default();
         let segments = test_dwarf_frame_index(
             &[
@@ -12495,7 +12532,7 @@ mod tests {
                     2,
                     gimli::DW_TAG_inlined_subroutine,
                     Some("child"),
-                    &[test_range(70, 80)],
+                    &[test_range(10, 90)],
                 ),
             ],
             &[test_range(20, 30), test_range(50, 60)],
@@ -12512,7 +12549,7 @@ mod tests {
             assert_eq!(
                 perf_dwarf_frame_names_from_index(&segments, &names.names, address, Some("float")),
                 Some(PerfDwarfFrameNames {
-                    frames: vec!["f".to_string()],
+                    frames: vec!["child".to_string(), "float".to_string()],
                     has_inline_frames: true,
                 }),
                 "address {address}"
@@ -12557,7 +12594,7 @@ mod tests {
 
     #[test]
     fn flattened_dwarf_lookup_keeps_nonfirst_short_rust_names_like_perf_libdw() {
-        // tools/perf/util/libdw.c libdw_a2l_cb() passes dwarf_diename(die) to
+        // Linux v7.2.9 libdw_a2l_cb() falls back to die_name() without linkage;
         // srcline.c new_inline_sym(); the GNU zero-address sentinel check in
         // tools/perf/util/addr2line.c read_addr2line_record() applies only to
         // the external addr2line child protocol's address/sentinel line, not
@@ -12595,7 +12632,7 @@ mod tests {
             Some(vec![
                 "eq<anstyle::color::Color>".to_string(),
                 "eq".to_string(),
-                "fmt".to_string(),
+                "outer_base".to_string(),
             ])
         );
     }

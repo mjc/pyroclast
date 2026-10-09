@@ -234,9 +234,9 @@ struct RecordedBuildId {
 struct PidUnwindState {
     arch: PerfArch,
     object_unwinder: FramehopUnwinder,
-    /// perf unwind-libdw.c caches DWFL on shared maps. `dwfl_attach_state()`
-    /// attaches once; `next_thread()` enumerates only that first TID.
-    attached_tid: Option<u32>,
+    /// perf caches architecture attachment on shared maps; its thread
+    /// callbacks consult the current sample, not the originally attached TID.
+    architecture_attached: bool,
     live_vdso_elf: OnceLock<Option<LiveVdsoElf>>,
     attempted_unwind_mappings: BTreeSet<UnwindMappingKey>,
     /// Original DSO path/load base to the reported module's stable identity.
@@ -257,7 +257,7 @@ impl PidUnwindState {
         Self {
             arch,
             object_unwinder: FramehopUnwinder::with_arch(arch),
-            attached_tid: None,
+            architecture_attached: false,
             live_vdso_elf: OnceLock::new(),
             attempted_unwind_mappings: BTreeSet::new(),
             loaded_unwind_modules: BTreeMap::new(),
@@ -4668,7 +4668,7 @@ fn unwind_object_stack_like_perf(
 
 fn unwind_object_frame_addresses_like_perf(
     state: &mut PidUnwindState,
-    (pid, tid): (u32, u32),
+    (pid, _tid): (u32, u32),
     memory: &mut MappedMemory<'_>,
     regs: &PerfUserRegs,
     stack_bytes: &[u8],
@@ -4688,16 +4688,15 @@ fn unwind_object_frame_addresses_like_perf(
         ReportModuleResult::NoDso => {}
     }
 
-    // unwind-libdw.c:403-408 attempts attachment after reporting the initial
-    // module, then requests this TID. elfutils dwfl_frame.c:136-144 rejects
-    // reattachment; getthread() enumerates only dwfl_pid() via next_thread()
-    // and returns ESRCH for another TID. With no module, attachment cannot
-    // identify the architecture (dwfl_frame.c:166-195) and may be retried.
-    match state.attached_tid {
-        Some(attached) if attached != tid => return Vec::new(),
-        Some(_) => {}
-        None if state.object_unwinder.module_count() == 0 => return Vec::new(),
-        None => state.attached_tid = Some(tid),
+    // linux v7.2.9 tools/perf/util/unwind-libdw.c:166-189,303-307:
+    // next_thread/get_thread use the current unwind_info's TID. libdwfl
+    // dwfl_frame.c:136-195 attaches architecture once, while getthread uses
+    // these callbacks per sample. Without a module, attachment may be retried.
+    if !state.architecture_attached {
+        if state.object_unwinder.module_count() == 0 {
+            return Vec::new();
+        }
+        state.architecture_attached = true;
     }
 
     // unwind-libdw.c:84-85 succeeds with no user DSO. Once attachment is
@@ -11128,20 +11127,23 @@ mod tests {
             syscall_return_state: true,
         };
         let mut state = super::PidUnwindState::with_arch(super::PerfArch::Aarch64);
-        state.attached_tid = Some(12);
+        state.architecture_attached = true;
         let table = super::MmapTable::default();
         let mut sources = super::DsoMemorySources::default();
-        assert_eq!(
-            super::unwind_object_frame_addresses_like_perf(
-                &mut state,
-                (11, 12),
-                &mut super::MappedMemory::new(11, &table, &mut sources, None),
-                &regs,
-                &[0; 24],
-                context,
-            ),
-            [0x20000, 0x2ffff]
-        );
+        for tid in [12, 13, 12] {
+            assert_eq!(
+                super::unwind_object_frame_addresses_like_perf(
+                    &mut state,
+                    (11, tid),
+                    &mut super::MappedMemory::new(11, &table, &mut sources, None),
+                    &regs,
+                    &[0; 24],
+                    context,
+                ),
+                [0x20000, 0x2ffff],
+                "sample from thread {tid} was dropped"
+            );
+        }
     }
 
     #[test]
@@ -11576,7 +11578,7 @@ mod tests {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
-    fn attached_object_unwind_keeps_mixed_and_unmapped_pcs_like_perf() {
+    fn shared_object_unwind_keeps_interleaved_threads_mixed_and_unmapped_pcs_like_perf() {
         let object = std::env::current_exe().unwrap();
         let mut table = super::MmapTable::default();
         insert_test_mapping(&mut table, 11, 0x4000, 0x1000, object.to_str().unwrap());
@@ -11613,17 +11615,21 @@ mod tests {
             let mut regs = test_x86_regs(ip);
             regs.bp = 0;
             regs.sp = 0x7fff_0000;
-            assert_eq!(
-                super::unwind_object_frame_addresses_like_perf(
-                    &mut state,
-                    (11, 12),
-                    &mut super::MappedMemory::new(11, &table, &mut sources, None),
-                    &PerfUserRegs::X86_64(regs),
-                    &[0; 24],
-                    context,
-                ),
-                [ip]
-            );
+            // v7.2.9 unwind-libdw.c:166-189 callbacks read the current TID.
+            for tid in [12, 13, 12] {
+                assert_eq!(
+                    super::unwind_object_frame_addresses_like_perf(
+                        &mut state,
+                        (11, tid),
+                        &mut super::MappedMemory::new(11, &table, &mut sources, None),
+                        &PerfUserRegs::X86_64(regs),
+                        &[0; 24],
+                        context,
+                    ),
+                    [ip],
+                    "sample from thread {tid} was dropped"
+                );
+            }
         }
     }
 

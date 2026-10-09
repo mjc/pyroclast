@@ -227,6 +227,16 @@ Native perf capture must be permitted; set `PERF_PARITY_DATA` to check an existi
 recording instead. Capture failures and parity mismatches fail the gate.
 Linux checks remain exact comparisons of native `perf script`, Inferno folded
 stacks, and rendered SVGs for both symbolizers and inline modes.
+The devenv Linux oracle uses perf 7.2.9. Its
+[`unwind-libdw.c` thread callbacks](https://github.com/gregkh/linux/blob/v7.2.9/tools/perf/util/unwind-libdw.c#L166-L189)
+read the current sample's TID while retaining the shared DWFL architecture and
+modules. Older perf 7.2.5 instead enumerates the initially attached TID and can
+drop later threads' DWARF samples; Pyroclast does not reproduce that bug or waive
+the resulting parity differences.
+Its [`libdw.c` inline callback](https://github.com/gregkh/linux/blob/v7.2.9/tools/perf/util/libdw.c#L85-L108)
+also retains the outer ELF symbol and prefers linkage names for inline DIEs.
+Both Pyroclast symbolizers follow those semantics; an unqualified outer DIE name
+does not turn the real function into a fake inline frame.
 
 On Darwin, the gate records a fresh CPU Profiler trace through Pyroclast, then
 independently exports that trace with Apple's `xctrace`. An XSLT oracle run by

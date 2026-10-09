@@ -2563,7 +2563,7 @@ fn attached_thread_keeps_unmapped_initial_pc_like_native_perf_libdw() {
                 records,
             );
             let (script, expected) = native_script_and_fold(&bytes);
-            assert_eq!(script.contains("20000 [unknown]"), tid == 12, "{script}");
+            assert!(script.contains("20000 [unknown]"), "{script}");
             assert!(!expected.is_empty());
             assert_eq!(
                 fold_perfdata_callchains(&bytes).unwrap(),
@@ -2808,10 +2808,11 @@ fn assert_aarch64_cfi_return_address_like_native(rule: &[u8], recovered: Option<
 
 #[cfg(target_os = "linux")]
 #[test]
-fn shared_process_unwind_attachment_keeps_first_tid_like_native_perf_libdw() {
-    // unwind-libdw.c stores DWFL on shared maps and next_thread() enumerates
-    // only dwfl_pid(). dwfl_frame.c rejects reattachment and reports ESRCH
-    // for another TID. This is an attachment lifetime, not a worker-name rule.
+fn shared_process_unwind_attachment_keeps_interleaved_tids_like_native_perf_libdw() {
+    // linux v7.2.9 tools/perf/util/unwind-libdw.c:166-189,303-307:
+    // next_thread/get_thread read the current sample's TID, not dwfl_pid().
+    // elfutils libdwfl/dwfl_frame.c:getthread uses that callback while keeping
+    // the attached architecture and loaded modules shared across samples.
     let fixture = SyntheticX86_64Object::create();
     for recorded in [false, true] {
         for first_tid in [12, 13] {
@@ -2860,13 +2861,11 @@ fn shared_process_unwind_attachment_keeps_first_tid_like_native_perf_libdw() {
             } else {
                 label.clone()
             };
-            let mut expected_rows = vec![
+            let mut expected_rows = [
                 format!(":{first_tid};{frames} 2\n"),
+                format!(":{other_tid};{frames} 1\n"),
                 format!(":22;{frames} 1\n"),
             ];
-            if recorded {
-                expected_rows.push(format!(":{other_tid};{label} 1\n"));
-            }
             expected_rows.sort();
             assert_eq!(expected, expected_rows.concat(), "{script}");
             assert_eq!(
@@ -2944,7 +2943,10 @@ fn leader_exit_splits_surviving_and_new_thread_maps_like_native_perf() {
         }
         let (script, expected) = native_script_and_fold(&bytes);
         let expected_rows = if keep_exited {
-            format!(":12;[{}] 1\n:12;[new-x86-64] 1\n", fixture.file_name())
+            format!(
+                ":12;[{}] 1\n:12;[new-x86-64] 1\n:13;[new-x86-64] 1\n",
+                fixture.file_name()
+            )
         } else {
             format!(":12;[{}] 2\n:13;[new-x86-64] 1\n", fixture.file_name())
         };
@@ -3089,7 +3091,11 @@ fn initial_module_failure_does_not_reserve_unwind_attachment_like_native_perf() 
         let (script, expected) = native_script_and_fold(&bytes);
         assert_eq!(
             expected,
-            format!(":13;[{}] 1\n", fixture.file_name()),
+            format!(
+                ":12;[{}] 1\n:13;[{}] 1\n",
+                fixture.file_name(),
+                fixture.file_name()
+            ),
             "{script}"
         );
         assert_eq!(

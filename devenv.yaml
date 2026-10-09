@@ -1,5 +1,8 @@
 require_version: true
 inputs:
+  # Pins the current-sample thread and linkage-name libdw oracle semantics.
+  nixpkgs:
+    url: github:NixOS/nixpkgs/77e644b938930f41f7078bf411b863856ef63b3b
   rust-overlay:
     url: github:oxalica/rust-overlay
     inputs:
