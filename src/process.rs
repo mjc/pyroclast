@@ -635,9 +635,13 @@ fn poll_child_pipes(fds: [Option<std::os::fd::RawFd>; 3]) -> std::io::Result<()>
         descriptor.fd = fd.unwrap_or(-1);
     }
     descriptors[2].events = libc::POLLOUT;
+    let count = descriptors
+        .len()
+        .try_into()
+        .expect("three pipe descriptors fit poll's descriptor count");
     // SAFETY: poll borrows the initialized descriptors for this call only.
     // The short timeout bounds response latency for atomic-only handlers.
-    let result = unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, 20) };
+    let result = unsafe { libc::poll(descriptors.as_mut_ptr(), count, 20) };
     if result < 0 {
         let error = std::io::Error::last_os_error();
         if error.kind() != std::io::ErrorKind::Interrupted {

@@ -6135,9 +6135,12 @@ mod tests {
 
     #[test]
     fn object_requests_use_elf_virtual_addresses_for_pie_file_offsets() {
-        let path = std::env::current_exe().expect("current test binary");
-        let bytes = std::fs::read(&path).expect("current test binary bytes");
-        let object = object::File::parse(bytes.as_slice()).expect("current test binary object");
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        let bytes = elf_with_dynamic_text_symbol(b"pie_function", 0x5000, 32);
+        std::fs::write(&path, &bytes).unwrap();
+        let object = object::File::parse(bytes.as_slice()).expect("fixture ELF");
+        assert_eq!(object.kind(), object::ObjectKind::Dynamic);
         let (file_offset, virtual_address) = object
             .segments()
             .find_map(|segment| {
@@ -6145,7 +6148,8 @@ mod tests {
                 let virtual_address = segment.address();
                 (file_size > 8).then_some((file_offset + 8, virtual_address + 8))
             })
-            .expect("current test binary has a load segment");
+            .expect("fixture ELF has a load segment");
+        assert_ne!(file_offset, virtual_address);
 
         let request = clean_object_symbol_request(path, file_offset);
 

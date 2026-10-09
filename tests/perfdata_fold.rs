@@ -2289,7 +2289,7 @@ fn native_vdso_dwarf_leaf_is_not_dropped_without_build_id_metadata() {
 #[test]
 fn keeps_unwind_frame_for_valid_elf_named_perf_data_like_perf_libdw_and_inferno() {
     let fixture = SyntheticX86_64Object::create();
-    let object_path = fixture.dir.path().join("perf.data");
+    let object_path = fixture.path.with_file_name("perf.data");
     std::fs::copy(&fixture.path, &object_path).expect("copy fixture ELF as perf.data");
     let object_path = object_path.to_str().expect("utf8 object path");
     let mut bytes = x86_leaf_only_perfdata(
@@ -2302,7 +2302,7 @@ fn keeps_unwind_frame_for_valid_elf_named_perf_data_like_perf_libdw_and_inferno(
         ],
     );
     put_u64(&mut bytes, 16, 144);
-    let perfdata = fixture.dir.path().join("recording.perf.data");
+    let perfdata = fixture.path.with_file_name("recording.perf.data");
     std::fs::write(&perfdata, bytes).expect("write recording");
 
     let perf = Command::new("perf")
@@ -8116,7 +8116,7 @@ impl SymbolResolver for SampleIpInlineSymbolResolver {
 struct ArrowInlineSymbolResolver;
 
 struct SyntheticX86_64Object {
-    dir: tempfile::TempDir,
+    _dir: tempfile::TempDir,
     path: std::path::PathBuf,
 }
 
@@ -8189,7 +8189,7 @@ impl SyntheticX86_64Object {
         let dir = tempfile::tempdir().expect("fixture dir");
         let path = dir.path().join("fixture-x86-64");
         std::fs::write(&path, &bytes).expect("write fixture elf");
-        Self { dir, path }
+        Self { _dir: dir, path }
     }
 
     fn path_string(&self) -> String {

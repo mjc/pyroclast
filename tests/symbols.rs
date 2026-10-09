@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 
-use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol, SymbolKind, build, elf};
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use object::ObjectSection;
+use object::{Object, ObjectSegment, ObjectSymbol, SymbolKind, build, elf};
 use proptest::prelude::*;
 use pyroclast::cli::SymbolizerKind;
 use pyroclast::perfdata::mappings::FileIdentity;
@@ -3352,11 +3354,13 @@ impl SymbolResolver for RecordingResolver {
     }
 }
 
+#[cfg(target_os = "linux")]
 struct FixedRecordingResolver {
     symbol: Option<String>,
     calls: RefCell<Vec<Vec<SymbolRequest>>>,
 }
 
+#[cfg(target_os = "linux")]
 impl FixedRecordingResolver {
     fn new(symbol: Option<String>) -> Self {
         Self {
@@ -3370,6 +3374,7 @@ impl FixedRecordingResolver {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl SymbolResolver for &FixedRecordingResolver {
     fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
         self.calls.borrow_mut().push(requests.to_vec());
