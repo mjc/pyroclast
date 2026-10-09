@@ -945,16 +945,37 @@ struct OrdinaryKernelLoad {
 struct LiveKallsymsSnapshot {
     core: Option<Kallsyms>,
     modules: FxHashMap<String, Arc<Kallsyms>>,
+    physical: KallsymsReferenceSource,
+}
+
+#[derive(Debug)]
+struct KallsymsReferenceSource {
     source: Box<str>,
     references: Mutex<Vec<KallsymsReference>>,
 }
 
+impl PartialEq for KallsymsReferenceSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
+    }
+}
+
+impl Eq for KallsymsReferenceSource {}
+
+#[derive(Debug)]
 enum KallsymsReference {
     Found { name: Range<usize>, address: u64 },
     Missing(Box<str>),
 }
 
-impl LiveKallsymsSnapshot {
+impl KallsymsReferenceSource {
+    fn new(source: Box<str>) -> Self {
+        Self {
+            source,
+            references: Mutex::new(Vec::new()),
+        }
+    }
+
     fn reference_address(&self, reference: &str) -> Option<u64> {
         let mut references = self.references.lock().expect("kallsyms reference lock");
         for cached in references.iter() {
@@ -979,6 +1000,12 @@ impl LiveKallsymsSnapshot {
             references.push(KallsymsReference::Missing(reference.into()));
             None
         }
+    }
+}
+
+impl LiveKallsymsSnapshot {
+    fn reference_address(&self, reference: &str) -> Option<u64> {
+        self.physical.reference_address(reference)
     }
 
     fn relocation_delta(&self, relocation: Option<&KernelRelocation>) -> Option<u64> {
@@ -1046,6 +1073,7 @@ pub struct Kallsyms {
     symbols: BTreeMap<u64, KallsymsSymbol>,
     addresses_by_name: FxHashMap<Arc<str>, u64>,
     module_indexes: FxHashMap<String, ModuleKallsymsIndex>,
+    physical: Option<Arc<KallsymsReferenceSource>>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1869,6 +1897,10 @@ impl Kallsyms {
     ///
     /// Returns an error when no valid symbols are present.
     pub fn parse(text: &str) -> Result<Self, String> {
+        Self::parse_symbols(text, true)
+    }
+
+    fn parse_symbols(text: &str, index_names: bool) -> Result<Self, String> {
         let mut symbols = BTreeMap::new();
         let mut addresses_by_name = FxHashMap::default();
         for (address, symbol) in text
@@ -1878,7 +1910,7 @@ impl Kallsyms {
         {
             insert_kallsyms_symbol(
                 &mut symbols,
-                Some(&mut addresses_by_name),
+                index_names.then_some(&mut addresses_by_name),
                 address,
                 KallsymsSymbol::kernel(symbol),
             );
@@ -1890,6 +1922,7 @@ impl Kallsyms {
             symbols,
             addresses_by_name,
             module_indexes: FxHashMap::default(),
+            physical: None,
         })
     }
 
@@ -1918,6 +1951,7 @@ impl Kallsyms {
             symbols,
             addresses_by_name,
             module_indexes: FxHashMap::default(),
+            physical: None,
         };
         result.build_module_indexes();
         Ok(result)
@@ -1949,6 +1983,7 @@ impl Kallsyms {
             symbols,
             addresses_by_name,
             module_indexes: FxHashMap::default(),
+            physical: None,
         };
         result.build_module_indexes();
         Ok(result)
@@ -2051,7 +2086,16 @@ impl Kallsyms {
         perf_build_id_kallsyms_paths(debug_dir, build_id)
             .into_iter()
             .filter_map(|path| std::fs::read_to_string(path).ok())
-            .find_map(|text| Self::parse(&text).ok())
+            .find_map(|text| {
+                // perf symbol.c:1480 kallsyms__delta uses event.c:132
+                // kallsyms__get_function_start on the selected cached file,
+                // not a name index of its display symbols.
+                let mut symbols = Self::parse_symbols(&text, false).ok()?;
+                symbols.physical = Some(Arc::new(KallsymsReferenceSource::new(
+                    text.into_boxed_str(),
+                )));
+                Some(symbols)
+            })
     }
 
     pub fn load_first_system_map_candidate(
@@ -2144,7 +2188,10 @@ impl Kallsyms {
     }
 
     fn address_of(&self, name: &str) -> Option<u64> {
-        self.addresses_by_name.get(name).copied()
+        match &self.physical {
+            Some(source) => source.reference_address(name),
+            None => self.addresses_by_name.get(name).copied(),
+        }
     }
 }
 
@@ -3266,8 +3313,7 @@ where
                 Some(LiveKallsymsSnapshot {
                     core: (!core.symbols.is_empty()).then_some(core),
                     modules,
-                    source: text,
-                    references: Mutex::new(Vec::new()),
+                    physical: KallsymsReferenceSource::new(text),
                 })
             })
             .as_ref()
@@ -9235,9 +9281,9 @@ mod tests {
             core.addresses_by_name.len()
         );
         let snapshot = resolver.live_kallsyms_snapshot().unwrap();
-        assert!(snapshot.references.lock().unwrap().is_empty());
+        assert!(snapshot.physical.references.lock().unwrap().is_empty());
         assert_eq!(snapshot.reference_address("reference_4095"), Some(0x3fff));
-        assert_eq!(snapshot.references.lock().unwrap().len(), 1);
+        assert_eq!(snapshot.physical.references.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -9335,7 +9381,7 @@ mod tests {
         let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
             .with_system_kallsyms_from_path(&path);
         let snapshot = resolver.live_kallsyms_snapshot().unwrap();
-        assert!(snapshot.references.lock().unwrap().is_empty());
+        assert!(snapshot.physical.references.lock().unwrap().is_empty());
         // Look up only after the file and the caller's name storage disappear.
         std::fs::remove_file(path).unwrap();
         for (name, address) in [("zero", 0), ("physical\t[module]", 0x2000)] {
@@ -9343,7 +9389,7 @@ mod tests {
             assert_eq!(snapshot.reference_address(&requested), Some(address));
             drop(requested);
         }
-        let references = snapshot.references.lock().unwrap();
+        let references = snapshot.physical.references.lock().unwrap();
         assert_eq!(references.len(), 2);
         for (cached, expected) in references
             .iter()
@@ -9352,8 +9398,75 @@ mod tests {
             let super::KallsymsReference::Found { name, address } = cached else {
                 panic!("successful physical reference owns a copied name");
             };
-            assert_eq!((&snapshot.source[name.clone()], *address), expected);
+            assert_eq!(
+                (&snapshot.physical.source[name.clone()], *address),
+                expected
+            );
         }
+    }
+
+    #[test]
+    fn cached_kallsyms_relocations_retain_source_and_share_requested_memo_across_clones() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("[kernel.kallsyms]/fixture");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("kallsyms");
+        std::fs::write(
+            &path,
+            "1000 D reference\n2000 T reference\n3000 T displayed\n",
+        )
+        .unwrap();
+        let symbols = Kallsyms::load_perf_build_id_cache(root.path(), "fixture").unwrap();
+        let cloned = symbols.clone();
+        assert!(symbols.addresses_by_name.is_empty());
+        let physical = symbols.physical.as_ref().unwrap();
+        assert!(Arc::ptr_eq(physical, cloned.physical.as_ref().unwrap()));
+        assert!(physical.references.lock().unwrap().is_empty());
+        std::fs::remove_file(path).unwrap();
+        super::KALLSYMS_REFERENCE_ROW_VISITS.with(|count| count.set(0));
+        let requested = "reference".to_owned();
+        assert_eq!(
+            symbols.resolve_relocated_with_offset(0x5001, &requested, 0x4000),
+            Some("displayed+0x1".into())
+        );
+        drop(requested);
+        assert_eq!(symbols.address_of("absent"), None);
+        super::KALLSYMS_REFERENCE_ROW_VISITS.with(|count| assert_eq!(count.get(), 5));
+        for _ in 0..100 {
+            assert_eq!(cloned.address_of("reference"), Some(0x2000));
+            assert_eq!(cloned.address_of("absent"), None);
+        }
+        super::KALLSYMS_REFERENCE_ROW_VISITS.with(|count| assert_eq!(count.get(), 5));
+        let references = physical.references.lock().unwrap();
+        assert_eq!(references.len(), 2);
+        let super::KallsymsReference::Found { name, address } = &references[0] else {
+            panic!("successful physical reference owns a copied name");
+        };
+        assert_eq!(
+            (&physical.source[name.clone()], *address),
+            ("reference", 0x2000)
+        );
+    }
+
+    #[test]
+    fn cached_kallsyms_equality_depends_on_physical_source_not_query_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("[kernel.kallsyms]/fixture");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("kallsyms");
+        std::fs::write(&path, "1000 D reference\n2000 T reference\n").unwrap();
+        let first = Kallsyms::load_perf_build_id_cache(root.path(), "fixture").unwrap();
+        let second = Kallsyms::load_perf_build_id_cache(root.path(), "fixture").unwrap();
+        assert_eq!(first.address_of("reference"), Some(0x2000));
+        assert_eq!(first.address_of("missing"), None);
+        assert_eq!(first, second);
+        // event.c:find_func_symbol_cb accepts A but not D. Identical display
+        // trees can have different physical relocation references.
+        std::fs::write(&path, "1000 A reference\n2000 T reference\n").unwrap();
+        let third = Kallsyms::load_perf_build_id_cache(root.path(), "fixture").unwrap();
+        assert_eq!(first.symbols, third.symbols);
+        assert_eq!(third.address_of("reference"), Some(0x1000));
+        assert_ne!(first, third);
     }
 
     #[test]
@@ -9367,7 +9480,7 @@ mod tests {
         assert_eq!(snapshot.reference_address("absent"), None);
         super::KALLSYMS_REFERENCE_ROW_VISITS.with(|count| assert_eq!(count.get(), 4));
         let (storage, capacity) = {
-            let references = snapshot.references.lock().unwrap();
+            let references = snapshot.physical.references.lock().unwrap();
             (references.as_ptr(), references.capacity())
         };
         for _ in 0..100 {
@@ -9375,7 +9488,7 @@ mod tests {
             assert_eq!(snapshot.reference_address("absent"), None);
         }
         super::KALLSYMS_REFERENCE_ROW_VISITS.with(|count| assert_eq!(count.get(), 4));
-        let references = snapshot.references.lock().unwrap();
+        let references = snapshot.physical.references.lock().unwrap();
         assert_eq!(references.len(), 2);
         assert_eq!(
             (references.as_ptr(), references.capacity()),
@@ -9384,7 +9497,7 @@ mod tests {
         drop(references);
         // A cached miss must not match a different exact name.
         assert_eq!(snapshot.reference_address("absent_suffix"), None);
-        assert_eq!(snapshot.references.lock().unwrap().len(), 3);
+        assert_eq!(snapshot.physical.references.lock().unwrap().len(), 3);
     }
 
     #[test]
@@ -9457,7 +9570,7 @@ mod tests {
             visits, 3,
             "cold hit and miss must each scan once under contention"
         );
-        assert_eq!(old.references.lock().unwrap().len(), 2);
+        assert_eq!(old.physical.references.lock().unwrap().len(), 2);
     }
 
     #[test]
@@ -9477,7 +9590,7 @@ mod tests {
             snapshot.kernel_map_range(request.kernel_relocation.as_ref()),
             Some((0x5000, 0x7000))
         );
-        assert_eq!(snapshot.references.lock().unwrap().len(), 1);
+        assert_eq!(snapshot.physical.references.lock().unwrap().len(), 1);
         request.kernel_relocation.as_mut().unwrap().reference_symbol = "missing".into();
         assert_eq!(snapshot.resolve_core(&request), None);
         assert_eq!(

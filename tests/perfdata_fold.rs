@@ -5289,6 +5289,216 @@ fn query_native_module_kallsyms(
 }
 
 #[cfg(target_os = "linux")]
+fn write_native_cached_kallsyms_reference_fixture(
+    rows: &str,
+    old_layout: bool,
+) -> (tempfile::TempDir, Vec<u8>) {
+    let (root, original) = write_native_ordered_module_kallsyms_fixture(
+        rows,
+        &[0xffff_ffff_8100_0010],
+        false,
+        ["[a]", "[b]"],
+    );
+    let header = pyroclast::perfdata::header::parse_header(&original).unwrap();
+    let records = pyroclast::perfdata::records::iter_records(&original, header)
+        .unwrap()
+        .into_iter()
+        .map(|record| {
+            record_bytes_with_misc(
+                record.header.record_type,
+                record.header.misc,
+                record.payload,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut attr = file_attr_bytes(
+        PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CALLCHAIN,
+        0,
+        0,
+    );
+    put_u64(&mut attr, 16, 1);
+    let mut feature = build_id_event_payload(u32::MAX, &[0xa5; 20], "[kernel.kallsyms]");
+    feature[4..6].copy_from_slice(&PERF_RECORD_MISC_CPUMODE_KERNEL.to_le_bytes());
+    let mut bytes = perfdata_with_records_attrs_and_build_id_feature([attr], records, &feature);
+    put_u64(&mut bytes, 16, 144);
+    std::fs::write(root.path().join("perf.data"), &bytes).unwrap();
+
+    let base = root
+        .path()
+        .join(".debug/[kernel.kallsyms]")
+        .join("a5".repeat(20));
+    let cache = if old_layout {
+        base
+    } else {
+        base.join("kallsyms")
+    };
+    std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    let alias = root.path().join("kallsyms");
+    std::fs::rename(&alias, &cache).unwrap();
+    std::os::unix::fs::symlink(&cache, &alias).unwrap();
+    assert_eq!(
+        std::fs::canonicalize(alias).unwrap(),
+        std::fs::canonicalize(cache).unwrap()
+    );
+    assert!(!root.path().join("kcore").exists());
+    (root, bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn assert_native_cached_kallsyms_reference(
+    rows: &str,
+    old_layout: bool,
+    expected_symbol: Option<&str>,
+) {
+    use pyroclast::symbols::{PerfSymbolResolver, SelectedObjectResolver, SymbolizerKind};
+
+    let (root, bytes) = write_native_cached_kallsyms_reference_fixture(rows, old_layout);
+    // Explicit --kallsyms selects an alias of the SAME physical cached file.
+    // This proves file semantics, not native automatic cache discovery.
+    let (script, stderr, native) = query_native_module_kallsyms(root.path(), &[]);
+    let selection = format!(
+        "Using {} for symbols",
+        root.path().join("kallsyms").display()
+    );
+    assert_eq!(
+        stderr.contains(&selection),
+        expected_symbol.is_some(),
+        "{stderr}"
+    );
+    if let Some(symbol) = expected_symbol {
+        assert!(
+            script.contains(&format!("{symbol}+0x0 (")),
+            "{script}\n{stderr}"
+        );
+        assert_eq!(native, format!("worker;{symbol} 1\n").as_bytes());
+    } else {
+        // Missing eligible references fail kallsyms__delta, even if the file
+        // contains display symbols. Do not pin Inferno's unknown-DSO spelling.
+        assert!(script.contains(" [unknown] ("), "{script}\n{stderr}");
+        assert!(!script.contains("target+"), "{script}\n{stderr}");
+        assert_eq!(std::str::from_utf8(&native).unwrap().lines().count(), 1);
+    }
+
+    let runner = pyroclast::process::RealCommandRunner::default();
+    let input = root.path().join("perf.data");
+    let missing = root.path().join("missing-system-source");
+    for eager in [false, true] {
+        for symbolizer in [SymbolizerKind::RustAddr2line, SymbolizerKind::Addr2line] {
+            for inline in [false, true] {
+                for file_input in [false, true] {
+                    let object = SelectedObjectResolver::new(&runner, symbolizer);
+                    let resolver = if eager {
+                        PerfSymbolResolver::from_object_resolver(object)
+                            .with_perfdata_kernel_cache(&bytes, &root.path().join(".debug"))
+                            .with_system_map_candidates([])
+                            .with_system_kallsyms_from_path(&missing)
+                    } else {
+                        perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+                            object,
+                            &input,
+                            root.path(),
+                            [],
+                            &missing,
+                        )
+                    }
+                    .with_live_kernel_notes_path(missing.clone());
+                    let options = FoldOptions {
+                        inline,
+                        count_periods: true,
+                    };
+                    let actual = if file_input {
+                        pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(
+                            &input, options, &resolver,
+                        )
+                    } else {
+                        fold_perfdata_callchains_with_symbols(&bytes, options, &resolver)
+                    }
+                    .unwrap();
+                    assert_eq!(
+                        actual.as_bytes(),
+                        native,
+                        "old={old_layout}, eager={eager}, {symbolizer:?}, inline={inline}, file={file_input}: {script}\n{stderr}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_cached_kallsyms_reference_ignores_data_rows() {
+    for old_layout in [false, true] {
+        assert_native_cached_kallsyms_reference(
+            "ffffffff82001000 D _stext\n\
+             ffffffff82000000 T _stext\n\
+             ffffffff82000010 T native_target\n\
+             ffffffff82001010 T generic_target\n\
+             ffffffff82002000 T sentinel\n",
+            old_layout,
+            Some("native_target"),
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_cached_kallsyms_reference_requires_the_full_name() {
+    assert_native_cached_kallsyms_reference(
+        "ffffffff82001000 T _stext\t[unmapped_fixture_module]\n\
+         ffffffff82000000 T _stext\n\
+         ffffffff82000010 T native_target\n\
+         ffffffff82001010 T generic_target\n\
+         ffffffff82002000 T sentinel\n",
+        false,
+        Some("native_target"),
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_cached_kallsyms_reference_accepts_each_type_in_physical_order() {
+    for symbol_type in ['T', 't', 'W', 'w', 'A'] {
+        // The later reference has a LOWER address. Numeric/display-tree order
+        // must not replace the first eligible physical reference.
+        let rows = format!(
+            "ffffffff82000000 {symbol_type} _stext\n\
+             ffffffff81f00000 T _stext\n\
+             ffffffff82000010 T native_target\n\
+             ffffffff81f00010 T generic_target\n\
+             ffffffff82002000 T sentinel\n"
+        );
+        assert_native_cached_kallsyms_reference(&rows, false, Some("native_target"));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_cached_kallsyms_reference_keeps_the_first_zero_match() {
+    assert_native_cached_kallsyms_reference(
+        "0000000000000000 T _stext\n\
+         0000000000000010 T native_target\n\
+         0000000000001000 T _stext\n\
+         0000000000001010 T generic_target\n\
+         0000000000002000 T sentinel\n",
+        false,
+        Some("native_target"),
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_cached_kallsyms_reference_rejects_missing_or_data_only_matches() {
+    for reference in ["", "ffffffff82000000 D _stext\n"] {
+        let rows = format!(
+            "{reference}ffffffff82000010 T generic_target\n\
+             ffffffff82002000 T sentinel\n"
+        );
+        assert_native_cached_kallsyms_reference(&rows, false, None);
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn assert_module_symbol_routes_match_native(
     root: &std::path::Path,
     bytes: &[u8],
