@@ -17,7 +17,8 @@
           <xsl:with-param name="kind" select="'pid'"/>
         </xsl:call-template>
       </xsl:variable>
-      <xsl:if test="number($pid)=number($target-pid)">
+      <!-- Apple emits sentinel instead of a backtrace when no stack is recorded. -->
+      <xsl:if test="number($pid)=number($target-pid) and not(sentinel and not(symbol | backtrace | tagged-backtrace))">
         <xsl:if test="count(weight | cycle-weight) != 1">
           <xsl:message terminate="yes">expected one CPU weight cell</xsl:message>
         </xsl:if>

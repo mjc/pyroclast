@@ -27,6 +27,20 @@ fn parses_live_xcode27_cpu_profiler_cycle_samples() {
 }
 
 #[test]
+fn native_sentinel_without_a_backtrace_is_not_a_symbol_sample() {
+    // Native CPU Profiler exported this sentinel shape during the Darwin gate.
+    let xml = r#"<trace-query-result><node><schema name="cpu-profile"/>
+    <row><process id="p" pid="7"/><cycle-weight>12</cycle-weight><tagged-backtrace><frame name="work"/></tagged-backtrace></row>
+    <row><process ref="p"/><cycle-weight>19579</cycle-weight><sentinel/></row>
+    </node></trace-query-result>"#;
+    let profile = parse_cpu_profile_for_pid(xml, Some(7)).unwrap();
+    assert_eq!(profile.rows.len(), 1);
+    assert_eq!(profile.rows[0].symbol, "work");
+    assert_float_eq(profile.total_weight, 12.0);
+    assert_eq!(profile.weight_unit, XctraceWeightUnit::Cycles);
+}
+
+#[test]
 fn rejects_mixed_cycle_and_time_weights() {
     for xml in [
         "<table><row><symbol>time</symbol><weight>100</weight></row><row><symbol>cycles</symbol><cycle-weight>200</cycle-weight></row></table>",

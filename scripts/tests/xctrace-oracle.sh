@@ -19,6 +19,7 @@ cat > "$root/refs.xml" <<'XML'
 <trace-query-result><node><schema name="time-profile"/>
 <row><thread id="t"><process id="p"><pid id="pid">7</pid></process></thread><weight id="w">12.5</weight><backtrace id="b"><frame id="f" name="a&amp;b&lt;T&gt;&quot;\&#9;&#10;"/><frame name="root"/></backtrace></row>
 <row><thread ref="t"/><weight ref="w"/><tagged-backtrace><backtrace ref="b"/></tagged-backtrace></row>
+<row><thread ref="t"/><weight>19579</weight><sentinel/></row>
 <row><process pid="8"/><weight>99</weight><symbol>other</symbol></row>
 <row><process><pid ref="pid"/></process><weight>2</weight><backtrace><frame ref="f"/></backtrace></row>
 </node></trace-query-result>
@@ -30,6 +31,8 @@ jq -e 'length == 3 and (map(.weight) | add) == 27 and
 for cells in \
     '<process pid="7"/><weight>1</weight><backtrace ref="missing"/>' \
     '<process pid="7"/><weight>1</weight><backtrace id="b" ref="b"/>' \
+    '<process pid="7"/><weight>1</weight><backtrace/>' \
+    '<process pid="7"/><weight>1</weight><sentinel/><backtrace ref="missing"/>' \
     '<process pid="7"/><weight>NaN</weight><symbol>bad</symbol>' \
     '<process pid="7"/><weight>-1</weight><symbol>bad</symbol>' \
     '<process pid="7"/><weight>1</weight><cycle-weight>2</cycle-weight><symbol>bad</symbol>'; do
