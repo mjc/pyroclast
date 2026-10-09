@@ -52,12 +52,19 @@ base.overrideAttrs (old: {
       bash ${vendor}/tests/check-native.sh \
         "$PWD/binutils/.libs/addr2line" ${base}/bin/addr2line
     source_dir=$(dirname "$configureScript")
-    $CC -g -O2 -Wall -Wextra -Werror \
-      -Ibfd -Ibinutils -I"$source_dir/bfd" -I"$source_dir/binutils" -I"$source_dir/include" \
-      ${vendor}/tests/api-proof.c -Lbfd/.libs -lbfd -Llibsframe/.libs -lsframe \
-      libiberty/libiberty.a -o api-proof
-    LD_LIBRARY_PATH="$PWD/bfd/.libs:$PWD/libsframe/.libs" \
-      timeout --kill-after=1 4 ./api-proof "$PWD/api.primary" "$PWD/api.auxiliary"
+    for adapter in linux portable; do
+      flags=()
+      if test "$adapter" = portable; then
+        flags=(-DPYRO_PORTABLE_SNAPSHOTS)
+      fi
+      $CC -g -O2 -Wall -Wextra -Werror "''${flags[@]}" \
+        -Ibfd -Ibinutils -I"$source_dir/bfd" -I"$source_dir/binutils" -I"$source_dir/include" \
+        ${vendor}/tests/api-proof.c -Lbfd/.libs -lbfd -Llibsframe/.libs -lsframe \
+        libiberty/libiberty.a -o "api-proof-$adapter"
+      LD_LIBRARY_PATH="$PWD/bfd/.libs:$PWD/libsframe/.libs" \
+        timeout --kill-after=1 4 "./api-proof-$adapter" \
+          "$PWD/api.$adapter.primary" "$PWD/api.$adapter.auxiliary"
+    done
     runHook postCheck
   '';
   installPhase = ''

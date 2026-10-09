@@ -105,10 +105,28 @@ process group. Syscall/register details are explicitly Linux x86_64. Other
 Linux architectures can build the adapter but do not claim this ptrace proof.
 
 During the Nix build, `tests/api-proof.c` also verifies independent offsets,
-seals, cache close/reopen metadata and filename, supplied-FD routing, rejected
-streams/writes without unlinking, FIFO negative caching, and stable canonical
-aliases after symlink retargeting. Installed-helper checks rerun the native
+read-only descriptors, Linux seals, cache close/reopen metadata and filename,
+supplied-FD routing, rejected streams/writes without unlinking, FIFO negative
+caching, stable canonical aliases after symlink retargeting, and auxiliary
+survival after rewrite and deletion. Installed-helper checks rerun the native
 suite after relocation/fixup without build-library environment overrides.
+
+The API proof runs again with `PYRO_PORTABLE_SNAPSHOTS` defined at compile time.
+That test poisons `memfd_create`, so it cannot accidentally pass by using the
+Linux adapter. The portable adapter creates backing in a private directory,
+opens an independent read-only descriptor, verifies its device/inode, and
+unlinks the file and directory before copying. Only that descriptor survives
+the completed copy; no writable descriptor is published. It observes the same
+finite input extent and preserves the input descriptor's offset.
+
+Without procfs, each BFD consumer receives an independent unlinked read-only
+copy of the retained snapshot, never of the live logical pathname. This
+preserves independent offsets without relying on `/dev/fd` behaving like a
+new open-file description. It does add copy/storage work per consumer and is
+not a performance optimization. Invalid temporary storage fails without a
+Linux or live-input fallback. This compile-time adapter is not a user option.
+The public helper package and Rust handoff are still Linux-only; a native
+portable-adapter proof alone does not establish Darwin product integration.
 
 ## Bounds And Integration
 

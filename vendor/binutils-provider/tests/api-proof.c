@@ -15,6 +15,12 @@ fatal (const char *format, ...)
   exit (2);
 }
 
+#if defined (__linux__) && defined (PYRO_PORTABLE_SNAPSHOTS)
+#include <sys/mman.h>
+/* Exercise the non-Linux adapter without allowing a Linux-only dependency. */
+#pragma GCC poison memfd_create
+#endif
+
 #include "snapshot-provider.h"
 
 static void
@@ -24,6 +30,21 @@ put_file (const char *name, const char *bytes)
   assert (fd >= 0);
   assert (write (fd, bytes, strlen (bytes)) == (ssize_t) strlen (bytes));
   assert (close (fd) == 0);
+}
+
+static void
+assert_readonly_snapshot (int fd)
+{
+  struct stat st;
+  assert (fstat (fd, &st) == 0 && S_ISREG (st.st_mode) && st.st_nlink == 0);
+  assert ((fcntl (fd, F_GETFL) & O_ACCMODE) == O_RDONLY);
+  assert ((fcntl (fd, F_GETFD) & FD_CLOEXEC) != 0);
+  assert (write (fd, "changed", 7) < 0 && errno == EBADF);
+  assert (pwrite (fd, "changed", 7, 0) < 0 && errno == EBADF);
+  assert (ftruncate (fd, 0) < 0);
+#if defined (__linux__) && !defined (PYRO_PORTABLE_SNAPSHOTS)
+  assert ((fcntl (fd, F_GET_SEALS) & F_SEAL_WRITE) != 0);
+#endif
 }
 
 int
@@ -53,14 +74,14 @@ main (int argc, char **argv)
   one = bfd_input_open (argv[1], O_RDONLY);
   two = bfd_input_open (argv[1], O_RDONLY);
   assert (one >= 0 && two >= 0);
-  assert ((fcntl (one, F_GETFL) & O_ACCMODE) == O_RDONLY);
-  assert ((fcntl (one, F_GET_SEALS) & F_SEAL_WRITE) != 0);
+  assert_readonly_snapshot (one);
+  assert_readonly_snapshot (two);
   assert (read (one, first, 8) == 8);
   assert (read (two, second, 8) == 8);
   assert (memcmp (first, selected, 8) == 0 && memcmp (first, second, 8) == 0);
   close (one);
   close (two);
-  puts ("PASS independent-open-descriptions-and-sealed-readonly-bytes");
+  puts ("PASS independent-open-descriptions-and-unlinked-readonly-bytes");
 
   object = bfd_openr (argv[1], NULL);
   assert (object && strcmp (bfd_get_filename (object), argv[1]) == 0);
@@ -124,5 +145,58 @@ main (int argc, char **argv)
     free (alias);
     puts ("PASS canonical-alias-deduplication-and-symlink-retarget-stability");
   }
+
+  {
+    char *auxiliary = concat (argv[2], ".captured", NULL);
+    put_file (auxiliary, selected);
+    fd = open (auxiliary, O_RDONLY | O_CLOEXEC);
+    assert (fd >= 0 && lseek (fd, 8, SEEK_SET) == 8);
+    one = snapshot_copy (fd);
+    assert (one >= 0 && lseek (fd, 0, SEEK_CUR) == 8);
+    assert (pread (one, first, 8, 0) == 8 && memcmp (first, selected, 8) == 0);
+    close (one);
+    close (fd);
+    one = bfd_input_open (auxiliary, O_RDONLY);
+    assert (one >= 0);
+    assert_readonly_snapshot (one);
+    put_file (auxiliary, "in-place-replacement");
+    two = bfd_input_open (auxiliary, O_RDONLY);
+    assert (two >= 0);
+    assert_readonly_snapshot (two);
+    assert (read (one, first, 8) == 8 && memcmp (first, selected, 8) == 0);
+    assert (read (two, second, 8) == 8 && memcmp (first, second, 8) == 0);
+    close (one);
+    close (two);
+    assert (unlink (auxiliary) == 0);
+    one = bfd_input_open (auxiliary, O_RDONLY);
+    assert (one >= 0 && read (one, first, 8) == 8);
+    assert (memcmp (first, selected, 8) == 0);
+    close (one);
+    free (auxiliary);
+    puts ("PASS auxiliary-snapshot-survives-rewrite-and-unlink");
+  }
+#if !defined (__linux__) || defined (PYRO_PORTABLE_SNAPSHOTS)
+  {
+    const char *temporary_root = getenv ("TMPDIR");
+    char *saved = temporary_root ? xstrdup (temporary_root) : NULL;
+    fd = open (argv[1], O_RDONLY | O_CLOEXEC);
+    assert (fd >= 0);
+    assert (setenv ("TMPDIR", argv[1], 1) == 0);
+    assert (snapshot_copy (fd) < 0 && errno == ENOTDIR);
+    if (saved)
+      {
+        assert (setenv ("TMPDIR", saved, 1) == 0);
+        free (saved);
+      }
+    else
+      assert (unsetenv ("TMPDIR") == 0);
+    one = snapshot_copy (fd);
+    assert (one >= 0);
+    assert_readonly_snapshot (one);
+    close (one);
+    close (fd);
+    puts ("PASS failed-portable-storage-does-not-fall-back-to-linux-or-live-input");
+  }
+#endif
   return 0;
 }

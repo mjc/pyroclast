@@ -1,6 +1,6 @@
 {
   "version": "2.46",
-  "providerPatchSha256": "d6c3d086f8298618f03edc61a4b6ddf45f6d45c502e5aaac242102e6d37475ba",
+  "providerPatchSha256": "41cf07b907a58d9995a669b5737f575f2147960147d4f96ab746c7afa7f8a1e7",
   "source": {
     "url": "https://ftp.gnu.org/gnu/binutils/binutils-with-gold-2.46.tar.bz2",
     "hash": "sha256-uMmj15bcCw6OqTXcJMXI1vNF6xd62lrGpbESLHfWIVg=",

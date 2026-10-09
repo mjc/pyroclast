@@ -240,9 +240,9 @@ diff -ruN baseline/binutils/addr2line.c source/binutils/addr2line.c
  
 diff -ruN baseline/binutils/snapshot-provider.h source/binutils/snapshot-provider.h
 --- baseline/binutils/snapshot-provider.h	1969-12-31 17:00:00.000000000 -0700
-+++ source/binutils/snapshot-provider.h	2026-10-08 18:39:50.856541682 -0600
-@@ -0,0 +1,188 @@
-+/* Linux proof adapter; transport and session ownership belong to the caller. */
++++ source/binutils/snapshot-provider.h	2026-10-08 22:05:02.301977491 -0600
+@@ -0,0 +1,250 @@
++/* Snapshot backing; transport and session ownership belong to the caller. */
 +#include "bfd-input-provider.h"
 +#include <sys/mman.h>
 +#include <sys/stat.h>
@@ -267,7 +267,13 @@ diff -ruN baseline/binutils/snapshot-provider.h source/binutils/snapshot-provide
 +  struct stat st;
 +  unsigned char buffer[65536];
 +  off_t offset = 0;
-+  int output, error;
++  int output = -1, error;
++#if !defined (__linux__) || defined (PYRO_PORTABLE_SNAPSHOTS)
++  const char *temporary_root = getenv ("TMPDIR");
++  char *directory = NULL, *name = NULL;
++  int readonly = -1;
++  struct stat copied, reopened;
++#endif
 +
 +  if (fstat (input, &st) < 0)
 +    return -1;
@@ -276,9 +282,40 @@ diff -ruN baseline/binutils/snapshot-provider.h source/binutils/snapshot-provide
 +      errno = EINVAL;
 +      return -1;
 +    }
++#if defined (__linux__) && !defined (PYRO_PORTABLE_SNAPSHOTS)
 +  output = memfd_create ("bfd-input", MFD_CLOEXEC | MFD_ALLOW_SEALING);
 +  if (output < 0)
 +    return -1;
++#else
++  if (!temporary_root || !*temporary_root)
++    temporary_root = "/tmp";
++  directory = concat (temporary_root, "/pyroclast-bfd.XXXXXX", NULL);
++  if (!mkdtemp (directory))
++    {
++      error = errno;
++      free (directory);
++      errno = error;
++      return -1;
++    }
++  name = concat (directory, "/snapshot", NULL);
++  output = open (name, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
++  if (output < 0)
++    goto fail;
++  /* Unlink before copying, so a terminated long copy cannot leave its
++     backing pathname behind. Publish only after closing the writer. */
++  if (fchmod (output, 0400) < 0 || fstat (output, &copied) < 0)
++    goto fail;
++  readonly = open (name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
++  if (readonly < 0 || fstat (readonly, &reopened) < 0)
++    goto fail;
++  if (copied.st_dev != reopened.st_dev || copied.st_ino != reopened.st_ino)
++    {
++      errno = ESTALE;
++      goto fail;
++    }
++  if (unlink (name) < 0 || rmdir (directory) < 0)
++    goto fail;
++#endif
 +  /* Read the observed finite extent, never a growing stream's EOF. */
 +  while (offset < st.st_size)
 +    {
@@ -311,13 +348,30 @@ diff -ruN baseline/binutils/snapshot-provider.h source/binutils/snapshot-provide
 +        }
 +      offset += got;
 +    }
++#if defined (__linux__) && !defined (PYRO_PORTABLE_SNAPSHOTS)
 +  if (fcntl (output, F_ADD_SEALS,
 +             F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) < 0)
 +    goto fail;
 +  return output;
++#else
++  /* Retain no writable handle or discoverable pathname. */
++  close (output);
++  free (name);
++  free (directory);
++  return readonly;
++#endif
 +fail:
 +  error = errno;
-+  close (output);
++  if (output >= 0)
++    close (output);
++#if !defined (__linux__) || defined (PYRO_PORTABLE_SNAPSHOTS)
++  if (readonly >= 0)
++    close (readonly);
++  unlink (name);
++  rmdir (directory);
++  free (name);
++  free (directory);
++#endif
 +  errno = error;
 +  return -1;
 +}
@@ -377,16 +431,24 @@ diff -ruN baseline/binutils/snapshot-provider.h source/binutils/snapshot-provide
 +snapshot_open (void *context ATTRIBUTE_UNUSED, const char *name, int borrowed_fd)
 +{
 +  struct snapshot_entry *entry = snapshot_lookup (name, borrowed_fd);
++#if defined (__linux__) && !defined (PYRO_PORTABLE_SNAPSHOTS)
 +  char descriptor[64];
++#endif
 +  if (entry->fd < 0)
 +    {
 +      errno = entry->error;
 +      return -1;
 +    }
++#if defined (__linux__) && !defined (PYRO_PORTABLE_SNAPSHOTS)
 +  /* Reopen the held sealed object, not its logical filesystem name.
 +     dup would share offsets across BFD, CRC probes and plugin consumers. */
 +  snprintf (descriptor, sizeof descriptor, "/proc/self/fd/%d", entry->fd);
 +  return open (descriptor, O_RDONLY | O_CLOEXEC);
++#else
++  /* /dev/fd and dup can share offsets. Copy the retained backing, never
++     the live logical path, into an independent unlinked read-only file. */
++  return snapshot_copy (entry->fd);
++#endif
 +}
 +
 +static char *
