@@ -26,11 +26,11 @@ type LoaderReader<'a> =
 type Error = Box<dyn std::error::Error>;
 type Result<T> = std::result::Result<T, Error>;
 
-type Opener = dyn Fn(&Path) -> Result<Arc<[u8]>> + Send + Sync;
+type Opener = dyn Fn(&Path) -> Result<Arc<Vec<u8>>> + Send + Sync;
 
 enum LoaderData {
     Mapped(Mmap),
-    Shared(Arc<[u8]>),
+    Shared(Arc<Vec<u8>>),
 }
 
 impl AsRef<[u8]> for LoaderData {
@@ -110,11 +110,13 @@ impl Loader {
     ///
     /// The opener is called for the main executable, dSYM candidates, DWP files,
     /// and lazily loaded DWO and Mach-O object/archive files. Returned bytes are
-    /// retained without copying. Directory discovery still uses the filesystem.
+    /// retained without copying. Sharing a read buffer via `Arc::new(vec)` also
+    /// avoids the buffer copy required to convert a `Vec<u8>` to `Arc<[u8]>`.
+    /// Directory discovery still uses the filesystem.
     /// Optional-file errors are ignored in the same cases as [`Self::new`].
     pub fn new_with_opener<F>(path: impl AsRef<Path>, opener: F) -> Result<Self>
     where
-        F: Fn(&Path) -> Result<Arc<[u8]>> + Send + Sync + 'static,
+        F: Fn(&Path) -> Result<Arc<Vec<u8>>> + Send + Sync + 'static,
     {
         Self::new_with_sup_and_opener(path, None::<&Path>, opener)
     }
@@ -128,7 +130,7 @@ impl Loader {
         opener: F,
     ) -> Result<Self>
     where
-        F: Fn(&Path) -> Result<Arc<[u8]>> + Send + Sync + 'static,
+        F: Fn(&Path) -> Result<Arc<Vec<u8>>> + Send + Sync + 'static,
     {
         let arena = LoaderArena {
             opener: Some(Box::new(opener)),

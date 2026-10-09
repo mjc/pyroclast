@@ -765,7 +765,7 @@ struct PreparedObjectMetadata {
 
 struct CachedObjectMetadata {
     object_metadata: PreparedObjectMetadata,
-    object_bytes: Arc<[u8]>,
+    object_bytes: Arc<Vec<u8>>,
     dwarf_index: Mutex<PerfDwarfIndexCache<'static>>,
     module_metadata: Mutex<FxHashMap<OsString, Arc<KernelModuleObjectMetadata>>>,
 }
@@ -1418,7 +1418,7 @@ impl RustAddr2lineResolver {
                 let loaded = read_regular_object(path).map(|bytes| {
                     Arc::new(CachedObjectMetadata {
                         object_metadata: PreparedObjectMetadata::from_object_bytes(&bytes),
-                        object_bytes: bytes.into(),
+                        object_bytes: retain_object_snapshot(bytes),
                         dwarf_index: Mutex::new(PerfDwarfIndexCache::default()),
                         module_metadata: Mutex::default(),
                     })
@@ -1486,7 +1486,7 @@ where
                         helper: Mutex::new(GnuHelperState::Uninitialized),
                         metadata: Arc::new(CachedObjectMetadata {
                             object_metadata: PreparedObjectMetadata::from_object_bytes(&bytes),
-                            object_bytes: bytes.into(),
+                            object_bytes: retain_object_snapshot(bytes),
                             dwarf_index: Mutex::new(PerfDwarfIndexCache::default()),
                             module_metadata: Mutex::default(),
                         }),
@@ -3440,10 +3440,14 @@ fn read_regular_object(path: &Path) -> Option<Vec<u8>> {
     read_object_with_size(file, len)
 }
 
-fn read_regular_snapshot(path: &Path) -> Option<Arc<[u8]>> {
+fn read_regular_snapshot(path: &Path) -> Option<Arc<Vec<u8>>> {
     let file = open_regular_object(path)?;
     let len = file.metadata().ok()?.len();
-    read_snapshot_with_size(file, len).map(Into::into)
+    read_snapshot_with_size(file, len).map(retain_object_snapshot)
+}
+
+fn retain_object_snapshot(bytes: Vec<u8>) -> Arc<Vec<u8>> {
+    Arc::new(bytes)
 }
 
 fn read_snapshot_with_size(reader: impl Read, len: u64) -> Option<Vec<u8>> {
@@ -5101,8 +5105,8 @@ impl CachedObjectMetadata {
                 // exists; symsrc__init (symbol-elf.c:1193) checks each source ID.
                 let runtime_bytes = runtime
                     .as_ref()
-                    .map_or(self.object_bytes.as_ref(), |runtime| {
-                        runtime.object_bytes.as_ref()
+                    .map_or(self.object_bytes.as_slice(), |runtime| {
+                        runtime.object_bytes.as_slice()
                     });
                 let metadata = Arc::new(kernel_module_object_metadata(
                     &self.object_bytes,
@@ -5115,7 +5119,7 @@ impl CachedObjectMetadata {
     }
 
     fn build_id(&self) -> Option<Vec<u8>> {
-        let object = object::File::parse(self.object_bytes.as_ref()).ok()?;
+        let object = object::File::parse(self.object_bytes.as_slice()).ok()?;
         object.build_id().ok()?.map(<[u8]>::to_vec)
     }
 
@@ -5694,7 +5698,7 @@ enum PerfDwarfDieName<R> {
 
 enum PerfDwarfObjectBytes<'a> {
     Borrowed(&'a [u8]),
-    Shared(Arc<[u8]>),
+    Shared(Arc<Vec<u8>>),
 }
 
 impl PerfDwarfObjectBytes<'_> {
@@ -9449,6 +9453,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn shared_object_snapshot_keeps_the_read_buffer_allocation() {
+        let mut bytes = cross_cu_inline_fixture(CrossCuInlineName::Direct);
+        bytes.reserve(8192);
+        let pointer = bytes.as_ptr();
+        let len = bytes.len();
+        let capacity = bytes.capacity();
+        let snapshot = super::retain_object_snapshot(bytes);
+        assert_eq!(snapshot.len(), len);
+        assert_eq!(snapshot.capacity(), capacity);
+        assert!(object::File::parse(snapshot.as_slice()).is_ok());
+        assert_eq!(
+            snapshot.as_ptr(),
+            pointer,
+            "sharing an already-read snapshot must move its allocation, not copy the whole object"
+        );
+        let weak = Arc::downgrade(&snapshot);
+        let clone = Arc::clone(&snapshot);
+        drop(snapshot);
+        assert_eq!(clone.as_ptr(), pointer);
+        drop(clone);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn shared_empty_snapshot_does_not_allocate_a_byte_buffer() {
+        let bytes = Vec::new();
+        let pointer = bytes.as_ptr();
+        let snapshot = super::retain_object_snapshot(bytes);
+        assert!(snapshot.is_empty());
+        assert_eq!(snapshot.capacity(), 0);
+        assert_eq!(snapshot.as_ptr(), pointer);
     }
 
     #[test]

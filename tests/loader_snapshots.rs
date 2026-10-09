@@ -136,7 +136,7 @@ fn skeleton() -> DwarfParts {
     }
 }
 
-fn elf(sections: &[(&str, &[u8])]) -> Arc<[u8]> {
+fn elf(sections: &[(&str, &[u8])]) -> Arc<Vec<u8>> {
     let mut object = object::write::Object::new(
         object::BinaryFormat::Elf,
         object::Architecture::X86_64,
@@ -153,7 +153,7 @@ fn elf(sections: &[(&str, &[u8])]) -> Arc<[u8]> {
     object.write().unwrap().into()
 }
 
-fn dwarf_elf(parts: &DwarfParts, split: bool) -> Arc<[u8]> {
+fn dwarf_elf(parts: &DwarfParts, split: bool) -> Arc<Vec<u8>> {
     elf(&[
         (
             if split {
@@ -174,7 +174,7 @@ fn dwarf_elf(parts: &DwarfParts, split: bool) -> Arc<[u8]> {
     ])
 }
 
-fn package(parts: &DwarfParts, id: u64) -> Arc<[u8]> {
+fn package(parts: &DwarfParts, id: u64) -> Arc<Vec<u8>> {
     // GNU DWARF4 package index: two sections, one CU, two hash slots.
     let mut index = Vec::new();
     for value in [2_u32, 2, 1, 2] {
@@ -207,7 +207,7 @@ type OpenedPaths = Arc<Mutex<Vec<PathBuf>>>;
 fn loader(
     main: &Path,
     supplementary: Option<&Path>,
-    files: Vec<(PathBuf, Arc<[u8]>)>,
+    files: Vec<(PathBuf, Arc<Vec<u8>>)>,
 ) -> (addr2line::Loader, OpenedPaths) {
     let files = files.into_iter().collect::<BTreeMap<_, _>>();
     let opened = Arc::new(Mutex::new(Vec::new()));
@@ -238,6 +238,7 @@ fn pyroc48_loader_retains_main_arc_and_supplementary_names() {
     let parts = dwarf_parts("unused", BASE, None, true);
     let main = dwarf_elf(&parts, false);
     let sup = elf(&[(".debug_str", b"supplementary_name\0")]);
+    let sup_range = sup.as_ptr_range();
     let main_path = Path::new("snapshot-main.so");
     let sup_path = Path::new("snapshot-main.sup");
     let (loader, opened) = loader(
@@ -251,6 +252,15 @@ fn pyroc48_loader_retains_main_arc_and_supplementary_names() {
     // Caller, retained callback table, and arena share exactly this allocation.
     assert_eq!(Arc::strong_count(&main), 3);
     assert_eq!(frame_names(&loader, BASE + 1), ["supplementary_name"]);
+    {
+        let mut frames = loader.find_frames(BASE + 1).unwrap();
+        let function = frames.next().unwrap().unwrap().function.unwrap();
+        let name = function.raw_name().unwrap();
+        assert!(
+            sup_range.contains(&name.as_ptr()),
+            "loader must borrow the supplied buffer"
+        );
+    }
     assert_eq!(
         *opened.lock().unwrap(),
         [main_path, sup_path, Path::new("snapshot-main.so.dwp")]
@@ -351,7 +361,7 @@ fn fixed_name(bytes: &mut Vec<u8>, name: &str) {
     bytes.resize(bytes.len() + 16 - name.len(), 0);
 }
 
-fn macho(uuid: [u8; 16], sections: &[(&str, &[u8])], symbols: &[(&str, u8, u64)]) -> Arc<[u8]> {
+fn macho(uuid: [u8; 16], sections: &[(&str, &[u8])], symbols: &[(&str, u8, u64)]) -> Arc<Vec<u8>> {
     // Raw commands permit UUID and ordered STABS, which object::write does not
     // currently expose. All offsets are computed before emitting the payload.
     let segment_size = if sections.is_empty() {
@@ -504,7 +514,7 @@ fn pyroc48_loader_dsym_callback_requires_matching_uuid() {
     assert!(opened.lock().unwrap().contains(&right_path));
 }
 
-fn relocated_macho_member(name: &str) -> Arc<[u8]> {
+fn relocated_macho_member(name: &str) -> Arc<Vec<u8>> {
     let parts = dwarf_parts(name, 0, None, false);
     let mut object = object::write::Object::new(
         object::BinaryFormat::MachO,
@@ -571,7 +581,7 @@ fn relocated_macho_member(name: &str) -> Arc<[u8]> {
     bytes.into()
 }
 
-fn archive(members: &[(&str, Arc<[u8]>)]) -> Arc<[u8]> {
+fn archive(members: &[(&str, Arc<Vec<u8>>)]) -> Arc<Vec<u8>> {
     let mut bytes = b"!<arch>\n".to_vec();
     for (name, data) in members {
         let header = format!(
@@ -618,7 +628,7 @@ fn pyroc48_loader_lazy_macho_object_and_archive_member_relocations() {
                 ("", object::macho::N_FUN, 16),
             ],
         );
-        let parsed = object::File::parse(main.as_ref()).unwrap();
+        let parsed = object::File::parse(main.as_slice()).unwrap();
         let map = parsed.object_map();
         assert_eq!(
             map.get(BASE + 1).unwrap().object(&map).member().is_some(),
@@ -657,7 +667,7 @@ fn pyroc48_loader_default_constructor_still_loads_regular_dwarf() {
     let path = dir.path().join("main.so");
     std::fs::write(
         &path,
-        dwarf_elf(&dwarf_parts("default_name", BASE, None, false), false),
+        dwarf_elf(&dwarf_parts("default_name", BASE, None, false), false).as_slice(),
     )
     .unwrap();
     let loader = addr2line::Loader::new(&path).unwrap();

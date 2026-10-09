@@ -156,6 +156,29 @@ are loaded/decompressed once per cached object, not on every new CU batch.
 This changes storage, not name-selection or folding semantics. Allocation,
 retained-memory and wall-clock changes still require workload measurements.
 
+## 2026-10-09 sharing snapshots transfers the existing read buffer
+
+The metadata cache converted an already-read `Vec<u8>` into `Arc<[u8]>`.
+That conversion allocates and copies the entire object while its original
+buffer is still live. A production-boundary regression was observed red:
+the shared snapshot had a different byte pointer from the read buffer.
+
+The cache and vendored addr2line opener now share `Arc<Vec<u8>>`, transferring
+the vector without a byte-buffer copy. Main files, explicitly supplied
+supplementary files, and lazy DWO/DWP/dSYM/object/archive inputs all use the
+same retained-opener path. The loader's borrowed DWARF readers remain backed
+by its arena-owned snapshot; no new unsafe lifetime mechanism is introduced.
+File-kind validation, recorded-size limits, interrupted-read handling, and
+regular-file/FIFO checks are unchanged. Perf/libdw naming, binutils inline
+enumeration, and Inferno normalization are unaffected by this storage change.
+
+The regression also checks spare capacity, shared clones, and release of the
+final owner. Empty snapshots require no byte buffer. The supplementary-name
+control checks that the returned raw name points into the supplied vector;
+existing lazy-input, ID/UUID, relocation, rewrite/unlink, and native parity
+tests guard the rest of the loader contract. Peak-memory reduction remains a
+measurement question, not a deduction from pointer identity alone.
+
 ## 2026-10-09 recorded kernel/user callchains still receive user unwinds
 
 Investigation of a fresh C thread workload found an unsupported mixed-callchain
