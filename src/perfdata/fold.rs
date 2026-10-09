@@ -11597,13 +11597,6 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    fn other_callchain() -> super::SampleCallchainState {
-        super::SampleCallchainState::Other {
-            has_callchain: true,
-            has_frames: false,
-        }
-    }
-
     #[test]
     fn arch_fallback_cannot_advance_when_x86_bp_is_zero_or_caller_sp_does_not_advance() {
         // elfutils 0.195 backends/x86_64_unwind.c:54,79-91 rejects fp == 0,
@@ -11662,7 +11655,10 @@ mod tests {
         let mut sources = super::DsoMemorySources::default();
         let leaf_only_ctx = super::UserUnwindContext {
             sample_callchain: super::SampleCallchainPresence::Present,
-            callchain: other_callchain(),
+            callchain: super::SampleCallchainState::Other {
+                has_callchain: true,
+                has_frames: false,
+            },
             initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
             module_count: 1,
             frame_pointer_at_or_above_stack_pointer: false,
