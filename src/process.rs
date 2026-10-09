@@ -5,7 +5,11 @@ use crate::tools::{ResolvedTool, ResolverContext, SystemToolResolver, ToolSpec, 
 #[cfg(unix)]
 mod cancellation;
 #[cfg(unix)]
+mod session;
+#[cfg(unix)]
 pub use cancellation::{CancellationScope, CliWriter};
+#[cfg(unix)]
+pub use session::CommandSession;
 #[cfg(not(unix))]
 pub struct CliWriter(bool);
 
@@ -75,6 +79,16 @@ pub enum CommandPurpose {
     Preparation,
     Recording,
     Finalization,
+}
+
+impl CommandPurpose {
+    fn permits_finalization(self) -> bool {
+        match self {
+            Self::Recording => false,
+            Self::Preparation => FINALIZING.with(|depth| depth.get() != 0),
+            Self::Finalization => true,
+        }
+    }
 }
 
 thread_local! {
@@ -219,11 +233,7 @@ impl CommandSpec {
     }
 
     fn permits_finalization(&self) -> bool {
-        match self.purpose {
-            CommandPurpose::Recording => false,
-            CommandPurpose::Preparation => FINALIZING.with(|depth| depth.get() != 0),
-            CommandPurpose::Finalization => true,
-        }
+        self.purpose.permits_finalization()
     }
 }
 
@@ -248,6 +258,17 @@ pub trait CommandRunner {
     ///
     /// Returns an I/O error when the command cannot be spawned or waited on.
     fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput>;
+
+    /// Starts an owned request/response child when supported by the runner.
+    /// The command must not supply initial stdin or interactive terminal I/O.
+    /// Custom runners can return `None` to retain whole-command execution.
+    ///
+    /// # Errors
+    /// Returns an error if the child cannot be prepared or started.
+    #[cfg(unix)]
+    fn start_session(&self, _command: &CommandSpec) -> std::io::Result<Option<CommandSession>> {
+        Ok(None)
+    }
 
     /// First parent cancellation cause, independent of child exit status.
     fn cancellation_signal(&self) -> Option<i32> {
@@ -314,6 +335,15 @@ impl CommandRunner for RealCommandRunner {
         run_process(&self.resolved_command(command)?)
     }
 
+    #[cfg(unix)]
+    fn start_session(&self, command: &CommandSpec) -> std::io::Result<Option<CommandSession>> {
+        let _scope = CancellationScope::enter()?;
+        let _finalization =
+            (command.purpose == CommandPurpose::Finalization).then(FinalizationScope::enter);
+        check_cancellation(command)?;
+        CommandSession::start(&self.resolved_command(command)?).map(Some)
+    }
+
     fn resolve_tool(&self, tool: &ToolSpec) -> std::io::Result<ResolvedTool> {
         self.resolver
             .lock()
@@ -345,9 +375,7 @@ fn check_cancellation(command: &CommandSpec) -> std::io::Result<()> {
     }
 }
 
-fn run_process(command: &CommandSpec) -> std::io::Result<CommandOutput> {
-    #[cfg(unix)]
-    let scope = CancellationScope::enter()?;
+fn spawn_process(command: &CommandSpec) -> std::io::Result<std::process::Child> {
     check_cancellation(command)?;
     if command.interactive && command.stdin.is_some() {
         return Err(std::io::Error::other(
@@ -384,10 +412,20 @@ fn run_process(command: &CommandSpec) -> std::io::Result<CommandOutput> {
         check_cancellation(command)?;
         let child = std_command.spawn()?;
         drop(inherited_files);
-        run_owned_process(child, command, &scope)
+        Ok(child)
     }
     #[cfg(not(unix))]
-    let mut child = std_command.spawn()?;
+    std_command.spawn()
+}
+
+fn run_process(command: &CommandSpec) -> std::io::Result<CommandOutput> {
+    #[cfg(unix)]
+    let scope = CancellationScope::enter()?;
+    let child = spawn_process(command)?;
+    #[cfg(unix)]
+    return run_owned_process(child, command, &scope);
+    #[cfg(not(unix))]
+    let mut child = child;
     #[cfg(not(unix))]
     let output = if let Some(bytes) = &command.stdin {
         use std::io::Write;

@@ -1,6 +1,212 @@
 use pyroclast::process::{CommandRunner, CommandSpec, RealCommandRunner};
 
 #[cfg(unix)]
+fn command_session(script: &str) -> pyroclast::process::CommandSession {
+    RealCommandRunner::default()
+        .start_session(&CommandSpec::new("sh").args(["-c", script]))
+        .unwrap()
+        .expect("real runner must support owned sessions")
+}
+
+#[cfg(unix)]
+#[test]
+fn session_keeps_one_child_and_reaps_it_when_dropped() {
+    use std::time::Duration;
+
+    let mut session =
+        command_session("while IFS= read -r line; do printf '%s\\n%s\\n' \"$$\" \"$line\"; done");
+    let first = session
+        .exchange_lines(b"first\n", 2, Duration::from_secs(2))
+        .unwrap();
+    let first = String::from_utf8(first).unwrap();
+    let pid = first.lines().next().unwrap();
+    for line in ["second", "third"] {
+        let response = session
+            .exchange_lines(format!("{line}\n").as_bytes(), 2, Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(response, format!("{pid}\n{line}\n").as_bytes());
+    }
+    let pid = pid.parse::<libc::pid_t>().unwrap();
+    drop(session);
+    // The session owns and reaps this child; no second waiter can find it.
+    assert_eq!(
+        unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn session_timeout_closes_the_protocol_without_retrying() {
+    use std::time::Duration;
+
+    // Bounded even without the timeout implementation, so the red run cannot
+    // leave an unbounded test child behind.
+    let mut session = command_session("read -r line; sleep 1; printf 'ready\\nreply\\n'");
+    let error = session
+        .exchange_lines(b"request\n", 2, Duration::from_millis(50))
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    let error = session
+        .exchange_lines(b"later\n", 2, Duration::from_secs(2))
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+}
+
+#[cfg(unix)]
+#[test]
+fn session_response_deadline_does_not_expire_an_idle_helper() {
+    use std::time::Duration;
+
+    let mut session = command_session("while IFS= read -r line; do printf '%s\\n' \"$line\"; done");
+    for line in [b"first\n", b"later\n"] {
+        assert_eq!(
+            session
+                .exchange_lines(line, 1, Duration::from_secs(1))
+                .unwrap(),
+            line
+        );
+        std::thread::sleep(Duration::from_millis(1100));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn session_accepts_split_response_lines() {
+    let mut session = command_session(
+        "read -r line; printf 'function\\n'; sleep 0.02; printf 'file\\n'; read -r later",
+    );
+    assert_eq!(
+        session
+            .exchange_lines(b"address\n", 2, std::time::Duration::from_secs(2))
+            .unwrap(),
+        b"function\nfile\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn session_rejects_incomplete_or_extra_response_lines() {
+    use std::io::ErrorKind;
+    use std::time::Duration;
+
+    for (script, expected) in [
+        ("read -r line; printf 'partial'", ErrorKind::UnexpectedEof),
+        (
+            "read -r line; printf 'a\\nb\\nc\\n'; read -r later",
+            ErrorKind::InvalidData,
+        ),
+    ] {
+        let mut session = command_session(script);
+        assert_eq!(
+            session
+                .exchange_lines(b"request\n", 2, Duration::from_secs(2))
+                .unwrap_err()
+                .kind(),
+            expected
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn session_drains_both_pipes_while_writing_large_requests() {
+    use std::time::Duration;
+
+    let mut session = command_session("cat");
+    let mut request = vec![b'x'; 1024 * 1024];
+    request.push(b'\n');
+    assert_eq!(
+        session
+            .exchange_lines(&request, 1, Duration::from_secs(5))
+            .unwrap(),
+        request
+    );
+    assert_eq!(
+        session
+            .exchange_lines(b"next\n", 1, Duration::from_secs(2))
+            .unwrap(),
+        b"next\n"
+    );
+    let mut noisy = command_session(
+        "read -r line; i=0; while [ \"$i\" -lt 4096 ]; do printf 'bounded diagnostic line\\n' >&2; i=$((i + 1)); done; printf 'ok\\nreply\\n'; read -r later",
+    );
+    assert_eq!(
+        noisy
+            .exchange_lines(b"request\n", 2, Duration::from_secs(5))
+            .unwrap(),
+        b"ok\nreply\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn session_rejects_interactive_and_initial_stdin_commands() {
+    for command in [
+        CommandSpec::new("cat").interactive(),
+        CommandSpec::new("cat").stdin(b"initial input".to_vec()),
+    ] {
+        let result = RealCommandRunner::default().start_session(&command);
+        assert!(matches!(result, Err(error) if error.kind() == std::io::ErrorKind::InvalidInput));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn session_cancellation_interrupts_response_and_reaps_its_child() {
+    use pyroclast::process::CancellationScope;
+    use std::time::Duration;
+
+    let scope = CancellationScope::enter().unwrap();
+    let mut session = command_session("read -r line; sleep 1");
+    let sender = std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(100));
+        // SAFETY: This test process pins its own PID throughout the send.
+        assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGINT) }, 0);
+    });
+    let error = session
+        .exchange_lines(b"request\n", 2, Duration::from_secs(2))
+        .unwrap_err();
+    sender.join().unwrap();
+    assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+    assert_eq!(scope.signal(), Some(libc::SIGINT));
+}
+
+#[cfg(unix)]
+#[test]
+fn session_finalization_honors_first_cancellation_but_not_repeated_signals() {
+    use pyroclast::process::{CancellationScope, FinalizationScope};
+    use std::time::Duration;
+
+    let scope = CancellationScope::enter().unwrap();
+    // SAFETY: Both handlers are installed. raise targets this calling thread,
+    // so the handler completes before we inspect the cancellation state.
+    assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+    assert_eq!(scope.signal(), Some(libc::SIGINT));
+    let _finalization = FinalizationScope::enter();
+    let mut session = command_session("while IFS= read -r line; do printf '%s\\n' \"$line\"; done");
+    assert_eq!(
+        session
+            .exchange_lines(b"finalize\n", 1, Duration::from_secs(2))
+            .unwrap(),
+        b"finalize\n"
+    );
+    // SAFETY: The same thread and handlers remain live.
+    assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+    assert_eq!(
+        session
+            .exchange_lines(b"again\n", 1, Duration::from_secs(2))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::Interrupted
+    );
+}
+
+#[cfg(unix)]
 #[test]
 fn inherited_file_survives_exec_without_reopening_its_deleted_path() {
     use std::os::fd::AsRawFd;
