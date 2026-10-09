@@ -1801,7 +1801,7 @@ impl Kallsyms {
                 &mut symbols,
                 Some(&mut addresses_by_name),
                 address,
-                KallsymsSymbol::kernel(symbol),
+                KallsymsSymbol::kernel(symbol.to_owned()),
             );
         }
         if symbols.is_empty() {
@@ -6253,12 +6253,12 @@ fn perf_build_id_kallsyms_paths(debug_dir: &Path, build_id: &str) -> [PathBuf; 2
     [base.join("kallsyms"), base]
 }
 
-fn parse_kallsyms_line(line: &str) -> Option<(u64, String)> {
+fn parse_kallsyms_line(line: &str) -> Option<(u64, &str)> {
     let mut fields = line.split_whitespace();
     let address = u64::from_str_radix(fields.next()?, 16).ok()?;
     let _symbol_type = fields.next()?;
     let symbol = fields.next()?;
-    Some((address, symbol.to_string()))
+    Some((address, symbol))
 }
 
 fn parse_global_kallsyms_row(line: &str) -> Option<BorrowedKallsymsRow<'_>> {
@@ -8743,6 +8743,57 @@ mod tests {
         assert_eq!(view.symbols[&0x1100].name, "winner");
         assert_eq!(view.symbols[&0x1100].end, Some(0x1200));
         assert_eq!(view.address_of("losing"), None);
+    }
+
+    #[test]
+    fn kallsyms_line_parser_borrows_names_before_address_acceptance() {
+        // tools/lib/symbol/kallsyms.c:kallsyms__parse supplies the parsed
+        // name to its callback before symbol.c:map__process_kallsym_symbol
+        // allocates an accepted symbol. Parsing alone need not own the token.
+        for address in ["0000000000000000", "ffffffff91201850"] {
+            let line = format!("{address} T borrowed_symbol [module]");
+            let (_, name) = super::parse_kallsyms_line(&line).unwrap();
+            let original = line.split_whitespace().nth(2).unwrap();
+            assert_eq!(name, original);
+            assert_eq!(name.as_ptr(), original.as_ptr(), "parser copied {address}");
+        }
+    }
+
+    #[test]
+    fn kallsyms_line_parser_keeps_token_and_malformed_input_behavior() {
+        for line in ["", "nothex T name", "1000", "1000 T", "1000 T   "] {
+            assert!(super::parse_kallsyms_line(line).is_none(), "{line:?}");
+        }
+        for line in [
+            "1000 T name",
+            " 1000\tT\tname [module]\r\n",
+            "1000 arbitrary_type name ignored trailing fields",
+        ] {
+            assert_eq!(super::parse_kallsyms_line(line), Some((0x1000, "name")));
+        }
+        let name = "x".repeat(4096);
+        let line = format!("1000 T {name}");
+        let (_, parsed) = super::parse_kallsyms_line(&line).unwrap();
+        assert_eq!(parsed, name);
+        assert_eq!(parsed.as_ptr(), line[7..].as_ptr());
+    }
+
+    #[test]
+    fn kallsyms_owns_only_accepted_names_after_input_is_dropped() {
+        let text = "0000 T masked\n1000 T first\n1000 T winner\n2000 T first\n".to_owned();
+        let symbols = Kallsyms::parse(&text).unwrap();
+        drop(text);
+        assert_eq!(symbols.address_of("masked"), None);
+        assert_eq!(symbols.address_of("first"), Some(0x1000));
+        assert_eq!(
+            symbols.resolve_with_offset(0x1001),
+            Some("winner+0x1".into())
+        );
+        assert_eq!(
+            symbols.resolve_with_offset(0x2001),
+            Some("first+0x1".into())
+        );
+        assert!(Kallsyms::parse("0000 T masked\n").is_err());
     }
 
     #[test]
