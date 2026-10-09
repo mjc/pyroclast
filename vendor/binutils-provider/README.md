@@ -43,7 +43,10 @@ Missing or invalid bootstrap data fails closed. Normal GNU help/version exits
 remain available without a primary. The existing GNU stdin address protocol
 is unchanged. Rust retains selected primary bytes and canonical names in its
 object cache and starts an owned, cancellable helper for each symbol-only batch.
-It constructs the sealed transport from those bytes, not by reopening the path.
+It constructs the sealed transport once, lazily on the first external batch,
+from those bytes, not by reopening the path. The selected DSO owns that
+transport until its resolver is dropped; subsequent batches borrow the same
+sealed file. Base-only and in-process lookups do not create the transport.
 The child receives a dedicated descriptor without changing the parent's
 close-on-exec flags. Persistent per-DSO helper sessions are not implemented.
 

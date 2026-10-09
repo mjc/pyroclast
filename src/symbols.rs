@@ -736,6 +736,8 @@ struct SelectedGnuObject {
     metadata: Arc<CachedObjectMetadata>,
     #[cfg(target_os = "linux")]
     canonical_name: PathBuf,
+    #[cfg(target_os = "linux")]
+    input: OnceLock<Result<Arc<std::fs::File>, String>>,
 }
 
 /// Per-object memo of DWARF inline-frame indexes.
@@ -1389,6 +1391,8 @@ where
                         }),
                         #[cfg(target_os = "linux")]
                         canonical_name,
+                        #[cfg(target_os = "linux")]
+                        input: OnceLock::new(),
                     }))
                 })();
                 entry.insert(path.as_os_str().to_owned(), loaded).1.clone()
@@ -5454,6 +5458,38 @@ mod tests {
             Some(&[0xaa, 0xbb, 0xcc, 0xdd][..])
         );
         output
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gnu_primary_transport_is_lazy_and_dropped_with_its_resolver() {
+        struct NoCommands;
+        impl crate::process::CommandRunner for NoCommands {
+            fn run(
+                &self,
+                _: &crate::process::CommandSpec,
+            ) -> std::io::Result<crate::process::CommandOutput> {
+                panic!("transport preparation must not spawn a helper");
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("selected.elf");
+        std::fs::write(&path, regression_elf_with_build_id()).unwrap();
+        let runner = NoCommands;
+        let resolver = super::Addr2lineResolver::new(&runner);
+        assert!(resolver.object_metadata(&path).is_some());
+        let selected = resolver.selected_object(&path).unwrap();
+        assert!(selected.input.get().is_none());
+        let command = selected
+            .attach_input(&path, crate::process::CommandSpec::new("addr2line"))
+            .unwrap();
+        let file = Arc::downgrade(selected.input.get().unwrap().as_ref().unwrap());
+        drop(command);
+        drop(selected);
+        assert!(file.upgrade().is_some(), "DSO retains its selected input");
+        drop(resolver);
+        assert!(file.upgrade().is_none(), "resolver drop releases its input");
     }
 
     #[test]

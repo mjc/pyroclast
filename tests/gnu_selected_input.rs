@@ -146,6 +146,53 @@ fn gnu_backend_selects_immutable_bytes_before_first_in_place_rewrite() {
 }
 
 #[test]
+fn gnu_batches_share_the_selected_primary_transport() {
+    struct RecordingRunner {
+        commands: RefCell<Vec<CommandSpec>>,
+        native: RealCommandRunner,
+    }
+
+    impl CommandRunner for RecordingRunner {
+        fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
+            self.commands.borrow_mut().push(command.clone());
+            self.native.run(command)
+        }
+    }
+
+    // perf addr2line.c:cmd__addr2line retains the selected DSO's input and
+    // helper across requests. A sealed transport must likewise belong to the
+    // selected object, not be recopied for each batch. Native output still
+    // comes from independently executed GNU, without symbol-name rewrites.
+    let root = tempfile::tempdir().unwrap();
+    let selected = fixture(root.path(), "selected_leaf");
+    let request = selected_request(&selected);
+    let expected_stdout = independent_gnu_output(&request);
+    let runner = RecordingRunner {
+        commands: RefCell::new(Vec::new()),
+        native: RealCommandRunner::default(),
+    };
+    let resolver = Addr2lineResolver::new(&runner);
+    for _ in 0..3 {
+        let symbols = resolver
+            .resolve_batch(std::slice::from_ref(&request))
+            .unwrap();
+        assert_eq!(symbols, [Some("selected_leaf".to_owned())]);
+    }
+    let commands = runner.commands.borrow();
+    assert_eq!(commands.len(), 3);
+    assert_eq!(commands[0].inherited_files.len(), 1);
+    for command in &commands[1..] {
+        assert_eq!(
+            command.inherited_files, commands[0].inherited_files,
+            "each batch must borrow the same selected transport"
+        );
+        let output = runner.native.run(command).unwrap();
+        assert_eq!(output.status_code, Some(0));
+        assert_eq!(output.stdout, expected_stdout);
+    }
+}
+
+#[test]
 fn gnu_backend_debuglink_discovery_keeps_original_logical_directory() {
     use object::Object;
 

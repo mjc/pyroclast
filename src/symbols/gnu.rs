@@ -20,13 +20,20 @@ impl SelectedGnuObject {
             .canonical_name
             .to_str()
             .ok_or("GNU symbolizer requires a UTF-8 canonical object path")?;
-        let file = sealed_input(&self.metadata.object_bytes)
-            .map_err(|error| format!("failed to prepare selected GNU object: {error}"))?;
+        let file = self
+            .input
+            .get_or_init(|| {
+                sealed_input(&self.metadata.object_bytes)
+                    .map(Arc::new)
+                    .map_err(|error| format!("failed to prepare selected GNU object: {error}"))
+            })
+            .as_ref()
+            .map_err(Clone::clone)?;
         "pyroclast-addr2line".clone_into(&mut command.program);
         Ok(command
             .env("PYRO_PRIMARY_NAME", logical_name)
             .env("PYRO_PRIMARY_CANONICAL", canonical_name)
-            .inherit_file("PYRO_PRIMARY_FD", Arc::new(file)))
+            .inherit_file("PYRO_PRIMARY_FD", Arc::clone(file)))
     }
 }
 
