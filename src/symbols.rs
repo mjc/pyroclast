@@ -728,14 +728,16 @@ struct PerfAddressRange {
 #[derive(Debug)]
 struct PerfDwarfUnitIndex {
     ranges: Option<Vec<PerfAddressRange>>,
-    segments: Vec<PerfDwarfFrameRange>,
+    frame_index: PerfDwarfFrameIndex,
 }
 
 #[derive(Debug)]
 struct PerfDwarfScope {
     depth: isize,
     ranges: Vec<PerfAddressRange>,
-    frames: Arc<[PerfDwarfNameId]>,
+    frame: Option<std::num::NonZeroUsize>,
+    frame_checkpoint: usize,
+    segment_checkpoint: usize,
     has_inline_frames: bool,
     suppressed: bool,
     child_coverage: Vec<PerfAddressRange>,
@@ -744,10 +746,22 @@ struct PerfDwarfScope {
 #[derive(Debug)]
 struct PerfDwarfFrameRange {
     range: PerfAddressRange,
-    frames: Arc<[PerfDwarfNameId]>,
+    frame: std::num::NonZeroUsize,
     has_inline_frames: bool,
     has_source_line: bool,
     order: usize,
+}
+
+#[derive(Debug, Default)]
+struct PerfDwarfFrameIndex {
+    segments: Vec<PerfDwarfFrameRange>,
+    nodes: Vec<PerfDwarfFrameNode>,
+}
+
+#[derive(Debug)]
+struct PerfDwarfFrameNode {
+    name: PerfDwarfNameId,
+    parent: Option<std::num::NonZeroUsize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -807,7 +821,7 @@ struct PerfDwarfIndexCache<'a> {
 struct PerfDwarfCachedUnit {
     ranges: Option<Vec<PerfAddressRange>>,
     source_line_ranges: Option<Vec<PerfAddressRange>>,
-    segments: Option<Vec<PerfDwarfFrameRange>>,
+    frame_index: Option<PerfDwarfFrameIndex>,
 }
 
 struct PerfDwarfPreparedUnit<R: gimli::Reader> {
@@ -5043,7 +5057,7 @@ impl<'a> PerfDwarfNameResolver<'a> {
             let source_line_ranges = perf_dwarf_source_line_ranges(unit);
             units.push(PerfDwarfUnitIndex {
                 ranges,
-                segments: perf_dwarf_unit_frame_ranges(
+                frame_index: perf_dwarf_unit_frame_index(
                     &dwarf,
                     unit,
                     &directory,
@@ -5067,9 +5081,12 @@ impl<'a> PerfDwarfNameResolver<'a> {
             if !perf_dwarf_unit_contains_address(unit, address) {
                 continue;
             }
-            if let Some(frames) =
-                perf_dwarf_frame_names_from_index(&unit.segments, &self.names, address, base_symbol)
-            {
+            if let Some(frames) = perf_dwarf_frame_names_from_index(
+                &unit.frame_index,
+                &self.names,
+                address,
+                base_symbol,
+            ) {
                 return Some(frames);
             }
         }
@@ -5138,7 +5155,7 @@ impl CachedObjectMetadata {
         }
         if let Some(units) = &cache.units {
             let needs_build = units.iter().any(|unit| {
-                unit.segments.is_none()
+                unit.frame_index.is_none()
                     && perf_dwarf_unit_ranges_match_addresses(unit.ranges.as_deref(), addresses)
             });
             if !needs_build {
@@ -5165,7 +5182,7 @@ impl CachedObjectMetadata {
     ) -> Option<PerfDwarfFrameNames> {
         let cache = self.dwarf_index.lock().expect("dwarf index cache lock");
         for unit in cache.units.as_deref()? {
-            let Some(segments) = &unit.segments else {
+            let Some(frame_index) = &unit.frame_index else {
                 continue;
             };
             if !unit
@@ -5176,7 +5193,7 @@ impl CachedObjectMetadata {
                 continue;
             }
             if let Some(frames) = perf_dwarf_frame_names_from_index(
-                segments,
+                frame_index,
                 &cache.names.names,
                 address,
                 base_symbol,
@@ -5230,7 +5247,7 @@ fn build_dwarf_index_cache_for_addresses<'a>(
                 units.push(PerfDwarfCachedUnit {
                     ranges: Some(Vec::new()),
                     source_line_ranges: Some(Vec::new()),
-                    segments: Some(Vec::new()),
+                    frame_index: Some(PerfDwarfFrameIndex::default()),
                 });
             }
             continue;
@@ -5239,19 +5256,19 @@ fn build_dwarf_index_cache_for_addresses<'a>(
             units.push(PerfDwarfCachedUnit {
                 ranges: perf_dwarf_ranges(dwarf.unit_ranges(unit).ok()),
                 source_line_ranges: Some(perf_dwarf_source_line_ranges(unit)),
-                segments: None,
+                frame_index: None,
             });
         }
         let Some(cached_unit) = units.get_mut(ordinal) else {
             break;
         };
-        if cached_unit.segments.is_none()
+        if cached_unit.frame_index.is_none()
             && perf_dwarf_unit_ranges_match_addresses(cached_unit.ranges.as_deref(), addresses)
         {
             let source_line_ranges = cached_unit
                 .source_line_ranges
                 .get_or_insert_with(|| perf_dwarf_source_line_ranges(unit));
-            cached_unit.segments = Some(perf_dwarf_unit_frame_ranges(
+            cached_unit.frame_index = Some(perf_dwarf_unit_frame_index(
                 &dwarf,
                 unit,
                 &directory,
@@ -5310,30 +5327,29 @@ where
     perf_dwarf_merge_ranges(ranges)
 }
 
-fn perf_dwarf_unit_frame_ranges<R>(
+fn perf_dwarf_unit_frame_index<R>(
     dwarf: &gimli::Dwarf<R>,
     unit: &gimli::Unit<R>,
     directory: &PerfDwarfUnitDirectory<R>,
     names: &mut PerfDwarfNameInterner<'_>,
     source_line_ranges: &[PerfAddressRange],
-) -> Vec<PerfDwarfFrameRange>
+) -> PerfDwarfFrameIndex
 where
     R: gimli::Reader,
 {
     let mut entries = unit.entries();
     let Ok(true) = entries.next_entry() else {
-        return Vec::new();
+        return PerfDwarfFrameIndex::default();
     };
     let Some(root) = entries.current() else {
-        return Vec::new();
+        return PerfDwarfFrameIndex::default();
     };
     if !root.has_children() {
-        return Vec::new();
+        return PerfDwarfFrameIndex::default();
     }
     let root_depth = root.depth();
     let mut scopes = Vec::<PerfDwarfScope>::new();
-    let root_frames: Arc<[PerfDwarfNameId]> = Arc::from([]);
-    let mut segments = Vec::new();
+    let mut index = PerfDwarfFrameIndex::default();
     let mut next_order = 0;
     let mut skip_subtree = false;
     loop {
@@ -5357,12 +5373,7 @@ where
             break;
         }
         while scopes.last().is_some_and(|scope| scope.depth >= depth) {
-            perf_dwarf_finish_scope(
-                &mut scopes,
-                source_line_ranges,
-                &mut segments,
-                &mut next_order,
-            );
+            perf_dwarf_finish_scope(&mut scopes, source_line_ranges, &mut index, &mut next_order);
         }
         let kind = match entry.tag() {
             gimli::DW_TAG_subprogram => PerfDwarfDieKind::Subprogram,
@@ -5383,14 +5394,25 @@ where
         // (including its names), but flattening excluded its entire subtree.
         let suppressed =
             parent.is_some_and(|scope| scope.suppressed || kind == PerfDwarfDieKind::Subprogram);
+        let frame_checkpoint = index.nodes.len();
+        let parent_frame = parent.and_then(|scope| scope.frame);
+        let frame = if suppressed {
+            None
+        } else if let Some(name) = name {
+            index.nodes.push(PerfDwarfFrameNode {
+                name,
+                parent: parent_frame,
+            });
+            std::num::NonZeroUsize::new(index.nodes.len())
+        } else {
+            parent_frame
+        };
         scopes.push(PerfDwarfScope {
             depth,
             ranges,
-            frames: if suppressed {
-                root_frames.clone()
-            } else {
-                perf_dwarf_node_frames(parent.map_or(&root_frames, |scope| &scope.frames), name)
-            },
+            frame,
+            frame_checkpoint,
+            segment_checkpoint: index.segments.len(),
             has_inline_frames: kind == PerfDwarfDieKind::Inline
                 || parent.is_some_and(|scope| scope.has_inline_frames),
             suppressed,
@@ -5399,15 +5421,10 @@ where
     }
     // Parsing errors previously retained partial nodes. Finalize them too.
     while !scopes.is_empty() {
-        perf_dwarf_finish_scope(
-            &mut scopes,
-            source_line_ranges,
-            &mut segments,
-            &mut next_order,
-        );
+        perf_dwarf_finish_scope(&mut scopes, source_line_ranges, &mut index, &mut next_order);
     }
-    segments.sort_by_key(|segment| segment.range.begin);
-    segments
+    index.segments.sort_by_key(|segment| segment.range.begin);
+    index
 }
 
 fn perf_dwarf_ranges<R>(ranges: Option<gimli::RangeIter<R>>) -> Option<Vec<PerfAddressRange>>
@@ -5440,7 +5457,7 @@ fn perf_dwarf_ranges_contain(ranges: &[PerfAddressRange], address: u64) -> bool 
 fn perf_dwarf_finish_scope(
     scopes: &mut Vec<PerfDwarfScope>,
     source_line_ranges: &[PerfAddressRange],
-    out: &mut Vec<PerfDwarfFrameRange>,
+    index: &mut PerfDwarfFrameIndex,
     next_order: &mut usize,
 ) {
     let Some(scope) = scopes.pop() else {
@@ -5449,7 +5466,7 @@ fn perf_dwarf_finish_scope(
     if scope.suppressed {
         return;
     }
-    if !scope.frames.is_empty() {
+    if let Some(frame) = scope.frame {
         for range in perf_dwarf_subtract_ranges(&scope.ranges, &scope.child_coverage) {
             let order = *next_order;
             *next_order += 1;
@@ -5469,9 +5486,9 @@ fn perf_dwarf_finish_scope(
                 .map(|range| (range, false))
                 .chain(covered.into_iter().map(|range| (range, true)))
             {
-                out.push(PerfDwarfFrameRange {
+                index.segments.push(PerfDwarfFrameRange {
                     range,
-                    frames: scope.frames.clone(),
+                    frame,
                     has_inline_frames: scope.has_inline_frames,
                     has_source_line,
                     order,
@@ -5480,23 +5497,16 @@ fn perf_dwarf_finish_scope(
         }
     }
 
+    // A subtree that emitted no intervals has no surviving chain references.
+    if index.segments.len() == scope.segment_checkpoint {
+        index.nodes.truncate(scope.frame_checkpoint);
+    }
+
     if let Some(parent) = scopes.last_mut() {
         parent
             .child_coverage
             .extend(perf_dwarf_merge_ranges(scope.ranges));
     }
-}
-
-fn perf_dwarf_node_frames(
-    parent_frames: &Arc<[PerfDwarfNameId]>,
-    name: Option<PerfDwarfNameId>,
-) -> Arc<[PerfDwarfNameId]> {
-    name.map_or(parent_frames.clone(), |name| {
-        let mut frames = Vec::with_capacity(parent_frames.len() + 1);
-        frames.extend(parent_frames.iter().copied());
-        frames.push(name);
-        Arc::from(frames)
-    })
 }
 
 fn perf_dwarf_merge_ranges(mut ranges: Vec<PerfAddressRange>) -> Vec<PerfAddressRange> {
@@ -5566,11 +5576,12 @@ struct PerfDwarfFrameNames {
 }
 
 fn perf_dwarf_frame_names_from_index(
-    segments: &[PerfDwarfFrameRange],
+    index: &PerfDwarfFrameIndex,
     names: &PerfDwarfNames<'_>,
     address: u64,
     base_symbol: Option<&str>,
 ) -> Option<PerfDwarfFrameNames> {
+    let segments = &index.segments;
     let upper_bound = segments.partition_point(|segment| segment.range.begin <= address);
     if upper_bound == 0 {
         return None;
@@ -5579,13 +5590,15 @@ fn perf_dwarf_frame_names_from_index(
         .iter()
         .filter(|segment| segment.range.begin <= address && address < segment.range.end)
         .min_by_key(|segment| segment.order)?;
-    let mut frames = segment
-        .frames
-        .iter()
-        .filter_map(|name| names.get(usize::try_from(*name).ok()?))
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    frames.reverse();
+    let mut frames = Vec::new();
+    let mut frame = Some(segment.frame);
+    while let Some(id) = frame {
+        let node = &index.nodes[id.get() - 1];
+        if let Some(name) = names.get(usize::try_from(node.name).ok()?) {
+            frames.push(name.to_owned());
+        }
+        frame = node.parent;
+    }
     let mut has_inline_frames = segment.has_inline_frames;
     if !has_inline_frames {
         let replaces_base_symbol = segment.has_source_line
@@ -9366,11 +9379,16 @@ mod tests {
 
     type TestDwarfDie<'a> = (usize, gimli::DwTag, Option<&'a str>, &'a [PerfAddressRange]);
 
-    fn test_dwarf_frame_ranges(
+    fn test_dwarf_frame_index(
         dies: &[TestDwarfDie<'_>],
         source_line_ranges: &[PerfAddressRange],
         names: &mut PerfDwarfNameInterner,
-    ) -> Vec<super::PerfDwarfFrameRange> {
+    ) -> super::PerfDwarfFrameIndex {
+        let (abbrev, info, ranges) = test_dwarf_sections(dies);
+        test_dwarf_frame_index_from_sections(&abbrev, &info, &ranges, source_line_ranges, names)
+    }
+
+    fn test_dwarf_sections(dies: &[TestDwarfDie<'_>]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let mut abbrev = vec![1, 0x11, 1, 0, 0];
         let mut info = vec![0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 8, 1];
         let mut ranges = Vec::new();
@@ -9405,11 +9423,21 @@ mod tests {
         abbrev.push(0);
         let length = u32::try_from(info.len() - 4).unwrap();
         info[..4].copy_from_slice(&length.to_le_bytes());
+        (abbrev, info, ranges)
+    }
+
+    fn test_dwarf_frame_index_from_sections(
+        abbrev: &[u8],
+        info: &[u8],
+        ranges: &[u8],
+        source_line_ranges: &[PerfAddressRange],
+        names: &mut PerfDwarfNameInterner,
+    ) -> super::PerfDwarfFrameIndex {
         let dwarf = gimli::Dwarf::load(|id| {
             let bytes = match id {
-                gimli::SectionId::DebugAbbrev => abbrev.as_slice(),
-                gimli::SectionId::DebugInfo => info.as_slice(),
-                gimli::SectionId::DebugRanges => ranges.as_slice(),
+                gimli::SectionId::DebugAbbrev => abbrev,
+                gimli::SectionId::DebugInfo => info,
+                gimli::SectionId::DebugRanges => ranges,
                 _ => &[],
             };
             Ok::<_, gimli::Error>(gimli::EndianSlice::new(bytes, gimli::LittleEndian))
@@ -9417,7 +9445,7 @@ mod tests {
         .unwrap();
         let directory = super::PerfDwarfUnitDirectory::new(&dwarf);
         let unit = directory.units[0].unit.as_ref().unwrap();
-        super::perf_dwarf_unit_frame_ranges(&dwarf, unit, &directory, names, source_line_ranges)
+        super::perf_dwarf_unit_frame_index(&dwarf, unit, &directory, names, source_line_ranges)
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -9514,7 +9542,7 @@ mod tests {
             (b".debug_info", first),
             (b".debug_str", b"wrong_unit\0read_at\0".to_vec()),
             (b".debug_str_offsets", string_offsets),
-            (b".debug_line", cross_cu_line_fixture()),
+            (b".debug_line", cross_cu_line_fixture(0x1000)),
         ] {
             let section = builder.sections.add();
             section.name = name.into();
@@ -9528,14 +9556,14 @@ mod tests {
         bytes
     }
 
-    fn cross_cu_line_fixture() -> Vec<u8> {
+    fn cross_cu_line_fixture(address: u64) -> Vec<u8> {
         let header = b"\x01\x01\x01\xfb\x0e\x0d\x00\x01\x01\x01\x01\x00\x00\x00\x01\x00\x00\x01\x00cross-cu.c\0\x00\x00\x00\x00";
         let mut line = vec![0; 4];
         line.extend_from_slice(&4_u16.to_le_bytes());
         line.extend_from_slice(&u32::try_from(header.len()).unwrap().to_le_bytes());
         line.extend_from_slice(header);
         line.extend_from_slice(&[0, 9, 2]); // DW_LNE_set_address.
-        line.extend_from_slice(&0x1000_u64.to_le_bytes());
+        line.extend_from_slice(&address.to_le_bytes());
         line.extend_from_slice(&[1, 2, 0x40, 0, 1, 1]); // copy, advance_pc, end_sequence.
         let length = u32::try_from(line.len() - 4).unwrap();
         line[..4].copy_from_slice(&length.to_le_bytes());
@@ -9767,7 +9795,7 @@ mod tests {
         for (name, data) in [
             (b".debug_abbrev".as_slice(), abbrev),
             (b".debug_info", info),
-            (b".debug_line", cross_cu_line_fixture()),
+            (b".debug_line", cross_cu_line_fixture(0x1000)),
         ] {
             let section = builder.sections.add();
             section.name = name.into();
@@ -10155,7 +10183,10 @@ mod tests {
             }
             assert_eq!(
                 perf_dwarf_frame_names_from_index(
-                    cache.units.as_ref().unwrap()[0].segments.as_ref().unwrap(),
+                    cache.units.as_ref().unwrap()[0]
+                        .frame_index
+                        .as_ref()
+                        .unwrap(),
                     &cache.names.names,
                     0x1018,
                     Some("base_symbol"),
@@ -10164,6 +10195,89 @@ mod tests {
                 .frames,
                 ["read_at", "read_at", "read_at", "outer"]
             );
+        }
+    }
+
+    #[test]
+    fn incremental_dwarf_indexes_keep_unit_local_chains_and_shared_names_distinct() {
+        let abbrev = vec![
+            1, 0x11, 1, 0x11, 0x01, 0x12, 0x06, 0x10, 0x17, 0, 0, 2, 0x2e, 1, 0x03, 0x08, 0x11,
+            0x01, 0x12, 0x06, 0, 0, 3, 0x1d, 1, 0x03, 0x08, 0x11, 0x01, 0x12, 0x06, 0, 0, 0,
+        ];
+        let mut info = Vec::new();
+        let mut lines = Vec::new();
+        for (address, name) in [(0x1000, "alpha"), (0x2000, "beta")] {
+            let mut unit = vec![0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 8];
+            pyroc50_push_die(&mut unit, 1, None, Some((address, 0x40)));
+            unit.extend_from_slice(&u32::try_from(lines.len()).unwrap().to_le_bytes());
+            pyroc50_push_die(&mut unit, 2, Some(name), Some((address, 0x40)));
+            pyroc50_push_die(&mut unit, 3, Some("shared"), Some((address + 0x10, 8)));
+            unit.extend_from_slice(&[0, 0, 0]);
+            let length = u32::try_from(unit.len() - 4).unwrap();
+            unit[..4].copy_from_slice(&length.to_le_bytes());
+            info.extend(unit);
+            lines.extend(cross_cu_line_fixture(address));
+        }
+        let base = elf_with_text_symbol_fixtures(
+            elf::EM_X86_64,
+            &[
+                (b"alpha", 0x1000, 0x40, elf::STB_GLOBAL, elf::STT_FUNC),
+                (b"beta", 0x2000, 0x40, elf::STB_GLOBAL, elf::STT_FUNC),
+            ],
+        );
+        let mut builder = build::elf::Builder::read(base.as_slice()).unwrap();
+        for section in &mut builder.sections {
+            if section.name.as_slice() == b".text" {
+                section.data = build::elf::SectionData::Data(vec![0; 0x1040].into());
+            }
+        }
+        for (name, data) in [
+            (b".debug_abbrev".as_slice(), abbrev),
+            (b".debug_info", info),
+            (b".debug_line", lines),
+        ] {
+            let section = builder.sections.add();
+            section.name = name.into();
+            section.sh_type = elf::SHT_PROGBITS;
+            section.sh_addralign = 1;
+            section.data = build::elf::SectionData::Data(data.into());
+        }
+        builder.set_section_sizes();
+        let mut bytes = Vec::new();
+        builder.write(&mut bytes).unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), &bytes).unwrap();
+        let resolver = RustAddr2lineResolver::new();
+        let metadata = resolver.object_metadata(file.path()).unwrap();
+        metadata.prepare_dwarf_frames_for_addresses(&[0x1011]);
+        let (nodes, segments) = {
+            let cache = metadata.dwarf_index.lock().unwrap();
+            let units = cache.units.as_ref().unwrap();
+            assert_eq!(units.len(), 2);
+            assert!(units[1].frame_index.is_none());
+            let first = units[0].frame_index.as_ref().unwrap();
+            (first.nodes.as_ptr(), first.segments.as_ptr())
+        };
+        metadata.prepare_dwarf_frames_for_addresses(&[0x2011]);
+        {
+            let cache = metadata.dwarf_index.lock().unwrap();
+            let units = cache.units.as_ref().unwrap();
+            let first = units[0].frame_index.as_ref().unwrap();
+            let second = units[1].frame_index.as_ref().unwrap();
+            assert_eq!(first.nodes.as_ptr(), nodes);
+            assert_eq!(first.segments.as_ptr(), segments);
+            assert_eq!(first.nodes.len(), 2);
+            assert_eq!(second.nodes.len(), 2);
+            assert_eq!(first.nodes[1].parent, second.nodes[1].parent);
+            assert_eq!(first.nodes[1].name, second.nodes[1].name);
+            assert_ne!(first.nodes[0].name, second.nodes[0].name);
+        }
+        for (address, name) in [(0x1011, "alpha"), (0x2011, "beta"), (0x1011, "alpha")] {
+            let frames = metadata
+                .dwarf_frame_names_for_base_symbol(address, Some(name))
+                .unwrap();
+            assert!(frames.has_inline_frames);
+            assert_eq!(frames.frames, ["shared", name]);
         }
     }
 
@@ -10214,7 +10328,7 @@ mod tests {
             std::fs::remove_file(file.path()).unwrap();
             metadata.prepare_dwarf_frames_for_addresses(&[0x2000]);
             let cache = metadata.dwarf_index.lock().unwrap();
-            assert!(cache.units.as_ref().unwrap()[1].segments.is_some());
+            assert!(cache.units.as_ref().unwrap()[1].frame_index.is_some());
             assert!(Arc::ptr_eq(
                 &backing,
                 cache.names.names.backing.as_ref().unwrap()
@@ -10231,7 +10345,10 @@ mod tests {
             );
             assert_eq!(
                 perf_dwarf_frame_names_from_index(
-                    cache.units.as_ref().unwrap()[0].segments.as_ref().unwrap(),
+                    cache.units.as_ref().unwrap()[0]
+                        .frame_index
+                        .as_ref()
+                        .unwrap(),
                     &cache.names.names,
                     0x1018,
                     Some("base_symbol"),
@@ -10372,8 +10489,11 @@ mod tests {
                 let cache = metadata.dwarf_index.lock().unwrap();
                 let units = cache.units.as_ref().unwrap();
                 assert_eq!(units.len(), 2);
-                assert!(units[1].segments.is_none(), "origin CU has no queried code");
-                units[0].segments.as_ref().unwrap().as_ptr()
+                assert!(
+                    units[1].frame_index.is_none(),
+                    "origin CU has no queried code"
+                );
+                units[0].frame_index.as_ref().unwrap().segments.as_ptr()
             };
             std::fs::remove_file(file.path()).unwrap();
             let requests = [0x1019, 0x101f]
@@ -10395,8 +10515,11 @@ mod tests {
             ));
             let cache = metadata.dwarf_index.lock().unwrap();
             let units = cache.units.as_ref().unwrap();
-            assert_eq!(units[0].segments.as_ref().unwrap().as_ptr(), segments);
-            assert!(units[1].segments.is_none());
+            assert_eq!(
+                units[0].frame_index.as_ref().unwrap().segments.as_ptr(),
+                segments
+            );
+            assert!(units[1].frame_index.is_none());
         }
     }
 
@@ -10534,6 +10657,7 @@ mod tests {
         assert_eq!(resolver.units.len(), 1);
         assert!(
             resolver.units[0]
+                .frame_index
                 .segments
                 .iter()
                 .all(|segment| !segment.has_source_line)
@@ -10547,7 +10671,7 @@ mod tests {
         .expect("prepare cached DWARF index");
         let units = cache.units.as_ref().expect("cached units");
         assert_eq!(units.len(), 1);
-        let segments = units[0].segments.as_ref().expect("cached segments");
+        let segments = units[0].frame_index.as_ref().expect("cached segments");
         for address in addresses {
             let names: Option<Vec<String>> = match address {
                 0x1018 | 0x101b => Some(vec!["leaf".into(), "outer".into()]),
@@ -10609,7 +10733,12 @@ mod tests {
                 cache.names.names.iter().collect::<Vec<_>>(),
                 ["outer", "leaf", "trailing", "later"]
             );
-            units[0].segments.as_ref().expect("prepared CU").as_ptr()
+            units[0]
+                .frame_index
+                .as_ref()
+                .expect("prepared CU")
+                .segments
+                .as_ptr()
         };
         // Different addresses must reuse the loaded file and prepared CU.
         std::fs::remove_file(path).expect("unlink deep fixture after loading");
@@ -10644,9 +10773,10 @@ mod tests {
             let cache = metadata.dwarf_index.lock().unwrap();
             assert_eq!(
                 cache.units.as_ref().unwrap()[0]
-                    .segments
+                    .frame_index
                     .as_ref()
                     .unwrap()
+                    .segments
                     .as_ptr(),
                 segment_pointer,
             );
@@ -10747,9 +10877,269 @@ mod tests {
     }
 
     #[test]
-    fn flattened_dwarf_ranges_share_frame_slices_for_the_same_node() {
+    fn named_dwarf_scope_storage_grows_linearly_with_depth() {
+        let depth = 64;
+        let labels: Vec<_> = (0..depth).map(|index| format!("scope_{index}")).collect();
+        let ranges: Vec<_> = (0..depth)
+            .map(|index| [test_range(index as u64, (2 * depth - index) as u64)])
+            .collect();
+        let dies: Vec<_> = (0..depth)
+            .map(|index| {
+                (
+                    index + 1,
+                    if index == 0 {
+                        gimli::DW_TAG_subprogram
+                    } else {
+                        gimli::DW_TAG_inlined_subroutine
+                    },
+                    Some(labels[index].as_str()),
+                    ranges[index].as_slice(),
+                )
+            })
+            .collect();
         let mut names = PerfDwarfNameInterner::default();
-        let segments = test_dwarf_frame_ranges(
+        let index = test_dwarf_frame_index(&dies, &[], &mut names);
+        assert_eq!(index.segments.len(), 2 * depth - 1);
+        let frames =
+            perf_dwarf_frame_names_from_index(&index, &names.names, depth as u64, None).unwrap();
+        assert_eq!(
+            frames.frames,
+            labels.iter().rev().cloned().collect::<Vec<_>>()
+        );
+        // Each arena node stores exactly one identifier, shared by its descendants.
+        let retained_ids = index.nodes.len();
+        assert!(
+            retained_ids <= depth,
+            "{depth} named scopes retained {retained_ids} frame identifiers"
+        );
+    }
+
+    #[test]
+    fn dwarf_frame_chains_keep_range_less_and_fully_covered_ancestors() {
+        for parent_ranges in [Vec::new(), vec![test_range(10, 20)]] {
+            let mut names = PerfDwarfNameInterner::default();
+            let index = test_dwarf_frame_index(
+                &[
+                    (1, gimli::DW_TAG_subprogram, Some("outer"), &parent_ranges),
+                    (
+                        2,
+                        gimli::DW_TAG_inlined_subroutine,
+                        Some("inner"),
+                        &[test_range(10, 20)],
+                    ),
+                ],
+                &[],
+                &mut names,
+            );
+            assert_eq!(index.nodes.len(), 2);
+            assert_eq!(index.segments.len(), 1);
+            assert_eq!(
+                perf_dwarf_frame_names_from_index(&index, &names.names, 15, None)
+                    .unwrap()
+                    .frames,
+                ["inner", "outer"]
+            );
+        }
+    }
+
+    #[test]
+    fn dwarf_frame_chains_reclaim_dead_suffixes_without_changing_live_siblings() {
+        let mut names = PerfDwarfNameInterner::default();
+        let index = test_dwarf_frame_index(
+            &[
+                (
+                    1,
+                    gimli::DW_TAG_subprogram,
+                    Some("outer"),
+                    &[test_range(0, 100)],
+                ),
+                (
+                    2,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("same"),
+                    &[test_range(10, 20)],
+                ),
+                (2, gimli::DW_TAG_inlined_subroutine, Some("dead"), &[]),
+                (3, gimli::DW_TAG_inlined_subroutine, Some("dead_child"), &[]),
+                (
+                    2,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("same"),
+                    &[test_range(30, 40)],
+                ),
+            ],
+            &[],
+            &mut names,
+        );
+        assert_eq!(index.nodes.len(), 3);
+        assert_eq!(index.nodes[1].name, index.nodes[2].name);
+        assert_eq!(index.nodes[1].parent, index.nodes[2].parent);
+        for address in [15, 35] {
+            assert_eq!(
+                perf_dwarf_frame_names_from_index(&index, &names.names, address, None)
+                    .unwrap()
+                    .frames,
+                ["same", "outer"]
+            );
+        }
+        let first = index
+            .segments
+            .iter()
+            .find(|segment| segment.range.begin == 10)
+            .unwrap();
+        let second = index
+            .segments
+            .iter()
+            .find(|segment| segment.range.begin == 30)
+            .unwrap();
+        assert_ne!(first.frame, second.frame);
+    }
+
+    #[test]
+    fn dwarf_frame_chains_preserve_repeated_names_in_recursive_scopes() {
+        let mut names = PerfDwarfNameInterner::default();
+        let index = test_dwarf_frame_index(
+            &[
+                (
+                    1,
+                    gimli::DW_TAG_subprogram,
+                    Some("same"),
+                    &[test_range(0, 100)],
+                ),
+                (
+                    2,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("same"),
+                    &[test_range(10, 20)],
+                ),
+            ],
+            &[],
+            &mut names,
+        );
+        assert_eq!(names.names.entries.len(), 1);
+        assert_eq!(index.nodes.len(), 2);
+        assert_eq!(
+            perf_dwarf_frame_names_from_index(&index, &names.names, 15, None)
+                .unwrap()
+                .frames,
+            ["same", "same"]
+        );
+    }
+
+    #[test]
+    fn dwarf_frame_chains_preserve_live_ancestry_after_malformed_tail() {
+        let cases: &[&[TestDwarfDie<'_>]] = &[
+            &[
+                (
+                    1,
+                    gimli::DW_TAG_subprogram,
+                    Some("outer"),
+                    &[test_range(0, 100)],
+                ),
+                (
+                    2,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("first"),
+                    &[test_range(10, 20)],
+                ),
+                (2, gimli::DW_TAG_inlined_subroutine, Some("dead"), &[]),
+                (3, gimli::DW_TAG_inlined_subroutine, Some("dead_child"), &[]),
+                (
+                    2,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("last"),
+                    &[test_range(30, 40)],
+                ),
+            ],
+            &[
+                (1, gimli::DW_TAG_subprogram, Some("outer"), &[]),
+                (
+                    2,
+                    gimli::DW_TAG_inlined_subroutine,
+                    Some("last"),
+                    &[test_range(30, 40)],
+                ),
+            ],
+        ];
+        for dies in cases {
+            let (abbrev, mut info, ranges) = test_dwarf_sections(dies);
+            // Interrupt before closing the last inline scope, which is still
+            // awaiting range emission when the unknown abbreviation fails.
+            let tail = info.len() - 3;
+            info[tail] = 127;
+            let mut names = PerfDwarfNameInterner::default();
+            let index =
+                test_dwarf_frame_index_from_sections(&abbrev, &info, &ranges, &[], &mut names);
+            assert_eq!(
+                perf_dwarf_frame_names_from_index(&index, &names.names, 35, None)
+                    .unwrap()
+                    .frames,
+                ["last", "outer"]
+            );
+            if dies.len() == 5 {
+                assert_eq!(
+                    perf_dwarf_frame_names_from_index(&index, &names.names, 15, None)
+                        .unwrap()
+                        .frames,
+                    ["first", "outer"]
+                );
+                assert_eq!(index.nodes.len(), 3);
+            } else {
+                assert_eq!(index.nodes.len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn deep_named_dwarf_index_and_drop_are_stack_safe() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let depth = 8192;
+                let abbrev = [
+                    1, 0x11, 1, 0, 0, 2, 0x2e, 1, 0x03, 0x08, 0x11, 0x01, 0x12, 0x06, 0, 0, 3,
+                    0x1d, 1, 0x03, 0x08, 0x11, 0x01, 0x12, 0x06, 0, 0, 0,
+                ];
+                let mut info = vec![0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 8, 1];
+                pyroc50_push_die(&mut info, 2, Some("same"), Some((0x1000, 0x40)));
+                for _ in 0..depth {
+                    pyroc50_push_die(&mut info, 3, Some("same"), Some((0x1000, 0x40)));
+                }
+                info.extend(std::iter::repeat_n(0, depth + 2));
+                let length = u32::try_from(info.len() - 4).unwrap();
+                info[..4].copy_from_slice(&length.to_le_bytes());
+                let dwarf = gimli::Dwarf::load(|id| {
+                    let bytes = match id {
+                        gimli::SectionId::DebugAbbrev => abbrev.as_slice(),
+                        gimli::SectionId::DebugInfo => info.as_slice(),
+                        _ => &[],
+                    };
+                    Ok::<_, gimli::Error>(gimli::EndianSlice::new(bytes, gimli::LittleEndian))
+                })
+                .unwrap();
+                let directory = super::PerfDwarfUnitDirectory::new(&dwarf);
+                let unit = directory.units[0].unit.as_ref().unwrap();
+                let mut names = PerfDwarfNameInterner::default();
+                let index =
+                    super::perf_dwarf_unit_frame_index(&dwarf, unit, &directory, &mut names, &[]);
+                assert_eq!(index.nodes.len(), depth + 1);
+                assert_eq!(index.segments.len(), 1);
+                let frames =
+                    perf_dwarf_frame_names_from_index(&index, &names.names, 0x1018, None).unwrap();
+                assert_eq!(frames.frames.len(), depth + 1);
+                assert!(frames.frames.iter().all(|name| name == "same"));
+                drop(frames);
+                drop(index);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn flattened_dwarf_ranges_share_the_same_scope_chain() {
+        let mut names = PerfDwarfNameInterner::default();
+        let segments = test_dwarf_frame_index(
             &[
                 (
                     1,
@@ -10768,27 +11158,27 @@ mod tests {
             &mut names,
         );
 
-        assert_eq!(segments.len(), 3);
+        assert_eq!(segments.segments.len(), 3);
         assert_eq!(
-            frame_names(&names, &segments[0].frames),
+            frame_names(&names, &segments, segments.segments[0].frame),
             vec!["outer".to_string()]
         );
         assert_eq!(
-            frame_names(&names, &segments[1].frames),
+            frame_names(&names, &segments, segments.segments[1].frame),
             vec!["outer".to_string(), "inner".to_string()]
         );
         assert_eq!(
-            frame_names(&names, &segments[2].frames),
+            frame_names(&names, &segments, segments.segments[2].frame),
             vec!["outer".to_string()]
         );
-        assert!(Arc::ptr_eq(&segments[0].frames, &segments[2].frames));
-        assert!(!Arc::ptr_eq(&segments[0].frames, &segments[1].frames));
+        assert_eq!(segments.segments[0].frame, segments.segments[2].frame);
+        assert_ne!(segments.segments[0].frame, segments.segments[1].frame);
     }
 
     #[test]
     fn pyroc50_wrapped_subprogram_interns_names_without_frames_or_coverage() {
         let mut names = PerfDwarfNameInterner::default();
-        let segments = test_dwarf_frame_ranges(
+        let segments = test_dwarf_frame_index(
             &[
                 (
                     1,
@@ -10860,10 +11250,10 @@ mod tests {
                 "root_inline"
             ]
         );
-        assert!(segments.iter().any(|segment| {
+        assert!(segments.segments.iter().any(|segment| {
             segment.range.begin <= 25
                 && 25 < segment.range.end
-                && frame_names(&names, &segment.frames) == ["outer"]
+                && frame_names(&names, &segments, segment.frame) == ["outer"]
         }));
         assert_eq!(
             perf_dwarf_frame_names_from_index(&segments, &names.names, 25, Some("outer")),
@@ -10885,7 +11275,7 @@ mod tests {
     #[test]
     fn pyroc50_pruned_last_child_resumes_at_parent_sibling() {
         let mut names = PerfDwarfNameInterner::default();
-        let segments = test_dwarf_frame_ranges(
+        let segments = test_dwarf_frame_index(
             &[
                 (
                     1,
@@ -10946,7 +11336,7 @@ mod tests {
     #[test]
     fn pyroc50_own_coverage_and_postorder_survive_missing_and_external_ranges() {
         let mut names = PerfDwarfNameInterner::default();
-        let segments = test_dwarf_frame_ranges(
+        let segments = test_dwarf_frame_index(
             &[
                 (
                     1,
@@ -10991,13 +11381,13 @@ mod tests {
         }
         // Descendant coverage is neither clipped to the parent nor promoted
         // into the parent's own coverage when returning to its caller.
-        assert!(segments.iter().any(|segment| {
+        assert!(segments.segments.iter().any(|segment| {
             segment.range.begin <= 45
                 && 45 < segment.range.end
-                && frame_names(&names, &segment.frames) == ["outer"]
+                && frame_names(&names, &segments, segment.frame) == ["outer"]
         }));
-        for segment in &segments {
-            let expected_order = match frame_names(&names, &segment.frames).as_slice() {
+        for segment in &segments.segments {
+            let expected_order = match frame_names(&names, &segments, segment.frame).as_slice() {
                 [_, leaf] if leaf == "leaf" => 0,
                 [_, _, outside] if outside == "outside" => 2,
                 [_] if segment.range.begin >= 20 && segment.range.end <= 30 => 1,
@@ -11020,7 +11410,7 @@ mod tests {
     #[test]
     fn flattened_dwarf_lookup_keeps_inline_and_base_symbol_rules() {
         let mut names = PerfDwarfNameInterner::default();
-        let segments = test_dwarf_frame_ranges(
+        let segments = test_dwarf_frame_index(
             &[
                 (
                     1,
@@ -11066,7 +11456,7 @@ mod tests {
         // new_inline_sym() then marks that symbol as inlined, so script output
         // suppresses the DSO and appends "(inlined)".
         let mut names = PerfDwarfNameInterner::default();
-        let segments = test_dwarf_frame_ranges(
+        let segments = test_dwarf_frame_index(
             &[
                 (1, gimli::DW_TAG_subprogram, None, &[test_range(0, 100)]),
                 (
@@ -11096,7 +11486,7 @@ mod tests {
         // line information. That leaves perf script printing the original
         // symtab symbol, as in the verified `float`/`f` fixture.
         let mut names = PerfDwarfNameInterner::default();
-        let segments = test_dwarf_frame_ranges(
+        let segments = test_dwarf_frame_index(
             &[(
                 1,
                 gimli::DW_TAG_subprogram,
@@ -11127,7 +11517,7 @@ mod tests {
         // die_find_realfunc(), and srcline.c new_inline_sym() marks it inlined
         // when dwarf_diename(die) differs from the symtab base symbol.
         let mut names = PerfDwarfNameInterner::default();
-        let segments = test_dwarf_frame_ranges(
+        let segments = test_dwarf_frame_index(
             &[
                 (
                     1,
@@ -11163,7 +11553,7 @@ mod tests {
     #[test]
     fn symbol_parity_single_function_die_with_line_replaces_base_without_children() {
         let mut names = PerfDwarfNameInterner::default();
-        let segments = test_dwarf_frame_ranges(
+        let segments = test_dwarf_frame_index(
             &[(
                 1,
                 gimli::DW_TAG_subprogram,
@@ -11189,7 +11579,7 @@ mod tests {
     #[test]
     fn symbol_parity_realfunc_line_guard_checks_the_lookup_address() {
         let mut names = PerfDwarfNameInterner::default();
-        let segments = test_dwarf_frame_ranges(
+        let segments = test_dwarf_frame_index(
             &[
                 (
                     1,
@@ -11235,7 +11625,7 @@ mod tests {
         // entropy_burn fixture requires modeling the external protocol at a
         // higher layer, not special-casing this DIE name here.
         let mut names = PerfDwarfNameInterner::default();
-        let segments = test_dwarf_frame_ranges(
+        let segments = test_dwarf_frame_index(
             &[
                 (
                     1,
@@ -11270,7 +11660,7 @@ mod tests {
         // to libdw DIE names. Real Rust functions named `eq` therefore remain
         // inline frames instead of terminating the chain.
         let mut names = PerfDwarfNameInterner::default();
-        let segments = test_dwarf_frame_ranges(
+        let segments = test_dwarf_frame_index(
             &[
                 (
                     1,
@@ -11309,7 +11699,7 @@ mod tests {
     #[test]
     fn flattened_dwarf_lookup_keeps_symtab_base_for_standalone_fn0_like_perf() {
         let mut names = PerfDwarfNameInterner::default();
-        let segments = test_dwarf_frame_ranges(
+        let segments = test_dwarf_frame_index(
             &[(
                 1,
                 gimli::DW_TAG_subprogram,
@@ -11329,7 +11719,7 @@ mod tests {
     #[test]
     fn flattened_dwarf_lookup_ignores_unnamed_intermediate_nodes() {
         let mut names = PerfDwarfNameInterner::default();
-        let segments = test_dwarf_frame_ranges(
+        let segments = test_dwarf_frame_index(
             &[
                 (
                     1,
@@ -11368,7 +11758,7 @@ mod tests {
         // the address. A later overlapping sibling must not win just because
         // its flattened range has the same start address.
         let mut names = PerfDwarfNameInterner::default();
-        let segments = test_dwarf_frame_ranges(
+        let segments = test_dwarf_frame_index(
             &[
                 (
                     1,
@@ -11407,7 +11797,7 @@ mod tests {
         // die_find_child() searches only accept DW_TAG_inlined_subroutine.
         // A nested DW_TAG_subprogram must not become part of the inline chain.
         let mut names = PerfDwarfNameInterner::default();
-        let segments = test_dwarf_frame_ranges(
+        let segments = test_dwarf_frame_index(
             &[
                 (
                     1,
@@ -12809,11 +13199,20 @@ mod tests {
         }
     }
 
-    fn frame_names(names: &PerfDwarfNameInterner, frames: &[u32]) -> Vec<String> {
+    fn frame_names(
+        names: &PerfDwarfNameInterner,
+        index: &super::PerfDwarfFrameIndex,
+        frame: std::num::NonZeroUsize,
+    ) -> Vec<String> {
+        let mut frames = Vec::new();
+        let mut frame = Some(frame);
+        while let Some(id) = frame {
+            let node = &index.nodes[id.get() - 1];
+            frames.push(names.names[node.name as usize].to_owned());
+            frame = node.parent;
+        }
+        frames.reverse();
         frames
-            .iter()
-            .map(|name| names.names[*name as usize].to_owned())
-            .collect()
     }
 
     fn test_range(begin: u64, end: u64) -> PerfAddressRange {
