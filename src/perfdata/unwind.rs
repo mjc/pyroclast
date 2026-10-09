@@ -16,7 +16,6 @@ use rustc_hash::FxBuildHasher;
 
 use super::memory::open_regular_object;
 
-#[cfg(target_os = "linux")]
 mod dwarf;
 
 // The gap-2 skip gate queries `has_unwind_info_for_ip` once per sampled IP,
@@ -331,7 +330,6 @@ enum ArchUnwinder {
     X86_64 {
         unwinder: Box<UnwinderX86_64<ModuleBytes>>,
         cache: CacheX86_64,
-        #[cfg(target_os = "linux")]
         dwarf_cache: dwarf::Cache,
     },
     Aarch64 {
@@ -365,7 +363,6 @@ struct ReportedModule {
     sections: ExplicitModuleSectionInfo<ModuleBytes>,
     memory_segments: Vec<ModuleMemorySegment>,
     unwind_ranges: Vec<Range<u64>>,
-    #[cfg(target_os = "linux")]
     dwarf: Option<dwarf::Module>,
 }
 
@@ -471,7 +468,6 @@ impl FramehopUnwinder {
             PerfArch::X86_64 => ArchUnwinder::X86_64 {
                 unwinder: Box::new(UnwinderX86_64::new()),
                 cache: CacheX86_64::new(),
-                #[cfg(target_os = "linux")]
                 dwarf_cache: dwarf::Cache::new(),
             },
             PerfArch::Aarch64 => ArchUnwinder::Aarch64 {
@@ -544,7 +540,6 @@ impl FramehopUnwinder {
         let sections = explicit_module_section_info(&object, addresses.base_svma);
         let memory_segments = module_memory_segments(&file, file_len, &object, addresses);
         let unwind_ranges = object_unwind_ranges(&object, addresses);
-        #[cfg(target_os = "linux")]
         let dwarf = (object.format() == object::BinaryFormat::Elf)
             .then(|| dwarf::Module::new(&sections, addresses, object_cfi_base_addresses(&object)));
         let module = Module::<ModuleBytes>::new(
@@ -563,7 +558,6 @@ impl FramehopUnwinder {
             sections,
             memory_segments,
             unwind_ranges,
-            #[cfg(target_os = "linux")]
             dwarf,
         });
         let position = self
@@ -761,17 +755,6 @@ impl FramehopUnwinder {
     }
 }
 
-fn module_has_unwind_info(modules: &[ReportedModule], lookup: &DwflSegmentLookup, ip: u64) -> bool {
-    lookup
-        .module_for_ip(ip, |id| modules[id].range.end)
-        .is_some_and(|id| {
-            modules[id]
-                .unwind_ranges
-                .iter()
-                .any(|range| range.contains(&ip))
-        })
-}
-
 impl ArchUnwinder {
     fn unwind_stack(
         &mut self,
@@ -829,7 +812,6 @@ impl ArchUnwinder {
         modules: &[ReportedModule],
         lookup: &DwflSegmentLookup,
     ) -> Vec<u64> {
-        #[cfg(target_os = "linux")]
         if matches!(self, Self::X86_64 { .. })
             && let PerfUserRegs::X86_64(regs) = regs
         {
@@ -839,50 +821,18 @@ impl ArchUnwinder {
         // The seeded register file must match the active arch; a mismatch means
         // the file header arch and the regs decode disagreed, which cannot
         // happen because both flow from the same PerfArch.
-        match (self, regs) {
-            (
-                Self::X86_64 {
-                    unwinder, cache, ..
-                },
-                PerfUserRegs::X86_64(regs),
-            ) => {
-                let mut regs = regs.to_framehop_regs();
-                let mut address = FrameAddress::from_instruction_pointer(ip);
-                while frames.len() < max_frames {
-                    push_perf_unwind_address(&mut frames, address.address());
-                    // libdwfl/frame_unwind.c:738-788 falls back to ebl_unwind
-                    // when no FDE covers this PC. Framehop's uncovered-FDE rule
-                    // instead pops SP on the initial frame (x86_64/dwarf.rs:87).
-                    let next =
-                        if module_has_unwind_info(modules, lookup, address.address_for_lookup()) {
-                            unwinder
-                                .unwind_frame(address, &mut regs, cache, read_stack)
-                                .ok()
-                                .flatten()
-                        } else {
-                            unwind_x86_64_frame_pointer(&mut regs, read_stack)
-                        };
-                    let Some(next) = next.and_then(FrameAddress::from_return_address) else {
-                        break;
-                    };
-                    address = next;
-                }
+        if let (Self::Aarch64 { unwinder, cache }, PerfUserRegs::Aarch64(regs)) = (self, regs) {
+            let mut iter = unwinder.iter_frames(ip, regs.to_framehop_regs(), cache, read_stack);
+            while frames.len() < max_frames {
+                let Ok(Some(frame)) = iter.next() else {
+                    break;
+                };
+                push_perf_unwind_address(&mut frames, frame.address());
             }
-            (Self::Aarch64 { unwinder, cache }, PerfUserRegs::Aarch64(regs)) => {
-                let mut iter = unwinder.iter_frames(ip, regs.to_framehop_regs(), cache, read_stack);
-                while frames.len() < max_frames {
-                    let Ok(Some(frame)) = iter.next() else {
-                        break;
-                    };
-                    push_perf_unwind_address(&mut frames, frame.address());
-                }
-            }
-            _ => {}
         }
         frames
     }
 
-    #[cfg(target_os = "linux")]
     fn iter_dwarf_addresses(
         &mut self,
         regs: PerfX86_64Regs,
@@ -965,28 +915,6 @@ impl ArchUnwinder {
         }
         frames
     }
-}
-
-fn unwind_x86_64_frame_pointer(
-    regs: &mut UnwindRegsX86_64,
-    read: &mut impl FnMut(u64) -> Result<u64, ()>,
-) -> Option<u64> {
-    // elfutils 0.195 backends/x86_64_unwind.c:48-91: missing previous FP
-    // is nonfatal; only the return-slot read and forward SP movement are required.
-    let fp = regs.bp();
-    if fp == 0 {
-        return None;
-    }
-    let previous_fp = read(fp).unwrap_or(0);
-    let return_address = read(fp.wrapping_add(8)).ok()?;
-    let next_sp = fp.wrapping_add(16);
-    if regs.sp() >= next_sp {
-        return None;
-    }
-    regs.set_bp(previous_fp);
-    regs.set_sp(next_sp);
-    regs.set_ip(return_address);
-    Some(return_address)
 }
 
 impl UserStackUnwinder for FramehopUnwinder {
