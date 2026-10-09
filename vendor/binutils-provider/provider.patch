@@ -1,0 +1,458 @@
+diff -ruN baseline/bfd/bfdio.c source/bfd/bfdio.c
+--- baseline/bfd/bfdio.c	2026-02-07 17:00:00.000000000 -0700
++++ source/bfd/bfdio.c	2026-10-08 18:21:21.569706197 -0600
+@@ -27,6 +27,7 @@
+ #include "libbfd.h"
+ #include "aout/ar.h"
+ #include "libiberty.h"
++#include "bfd-input-provider.h"
+ #if defined (_WIN32)
+ #include <windows.h>
+ #include <locale.h>
+@@ -87,9 +88,77 @@
+   return file;
+ }
+ 
++static const struct bfd_input_provider *input_provider;
++
++int
++bfd_set_input_provider (const struct bfd_input_provider *provider)
++{
++  if (input_provider || !provider || !provider->open_snapshot
++      || !provider->canonical_name)
++    {
++      errno = EINVAL;
++      return -1;
++    }
++  input_provider = provider;
++  return 0;
++}
++
++int
++bfd_input_provider_active (void)
++{
++  return input_provider != NULL;
++}
++
++FILE *
++bfd_input_fopen (const char *filename, const char *mode, int borrowed_fd)
++{
++  int fd;
++  FILE *stream;
++  if (strcmp (mode, "r") != 0 && strcmp (mode, "rb") != 0)
++    {
++      errno = EROFS;
++      return NULL;
++    }
++  fd = input_provider->open_snapshot (input_provider->context, filename,
++                                      borrowed_fd);
++  if (fd < 0)
++    return NULL;
++  stream = fdopen (fd, mode);
++  if (!stream)
++    {
++      int error = errno;
++      close (fd);
++      errno = error;
++    }
++  return close_on_exec (stream);
++}
++
++int
++bfd_input_open (const char *filename, int flags)
++{
++  if (!input_provider)
++    return open (filename, flags);
++  if ((flags & O_ACCMODE) != O_RDONLY || (flags & (O_CREAT | O_TRUNC)))
++    {
++      errno = EROFS;
++      return -1;
++    }
++  return input_provider->open_snapshot (input_provider->context, filename, -1);
++}
++
++char *
++bfd_input_canonical_name (const char *filename)
++{
++  if (!input_provider)
++    return lrealpath (filename);
++  return input_provider->canonical_name (input_provider->context, filename);
++}
++
+ FILE *
+ _bfd_real_fopen (const char *filename, const char *modes)
+ {
++  if (input_provider)
++    return bfd_input_fopen (filename, modes, -1);
+ #ifdef VMS
+   char *vms_attr;
+ 
+diff -ruN baseline/bfd/cache.c source/bfd/cache.c
+--- baseline/bfd/cache.c	2026-02-07 17:00:00.000000000 -0700
++++ source/bfd/cache.c	2026-10-08 18:23:43.866910117 -0600
+@@ -43,6 +43,7 @@
+ #include "sysdep.h"
+ #include "bfd.h"
+ #include "libbfd.h"
++#include "bfd-input-provider.h"
+ #include "libiberty.h"
+ 
+ static FILE *_bfd_open_file_unlocked (bfd *abfd);
+@@ -767,6 +768,12 @@
+       break;
+     case both_direction:
+     case write_direction:
++      if (bfd_input_provider_active ())
++        {
++          errno = EROFS;
++          bfd_set_error (bfd_error_system_call);
++          return NULL;
++        }
+       if (abfd->opened_once)
+ 	{
+ 	  abfd->iostream = _bfd_real_fopen (bfd_get_filename (abfd),
+diff -ruN baseline/bfd/opncls.c source/bfd/opncls.c
+--- baseline/bfd/opncls.c	2026-02-07 17:00:00.000000000 -0700
++++ source/bfd/opncls.c	2026-10-08 18:21:21.569706197 -0600
+@@ -24,6 +24,7 @@
+ #include "bfd.h"
+ #include "objalloc.h"
+ #include "libbfd.h"
++#include "bfd-input-provider.h"
+ #include "libiberty.h"
+ #include "elf-bfd.h"
+ 
+@@ -252,7 +253,19 @@
+ 
+ #ifdef HAVE_FDOPEN
+   if (fd != -1)
+-    nbfd->iostream = fdopen (fd, mode);
++    {
++      if (bfd_input_provider_active ())
++        {
++          int error;
++          nbfd->iostream = bfd_input_fopen (filename, mode, fd);
++          error = errno;
++          close (fd);
++          fd = -1;
++          errno = error;
++        }
++      else
++        nbfd->iostream = fdopen (fd, mode);
++    }
+   else
+ #endif
+     nbfd->iostream = _bfd_real_fopen (filename, mode);
+@@ -461,6 +474,13 @@
+   bfd *nbfd;
+   const bfd_target *target_vec;
+ 
++  /* The caller retains its stream on failure; never bypass the provider. */
++  if (bfd_input_provider_active ())
++    {
++      bfd_set_error (bfd_error_invalid_operation);
++      return NULL;
++    }
++
+   nbfd = _bfd_new_bfd ();
+   if (nbfd == NULL)
+     return NULL;
+@@ -1421,7 +1441,13 @@
+ 
+   /* Compute the canonical name of the bfd object with all symbolic links
+      resolved, for use in the global debugfile directory.  */
+-  canon_dir = lrealpath (bfd_get_filename (abfd));
++  canon_dir = bfd_input_canonical_name (bfd_get_filename (abfd));
++  if (!canon_dir)
++    {
++      free (base);
++      free (dir);
++      return NULL;
++    }
+   for (canon_dirlen = strlen (canon_dir); canon_dirlen > 0; canon_dirlen--)
+     if (IS_DIR_SEPARATOR (canon_dir[canon_dirlen - 1]))
+       break;
+diff -ruN baseline/bfd/plugin.c source/bfd/plugin.c
+--- baseline/bfd/plugin.c	2026-10-08 18:16:17.594063246 -0600
++++ source/bfd/plugin.c	2026-10-08 18:21:21.569706197 -0600
+@@ -35,6 +35,7 @@
+ #include "plugin-api.h"
+ #include "plugin.h"
+ #include "libbfd.h"
++#include "bfd-input-provider.h"
+ #include "libiberty.h"
+ #include <dirent.h>
+ 
+@@ -398,7 +399,7 @@
+ 	 dup isn't good enough.  plugin IO uses lseek/read while BFD uses
+ 	 fseek/fread.  It isn't wise to mix the unistd and stdio calls on
+ 	 the same underlying file descriptor.  */
+-      fd = open (file->name, O_RDONLY | O_BINARY);
++      fd = bfd_input_open (file->name, O_RDONLY | O_BINARY);
+       if (fd < 0)
+ 	{
+ #ifndef EMFILE
+@@ -419,7 +420,7 @@
+ 	    {
+ 	      lim.rlim_cur = lim.rlim_max;
+ 	      if (setrlimit (RLIMIT_NOFILE, &lim) == 0)
+-		fd = open (file->name, O_RDONLY | O_BINARY);
++		fd = bfd_input_open (file->name, O_RDONLY | O_BINARY);
+ 	    }
+ 
+ 	  if (fd < 0)
+diff -ruN baseline/binutils/addr2line.c source/binutils/addr2line.c
+--- baseline/binutils/addr2line.c	2026-02-07 17:00:00.000000000 -0700
++++ source/binutils/addr2line.c	2026-10-08 18:22:04.655371904 -0600
+@@ -38,6 +38,7 @@
+ #include "bucomm.h"
+ #include "elf-bfd.h"
+ #include "safe-ctype.h"
++#include "snapshot-provider.h"
+ 
+ static bool unwind_inlines;	/* -i, unwind inlined functions. */
+ static bool with_addresses;	/* -a, show addresses.  */
+@@ -438,13 +439,24 @@
+   asection *section;
+   char **matching;
+ 
+-  if (get_file_size (file_name) < 1)
++  snapshot_provider_init (file_name);
++  if (!bfd_input_provider_active () && get_file_size (file_name) < 1)
+     return 1;
+ 
+   abfd = bfd_openr (file_name, target);
+   if (abfd == NULL)
+     bfd_fatal (file_name);
+ 
++  if (bfd_input_provider_active ())
++    {
++      struct stat st;
++      if (bfd_stat (abfd, &st) < 0 || !S_ISREG (st.st_mode) || st.st_size < 1)
++        {
++          bfd_close (abfd);
++          return 1;
++        }
++    }
++
+   /* Decompress sections.  */
+   abfd->flags |= BFD_DECOMPRESS;
+ 
+diff -ruN baseline/binutils/snapshot-provider.h source/binutils/snapshot-provider.h
+--- baseline/binutils/snapshot-provider.h	1969-12-31 17:00:00.000000000 -0700
++++ source/binutils/snapshot-provider.h	2026-10-08 18:39:50.856541682 -0600
+@@ -0,0 +1,188 @@
++/* Linux proof adapter; transport and session ownership belong to the caller. */
++#include "bfd-input-provider.h"
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <unistd.h>
++
++struct snapshot_entry
++{
++  char *name;
++  char *canonical;
++  int fd;
++  int error;
++  struct snapshot_entry *next;
++};
++
++static struct snapshot_entry *snapshots;
++
++static int
++snapshot_copy (int input)
++{
++  struct stat st;
++  unsigned char buffer[65536];
++  off_t offset = 0;
++  int output, error;
++
++  if (fstat (input, &st) < 0)
++    return -1;
++  if (!S_ISREG (st.st_mode) || st.st_size < 0)
++    {
++      errno = EINVAL;
++      return -1;
++    }
++  output = memfd_create ("bfd-input", MFD_CLOEXEC | MFD_ALLOW_SEALING);
++  if (output < 0)
++    return -1;
++  /* Read the observed finite extent, never a growing stream's EOF. */
++  while (offset < st.st_size)
++    {
++      size_t count = sizeof buffer;
++      ssize_t got;
++      size_t written = 0;
++      if (st.st_size - offset < (off_t) count)
++        count = st.st_size - offset;
++      do
++        got = pread (input, buffer, count, offset);
++      while (got < 0 && errno == EINTR);
++      if (got <= 0)
++        {
++          if (got == 0)
++            errno = EIO;
++          goto fail;
++        }
++      while (written < (size_t) got)
++        {
++          ssize_t put = write (output, buffer + written, got - written);
++          if (put < 0 && errno == EINTR)
++            continue;
++          if (put <= 0)
++            {
++              if (put == 0)
++                errno = EIO;
++              goto fail;
++            }
++          written += put;
++        }
++      offset += got;
++    }
++  if (fcntl (output, F_ADD_SEALS,
++             F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) < 0)
++    goto fail;
++  return output;
++fail:
++  error = errno;
++  close (output);
++  errno = error;
++  return -1;
++}
++
++static struct snapshot_entry *
++snapshot_lookup (const char *name, int borrowed_fd)
++{
++  struct snapshot_entry *entry, *other;
++  int input;
++  for (entry = snapshots; entry; entry = entry->next)
++    if (strcmp (name, entry->name) == 0)
++      return entry;
++
++  entry = xcalloc (1, sizeof *entry);
++  entry->name = xstrdup (name);
++  entry->canonical = lrealpath (name);
++  entry->fd = -1;
++  entry->next = snapshots;
++  snapshots = entry;
++  if (!entry->canonical)
++    {
++      entry->error = errno ? errno : ENOMEM;
++      return entry;
++    }
++  /* Bind each logical alias once, including failed candidates. */
++  for (other = entry->next; other; other = other->next)
++    if (other->canonical
++        && strcmp (entry->canonical, other->canonical) == 0)
++      {
++        entry->error = other->error;
++        if (other->fd >= 0)
++          {
++            entry->fd = fcntl (other->fd, F_DUPFD_CLOEXEC, 0);
++            if (entry->fd < 0)
++              entry->error = errno;
++          }
++        return entry;
++      }
++
++  input = borrowed_fd;
++  if (input < 0)
++    input = open (name, O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
++  if (input < 0)
++    entry->error = errno;
++  else
++    {
++      entry->fd = snapshot_copy (input);
++      if (entry->fd < 0)
++        entry->error = errno;
++      if (borrowed_fd < 0)
++        close (input);
++    }
++  return entry;
++}
++
++static int
++snapshot_open (void *context ATTRIBUTE_UNUSED, const char *name, int borrowed_fd)
++{
++  struct snapshot_entry *entry = snapshot_lookup (name, borrowed_fd);
++  char descriptor[64];
++  if (entry->fd < 0)
++    {
++      errno = entry->error;
++      return -1;
++    }
++  /* Reopen the held sealed object, not its logical filesystem name.
++     dup would share offsets across BFD, CRC probes and plugin consumers. */
++  snprintf (descriptor, sizeof descriptor, "/proc/self/fd/%d", entry->fd);
++  return open (descriptor, O_RDONLY | O_CLOEXEC);
++}
++
++static char *
++snapshot_canonical (void *context ATTRIBUTE_UNUSED, const char *name)
++{
++  struct snapshot_entry *entry = snapshot_lookup (name, -1);
++  if (!entry->canonical)
++    {
++      errno = entry->error;
++      return NULL;
++    }
++  return xstrdup (entry->canonical);
++}
++
++static void
++snapshot_provider_init (const char *file_name)
++{
++  static const struct bfd_input_provider provider =
++    { NULL, snapshot_open, snapshot_canonical };
++  const char *fd_text = getenv ("PYRO_PRIMARY_FD");
++  const char *name = getenv ("PYRO_PRIMARY_NAME");
++  const char *canonical = getenv ("PYRO_PRIMARY_CANONICAL");
++  struct snapshot_entry *primary;
++  char *end;
++  long fd;
++  if (!fd_text)
++    fatal ("selected primary descriptor required");
++  errno = 0;
++  fd = strtol (fd_text, &end, 10);
++  if (errno || !*fd_text || *end || fd < 0 || fd > INT_MAX
++      || !name || strcmp (file_name, name) != 0 || !canonical)
++    fatal ("invalid selected primary descriptor or filename");
++  primary = xcalloc (1, sizeof *primary);
++  primary->name = xstrdup (name);
++  primary->canonical = xstrdup (canonical);
++  primary->fd = snapshot_copy (fd);
++  if (primary->fd < 0)
++    fatal ("cannot capture selected primary: %s", strerror (errno));
++  close (fd);
++  snapshots = primary;
++  if (bfd_set_input_provider (&provider) < 0)
++    fatal ("cannot install input provider: %s", strerror (errno));
++}
+diff -ruN baseline/include/bfd-input-provider.h source/include/bfd-input-provider.h
+--- baseline/include/bfd-input-provider.h	1969-12-31 17:00:00.000000000 -0700
++++ source/include/bfd-input-provider.h	2026-10-08 18:27:43.462648939 -0600
+@@ -0,0 +1,22 @@
++/* Private, single-process read-only input provider for pinned GNU BFD. */
++#ifndef BFD_INPUT_PROVIDER_H
++#define BFD_INPUT_PROVIDER_H
++
++#include <stdio.h>
++
++struct bfd_input_provider
++{
++  void *context;
++  /* Return an owned independent read-only FD; do not consume borrowed_fd. */
++  int (*open_snapshot) (void *, const char *, int borrowed_fd);
++  /* Return a malloc-owned, stable original canonical filename. */
++  char *(*canonical_name) (void *, const char *);
++};
++
++extern int bfd_set_input_provider (const struct bfd_input_provider *);
++extern int bfd_input_provider_active (void);
++extern FILE *bfd_input_fopen (const char *, const char *, int);
++extern int bfd_input_open (const char *, int);
++extern char *bfd_input_canonical_name (const char *);
++
++#endif

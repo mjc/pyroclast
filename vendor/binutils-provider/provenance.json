@@ -1,0 +1,45 @@
+{
+  "version": "2.46",
+  "providerPatchSha256": "d6c3d086f8298618f03edc61a4b6ddf45f6d45c502e5aaac242102e6d37475ba",
+  "source": {
+    "url": "https://ftp.gnu.org/gnu/binutils/binutils-with-gold-2.46.tar.bz2",
+    "hash": "sha256-uMmj15bcCw6OqTXcJMXI1vNF6xd62lrGpbESLHfWIVg=",
+    "sha256": "b8c9a3d796dc0b0e8ea935dc24c5c8d6f345eb177ada5ac6a5b1122c77d62158"
+  },
+  "nixpkgsRevision": "64c08a7ca051951c8eae34e3e3cb1e202fe36786",
+  "configureFlags": [
+    "--enable-64-bit-bfd",
+    "--with-system-zlib",
+    "--enable-deterministic-archives",
+    "--disable-werror",
+    "--enable-fix-loongson2f-nop",
+    "--enable-new-dtags",
+    "--program-prefix=",
+    "--disable-gprofng",
+    "--with-lib-path=:",
+    "--enable-gold",
+    "--enable-plugins",
+    "--enable-shared",
+    "--disable-static"
+  ],
+  "nixPatches": [
+    { "name": "deterministic.patch", "sha256": "912815241d4f64f971b22deb456217b8288b44b2f96ae0e50289a911dbecddc8" },
+    { "name": "0001-Revert-libtool.m4-fix-the-NM-nm-over-here-B-option-w.patch", "sha256": "188b6a3899a19d096848ebae8d8cba15900628c3d321f04efc155a3ab42c5b10" },
+    { "name": "0001-Revert-libtool.m4-fix-nm-BSD-flag-detection.patch", "sha256": "dc0787a90fa43a6a9524852598adfd44539d7d8a2cdb73a7c33106dbb4c0ee82" },
+    { "name": "always-search-rpath.patch", "sha256": "7640ceb1ecaa2c339c0bcb35d7dd7b43db294585abd1772104731051299d67fe" },
+    { "name": "plugins-no-BINDIR.patch", "sha256": "2ea7882146ac0113936f870fd8489480b1fd0f03440fdb82479a128b2659dd10" },
+    { "name": "0001-libtool.m4-update-macos-version-detection-block.patch", "sha256": "27060ba7e39cb8602e08ba171b7d4346d39e8291f44b017beee3041ac855ff77" },
+    { "name": "avr-size.patch", "sha256": "7aed303887a8541feba008943d0331dc95dd90a309575f81b7a195650e4cba1e" },
+    { "name": "windres-locate-gcc.patch", "sha256": "990c87b5bbf15f76e2d185ac2ff5938148b2f736393dcadef3f19b5eae607e5d" }
+  ],
+  "prototypeOracle": {
+    "executable": "/nix/store/31gnwsgag5qa14hfblqi5hyn71pyx7py-binutils-2.46/bin/addr2line",
+    "derivation": "/nix/store/jmfpmfyjrhn46mhiaqwqh074y3zj7hp5-binutils-2.46.drv"
+  },
+  "reviewReference": {
+    "repository": "binutils-gdb",
+    "commit": "95451ea43a7",
+    "version": "2.46.50",
+    "role": "Source audit reference only; not the packaged source."
+  }
+}

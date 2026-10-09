@@ -77,6 +77,9 @@
         {
           default = pyroclast;
         }
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          pyroclast-addr2line = pkgs.callPackage ./nix/binutils-provider.nix { };
+        }
       );
 
       checks = forAllSystems (
