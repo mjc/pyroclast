@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use clap::ValueEnum;
-use hashbrown::{HashMap, HashSet, hash_map::RawEntryMut};
+use hashbrown::{HashMap, HashSet, HashTable, hash_map::RawEntryMut};
 use object::{
     Object, ObjectSection, ObjectSegment, ObjectSymbol, ObjectSymbolTable, SymbolIndex, SymbolKind,
 };
@@ -712,8 +712,8 @@ struct ObjectSegmentRange {
     virtual_address: u64,
 }
 
-struct PerfDwarfNameResolver {
-    names: Vec<String>,
+struct PerfDwarfNameResolver<'a> {
+    names: PerfDwarfNames<'a>,
     units: Vec<PerfDwarfUnitIndex>,
 }
 
@@ -766,7 +766,7 @@ struct PreparedObjectMetadata {
 struct CachedObjectMetadata {
     object_metadata: PreparedObjectMetadata,
     object_bytes: Arc<[u8]>,
-    dwarf_index: Mutex<PerfDwarfIndexCache>,
+    dwarf_index: Mutex<PerfDwarfIndexCache<'static>>,
     module_metadata: Mutex<FxHashMap<OsString, Arc<KernelModuleObjectMetadata>>>,
 }
 
@@ -798,8 +798,8 @@ enum GnuHelperState {
 /// addresses land in it. The name interner is append-only so frame name ids
 /// stay valid across incremental builds.
 #[derive(Default)]
-struct PerfDwarfIndexCache {
-    names: PerfDwarfNameInterner,
+struct PerfDwarfIndexCache<'a> {
+    names: PerfDwarfNameInterner<'a>,
     units: Option<Vec<PerfDwarfCachedUnit>>,
     failed: bool,
 }
@@ -5001,35 +5001,23 @@ pub fn perf_dwarf_frame_names_from_object_bytes(bytes: &[u8], address: u64) -> O
         .or(base_symbol.map(|symbol| vec![symbol]))
 }
 
-impl PerfDwarfNameResolver {
+impl<'a> PerfDwarfNameResolver<'a> {
     fn from_object_bytes_for_addresses(
-        bytes: &[u8],
+        bytes: &'a [u8],
         addresses: &[u64],
     ) -> Result<Self, gimli::Error> {
         Self::from_object_bytes_matching_addresses(bytes, Some(addresses))
     }
 
     fn from_object_bytes_matching_addresses(
-        bytes: &[u8],
+        bytes: &'a [u8],
         addresses: Option<&[u64]>,
     ) -> Result<Self, gimli::Error> {
-        let object = object::File::parse(bytes).map_err(|_| gimli::Error::Io)?;
-        let endian = if object.is_little_endian() {
-            gimli::RunTimeEndian::Little
-        } else {
-            gimli::RunTimeEndian::Big
-        };
-        let mut names = PerfDwarfNameInterner::default();
-        let dwarf_sections = gimli::DwarfSections::load(|id| {
-            Ok::<_, gimli::Error>(
-                object
-                    .section_by_name(id.name())
-                    .and_then(|section| section.uncompressed_data().ok())
-                    .unwrap_or(Cow::Borrowed(&[][..])),
-            )
-        })?;
-        let dwarf =
-            dwarf_sections.borrow(|section| gimli::EndianSlice::new(section.as_ref(), endian));
+        let backing = Arc::new(PerfDwarfBacking::load(PerfDwarfObjectBytes::Borrowed(
+            bytes,
+        ))?);
+        let mut names = PerfDwarfNameInterner::with_backing(Arc::clone(&backing));
+        let dwarf = backing.dwarf();
         let mut units = Vec::new();
         let directory = PerfDwarfUnitDirectory::new(&dwarf);
         for prepared in &directory.units {
@@ -5147,7 +5135,12 @@ impl CachedObjectMetadata {
                 return;
             }
         }
-        if build_dwarf_index_cache_for_addresses(&mut cache, &self.object_bytes, addresses).is_err()
+        if build_dwarf_index_cache_for_addresses(
+            &mut cache,
+            PerfDwarfObjectBytes::Shared(Arc::clone(&self.object_bytes)),
+            addresses,
+        )
+        .is_err()
         {
             cache.failed = true;
         }
@@ -5200,26 +5193,23 @@ impl CachedObjectMetadata {
     }
 }
 
-fn build_dwarf_index_cache_for_addresses(
-    cache: &mut PerfDwarfIndexCache,
-    bytes: &[u8],
+fn build_dwarf_index_cache_for_addresses<'a>(
+    cache: &mut PerfDwarfIndexCache<'a>,
+    bytes: PerfDwarfObjectBytes<'a>,
     addresses: &[u64],
 ) -> Result<(), gimli::Error> {
-    let object = object::File::parse(bytes).map_err(|_| gimli::Error::Io)?;
-    let endian = if object.is_little_endian() {
-        gimli::RunTimeEndian::Little
-    } else {
-        gimli::RunTimeEndian::Big
-    };
-    let dwarf_sections = gimli::DwarfSections::load(|id| {
-        Ok::<_, gimli::Error>(
-            object
-                .section_by_name(id.name())
-                .and_then(|section| section.uncompressed_data().ok())
-                .unwrap_or(Cow::Borrowed(&[][..])),
-        )
-    })?;
-    let dwarf = dwarf_sections.borrow(|section| gimli::EndianSlice::new(section.as_ref(), endian));
+    if cache.names.names.backing.is_none() {
+        cache.names.names.backing = Some(Arc::new(PerfDwarfBacking::load(bytes)?));
+    }
+    let backing = Arc::clone(
+        cache
+            .names
+            .names
+            .backing
+            .as_ref()
+            .expect("DWARF backing loaded"),
+    );
+    let dwarf = backing.dwarf();
 
     let scanning = cache.units.is_none();
     let mut units = cache.units.take().unwrap_or_default();
@@ -5314,7 +5304,7 @@ fn perf_dwarf_unit_frame_ranges<R>(
     dwarf: &gimli::Dwarf<R>,
     unit: &gimli::Unit<R>,
     directory: &PerfDwarfUnitDirectory<R>,
-    names: &mut PerfDwarfNameInterner,
+    names: &mut PerfDwarfNameInterner<'_>,
     source_line_ranges: &[PerfAddressRange],
 ) -> Vec<PerfDwarfFrameRange>
 where
@@ -5377,8 +5367,8 @@ where
             continue;
         }
         let ranges = perf_dwarf_ranges(dwarf.die_ranges(unit, entry).ok()).unwrap_or_default();
-        let name =
-            perf_dwarf_die_frame_name(dwarf, unit, directory, entry).map(|name| names.intern(name));
+        let name = perf_dwarf_die_frame_name(dwarf, unit, directory, entry)
+            .and_then(|name| names.intern(name));
         // A subprogram behind a transparent wrapper was previously collected
         // (including its names), but flattening excluded its entire subtree.
         let suppressed =
@@ -5567,7 +5557,7 @@ struct PerfDwarfFrameNames {
 
 fn perf_dwarf_frame_names_from_index(
     segments: &[PerfDwarfFrameRange],
-    names: &[String],
+    names: &PerfDwarfNames<'_>,
     address: u64,
     base_symbol: Option<&str>,
 ) -> Option<PerfDwarfFrameNames> {
@@ -5583,7 +5573,7 @@ fn perf_dwarf_frame_names_from_index(
         .frames
         .iter()
         .filter_map(|name| names.get(usize::try_from(*name).ok()?))
-        .cloned()
+        .map(str::to_owned)
         .collect::<Vec<_>>();
     frames.reverse();
     let mut has_inline_frames = segment.has_inline_frames;
@@ -5622,12 +5612,12 @@ fn perf_dwarf_die_frame_name<R>(
     unit: &gimli::Unit<R>,
     directory: &PerfDwarfUnitDirectory<R>,
     entry: &gimli::DebuggingInformationEntry<R>,
-) -> Option<String>
+) -> Option<PerfDwarfDieName<R>>
 where
     R: gimli::Reader,
 {
     perf_dwarf_die_name(dwarf, unit, directory, entry)
-        .map(|name| perf_dwarf_function_name(&name))
+        .map(PerfDwarfDieName::Raw)
         .or_else(|| {
             perf_dwarf_inherited_string(
                 dwarf,
@@ -5637,7 +5627,13 @@ where
                 gimli::DW_AT_linkage_name,
                 16,
             )
-            .map(|linkage| demangle_addr2line_name_qualified(&linkage))
+            .and_then(|linkage| {
+                let text = linkage.to_string_lossy().ok()?;
+                Some(match addr2line::demangle_auto(text, None) {
+                    Cow::Borrowed(_) => PerfDwarfDieName::Raw(linkage),
+                    Cow::Owned(name) => PerfDwarfDieName::Rendered(name),
+                })
+            })
         })
 }
 
@@ -5646,7 +5642,7 @@ fn perf_dwarf_die_name<R>(
     unit: &gimli::Unit<R>,
     directory: &PerfDwarfUnitDirectory<R>,
     entry: &gimli::DebuggingInformationEntry<R>,
-) -> Option<String>
+) -> Option<R>
 where
     R: gimli::Reader,
 {
@@ -5661,7 +5657,7 @@ fn perf_dwarf_inherited_string<'a, R>(
     entry: &gimli::DebuggingInformationEntry<R>,
     attribute: gimli::DwAt,
     entry_limit: usize,
-) -> Option<String>
+) -> Option<R>
 where
     R: gimli::Reader,
 {
@@ -5670,7 +5666,7 @@ where
         if let Some(name) = entry
             .attr(attribute)
             .and_then(|attr| dwarf.attr_string(unit, attr.value()).ok())
-            .and_then(|name| name.to_string_lossy().ok().map(Cow::into_owned))
+            .filter(|name| name.to_string_lossy().is_ok())
         {
             return Some(name);
         }
@@ -5691,24 +5687,229 @@ where
     None
 }
 
-#[derive(Default)]
-struct PerfDwarfNameInterner {
-    names: Vec<String>,
-    ids_by_name: HashMap<String, PerfDwarfNameId, FxBuildHasher>,
+enum PerfDwarfDieName<R> {
+    Raw(R),
+    Rendered(String),
 }
 
-impl PerfDwarfNameInterner {
-    fn intern(&mut self, name: String) -> PerfDwarfNameId {
-        if let Some(&id) = self.ids_by_name.get(name.as_str()) {
+enum PerfDwarfObjectBytes<'a> {
+    Borrowed(&'a [u8]),
+    Shared(Arc<[u8]>),
+}
+
+impl PerfDwarfObjectBytes<'_> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Shared(bytes) => bytes,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PerfDwarfNameSpan {
+    buffer: usize,
+    offset: usize,
+    len: usize,
+}
+
+// Readers are temporary views; persisted names hold ranges into this shared
+// owner, including decompressed sections needed by later CU index builds.
+struct PerfDwarfBacking<'a> {
+    object: PerfDwarfObjectBytes<'a>,
+    decompressed: Vec<Vec<u8>>,
+    sections: gimli::DwarfSections<PerfDwarfNameSpan>,
+    endian: gimli::RunTimeEndian,
+}
+
+impl<'a> PerfDwarfBacking<'a> {
+    fn load(bytes: PerfDwarfObjectBytes<'a>) -> Result<Self, gimli::Error> {
+        let slice = bytes.as_slice();
+        let object = object::File::parse(slice).map_err(|_| gimli::Error::Io)?;
+        let endian = if object.is_little_endian() {
+            gimli::RunTimeEndian::Little
+        } else {
+            gimli::RunTimeEndian::Big
+        };
+        let base = gimli::EndianSlice::new(slice, endian);
+        let mut decompressed = Vec::new();
+        let sections = gimli::DwarfSections::load(|id| {
+            let data = object
+                .section_by_name(id.name())
+                .and_then(|section| section.uncompressed_data().ok())
+                .unwrap_or(Cow::Borrowed(&[]));
+            let len = data.len();
+            let (buffer, offset) = match data {
+                Cow::Borrowed([]) => (0, 0),
+                Cow::Borrowed(data) => {
+                    let reader = gimli::EndianSlice::new(data, endian);
+                    let offset =
+                        gimli::Reader::lookup_offset_id(&base, gimli::Reader::offset_id(&reader))
+                            .ok_or(gimli::Error::Io)?;
+                    (0, offset)
+                }
+                Cow::Owned(data) => {
+                    decompressed.push(data);
+                    (decompressed.len(), 0)
+                }
+            };
+            Ok::<_, gimli::Error>(PerfDwarfNameSpan {
+                buffer,
+                offset,
+                len,
+            })
+        })?;
+        Ok(Self {
+            object: bytes,
+            decompressed,
+            sections,
+            endian,
+        })
+    }
+
+    fn buffer(&self, index: usize) -> Option<&[u8]> {
+        if index == 0 {
+            Some(self.object.as_slice())
+        } else {
+            self.decompressed.get(index - 1).map(Vec::as_slice)
+        }
+    }
+
+    fn bytes(&self, span: PerfDwarfNameSpan) -> Option<&[u8]> {
+        self.buffer(span.buffer)?
+            .get(span.offset..span.offset.checked_add(span.len)?)
+    }
+
+    fn dwarf(&self) -> gimli::Dwarf<gimli::EndianSlice<'_, gimli::RunTimeEndian>> {
+        self.sections.borrow(|span| {
+            gimli::EndianSlice::new(
+                self.bytes(*span).expect("valid DWARF section range"),
+                self.endian,
+            )
+        })
+    }
+
+    fn name_span<R: gimli::Reader>(&self, reader: &R) -> Option<PerfDwarfNameSpan> {
+        let len = usize::try_from(gimli::ReaderOffset::into_u64(reader.len())).ok()?;
+        for buffer in 0..=self.decompressed.len() {
+            let bytes = self.buffer(buffer)?;
+            let base = gimli::EndianSlice::new(bytes, self.endian);
+            if let Some(offset) = gimli::Reader::lookup_offset_id(&base, reader.offset_id())
+                && offset.checked_add(len)? <= bytes.len()
+            {
+                return Some(PerfDwarfNameSpan {
+                    buffer,
+                    offset,
+                    len,
+                });
+            }
+        }
+        None
+    }
+}
+
+enum PerfDwarfStoredName {
+    Source(PerfDwarfNameSpan),
+    Rendered(String),
+}
+
+#[derive(Default)]
+struct PerfDwarfNames<'a> {
+    backing: Option<Arc<PerfDwarfBacking<'a>>>,
+    entries: Vec<PerfDwarfStoredName>,
+}
+
+impl PerfDwarfNames<'_> {
+    fn get(&self, index: usize) -> Option<&str> {
+        match self.entries.get(index)? {
+            PerfDwarfStoredName::Source(span) => {
+                std::str::from_utf8(self.backing.as_ref()?.bytes(*span)?).ok()
+            }
+            PerfDwarfStoredName::Rendered(name) => Some(name),
+        }
+    }
+
+    #[cfg(test)]
+    fn iter(&self) -> impl Iterator<Item = &str> {
+        (0..self.entries.len()).map(|index| self.get(index).expect("valid DWARF name ID"))
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Index<usize> for PerfDwarfNames<'_> {
+    type Output = str;
+
+    fn index(&self, index: usize) -> &str {
+        self.get(index).expect("valid DWARF name ID")
+    }
+}
+
+#[derive(Default)]
+struct PerfDwarfNameInterner<'a> {
+    names: PerfDwarfNames<'a>,
+    ids_by_name: HashTable<PerfDwarfNameId>,
+}
+
+fn perf_dwarf_name_hash(name: &str) -> u64 {
+    let mut hasher = rustc_hash::FxHasher::default();
+    name.hash(&mut hasher);
+    hasher.finish()
+}
+
+impl<'a> PerfDwarfNameInterner<'a> {
+    fn with_backing(backing: Arc<PerfDwarfBacking<'a>>) -> Self {
+        Self {
+            names: PerfDwarfNames {
+                backing: Some(backing),
+                entries: Vec::new(),
+            },
+            ids_by_name: HashTable::new(),
+        }
+    }
+
+    fn intern<R: gimli::Reader>(&mut self, name: PerfDwarfDieName<R>) -> Option<PerfDwarfNameId> {
+        match name {
+            PerfDwarfDieName::Raw(reader) => {
+                let text = reader.to_string_lossy().ok()?;
+                let span = self
+                    .names
+                    .backing
+                    .as_ref()
+                    .and_then(|backing| backing.name_span(&reader));
+                Some(self.intern_text(text, span))
+            }
+            PerfDwarfDieName::Rendered(name) => Some(self.intern_text(Cow::Owned(name), None)),
+        }
+    }
+
+    fn intern_text(
+        &mut self,
+        name: Cow<'_, str>,
+        span: Option<PerfDwarfNameSpan>,
+    ) -> PerfDwarfNameId {
+        let hash = perf_dwarf_name_hash(&name);
+        if let Some(&id) = self.ids_by_name.find(hash, |&id| {
+            self.names.get(id as usize) == Some(name.as_ref())
+        }) {
             return id;
         }
-        let id = PerfDwarfNameId::try_from(self.names.len()).expect("dwarf name table fits in u32");
-        self.ids_by_name.insert(name.clone(), id);
-        self.names.push(name);
+        let id = PerfDwarfNameId::try_from(self.names.entries.len())
+            .expect("dwarf name table fits in u32");
+        let stored = match name {
+            Cow::Borrowed(name) => span.map_or_else(
+                || PerfDwarfStoredName::Rendered(name.to_owned()),
+                PerfDwarfStoredName::Source,
+            ),
+            Cow::Owned(name) => PerfDwarfStoredName::Rendered(name),
+        };
+        self.names.entries.push(stored);
+        self.ids_by_name.insert_unique(hash, id, |&id| {
+            perf_dwarf_name_hash(self.names.get(id as usize).expect("valid DWARF name ID"))
+        });
         id
     }
 
-    fn into_names(self) -> Vec<String> {
+    fn into_names(self) -> PerfDwarfNames<'a> {
         self.names
     }
 }
@@ -9175,7 +9376,12 @@ mod tests {
         // dwarf_attr_integrate.c:43-63 follows one selected reference chain,
         // not a backtracking search through both attributes.
         assert_eq!(
-            super::perf_dwarf_die_frame_name(&dwarf, unit, &directory, &entry).as_deref(),
+            super::perf_dwarf_die_frame_name(&dwarf, unit, &directory, &entry)
+                .map(|name| match name {
+                    super::PerfDwarfDieName::Raw(reader) => reader.to_string_lossy().into_owned(),
+                    super::PerfDwarfDieName::Rendered(name) => name,
+                })
+                .as_deref(),
             expected,
             "{kind:?}"
         );
@@ -9213,6 +9419,214 @@ mod tests {
         // Upstream function.rs:name_attr carries the target CU across ref_addr.
         assert_eq!(names, ["read_at", "read_at", "read_at", "outer"]);
         file
+    }
+
+    #[test]
+    fn standalone_dwarf_names_borrow_original_object_bytes() {
+        for kind in [
+            CrossCuInlineName::Direct,
+            CrossCuInlineName::LocalReference,
+            CrossCuInlineName::IndexedString,
+        ] {
+            let bytes = cross_cu_inline_fixture(kind);
+            let resolver =
+                super::PerfDwarfNameResolver::from_object_bytes_for_addresses(&bytes, &[0x1018])
+                    .unwrap();
+            assert_eq!(
+                resolver
+                    .names
+                    .iter()
+                    .filter(|name| name.as_bytes() == b"read_at")
+                    .count(),
+                1,
+                "duplicate DIE names share an ID"
+            );
+            let object_range = bytes.as_ptr_range();
+            for name in resolver.names.iter() {
+                assert!(
+                    object_range.contains(&name.as_ptr()),
+                    "{kind:?}: {name:?} was copied instead of borrowing ELF/DWARF bytes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cached_dwarf_names_borrow_retained_object_bytes() {
+        for kind in [
+            CrossCuInlineName::Direct,
+            CrossCuInlineName::LocalReference,
+            CrossCuInlineName::IndexedString,
+        ] {
+            let bytes = cross_cu_inline_fixture(kind);
+            let file = cross_cu_reference_file(&bytes);
+            let resolver = RustAddr2lineResolver::new();
+            let metadata = resolver.object_metadata(file.path()).unwrap();
+            metadata.prepare_dwarf_frames_for_addresses(&[0x1018]);
+            std::fs::remove_file(file.path()).unwrap();
+            let cache = metadata.dwarf_index.lock().unwrap();
+            assert_eq!(
+                cache
+                    .names
+                    .names
+                    .iter()
+                    .filter(|name| name.as_bytes() == b"read_at")
+                    .count(),
+                1
+            );
+            let object_range = metadata.object_bytes.as_ptr_range();
+            for name in cache.names.names.iter() {
+                assert!(
+                    object_range.contains(&name.as_ptr()),
+                    "{kind:?}: {name:?} was copied instead of borrowing cached ELF/DWARF bytes"
+                );
+            }
+            assert_eq!(
+                perf_dwarf_frame_names_from_index(
+                    cache.units.as_ref().unwrap()[0].segments.as_ref().unwrap(),
+                    &cache.names.names,
+                    0x1018,
+                    Some("base_symbol"),
+                )
+                .unwrap()
+                .frames,
+                ["read_at", "read_at", "read_at", "outer"]
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compressed_dwarf_names_keep_section_backing_across_incremental_indexes() {
+        for format in ["zlib", "zlib-gnu"] {
+            let bytes = cross_cu_inline_fixture(CrossCuInlineName::Direct);
+            let file = cross_cu_reference_file(&bytes);
+            let output = std::process::Command::new("objcopy")
+                .arg(format!("--compress-debug-sections={format}"))
+                .arg(file.path())
+                .output()
+                .expect("binutils compressed DWARF fixture");
+            assert!(output.status.success(), "{output:?}");
+            let resolver = RustAddr2lineResolver::new();
+            let metadata = resolver.object_metadata(file.path()).unwrap();
+            metadata.prepare_dwarf_frames_for_addresses(&[0x1018]);
+            let (backing, name_pointer) = {
+                let cache = metadata.dwarf_index.lock().unwrap();
+                let backing = Arc::clone(cache.names.names.backing.as_ref().unwrap());
+                assert!(
+                    !backing.decompressed.is_empty(),
+                    "{format} fixture must be compressed"
+                );
+                assert!(
+                    cache
+                        .names
+                        .names
+                        .entries
+                        .iter()
+                        .all(|name| { matches!(name, super::PerfDwarfStoredName::Source(_)) })
+                );
+                let name = cache
+                    .names
+                    .names
+                    .iter()
+                    .find(|name| *name == "read_at")
+                    .unwrap();
+                assert!(
+                    backing
+                        .decompressed
+                        .iter()
+                        .any(|bytes| bytes.as_ptr_range().contains(&name.as_ptr()))
+                );
+                (backing, name.as_ptr())
+            };
+            std::fs::remove_file(file.path()).unwrap();
+            metadata.prepare_dwarf_frames_for_addresses(&[0x2000]);
+            let cache = metadata.dwarf_index.lock().unwrap();
+            assert!(cache.units.as_ref().unwrap()[1].segments.is_some());
+            assert!(Arc::ptr_eq(
+                &backing,
+                cache.names.names.backing.as_ref().unwrap()
+            ));
+            assert_eq!(
+                cache
+                    .names
+                    .names
+                    .iter()
+                    .find(|name| *name == "read_at")
+                    .unwrap()
+                    .as_ptr(),
+                name_pointer
+            );
+            assert_eq!(
+                perf_dwarf_frame_names_from_index(
+                    cache.units.as_ref().unwrap()[0].segments.as_ref().unwrap(),
+                    &cache.names.names,
+                    0x1018,
+                    Some("base_symbol"),
+                )
+                .unwrap()
+                .frames,
+                ["read_at", "read_at", "read_at", "outer"]
+            );
+        }
+    }
+
+    #[test]
+    fn raw_dwarf_name_ids_and_backing_survive_interner_growth() {
+        let bytes = cross_cu_inline_fixture(CrossCuInlineName::IndexedString);
+        let backing = Arc::new(
+            super::PerfDwarfBacking::load(super::PerfDwarfObjectBytes::Shared(bytes.into()))
+                .unwrap(),
+        );
+        let weak = Arc::downgrade(&backing);
+        let mut names = PerfDwarfNameInterner::with_backing(Arc::clone(&backing));
+        let (id, pointer) = {
+            let dwarf = backing.dwarf();
+            let reader = dwarf.debug_str.get_str(gimli::DebugStrOffset(11)).unwrap();
+            let pointer = reader.slice().as_ptr();
+            let id = names.intern(super::PerfDwarfDieName::Raw(reader)).unwrap();
+            for index in 0..1024 {
+                names.intern_text(std::borrow::Cow::Owned(format!("rendered_{index}")), None);
+            }
+            let repeated = dwarf.debug_str.get_str(gimli::DebugStrOffset(11)).unwrap();
+            assert_eq!(
+                names.intern(super::PerfDwarfDieName::Raw(repeated)),
+                Some(id)
+            );
+            assert_eq!(names.names.entries.len(), 1025);
+            (id, pointer)
+        };
+        drop(backing);
+        assert!(
+            weak.upgrade().is_some(),
+            "name store owns the backing, not the names"
+        );
+        assert_eq!(names.names.get(id as usize), Some("read_at"));
+        assert_eq!(names.names.get(id as usize).unwrap().as_ptr(), pointer);
+        drop(names);
+        assert!(
+            weak.upgrade().is_none(),
+            "backing is released with its name store"
+        );
+    }
+
+    #[test]
+    fn rendered_dwarf_names_transfer_storage_once_and_deduplicate_by_text() {
+        let mut names = PerfDwarfNameInterner::default();
+        let rendered = "demangled_name".to_owned();
+        let pointer = rendered.as_ptr();
+        let id = names.intern_text(std::borrow::Cow::Owned(rendered), None);
+        assert_eq!(names.names.get(id as usize).unwrap().as_ptr(), pointer);
+        assert_eq!(
+            names.intern_text(std::borrow::Cow::Borrowed("demangled_name"), None),
+            id
+        );
+        let reader = gimli::EndianSlice::new(b"invalid_\xff", gimli::LittleEndian);
+        let lossy = names.intern(super::PerfDwarfDieName::Raw(reader)).unwrap();
+        assert_eq!(names.names.get(lossy as usize), Some("invalid_\u{fffd}"));
+        let empty = names.intern_text(std::borrow::Cow::Borrowed(""), None);
+        assert_eq!(names.names.get(empty as usize), Some(""));
+        assert_eq!(names.names.entries.len(), 3);
     }
 
     #[test]
@@ -9453,8 +9867,12 @@ mod tests {
                 .all(|segment| !segment.has_source_line)
         );
         let mut cache = PerfDwarfIndexCache::default();
-        super::build_dwarf_index_cache_for_addresses(&mut cache, bytes, &addresses)
-            .expect("prepare cached DWARF index");
+        super::build_dwarf_index_cache_for_addresses(
+            &mut cache,
+            super::PerfDwarfObjectBytes::Borrowed(bytes),
+            &addresses,
+        )
+        .expect("prepare cached DWARF index");
         let units = cache.units.as_ref().expect("cached units");
         assert_eq!(units.len(), 1);
         let segments = units[0].segments.as_ref().expect("cached segments");
@@ -9515,7 +9933,10 @@ mod tests {
             let cache = metadata.dwarf_index.lock().unwrap();
             let units = cache.units.as_ref().expect("file resolver prepared units");
             assert_eq!(units.len(), 1);
-            assert_eq!(cache.names.names, ["outer", "leaf", "trailing", "later"]);
+            assert_eq!(
+                cache.names.names.iter().collect::<Vec<_>>(),
+                ["outer", "leaf", "trailing", "later"]
+            );
             units[0].segments.as_ref().expect("prepared CU").as_ptr()
         };
         // Different addresses must reuse the loaded file and prepared CU.
@@ -9757,7 +10178,7 @@ mod tests {
             &mut names,
         );
         assert_eq!(
-            names.names,
+            names.names.iter().collect::<Vec<_>>(),
             [
                 "outer",
                 "wrapped",
@@ -9834,7 +10255,10 @@ mod tests {
             &[],
             &mut names,
         );
-        assert_eq!(names.names, ["first", "early", "second", "last"]);
+        assert_eq!(
+            names.names.iter().collect::<Vec<_>>(),
+            ["first", "early", "second", "last"]
+        );
         assert_eq!(
             perf_dwarf_frame_names_from_index(&segments, &names.names, 115, None)
                 .unwrap()
@@ -11716,7 +12140,7 @@ mod tests {
     fn frame_names(names: &PerfDwarfNameInterner, frames: &[u32]) -> Vec<String> {
         frames
             .iter()
-            .map(|name| names.names[*name as usize].clone())
+            .map(|name| names.names[*name as usize].to_owned())
             .collect()
     }
 

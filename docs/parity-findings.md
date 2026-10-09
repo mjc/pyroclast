@@ -127,6 +127,35 @@ fixture/argument failures were not parity evidence. The production walker now
 follows only the selected chain within the existing reference budget, retaining
 the correct CU for cross-CU references and removing its backtracking vector.
 
+## 2026-10-09 DWARF names retain backing instead of owning raw text
+
+The name walker previously materialized a String for every DIE, copied it
+again in the frame-name helper, and cloned each new name into the interner's
+lookup map. Raw names need none of these copies. Libdw
+`dwarf_formstring.c:39-47` returns a pointer into the DIE for `DW_FORM_string`;
+its string-section and indexed-string paths likewise return section-backed
+text. Perf `util/libdw.c:libdw_a2l_cb` consumes that name, and
+`util/srcline.c:94-129` separately handles demangling and symbol creation.
+Binutils `addr2line.c:355-382` likewise distinguishes the raw function name
+from optional allocated demangled text. Inferno's `collapse/perf.rs:534-546`
+annotations do not dictate how the resolver owns its source names.
+
+Two ownership regressions were observed red at the production index boundary:
+stored name pointers were outside both the standalone input and cached ELF
+backing. The indexes now keep raw names as buffer/offset/length ranges into
+retained object or decompressed DWARF bytes. Shared backing is retained once
+per name store, not once per name. The hash table contains name IDs only and
+compares their referenced text; transformed or lossy names retain one owned
+value. Output APIs still materialize their requested owned frame lists.
+
+Coverage includes direct, cross-CU local-reference, and indexed-string names;
+duplicate nested frame preservation; source-file unlinking; ELF and GNU zlib
+compressed sections across incremental CU builds; hash-table growth; backing
+release; transferred transformed text; lossy UTF-8 and empty names. Sections
+are loaded/decompressed once per cached object, not on every new CU batch.
+This changes storage, not name-selection or folding semantics. Allocation,
+retained-memory and wall-clock changes still require workload measurements.
+
 ## 2026-10-09 recorded kernel/user callchains still receive user unwinds
 
 Investigation of a fresh C thread workload found an unsupported mixed-callchain
