@@ -154,6 +154,55 @@ completed output and include recording, analysis, rendering, and peak memory on 
 
 ## Development
 
+### Nix Package
+
+Add Pyroclast as an input in `devenv.yaml` and include its flake package:
+
+```yaml
+# devenv.yaml
+inputs:
+  pyroclast:
+    url: github:mjc/pyroclast
+```
+
+```nix
+# devenv.nix
+{ pkgs, inputs, ... }:
+{
+  packages = [ inputs.pyroclast.packages.${pkgs.system}.default ];
+}
+```
+
+For source-only consumption, set `flake: false` on the `pyroclast` input and
+provide Crane separately, then call the reusable derivation:
+
+```yaml
+# devenv.yaml
+inputs:
+  pyroclast:
+    url: github:mjc/pyroclast
+    flake: false
+  crane:
+    url: github:ipetkov/crane/edb38893982a3338972bb4a2ec7ce7c29ba10fd9
+```
+
+```nix
+# devenv.nix
+{ pkgs, inputs, ... }:
+{
+  packages = [
+    (pkgs.callPackage "${inputs.pyroclast}/nix/pyroclast.nix" {
+      crane = inputs.crane;
+      src = inputs.pyroclast;
+    })
+  ];
+}
+```
+
+The derivation builds the Rust CLI and includes vendored rendering assets and
+license notices. Runtime symbolization remains in-process Rust and does not
+depend on GNU `addr2line`.
+
 Build or run the CLI from the Nix flake:
 
 ```sh

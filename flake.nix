@@ -35,61 +35,8 @@
     {
       packages = forAllSystems (
         { pkgs, ... }:
-        let
-          craneLib = crane.mkLib pkgs;
-          commonArgs = {
-            src = pkgs.lib.cleanSourceWith {
-              src = pkgs.lib.cleanSource ./.;
-              filter =
-                path: type:
-                craneLib.filterCargoSources path type
-                || pkgs.lib.any (suffix: pkgs.lib.hasSuffix suffix (toString path)) [
-                  "/vendor/inferno/src/flamegraph/flamegraph.css"
-                  "/vendor/inferno/src/flamegraph/flamegraph.js"
-                  "/LICENSE-APACHE"
-                  "/LICENSE-MIT"
-                  "/vendor/inferno/LICENSE"
-                ];
-            };
-            strictDeps = true;
-          };
-          cargoArtifacts = craneLib.buildDepsOnly (
-            commonArgs
-            // {
-              pname = "pyroclast";
-              version = "0.1.0";
-              cargoExtraArgs = "--bins";
-              doCheck = false;
-            }
-          );
-          pyroclast = craneLib.buildPackage (
-            commonArgs
-            // {
-              pname = "pyroclast";
-              version = "0.1.0";
-              inherit cargoArtifacts;
-              cargoExtraArgs = "--bins";
-              doCheck = false;
-              postInstall = ''
-                mkdir -p "$out/share/doc/pyroclast/vendor/addr2line" "$out/share/doc/pyroclast/vendor/inferno"
-                install -m644 LICENSE-APACHE LICENSE-MIT "$out/share/doc/pyroclast/"
-                install -m644 vendor/addr2line/LICENSE-APACHE vendor/addr2line/LICENSE-MIT \
-                  "$out/share/doc/pyroclast/vendor/addr2line/"
-                install -m644 vendor/inferno/LICENSE "$out/share/doc/pyroclast/vendor/inferno/"
-              '';
-              meta = {
-                description = packageDescription;
-                mainProgram = "pyroclast";
-                license = with pkgs.lib.licenses; [
-                  asl20
-                  mit
-                ];
-              };
-            }
-          );
-        in
         {
-          default = pyroclast;
+          default = import ./nix/pyroclast.nix { inherit pkgs crane; };
         }
         // pkgs.lib.optionalAttrs (pkgs.stdenv.hostPlatform.isLinux || pkgs.stdenv.hostPlatform.isDarwin) {
           pyroclast-addr2line = pkgs.callPackage ./nix/binutils-provider.nix { };
@@ -98,7 +45,18 @@
 
       checks = forAllSystems (
         { pkgs, system }:
+        let
+          callPackagePyroclast = pkgs.callPackage ./nix/pyroclast.nix {
+            inherit crane;
+            src = ./.;
+          };
+        in
         {
+          package-callpackage-interface =
+            assert callPackagePyroclast.drvPath == self.packages.${system}.default.drvPath;
+            pkgs.runCommand "pyroclast-callpackage-interface" { } ''
+              mkdir "$out"
+            '';
           package-source-assets = pkgs.runCommand "pyroclast-package-source-assets" { } ''
             test -s ${self.packages.${system}.default.src}/vendor/inferno/src/flamegraph/flamegraph.css
             test -s ${self.packages.${system}.default.src}/vendor/inferno/src/flamegraph/flamegraph.js
