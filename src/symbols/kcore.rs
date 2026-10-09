@@ -4,8 +4,10 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::{Kallsyms, KallsymsSymbol, KernelModuleSectionMap, is_kernel_module_symbol_path_str};
-use crate::perfdata::fold::recorded_kernel_maps_file;
+use super::{
+    KallsymsSymbol, KernelModuleSectionMap, LiveKallsymsSnapshot, is_kernel_module_symbol_path_str,
+};
+use crate::perfdata::mappings::MmapTable;
 use crate::perfdata::unwind::PerfArch;
 
 pub(super) struct KcoreSymbols {
@@ -17,25 +19,27 @@ pub(super) struct KcoreSymbols {
 }
 
 impl KcoreSymbols {
-    pub(super) fn load(recording: &Path, kallsyms_path: &Path) -> Option<Self> {
+    pub(super) fn load(
+        table: &MmapTable,
+        arch: PerfArch,
+        kallsyms_path: &Path,
+        snapshot: &LiveKallsymsSnapshot,
+    ) -> Option<Self> {
         // perf util/symbol.c:filename_from_kallsyms_filename only recognizes
         // a file named kallsyms, with kcore and modules alongside it.
         if kallsyms_path.file_name()? != "kallsyms" {
             return None;
         }
         let directory = kallsyms_path.parent()?;
-        let (arch, recorded) = recorded_kernel_maps_file(recording).ok()?;
-        let core = recorded
-            .iter()
-            .rev()
+        let core = table
+            .host_kernel_mappings()
             .find(|map| map.path.starts_with("[kernel.kallsyms]"))?;
-        let text = std::fs::read_to_string(kallsyms_path).ok()?;
         let reference = core.path.strip_prefix("[kernel.kallsyms]")?;
         // perf validate_kcore_addresses requires an exact reference address;
         // relocation is valid for kallsyms, but never for live kcore maps.
         if core.pgoff != 0
             && !reference.is_empty()
-            && reference_function_start(&text, reference)? != core.pgoff
+            && snapshot.reference_address(reference)? != core.pgoff
         {
             return None;
         }
@@ -51,9 +55,9 @@ impl KcoreSymbols {
                 ))
             })
             .collect::<BTreeMap<_, _>>();
-        for mapping in &recorded {
-            if let Some(module) = module_short_name(&mapping.path)
-                && module_bases.get(module.as_ref()) != Some(&mapping.start)
+        for mapping in table.host_kernel_mappings() {
+            if let Some(module) = mapping.module_name
+                && module_bases.get(module) != Some(&mapping.start)
             {
                 return None;
             }
@@ -65,17 +69,20 @@ impl KcoreSymbols {
         }
         // symbol.c:maps__split_kallsyms_for_kcore shares the globally fixed
         // symbol tree across replacement maps, stripping module suffixes.
-        let symbols: BTreeMap<_, _> = Kallsyms::parse_module_symbols(&text)
-            .into_iter()
-            .filter_map(|row| {
+        let symbols: BTreeMap<_, _> = snapshot
+            .core
+            .iter()
+            .chain(snapshot.modules.values().map(AsRef::as_ref))
+            .flat_map(|symbols| &symbols.symbols)
+            .filter_map(|(&address, symbol)| {
                 let (_, end) = ranges
                     .iter()
-                    .find(|&&(start, end)| start <= row.address && row.address < end)?;
+                    .find(|&&(start, end)| start <= address && address < end)?;
                 Some((
-                    row.address,
+                    address,
                     KallsymsSymbol {
-                        name: row.name.into(),
-                        end: Some(row.end.min(*end)),
+                        name: std::sync::Arc::clone(&symbol.name),
+                        end: Some(symbol.end?.min(*end)),
                         module: None,
                     },
                 ))
@@ -137,13 +144,6 @@ impl KcoreSymbols {
         (address < end || (address == end && *start == end))
             .then(|| format!("{}+0x{:x}", symbol.name, address - start))
     }
-}
-
-fn reference_function_start(text: &str, reference: &str) -> Option<u64> {
-    // perf symbol.c:validate_kcore_addresses -> event.c:find_func_symbol_cb
-    // stops at the first T/t/W/w/A full-name match, without excluding zero.
-    // tools/lib/symbol/kallsyms.c passes the module suffix as part of the name.
-    super::kallsyms_reference_span(text, reference).map(|(address, _)| address)
 }
 
 pub(crate) fn module_short_name(path: &str) -> Option<Cow<'_, str>> {

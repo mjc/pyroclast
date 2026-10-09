@@ -1,8 +1,6 @@
 mod metadata;
 mod threads;
-pub(crate) use metadata::{
-    PerfSampleMetadata, recorded_kernel_maps_file, visit_perfdata_file_metadata,
-};
+pub(crate) use metadata::{PerfSampleMetadata, perfdata_file_arch, visit_perfdata_file_metadata};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
@@ -652,7 +650,13 @@ pub fn summarize_perfdata(bytes: &[u8]) -> Result<PerfSummary, String> {
     validate_perfdata_sections(header, bytes.len())?;
     let sample_layouts = sample_layouts(bytes, header)?;
     let arch = perf_arch_from_header(parse_header_arch(bytes, &header)?.as_deref());
-    summarize_perfdata_source(&mut SliceSource(bytes), header, &sample_layouts, arch)
+    summarize_perfdata_source(
+        &mut SliceSource(bytes),
+        header,
+        &sample_layouts,
+        arch,
+        header_build_ids_by_filename(bytes)?,
+    )
 }
 
 /// Summarizes a completed perf recording with bounded buffered reads.
@@ -667,7 +671,13 @@ pub fn summarize_perfdata_file(path: &Path) -> Result<PerfSummary, String> {
     validate_perfdata_sections(header, source.len())?;
     let layouts = sample_layouts_from_file(&file, header, &bytes)?;
     let arch = perf_arch_from_header(header_arch_from_file(&file, header, &bytes)?.as_deref());
-    summarize_perfdata_source(&mut source, header, &layouts, arch)
+    summarize_perfdata_source(
+        &mut source,
+        header,
+        &layouts,
+        arch,
+        header_build_ids_by_filename_from_file(&file)?,
+    )
 }
 
 fn validate_perfdata_sections(header: PerfHeader, file_len: usize) -> Result<(), String> {
@@ -702,6 +712,7 @@ fn summarize_perfdata_source(
     header: PerfHeader,
     sample_layouts: &SampleLayouts,
     arch: PerfArch,
+    mut header_build_ids: BTreeMap<String, RecordedBuildId>,
 ) -> Result<PerfSummary, String> {
     let mut offset = usize::try_from(header.data_offset)
         .map_err(|_| "perf data section offset exceeds usize".to_string())?;
@@ -712,6 +723,11 @@ fn summarize_perfdata_source(
         )
         .ok_or_else(|| "perf data section range overflows usize".to_string())?;
     let mut summary = PerfSummary::default();
+    summary.mmap_table.initialize_native_dso_headers(
+        header_build_ids
+            .iter()
+            .map(|(path, id)| (path.as_str(), id.bytes.as_slice(), id.misc)),
+    );
 
     while offset < end {
         let record = source.record_at(offset, end)?;
@@ -721,82 +737,22 @@ fn summarize_perfdata_source(
             .record_counts
             .entry(record.header.record_type)
             .or_insert(0) += 1;
+        if record.header.record_type == crate::perfdata::records::PERF_RECORD_HEADER_BUILD_ID {
+            let event = parse_build_id_record(record.header.misc, record.payload)?;
+            apply_recorded_build_id(&mut summary.mmap_table, &mut header_build_ids, event);
+            continue;
+        }
+        let source_misc = record.header.misc;
         let parsed_record = parse_record_with_context(record)?;
-        let record_result: Result<(), String> = match parsed_record {
-            ParsedRecord::Comm(record) => {
-                summary
-                    .comms_by_pid
-                    .insert(record.pid, record.comm.to_string());
-                summary
-                    .comms_by_tid
-                    .insert(record.tid, record.comm.to_string());
-                summary.comms.push(record.comm.to_string());
-                Ok(())
-            }
-            ParsedRecord::Lost(record) => {
-                summary.lost_records = summary.lost_records.saturating_add(record.lost);
-                Ok(())
-            }
-            ParsedRecord::LostSamples(record) => {
-                summary.lost_records = summary.lost_records.saturating_add(record.lost);
-                Ok(())
-            }
-            ParsedRecord::Mmap(record) => {
-                summary.mmaps.push(record.path.clone());
-                summary.mmap_table.insert_mmap(record);
-                Ok(())
-            }
-            ParsedRecord::Sample(record) => {
-                parse_sample_for_summary(record.misc, &record.payload, sample_layouts, arch).map(
-                    |sample| {
-                        if let Some(sample) = sample {
-                            summary.sample_stacks.push(sample);
-                        }
-                    },
-                )
-            }
-            ParsedRecord::Mmap2(record) => {
-                summary.mmaps.push(record.path.clone());
-                summary.mmap_table.insert_mmap2(record);
-                Ok(())
-            }
-            ParsedRecord::Mmap2BuildId { misc, record } => {
-                summary.mmaps.push(record.path.clone());
-                summary
-                    .mmap_table
-                    .insert_mmap2_build_id_with_misc(record, misc);
-                Ok(())
-            }
-            ParsedRecord::Fork(record) => {
-                if let Some(comm) = summary.comms_by_tid.get(&record.ptid).cloned() {
-                    summary.comms_by_pid.insert(record.pid, comm.clone());
-                    summary.comms_by_tid.insert(record.tid, comm);
-                }
-                if record.clone_maps {
-                    summary
-                        .mmap_table
-                        .clone_pid_mappings(record.ppid, record.pid);
-                }
-                Ok(())
-            }
-            ParsedRecord::Unsupported { .. }
-            | ParsedRecord::Exit(_)
-            | ParsedRecord::Throttle(_)
-            | ParsedRecord::Unthrottle(_)
-            | ParsedRecord::Read(_)
-            | ParsedRecord::Aux(_)
-            | ParsedRecord::ItraceStart(_)
-            | ParsedRecord::Switch(_)
-            | ParsedRecord::SwitchCpuWide(_)
-            | ParsedRecord::Namespaces(_)
-            | ParsedRecord::Ksymbol(_)
-            | ParsedRecord::BpfEvent(_)
-            | ParsedRecord::Cgroup(_)
-            | ParsedRecord::TextPoke(_)
-            | ParsedRecord::AuxOutputHwId(_)
-            | ParsedRecord::CallchainDeferred(_) => Ok(()),
-        };
-        record_result.map_err(|error| {
+        summarize_record(
+            &mut summary,
+            parsed_record,
+            source_misc,
+            sample_layouts,
+            arch,
+            &header_build_ids,
+        )
+        .map_err(|error| {
             format!(
                 "failed to parse record type {} at offset {}: {error}",
                 record.header.record_type, record.offset
@@ -805,6 +761,104 @@ fn summarize_perfdata_source(
     }
 
     Ok(summary)
+}
+
+fn summarize_record(
+    summary: &mut PerfSummary,
+    parsed_record: ParsedRecord,
+    source_misc: u16,
+    sample_layouts: &SampleLayouts,
+    arch: PerfArch,
+    header_build_ids: &BTreeMap<String, RecordedBuildId>,
+) -> Result<(), String> {
+    match parsed_record {
+        ParsedRecord::Comm(record) => {
+            summary
+                .comms_by_pid
+                .insert(record.pid, record.comm.to_string());
+            summary
+                .comms_by_tid
+                .insert(record.tid, record.comm.to_string());
+            summary.comms.push(record.comm.to_string());
+            Ok(())
+        }
+        ParsedRecord::Lost(record) => {
+            summary.lost_records = summary.lost_records.saturating_add(record.lost);
+            Ok(())
+        }
+        ParsedRecord::LostSamples(record) => {
+            summary.lost_records = summary.lost_records.saturating_add(record.lost);
+            Ok(())
+        }
+        ParsedRecord::Mmap(record) => {
+            summary.mmaps.push(record.path.clone());
+            let build_id = header_build_ids
+                .get(&record.path)
+                .map(|id| id.bytes.clone());
+            summary.mmap_table.insert_mmap_with_build_id_and_misc(
+                record,
+                build_id,
+                // machine.c:machine__process_mmap_event selects kernel maps
+                // from misc; map.c:map__new binds the header-created DSO.
+                source_misc,
+            );
+            Ok(())
+        }
+        ParsedRecord::Sample(record) => {
+            parse_sample_for_summary(record.misc, &record.payload, sample_layouts, arch).map(
+                |sample| {
+                    if let Some(sample) = sample {
+                        summary.sample_stacks.push(sample);
+                    }
+                },
+            )
+        }
+        ParsedRecord::Mmap2(record) => {
+            summary.mmaps.push(record.path.clone());
+            let build_id = header_build_ids
+                .get(&record.path)
+                .map(|id| id.bytes.clone());
+            summary
+                .mmap_table
+                .insert_mmap2_with_build_id_and_misc(record, build_id, source_misc);
+            Ok(())
+        }
+        ParsedRecord::Mmap2BuildId { misc, record } => {
+            summary.mmaps.push(record.path.clone());
+            summary
+                .mmap_table
+                .insert_mmap2_build_id_with_misc(record, misc);
+            Ok(())
+        }
+        ParsedRecord::Fork(record) => {
+            if let Some(comm) = summary.comms_by_tid.get(&record.ptid).cloned() {
+                summary.comms_by_pid.insert(record.pid, comm.clone());
+                summary.comms_by_tid.insert(record.tid, comm);
+            }
+            if record.clone_maps {
+                summary
+                    .mmap_table
+                    .clone_pid_mappings(record.ppid, record.pid);
+            }
+            Ok(())
+        }
+        ParsedRecord::Unsupported { .. }
+        | ParsedRecord::Exit(_)
+        | ParsedRecord::Throttle(_)
+        | ParsedRecord::Unthrottle(_)
+        | ParsedRecord::Read(_)
+        | ParsedRecord::Aux(_)
+        | ParsedRecord::ItraceStart(_)
+        | ParsedRecord::Switch(_)
+        | ParsedRecord::SwitchCpuWide(_)
+        | ParsedRecord::Namespaces(_)
+        | ParsedRecord::Ksymbol(_)
+        | ParsedRecord::BpfEvent(_)
+        | ParsedRecord::Cgroup(_)
+        | ParsedRecord::TextPoke(_)
+        | ParsedRecord::AuxOutputHwId(_)
+        | ParsedRecord::CallchainDeferred(_) => Ok(()),
+    }
 }
 
 /// Collapses parsed perf sample callchains into folded stack lines.
@@ -1235,9 +1289,8 @@ fn recorded_build_ids_by_filename(
     let mut ids = events
         .into_iter()
         .filter(BuildIdEvent::has_valid_cpu_mode)
-        // tools/perf/util/build-id.c:build_id__is_defined: empty and all-zero
-        // recorded IDs are absent, not identities to require from an ELF.
-        .filter(|event| event.build_id.bytes().any(|byte| byte != b'0'))
+        // header.c:__event_process_build_id retains/classifies DSOs with an
+        // undefined ID, including updates that clear an earlier defined ID.
         .map(|event| {
             hex_build_id_bytes(&event.build_id).map(|bytes| {
                 (
@@ -1256,6 +1309,7 @@ fn recorded_build_ids_by_filename(
         let aliases = ids
             .iter()
             .filter(|(path, _)| is_perf_temporary_vdso_path(path))
+            .filter(|(_, id)| id.bytes.iter().any(|byte| *byte != 0))
             .map(|(_, id)| &id.bytes)
             .collect::<BTreeSet<_>>();
         if aliases.len() > 1 {
@@ -2482,6 +2536,24 @@ fn upsert_comm(map: &mut BTreeMap<u32, String>, id: u32, comm: &str) {
     }
 }
 
+fn apply_recorded_build_id(
+    table: &mut MmapTable,
+    ids: &mut BTreeMap<String, RecordedBuildId>,
+    event: BuildIdEvent,
+) {
+    if event.has_valid_cpu_mode() {
+        let id = hex_build_id_bytes(&event.build_id).expect("parsed build-ID hexadecimal");
+        table.update_native_dso_build_id(&event.filename, &id, event.misc);
+        ids.insert(
+            event.filename,
+            RecordedBuildId {
+                bytes: id,
+                misc: event.misc,
+            },
+        );
+    }
+}
+
 impl SessionState {
     fn apply_metadata(&mut self, record: FoldRecord<'_>) {
         self.mmap_table.initialize_native_dso_headers(
@@ -2493,19 +2565,7 @@ impl SessionState {
             FoldRecord::BuildId(event) => {
                 // session.c:1649 processes these user records before timestamp
                 // queuing. header.c:__event_process_build_id updates that DSO.
-                if event.has_valid_cpu_mode() {
-                    let id =
-                        hex_build_id_bytes(&event.build_id).expect("parsed build-ID hexadecimal");
-                    self.mmap_table
-                        .update_native_dso_build_id(&event.filename, &id, event.misc);
-                    self.header_build_ids.insert(
-                        event.filename,
-                        RecordedBuildId {
-                            bytes: id,
-                            misc: event.misc,
-                        },
-                    );
-                }
+                apply_recorded_build_id(&mut self.mmap_table, &mut self.header_build_ids, event);
             }
             FoldRecord::Comm(record) => {
                 self.maps_for_thread(record.pid, record.tid);
@@ -6184,7 +6244,9 @@ mod tests {
     }
 
     #[test]
-    fn undefined_recorded_build_ids_do_not_constrain_mappings_like_perf() {
+    fn undefined_build_id_headers_preserve_dsos_without_constraining_identity() {
+        // header.c:__event_process_build_id still creates/classifies the DSO
+        // when its ID is undefined; build_id__is_defined only gates identity.
         let events = ["", "0000000000000000000000000000000000000000"]
             .into_iter()
             .enumerate()
@@ -6195,11 +6257,27 @@ mod tests {
                 build_id: build_id.into(),
             })
             .collect();
-        assert!(
-            super::recorded_build_ids_by_filename(events)
-                .unwrap()
-                .is_empty()
-        );
+        let ids = super::recorded_build_ids_by_filename(events).unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids["/object-0"].bytes.is_empty());
+        assert_eq!(ids["/object-1"].bytes, [0; 20]);
+    }
+
+    #[test]
+    fn build_id_feature_headers_retain_the_last_zero_update() {
+        // header.c applies each feature record with dso__set_build_id; a zero
+        // update must clear the previous ID, not preserve a cached identity.
+        let events = ["aa".repeat(20), "00".repeat(20)]
+            .into_iter()
+            .map(|build_id| super::BuildIdEvent {
+                pid: u32::MAX,
+                misc: crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_KERNEL,
+                filename: "[kernel.kallsyms]".into(),
+                build_id,
+            })
+            .collect();
+        let ids = super::recorded_build_ids_by_filename(events).unwrap();
+        assert_eq!(ids["[kernel.kallsyms]"].bytes, [0; 20]);
     }
 
     #[test]

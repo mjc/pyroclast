@@ -106,71 +106,13 @@ impl PerfMetadata {
     }
 }
 
-/// Recorded host-kernel maps only; no sample payload is decoded or retained.
-pub(crate) struct RecordedKernelMap {
-    pub path: String,
-    pub start: u64,
-    pub pgoff: u64,
-    pub prot: u32,
-}
-
-pub(crate) fn recorded_kernel_maps_file(
-    path: &Path,
-) -> Result<(super::PerfArch, Vec<RecordedKernelMap>), String> {
-    use crate::perfdata::records::{
-        PERF_RECORD_MISC_CPUMODE_KERNEL, PERF_RECORD_MISC_CPUMODE_MASK, PERF_RECORD_MMAP,
-        PERF_RECORD_MMAP2,
-    };
+pub(crate) fn perfdata_file_arch(path: &Path) -> Result<super::PerfArch, String> {
     let file = File::open(path).map_err(|error| error.to_string())?;
     let (header, bytes) = perfdata_header_from_file(&file)?;
-    let mut source = FileSource::new(&file)?;
-    validate_perfdata_sections(header, source.len())?;
-    let arch =
-        super::perf_arch_from_header(header_arch_from_file(&file, header, &bytes)?.as_deref());
-    let mut offset = usize::try_from(header.data_offset).map_err(|error| error.to_string())?;
-    let end = offset
-        .checked_add(usize::try_from(header.data_size).map_err(|error| error.to_string())?)
-        .ok_or("kernel metadata range overflows")?;
-    let mut mappings = Vec::new();
-    while offset < end {
-        let record = source.record_at(offset, end)?;
-        offset += usize::from(record.header.size);
-        if !matches!(
-            record.header.record_type,
-            PERF_RECORD_MMAP | PERF_RECORD_MMAP2
-        ) {
-            continue;
-        }
-        let cpumode = record.header.misc & PERF_RECORD_MISC_CPUMODE_MASK;
-        // A host kcore cannot identify guest maps, even if names/addresses coincide.
-        if cpumode == 4 {
-            return Err("guest kernel maps cannot use host kcore".into());
-        }
-        if cpumode != PERF_RECORD_MISC_CPUMODE_KERNEL {
-            continue;
-        }
-        let mapping = match super::parse_fold_record(record)? {
-            super::FoldRecord::Mmap { record, .. } => RecordedKernelMap {
-                path: record.path,
-                start: record.start,
-                pgoff: record.pgoff,
-                prot: 0,
-            },
-            super::FoldRecord::Mmap2 { record, .. } => RecordedKernelMap {
-                path: record.path,
-                start: record.start,
-                pgoff: record.pgoff,
-                prot: record.prot,
-            },
-            super::FoldRecord::Mmap2BuildId { record, .. } => RecordedKernelMap {
-                path: record.path,
-                start: record.start,
-                pgoff: record.pgoff,
-                prot: record.prot,
-            },
-            _ => unreachable!("only mmap records are parsed"),
-        };
-        mappings.push(mapping);
-    }
-    Ok((arch, mappings))
+    let len = usize::try_from(file.metadata().map_err(|error| error.to_string())?.len())
+        .map_err(|error| error.to_string())?;
+    validate_perfdata_sections(header, len)?;
+    Ok(super::perf_arch_from_header(
+        header_arch_from_file(&file, header, &bytes)?.as_deref(),
+    ))
 }

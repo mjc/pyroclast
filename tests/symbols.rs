@@ -2358,7 +2358,7 @@ fn perf_symbol_resolver_loads_perfdata_kernel_build_id_cache() {
 }
 
 #[test]
-fn perf_symbol_resolver_loads_perfdata_kernel_build_id_cache_from_file() {
+fn perf_symbol_resolver_loads_kernel_build_id_cache_from_delivered_maps() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
     std::fs::write(&perfdata, perfdata_with_kernel_build_id()).expect("perfdata");
@@ -2375,6 +2375,7 @@ fn perf_symbol_resolver_loads_perfdata_kernel_build_id_cache_from_file() {
     let runner = Addr2lineRunner::new(b"");
     let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
         .with_perfdata_file_kernel_cache(&perfdata, root.path());
+    resolver.initialize_kernel_maps(&kernel_build_id_maps());
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
@@ -2394,7 +2395,7 @@ fn perf_symbol_resolver_loads_perfdata_kernel_build_id_cache_from_file() {
 }
 
 #[test]
-fn perf_symbol_resolver_opens_kernel_metadata_only_on_a_kernel_request() {
+fn perf_symbol_resolver_loads_kernel_metadata_only_with_delivered_kernel_maps() {
     // tools/perf/util/symbol.c:dso__load loads a DSO on demand, not when
     // constructing a session that may contain only user-space samples.
     let root = tempfile::tempdir().unwrap();
@@ -2411,6 +2412,7 @@ fn perf_symbol_resolver_opens_kernel_metadata_only_on_a_kernel_request() {
         .join("kallsyms");
     std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
     std::fs::write(cached, "ffffffff88000080 t asm_exc_page_fault\n").unwrap();
+    resolver.initialize_kernel_maps(&kernel_build_id_maps());
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
             addr2line_address: None,
@@ -2535,6 +2537,7 @@ fn perf_symbol_resolver_constructor_uses_perfdata_cache_before_system_kallsyms()
 
     let runner = Addr2lineRunner::new(b"");
     let resolver = perf_symbol_resolver_for_perfdata_file(&runner, &perfdata, home.path());
+    resolver.initialize_kernel_maps(&kernel_build_id_maps());
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
@@ -2575,6 +2578,7 @@ fn perf_symbol_resolver_does_not_use_system_map_for_recorded_kernel_build_id_wit
         [system_map],
         &home.path().join("kallsyms"),
     );
+    resolver.initialize_kernel_maps(&kernel_build_id_maps());
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
@@ -2622,6 +2626,7 @@ fn check_live_module_build_id_without_cache(core_first: bool) {
         [],
         &live_kallsyms,
     );
+    resolver.initialize_kernel_maps(&kernel_build_id_maps());
 
     if core_first {
         load_module_test_core(&resolver);
@@ -2696,6 +2701,7 @@ ffffffff914e8fa0 t mp_map_pin_to_irq
     )
     .with_system_kallsyms_from_path(&live_kallsyms)
     .with_live_kernel_notes_path(live_notes);
+    resolver.initialize_kernel_maps(&kernel_build_id_maps());
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
@@ -2742,6 +2748,7 @@ fn perf_symbol_resolver_prefers_perfdata_kallsyms_over_kernel_elf() {
 
     let runner = Addr2lineRunner::new(b"memcpy\n??:0\n");
     let resolver = perf_symbol_resolver_for_perfdata_file(&runner, &perfdata, home.path());
+    resolver.initialize_kernel_maps(&kernel_build_id_maps());
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
@@ -2776,6 +2783,7 @@ fn perf_symbol_resolver_rejects_invalid_kernel_build_id_elf_when_kallsyms_is_mis
     let runner = Addr2lineRunner::new(b"asm_exc_page_fault\n??:0\n");
     let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
         .with_perfdata_file_kernel_cache(&perfdata, &perf_debug_dir(home.path()));
+    resolver.initialize_kernel_maps(&kernel_build_id_maps());
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
@@ -2811,6 +2819,7 @@ fn perf_symbol_resolver_uses_valid_kernel_build_id_elf_when_kallsyms_is_missing(
     let runner = Addr2lineRunner::new(b"asm_exc_page_fault\n??:0\n");
     let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
         .with_perfdata_file_kernel_cache(&perfdata, &perf_debug_dir(home.path()));
+    resolver.initialize_kernel_maps(&kernel_build_id_maps());
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
             addr2line_address: None,
@@ -3620,6 +3629,7 @@ fn perf_symbol_resolver_uses_system_map_candidates_when_cache_is_missing() {
     let runner = Addr2lineRunner::new(b"");
     let resolver = perf_symbol_resolver_for_perfdata_file(&runner, &perfdata, home.path())
         .with_system_map_candidates([system_map]);
+    resolver.initialize_kernel_maps(&kernel_build_id_maps());
 
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
@@ -3662,6 +3672,7 @@ fn perf_symbol_resolver_keeps_live_kallsyms_for_modules_when_system_map_exists()
         [system_map],
         &kallsyms,
     );
+    resolver.initialize_kernel_maps(&kernel_build_id_maps());
 
     let symbols = resolver
         .resolve_batch(&[
@@ -3710,8 +3721,33 @@ fn perfdata_with_kernel_build_id() -> Vec<u8> {
         0x16, 0xed, 0x3d, 0x53, 0x17, 0xad, 0x21, 0x9c, 0x89, 0xd0, 0xe3, 0xc5, 0xea, 0x0e, 0xa2,
         0xca, 0xa3, 0xcd, 0x49, 0x49,
     ];
-    let payload = build_id_event_payload(u32::MAX, &build_id, "[kernel.kallsyms]");
+    let mut payload = build_id_event_payload(u32::MAX, &build_id, "[kernel.kallsyms]");
+    // header.c:__event_process_build_id rejects misc=0; host kernel is 1.
+    payload[4..6].copy_from_slice(&1_u16.to_le_bytes());
     perfdata_with_build_id_feature(&payload)
+}
+
+fn kernel_build_id_maps() -> pyroclast::perfdata::mappings::MmapTable {
+    // Supply the delivered map/DSO header context, rather than asking a symbol
+    // resolver to replay future records from the file (perf map.c:map__load).
+    let mut record = Vec::new();
+    record.extend(1_u32.to_le_bytes());
+    record.extend(1_u16.to_le_bytes());
+    record.extend(72_u16.to_le_bytes());
+    record.extend(u32::MAX.to_le_bytes());
+    record.extend(0_u32.to_le_bytes());
+    record.extend(0xffff_ffff_8800_0000_u64.to_le_bytes());
+    record.extend(0x1000_u64.to_le_bytes());
+    record.extend(0_u64.to_le_bytes());
+    record.extend(b"[kernel.kallsyms]\0");
+    record.resize(72, 0);
+    let mut bytes = perfdata_with_kernel_build_id();
+    bytes.splice(128..128, record);
+    put_u64(&mut bytes, 48, 72);
+    put_u64(&mut bytes, 200, 232);
+    pyroclast::perfdata::fold::summarize_perfdata(&bytes)
+        .expect("delivered kernel map")
+        .mmap_table
 }
 
 fn build_id_event_payload(pid: u32, build_id: &[u8; 20], filename: &str) -> Vec<u8> {

@@ -5882,6 +5882,7 @@ fn assert_native_kcore_reference_selection(reference_rows: &str, accepted: bool)
         .mmap_table
         .resolve_ref(11, 0xffff_ffff_8100_0010)
         .unwrap();
+    resolver.initialize_kernel_maps(&summary.mmap_table);
     resolved_kernel_dso(&resolver, &core);
     let module = summary
         .mmap_table
@@ -5927,6 +5928,7 @@ fn native_kcore_replaces_module_dso_names_only_when_recorded_addresses_match() {
         .mmap_table
         .resolve_ref(11, 0xffff_ffff_8100_0010)
         .unwrap();
+    resolver.initialize_kernel_maps(&summary.mmap_table);
     assert_eq!(resolved_kernel_dso(&resolver, &core), "[kernel.kallsyms]");
     assert_eq!(
         resolved_kernel_dso(&resolver, &mapping),
@@ -5962,13 +5964,17 @@ fn native_kcore_replaces_module_dso_names_only_when_recorded_addresses_match() {
         assert_eq!(actual.as_bytes(), native);
     }
     let new_resolver = || {
-        perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+        let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
             StaticSymbolResolver,
             &root.path().join("perf.data"),
             root.path(),
             [],
             &root.path().join("kallsyms"),
-        )
+        );
+        let current =
+            summarize_perfdata(&std::fs::read(root.path().join("perf.data")).unwrap()).unwrap();
+        resolver.initialize_kernel_maps(&current.mmap_table);
+        resolver
     };
     // Matching kernel identity alone cannot validate a module loaded elsewhere.
     std::fs::write(
@@ -5999,6 +6005,157 @@ fn native_kcore_replaces_module_dso_names_only_when_recorded_addresses_match() {
     std::fs::write(root.path().join("perf.data"), &bytes).unwrap();
     std::fs::write(root.path().join("kcore"), b"truncated").unwrap();
     assert_eq!(resolved_kernel_dso(&new_resolver(), &mapping), "[a]");
+}
+
+#[cfg(target_os = "linux")]
+fn assert_later_kernel_map_does_not_change_kcore_load(path: &str, misc: u16, pgoff: u64) {
+    use pyroclast::symbols::{SelectedObjectResolver, SymbolizerKind};
+    // symbol.c:validate_kcore_addresses validates the delivered machine maps,
+    // not future records. dso__load caches that first kernel load.
+    let (root, mut bytes) = write_native_kcore_fixture("[a]");
+    let summary = summarize_perfdata(&bytes).unwrap();
+    let mapping = summary
+        .mmap_table
+        .resolve_ref(11, 0xffff_ffff_c100_0010)
+        .unwrap();
+    let header = pyroclast::perfdata::header::parse_header(&bytes).unwrap();
+    assert_eq!(
+        header.data_offset + header.data_size,
+        u64::try_from(bytes.len()).unwrap()
+    );
+    let start = if path.starts_with("[kernel.kallsyms]") {
+        0xffff_ffff_8100_0000
+    } else {
+        0xffff_ffff_c200_0000
+    };
+    let mut payload = mmap_payload(u32::MAX, u32::MAX, start, 0x10000, pgoff, path);
+    payload.resize(payload.len().next_multiple_of(8), 0);
+    let record = record_bytes_with_misc(1, misc, &payload);
+    put_u64(
+        &mut bytes,
+        48,
+        header.data_size + u64::try_from(record.len()).unwrap(),
+    );
+    bytes.extend_from_slice(&record);
+    std::fs::write(root.path().join("perf.data"), &bytes).unwrap();
+    let (script, stderr, native) = query_native_module_kallsyms(root.path(), &[]);
+    assert!(stderr.contains("/kcore for kernel data"), "{stderr}");
+    assert!(
+        script.contains("first+0x10 ([kernel.kallsyms])"),
+        "{script}"
+    );
+    let runner = pyroclast::process::RealCommandRunner::default();
+    for symbolizer in [SymbolizerKind::RustAddr2line, SymbolizerKind::Addr2line] {
+        for inline in [false, true] {
+            for file_route in [false, true] {
+                let resolver =
+                    perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+                        SelectedObjectResolver::new(&runner, symbolizer),
+                        &root.path().join("perf.data"),
+                        root.path(),
+                        [],
+                        &root.path().join("kallsyms"),
+                    );
+                let options = FoldOptions {
+                    inline,
+                    count_periods: true,
+                };
+                let actual = if file_route {
+                    pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(
+                        &root.path().join("perf.data"),
+                        options,
+                        &resolver,
+                    )
+                } else {
+                    fold_perfdata_callchains_with_symbols(&bytes, options, &resolver)
+                }
+                .unwrap();
+                assert_eq!(
+                    actual.as_bytes(),
+                    native,
+                    "{symbolizer:?}, inline={inline}, file={file_route}"
+                );
+                // Inferno drops a known symbol's DSO in its default folded
+                // key. Check the retained source used by perf-script too.
+                assert_eq!(
+                    resolved_kernel_dso(&resolver, &mapping),
+                    "[kernel.kallsyms]",
+                    "{symbolizer:?}, inline={inline}, file={file_route}: {script}",
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_kcore_first_load_ignores_future_module_maps() {
+    assert_later_kernel_map_does_not_change_kcore_load(
+        "[later]",
+        PERF_RECORD_MISC_CPUMODE_KERNEL,
+        0,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_kcore_first_load_ignores_future_relocation_references() {
+    assert_later_kernel_map_does_not_change_kcore_load(
+        "[kernel.kallsyms]_stext",
+        PERF_RECORD_MISC_CPUMODE_KERNEL,
+        0xffff_ffff_8100_1000,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_host_kcore_first_load_ignores_future_guest_kernel_maps() {
+    assert_later_kernel_map_does_not_change_kcore_load("[later]", 4, 0);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn kcore_failed_first_load_is_not_retried_after_source_files_change() {
+    // map.c:map__load and symbol.c:dso__load cache the first load, including
+    // failure. Later filesystem changes do not reopen that loaded core DSO.
+    let (root, bytes) = write_native_kcore_fixture("[a]");
+    let summary = summarize_perfdata(&bytes).unwrap();
+    let core = summary
+        .mmap_table
+        .resolve_ref(11, 0xffff_ffff_8100_0010)
+        .unwrap();
+    let module = summary
+        .mmap_table
+        .resolve_ref(11, 0xffff_ffff_c100_0010)
+        .unwrap();
+    let kcore = root.path().join("kcore");
+    let valid = std::fs::read(&kcore).unwrap();
+    std::fs::write(&kcore, b"truncated").unwrap();
+    let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+        StaticSymbolResolver,
+        &root.path().join("perf.data"),
+        root.path(),
+        [],
+        &root.path().join("kallsyms"),
+    );
+    resolver.initialize_kernel_maps(&summary.mmap_table);
+    resolved_kernel_dso(&resolver, &core);
+    assert_eq!(resolved_kernel_dso(&resolver, &module), "[a]");
+    std::fs::write(kcore, valid).unwrap();
+    resolver.initialize_kernel_maps(&summary.mmap_table);
+    assert_eq!(resolved_kernel_dso(&resolver, &module), "[a]");
+    let (_, stderr, _) = query_native_module_kallsyms(root.path(), &[]);
+    assert!(stderr.contains("/kcore for kernel data"), "{stderr}");
+    let fresh = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+        StaticSymbolResolver,
+        &root.path().join("perf.data"),
+        root.path(),
+        [],
+        &root.path().join("kallsyms"),
+    );
+    fresh.initialize_kernel_maps(&summary.mmap_table);
+    resolved_kernel_dso(&fresh, &core);
+    assert_eq!(resolved_kernel_dso(&fresh, &module), "[kernel.kallsyms]");
 }
 
 #[cfg(target_os = "linux")]
@@ -6287,6 +6444,7 @@ fn native_kcore_checks_absolute_and_compressed_module_addresses() {
             [],
             &root.path().join("kallsyms"),
         );
+        resolver.initialize_kernel_maps(&summary.mmap_table);
         assert_eq!(resolved_kernel_dso(&resolver, &mapping), module_path);
         // Exercise the same validation through the core map, independent of
         // the module frame's absolute object path.
@@ -6331,6 +6489,7 @@ fn native_kcore_accepts_a_hidden_zero_relocation_reference() {
         .mmap_table
         .resolve_ref(11, 0xffff_ffff_8100_0010)
         .unwrap();
+    resolver.initialize_kernel_maps(&summary.mmap_table);
     assert_eq!(resolved_kernel_dso(&resolver, &core), "[kernel.kallsyms]");
     assert_eq!(
         resolved_kernel_dso(&resolver, &mapping),
@@ -6739,7 +6898,7 @@ fn kcore_module_object_resolution_precedes_initial_core_loading() {
             Ok(vec![Some("cached_module_object".into()); requests.len()])
         }
     }
-    let (root, _) = write_native_kcore_fixture("[a]");
+    let (root, recording) = write_native_kcore_fixture("[a]");
     let debug = root.path().join(".debug");
     let object = pyroclast::symbols::perf_build_id_elf_path(&debug, "abcdef");
     std::fs::create_dir_all(object.parent().unwrap()).unwrap();
@@ -6782,6 +6941,7 @@ fn kcore_module_object_resolution_precedes_initial_core_loading() {
         [],
         &root.path().join("kallsyms"),
     );
+    resolver.initialize_kernel_maps(&summarize_perfdata(&recording).unwrap().mmap_table);
     let module = SymbolRequest {
         addr2line_address: None,
         kernel_module_address: None,
@@ -11014,7 +11174,7 @@ impl SymbolResolver for RecordingSymbolResolver {
 #[cfg(target_os = "linux")]
 #[test]
 fn kcore_failed_cached_module_loading_preserves_first_cursor_then_replaces_maps() {
-    let (root, _) = write_native_kcore_fixture("[a]");
+    let (root, recording) = write_native_kcore_fixture("[a]");
     let debug = root.path().join(".debug");
     let object = pyroclast::symbols::perf_build_id_elf_path(&debug, "abcdef");
     std::fs::create_dir_all(object.parent().unwrap()).unwrap();
@@ -11037,6 +11197,7 @@ fn kcore_failed_cached_module_loading_preserves_first_cursor_then_replaces_maps(
             [],
             &root.path().join("kallsyms"),
         );
+        resolver.initialize_kernel_maps(&summarize_perfdata(&recording).unwrap().mmap_table);
         if scalar {
             assert_eq!(
                 resolver
@@ -12125,105 +12286,110 @@ fn query_native_module_object(root: &std::path::Path) -> (String, String, Vec<u8
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn kernel_symbol_batches_preserve_native_module_core_cursor_order() {
+    for data_symbol in [true, false] {
+        assert_kernel_symbol_batch_cursor_order(data_symbol);
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn assert_kernel_symbol_batch_cursor_order(data_symbol: bool) {
     use pyroclast::symbols::{SelectedObjectResolver, SymbolizerKind};
     use std::fmt::Write as _;
     const MODULE: u64 = 0xffff_ffff_c100_0010;
     const CORE: u64 = 0xffff_ffff_8100_0010;
 
-    for data_symbol in [true, false] {
-        let (root, bytes) = write_native_cached_module_queries(
-            false,
-            data_symbol,
-            &[
-                (MODULE, &[MODULE]),
-                (MODULE + 0x10, &[MODULE + 0x10]),
-                (CORE, &[CORE]),
-                (MODULE, &[MODULE]),
-            ],
-        );
-        let (script, _, folded) = query_native_module_object(root.path());
+    let (root, bytes) = write_native_cached_module_queries(
+        false,
+        data_symbol,
+        &[
+            (MODULE, &[MODULE]),
+            (MODULE + 0x10, &[MODULE + 0x10]),
+            (CORE, &[CORE]),
+            (MODULE, &[MODULE]),
+        ],
+    );
+    let (script, _, folded) = query_native_module_object(root.path());
+    assert_eq!(
+        script.matches("cached_module_object+0x").count(),
+        if data_symbol { 3 } else { 1 },
+        "{script}"
+    );
+    assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &folded);
+    let summary = summarize_perfdata(&bytes).unwrap();
+    let requests = [MODULE, MODULE + 0x10, CORE, MODULE].map(|ip| {
+        let mapping = summary.mmap_table.resolve_ref(11, ip).unwrap();
+        SymbolRequest {
+            addr2line_address: None,
+            path: mapping.path.into(),
+            relative_address: mapping.relative_address,
+            kernel_module_address: mapping.kernel_module_address,
+            kernel_mapping_range: Some((mapping.start, mapping.end)),
+            build_id: mapping.build_id.map(|id| {
+                id.iter().fold(String::new(), |mut hex, byte| {
+                    write!(hex, "{byte:02x}").unwrap();
+                    hex
+                })
+            }),
+            file_identity: mapping.file_identity,
+            kernel_relocation: mapping.kernel_relocation,
+        }
+    });
+    let runner = pyroclast::process::RealCommandRunner::default();
+    for symbolizer in [SymbolizerKind::RustAddr2line, SymbolizerKind::Addr2line] {
+        let make_resolver = || {
+            let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+                SelectedObjectResolver::new(&runner, symbolizer),
+                &root.path().join("perf.data"),
+                root.path(),
+                [],
+                &root.path().join("kallsyms"),
+            );
+            resolver.initialize_kernel_maps(&summary.mmap_table);
+            resolver
+        };
+        let sequential = make_resolver();
+        let expected = requests
+            .iter()
+            .flat_map(|request| {
+                sequential
+                    .resolve_batch(std::slice::from_ref(request))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(expected[0].as_deref(), Some("cached_module_object"));
+        let later_symbol = if data_symbol {
+            "cached_module_object"
+        } else {
+            "first+0x10"
+        };
+        assert_eq!(expected[3].as_deref(), Some(later_symbol));
         assert_eq!(
-            script.matches("cached_module_object+0x").count(),
-            if data_symbol { 3 } else { 1 },
-            "{script}"
+            make_resolver().resolve_batch(&requests).unwrap(),
+            expected,
+            "{symbolizer:?} data={data_symbol}: {script}"
         );
-        assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &folded);
-        let summary = summarize_perfdata(&bytes).unwrap();
-        let requests = [MODULE, MODULE + 0x10, CORE, MODULE].map(|ip| {
-            let mapping = summary.mmap_table.resolve_ref(11, ip).unwrap();
-            SymbolRequest {
-                addr2line_address: None,
-                path: mapping.path.into(),
-                relative_address: mapping.relative_address,
-                kernel_module_address: mapping.kernel_module_address,
-                kernel_mapping_range: Some((mapping.start, mapping.end)),
-                build_id: mapping.build_id.map(|id| {
-                    id.iter().fold(String::new(), |mut hex, byte| {
-                        write!(hex, "{byte:02x}").unwrap();
-                        hex
-                    })
-                }),
-                file_identity: mapping.file_identity,
-                kernel_relocation: mapping.kernel_relocation,
-            }
-        });
-        let runner = pyroclast::process::RealCommandRunner::default();
-        for symbolizer in [SymbolizerKind::RustAddr2line, SymbolizerKind::Addr2line] {
-            let make_resolver = || {
-                perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
-                    SelectedObjectResolver::new(&runner, symbolizer),
-                    &root.path().join("perf.data"),
-                    root.path(),
-                    [],
-                    &root.path().join("kallsyms"),
-                )
+        for inline in [false, true] {
+            let resolve = |resolver: &pyroclast::symbols::PerfSymbolResolver<
+                SelectedObjectResolver<'_, pyroclast::process::RealCommandRunner>,
+            >,
+                           batch: &[SymbolRequest]| {
+                if inline {
+                    resolver.resolve_frame_batch_with_metadata(batch)
+                } else {
+                    resolver.resolve_base_frame_batch_with_metadata(batch)
+                }
+                .unwrap()
             };
             let sequential = make_resolver();
             let expected = requests
                 .iter()
-                .flat_map(|request| {
-                    sequential
-                        .resolve_batch(std::slice::from_ref(request))
-                        .unwrap()
-                })
+                .flat_map(|request| resolve(&sequential, std::slice::from_ref(request)))
                 .collect::<Vec<_>>();
-            assert_eq!(expected[0].as_deref(), Some("cached_module_object"));
             assert_eq!(
-                expected[3].as_deref(),
-                Some(if data_symbol {
-                    "cached_module_object"
-                } else {
-                    "first+0x10"
-                })
-            );
-            assert_eq!(
-                make_resolver().resolve_batch(&requests).unwrap(),
+                resolve(&make_resolver(), &requests),
                 expected,
-                "{symbolizer:?} data={data_symbol}: {script}"
+                "{symbolizer:?} inline={inline} data={data_symbol}"
             );
-            for inline in [false, true] {
-                let resolve = |resolver: &pyroclast::symbols::PerfSymbolResolver<
-                    SelectedObjectResolver<'_, pyroclast::process::RealCommandRunner>,
-                >,
-                               batch: &[SymbolRequest]| {
-                    if inline {
-                        resolver.resolve_frame_batch_with_metadata(batch)
-                    } else {
-                        resolver.resolve_base_frame_batch_with_metadata(batch)
-                    }
-                    .unwrap()
-                };
-                let sequential = make_resolver();
-                let expected = requests
-                    .iter()
-                    .flat_map(|request| resolve(&sequential, std::slice::from_ref(request)))
-                    .collect::<Vec<_>>();
-                assert_eq!(
-                    resolve(&make_resolver(), &requests),
-                    expected,
-                    "{symbolizer:?} inline={inline} data={data_symbol}"
-                );
-            }
         }
     }
 }

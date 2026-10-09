@@ -83,6 +83,15 @@ pub struct ResolvedMappingRef<'a> {
     pub kernel_relocation: Option<KernelRelocation>,
 }
 
+pub(crate) struct HostKernelMappingRef<'a> {
+    pub path: &'a str,
+    pub module_name: Option<&'a str>,
+    pub start: u64,
+    pub pgoff: u64,
+    pub prot: u32,
+    pub build_id: Option<&'a [u8]>,
+}
+
 pub(super) struct DsoMemoryMapping<'a> {
     pub(super) source_id: usize,
     pub(super) path: &'a str,
@@ -430,6 +439,7 @@ struct NativeDso {
     build_id: OnceCell<Vec<u8>>,
     symbol_build_id: OnceCell<Option<Vec<u8>>>,
     file_identity: Option<FileIdentity>,
+    is_kernel_core: bool,
 }
 
 impl NativeDso {
@@ -492,7 +502,7 @@ impl NativeDso {
 
 impl NativeDsoRegistry {
     fn register_header(&mut self, path: &str, build_id: &[u8], misc: u16) {
-        if build_id.iter().all(|byte| *byte == 0) || !self.header_paths.insert(path.to_string()) {
+        if !self.header_paths.insert(path.to_string()) {
             return;
         }
         // header.c:__event_process_build_id finds by empty identity, then
@@ -504,10 +514,13 @@ impl NativeDsoRegistry {
 
     fn set_header_module_name(&mut self, id: usize, misc: u16) {
         // header.c:2550 calls dso__set_module_info only for kernel modules.
-        if mapping_cpumode_from_misc(misc) == PERF_RECORD_MISC_CPUMODE_KERNEL
-            && let name = crate::symbols::kcore::module_dso_short_name(&self.entries[id].path)
-            && name.starts_with('[')
-            && let basename = self.entries[id].path.rsplit('/').next().unwrap_or_default()
+        if mapping_cpumode_from_misc(misc) != PERF_RECORD_MISC_CPUMODE_KERNEL {
+            return;
+        }
+        let dso = &mut self.entries[id];
+        let name = crate::symbols::kcore::module_dso_short_name(&dso.path);
+        let basename = dso.path.rsplit('/').next().unwrap_or_default();
+        let is_module = name.starts_with('[')
             // dso.c:436 applies reserved prefixes only to an originally
             // bracketed basename, not to a canonicalized ordinary .ko name.
             && (!basename.starts_with('[') || ![
@@ -519,12 +532,30 @@ impl NativeDsoRegistry {
                 "[vsyscall]",
             ]
             .iter()
-            .any(|prefix| basename.starts_with(prefix)))
-        {
-            self.entries[id].short_name = name.into_owned();
+            .any(|prefix| basename.starts_with(prefix)));
+        dso.is_kernel_core = !is_module;
+        if is_module {
+            dso.short_name = name.into_owned();
             // dso.c:dso__set_short_name invalidates the array sort order.
             self.sorted = false;
         }
+    }
+
+    fn intern_kernel(&mut self, build_id: Option<&[u8]>) -> usize {
+        // machine.c:machine__process_kernel_mmap_event selects the existing
+        // header kernel DSO via dsos.c:dsos__find_kernel_dso. The MMAP suffix
+        // names a relocation reference, not a new symbol source.
+        let id = self
+            .order
+            .iter()
+            .copied()
+            .find(|&id| self.entries[id].is_kernel_core)
+            .unwrap_or_else(|| self.intern("[kernel.kallsyms]", None, None));
+        self.entries[id].is_kernel_core = true;
+        if let Some(build_id) = build_id.filter(|id| id.iter().any(|byte| *byte != 0)) {
+            self.entries[id].set_build_id(build_id);
+        }
+        id
     }
 
     fn intern_module(&mut self, path: &str, build_id: Option<&[u8]>) -> usize {
@@ -594,6 +625,7 @@ impl NativeDsoRegistry {
             build_id: build_id.map_or_else(OnceCell::new, |id| OnceCell::from(id.to_vec())),
             symbol_build_id: OnceCell::new(),
             file_identity,
+            is_kernel_core: false,
         };
         if !self.sorted {
             self.entries.push(dso);
@@ -1099,7 +1131,11 @@ impl MmapTable {
             .mmap_build_id
             .then_some(mapping.build_id.as_deref())
             .flatten();
-        mapping.native_dso_id = if is_module {
+        mapping.native_dso_id = if mapping.cpumode == PERF_RECORD_MISC_CPUMODE_KERNEL
+            && mapping.path.starts_with("[kernel.kallsyms]")
+        {
+            self.native_dsos.intern_kernel(build_id)
+        } else if is_module {
             self.native_dsos.intern_module(&mapping.path, build_id)
         } else {
             self.native_dsos
@@ -1449,7 +1485,30 @@ impl MmapTable {
                 dso.build_id.get().cloned()
             })
             .as_deref();
+        if frame.mapping.cpumode == PERF_RECORD_MISC_CPUMODE_KERNEL {
+            resolver.initialize_kernel_maps(self);
+        }
         mapping
+    }
+
+    pub(crate) fn host_kernel_mappings(&self) -> impl Iterator<Item = HostKernelMappingRef<'_>> {
+        self.mappings
+            .iter()
+            .filter(|mapping| mapping.cpumode == PERF_RECORD_MISC_CPUMODE_KERNEL)
+            .map(|mapping| {
+                let dso = &self.native_dsos.entries[mapping.native_dso_id];
+                HostKernelMappingRef {
+                    path: &mapping.path,
+                    module_name: mapping.module_display.as_deref(),
+                    start: mapping.start,
+                    pgoff: mapping.pgoff,
+                    prot: mapping.prot.unwrap_or(0),
+                    build_id: dso
+                        .symbol_build_id
+                        .get()
+                        .map_or_else(|| dso.build_id(), Option::as_deref),
+                }
+            })
     }
 
     pub(crate) fn resolve_user_frame_cached(
@@ -1847,6 +1906,61 @@ fn is_perf_data_path(path: &str) -> bool {
 mod tests {
     use proptest::prelude::*;
 
+    #[test]
+    fn zero_build_id_header_keeps_the_kernel_dso_classification() {
+        // header.c:__event_process_build_id sets kernel space even when
+        // build_id__is_defined is false. dsos__find_kernel_dso still finds it.
+        let mut table = super::MmapTable::default();
+        table.initialize_native_dso_headers([
+            (
+                "/boot/vmlinux",
+                &[0; 20][..],
+                PERF_RECORD_MISC_CPUMODE_KERNEL,
+            ),
+            (
+                "[kernel.kallsyms]",
+                &[0xa5; 20][..],
+                PERF_RECORD_MISC_CPUMODE_KERNEL,
+            ),
+        ]);
+        table.insert_mmap_with_misc(
+            mutation_record(u32::MAX, 0x1000, 0x100, 0, "[kernel.kallsyms]_stext"),
+            PERF_RECORD_MISC_CPUMODE_KERNEL,
+        );
+        let mapping = table.host_kernel_mappings().next().unwrap();
+        assert_eq!(mapping.build_id, None);
+        assert_eq!(table.native_dsos.entries.len(), 2);
+    }
+
+    #[test]
+    fn kernel_relocation_maps_reuse_the_header_kernel_dso() {
+        // machine.c:machine__process_kernel_mmap_event uses
+        // dsos__find_kernel_dso, not the MMAP's relocation reference filename.
+        // header.c:__event_process_build_id marks the header DSO as kernel.
+        for header_path in ["[kernel.kallsyms]", "/boot/vmlinux"] {
+            let mut table = super::MmapTable::default();
+            table.initialize_native_dso_headers([(
+                header_path,
+                &[0xa5; 20][..],
+                PERF_RECORD_MISC_CPUMODE_KERNEL,
+            )]);
+            table.insert_mmap_with_misc(
+                mutation_record(
+                    u32::MAX,
+                    0xffff_ffff_8100_0000,
+                    0x10000,
+                    0xffff_ffff_8100_0000,
+                    "[kernel.kallsyms]_stext",
+                ),
+                PERF_RECORD_MISC_CPUMODE_KERNEL,
+            );
+            let mapping = table.host_kernel_mappings().next().unwrap();
+            assert_eq!(mapping.build_id, Some(&[0xa5; 20][..]), "{header_path}");
+            assert_eq!(table.native_dsos.entries.len(), 1);
+            assert_eq!(mapping.path, "[kernel.kallsyms]_stext");
+        }
+    }
+
     struct BuildIdProbe {
         calls: std::cell::Cell<usize>,
         id: Option<Vec<u8>>,
@@ -2030,6 +2144,7 @@ mod tests {
             file_identity: inode.map(file),
             build_id: std::cell::OnceCell::from(vec![byte; 20]),
             symbol_build_id: std::cell::OnceCell::new(),
+            is_kernel_core: false,
         };
         let a = dso(Some(2), 0x33);
         let b = dso(Some(1), 0x11);

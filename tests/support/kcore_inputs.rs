@@ -336,6 +336,7 @@ mod module_inputs {
 
         let bytes = std::fs::read(input).unwrap();
         let summary = summarize_perfdata(&bytes).unwrap();
+        resolver.initialize_kernel_maps(&summary.mmap_table);
         let mapping = summary
             .mmap_table
             .resolve_ref(11, 0xffff_ffff_c100_0010)

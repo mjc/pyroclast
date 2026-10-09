@@ -26,10 +26,8 @@ use rustc_hash::FxBuildHasher;
 use serde::Serialize;
 use smallvec::SmallVec;
 
-use crate::perfdata::build_id::{
-    hex_build_id_bytes, kernel_build_id_from_perfdata, kernel_build_id_from_perfdata_file,
-};
-use crate::perfdata::mappings::{FileIdentity, MappedFrame, ResolvedMappingRef};
+use crate::perfdata::build_id::{hex_build_id_bytes, kernel_build_id_from_perfdata};
+use crate::perfdata::mappings::{FileIdentity, MappedFrame, MmapTable, ResolvedMappingRef};
 use crate::process::{CommandRunner, CommandSpec};
 
 type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
@@ -156,6 +154,10 @@ pub struct KernelModuleObjectMetadata {
 }
 
 pub trait SymbolResolver {
+    /// Supplies the currently delivered host kernel maps before symbol loading.
+    /// Direct callers must provide this context explicitly; no recording is replayed.
+    fn initialize_kernel_maps(&self, _table: &MmapTable) {}
+
     /// Reports the live ELF's ID before a DSO's first symbol lookup, as perf's
     /// `symbol.c:dso__load` does before selecting build-ID cache candidates.
     fn object_build_id(&self, _path: &Path) -> Option<Vec<u8>> {
@@ -1050,6 +1052,7 @@ struct FileKernelCache {
     perfdata: PathBuf,
     debug_dir: PathBuf,
     loaded: OnceLock<CachedKernelSymbols>,
+    arch: OnceLock<Option<crate::perfdata::unwind::PerfArch>>,
 }
 
 #[derive(Default)]
@@ -1060,22 +1063,30 @@ struct CachedKernelSymbols {
 }
 
 impl FileKernelCache {
-    fn symbols(&self) -> &CachedKernelSymbols {
+    fn arch(&self) -> Option<crate::perfdata::unwind::PerfArch> {
+        *self
+            .arch
+            .get_or_init(|| crate::perfdata::fold::perfdata_file_arch(&self.perfdata).ok())
+    }
+
+    fn initialize_symbols(&self, recorded_build_id: Option<&[u8]>) {
         self.loaded.get_or_init(|| {
-            let Some(build_id) = kernel_build_id_from_perfdata_file(&self.perfdata)
-                .ok()
-                .flatten()
-                .filter(|id| build_id_is_defined(id))
+            let Some(build_id) = recorded_build_id.filter(|id| id.iter().any(|byte| *byte != 0))
             else {
                 return CachedKernelSymbols::default();
             };
+            let build_id = build_id_hex(build_id);
             let elf = perf_build_id_elf_path(&self.debug_dir, &build_id);
             CachedKernelSymbols {
                 kallsyms: Kallsyms::load_perf_build_id_cache(&self.debug_dir, &build_id),
                 elf: elf.exists().then_some(elf),
                 build_id: Some(build_id),
             }
-        })
+        });
+    }
+
+    fn symbols(&self) -> Option<&CachedKernelSymbols> {
+        self.loaded.get()
     }
 }
 
@@ -1800,6 +1811,14 @@ where
     }
 
     #[must_use]
+    /// Configures lazy kernel sources for a completed recording.
+    ///
+    /// The perfdata replay supplies the currently delivered maps automatically.
+    /// Direct symbol callers must call [`SymbolResolver::initialize_kernel_maps`]
+    /// with that context before their first kernel lookup. Only architecture
+    /// metadata is read from the recording; its event stream is not replayed.
+    /// This follows perf `map.c:map__load` and
+    /// `symbol.c:validate_kcore_addresses` at the first DSO load.
     pub fn with_perfdata_file_kernel_cache(mut self, perfdata: &Path, debug_dir: &Path) -> Self {
         // tools/perf/util/symbol.c:dso__load loads symbols on demand. A
         // user-only recording must not first be traversed to find kernel IDs.
@@ -1807,6 +1826,7 @@ where
             perfdata: perfdata.to_path_buf(),
             debug_dir: debug_dir.to_path_buf(),
             loaded: OnceLock::new(),
+            arch: OnceLock::new(),
         });
         self.debug_dir = Some(debug_dir.to_path_buf());
         self
@@ -1883,7 +1903,7 @@ where
         self.recorded_kernel_build_id.as_deref().or_else(|| {
             self.file_kernel_cache
                 .as_ref()?
-                .symbols()
+                .symbols()?
                 .build_id
                 .as_deref()
         })
@@ -1892,13 +1912,17 @@ where
     fn kernel_elf_ref(&self) -> Option<&PathBuf> {
         self.kernel_elf
             .as_ref()
-            .or_else(|| self.file_kernel_cache.as_ref()?.symbols().elf.as_ref())
+            .or_else(|| self.file_kernel_cache.as_ref()?.symbols()?.elf.as_ref())
     }
 
     fn kallsyms_ref(&self) -> Option<&Kallsyms> {
-        self.kallsyms
-            .as_ref()
-            .or_else(|| self.file_kernel_cache.as_ref()?.symbols().kallsyms.as_ref())
+        self.kallsyms.as_ref().or_else(|| {
+            self.file_kernel_cache
+                .as_ref()?
+                .symbols()?
+                .kallsyms
+                .as_ref()
+        })
     }
 }
 
@@ -2763,6 +2787,34 @@ impl<O> SymbolResolver for PerfSymbolResolver<O>
 where
     O: SymbolResolver,
 {
+    fn initialize_kernel_maps(&self, table: &MmapTable) {
+        // A module without a delivered core map cannot load that core DSO yet.
+        if self.kcore_symbols.get().is_some() {
+            return;
+        }
+        let Some(core) = table
+            .host_kernel_mappings()
+            .find(|mapping| mapping.path.starts_with("[kernel.kallsyms]"))
+        else {
+            return;
+        };
+        if let Some(cache) = &self.file_kernel_cache {
+            cache.initialize_symbols(core.build_id);
+        }
+        self.kcore_symbols.get_or_init(|| {
+            // Explicit/cached sources retain their original mapping identity.
+            if self.kallsyms_ref().is_some() || self.kernel_elf_ref().is_some() {
+                return None;
+            }
+            let kallsyms_path = self.live_kallsyms_path.as_deref()?;
+            if kallsyms_path.file_name()? != "kallsyms" {
+                return None;
+            }
+            let arch = self.file_kernel_cache.as_ref()?.arch()?;
+            kcore::KcoreSymbols::load(table, arch, kallsyms_path, self.live_kallsyms_snapshot()?)
+        });
+    }
+
     fn preprocess_sample_ip(&self, mapping: &ResolvedMappingRef<'_>) {
         if is_kernel_module_symbol_path_str(mapping.path) || mapping.kernel_module_address.is_some()
         {
@@ -3359,16 +3411,7 @@ where
 
     fn kcore_symbols_ref(&self) -> Option<&kcore::KcoreSymbols> {
         self.kcore_symbols
-            .get_or_init(|| {
-                // Explicit/cached sources keep their own map identity. Host kcore
-                // is consulted only for the actual file-backed live kallsyms path.
-                if self.kallsyms_ref().is_some() || self.kernel_elf_ref().is_some() {
-                    return None;
-                }
-                let kallsyms_path = self.live_kallsyms_path.as_deref()?;
-                let recording = &self.file_kernel_cache.as_ref()?.perfdata;
-                kcore::KcoreSymbols::load(recording, kallsyms_path)
-            })
+            .get()?
             .as_ref()
             .filter(|symbols| !symbols.is_rejected())
     }
