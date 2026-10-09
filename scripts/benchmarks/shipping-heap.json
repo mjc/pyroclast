@@ -1,0 +1,25 @@
+{
+  "repetitions": 10,
+  "inputs": ["WORKLOAD"],
+  "conditions": "Declare host, tool versions, affinity, CPU load and cache policy before measuring. Linux heap: heaptrack --record-only followed by heaptrack_print. Shipping also writes machine-readable summaries and a run manifest. Captures are independent; verify each shipping summary against a fresh native report of its own raw recording outside the timed intervals.",
+  "rows": [
+    {
+      "name": "baseline",
+      "stages": [{"name": "workload", "argv": ["WORKLOAD", "alloc", "1000000"]}]
+    },
+    {
+      "name": "shipping",
+      "required_artifacts": ["shipping/profile.raw.heaptrack.zst", "shipping/run.json", "shipping/summary.json", "shipping/summary.txt", "shipping/stdout.log"],
+      "stages": [{"name": "profile_total", "argv": ["{pyroclast}", "profile", "--kind", "memory", "--json", "--out", "{run_dir}/shipping", "--", "WORKLOAD", "alloc", "1000000"]}]
+    },
+    {
+      "name": "native",
+      "required_artifacts": ["native.heaptrack.zst", "native.report"],
+      "stages": [
+        {"name": "capture", "argv": ["heaptrack", "--record-only", "-o", "{run_dir}/native.heaptrack", "WORKLOAD", "alloc", "1000000"]},
+        {"name": "analysis", "argv": ["heaptrack_print", "{run_dir}/native.heaptrack.zst"], "stdout": "native.report"}
+      ]
+    }
+  ],
+  "comparisons": []
+}

@@ -3,6 +3,77 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[test]
+fn heap_workflow_matrix_times_matching_targets_and_keeps_native_analysis_separate() {
+    let matrix: serde_json::Value =
+        serde_json::from_str(include_str!("../scripts/benchmarks/shipping-heap.json")).unwrap();
+    assert_eq!(matrix["repetitions"], 10);
+    assert_eq!(matrix["inputs"], serde_json::json!(["WORKLOAD"]));
+    // Independent captures have different timing and leaks; compare each summary
+    // with a fresh native report of its own raw recording outside timed stages.
+    assert_eq!(matrix["comparisons"], serde_json::json!([]));
+    let rows = matrix["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["name"], "baseline");
+    assert_eq!(
+        rows[0]["stages"][0]["argv"],
+        serde_json::json!(["WORKLOAD", "alloc", "1000000"])
+    );
+    assert_eq!(rows[1]["name"], "shipping");
+    assert_eq!(rows[1]["stages"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        rows[1]["stages"][0]["argv"],
+        serde_json::json!([
+            "{pyroclast}",
+            "profile",
+            "--kind",
+            "memory",
+            "--json",
+            "--out",
+            "{run_dir}/shipping",
+            "--",
+            "WORKLOAD",
+            "alloc",
+            "1000000"
+        ])
+    );
+    assert_eq!(rows[2]["name"], "native");
+    assert_eq!(rows[2]["stages"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        rows[2]["stages"][0]["argv"],
+        serde_json::json!([
+            "heaptrack",
+            "--record-only",
+            "-o",
+            "{run_dir}/native.heaptrack",
+            "WORKLOAD",
+            "alloc",
+            "1000000"
+        ])
+    );
+    assert_eq!(
+        rows[2]["stages"][1]["argv"],
+        serde_json::json!(["heaptrack_print", "{run_dir}/native.heaptrack.zst"])
+    );
+    assert_eq!(rows[2]["stages"][1]["stdout"], "native.report");
+    for (row, artifact) in [
+        (1, "shipping/profile.raw.heaptrack.zst"),
+        (1, "shipping/run.json"),
+        (1, "shipping/summary.json"),
+        (1, "shipping/summary.txt"),
+        (1, "shipping/stdout.log"),
+        (2, "native.heaptrack.zst"),
+        (2, "native.report"),
+    ] {
+        assert!(
+            rows[row]["required_artifacts"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(artifact))
+        );
+    }
+}
+
 fn build(root: &Path) -> [PathBuf; 2] {
     let c = root.join("c-workload");
     let rust = root.join("rust-workload");
