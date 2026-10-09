@@ -810,6 +810,42 @@ struct PerfDwarfCachedUnit {
     segments: Option<Vec<PerfDwarfFrameRange>>,
 }
 
+struct PerfDwarfPreparedUnit<R: gimli::Reader> {
+    header: gimli::UnitHeader<R>,
+    unit: Option<gimli::Unit<R>>,
+}
+
+struct PerfDwarfUnitDirectory<R: gimli::Reader> {
+    units: Vec<PerfDwarfPreparedUnit<R>>,
+}
+
+impl<R: gimli::Reader> PerfDwarfUnitDirectory<R> {
+    fn new(dwarf: &gimli::Dwarf<R>) -> Self {
+        let mut units = Vec::new();
+        let mut headers = dwarf.units();
+        while let Ok(Some(header)) = headers.next() {
+            let unit = dwarf.unit(header.clone()).ok();
+            units.push(PerfDwarfPreparedUnit { header, unit });
+        }
+        Self { units }
+    }
+
+    fn resolve_reference(
+        &self,
+        offset: gimli::DebugInfoOffset<R::Offset>,
+    ) -> Option<(&gimli::Unit<R>, gimli::UnitOffset<R::Offset>)> {
+        // Names can refer to CUs outside queried address coverage. Locate their
+        // owner without scanning units or preparing their inline frame indexes.
+        let index = self
+            .units
+            .partition_point(|unit| unit.header.offset().0 <= offset.0)
+            .checked_sub(1)?;
+        let prepared = &self.units[index];
+        let offset = offset.to_unit_offset(&prepared.header)?;
+        Some((prepared.unit.as_ref()?, offset))
+    }
+}
+
 pub(crate) struct LiveVdsoElf {
     pub(crate) path: PathBuf,
     pub(crate) architecture: object::Architecture,
@@ -4995,23 +5031,24 @@ impl PerfDwarfNameResolver {
         let dwarf =
             dwarf_sections.borrow(|section| gimli::EndianSlice::new(section.as_ref(), endian));
         let mut units = Vec::new();
-        let mut headers = dwarf.units();
-        while let Ok(Some(header)) = headers.next() {
-            let Ok(unit) = dwarf.unit(header) else {
+        let directory = PerfDwarfUnitDirectory::new(&dwarf);
+        for prepared in &directory.units {
+            let Some(unit) = &prepared.unit else {
                 continue;
             };
-            let ranges = perf_dwarf_ranges(dwarf.unit_ranges(&unit).ok());
+            let ranges = perf_dwarf_ranges(dwarf.unit_ranges(unit).ok());
             if let Some(addresses) = addresses
                 && !perf_dwarf_unit_ranges_match_addresses(ranges.as_deref(), addresses)
             {
                 continue;
             }
-            let source_line_ranges = perf_dwarf_source_line_ranges(&unit);
+            let source_line_ranges = perf_dwarf_source_line_ranges(unit);
             units.push(PerfDwarfUnitIndex {
                 ranges,
                 segments: perf_dwarf_unit_frame_ranges(
                     &dwarf,
-                    &unit,
+                    unit,
+                    &directory,
                     &mut names,
                     &source_line_ranges,
                 ),
@@ -5186,10 +5223,9 @@ fn build_dwarf_index_cache_for_addresses(
 
     let scanning = cache.units.is_none();
     let mut units = cache.units.take().unwrap_or_default();
-    let mut headers = dwarf.units();
-    let mut ordinal = 0_usize;
-    while let Ok(Some(header)) = headers.next() {
-        let Ok(unit) = dwarf.unit(header) else {
+    let directory = PerfDwarfUnitDirectory::new(&dwarf);
+    for (ordinal, prepared) in directory.units.iter().enumerate() {
+        let Some(unit) = &prepared.unit else {
             if scanning {
                 units.push(PerfDwarfCachedUnit {
                     ranges: Some(Vec::new()),
@@ -5197,13 +5233,12 @@ fn build_dwarf_index_cache_for_addresses(
                     segments: Some(Vec::new()),
                 });
             }
-            ordinal += 1;
             continue;
         };
         if scanning {
             units.push(PerfDwarfCachedUnit {
-                ranges: perf_dwarf_ranges(dwarf.unit_ranges(&unit).ok()),
-                source_line_ranges: Some(perf_dwarf_source_line_ranges(&unit)),
+                ranges: perf_dwarf_ranges(dwarf.unit_ranges(unit).ok()),
+                source_line_ranges: Some(perf_dwarf_source_line_ranges(unit)),
                 segments: None,
             });
         }
@@ -5215,15 +5250,15 @@ fn build_dwarf_index_cache_for_addresses(
         {
             let source_line_ranges = cached_unit
                 .source_line_ranges
-                .get_or_insert_with(|| perf_dwarf_source_line_ranges(&unit));
+                .get_or_insert_with(|| perf_dwarf_source_line_ranges(unit));
             cached_unit.segments = Some(perf_dwarf_unit_frame_ranges(
                 &dwarf,
-                &unit,
+                unit,
+                &directory,
                 &mut cache.names,
                 source_line_ranges.as_slice(),
             ));
         }
-        ordinal += 1;
     }
     cache.units = Some(units);
     Ok(())
@@ -5278,6 +5313,7 @@ where
 fn perf_dwarf_unit_frame_ranges<R>(
     dwarf: &gimli::Dwarf<R>,
     unit: &gimli::Unit<R>,
+    directory: &PerfDwarfUnitDirectory<R>,
     names: &mut PerfDwarfNameInterner,
     source_line_ranges: &[PerfAddressRange],
 ) -> Vec<PerfDwarfFrameRange>
@@ -5341,7 +5377,8 @@ where
             continue;
         }
         let ranges = perf_dwarf_ranges(dwarf.die_ranges(unit, entry).ok()).unwrap_or_default();
-        let name = perf_dwarf_die_frame_name(dwarf, unit, entry).map(|name| names.intern(name));
+        let name =
+            perf_dwarf_die_frame_name(dwarf, unit, directory, entry).map(|name| names.intern(name));
         // A subprogram behind a transparent wrapper was previously collected
         // (including its names), but flattening excluded its entire subtree.
         let suppressed =
@@ -5583,34 +5620,44 @@ fn perf_dwarf_frame_names_from_index(
 fn perf_dwarf_die_frame_name<R>(
     dwarf: &gimli::Dwarf<R>,
     unit: &gimli::Unit<R>,
+    directory: &PerfDwarfUnitDirectory<R>,
     entry: &gimli::DebuggingInformationEntry<R>,
 ) -> Option<String>
 where
     R: gimli::Reader,
 {
-    perf_dwarf_die_name(dwarf, unit, entry)
+    perf_dwarf_die_name(dwarf, unit, directory, entry)
         .map(|name| perf_dwarf_function_name(&name))
         .or_else(|| {
-            perf_dwarf_inherited_string(dwarf, unit, entry, gimli::DW_AT_linkage_name, 16)
-                .map(|linkage| demangle_addr2line_name_qualified(&linkage))
+            perf_dwarf_inherited_string(
+                dwarf,
+                unit,
+                directory,
+                entry,
+                gimli::DW_AT_linkage_name,
+                16,
+            )
+            .map(|linkage| demangle_addr2line_name_qualified(&linkage))
         })
 }
 
 fn perf_dwarf_die_name<R>(
     dwarf: &gimli::Dwarf<R>,
     unit: &gimli::Unit<R>,
+    directory: &PerfDwarfUnitDirectory<R>,
     entry: &gimli::DebuggingInformationEntry<R>,
 ) -> Option<String>
 where
     R: gimli::Reader,
 {
     // Keep the existing root plus sixteen referenced DIEs for DW_AT_name.
-    perf_dwarf_inherited_string(dwarf, unit, entry, gimli::DW_AT_name, 17)
+    perf_dwarf_inherited_string(dwarf, unit, directory, entry, gimli::DW_AT_name, 17)
 }
 
-fn perf_dwarf_inherited_string<R>(
+fn perf_dwarf_inherited_string<'a, R>(
     dwarf: &gimli::Dwarf<R>,
-    unit: &gimli::Unit<R>,
+    mut unit: &'a gimli::Unit<R>,
+    directory: &'a PerfDwarfUnitDirectory<R>,
     entry: &gimli::DebuggingInformationEntry<R>,
     attribute: gimli::DwAt,
     entry_limit: usize,
@@ -5633,18 +5680,24 @@ where
             // LIFO preserves the abstract-origin subtree before specification,
             // including when a reference is bad or cyclic.
             for attr in [gimli::DW_AT_specification, gimli::DW_AT_abstract_origin] {
-                if let Some(gimli::AttributeValue::UnitRef(offset)) =
-                    entry.attr(attr).map(gimli::Attribute::value)
-                {
-                    pending.push((offset, remaining - 1));
+                let reference = match entry.attr(attr).map(gimli::Attribute::value) {
+                    Some(gimli::AttributeValue::UnitRef(offset)) => Some((unit, offset)),
+                    Some(gimli::AttributeValue::DebugInfoRef(offset)) => {
+                        directory.resolve_reference(offset)
+                    }
+                    _ => None,
+                };
+                if let Some((owner, offset)) = reference {
+                    pending.push((owner, offset, remaining - 1));
                 }
             }
         }
         loop {
-            let (offset, limit) = pending.pop()?;
+            let (owner, offset, limit) = pending.pop()?;
             if limit > 0
-                && let Ok(next) = unit.entry(offset)
+                && let Ok(next) = owner.entry(offset)
             {
+                unit = owner;
                 entry = Cow::Owned(next);
                 remaining = limit;
                 break;
@@ -8874,9 +8927,244 @@ mod tests {
             Ok::<_, gimli::Error>(gimli::EndianSlice::new(bytes, gimli::LittleEndian))
         })
         .unwrap();
-        let header = dwarf.units().next().unwrap().unwrap();
-        let unit = dwarf.unit(header).unwrap();
-        super::perf_dwarf_unit_frame_ranges(&dwarf, &unit, names, source_line_ranges)
+        let directory = super::PerfDwarfUnitDirectory::new(&dwarf);
+        let unit = directory.units[0].unit.as_ref().unwrap();
+        super::perf_dwarf_unit_frame_ranges(&dwarf, unit, &directory, names, source_line_ranges)
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum CrossCuInlineName {
+        Direct,
+        LocalReference,
+        IndexedString,
+    }
+
+    fn cross_cu_inline_fixture(kind: CrossCuInlineName) -> Vec<u8> {
+        let abbrev = vec![
+            // CU: low/high PC, str_offsets_base, stmt_list.
+            1, 0x11, 1, 0x11, 0x01, 0x12, 0x06, 0x72, 0x17, 0x10, 0x17, 0, 0,
+            // Concrete subprogram: name, low/high PC.
+            2, 0x2e, 1, 0x03, 0x08, 0x11, 0x01, 0x12, 0x06, 0, 0,
+            // Inline: abstract_origin ref_addr, low/high PC.
+            3, 0x1d, 1, 0x31, 0x10, 0x11, 0x01, 0x12, 0x06, 0, 0, 4, 0x2e, 0, 0x03, 0x08, 0,
+            0, // Abstract subprogram: name string.
+            5, 0x2e, 0, 0x31, 0x13, 0, 0, // Abstract subprogram: origin ref4.
+            6, 0x2e, 0, 0x03, 0x25, 0, 0, // Abstract subprogram: name strx1.
+            0,
+        ];
+        let unit = |start: u64, string_base: u32| {
+            let mut info = vec![0, 0, 0, 0, 5, 0, 1, 8, 0, 0, 0, 0];
+            info.push(1);
+            info.extend_from_slice(&start.to_le_bytes());
+            info.extend_from_slice(&0x40_u32.to_le_bytes());
+            info.extend_from_slice(&string_base.to_le_bytes());
+            info.extend_from_slice(&0_u32.to_le_bytes());
+            info
+        };
+        let finish = |info: &mut Vec<u8>| {
+            info.push(0);
+            let length = u32::try_from(info.len() - 4).unwrap();
+            info[..4].copy_from_slice(&length.to_le_bytes());
+        };
+        let mut first = unit(0x1000, 8);
+        first.extend_from_slice(b"\x02outer\0");
+        first.extend_from_slice(&0x1000_u64.to_le_bytes());
+        first.extend_from_slice(&0x40_u32.to_le_bytes());
+        let mut references = Vec::new();
+        for _ in 0..3 {
+            first.push(3);
+            references.push(first.len());
+            first.extend_from_slice(&0_u32.to_le_bytes());
+            first.extend_from_slice(&0x1010_u64.to_le_bytes());
+            first.extend_from_slice(&0x10_u32.to_le_bytes());
+        }
+        first.extend_from_slice(&[0; 4]);
+        let decoy_offset = u32::try_from(first.len()).unwrap();
+        first.extend_from_slice(b"\x04wrong_unit\0");
+        finish(&mut first);
+
+        // This CU has no code at the queried PC. Its names must still resolve.
+        let mut second = unit(0x2000, 20);
+        for reference in references {
+            let offset = u32::try_from(first.len() + second.len()).unwrap();
+            first[reference..reference + 4].copy_from_slice(&offset.to_le_bytes());
+            match kind {
+                CrossCuInlineName::Direct => second.extend_from_slice(b"\x04read_at\0"),
+                CrossCuInlineName::LocalReference => {
+                    second.push(5);
+                    second.extend_from_slice(&decoy_offset.to_le_bytes());
+                }
+                CrossCuInlineName::IndexedString => second.extend_from_slice(&[6, 0]),
+            }
+        }
+        if matches!(kind, CrossCuInlineName::LocalReference) {
+            // The same CU-local offset names wrong_unit in the originating CU.
+            let padding = usize::try_from(decoy_offset).unwrap() - second.len() - 2;
+            second.push(4);
+            second.extend(std::iter::repeat_n(b'p', padding));
+            second.push(0);
+            assert_eq!(second.len(), usize::try_from(decoy_offset).unwrap());
+            second.extend_from_slice(b"\x04read_at\0");
+        }
+        finish(&mut second);
+        first.extend(second);
+
+        let mut string_offsets = Vec::new();
+        for offset in [0_u32, 11] {
+            string_offsets.extend_from_slice(&8_u32.to_le_bytes());
+            string_offsets.extend_from_slice(&5_u16.to_le_bytes());
+            string_offsets.extend_from_slice(&0_u16.to_le_bytes());
+            string_offsets.extend_from_slice(&offset.to_le_bytes());
+        }
+        let base = elf_with_text_symbol_fixtures(
+            elf::EM_X86_64,
+            &[(b"base_symbol", 0x1000, 0x40, elf::STB_GLOBAL, elf::STT_FUNC)],
+        );
+        let mut builder = build::elf::Builder::read(base.as_slice()).unwrap();
+        for (name, data) in [
+            (b".debug_abbrev".as_slice(), abbrev),
+            (b".debug_info", first),
+            (b".debug_str", b"wrong_unit\0read_at\0".to_vec()),
+            (b".debug_str_offsets", string_offsets),
+            (b".debug_line", cross_cu_line_fixture()),
+        ] {
+            let section = builder.sections.add();
+            section.name = name.into();
+            section.sh_type = elf::SHT_PROGBITS;
+            section.sh_addralign = 1;
+            section.data = build::elf::SectionData::Data(data.into());
+        }
+        builder.set_section_sizes();
+        let mut bytes = Vec::new();
+        builder.write(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn cross_cu_line_fixture() -> Vec<u8> {
+        let header = b"\x01\x01\x01\xfb\x0e\x0d\x00\x01\x01\x01\x01\x00\x00\x00\x01\x00\x00\x01\x00cross-cu.c\0\x00\x00\x00\x00";
+        let mut line = vec![0; 4];
+        line.extend_from_slice(&4_u16.to_le_bytes());
+        line.extend_from_slice(&u32::try_from(header.len()).unwrap().to_le_bytes());
+        line.extend_from_slice(header);
+        line.extend_from_slice(&[0, 9, 2]); // DW_LNE_set_address.
+        line.extend_from_slice(&0x1000_u64.to_le_bytes());
+        line.extend_from_slice(&[1, 2, 0x40, 0, 1, 1]); // copy, advance_pc, end_sequence.
+        let length = u32::try_from(line.len() - 4).unwrap();
+        line[..4].copy_from_slice(&length.to_le_bytes());
+        line
+    }
+
+    fn cross_cu_reference_file(bytes: &[u8]) -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), bytes).unwrap();
+        let loader = addr2line::Loader::new(file.path()).unwrap();
+        let mut frames = loader.find_frames(0x1018).unwrap();
+        let mut names = Vec::new();
+        while let Some(frame) = frames.next().unwrap() {
+            names.push(frame.function.unwrap().raw_name().unwrap().into_owned());
+        }
+        // Upstream function.rs:name_attr carries the target CU across ref_addr.
+        assert_eq!(names, ["read_at", "read_at", "read_at", "outer"]);
+        file
+    }
+
+    #[test]
+    fn cross_cu_inline_names_preserve_three_nested_duplicates() {
+        let bytes = cross_cu_inline_fixture(CrossCuInlineName::Direct);
+        let _reference = cross_cu_reference_file(&bytes);
+        assert_eq!(
+            super::perf_dwarf_frame_names_from_object_bytes(&bytes, 0x1018),
+            Some(vec![
+                "read_at".into(),
+                "read_at".into(),
+                "read_at".into(),
+                "outer".into()
+            ])
+        );
+    }
+
+    #[test]
+    fn cross_cu_inline_names_keep_target_cu_for_local_references() {
+        let bytes = cross_cu_inline_fixture(CrossCuInlineName::LocalReference);
+        let _reference = cross_cu_reference_file(&bytes);
+        assert_eq!(
+            super::perf_dwarf_frame_names_from_object_bytes(&bytes, 0x1018),
+            Some(vec![
+                "read_at".into(),
+                "read_at".into(),
+                "read_at".into(),
+                "outer".into()
+            ])
+        );
+    }
+
+    #[test]
+    fn cross_cu_inline_names_keep_target_cu_for_indexed_strings() {
+        let bytes = cross_cu_inline_fixture(CrossCuInlineName::IndexedString);
+        let _reference = cross_cu_reference_file(&bytes);
+        assert_eq!(
+            super::perf_dwarf_frame_names_from_object_bytes(&bytes, 0x1018),
+            Some(vec![
+                "read_at".into(),
+                "read_at".into(),
+                "read_at".into(),
+                "outer".into()
+            ])
+        );
+    }
+
+    #[test]
+    fn cross_cu_inline_names_survive_cold_and_warm_production_indexes() {
+        for kind in [
+            CrossCuInlineName::Direct,
+            CrossCuInlineName::LocalReference,
+            CrossCuInlineName::IndexedString,
+        ] {
+            let bytes = cross_cu_inline_fixture(kind);
+            let file = cross_cu_reference_file(&bytes);
+            let resolver = RustAddr2lineResolver::new();
+            let request = super::clean_object_symbol_request(file.path().into(), 0x1018);
+            let first = resolver
+                .resolve_frame_batch_with_metadata(&[request])
+                .unwrap();
+            assert_eq!(
+                first[0].frames,
+                ["outer", "read_at", "read_at", "read_at"],
+                "{kind:?}"
+            );
+            assert!(first[0].has_base_symbol && first[0].has_inline_frames);
+            assert_eq!(first[0].base_offset, Some(0x18));
+            let metadata = resolver.object_metadata(file.path()).unwrap();
+            let segments = {
+                let cache = metadata.dwarf_index.lock().unwrap();
+                let units = cache.units.as_ref().unwrap();
+                assert_eq!(units.len(), 2);
+                assert!(units[1].segments.is_none(), "origin CU has no queried code");
+                units[0].segments.as_ref().unwrap().as_ptr()
+            };
+            std::fs::remove_file(file.path()).unwrap();
+            let requests = [0x1019, 0x101f]
+                .map(|address| super::clean_object_symbol_request(file.path().into(), address));
+            let warm = resolver
+                .resolve_frame_batch_with_metadata(&requests)
+                .unwrap();
+            for frames in warm {
+                assert_eq!(
+                    frames.frames,
+                    ["outer", "read_at", "read_at", "read_at"],
+                    "{kind:?}"
+                );
+                assert!(frames.has_base_symbol && frames.has_inline_frames);
+            }
+            assert!(Arc::ptr_eq(
+                &metadata,
+                &resolver.object_metadata(file.path()).unwrap()
+            ));
+            let cache = metadata.dwarf_index.lock().unwrap();
+            let units = cache.units.as_ref().unwrap();
+            assert_eq!(units[0].segments.as_ref().unwrap().as_ptr(), segments);
+            assert!(units[1].segments.is_none());
+        }
     }
 
     fn pyroc50_raw_nested_dwarf(depth: usize, unnamed_inline: bool) -> Vec<u8> {

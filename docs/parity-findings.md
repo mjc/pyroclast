@@ -84,6 +84,31 @@ the missing third frame for failed EBL, but must not resurrect that frame after
 a decoded CFI stop. Both failed on the old restart implementation or its first
 cursor replacement before the retry distinction was implemented.
 
+## 2026-10-09 cross-CU references retain the target compilation unit
+
+The fresh CPU capture also exposed three missing inline frames at a single
+instruction. Their `DW_AT_abstract_origin` values use `DW_FORM_ref_addr` to
+reference another compilation unit. The custom Rust name walk handled only
+CU-local references, so it discarded these names rather than preserving the
+three nested occurrences.
+
+`libdw/dwarf_formref_die.c:47-79` resolves absolute references through
+`dwarf_offdie`; `bfd/dwarf2.c:3488-3594` locates the containing CU before reading
+the referenced DIE. Vendored Rust addr2line's `function.rs:name_attr` likewise
+switches unit for `DebugInfoRef`. Binutils `addr2line.c:408-414` emits each
+inline caller, and Inferno `collapse/perf.rs:530-543` annotates inline lines
+without deduplicating equal names.
+
+The Rust resolver now uses a temporary CU directory to resolve absolute
+references. Subsequent CU-local references and indexed strings stay attached
+to the target CU. Four regressions were observed red against production and
+then green: nested duplicate names, a local-reference chain with a decoy in
+the originating CU, different string-offset bases, and cold/warm production
+indexes. The fixture is independently checked by vendored addr2line's loader;
+unrelated CUs still do not receive inline frame indexes. This changes no
+backend default and introduces no automatic GNU fallback. Retaining temporary
+CU metadata needs memory measurement; it is not an allocation reduction claim.
+
 ## 2026-10-09 recorded kernel/user callchains still receive user unwinds
 
 Investigation of a fresh C thread workload found an unsupported mixed-callchain
