@@ -1,6 +1,6 @@
 use crate::perfdata::records::{
-    Mmap2BuildIdRecord, Mmap2Record, MmapRecord, PERF_RECORD_MISC_CPUMODE_MASK,
-    PERF_RECORD_MISC_CPUMODE_USER,
+    Mmap2BuildIdRecord, Mmap2Record, MmapRecord, PERF_RECORD_MISC_CPUMODE_KERNEL,
+    PERF_RECORD_MISC_CPUMODE_MASK, PERF_RECORD_MISC_CPUMODE_USER,
 };
 use crate::symbols::{KernelRelocation, SymbolResolver};
 use hashbrown::{HashMap, HashSet};
@@ -426,12 +426,18 @@ struct NativeDsoRegistry {
 struct NativeDso {
     id: usize,
     path: String,
+    short_name: String,
     build_id: OnceCell<Vec<u8>>,
     symbol_build_id: OnceCell<Option<Vec<u8>>>,
     file_identity: Option<FileIdentity>,
 }
 
 impl NativeDso {
+    fn compare_dso(&self, other: &Self) -> Ordering {
+        self.compare(&other.path, other.file_identity, other.build_id())
+            .then_with(|| self.short_name.cmp(&other.short_name))
+    }
+
     fn build_id(&self) -> Option<&[u8]> {
         self.build_id.get().map(Vec::as_slice)
     }
@@ -485,7 +491,7 @@ impl NativeDso {
 }
 
 impl NativeDsoRegistry {
-    fn register_header(&mut self, path: &str, build_id: &[u8]) {
+    fn register_header(&mut self, path: &str, build_id: &[u8], misc: u16) {
         if build_id.iter().all(|byte| *byte == 0) || !self.header_paths.insert(path.to_string()) {
             return;
         }
@@ -493,6 +499,46 @@ impl NativeDsoRegistry {
         // sets the DSO build ID before mapping records are processed.
         let id = self.intern(path, None, None);
         self.entries[id].set_build_id(build_id);
+        self.set_header_module_name(id, misc);
+    }
+
+    fn set_header_module_name(&mut self, id: usize, misc: u16) {
+        // header.c:2550 calls dso__set_module_info only for kernel modules.
+        if mapping_cpumode_from_misc(misc) == PERF_RECORD_MISC_CPUMODE_KERNEL
+            && let name = crate::symbols::kcore::module_dso_short_name(&self.entries[id].path)
+            && name.starts_with('[')
+            && ![
+                "[kernel.kallsyms]",
+                "[guest.kernel.kallsyms",
+                "[vdso]",
+                "[vdso32]",
+                "[vdsox32]",
+                "[vsyscall]",
+            ]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            self.entries[id].short_name = name.into_owned();
+            // dso.c:dso__set_short_name invalidates the array sort order.
+            self.sorted = false;
+        }
+    }
+
+    fn intern_module(&mut self, path: &str, build_id: Option<&[u8]>) -> usize {
+        let name = crate::symbols::kcore::module_short_name(path).expect("kernel module pathname");
+        // dsos.c:429 searches the current DSO array by short name with an
+        // empty identity, preserving the first matching DSO's long filename.
+        let id = self
+            .order
+            .iter()
+            .copied()
+            .find(|&id| self.entries[id].short_name == name)
+            .unwrap_or_else(|| self.add(path, name.into_owned(), None, None));
+        // machine.c:1668 updates the reused DSO's ID without reloading symbols.
+        if let Some(build_id) = build_id.filter(|id| id.iter().any(|byte| *byte != 0)) {
+            self.entries[id].set_build_id(build_id);
+        }
+        id
     }
 
     fn intern(
@@ -526,28 +572,43 @@ impl NativeDsoRegistry {
                 }
             }
         }
+        let short_name = path.rsplit('/').next().unwrap_or(path).to_owned();
+        self.add(path, short_name, file_identity, build_id)
+    }
+
+    fn add(
+        &mut self,
+        path: &str,
+        short_name: String,
+        file_identity: Option<FileIdentity>,
+        build_id: Option<&[u8]>,
+    ) -> usize {
+        let id = self.entries.len();
+        let dso = NativeDso {
+            id,
+            path: path.to_string(),
+            short_name,
+            build_id: build_id.map_or_else(OnceCell::new, |id| OnceCell::from(id.to_vec())),
+            symbol_build_id: OnceCell::new(),
+            file_identity,
+        };
+        if !self.sorted {
+            self.entries.push(dso);
+            self.order.push(id);
+            return id;
+        }
         // __dsos__add uses a lower-bound search with an inclusive high end,
         // whose midpoint differs from bsearch for even-length arrays.
         let (mut low, mut high) = (0, self.order.len());
         while low < high {
             let mid = low + (high - low - 1) / 2;
-            if self.entries[self.order[mid]]
-                .compare(path, file_identity, build_id)
-                .is_lt()
-            {
+            if self.entries[self.order[mid]].compare_dso(&dso).is_lt() {
                 low = mid + 1;
             } else {
                 high = mid;
             }
         }
-        let id = self.entries.len();
-        self.entries.push(NativeDso {
-            id,
-            path: path.to_string(),
-            build_id: build_id.map_or_else(OnceCell::new, |id| OnceCell::from(id.to_vec())),
-            symbol_build_id: OnceCell::new(),
-            file_identity,
-        });
+        self.entries.push(dso);
         self.order.insert(low, id);
         id
     }
@@ -575,15 +636,7 @@ impl NativeDsoRegistry {
         #[cfg(not(unix))]
         for index in 1..ordered.len() {
             let mut position = index;
-            while position > 0
-                && ordered[position]
-                    .compare(
-                        &ordered[position - 1].path,
-                        ordered[position - 1].file_identity,
-                        ordered[position - 1].build_id(),
-                    )
-                    .is_lt()
-            {
+            while position > 0 && ordered[position].compare_dso(ordered[position - 1]).is_lt() {
                 ordered.swap(position - 1, position);
                 position -= 1;
             }
@@ -601,7 +654,7 @@ unsafe extern "C" fn compare_native_dsos(
     // SAFETY: only NativeDsoRegistry::sort calls this with pointers to live
     // elements of its Vec<&NativeDso>.
     let (a, b) = unsafe { (*a.cast::<&NativeDso>(), *b.cast::<&NativeDso>()) };
-    match a.compare(&b.path, b.file_identity, b.build_id()) {
+    match a.compare_dso(b) {
         Ordering::Less => -1,
         Ordering::Equal => 0,
         Ordering::Greater => 1,
@@ -865,7 +918,7 @@ impl MmapTable {
         misc: u16,
     ) {
         if let Some(id) = build_id.as_deref() {
-            self.native_dsos.register_header(&record.path, id);
+            self.native_dsos.register_header(&record.path, id, misc);
         }
         self.insert_mapping(Mapping {
             pid: record.pid,
@@ -904,7 +957,7 @@ impl MmapTable {
         misc: u16,
     ) {
         if let Some(id) = build_id.as_deref() {
-            self.native_dsos.register_header(&record.path, id);
+            self.native_dsos.register_header(&record.path, id, misc);
         }
         self.insert_mapping(Mapping {
             pid: record.pid,
@@ -1028,22 +1081,33 @@ impl MmapTable {
     fn insert_mapping(&mut self, mut mapping: Mapping) {
         // map.c:map__new binds a DSO before inserting/splitting maps. Splits
         // and fork copies retain that ID without repeating wildcard lookup.
-        mapping.native_dso_id = self.native_dsos.intern(
-            &mapping.path,
-            mapping.file_identity,
-            if mapping.mmap_build_id {
-                mapping.build_id.as_deref()
-            } else {
-                None
-            },
-        );
+        let is_module = mapping.cpumode == PERF_RECORD_MISC_CPUMODE_KERNEL
+            && crate::symbols::kcore::module_short_name(&mapping.path).is_some();
+        let build_id = mapping
+            .mmap_build_id
+            .then_some(mapping.build_id.as_deref())
+            .flatten();
+        mapping.native_dso_id = if is_module {
+            self.native_dsos.intern_module(&mapping.path, build_id)
+        } else {
+            self.native_dsos
+                .intern(&mapping.path, mapping.file_identity, build_id)
+        };
+        if is_module {
+            mapping
+                .path
+                .clone_from(&self.native_dsos.entries[mapping.native_dso_id].path);
+        }
         // perf util/machine.c:870 and util/dsos.c:420-449 register the
         // util/dso.c:412-475 short name while retaining the long ELF path.
         // addr2line.c:444 opens file_name; libdwfl/dwfl_module_getdwarf.c:55
         // opens the selected file too. Neither should receive display metadata.
-        if mapping.kernel_module_address(mapping.start).is_some() {
-            mapping.module_display = crate::symbols::kcore::module_short_name(&mapping.path)
-                .map(|name| Arc::from(name.as_ref()));
+        if is_module {
+            mapping.module_display = Some(Arc::from(
+                self.native_dsos.entries[mapping.native_dso_id]
+                    .short_name
+                    .as_str(),
+            ));
         }
         mapping.path_layout = MappingPathLayout::new(mapping.display_path());
         let next_id = self.display_path_ids.len();
@@ -1325,25 +1389,26 @@ impl MmapTable {
 
     pub(super) fn initialize_native_dso_headers<'a>(
         &mut self,
-        headers: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+        headers: impl IntoIterator<Item = (&'a str, &'a [u8], u16)>,
     ) {
         if self.native_dsos.headers_initialized {
             return;
         }
-        for (path, id) in headers {
-            self.native_dsos.register_header(path, id);
+        for (path, id, misc) in headers {
+            self.native_dsos.register_header(path, id, misc);
         }
         self.native_dsos.headers_initialized = true;
     }
 
-    pub(super) fn update_native_dso_build_id(&mut self, path: &str, build_id: &[u8]) {
+    pub(super) fn update_native_dso_build_id(&mut self, path: &str, build_id: &[u8], misc: u16) {
         // header.c:__event_process_build_id finds with empty file/build identity,
         // then sets the ID on the existing DSO; maps keep their DSO binding.
         let id = self.native_dsos.intern(path, None, None);
         self.native_dsos.entries[id].set_build_id(build_id);
+        self.native_dsos.set_header_module_name(id, misc);
         self.native_dsos.header_paths.insert(path.to_owned());
-        // dso.c:dso__set_build_id does not change dsos->sorted. Only identity
-        // enrichment through __dso__improve_id invalidates lookup order.
+        // dso.c:dso__set_build_id alone does not change dsos->sorted.
+        // Module short-name updates above do invalidate the sort order.
     }
 
     pub(crate) fn symbol_mapping_ref<'a, R: SymbolResolver>(
@@ -1673,8 +1738,11 @@ impl Mapping {
     fn kernel_module_address(&self, ip: u64) -> Option<u64> {
         // machine.c:machine__process_kernel_mmap_event creates a module map
         // for an absolute kernel path even when its name has no .ko suffix.
+        // The bound DSO's long filename can instead come from a relative
+        // kernel header; retain its module role independently of that name.
         (self.cpumode == crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_KERNEL
-            && self.path.starts_with('/'))
+            && self.module_display.is_some()
+            && !self.path.starts_with('['))
         .then_some(ip)
     }
 
@@ -1821,7 +1889,11 @@ mod tests {
             );
             table.clone_pid_mappings(7, 8);
             for replacement in [&[0x22; 20], &[0; 20]] {
-                table.update_native_dso_build_id("/object", replacement);
+                table.update_native_dso_build_id(
+                    "/object",
+                    replacement,
+                    PERF_RECORD_MISC_CPUMODE_USER,
+                );
                 for pid in [7, 8] {
                     let frame = table
                         .resolve_user_frame_cached(pid, 0x1000, &mut cache)
@@ -1916,6 +1988,15 @@ mod tests {
     }
 
     #[test]
+    fn kernel_header_module_short_name_change_invalidates_native_dso_sort_order() {
+        let mut registry = super::NativeDsoRegistry::default();
+        registry.register_header("/old/a.ko", &[0x11; 20], PERF_RECORD_MISC_CPUMODE_KERNEL);
+        assert_eq!(registry.entries[0].short_name, "[a]");
+        // dso.c:1583 marks the DSO array unsorted on a short-name change.
+        assert!(!registry.sorted);
+    }
+
+    #[test]
     fn native_dso_identity_wildcards_are_non_transitive_and_zero_inodes_are_known() {
         let file = |inode| super::FileIdentity {
             major: 0,
@@ -1926,6 +2007,7 @@ mod tests {
         let dso = |inode: Option<u64>, byte| super::NativeDso {
             id: 0,
             path: "/object".into(),
+            short_name: "object".into(),
             file_identity: inode.map(file),
             build_id: std::cell::OnceCell::from(vec![byte; 20]),
             symbol_build_id: std::cell::OnceCell::new(),

@@ -9198,6 +9198,155 @@ fn native_kcore_ignores_live_module_section_maps_when_build_id_is_wrong_or_missi
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn write_native_module_path_replacement_fixture(
+    same_short_name: bool,
+) -> (tempfile::TempDir, Vec<u8>) {
+    const MODULE: u64 = 0xffff_ffff_c100_0010;
+    let (root, bytes) =
+        write_native_module_object_queries(false, false, &[(MODULE, &[MODULE])], true);
+    std::fs::remove_file(root.path().join("kcore")).unwrap();
+    let original = std::fs::read(root.path().join("a.ko")).unwrap();
+    let elf = object::File::parse(original.as_slice()).unwrap();
+    let id = elf.build_id().unwrap().unwrap();
+    let mut builder = object::build::elf::Builder::read(original.as_slice()).unwrap();
+    for symbol in &mut builder.symbols {
+        if symbol.name.as_slice() == b"cached_module_object" {
+            symbol.name = b"replacement_module_object".as_slice().into();
+        }
+    }
+    let mut replacement = Vec::new();
+    builder.write(&mut replacement).unwrap();
+    let directory = root.path().join("new");
+    std::fs::create_dir(&directory).unwrap();
+    // The fixture already contains [b]; use a genuinely new module for
+    // the independent-name control.
+    let path = directory.join(if same_short_name { "a.ko" } else { "c.ko" });
+    std::fs::write(&path, replacement).unwrap();
+    let header = pyroclast::perfdata::header::parse_header(&bytes).unwrap();
+    let data_offset = usize::try_from(header.data_offset).unwrap();
+    let mut replaced = bytes[..data_offset].to_vec();
+    for record in pyroclast::perfdata::records::iter_records(&bytes, header).unwrap() {
+        replaced.extend(record_bytes_with_misc(
+            record.header.record_type,
+            record.header.misc,
+            record.payload,
+        ));
+        if record.header.record_type == 10 {
+            let mut payload = mmap2_build_id_payload(
+                u32::MAX,
+                u32::MAX,
+                0xffff_ffff_c100_0000,
+                0x4000,
+                0,
+                path.to_str().unwrap(),
+            );
+            payload[32] = 20;
+            payload[36..56].copy_from_slice(id);
+            payload.resize(payload.len().next_multiple_of(8), 0);
+            replaced.extend(record_bytes_with_misc(
+                10,
+                PERF_RECORD_MISC_CPUMODE_KERNEL | PERF_RECORD_MISC_MMAP_BUILD_ID,
+                &payload,
+            ));
+        }
+    }
+    let size = u64::try_from(replaced.len() - data_offset).unwrap();
+    put_u64(&mut replaced, 48, size);
+    std::fs::write(root.path().join("perf.data"), &replaced).unwrap();
+    (root, replaced)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_module_path_replacement_reuses_only_the_same_short_name_dso() {
+    for same_short_name in [false, true] {
+        let (root, bytes) = write_native_module_path_replacement_fixture(same_short_name);
+        let (script, stderr, native) = query_native_module_object(root.path());
+        // dsos.c:429 finds an existing module by short name and empty
+        // identity. Its original long filename survives a later MMAP.
+        assert!(!stderr.contains("/kcore for kernel data"), "{stderr}");
+        assert_eq!(
+            script.contains("cached_module_object+0x10 ([a])"),
+            same_short_name,
+            "{script}"
+        );
+        assert_eq!(
+            script.contains("replacement_module_object+0x10 ([c])"),
+            !same_short_name,
+            "{script}"
+        );
+        assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &native);
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_kernel_build_id_header_binds_module_by_short_name_but_user_header_does_not() {
+    for (kernel, relative) in [(true, false), (false, false), (true, true), (false, true)] {
+        let (root, bytes) = write_native_module_path_replacement_fixture(true);
+        let header = pyroclast::perfdata::header::parse_header(&bytes).unwrap();
+        let mut first_module = true;
+        let records = pyroclast::perfdata::records::iter_records(&bytes, header)
+            .unwrap()
+            .into_iter()
+            .filter_map(|record| {
+                if record.header.record_type == 10 && first_module {
+                    first_module = false;
+                    None
+                } else {
+                    Some(record_bytes_with_misc(
+                        record.header.record_type,
+                        record.header.misc,
+                        record.payload,
+                    ))
+                }
+            })
+            .collect::<Vec<_>>();
+        let records: [Vec<u8>; 5] = records.try_into().unwrap();
+        let old = std::fs::read(root.path().join("a.ko")).unwrap();
+        let elf = object::File::parse(old.as_slice()).unwrap();
+        let id = elf.build_id().unwrap().unwrap().try_into().unwrap();
+        let old_path = root.path().join("a.ko");
+        let cwd = std::env::current_dir().unwrap();
+        let header_path = if relative {
+            old_path.strip_prefix(&cwd).unwrap()
+        } else {
+            &old_path
+        };
+        let mut feature = build_id_event_payload(u32::MAX, id, header_path.to_str().unwrap());
+        let misc = if kernel {
+            PERF_RECORD_MISC_CPUMODE_KERNEL
+        } else {
+            PERF_RECORD_MISC_CPUMODE_USER
+        };
+        feature[4..6].copy_from_slice(&misc.to_le_bytes());
+        let mut attr = file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        );
+        put_u64(&mut attr, 16, 1);
+        let mut bytes = perfdata_with_records_attrs_and_build_id_feature([attr], records, &feature);
+        put_u64(&mut bytes, 16, 144);
+        std::fs::write(root.path().join("perf.data"), &bytes).unwrap();
+        let (script, _, native) = query_native_module_object(root.path());
+        // header.c:2550 canonicalizes kernel module headers with
+        // dso__set_module_info. USER headers retain their ordinary basename.
+        assert_eq!(
+            script.contains("cached_module_object+0x10 ("),
+            kernel,
+            "{script}"
+        );
+        assert_eq!(
+            script.contains("replacement_module_object+0x10 ("),
+            !kernel,
+            "{script}"
+        );
+        assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &native);
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn native_module_event_ip_discovers_live_build_id_before_cache_selection() {
     use std::fmt::Write as _;

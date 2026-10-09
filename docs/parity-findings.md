@@ -80,6 +80,32 @@ The native regression passed after this change for both cache/live map-layout
 controls across Rust/GNU providers, inline modes, and byte/file folding. This
 does not resolve pathname-changing native module DSO reuse.
 
+## 2026-10-09 kernel module DSO binding across pathname changes
+
+A fresh native fixture replaced a module MMAP before its first sample. Two
+live objects at different paths had the same build ID but different function
+names. For the same canonical module name, native opened the original path;
+Pyroclast opened the replacement and emitted the wrong function. The native
+comparison was red before changing DSO binding. A different-module-name
+control independently selected the replacement object.
+
+The registry now retains the canonical short name separately from the long
+filename and uses the ordered empty-identity short-name lookup from
+`dsos.c:429`. Reused module DSOs keep their original filename, and MMAP2 updates
+the current build ID afterward (`machine.c:1668`). Kernel-module header IDs
+also receive canonical names (`header.c:2550`); their CPU mode is retained
+rather than applying that rule to user headers. A fresh native kernel/user
+header control checks that distinction for absolute and relative filenames.
+The relative-header control was also red before separating DSO name parsing
+from MMAP eligibility; bound module role survives a relative long filename.
+DSO sorting includes the final short
+name tie-breaker and invalidates the order when a short name changes
+(`dsos.c:143`, `dso.c:1583`), with a separately observed red sorting test.
+
+Both native fixtures compare folded output across Rust/GNU providers, inline
+modes, and byte/file replay. This proves pre-load DSO reuse, not post-load
+per-map text offsets or general split-debug/runtime source selection.
+
 ## 2026-10-09 retained GNU helper and auxiliary lifetime
 
 External symbol-only batches previously launched a new helper each time. The

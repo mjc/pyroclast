@@ -3193,7 +3193,7 @@ where
 
     fn resolve_kernel_symbol(&self, request: &SymbolRequest) -> Option<String> {
         if is_kernel_module_request(request) {
-            let module_name = kcore::module_short_name(request.path.to_str()?)?;
+            let module_name = kcore::module_dso_short_name(request.path.to_str()?);
             {
                 // perf symbol.c:dso__load sets loaded even on failure (1866).
                 // maps__split_kallsyms (913) discards those DSO rows when the
@@ -3266,9 +3266,8 @@ where
             .ordinary_kernel_load
             .lock()
             .expect("kernel DSO load lock");
-        if !load.core_loaded
-            && let Some(name) = kcore::module_short_name(path)
-        {
+        if !load.core_loaded {
+            let name = kcore::module_dso_short_name(path);
             // Both successful and failed dso__load attempts set loaded; a
             // selected ELF must not gain kallsyms symbols in its address gaps.
             load.modules_loaded_before_core.insert(name.into_owned());
@@ -5749,7 +5748,7 @@ fn resolve_kernel_kallsyms(kallsyms: &Kallsyms, request: &SymbolRequest) -> Opti
 }
 
 fn resolve_module_kallsyms(kallsyms: &Kallsyms, request: &SymbolRequest) -> Option<String> {
-    let module_name = kcore::module_short_name(request.path.to_str()?)?;
+    let module_name = kcore::module_dso_short_name(request.path.to_str()?);
     kallsyms.resolve_module_with_offset_for_path(
         request
             .kernel_module_address

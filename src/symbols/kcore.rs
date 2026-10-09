@@ -107,11 +107,8 @@ impl KcoreSymbols {
     pub(super) fn validate_module_maps(&self, path: &Path, maps: &[KernelModuleSectionMap]) {
         // perf symbol.c:do_validate_kcore_modules_cb checks every resulting
         // module map against /proc/modules by DSO short name and start.
-        let module = module_short_name(path.to_str().unwrap_or_default());
+        let module = module_dso_short_name(path.to_str().unwrap_or_default());
         if maps.iter().any(|map| {
-            let Some(module) = &module else {
-                return true;
-            };
             self.module_bases.get(&format!("{module}{}", map.section)) != Some(&map.start)
         }) {
             self.rejected.store(true, Ordering::Relaxed);
@@ -146,18 +143,21 @@ pub(crate) fn module_short_name(path: &str) -> Option<Cow<'_, str>> {
     // perf machine.c:machine__process_kernel_mmap_event creates module DSOs
     // for absolute kernel paths. dso.c:__kmod_path__parse keeps bracketed
     // names, recognizes .ko with gzip/xz suffixes, and maps '-' to '_'.
-    if is_kernel_module_symbol_path_str(path) {
-        return Some(Cow::Borrowed(path));
-    }
-    if !path.starts_with('/') {
+    if !is_kernel_module_symbol_path_str(path) && !path.starts_with('/') {
         return None;
     }
-    let name = path.rsplit('/').next()?;
+    Some(module_dso_short_name(path))
+}
+
+pub(crate) fn module_dso_short_name(path: &str) -> Cow<'_, str> {
+    // dso.c:__kmod_path__parse also accepts relative header filenames.
+    // MMAP eligibility is checked separately by module_short_name.
+    let name = path.rsplit('/').next().unwrap_or(path);
     if name.starts_with('[') {
-        return Some(Cow::Borrowed(name));
+        return Cow::Borrowed(name);
     }
     let Some(mut extension) = name.rfind('.') else {
-        return Some(Cow::Borrowed(name));
+        return Cow::Borrowed(name);
     };
     if matches!(name.get(extension + 1..), Some("gz" | "xz")) {
         extension = extension.saturating_sub(3);
@@ -167,7 +167,7 @@ pub(crate) fn module_short_name(path: &str) -> Option<Cow<'_, str>> {
     } else {
         name.to_owned()
     };
-    Some(Cow::Owned(short.replace('-', "_")))
+    Cow::Owned(short.replace('-', "_"))
 }
 
 /// Read only ELF/program headers: /proc/kcore can describe terabytes. Supported

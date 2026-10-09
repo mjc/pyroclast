@@ -215,13 +215,19 @@ struct SessionState {
     mapping_cache: MappingResolveCache,
     unwind_states: HashMap<u32, PidUnwindState, FxBuildHasher>,
     unwind_memory: DsoMemorySources,
-    header_build_ids: BTreeMap<String, Vec<u8>>,
+    header_build_ids: BTreeMap<String, RecordedBuildId>,
     deferred_samples: Vec<DeferredFoldSample>,
     unwind_debug_dir: Option<PathBuf>,
     /// Architecture of the recording machine (`HEADER_ARCH`), used to decode
     /// `REGS_USER` samples and construct per-pid unwinders. Defaults to `x86_64`
     /// when the feature is absent.
     arch: PerfArch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecordedBuildId {
+    bytes: Vec<u8>,
+    misc: u16,
 }
 
 struct PidUnwindState {
@@ -1212,20 +1218,30 @@ fn deliver_record<O: SampleOutput>(
         })
 }
 
-fn header_build_ids_by_filename(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, String> {
+fn header_build_ids_by_filename(bytes: &[u8]) -> Result<BTreeMap<String, RecordedBuildId>, String> {
     recorded_build_ids_by_filename(header_build_id_events_from_perfdata(bytes)?)
 }
 
 fn recorded_build_ids_by_filename(
     events: Vec<BuildIdEvent>,
-) -> Result<BTreeMap<String, Vec<u8>>, String> {
+) -> Result<BTreeMap<String, RecordedBuildId>, String> {
     let mut ids = events
         .into_iter()
         .filter(BuildIdEvent::has_valid_cpu_mode)
         // tools/perf/util/build-id.c:build_id__is_defined: empty and all-zero
         // recorded IDs are absent, not identities to require from an ELF.
         .filter(|event| event.build_id.bytes().any(|byte| byte != b'0'))
-        .map(|event| hex_build_id_bytes(&event.build_id).map(|id| (event.filename, id)))
+        .map(|event| {
+            hex_build_id_bytes(&event.build_id).map(|bytes| {
+                (
+                    event.filename,
+                    RecordedBuildId {
+                        bytes,
+                        misc: event.misc,
+                    },
+                )
+            })
+        })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
     if !ids.contains_key("[vdso]") {
         // Native perf writes the live image using a mkstemp name while MMAP2
@@ -1233,12 +1249,16 @@ fn recorded_build_ids_by_filename(
         let aliases = ids
             .iter()
             .filter(|(path, _)| is_perf_temporary_vdso_path(path))
-            .map(|(_, id)| id)
+            .map(|(_, id)| &id.bytes)
             .collect::<BTreeSet<_>>();
         if aliases.len() > 1 {
             return Err("ambiguous recorded native vDSO build IDs".to_string());
         }
-        let alias_id = aliases.into_iter().next().cloned();
+        let alias_id = aliases.into_iter().next().and_then(|bytes| {
+            ids.iter()
+                .find(|(path, id)| is_perf_temporary_vdso_path(path) && &id.bytes == bytes)
+                .map(|(_, id)| id.clone())
+        });
         if let Some(id) = alias_id {
             ids.insert("[vdso]".to_string(), id);
         }
@@ -2073,7 +2093,7 @@ fn file_attr_ids_from_file(file: &File, attr: &PerfFileAttr) -> Result<Vec<u64>,
 
 fn header_build_ids_by_filename_from_file(
     file: &File,
-) -> Result<BTreeMap<String, Vec<u8>>, String> {
+) -> Result<BTreeMap<String, RecordedBuildId>, String> {
     let mut reader = file
         .try_clone()
         .map_err(|error| format!("failed to clone perf.data handle: {error}"))?;
@@ -2211,7 +2231,7 @@ fn read_file_range(
 }
 
 impl SessionState {
-    fn new(header_build_ids: BTreeMap<String, Vec<u8>>) -> Self {
+    fn new(header_build_ids: BTreeMap<String, RecordedBuildId>) -> Self {
         Self {
             process_comms: BTreeMap::new(),
             exec_process_comms: BTreeMap::new(),
@@ -2403,7 +2423,7 @@ impl SessionState {
         self.mmap_table.initialize_native_dso_headers(
             self.header_build_ids
                 .iter()
-                .map(|(path, id)| (path.as_str(), id.as_slice())),
+                .map(|(path, id)| (path.as_str(), id.bytes.as_slice(), id.misc)),
         );
         match record {
             FoldRecord::BuildId(event) => {
@@ -2413,8 +2433,14 @@ impl SessionState {
                     let id =
                         hex_build_id_bytes(&event.build_id).expect("parsed build-ID hexadecimal");
                     self.mmap_table
-                        .update_native_dso_build_id(&event.filename, &id);
-                    self.header_build_ids.insert(event.filename, id);
+                        .update_native_dso_build_id(&event.filename, &id, event.misc);
+                    self.header_build_ids.insert(
+                        event.filename,
+                        RecordedBuildId {
+                            bytes: id,
+                            misc: event.misc,
+                        },
+                    );
                 }
             }
             FoldRecord::Comm(record) => {
@@ -2429,14 +2455,20 @@ impl SessionState {
                 self.clear_mapping_dependent_unwind_memo(record.pid);
                 // map.c:map__new reuses the DSO populated from HEADER_BUILD_ID
                 // even for MMAP records, which carry no build ID themselves.
-                let build_id = self.header_build_ids.get(&record.path).cloned();
+                let build_id = self
+                    .header_build_ids
+                    .get(&record.path)
+                    .map(|id| id.bytes.clone());
                 self.mmap_table
                     .insert_mmap_with_build_id_and_misc(record, build_id, misc);
                 self.mapping_cache = MappingResolveCache::default();
             }
             FoldRecord::Mmap2 { misc, record } => {
                 self.clear_mapping_dependent_unwind_memo(record.pid);
-                let build_id = self.header_build_ids.get(&record.path).cloned();
+                let build_id = self
+                    .header_build_ids
+                    .get(&record.path)
+                    .map(|id| id.bytes.clone());
                 if let Some(build_id) = build_id {
                     self.mmap_table.insert_mmap2_with_build_id_and_misc(
                         record,
