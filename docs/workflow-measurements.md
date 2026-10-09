@@ -15,6 +15,27 @@ inserted paths. There is no implicit shell; pipelines explicitly use Bash with
 
 ## Completed Capture
 
+Checked workloads in `scripts/benchmarks/workload.{c,rs}` accept a mode and
+positive round count. `cpu` performs dependent integer work, `threads` performs
+that work on four independent workers, and `alloc` retains 8 MiB while churning
+variable-sized buffers. Both languages print independently checked checksums;
+usage failures exit 2. These synthetic cases complement real application
+recordings; they do not establish universal performance.
+
+```sh
+mkdir -p target/workflow-workloads
+cc -O2 -g -fno-omit-frame-pointer -pthread \
+  scripts/benchmarks/workload.c -o target/workflow-workloads/c
+rustc --edition=2024 -C opt-level=2 -C debuginfo=2 \
+  -C force-frame-pointers=yes scripts/benchmarks/workload.rs \
+  -o target/workflow-workloads/rust
+```
+
+Append the chosen mode/rounds to the workload argv in the baseline, shipping
+`profile_total` and native `capture` stages. Do not append them to the native
+analysis pipeline. Compile and calibrate workloads before measuring; retain
+that calibration separately from the alternating acceptance observations.
+
 Use a prebuilt, bounded workload. Bind its absolute path with jq:
 
 ```sh
