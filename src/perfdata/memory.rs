@@ -74,11 +74,10 @@ impl DsoMemorySources {
         if !self.sources.contains_key(&id) {
             let source =
                 DsoMemory::open_with(mapping, debug_dir, |path| self.open_with_eviction(path)).ok();
-            let opened = source.is_some();
-            self.sources.insert(id, source);
-            if opened {
+            if source.is_some() {
                 self.register_open(id);
             }
+            self.sources.insert(id, source);
         }
         let source = self.sources.get(&id)?.as_ref()?;
         if source.failed {
@@ -92,15 +91,15 @@ impl DsoMemorySources {
                 let len = file.metadata()?.len();
                 Ok((file, len))
             });
-            let source = self.sources.get_mut(&id)?.as_mut()?;
             if let Ok((file, len)) = reopened {
+                self.register_open(id);
+                let source = self.sources.get_mut(&id)?.as_mut()?;
                 source.file = Some(file);
                 source.len = len;
-                self.register_open(id);
             } else {
                 // Native DSO_DATA_STATUS_ERROR is sticky only after
                 // do_open has exhausted its owned-FD eviction retries.
-                source.failed = true;
+                self.sources.get_mut(&id)?.as_mut()?.failed = true;
                 return None;
             }
         }
@@ -126,21 +125,27 @@ impl DsoMemorySources {
     fn register_open(&mut self, id: usize) {
         self.open_order.push_back(id);
         let limit = *self.fd_limit.get_or_insert_with(native_fd_limit);
-        // Native check_data_close keeps count strictly below half the soft
-        // limit. Reads do not promote entries: list_add_tail runs on open only.
+        // Native checks the half-limit before assigning the new descriptor.
+        // Reads do not promote entries: list_add_tail runs on open only.
         if self.open_order.len() >= limit {
             self.close_oldest();
         }
     }
 
     fn close_oldest(&mut self) -> bool {
-        let Some(id) = self.open_order.pop_front() else {
+        let Some(&id) = self.open_order.front() else {
             return false;
         };
-        if let Some(Some(source)) = self.sources.get_mut(&id) {
-            source.file = None;
-            source.len = 0;
+        // dso.c:close_data_fd leaves the opening DSO queued when fd == -1.
+        let Some(Some(source)) = self.sources.get_mut(&id) else {
+            return false;
+        };
+        if source.file.is_none() {
+            return false;
         }
+        source.file = None;
+        source.len = 0;
+        self.open_order.pop_front();
         true
     }
 }
@@ -368,6 +373,105 @@ mod tests {
             table.insert_mmap(record);
         }
         table
+    }
+
+    #[cfg(target_os = "linux")]
+    fn low_fd_limit_reads(root: &Path, soft: libc::rlim_t) {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        struct RestoreDescriptors {
+            limit: libc::rlimit,
+            stdin: OwnedFd,
+            stdout: OwnedFd,
+        }
+        impl Drop for RestoreDescriptors {
+            fn drop(&mut self) {
+                // SAFETY: the saved descriptors and original limit stay valid.
+                unsafe {
+                    libc::setrlimit(libc::RLIMIT_NOFILE, &raw const self.limit);
+                    libc::dup2(self.stdin.as_raw_fd(), 0);
+                    libc::dup2(self.stdout.as_raw_fd(), 1);
+                }
+            }
+        }
+
+        let path = root.join("data-0");
+        std::fs::write(root.join("data-1"), vec![0x33; BLOCK_SIZE * 2]).unwrap();
+        let table = fd_pressure_table(root);
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes a valid rlimit; dup returns owned descriptors.
+        let restore = unsafe {
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit), 0);
+            let stdin = libc::dup(0);
+            assert!(stdin >= 0);
+            let stdin = OwnedFd::from_raw_fd(stdin);
+            let stdout = libc::dup(1);
+            assert!(stdout >= 0);
+            RestoreDescriptors {
+                limit,
+                stdin,
+                stdout: OwnedFd::from_raw_fd(stdout),
+            }
+        };
+        limit.rlim_cur = soft;
+        // SAFETY: these changes affect only the isolated child. FD 2 retains
+        // the log, and the saved descriptors remain valid above the new limit.
+        unsafe {
+            assert_eq!(libc::close(0), 0);
+            assert_eq!(libc::close(1), 0);
+            assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit), 0);
+        }
+        let control = open_regular_object(&path).expect("opening must succeed at the low limit");
+        let mut word = [0; 8];
+        assert_eq!(read_file_at(&control, 0, &mut word).unwrap(), 8);
+        assert_eq!(u64::from_le_bytes(word), 0x1111_1111_1111_1111);
+        drop(control);
+
+        let mut sources = DsoMemorySources::default();
+        for (address, expected) in [
+            (0x1_0000, 0x1111_1111_1111_1111),
+            (0x1_2000, 0x3333_3333_3333_3333),
+            (0x1_1000, 0x2222_2222_2222_2222),
+            (0x1_0000, 0x1111_1111_1111_1111),
+        ] {
+            assert_eq!(
+                MappedMemory::new(7, &table, &mut sources, None).read_u64(address),
+                Some(expected),
+                "native retains the just-opened descriptor at soft limit {soft}"
+            );
+        }
+        drop(sources);
+        drop(restore);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn fd_pressure_soft_limit_one_preserves_native_open_assignment_timing() {
+        isolated_fd_pressure(
+            "perfdata::memory::tests::fd_pressure_soft_limit_one_preserves_native_open_assignment_timing",
+            |root| low_fd_limit_reads(root, 1),
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn fd_pressure_soft_limit_two_preserves_native_open_assignment_timing() {
+        isolated_fd_pressure(
+            "perfdata::memory::tests::fd_pressure_soft_limit_two_preserves_native_open_assignment_timing",
+            |root| low_fd_limit_reads(root, 2),
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn fd_pressure_soft_limit_three_preserves_native_open_assignment_timing() {
+        isolated_fd_pressure(
+            "perfdata::memory::tests::fd_pressure_soft_limit_three_preserves_native_open_assignment_timing",
+            |root| low_fd_limit_reads(root, 3),
+        );
     }
 
     #[test]
