@@ -4849,8 +4849,9 @@ fn native_kcore_preserves_cached_module_objects_until_core_replacement() {
         fn selected_object_module_metadata(
             &self,
             path: &std::path::Path,
+            module: &SymbolRequest,
         ) -> Option<std::sync::Arc<pyroclast::symbols::KernelModuleObjectMetadata>> {
-            self.inner.selected_object_module_metadata(path)
+            self.inner.selected_object_module_metadata(path, module)
         }
 
         fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
@@ -9119,6 +9120,371 @@ fn native_kcore_preserves_live_module_objects_until_core_replacement() {
             .unwrap();
         assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &expected);
     }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn write_native_split_debug_module_fixture() -> (tempfile::TempDir, Vec<u8>, std::path::PathBuf) {
+    use std::fmt::Write as _;
+
+    const MODULE: u64 = 0xffff_ffff_c100_0010;
+    const CORE: u64 = 0xffff_ffff_8100_0010;
+    let (root, bytes) = write_native_module_object_queries(
+        true,
+        false,
+        &[(MODULE, &[MODULE]), (CORE, &[CORE]), (MODULE, &[MODULE])],
+        true,
+    );
+    let path = root.path().join("a.ko");
+    let original = std::fs::read(&path).unwrap();
+    let original_elf = object::File::parse(original.as_slice()).unwrap();
+    let id = original_elf.build_id().unwrap().unwrap();
+    let hex = id.iter().fold(String::new(), |mut hex, byte| {
+        write!(hex, "{byte:02x}").unwrap();
+        hex
+    });
+    let source = root.path().join("module.S");
+    // Fill one page so objcopy's compact NOBITS layout is contiguous while
+    // the runtime section remains separated by the explicit VMA gap.
+    let mut assembly = std::fs::read_to_string(&source)
+        .unwrap()
+        .replace(".fill 512,1,0x90", ".fill 4096,1,0x90");
+    assembly.push_str(".section .noinstr.text,\"ax\",@progbits\n.globl separate_module_text\n.type separate_module_text,@function\nseparate_module_text:\n.fill 512,1,0x90\n.size separate_module_text,.-separate_module_text\n");
+    std::fs::write(&source, assembly).unwrap();
+    let compiler = Command::new("cc")
+        .args([
+            "-nostdlib",
+            "-shared",
+            "-Wl,-e,cached_module_object",
+            "-Wl,-Ttext=0xffffffffc1000000",
+            "-Wl,--section-start=.noinstr.text=0xffffffffc1008000",
+        ])
+        .arg(format!("-Wl,--build-id=0x{hex}"))
+        .arg("-o")
+        .arg(&path)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        compiler.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiler.stderr)
+    );
+    let runtime_image = std::fs::read(&path).unwrap();
+    let mut builder = object::build::elf::Builder::read(runtime_image.as_slice()).unwrap();
+    let text_sections = builder
+        .sections
+        .iter()
+        .filter(|section| matches!(section.name.as_slice(), b".text" | b".noinstr.text"))
+        .map(object::build::elf::Section::id)
+        .collect::<Vec<_>>();
+    // Linker-generated data symbols would independently reject kcore and
+    // conceal the runtime-versus-debug executable-section difference.
+    for symbol in &mut builder.symbols {
+        symbol.delete = !symbol
+            .section
+            .is_some_and(|section| text_sections.contains(&section));
+    }
+    let mut selected = Vec::new();
+    builder.write(&mut selected).unwrap();
+    std::fs::write(&path, selected).unwrap();
+    let cache = pyroclast::symbols::perf_build_id_elf_path(&root.path().join(".debug"), &hex);
+    let copy = Command::new("objcopy")
+        .arg("--only-keep-debug")
+        .arg(&path)
+        .arg(&cache)
+        .output()
+        .unwrap();
+    assert!(
+        copy.status.success(),
+        "{}",
+        String::from_utf8_lossy(&copy.stderr)
+    );
+    let runtime = std::fs::read(&path).unwrap();
+    let debug = std::fs::read(&cache).unwrap();
+    assert_split_debug_module_layout(&runtime, &debug, id);
+    (root, bytes, cache)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn assert_split_debug_module_layout(runtime: &[u8], debug: &[u8], id: &[u8]) {
+    use object::ObjectSection as _;
+    use object::read::elf::SectionHeader as _;
+    for file in [runtime, debug] {
+        let elf = object::File::parse(file).unwrap();
+        assert_eq!(elf.build_id().unwrap().unwrap(), id);
+        assert!(
+            elf.symbols()
+                .any(|symbol| symbol.name() == Ok("separate_module_text"))
+        );
+    }
+    let layout = |bytes: &[u8], name: &str| {
+        let object::File::Elf64(elf) = object::File::parse(bytes).unwrap() else {
+            panic!("fixture must be ELF64");
+        };
+        let section = elf.section_by_name(name).unwrap();
+        let header = section.elf_section_header();
+        (
+            section.index(),
+            header.sh_type(elf.endian()),
+            header.sh_offset(elf.endian()),
+            section.size(),
+            section.address(),
+            header.sh_flags(elf.endian()),
+        )
+    };
+    assert_eq!(layout(runtime, ".dynsym").1, object::elf::SHT_DYNSYM);
+    assert_eq!(layout(debug, ".dynsym").1, object::elf::SHT_NOBITS);
+    let text = layout(runtime, ".text");
+    let extra = layout(runtime, ".noinstr.text");
+    let debug_text = layout(debug, ".text");
+    let debug_extra = layout(debug, ".noinstr.text");
+    assert!(extra.2 > text.2 + text.3);
+    assert_ne!(extra.2, (text.2 + text.3).next_multiple_of(4096));
+    assert!(
+        debug_extra.2 <= debug_text.2 + debug_text.3,
+        "debug text={debug_text:?}, extra={debug_extra:?}"
+    );
+    assert_eq!(
+        (text.0, text.4, text.5),
+        (debug_text.0, debug_text.4, debug_text.5)
+    );
+    assert_eq!(
+        (extra.0, extra.4, extra.5),
+        (debug_extra.0, debug_extra.4, debug_extra.5)
+    );
+    assert_eq!(debug_text.1, object::elf::SHT_NOBITS);
+    assert_eq!(debug_extra.1, object::elf::SHT_NOBITS);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_split_debug_module_uses_runtime_section_layout_for_kcore_validation() {
+    let (root, bytes, _) = write_native_split_debug_module_fixture();
+    // symbol.c:1809 selects symbol and runtime ELFs independently. The
+    // debug ELF's NOBITS sections use same-index runtime headers at
+    // symbol-elf.c:1656, including the executable cutoff from line 1581.
+    // The separated runtime section therefore prevents kcore replacement.
+    let (script, stderr, native) = query_native_module_object(root.path());
+    assert!(!stderr.contains("/kcore for kernel data"), "{stderr}");
+    assert_eq!(
+        script.matches("cached_module_object+0x10 ([a])").count(),
+        2,
+        "{script}"
+    );
+    assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &native);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_split_debug_module_runtime_requires_matching_id_and_runtime_sections() {
+    #[derive(Clone, Copy, Debug)]
+    enum Runtime {
+        Missing,
+        WrongId,
+        DebugOnly,
+    }
+    for control in [Runtime::Missing, Runtime::WrongId, Runtime::DebugOnly] {
+        let (root, bytes, cache) = write_native_split_debug_module_fixture();
+        let path = root.path().join("a.ko");
+        match control {
+            Runtime::Missing => std::fs::remove_file(&path).unwrap(),
+            Runtime::DebugOnly => {
+                std::fs::copy(&cache, &path).unwrap();
+            }
+            Runtime::WrongId => {
+                let original = std::fs::read(&path).unwrap();
+                let elf = object::File::parse(original.as_slice()).unwrap();
+                let mut id = elf.build_id().unwrap().unwrap().to_vec();
+                id[0] ^= 0xff;
+                let mut builder = object::build::elf::Builder::read(original.as_slice()).unwrap();
+                let note = builder
+                    .sections
+                    .iter_mut()
+                    .find(|section| section.name.as_slice() == b".note.gnu.build-id")
+                    .unwrap();
+                let mut contents = Vec::new();
+                contents.extend(4_u32.to_le_bytes());
+                contents.extend(20_u32.to_le_bytes());
+                contents.extend(object::elf::NT_GNU_BUILD_ID.to_le_bytes());
+                contents.extend(b"GNU\0");
+                contents.extend(&id);
+                note.data = object::build::elf::SectionData::Data(contents.into());
+                let mut rewritten = Vec::new();
+                builder.write(&mut rewritten).unwrap();
+                assert_eq!(
+                    object::File::parse(rewritten.as_slice())
+                        .unwrap()
+                        .build_id()
+                        .unwrap()
+                        .unwrap(),
+                    id
+                );
+                std::fs::write(&path, rewritten).unwrap();
+            }
+        }
+        // symsrc__init (symbol-elf.c:1193) validates every source ID.
+        // symsrc__possibly_runtime (1038) excludes debug-only NOBITS dynsym.
+        // symbol.c:1846 falls back to the symbol source without a runtime ELF.
+        let (script, stderr, native) = query_native_module_object(root.path());
+        assert!(
+            stderr.contains("/kcore for kernel data"),
+            "{control:?}: {stderr}"
+        );
+        assert_eq!(
+            script.matches("cached_module_object+0x10 ([a])").count(),
+            1,
+            "{control:?}: {script}"
+        );
+        assert!(
+            script.contains("first+0x10 ([kernel.kallsyms])"),
+            "{control:?}: {script}"
+        );
+        assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &native);
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn split_debug_module_metadata_retains_each_runtime_source_pair() {
+    use pyroclast::symbols::{KernelModuleSectionMap, SelectedObjectResolver, SymbolizerKind};
+    let runner = pyroclast::process::RealCommandRunner::default();
+    for kind in [SymbolizerKind::RustAddr2line, SymbolizerKind::Addr2line] {
+        let (root, _, cache) = write_native_split_debug_module_fixture();
+        let path = root.path().join("a.ko");
+        let other_path = root.path().join("other.ko");
+        std::fs::copy(&cache, &other_path).unwrap();
+        let request = SymbolRequest {
+            path: path.clone(),
+            relative_address: 0,
+            kernel_module_address: None,
+            kernel_mapping_range: None,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        };
+        let other_request = SymbolRequest {
+            path: other_path.clone(),
+            ..request.clone()
+        };
+        let resolver = SelectedObjectResolver::new(&runner, kind);
+        let first = resolver
+            .selected_object_module_metadata(&cache, &request)
+            .unwrap();
+        let second = resolver
+            .selected_object_module_metadata(&cache, &other_request)
+            .unwrap();
+        assert_eq!(
+            first.maps,
+            [KernelModuleSectionMap {
+                section: ".noinstr.text".into(),
+                start: 0xffff_ffff_c100_8000,
+            }]
+        );
+        assert!(second.maps.is_empty());
+        // The native controls above establish opposite map effects for a
+        // runtime ELF and a debug-only ELF. One shared symbol file must retain
+        // both selections independently, including after removal or rewrite.
+        std::fs::copy(&path, &other_path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(&cache).unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            &first,
+            &resolver
+                .selected_object_module_metadata(&cache, &request)
+                .unwrap()
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &second,
+            &resolver
+                .selected_object_module_metadata(&cache, &other_request)
+                .unwrap()
+        ));
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn assert_native_split_debug_label_uses_runtime_name(runtime_text: bool) {
+    use object::ObjectSection as _;
+    let (root, bytes, cache) = write_native_split_debug_module_fixture();
+    let path = root.path().join("a.ko");
+    for (file, text_name) in [(&cache, !runtime_text), (&path, runtime_text)] {
+        let original = std::fs::read(file).unwrap();
+        let mut builder = object::build::elf::Builder::read(original.as_slice()).unwrap();
+        let section = builder
+            .sections
+            .iter_mut()
+            .find(|section| section.name.as_slice() == b".noinstr.text")
+            .unwrap();
+        if !text_name {
+            section.name = b".cold".as_slice().into();
+        }
+        for symbol in &mut builder.symbols {
+            if symbol.name.as_slice() == b"separate_module_text" {
+                symbol.st_info = (symbol.st_info & !0xf) | object::elf::STT_NOTYPE;
+            }
+        }
+        let mut rewritten = Vec::new();
+        builder.write(&mut rewritten).unwrap();
+        let elf = object::File::parse(rewritten.as_slice()).unwrap();
+        let label = elf
+            .symbols()
+            .find(|symbol| symbol.name() == Ok("separate_module_text"))
+            .unwrap();
+        assert!(
+            matches!(label.flags(), object::SymbolFlags::Elf { st_info, .. }
+            if st_info & 0xf == object::elf::STT_NOTYPE)
+        );
+        let section = elf
+            .section_by_index(label.section_index().unwrap())
+            .unwrap();
+        assert_eq!(
+            section.name().unwrap(),
+            if text_name { ".noinstr.text" } else { ".cold" }
+        );
+        std::fs::write(file, rewritten).unwrap();
+    }
+    let runtime = std::fs::read(&path).unwrap();
+    let debug = std::fs::read(&cache).unwrap();
+    let runtime_elf = object::File::parse(runtime.as_slice()).unwrap();
+    let debug_elf = object::File::parse(debug.as_slice()).unwrap();
+    assert_eq!(
+        runtime_elf.build_id().unwrap(),
+        debug_elf.build_id().unwrap()
+    );
+    let section_index = |elf: &object::File<'_>| {
+        elf.symbols()
+            .find(|symbol| symbol.name() == Ok("separate_module_text"))
+            .unwrap()
+            .section_index()
+            .unwrap()
+    };
+    assert_eq!(section_index(&runtime_elf), section_index(&debug_elf));
+    // symbol-elf.c:1665 checks a NOTYPE label's section name only after
+    // substituting a NOBITS header from the same-index runtime section.
+    let (script, stderr, native) = query_native_module_object(root.path());
+    assert_eq!(
+        stderr.contains("/kcore for kernel data"),
+        !runtime_text,
+        "{stderr}"
+    );
+    assert_eq!(
+        script.matches("cached_module_object+0x10 ([a])").count(),
+        if runtime_text { 2 } else { 1 },
+        "{script}"
+    );
+    assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &native);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_split_debug_module_excludes_label_in_nontext_runtime_section() {
+    assert_native_split_debug_label_uses_runtime_name(false);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_split_debug_module_keeps_label_in_text_runtime_section() {
+    assert_native_split_debug_label_uses_runtime_name(true);
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

@@ -164,11 +164,12 @@ mod module_inputs {
         fn selected_object_module_metadata(
             &self,
             path: &Path,
+            module: &SymbolRequest,
         ) -> Option<std::sync::Arc<pyroclast::symbols::KernelModuleObjectMetadata>> {
             if self.before_loading {
                 self.replace_selected_module_path(path);
             }
-            self.inner.selected_object_module_metadata(path)
+            self.inner.selected_object_module_metadata(path, module)
         }
 
         fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {

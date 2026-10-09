@@ -26,9 +26,10 @@ byte/file replay, retained metadata after replacement/unlink, and map-name
 reuse when distinct ELF sections share a name. The duplicate-name test was
 also observed red before fixing section-index deduplication.
 
-This is not general split-debug parity: native can select distinct symbol and
-runtime sources and substitutes runtime headers for NOBITS sections. That
-source-selection behavior still needs its own native fixtures.
+This initial proof did not establish general split-debug parity. The later
+split-debug module runtime section layout section below proves independent
+source selection and NOBITS header substitution for module-map validation;
+general split-debug address adjustment remains outside that conclusion.
 
 ## 2026-10-09 module event-IP loading and original cursor addresses
 
@@ -121,6 +122,36 @@ again and discarded it. It now looks up the already-bound short name directly,
 as `symbol.c:maps__split_kallsyms` does at line 914. The regression checks
 `vdso.ko`, `vdso32.ko`, `vdsox32.ko`, and `kernel_test.ko` with missing ELFs and
 core loaded first, across the same eight folding routes.
+
+## 2026-10-09 split-debug module runtime section layout
+
+A fresh native regression selected a debug-only build-ID cache and a matching
+live module ELF. Both contained the same functions and section indexes, but
+the debug file had compact NOBITS section offsets while the runtime executable
+section was separated by a gap. Native retained both module samples as
+`cached_module_object`; Pyroclast incorrectly accepted kcore replacement and
+resolved the second sample as `first`. The comparison was observed red before
+changing the loader, after checking the fixture's ELF layout and native output.
+
+`symbol.c:1809` selects symbol and runtime sources independently. Runtime
+eligibility requires an actual dynsym or `.opd` (`symbol-elf.c:1038,1221`),
+and each candidate must satisfy the recorded build ID (`symbol-elf.c:1193`).
+The loader now retains both sources for module metadata. A symbol section
+with NOBITS uses the runtime header at the same index (`symbol-elf.c:1656`),
+and the executable cutoff comes from the runtime file (`symbol-elf.c:1581`).
+Metadata is retained per symbol/runtime pair, not per debug file alone.
+
+The original red comparison passes across Rust/GNU providers, inline modes,
+and byte/file replay. Fresh native controls cover missing, wrong-ID, and
+debug-only runtime candidates; none must change the native kcore decision.
+An ownership regression also checks separate runtime candidates sharing one
+symbol file and retention after rewrite/unlink. Review found two more native
+red comparisons: a NOTYPE label's debug and runtime section names disagreed.
+The loader now filters labels only after substituting the runtime header
+(`symbol-elf.c:1665`), preserving both native inclusion and exclusion. Ordinary
+object-symbol filtering keeps its existing section-name rule. This proves module-map
+validation for these source pairs, not general split-debug address adjustment,
+post-load per-map offsets, guest domains, or GNU debugdata selection.
 
 ## 2026-10-09 retained GNU helper and auxiliary lifetime
 

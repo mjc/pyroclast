@@ -150,13 +150,14 @@ pub trait SymbolResolver {
         None
     }
 
-    /// Reports additional maps created by loading the retained primary ELF.
+    /// Reports maps created from retained symbol and runtime ELF sources.
     /// perf `symbol-elf.c:dso__process_kernel_symbol` uses eligible symbols and
     /// section layout, not ELF type alone, to create these maps.
     /// Wrapping resolvers must forward this to the owner of the selected primary.
     fn selected_object_module_metadata(
         &self,
         _path: &Path,
+        _module: &SymbolRequest,
     ) -> Option<Arc<KernelModuleObjectMetadata>> {
         None
     }
@@ -759,13 +760,14 @@ enum PerfDwarfDieKind {
 struct PreparedObjectMetadata {
     object_symbols: PerfObjectSymbolIndex,
     has_debug_line: bool,
+    possibly_runtime: bool,
 }
 
 struct CachedObjectMetadata {
     object_metadata: PreparedObjectMetadata,
     object_bytes: Arc<[u8]>,
     dwarf_index: Mutex<PerfDwarfIndexCache>,
-    module_metadata: OnceLock<Arc<KernelModuleObjectMetadata>>,
+    module_metadata: Mutex<FxHashMap<OsString, Arc<KernelModuleObjectMetadata>>>,
 }
 
 struct SelectedGnuObject {
@@ -1382,7 +1384,7 @@ impl RustAddr2lineResolver {
                         object_metadata: PreparedObjectMetadata::from_object_bytes(&bytes),
                         object_bytes: bytes.into(),
                         dwarf_index: Mutex::new(PerfDwarfIndexCache::default()),
-                        module_metadata: OnceLock::new(),
+                        module_metadata: Mutex::default(),
                     })
                 });
                 entry.insert(path.as_os_str().to_owned(), loaded).1.clone()
@@ -1450,7 +1452,7 @@ where
                             object_metadata: PreparedObjectMetadata::from_object_bytes(&bytes),
                             object_bytes: bytes.into(),
                             dwarf_index: Mutex::new(PerfDwarfIndexCache::default()),
-                            module_metadata: OnceLock::new(),
+                            module_metadata: Mutex::default(),
                         }),
                         #[cfg(unix)]
                         canonical_name,
@@ -2618,7 +2620,7 @@ where
                 if let Some(object_request) = object_request
                     && let Some(metadata) = self
                         .object_resolver
-                        .selected_object_module_metadata(&object_request.path)
+                        .selected_object_module_metadata(&object_request.path, &request)
                 {
                     // event.c:machine__resolve loads this DSO before callchain
                     // lookup. Apply its section maps without initializing core
@@ -2641,8 +2643,10 @@ where
     fn selected_object_module_metadata(
         &self,
         path: &Path,
+        module: &SymbolRequest,
     ) -> Option<Arc<KernelModuleObjectMetadata>> {
-        self.object_resolver.selected_object_module_metadata(path)
+        self.object_resolver
+            .selected_object_module_metadata(path, module)
     }
 
     fn object_build_id(&self, path: &Path) -> Option<Vec<u8>> {
@@ -2775,7 +2779,7 @@ where
                 if old_module_objects.contains(&index) {
                     // Loading a module also initializes the core maps, but this
                     // cursor keeps its original module source.
-                    self.finish_module_object_load(&requests[index].path, &object_request.path);
+                    self.finish_module_object_load(&requests[index], &object_request.path);
                     resolved[index] = symbol;
                 } else {
                     resolved[index] = symbol.or_else(|| {
@@ -2979,19 +2983,19 @@ where
         }
         if old_module {
             // Initialize core maps after resolving this cursor's original DSO.
-            self.finish_module_object_load(&request.path, path);
+            self.finish_module_object_load(request, path);
             frames.source_state = SymbolSourceState::KernelObjectMapReplaced;
         }
         frames
     }
 
-    fn finish_module_object_load(&self, module: &Path, selected: &Path) {
+    fn finish_module_object_load(&self, module: &SymbolRequest, selected: &Path) {
         if let Some(symbols) = self.kcore_symbols_ref() {
             let metadata = self
                 .object_resolver
-                .selected_object_module_metadata(selected);
+                .selected_object_module_metadata(selected, module);
             symbols.finish_module_load(
-                module,
+                &module.path,
                 metadata.as_deref().map_or(&[], |metadata| &metadata.maps),
             );
         }
@@ -3054,7 +3058,7 @@ where
                 .checked_sub(start)
             && let Some(text_address) = self
                 .object_resolver
-                .selected_object_module_metadata(&selected.path)
+                .selected_object_module_metadata(&selected.path, request)
                 .and_then(|metadata| metadata.text_address)
             && let Some(address) = text_address.checked_add(offset)
         {
@@ -3465,9 +3469,10 @@ where
     fn selected_object_module_metadata(
         &self,
         path: &Path,
+        module: &SymbolRequest,
     ) -> Option<Arc<KernelModuleObjectMetadata>> {
         self.object_metadata(path)
-            .map(|metadata| Arc::clone(metadata.module_metadata()))
+            .map(|metadata| metadata.module_metadata(module, |path| self.object_metadata(path)))
     }
 
     fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
@@ -3597,10 +3602,11 @@ where
     fn selected_object_module_metadata(
         &self,
         path: &Path,
+        module: &SymbolRequest,
     ) -> Option<Arc<KernelModuleObjectMetadata>> {
         match self {
-            Self::Addr2line(resolver) => resolver.selected_object_module_metadata(path),
-            Self::RustAddr2line(resolver) => resolver.selected_object_module_metadata(path),
+            Self::Addr2line(resolver) => resolver.selected_object_module_metadata(path, module),
+            Self::RustAddr2line(resolver) => resolver.selected_object_module_metadata(path, module),
         }
     }
 
@@ -3649,9 +3655,10 @@ impl SymbolResolver for RustAddr2lineResolver {
     fn selected_object_module_metadata(
         &self,
         path: &Path,
+        module: &SymbolRequest,
     ) -> Option<Arc<KernelModuleObjectMetadata>> {
         self.object_metadata(path)
-            .map(|metadata| Arc::clone(metadata.module_metadata()))
+            .map(|metadata| metadata.module_metadata(module, |path| self.object_metadata(path)))
     }
 
     fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
@@ -3976,6 +3983,28 @@ enum PerfSymbolBinding {
 }
 
 fn perf_symbol_is_candidate(object: &object::File<'_>, symbol: &object::Symbol<'_, '_>) -> bool {
+    if !perf_symbol_is_allocated_candidate(object, symbol) {
+        return false;
+    }
+    if !elf_symbol_is_label(symbol) {
+        return true;
+    }
+    symbol
+        .section_index()
+        .and_then(|index| object.section_by_index(index).ok())
+        .and_then(|section| section.name().ok())
+        .is_some_and(|name| name.contains("text") || name.contains("data"))
+}
+
+fn elf_symbol_is_label(symbol: &object::Symbol<'_, '_>) -> bool {
+    matches!(symbol.flags(), object::SymbolFlags::Elf { st_info, .. }
+        if st_info & 0xf == object::elf::STT_NOTYPE)
+}
+
+fn perf_symbol_is_allocated_candidate(
+    object: &object::File<'_>,
+    symbol: &object::Symbol<'_, '_>,
+) -> bool {
     if symbol.is_undefined() || symbol.name().unwrap_or_default().is_empty() {
         return false;
     }
@@ -4006,7 +4035,8 @@ fn perf_symbol_is_candidate(object: &object::File<'_>, symbol: &object::Symbol<'
     }
     // perf util/symbol-elf.c:elf_sym__is_label/elf_sym__filter and dso__load_sym:
     // FUNC/IFUNC/OBJECT may be hidden, but NOTYPE labels may not. All require
-    // an allocated section; labels additionally need a text/data section name.
+    // an allocated original section. Label section-name filtering follows
+    // any NOBITS runtime-header substitution in the module loader.
     let symbol_type = st_info & 0xf;
     match symbol_type {
         object::elf::STT_FUNC | object::elf::STT_GNU_IFUNC | object::elf::STT_OBJECT => {}
@@ -4027,34 +4057,87 @@ fn perf_symbol_is_candidate(object: &object::File<'_>, symbol: &object::Symbol<'
         return false;
     };
     sh_flags & u64::from(object::elf::SHF_ALLOC) != 0
-        && (symbol_type != object::elf::STT_NOTYPE
-            || section
-                .name()
-                .is_ok_and(|name| name.contains("text") || name.contains("data")))
 }
 
-fn elf_section_file_offset(object: &object::File<'_>, index: object::SectionIndex) -> Option<u64> {
+fn elf_section_layout(
+    object: &object::File<'_>,
+    index: object::SectionIndex,
+) -> Option<(u32, u64)> {
     use object::read::elf::SectionHeader as _;
     match object {
-        object::File::Elf32(elf) => Some(
-            elf.section_by_index(index)
-                .ok()?
-                .elf_section_header()
-                .sh_offset(elf.endian())
-                .into(),
-        ),
-        object::File::Elf64(elf) => Some(
-            elf.section_by_index(index)
-                .ok()?
-                .elf_section_header()
-                .sh_offset(elf.endian()),
-        ),
+        object::File::Elf32(elf) => {
+            let header = elf.section_by_index(index).ok()?.elf_section_header();
+            Some((
+                header.sh_type(elf.endian()),
+                header.sh_offset(elf.endian()).into(),
+            ))
+        }
+        object::File::Elf64(elf) => {
+            let header = elf.section_by_index(index).ok()?.elf_section_header();
+            Some((header.sh_type(elf.endian()), header.sh_offset(elf.endian())))
+        }
         _ => None,
     }
 }
 
-fn kernel_module_object_metadata(bytes: &[u8]) -> KernelModuleObjectMetadata {
+fn elf_possibly_runtime(object: &object::File<'_>) -> bool {
+    // symbol-elf.c:symsrc__possibly_runtime (1038) requires an actual dynsym
+    // or .opd. A debug-only NOBITS section with either name does not qualify.
+    [
+        (".dynsym", object::elf::SHT_DYNSYM),
+        (".opd", object::elf::SHT_PROGBITS),
+    ]
+    .iter()
+    .any(|(name, kind)| {
+        object
+            .section_by_name(name)
+            .and_then(|section| elf_section_layout(object, section.index()))
+            .is_some_and(|(section_type, _)| section_type == *kind)
+    })
+}
+
+fn elf_section_is_executable(section: &object::Section<'_, '_>) -> bool {
+    matches!(section.flags(), object::SectionFlags::Elf { sh_flags }
+        if sh_flags & u64::from(object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR)
+            == u64::from(object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR))
+}
+
+fn kernel_module_max_text_offset(runtime: &object::File<'_>) -> u64 {
+    // symbol-elf.c:max_text_section stops at init/exit or a noncontiguous
+    // executable section. Its offsets are file offsets, not section VMAs.
+    let mut max_text_offset = 0_u64;
+    if !matches!(
+        runtime.architecture(),
+        object::Architecture::Alpha | object::Architecture::Hppa
+    ) {
+        for section in runtime.sections().filter(elf_section_is_executable) {
+            let Ok(name) = section.name() else {
+                break;
+            };
+            if name.starts_with(".init") || name.starts_with(".exit") {
+                break;
+            }
+            let Some((_, offset)) = elf_section_layout(runtime, section.index()) else {
+                break;
+            };
+            let align = section.align().max(1);
+            let aligned = max_text_offset
+                .checked_add(align - 1)
+                .map(|end| end & !(align - 1));
+            if max_text_offset != 0 && aligned != Some(offset) {
+                break;
+            }
+            max_text_offset = offset.saturating_add(section.size());
+        }
+    }
+    max_text_offset
+}
+
+fn kernel_module_object_metadata(bytes: &[u8], runtime_bytes: &[u8]) -> KernelModuleObjectMetadata {
     let Ok(object) = object::File::parse(bytes) else {
+        return KernelModuleObjectMetadata::default();
+    };
+    let Ok(runtime) = object::File::parse(runtime_bytes) else {
         return KernelModuleObjectMetadata::default();
     };
     // symbol-elf.c:dso__load_sym requires a kernel symtab before dynsym,
@@ -4070,38 +4153,7 @@ fn kernel_module_object_metadata(bytes: &[u8]) -> KernelModuleObjectMetadata {
     {
         return KernelModuleObjectMetadata::default();
     }
-    let executable = |section: &object::Section<'_, '_>| {
-        matches!(section.flags(), object::SectionFlags::Elf { sh_flags }
-            if sh_flags & u64::from(object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR)
-                == u64::from(object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR))
-    };
-    // symbol-elf.c:max_text_section stops at init/exit or a noncontiguous
-    // executable section. Its offsets are file offsets, not section VMAs.
-    let mut max_text_offset = 0_u64;
-    if !matches!(
-        object.architecture(),
-        object::Architecture::Alpha | object::Architecture::Hppa
-    ) {
-        for section in object.sections().filter(executable) {
-            let Ok(name) = section.name() else {
-                break;
-            };
-            if name.starts_with(".init") || name.starts_with(".exit") {
-                break;
-            }
-            let Some(offset) = elf_section_file_offset(&object, section.index()) else {
-                break;
-            };
-            let align = section.align().max(1);
-            let aligned = max_text_offset
-                .checked_add(align - 1)
-                .map(|end| end & !(align - 1));
-            if max_text_offset != 0 && aligned != Some(offset) {
-                break;
-            }
-            max_text_offset = offset.saturating_add(section.size());
-        }
-    }
+    let max_text_offset = kernel_module_max_text_offset(&runtime);
     let mut maps = Vec::new();
     let mut seen = FxHashSet::default();
     let mut text_address = None;
@@ -4109,18 +4161,35 @@ fn kernel_module_object_metadata(bytes: &[u8]) -> KernelModuleObjectMetadata {
         // dso__load_sym_internal resets remap_kernel for each table pass.
         let mut text_remapped = false;
         for symbol in table {
-            if !perf_symbol_is_candidate(&object, &symbol) {
+            if !perf_symbol_is_allocated_candidate(&object, &symbol) {
                 continue;
             }
             let Some(index) = symbol.section_index() else {
                 continue;
             };
-            let Ok(section) = object.section_by_index(index) else {
+            let Ok(symbol_section) = object.section_by_index(index) else {
                 continue;
+            };
+            // symbol-elf.c:1656 replaces a NOBITS symbol-section header with
+            // the runtime source's header at the same index, not by name.
+            let use_runtime = elf_section_layout(&object, index)
+                .is_some_and(|(kind, _)| kind == object::elf::SHT_NOBITS);
+            let section_owner = if use_runtime { &runtime } else { &object };
+            let section = if use_runtime {
+                let Ok(section) = runtime.section_by_index(index) else {
+                    continue;
+                };
+                section
+            } else {
+                symbol_section
             };
             let Ok(name) = section.name() else {
                 continue;
             };
+            // symbol-elf.c:1665 filters labels after runtime substitution.
+            if elf_symbol_is_label(&symbol) && !name.contains("text") && !name.contains("data") {
+                continue;
+            }
             if name == ".text" {
                 if !text_remapped {
                     text_address = Some(if object.kind() == object::ObjectKind::Relocatable {
@@ -4132,9 +4201,9 @@ fn kernel_module_object_metadata(bytes: &[u8]) -> KernelModuleObjectMetadata {
                 }
                 continue;
             }
-            if (executable(&section)
-                && elf_section_file_offset(&object, index)
-                    .is_some_and(|offset| offset <= max_text_offset))
+            if (elf_section_is_executable(&section)
+                && elf_section_layout(section_owner, index)
+                    .is_some_and(|(_, offset)| offset <= max_text_offset))
                 || !seen.insert(name)
             {
                 continue;
@@ -4229,6 +4298,7 @@ impl PreparedObjectMetadata {
             has_debug_line: object
                 .as_ref()
                 .is_some_and(|object| object.section_by_name(".debug_line").is_some()),
+            possibly_runtime: object.as_ref().is_some_and(elf_possibly_runtime),
         }
     }
 
@@ -4973,9 +5043,50 @@ impl PerfDwarfNameResolver {
 }
 
 impl CachedObjectMetadata {
-    fn module_metadata(&self) -> &Arc<KernelModuleObjectMetadata> {
-        self.module_metadata
-            .get_or_init(|| Arc::new(kernel_module_object_metadata(&self.object_bytes)))
+    fn module_metadata(
+        &self,
+        module: &SymbolRequest,
+        load: impl FnOnce(&Path) -> Option<Arc<Self>>,
+    ) -> Arc<KernelModuleObjectMetadata> {
+        // symbol.c:1809 selects syms_ss and runtime_ss independently. Cache
+        // by the runtime candidate as distinct DSOs can share a debug file.
+        let candidate = if self.object_metadata.possibly_runtime {
+            OsStr::new("")
+        } else {
+            module.path.as_os_str()
+        };
+        let mut cache = self
+            .module_metadata
+            .lock()
+            .expect("module metadata cache lock");
+        match cache.raw_entry_mut().from_key(candidate) {
+            RawEntryMut::Occupied(entry) => Arc::clone(entry.get()),
+            RawEntryMut::Vacant(entry) => {
+                let runtime = (!candidate.is_empty())
+                    .then(|| load(Path::new(candidate)))
+                    .flatten()
+                    .filter(|runtime| {
+                        runtime.object_metadata.possibly_runtime
+                            && module.recorded_build_id().is_none_or(|recorded| {
+                                runtime.build_id().as_deref().map(build_id_hex).as_deref()
+                                    == Some(recorded)
+                            })
+                    });
+                // symbol.c falls back to syms_ss if no eligible runtime source
+                // exists; symsrc__init (symbol-elf.c:1193) checks each source ID.
+                let runtime_bytes = runtime
+                    .as_ref()
+                    .map_or(self.object_bytes.as_ref(), |runtime| {
+                        runtime.object_bytes.as_ref()
+                    });
+                let metadata = Arc::new(kernel_module_object_metadata(
+                    &self.object_bytes,
+                    runtime_bytes,
+                ));
+                entry.insert(candidate.to_owned(), Arc::clone(&metadata));
+                metadata
+            }
+        }
     }
 
     fn build_id(&self) -> Option<Vec<u8>> {
@@ -6054,14 +6165,14 @@ mod tests {
                 let request = test_request(path.to_str().unwrap(), 0x1001);
                 assert!(
                     !resolver
-                        .resolve_base_frame_batch_with_metadata(&[request])
+                        .resolve_base_frame_batch_with_metadata(std::slice::from_ref(&request))
                         .unwrap()[0]
                         .frames
                         .is_empty()
                 );
                 assert_eq!(
                     resolver
-                        .selected_object_module_metadata(&path)
+                        .selected_object_module_metadata(&path, &request)
                         .unwrap()
                         .maps,
                     expected
@@ -6069,7 +6180,7 @@ mod tests {
                 std::fs::write(&path, module_metadata_retention_fixture(!separate_map)).unwrap();
                 assert_eq!(
                     resolver
-                        .selected_object_module_metadata(&path)
+                        .selected_object_module_metadata(&path, &request)
                         .unwrap()
                         .maps,
                     expected
@@ -6077,16 +6188,21 @@ mod tests {
                 std::fs::remove_file(&path).unwrap();
                 assert_eq!(
                     resolver
-                        .selected_object_module_metadata(&path)
+                        .selected_object_module_metadata(&path, &request)
                         .unwrap()
                         .maps,
                     expected
                 );
                 let missing = root.path().join("missing.elf");
-                assert_eq!(resolver.selected_object_module_metadata(&missing), None);
+                assert_eq!(
+                    resolver.selected_object_module_metadata(&missing, &request),
+                    None
+                );
                 std::fs::write(&missing, regression_elf_with_build_id()).unwrap();
                 assert!(
-                    resolver.selected_object_module_metadata(&missing).is_none(),
+                    resolver
+                        .selected_object_module_metadata(&missing, &request)
+                        .is_none(),
                     "failed selection is retained"
                 );
             }
@@ -6122,7 +6238,7 @@ mod tests {
         let mut selected = Vec::new();
         builder.write(&mut selected).unwrap();
         assert_eq!(
-            super::kernel_module_object_metadata(&selected).text_address,
+            super::kernel_module_object_metadata(&selected, &selected).text_address,
             Some(first)
         );
     }
@@ -6158,7 +6274,7 @@ mod tests {
         builder.set_section_sizes();
         let mut selected = Vec::new();
         builder.write(&mut selected).unwrap();
-        let metadata = super::kernel_module_object_metadata(&selected);
+        let metadata = super::kernel_module_object_metadata(&selected, &selected);
         assert_eq!(metadata.text_address, None);
         assert_eq!(metadata.maps.len(), 1);
         assert_eq!(metadata.maps[0].section, ".init.text");
@@ -6255,7 +6371,7 @@ mod tests {
         let mut bytes = Vec::new();
         builder.write(&mut bytes).unwrap();
         assert_eq!(
-            super::kernel_module_object_metadata(&bytes).maps,
+            super::kernel_module_object_metadata(&bytes, &bytes).maps,
             [super::KernelModuleSectionMap {
                 section: ".data".into(),
                 start: 0x2000,
@@ -8065,7 +8181,7 @@ mod tests {
             object_metadata: PreparedObjectMetadata::from_object_bytes(&object_bytes),
             object_bytes: object_bytes.into(),
             dwarf_index: Mutex::new(PerfDwarfIndexCache::default()),
-            module_metadata: std::sync::OnceLock::new(),
+            module_metadata: Mutex::default(),
         });
 
         let frames = resolve_base_frames_from_object_metadata(
