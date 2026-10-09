@@ -207,7 +207,7 @@ fn offcpu_workload_arguments_remain_literal_in_logs() {
 #[test]
 fn offcpu_workload_preserves_native_shell_missing_executable_failure() {
     let root = tempfile::tempdir().unwrap();
-    let native = std::process::Command::new("sh")
+    let native = std::process::Command::new("/bin/sh")
         .args(["-c", "exec /pyroclast-nonexistent-executable"])
         .output()
         .unwrap();
