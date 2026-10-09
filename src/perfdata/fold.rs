@@ -2329,7 +2329,7 @@ impl SessionState {
         if self
             .thread_maps
             .pid(record.ptid)
-            .is_some_and(|pid| pid != record.ppid)
+            .is_some_and(|pid| pid != u32::MAX && pid != record.ppid)
         {
             self.remove_thread(record.ptid);
         }

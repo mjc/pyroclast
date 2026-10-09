@@ -74,6 +74,18 @@ maps and retained DSO identities, and cache revalidation after slot reuse.
 Allocator controls ensure internal group keys cannot alias another real PID,
 and that temporary fork references survive replacement until maps are copied.
 
+A subsequent review found two unknown-PID promotion errors, both observed red:
+FORK treated an unknown parent as a conflicting known PID and discarded its
+COMM, and leader promotion unnecessarily replaced its map group. Native
+`machine.c:475-518` promotes unknown PIDs before checking parent conflicts and
+preserves a leader's group in place. The native parent-COMM byte/file comparison
+and the source-derived leader-identity unit regression now follow those rules.
+
+Replaying the real C workload after these attachment changes removed worker
+stack differences, but one native caller (`2` after `_start`) is still absent.
+That recording has substantial capture loss and is not performance evidence;
+the remaining CFI/architecture fallback mismatch is not resolved here.
+
 ## 2026-10-09 kernel module section maps, not ELF-type rejection
 
 Two fresh native regressions disproved the blanket ET_DYN rejection. Keeping

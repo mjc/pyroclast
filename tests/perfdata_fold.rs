@@ -2624,6 +2624,43 @@ fn reused_tid_does_not_keep_exited_threads_comm_like_native_perf() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn fork_promotes_unknown_parent_pid_without_losing_its_comm_like_native_perf() {
+    let mut comm = comm_payload(u32::MAX, 12, "parent");
+    comm.resize(comm.len().next_multiple_of(8), 0);
+    let mut bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(3, &comm),
+            record_bytes(PERF_RECORD_FORK, &fork_payload(22, 11, 22, 12, 0)),
+            record_bytes_with_misc(
+                9,
+                PERF_RECORD_MISC_CPUMODE_USER,
+                &sample_payload(0x4000, 22, 22, [0x4000]),
+            ),
+        ],
+    );
+    put_u64(&mut bytes, 16, 144);
+    let (script, expected) = native_script_and_fold(&bytes);
+    assert_eq!(expected, "parent;[unknown] 1\n", "{script}");
+    assert_eq!(
+        fold_perfdata_callchains(&bytes).unwrap(),
+        expected,
+        "{script}"
+    );
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), &bytes).unwrap();
+    assert_eq!(
+        fold_perfdata_file_with_options(file.path(), FoldOptions::default()).unwrap(),
+        expected
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn initial_module_failure_does_not_reserve_unwind_attachment_like_native_perf() {
     let fixture = SyntheticX86_64Object::create();
     for missing_mapping in [false, true] {

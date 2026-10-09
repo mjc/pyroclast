@@ -28,6 +28,12 @@ impl ThreadMaps {
             if thread.pid != u32::MAX || pid == u32::MAX {
                 return thread.maps;
             }
+            if pid == tid {
+                // machine.c:485 promotes a leader in place without changing
+                // its map group or attached unwind session.
+                self.threads.get_mut(&tid).expect("existing thread").pid = pid;
+                return thread.maps;
+            }
             // machine.c:machine__update_thread_pid joins the leader's maps
             // when a previously unknown PID becomes known.
             self.remove(tid);
@@ -117,6 +123,17 @@ mod tests {
         assert_ne!(old, split);
         assert_ne!(split, other);
         assert_eq!(threads.find_or_create(11, 13), split);
+    }
+
+    #[test]
+    fn unknown_pid_leader_promotion_keeps_its_existing_group() {
+        // machine.c:485 returns after setting PID when PID == TID; it does
+        // not discard the maps already owned by this thread.
+        let mut threads = ThreadMaps::default();
+        let old = threads.find_or_create(u32::MAX, 12);
+        assert_eq!(threads.find_or_create(12, 12), old);
+        assert_eq!(threads.pid(12), Some(12));
+        assert_eq!(threads.take_retired().count(), 0);
     }
 
     #[test]
