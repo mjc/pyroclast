@@ -120,6 +120,47 @@ private unwind path; it was separately red before the fix. The redundant
 classifier and enum are removed. Initial module-report errors and attachment
 failures still return early; the existing no-CFI leaf shortcut is unchanged.
 
+## 2026-10-09 AArch64 fallback follows CFI row status
+
+The unmapped-PC investigation also found a caller omission on AArch64. After
+DWFL attachment, native perf accepts an unmapped leaf and its captured LR
+caller. Pyroclast's supplemental fallback instead required a module at the
+current PC. A fresh native byte/file regression failed with the caller missing.
+
+Removing that module gate alone is insufficient. The old fallback inferred
+"no CFI" from a seed-only frame vector. Elfutils `frame_unwind.c:529-675`
+creates a successor after decoding a row, even when the return register is
+undefined, zero, or unreadable. Lines 741-760 then retain that CFI result and
+do not try EBL. Framehop's initial AArch64 rule can instead use captured LR
+for an undefined return register. Three independent native comparisons failed
+because Pyroclast fabricated callers in those stopping cases. A fourth failed
+because a successfully restored LR must survive into the next no-CFI frame:
+native accepts the same caller PC twice, while Pyroclast omitted the second.
+
+Both ELF architectures now use the existing DWARF row evaluator and shared
+iterator. EH CFI precedes debug CFI; architecture fallback runs only on
+`NoRow`, never `Stop`. AArch64 defaults follow `backends/aarch64_cfi.c` and
+LR/FP recovery follows `backends/aarch64_unwind.c:52-87`. Perf's frame callback
+at `unwind-libdw.c:326-338` and Inferno's `collapse/perf.rs:588-599` preserve
+the repeated caller. The seed-vector fallback, its module-presence gate, and
+duplicate standalone architecture walkers are removed. Their tests now use
+the actual iterator or attachment path, with behavior-based names.
+
+Review also exposed conflation of callback PC and DWARF register 32. A second
+CFI row tried to recover LR from a register explicitly undefined by the first;
+native stopped, while Pyroclast fabricated callers until the depth limit. The
+native comparison was red in run `3da9f750-2c54-4f06-860a-e14c32037dde`.
+Registers now retain callback PC separately from register values and validity,
+as `frame_unwind.c:643-660,681-691` does for both CFI and EBL successors.
+
+The five public native comparisons were independently observed red in nextest
+run `21604cfe-f05f-4ad2-b099-1217221daf94`. Earlier oracle setup failures are
+not red evidence. The converted private attachment test was separately run
+against unchanged parent `8db5965`, with only the test changed. Run
+`5947389b-a3f1-485f-be2d-76c302f16ffc` failed with the same missing caller.
+This change does not establish general AArch64 parity: captured
+general-purpose registers outside FP/LR/SP/PC and PAC still need an audit.
+
 ## 2026-10-09 kernel module section maps, not ELF-type rejection
 
 Two fresh native regressions disproved the blanket ET_DYN rejection. Keeping

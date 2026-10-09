@@ -2583,6 +2583,231 @@ fn attached_thread_keeps_unmapped_initial_pc_like_native_perf_libdw() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn attached_aarch64_unmapped_pc_keeps_lr_caller_like_native_perf_libdw() {
+    // unwind-libdw.c:79-85 accepts a missing user DSO. After attachment,
+    // elfutils backends/aarch64_unwind.c:52-87 accepts LR before nonfatal
+    // FP reads, even when the current PC is outside every module.
+    let fixture = SyntheticAarch64Object::create_with_symbol();
+    let mut mmap = mmap_payload(11, 11, 0x4000, 0x1000, 0x4000, &fixture.path_string());
+    mmap.resize(mmap.len().next_multiple_of(8), 0);
+    let sample = |pc, lr| {
+        record_bytes_with_misc(
+            9,
+            PERF_RECORD_MISC_CPUMODE_USER,
+            &sample_payload_with_user_stack(pc, 11, 11, [], 1, [0, lr, 0x1000, pc], [0; 24]),
+        )
+    };
+    let bytes = perfdata_with_records_attrs_and_arch_feature(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            (1 << 29) | (1 << 30) | (1 << 31) | (1 << 32),
+        )],
+        [
+            record_bytes(1, &mmap),
+            sample(0x4000, 0),
+            sample(0x20000, 0x30000),
+        ],
+        "aarch64",
+    );
+    let (script, expected) = native_script_and_fold(&bytes);
+    assert!(script.contains("seed+0x0"), "{script}");
+    assert!(script.contains("20000 [unknown]"), "{script}");
+    assert!(script.contains("2ffff [unknown]"), "{script}");
+    assert!(!expected.is_empty());
+    let resolver = pyroclast::symbols::PerfSymbolResolver::from_object_resolver(
+        pyroclast::symbols::RustAddr2lineResolver::new(),
+    );
+    assert_eq!(
+        fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver).unwrap(),
+        expected,
+        "{script}"
+    );
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), bytes).unwrap();
+    assert_eq!(
+        pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(
+            file.path(),
+            FoldOptions::default(),
+            &resolver
+        )
+        .unwrap(),
+        expected,
+        "{script}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn aarch64_cfi_undefined_lr_stops_like_native_perf_libdw() {
+    assert_aarch64_cfi_return_address_like_native(&[0x07, 0x1e], None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn aarch64_cfi_zero_lr_stops_like_native_perf_libdw() {
+    assert_aarch64_cfi_return_address_like_native(&[0x9e, 0], Some(0));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn aarch64_cfi_unreadable_lr_stops_like_native_perf_libdw() {
+    assert_aarch64_cfi_return_address_like_native(&[0x9e, 4], None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn aarch64_cfi_restored_lr_produces_caller_like_native_perf_libdw() {
+    assert_aarch64_cfi_return_address_like_native(&[0x9e, 0], Some(0x30000));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn aarch64_cfi_pc_does_not_define_register_32_like_native_perf_libdw() {
+    // frame_unwind.c:578 and 643 keep recovered register validity separate
+    // from unwound->pc. The second FDE cannot use an explicitly undefined r32.
+    let fixture = SyntheticAarch64Object::create_with_symbol();
+    let mut object = std::fs::read(&fixture.path).unwrap();
+    object.copy_within(0x100..0x130, 0x800);
+    put_u32(&mut object, 0x820, 0x4000 - 0x820);
+    object[0x829..0x82e].copy_from_slice(&[0x0c, 0x1f, 0, 0x07, 0x20]);
+    put_u32(&mut object, 0x830, 20);
+    put_u32(&mut object, 0x834, 0x34);
+    put_u32(&mut object, 0x838, 0x4ffc - 0x838);
+    put_u32(&mut object, 0x83c, 4);
+    object[0x841..0x847].copy_from_slice(&[0x0c, 0x1f, 0, 0x09, 0x1e, 0x20]);
+    for offset in [16, 24] {
+        put_u64(&mut object, 0x2c0 + offset, 0x800);
+    }
+    put_u64(&mut object, 0x2c0 + 32, 76);
+    std::fs::write(&fixture.path, object).unwrap();
+    let mut mmap = mmap_payload(11, 11, 0x4000, 0x2000, 0x4000, &fixture.path_string());
+    mmap.resize(mmap.len().next_multiple_of(8), 0);
+    let bytes = perfdata_with_records_attrs_and_arch_feature(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            (1 << 29) | (1 << 30) | (1 << 31) | (1 << 32),
+        )],
+        [
+            record_bytes(1, &mmap),
+            record_bytes_with_misc(
+                9,
+                PERF_RECORD_MISC_CPUMODE_USER,
+                &sample_payload_with_user_stack(
+                    0x4000,
+                    11,
+                    11,
+                    [],
+                    1,
+                    [0, 0x5000, 0x1000, 0x4000],
+                    [0; 24],
+                ),
+            ),
+        ],
+        "aarch64",
+    );
+    let (script, expected) = native_script_and_fold(&bytes);
+    assert!(script.contains("4000 seed+0x0"), "{script}");
+    assert_eq!(
+        script
+            .lines()
+            .filter(|line| line.trim_start().starts_with("4fff "))
+            .count(),
+        1,
+        "{script}"
+    );
+    let resolver = pyroclast::symbols::PerfSymbolResolver::from_object_resolver(
+        pyroclast::symbols::RustAddr2lineResolver::new(),
+    );
+    assert_eq!(
+        fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver).unwrap(),
+        expected,
+        "{script}",
+    );
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), bytes).unwrap();
+    assert_eq!(
+        pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(
+            file.path(),
+            FoldOptions::default(),
+            &resolver,
+        )
+        .unwrap(),
+        expected,
+        "{script}",
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn assert_aarch64_cfi_return_address_like_native(rule: &[u8], recovered: Option<u64>) {
+    // elfutils frame_unwind.c:529-675 retains a decoded CFI successor even
+    // when RA is undefined, zero, or unreadable. Lines 741-760 return without
+    // ebl_unwind in that case; the sampled LR cannot replace the recovered RA.
+    let fixture = SyntheticAarch64Object::create_with_symbol();
+    let mut object = std::fs::read(&fixture.path).unwrap();
+    put_u32(&mut object, 0x120, 0x4000 - 0x120); // FDE pcrel start
+    object[0x129..0x12c].copy_from_slice(&[0x0c, 0x1f, 0]); // CFA = SP
+    object[0x12c..0x12c + rule.len()].copy_from_slice(rule);
+    std::fs::write(&fixture.path, object).unwrap();
+    let mut mmap = mmap_payload(11, 11, 0x4000, 0x1000, 0x4000, &fixture.path_string());
+    mmap.resize(mmap.len().next_multiple_of(8), 0);
+    let mut stack = [0; 24];
+    stack[..8].copy_from_slice(&recovered.unwrap_or(0_u64).to_le_bytes());
+    let sample = record_bytes_with_misc(
+        9,
+        PERF_RECORD_MISC_CPUMODE_USER,
+        &sample_payload_with_user_stack(0x4000, 11, 11, [], 1, [0, 0x30000, 0x1000, 0x4000], stack),
+    );
+    let bytes = perfdata_with_records_attrs_and_arch_feature(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            (1 << 29) | (1 << 30) | (1 << 31) | (1 << 32),
+        )],
+        [record_bytes(1, &mmap), sample],
+        "aarch64",
+    );
+    let (script, expected) = native_script_and_fold(&bytes);
+    assert!(script.contains("4000 seed+0x0"), "{script}");
+    assert_eq!(
+        script.contains("2ffff [unknown]"),
+        recovered == Some(0x30000),
+        "{script}"
+    );
+    let resolver = pyroclast::symbols::PerfSymbolResolver::from_object_resolver(
+        pyroclast::symbols::RustAddr2lineResolver::new(),
+    );
+    assert_eq!(
+        fold_perfdata_callchains_with_symbols(&bytes, FoldOptions::default(), &resolver).unwrap(),
+        expected,
+        "CFI {rule:?}, recovered {recovered:?}: {script}"
+    );
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), bytes).unwrap();
+    assert_eq!(
+        pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(
+            file.path(),
+            FoldOptions::default(),
+            &resolver,
+        )
+        .unwrap(),
+        expected,
+        "CFI {rule:?}, recovered {recovered:?}: {script}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn shared_process_unwind_attachment_keeps_first_tid_like_native_perf_libdw() {
     // unwind-libdw.c stores DWFL on shared maps and next_thread() enumerates
     // only dwfl_pid(). dwfl_frame.c rejects reattachment and reports ESRCH
@@ -9255,6 +9480,54 @@ struct SyntheticAarch64Object {
 }
 
 impl SyntheticAarch64Object {
+    #[cfg(target_os = "linux")]
+    fn create_with_symbol() -> Self {
+        // Perf thread.c:519-547 discovers e_machine through loaded DSOs.
+        // A symbol-less ELF is NOT_FOUND (dso.c:1323), falling back to the
+        // host architecture rather than HEADER_ARCH. Give it a real text symbol.
+        let fixture = Self::create();
+        let mut bytes = std::fs::read(&fixture.path).unwrap();
+        bytes.resize(0x4004, 0);
+        bytes.copy_within(0x180..0x240, 0x280);
+        put_u64(&mut bytes, 40, 0x280);
+        bytes[60..62].copy_from_slice(&6_u16.to_le_bytes());
+        put_u64(&mut bytes, 96, 0x4004);
+        let names = b"\0.eh_frame\0.shstrtab\0.symtab\0.strtab\0.text\0";
+        bytes[0x140..0x140 + names.len()].copy_from_slice(names);
+        put_u64(&mut bytes, 0x300 + 32, names.len() as u64);
+        bytes[0x180..0x1b0].fill(0);
+        put_u32(&mut bytes, 0x198, 1);
+        bytes[0x19c] = 0x12; // STB_GLOBAL | STT_FUNC
+        bytes[0x19e..0x1a0].copy_from_slice(&5_u16.to_le_bytes());
+        put_u64(&mut bytes, 0x1a0, 0x4000);
+        put_u64(&mut bytes, 0x1a8, 4);
+        bytes[0x1c0..0x1c6].copy_from_slice(b"\0seed\0");
+        bytes[0x4000..0x4004].copy_from_slice(&[0x1f, 0x20, 0x03, 0xd5]); // nop
+        for (index, name, kind, flags, addr, offset, size, align) in [
+            (3, 21, 2, 0, 0, 0x180, 48, 8),
+            (4, 29, 3, 0, 0, 0x1c0, 6, 1),
+            (5, 37, 1, 6, 0x4000, 0x4000, 4, 4),
+        ] {
+            let base = 0x280 + index * 64;
+            put_u32(&mut bytes, base, name);
+            put_u32(&mut bytes, base + 4, kind);
+            for (at, value) in [
+                (8, flags),
+                (16, addr),
+                (24, offset),
+                (32, size),
+                (48, align),
+            ] {
+                put_u64(&mut bytes, base + at, value);
+            }
+        }
+        put_u32(&mut bytes, 0x340 + 40, 4); // .symtab sh_link = .strtab
+        put_u32(&mut bytes, 0x340 + 44, 1); // first global symbol
+        put_u64(&mut bytes, 0x340 + 56, 24);
+        std::fs::write(&fixture.path, bytes).unwrap();
+        fixture
+    }
+
     fn create() -> Self {
         let mut bytes = vec![0_u8; 0x240];
         bytes[0..4].copy_from_slice(b"\x7fELF");

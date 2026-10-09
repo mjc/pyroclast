@@ -49,11 +49,7 @@ use crate::perfdata::samples::{
 use crate::perfdata::source::{
     FileSource, QueuedPerfRecord, RecordSource, SliceSource, WindowStore,
 };
-use crate::perfdata::unwind::{
-    FramehopUnwinder, ObjectMappingResult, PerfArch, PerfUserRegs,
-    unwind_aarch64_frame_pointer_stack_like_elfutils,
-    unwind_x86_64_frame_pointer_stack_like_elfutils,
-};
+use crate::perfdata::unwind::{FramehopUnwinder, ObjectMappingResult, PerfArch, PerfUserRegs};
 #[cfg(test)]
 use crate::perfdata::unwind::{UserStackUnwindResult, UserStackUnwinder};
 use crate::symbols::{
@@ -4682,22 +4678,9 @@ fn unwind_object_frame_addresses_like_perf(
     if failed {
         return perf_accepted_object_unwind_frames(regs, false, raw_frames);
     }
-    let initial_ip_has_reported_module = initial_ip_mapping_has_reported_unwind_module(
-        Some(pid),
-        regs.ip(),
-        mmap_table,
-        &state.object_unwinder,
-    );
-    let use_libdw_arch_fallback = should_use_libdw_arch_fallback_after_empty_object_unwind(
-        context,
-        initial_ip_has_reported_module,
-    );
-    let mut raw_frames = libdw_arch_fallback_after_empty_object_unwind(
-        raw_frames,
-        regs,
-        stack_bytes,
-        use_libdw_arch_fallback,
-    );
+    // The iterator chooses CFI or EBL per frame. A seed-only vector may be a
+    // decoded CFI stop, so it must not trigger a second architecture walk.
+    let mut raw_frames = raw_frames;
     report_callback_entries_like_perf(state, mmap_table, pid, &mut raw_frames, unwind_debug_dir);
     let raw_frames = truncate_syscall_return_unwind_after_first_executable_frame(
         raw_frames,
@@ -4847,42 +4830,6 @@ fn arch_fallback_provably_cannot_advance(regs: &PerfUserRegs) -> bool {
     }
 }
 
-fn libdw_arch_fallback_after_empty_object_unwind(
-    raw_frames: Vec<u64>,
-    regs: &PerfUserRegs,
-    stack_bytes: &[u8],
-    use_libdw_arch_fallback: bool,
-) -> Vec<u64> {
-    if !use_libdw_arch_fallback {
-        return raw_frames;
-    }
-    match *regs {
-        // elfutils' x86_64 backend only walks the rbp chain when the frame
-        // pointer is at or above the stack pointer. framehop's own x86_64
-        // frame-pointer recovery already advances most stacks, so the elfutils
-        // fallback only fills in stacks where framehop produced nothing.
-        PerfUserRegs::X86_64(regs) if raw_frames.is_empty() && regs.bp >= regs.sp => {
-            unwind_x86_64_frame_pointer_stack_like_elfutils(regs, stack_bytes, 256)
-        }
-        // aarch64's backend has no bp/sp precondition: it accepts the lr-based
-        // caller unless lr == 0, with its own internal `fp == 0 || fp+16 > sp`
-        // accept condition (backends/aarch64_unwind.c). framehop's aarch64
-        // unwinder yields only the seed pc when no CFI covers it, which is
-        // exactly when libdwfl invokes ebl_unwind on the leaf, so the fallback
-        // fires when framehop produced no caller beyond the sampled pc.
-        PerfUserRegs::Aarch64(regs) if frames_are_seed_only(&raw_frames, regs.pc) => {
-            unwind_aarch64_frame_pointer_stack_like_elfutils(regs, stack_bytes, 256)
-        }
-        PerfUserRegs::X86_64(_) | PerfUserRegs::Aarch64(_) => raw_frames,
-    }
-}
-
-/// Whether framehop produced no caller beyond the sampled pc: either nothing at
-/// all, or just the seed instruction pointer.
-fn frames_are_seed_only(raw_frames: &[u64], pc: u64) -> bool {
-    raw_frames.is_empty() || raw_frames == [pc]
-}
-
 fn truncate_syscall_return_unwind_after_first_executable_frame(
     raw_frames: Vec<u64>,
     _pid: Option<u32>,
@@ -4890,14 +4837,6 @@ fn truncate_syscall_return_unwind_after_first_executable_frame(
     _context: UserUnwindContext,
 ) -> Vec<u64> {
     raw_frames
-}
-
-fn should_use_libdw_arch_fallback_after_empty_object_unwind(
-    context: UserUnwindContext,
-    initial_ip_mapping_has_reported_module: bool,
-) -> bool {
-    context.initial_ip_mapping != InitialIpMappingState::RecordedMappingMissing
-        && initial_ip_mapping_has_reported_module
 }
 
 fn initial_ip_mapping_has_reported_unwind_module(
@@ -11116,7 +11055,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_object_unwind_uses_arch_fallback_like_libdw_ebl_unwind() {
+    fn object_unwinder_uses_x86_arch_fallback_without_cfi_like_libdw_ebl() {
         // elfutils libdwfl/frame_unwind.c tries EH CFI, then DWARF CFI, then
         // falls through to ebl_unwind(). The real period 803991 sample in the
         // octo profile takes this path: framehop returns no object frames, while
@@ -11139,83 +11078,52 @@ mod tests {
         stack[0x28..0x30].copy_from_slice(&0x7fff_f7e9_9d7e_u64.to_le_bytes());
 
         assert_eq!(
-            super::libdw_arch_fallback_after_empty_object_unwind(
-                Vec::new(),
-                &PerfUserRegs::X86_64(regs),
-                &stack,
-                true,
-            ),
+            super::FramehopUnwinder::new().unwind_stack(PerfUserRegs::X86_64(regs), &stack, 256),
             vec![0x7fff_f7e1_c03e, 0x7fff_f7e1_c083, 0x7fff_f7e9_9d7d]
         );
     }
 
     #[test]
-    fn empty_object_unwind_arch_fallback_requires_initial_reported_module_like_perf_libdw() {
-        let regs = PerfX86_64Regs {
-            ip: 0x4000,
-            sp: 0x8000,
-            bp: 0x8000,
-            registers: [0; 16],
-        };
-        let stack = 0x5000_u64.to_le_bytes();
-
-        assert_eq!(
-            super::libdw_arch_fallback_after_empty_object_unwind(
-                Vec::new(),
-                &PerfUserRegs::X86_64(regs),
-                &stack,
-                false,
-            ),
-            Vec::<u64>::new()
-        );
-
-        let matching_context = super::UserUnwindContext {
+    fn attached_object_unwind_recovers_unmapped_lr_caller_like_perf_libdw() {
+        // unwind-libdw.c:79-85 succeeds without a user DSO. An existing
+        // attachment still invokes aarch64_unwind.c:52-87 for a no-CFI PC.
+        // Exercise the actual private path, not a module-presence classifier.
+        let regs = PerfUserRegs::Aarch64(crate::perfdata::unwind::PerfAarch64Regs {
+            pc: 0x20000,
+            sp: 0x1000,
+            fp: 0,
+            lr: 0x30000,
+        });
+        let context = super::UserUnwindContext {
             sample_callchain: super::SampleCallchainPresence::Present,
             callchain: super::SampleCallchainState::KernelWithCallchain,
-            initial_ip_mapping: super::InitialIpMappingState::RecordedMappingLoaded,
-            module_count: 1,
-            frame_pointer_at_or_above_stack_pointer: true,
+            initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
+            module_count: 0,
+            frame_pointer_at_or_above_stack_pointer: false,
             syscall_return_state: true,
         };
-        assert!(
-            super::should_use_libdw_arch_fallback_after_empty_object_unwind(matching_context, true)
-        );
-
-        assert!(
-            !super::should_use_libdw_arch_fallback_after_empty_object_unwind(
-                super::UserUnwindContext {
-                    initial_ip_mapping: super::InitialIpMappingState::NoRecordedMapping,
-                    ..matching_context
-                },
-                false
+        let mut state = super::PidUnwindState::with_arch(super::PerfArch::Aarch64);
+        state.attached_tid = Some(12);
+        let table = super::MmapTable::default();
+        let mut sources = super::DsoMemorySources::default();
+        assert_eq!(
+            super::unwind_object_frame_addresses_like_perf(
+                &mut state,
+                (11, 12),
+                &mut super::MappedMemory::new(11, &table, &mut sources, None),
+                &regs,
+                &[0; 24],
+                context,
             ),
-            "perf unwind__get_entries exits before dwfl_getthread_frames when report_module(ip) fails"
-        );
-        assert!(
-            !super::should_use_libdw_arch_fallback_after_empty_object_unwind(
-                super::UserUnwindContext { ..matching_context },
-                false
-            ),
-            "perf frame_callback reaches ebl_unwind only after the initial IP module is reported"
-        );
-        assert!(
-            !super::should_use_libdw_arch_fallback_after_empty_object_unwind(
-                super::UserUnwindContext {
-                    syscall_return_state: false,
-                    ..matching_context
-                },
-                false
-            ),
-            "non-syscall samples still need perf's initial report_module(ip) success"
+            [0x20000, 0x2ffff]
         );
     }
 
     #[test]
-    fn aarch64_arch_fallback_fires_on_seed_only_object_unwind_like_libdw_ebl() {
-        // framehop's aarch64 unwinder yields only the seed pc when no CFI
-        // covers it; that is exactly when libdwfl invokes ebl_unwind on the
-        // leaf (backends/aarch64_unwind.c), so the fp-chain fallback must run
-        // even though framehop returned one frame.
+    fn object_unwinder_uses_aarch64_arch_fallback_without_cfi_like_libdw_ebl() {
+        // libdwfl/frame_unwind.c:736-774 reaches ebl_unwind with no CFI row.
+        // Exercise that decision through the raw iterator rather than forcing
+        // a supplemental fallback after a prebuilt seed-only vector.
         let regs = PerfUserRegs::Aarch64(crate::perfdata::unwind::PerfAarch64Regs {
             pc: 0x4000,
             sp: 0x1000,
@@ -11225,7 +11133,8 @@ mod tests {
         let stack = vec![0_u8; 0x40];
 
         assert_eq!(
-            super::libdw_arch_fallback_after_empty_object_unwind(vec![0x4000], &regs, &stack, true,),
+            super::FramehopUnwinder::with_arch(super::PerfArch::Aarch64)
+                .unwind_stack(regs, &stack, 256),
             // pc, then the lr caller (perf pc-1 adjustment), then stop on the
             // zeroed next lr.
             vec![0x4000, 0x4fff]
@@ -11233,9 +11142,9 @@ mod tests {
     }
 
     #[test]
-    fn aarch64_arch_fallback_keeps_multi_frame_object_unwind() {
-        // When framehop already produced callers past the seed (CFI worked),
-        // the ebl fallback must not clobber them.
+    fn aarch64_object_unwind_acceptance_keeps_existing_callers_like_libdw_entry() {
+        // unwind-libdw.c:158 accepts each callback entry without reconstructing
+        // the stack from captured LR. Native CFI recovery is covered separately.
         let regs = PerfUserRegs::Aarch64(crate::perfdata::unwind::PerfAarch64Regs {
             pc: 0x4000,
             sp: 0x1000,
@@ -11244,12 +11153,7 @@ mod tests {
         });
 
         assert_eq!(
-            super::libdw_arch_fallback_after_empty_object_unwind(
-                vec![0x4000, 0x9000],
-                &regs,
-                &[0_u8; 0x40],
-                true,
-            ),
+            super::perf_accepted_object_unwind_frames(&regs, false, vec![0x4000, 0x9000],),
             vec![0x4000, 0x9000]
         );
     }

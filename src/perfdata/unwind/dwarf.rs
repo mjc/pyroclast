@@ -7,7 +7,8 @@ use gimli::{
 };
 
 use super::{
-    ExplicitModuleSectionInfo, ModuleAddresses, ModuleBytes, PerfX86_64Regs, Reg, UnwindRegsX86_64,
+    ExplicitModuleSectionInfo, ModuleAddresses, ModuleBytes, PerfAarch64Regs, PerfArch,
+    PerfX86_64Regs, Reg, UnwindRegsAarch64, UnwindRegsX86_64,
 };
 
 type Bytes<'a> = EndianSlice<'a, LittleEndian>;
@@ -27,12 +28,57 @@ impl Cache {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct Registers {
-    values: [u64; 17],
-    valid: u32,
+pub(super) struct Registers<const N: usize = 17> {
+    values: [u64; N],
+    valid: u64,
+    pc: u64,
 }
 
-impl Registers {
+pub(super) trait RegisterLayout<const N: usize>: Copy {
+    fn default_rule(register: Register) -> RegisterRule<usize>;
+    fn default_cfa() -> Option<Register>;
+    fn arch_fallback(self, read: &mut impl FnMut(u64) -> Result<u64, ()>) -> Step<N>;
+}
+
+impl RegisterLayout<17> for Registers<17> {
+    fn default_rule(register: Register) -> RegisterRule<usize> {
+        // x86_64_cfi.c:39-61 uses register 0 despite its rbx comment.
+        match register.0 {
+            0 | 6 | 12..=16 => RegisterRule::SameValue,
+            7 => RegisterRule::ValOffset(0),
+            _ => RegisterRule::Undefined,
+        }
+    }
+
+    fn default_cfa() -> Option<Register> {
+        None
+    }
+
+    fn arch_fallback(self, read: &mut impl FnMut(u64) -> Result<u64, ()>) -> Step {
+        self.frame_pointer_step(read)
+    }
+}
+
+impl RegisterLayout<33> for Registers<33> {
+    fn default_rule(register: Register) -> RegisterRule<usize> {
+        match register.0 {
+            19..=30 => RegisterRule::SameValue,
+            31 => RegisterRule::ValOffset(0),
+            _ => RegisterRule::Undefined,
+        }
+    }
+
+    fn default_cfa() -> Option<Register> {
+        // aarch64_cfi.c's instructions use LR (30), not the commented SP.
+        Some(Register(30))
+    }
+
+    fn arch_fallback(self, read: &mut impl FnMut(u64) -> Result<u64, ()>) -> Step<33> {
+        self.frame_pointer_step(read)
+    }
+}
+
+impl Registers<17> {
     pub(super) fn new(regs: PerfX86_64Regs) -> Self {
         let mut values = [0; 17];
         for (value, recorded) in values.iter_mut().zip(regs.registers) {
@@ -44,41 +90,13 @@ impl Registers {
         Self {
             values,
             valid: (1 << 17) - 1,
+            pc: regs.ip,
         }
-    }
-
-    fn empty() -> Self {
-        Self {
-            values: [0; 17],
-            valid: 0,
-        }
-    }
-
-    fn set(&mut self, number: usize, value: Option<u64>) {
-        if let Some(value) = value {
-            self.values[number] = value;
-            self.valid |= 1 << number;
-        } else {
-            self.values[number] = 0;
-            self.valid &= !(1 << number);
-        }
-    }
-
-    fn get(self, register: Register) -> Option<u64> {
-        let number = usize::from(register.0);
-        self.values
-            .get(number)
-            .copied()
-            .filter(|_| self.valid & (1 << number) != 0)
-    }
-
-    pub(super) fn pc(self) -> Option<u64> {
-        self.get(Register(16))
     }
 
     pub(super) fn framehop_regs(self) -> UnwindRegsX86_64 {
         let regs = PerfX86_64Regs {
-            ip: self.pc().unwrap_or(0),
+            ip: self.pc(),
             sp: self.get(Register(7)).unwrap_or(0),
             bp: self.get(Register(6)).unwrap_or(0),
             registers: std::array::from_fn(|index| self.values[index]),
@@ -109,13 +127,13 @@ impl Registers {
         for (number, register) in order.into_iter().enumerate() {
             caller.set(number, Some(regs.get(register)));
         }
-        caller.set(16, Some(regs.ip()));
+        caller.pc = regs.ip();
         caller
     }
 
     pub(super) fn frame_pointer_step(self, read: &mut impl FnMut(u64) -> Result<u64, ()>) -> Step {
         // elfutils backends/x86_64_unwind.c:48-91: missing old SP is zero,
-        // missing previous FP is nonfatal, and only these three regs are set.
+        // missing previous FP is nonfatal; only FP/SP and callback PC are set.
         let Some(fp) = self.get(Register(6)).filter(|fp| *fp != 0) else {
             return Step::Stop;
         };
@@ -130,15 +148,104 @@ impl Registers {
         let mut caller = Self::empty();
         caller.set(6, Some(previous));
         caller.set(7, Some(sp));
-        caller.set(16, Some(pc));
+        caller.pc = pc;
         Step::Caller(caller, false)
     }
 }
 
-pub(super) enum Step {
+impl Registers<33> {
+    pub(super) fn new_aarch64(regs: PerfAarch64Regs) -> Self {
+        let mut values = [0; 33];
+        values[29] = regs.fp;
+        values[30] = regs.lr;
+        values[31] = regs.sp;
+        values[32] = regs.pc;
+        Self {
+            values,
+            valid: (1_u64 << 33) - 1,
+            pc: regs.pc,
+        }
+    }
+
+    pub(super) fn framehop_regs(self) -> UnwindRegsAarch64 {
+        UnwindRegsAarch64::new(
+            self.get(Register(30)).unwrap_or(0),
+            self.get(Register(31)).unwrap_or(0),
+            self.get(Register(29)).unwrap_or(0),
+        )
+    }
+
+    pub(super) fn from_framehop(regs: UnwindRegsAarch64, pc: u64) -> Self {
+        let mut caller = Self::empty();
+        caller.set(29, Some(regs.fp()));
+        caller.set(30, Some(regs.lr()));
+        caller.set(31, Some(regs.sp()));
+        caller.pc = pc;
+        caller
+    }
+
+    pub(super) fn frame_pointer_step(
+        self,
+        read: &mut impl FnMut(u64) -> Result<u64, ()>,
+    ) -> Step<33> {
+        let Some(pc) = self.get(Register(30)).filter(|pc| *pc != 0) else {
+            return Step::Stop;
+        };
+        let fp = self.get(Register(29)).unwrap_or(0);
+        let sp = fp.wrapping_add(16);
+        let lr = read(fp.wrapping_add(8)).unwrap_or(0);
+        let previous = read(fp).unwrap_or(0);
+        if fp != 0 && sp <= self.get(Register(31)).unwrap_or(0) {
+            return Step::Stop;
+        }
+        let mut caller = Self::empty();
+        caller.set(29, Some(previous));
+        caller.set(30, Some(lr));
+        caller.set(31, Some(sp));
+        caller.pc = pc;
+        Step::Caller(caller, false)
+    }
+}
+
+impl<const N: usize> Registers<N>
+where
+    Self: RegisterLayout<N>,
+{
+    fn empty() -> Self {
+        Self {
+            values: [0; N],
+            valid: 0,
+            pc: 0,
+        }
+    }
+
+    fn set(&mut self, number: usize, value: Option<u64>) {
+        if let Some(value) = value {
+            self.values[number] = value;
+            self.valid |= 1 << number;
+        } else {
+            self.values[number] = 0;
+            self.valid &= !(1 << number);
+        }
+    }
+
+    fn get(self, register: Register) -> Option<u64> {
+        let number = usize::from(register.0);
+        self.values
+            .get(number)
+            .copied()
+            .filter(|_| self.valid & (1 << number) != 0)
+    }
+
+    pub(super) fn pc(self) -> u64 {
+        self.pc
+    }
+}
+
+pub(super) enum Step<const N: usize = 17> {
     NoRow,
     Stop,
-    Caller(Registers, bool),
+    Caller(Registers<N>, bool),
 }
 
 #[derive(Clone)]
@@ -161,7 +268,7 @@ struct Entry {
     end: u64,
     offset: usize,
     max_end: u64,
-    undefined_cfa: Vec<Range<u64>>,
+    default_cfa: Vec<Range<u64>>,
 }
 
 impl Module {
@@ -169,15 +276,20 @@ impl Module {
         sections: &ExplicitModuleSectionInfo<ModuleBytes>,
         addresses: ModuleAddresses,
         bases: BaseAddresses,
+        arch: PerfArch,
     ) -> Self {
-        let eh = sections
-            .eh_frame
-            .as_ref()
-            .map(|bytes| Section::new(bytes.clone(), &EhFrame::new(bytes, LittleEndian), &bases));
+        let eh = sections.eh_frame.as_ref().map(|bytes| {
+            Section::new(
+                bytes.clone(),
+                &EhFrame::new(bytes, LittleEndian),
+                &bases,
+                arch,
+            )
+        });
         let debug = sections.debug_frame.as_ref().map(|bytes| {
             let mut section = DebugFrame::new(bytes, LittleEndian);
             section.set_address_size(8);
-            Section::new(bytes.clone(), &section, &bases)
+            Section::new(bytes.clone(), &section, &bases, arch)
         });
         Self {
             addresses,
@@ -187,13 +299,16 @@ impl Module {
         }
     }
 
-    pub(super) fn step(
+    pub(super) fn step<const N: usize>(
         &self,
         address: u64,
-        regs: Registers,
+        regs: Registers<N>,
         cache: &mut Cache,
         read: &mut impl FnMut(u64) -> Result<u64, ()>,
-    ) -> Step {
+    ) -> Step<N>
+    where
+        Registers<N>: RegisterLayout<N>,
+    {
         let linked = address
             .wrapping_sub(self.addresses.base_avma)
             .wrapping_add(self.addresses.base_svma);
@@ -212,14 +327,17 @@ impl Module {
         Step::NoRow
     }
 
-    fn section_step<'a>(
+    fn section_step<'a, const N: usize>(
         &self,
         (data, section): (&Section, &impl UnwindSection<Bytes<'a>>),
         address: u64,
-        regs: Registers,
+        regs: Registers<N>,
         cache: &mut Cache,
         read: &mut impl FnMut(u64) -> Result<u64, ()>,
-    ) -> Step {
+    ) -> Step<N>
+    where
+        Registers<N>: RegisterLayout<N>,
+    {
         let Some(entry) = data.entry(address) else {
             return Step::NoRow;
         };
@@ -243,15 +361,22 @@ impl Module {
             encoding: fde.cie().encoding(),
             addresses: self.addresses,
         };
-        let undefined = entry
-            .undefined_cfa
+        let default = entry
+            .default_cfa
             .partition_point(|range| range.end <= address);
         let cfa = if entry
-            .undefined_cfa
-            .get(undefined)
+            .default_cfa
+            .get(default)
             .is_some_and(|range| range.contains(&address))
         {
-            None
+            Registers::<N>::default_cfa().and_then(|register| {
+                let offset = match row.cfa() {
+                    CfaRule::RegisterAndOffset { offset, .. } => *offset,
+                    CfaRule::Expression(_) => return None,
+                };
+                regs.get(register)
+                    .map(|value| value.wrapping_add_signed(offset))
+            })
         } else {
             match row.cfa() {
                 CfaRule::RegisterAndOffset { register, offset } => regs
@@ -268,9 +393,9 @@ impl Module {
             }
         };
         let evaluator = Evaluator { cfa, ..evaluator };
-        let mut caller = Registers::empty();
-        for number in 0..17 {
-            let register = Register(u16::try_from(number).expect("17 registers"));
+        let mut caller = Registers::<N>::empty();
+        for number in 0..N {
+            let register = Register(u16::try_from(number).expect("DWARF register"));
             caller.set(
                 number,
                 evaluator.register(section, row, register, read, &mut cache.expression_offsets),
@@ -282,7 +407,8 @@ impl Module {
         else {
             return Step::Stop;
         };
-        caller.set(16, Some(pc));
+        // libdwfl keeps callback PC separate from recovered register validity.
+        caller.pc = pc;
         Step::Caller(caller, fde.is_signal_trampoline())
     }
 }
@@ -292,6 +418,7 @@ impl Section {
         bytes: ModuleBytes,
         section: &impl UnwindSection<Bytes<'a>>,
         bases: &BaseAddresses,
+        arch: PerfArch,
     ) -> Self {
         let mut entries = section.entries(bases);
         let mut index = Vec::new();
@@ -307,7 +434,7 @@ impl Section {
                 end: fde.end_address(),
                 offset: fde.offset(),
                 max_end: 0,
-                undefined_cfa: undefined_cfa_ranges(&fde, section, bases),
+                default_cfa: default_cfa_ranges(&fde, section, bases, arch),
             });
         }
         index.sort_unstable_by_key(|entry| (entry.start, entry.offset));
@@ -340,11 +467,14 @@ struct CfaDefinition {
 }
 
 impl CfaDefinition {
-    fn apply(&mut self, instruction: &CallFrameInstruction<usize>) {
+    fn apply(&mut self, instruction: &CallFrameInstruction<usize>, arch: PerfArch) {
         match instruction {
             CallFrameInstruction::DefCfa { .. }
             | CallFrameInstruction::DefCfaSf { .. }
             | CallFrameInstruction::DefCfaExpression { .. } => self.defined = true,
+            CallFrameInstruction::DefCfaRegister { .. } if arch == PerfArch::Aarch64 => {
+                self.defined = true;
+            }
             CallFrameInstruction::RememberState => self.saved.push(self.defined),
             CallFrameInstruction::RestoreState => {
                 if let Some(defined) = self.saved.pop() {
@@ -356,18 +486,18 @@ impl CfaDefinition {
     }
 }
 
-fn undefined_cfa_ranges<'a>(
+fn default_cfa_ranges<'a>(
     fde: &FrameDescriptionEntry<Bytes<'a>>,
     section: &impl UnwindSection<Bytes<'a>>,
     bases: &BaseAddresses,
+    arch: PerfArch,
 ) -> Vec<Range<u64>> {
-    // Gimli's default CFA is indistinguishable from explicit RAX+0. Preserve
-    // only its missing validity bit; Gimli still decodes/evaluates every rule.
-    // libdw/cfi.c:482-522 and dwarf_frame_cfa.c:46-50 start CFA undefined.
+    // Gimli starts CFA at register 0. Preserve where the ABI base is still
+    // inherited: undefined on x86_64, LR on aarch64 (aarch64_cfi.c:55-58).
     let mut state = CfaDefinition::default();
     let mut initial = fde.cie().instructions(section, bases);
     while let Ok(Some(instruction)) = initial.next() {
-        state.apply(&instruction);
+        state.apply(&instruction, arch);
     }
     if state.defined && state.saved.iter().all(|defined| *defined) {
         return Vec::new();
@@ -391,7 +521,7 @@ fn undefined_cfa_ranges<'a>(
                 };
                 address = next;
             }
-            _ => state.apply(&instruction),
+            _ => state.apply(&instruction, arch),
         }
         if state.defined {
             if let Some(start) = undefined_start.take()
@@ -411,14 +541,17 @@ fn undefined_cfa_ranges<'a>(
     ranges
 }
 
-struct Evaluator {
-    regs: Registers,
+struct Evaluator<const N: usize> {
+    regs: Registers<N>,
     cfa: Option<u64>,
     encoding: Encoding,
     addresses: ModuleAddresses,
 }
 
-impl Evaluator {
+impl<const N: usize> Evaluator<N>
+where
+    Registers<N>: RegisterLayout<N>,
+{
     fn register<'a>(
         &self,
         section: &impl UnwindSection<Bytes<'a>>,
@@ -427,13 +560,9 @@ impl Evaluator {
         read: &mut impl FnMut(u64) -> Result<u64, ()>,
         offsets: &mut Vec<usize>,
     ) -> Option<u64> {
-        // Match the actual elfutils 0.195 x86_64_cfi.c:39-61 defaults,
-        // including DWARF register 0 (despite its source comment saying rbx).
-        let rule = row.register(register).unwrap_or(match register.0 {
-            0 | 6 | 12..=16 => RegisterRule::SameValue,
-            7 => RegisterRule::ValOffset(0),
-            _ => RegisterRule::Undefined,
-        });
+        let rule = row
+            .register(register)
+            .unwrap_or_else(|| Registers::<N>::default_rule(register));
         match rule {
             RegisterRule::Undefined | RegisterRule::Architectural => None,
             RegisterRule::SameValue => self.regs.get(register),

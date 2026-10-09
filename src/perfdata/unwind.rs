@@ -335,6 +335,7 @@ enum ArchUnwinder {
     Aarch64 {
         unwinder: Box<UnwinderAarch64<ModuleBytes>>,
         cache: CacheAarch64,
+        dwarf_cache: dwarf::Cache,
     },
 }
 
@@ -416,40 +417,6 @@ pub fn unwind_x86_64_stack(regs: PerfX86_64Regs, stack: &[u8], max_frames: usize
     frames
 }
 
-#[must_use]
-pub fn unwind_x86_64_frame_pointer_stack_like_elfutils(
-    regs: PerfX86_64Regs,
-    stack: &[u8],
-    max_frames: usize,
-) -> Vec<u64> {
-    let memory_reader = PerfStackReader::new(regs.sp, stack);
-    let mut frames = Vec::new();
-    if max_frames == 0 || regs.bp == 0 {
-        return frames;
-    }
-
-    frames.push(regs.ip);
-    let mut fp = regs.bp;
-    let mut sp = regs.sp;
-    while frames.len() < max_frames {
-        let prev_fp = memory_reader.read_u64(fp).unwrap_or(0);
-        let Some(ret) = memory_reader.read_u64(fp.saturating_add(8)) else {
-            break;
-        };
-        let next_sp = fp.saturating_add(16);
-        if sp >= next_sp {
-            break;
-        }
-        push_perf_unwind_address(&mut frames, ret);
-        fp = prev_fp;
-        sp = next_sp;
-        if fp == 0 {
-            break;
-        }
-    }
-    frames
-}
-
 impl Default for FramehopUnwinder {
     fn default() -> Self {
         Self::new()
@@ -473,6 +440,7 @@ impl FramehopUnwinder {
             PerfArch::Aarch64 => ArchUnwinder::Aarch64 {
                 unwinder: Box::new(UnwinderAarch64::new()),
                 cache: CacheAarch64::new(),
+                dwarf_cache: dwarf::Cache::new(),
             },
         };
         Self {
@@ -540,8 +508,18 @@ impl FramehopUnwinder {
         let sections = explicit_module_section_info(&object, addresses.base_svma);
         let memory_segments = module_memory_segments(&file, file_len, &object, addresses);
         let unwind_ranges = object_unwind_ranges(&object, addresses);
-        let dwarf = (object.format() == object::BinaryFormat::Elf)
-            .then(|| dwarf::Module::new(&sections, addresses, object_cfi_base_addresses(&object)));
+        let arch = match self.arch {
+            ArchUnwinder::X86_64 { .. } => PerfArch::X86_64,
+            ArchUnwinder::Aarch64 { .. } => PerfArch::Aarch64,
+        };
+        let dwarf = (object.format() == object::BinaryFormat::Elf).then(|| {
+            dwarf::Module::new(
+                &sections,
+                addresses,
+                object_cfi_base_addresses(&object),
+                arch,
+            )
+        });
         let module = Module::<ModuleBytes>::new(
             path.to_string_lossy().into_owned(),
             module_range.clone(),
@@ -767,14 +745,7 @@ impl ArchUnwinder {
     ) -> UserStackUnwindResult {
         let mut memory_reader = PerfUserMemoryReader::new(regs.sp(), stack, memory);
         let mut read_stack = |address| memory_reader.read_u64(address).ok_or(());
-        let frames = self.iter_addresses(
-            regs.ip(),
-            regs,
-            &mut read_stack,
-            max_frames,
-            modules,
-            lookup,
-        );
+        let frames = self.iter_addresses(regs, &mut read_stack, max_frames, modules, lookup);
         let framehop_frame_count = frames.len();
         UserStackUnwindResult {
             accepted_frames: frames,
@@ -790,7 +761,9 @@ impl ArchUnwinder {
                 **unwinder = UnwinderX86_64::new();
                 *cache = CacheX86_64::new();
             }
-            Self::Aarch64 { unwinder, cache } => {
+            Self::Aarch64 {
+                unwinder, cache, ..
+            } => {
                 **unwinder = UnwinderAarch64::new();
                 *cache = CacheAarch64::new();
             }
@@ -805,57 +778,83 @@ impl ArchUnwinder {
 
     fn iter_addresses(
         &mut self,
-        ip: u64,
         regs: PerfUserRegs,
         read_stack: &mut impl FnMut(u64) -> Result<u64, ()>,
         max_frames: usize,
         modules: &[ReportedModule],
         lookup: &DwflSegmentLookup,
     ) -> Vec<u64> {
-        if matches!(self, Self::X86_64 { .. })
-            && let PerfUserRegs::X86_64(regs) = regs
-        {
-            return self.iter_dwarf_addresses(regs, modules, lookup, read_stack, max_frames);
+        match (self, regs) {
+            (
+                Self::X86_64 {
+                    unwinder,
+                    cache,
+                    dwarf_cache,
+                },
+                PerfUserRegs::X86_64(regs),
+            ) => Self::iter_dwarf_addresses(
+                dwarf::Registers::<17>::new(regs),
+                modules,
+                lookup,
+                read_stack,
+                max_frames,
+                dwarf_cache,
+                |address, regs, read| {
+                    let mut platform_regs = regs.framehop_regs();
+                    match unwinder.unwind_frame(address, &mut platform_regs, cache, read) {
+                        Ok(Some(_)) => dwarf::Step::Caller(
+                            dwarf::Registers::<17>::from_framehop(platform_regs),
+                            false,
+                        ),
+                        Ok(None) | Err(_) => dwarf::Step::Stop,
+                    }
+                },
+            ),
+            (
+                Self::Aarch64 {
+                    unwinder,
+                    cache,
+                    dwarf_cache,
+                },
+                PerfUserRegs::Aarch64(regs),
+            ) => Self::iter_dwarf_addresses(
+                dwarf::Registers::<33>::new_aarch64(regs),
+                modules,
+                lookup,
+                read_stack,
+                max_frames,
+                dwarf_cache,
+                |address, regs, read| {
+                    let mut platform_regs = regs.framehop_regs();
+                    match unwinder.unwind_frame(address, &mut platform_regs, cache, read) {
+                        Ok(Some(pc)) => dwarf::Step::Caller(
+                            dwarf::Registers::<33>::from_framehop(platform_regs, pc),
+                            false,
+                        ),
+                        Ok(None) | Err(_) => dwarf::Step::Stop,
+                    }
+                },
+            ),
+            _ => Vec::new(),
         }
-        let mut frames = Vec::new();
-        // The seeded register file must match the active arch; a mismatch means
-        // the file header arch and the regs decode disagreed, which cannot
-        // happen because both flow from the same PerfArch.
-        if let (Self::Aarch64 { unwinder, cache }, PerfUserRegs::Aarch64(regs)) = (self, regs) {
-            let mut iter = unwinder.iter_frames(ip, regs.to_framehop_regs(), cache, read_stack);
-            while frames.len() < max_frames {
-                let Ok(Some(frame)) = iter.next() else {
-                    break;
-                };
-                push_perf_unwind_address(&mut frames, frame.address());
-            }
-        }
-        frames
     }
 
-    fn iter_dwarf_addresses(
-        &mut self,
-        regs: PerfX86_64Regs,
+    fn iter_dwarf_addresses<const N: usize, F: FnMut(u64) -> Result<u64, ()>>(
+        mut regs: dwarf::Registers<N>,
         modules: &[ReportedModule],
         lookup: &DwflSegmentLookup,
-        read: &mut impl FnMut(u64) -> Result<u64, ()>,
+        read: &mut F,
         max_frames: usize,
-    ) -> Vec<u64> {
-        let Self::X86_64 {
-            unwinder,
-            cache,
-            dwarf_cache,
-        } = self
-        else {
-            unreachable!()
-        };
-        let mut regs = dwarf::Registers::new(regs);
+        dwarf_cache: &mut dwarf::Cache,
+        mut platform_step: impl FnMut(FrameAddress, dwarf::Registers<N>, &mut F) -> dwarf::Step<N>,
+    ) -> Vec<u64>
+    where
+        dwarf::Registers<N>: dwarf::RegisterLayout<N>,
+    {
         let mut signal = false;
         let mut frames = Vec::new();
         while frames.len() < max_frames {
-            let Some(pc) = regs.pc() else {
-                break;
-            };
+            let pc = regs.pc();
             let initial = frames.is_empty();
             let address = if initial || signal {
                 pc
@@ -870,30 +869,20 @@ impl ArchUnwinder {
                     dwarf.step(address, regs, dwarf_cache, read)
                 } else {
                     // Keep Framehop for non-ELF platform unwind formats.
-                    let mut platform_regs = regs.framehop_regs();
                     let address = if initial || signal {
                         Some(FrameAddress::from_instruction_pointer(pc))
                     } else {
                         FrameAddress::from_return_address(pc)
                     };
-                    match address.and_then(|address| {
-                        unwinder
-                            .unwind_frame(address, &mut platform_regs, cache, read)
-                            .ok()
-                            .flatten()
-                    }) {
-                        Some(_) => dwarf::Step::Caller(
-                            dwarf::Registers::from_framehop(platform_regs),
-                            false,
-                        ),
-                        None => dwarf::Step::Stop,
-                    }
+                    address.map_or(dwarf::Step::Stop, |address| {
+                        platform_step(address, regs, read)
+                    })
                 }
             } else {
                 dwarf::Step::NoRow
             };
             let step = if matches!(step, dwarf::Step::NoRow) {
-                regs.frame_pointer_step(read)
+                dwarf::RegisterLayout::arch_fallback(regs, read)
             } else {
                 step
             };
@@ -1402,49 +1391,6 @@ impl PerfAarch64Regs {
     }
 }
 
-/// Walks an aarch64 frame-pointer chain the way elfutils' `ebl_unwind` backend
-/// does when no CFI covers the program counter.
-///
-/// Faithful to elfutils `backends/aarch64_unwind.c`: the caller's pc is the
-/// current lr (zero lr ends the walk before any caller is accepted), the next
-/// lr/fp load from `fp+8`/`fp+0` (zero on failed reads), the next sp is
-/// `fp+16`, and a step is accepted iff `fp == 0 || new_sp > sp`. Unlike the
-/// `x86_64` backend there is no `fp >= sp` precondition, so a zero frame pointer
-/// still yields one lr-based caller.
-#[must_use]
-pub fn unwind_aarch64_frame_pointer_stack_like_elfutils(
-    regs: PerfAarch64Regs,
-    stack: &[u8],
-    max_frames: usize,
-) -> Vec<u64> {
-    let memory_reader = PerfStackReader::new(regs.sp, stack);
-    let mut frames = Vec::new();
-    if max_frames == 0 {
-        return frames;
-    }
-
-    frames.push(regs.pc);
-    let mut lr = regs.lr;
-    let mut fp = regs.fp;
-    let mut sp = regs.sp;
-    while frames.len() < max_frames {
-        if lr == 0 {
-            break;
-        }
-        let new_lr = memory_reader.read_u64(fp.saturating_add(8)).unwrap_or(0);
-        let new_fp = memory_reader.read_u64(fp).unwrap_or(0);
-        let caller_sp = fp.saturating_add(16);
-        if fp != 0 && caller_sp <= sp {
-            break;
-        }
-        push_perf_unwind_address(&mut frames, lr);
-        lr = new_lr;
-        fp = new_fp;
-        sp = caller_sp;
-    }
-    frames
-}
-
 impl<'a> PerfStackReader<'a> {
     #[must_use]
     pub fn new(sp: u64, bytes: &'a [u8]) -> Self {
@@ -1780,7 +1726,11 @@ mod tests {
         stack[0x28..0x30].copy_from_slice(&0x7fff_f7e9_9d7e_u64.to_le_bytes());
 
         assert_eq!(
-            super::unwind_x86_64_frame_pointer_stack_like_elfutils(regs, &stack, 256),
+            super::FramehopUnwinder::new().unwind_stack(
+                super::PerfUserRegs::X86_64(regs),
+                &stack,
+                256,
+            ),
             vec![0x7fff_f7e1_c03e, 0x7fff_f7e1_c083, 0x7fff_f7e9_9d7d]
         );
     }
@@ -1801,7 +1751,11 @@ mod tests {
         stack[8..16].copy_from_slice(&0x5000_u64.to_le_bytes());
 
         assert_eq!(
-            super::unwind_x86_64_frame_pointer_stack_like_elfutils(regs, &stack, 256),
+            super::FramehopUnwinder::new().unwind_stack(
+                super::PerfUserRegs::X86_64(regs),
+                &stack,
+                256,
+            ),
             vec![0x4000]
         );
     }
@@ -1889,7 +1843,11 @@ mod tests {
         stack[0x30..0x38].copy_from_slice(&0_u64.to_le_bytes());
         stack[0x38..0x40].copy_from_slice(&0_u64.to_le_bytes());
 
-        let frames = super::unwind_aarch64_frame_pointer_stack_like_elfutils(regs, &stack, 256);
+        let frames = super::FramehopUnwinder::with_arch(super::PerfArch::Aarch64).unwind_stack(
+            super::PerfUserRegs::Aarch64(regs),
+            &stack,
+            256,
+        );
 
         // Return addresses after the leaf take the perf `pc - 1` adjustment.
         assert_eq!(frames, vec![0x4000, 0x4fff, 0x5fff]);
@@ -1906,8 +1864,11 @@ mod tests {
             lr: 0x5000,
         };
 
-        let frames =
-            super::unwind_aarch64_frame_pointer_stack_like_elfutils(regs, &[0_u8; 0x20], 256);
+        let frames = super::FramehopUnwinder::with_arch(super::PerfArch::Aarch64).unwind_stack(
+            super::PerfUserRegs::Aarch64(regs),
+            &[0_u8; 0x20],
+            256,
+        );
 
         assert_eq!(frames, vec![0x4000, 0x4fff]);
     }
@@ -1922,8 +1883,11 @@ mod tests {
             lr: 0x5000,
         };
 
-        let frames =
-            super::unwind_aarch64_frame_pointer_stack_like_elfutils(regs, &[0_u8; 0x40], 256);
+        let frames = super::FramehopUnwinder::with_arch(super::PerfArch::Aarch64).unwind_stack(
+            super::PerfUserRegs::Aarch64(regs),
+            &[0_u8; 0x40],
+            256,
+        );
 
         assert_eq!(frames, vec![0x4000]);
     }
@@ -1937,8 +1901,11 @@ mod tests {
             lr: 0,
         };
 
-        let frames =
-            super::unwind_aarch64_frame_pointer_stack_like_elfutils(regs, &[0_u8; 0x40], 256);
+        let frames = super::FramehopUnwinder::with_arch(super::PerfArch::Aarch64).unwind_stack(
+            super::PerfUserRegs::Aarch64(regs),
+            &[0_u8; 0x40],
+            256,
+        );
 
         assert_eq!(frames, vec![0x4000]);
     }
