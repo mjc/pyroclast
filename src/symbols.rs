@@ -5817,12 +5817,12 @@ fn perf_dwarf_frame_names_from_index(
     let mut has_outer_frame = false;
     while let Some(id) = frame {
         let node = &index.nodes[id.get() - 1];
-        let name = names.get(usize::try_from(node.name).ok()?);
+        let name_index = usize::try_from(node.name).ok()?;
         let name = if node.kind == PerfDwarfDieKind::Subprogram {
             has_outer_frame = true;
-            base_symbol.or(name)
+            base_symbol.or_else(|| names.get(name_index))
         } else {
-            name
+            names.get(name_index)
         };
         if let Some(name) = name {
             frames.push(name.to_owned());
@@ -5855,13 +5855,7 @@ where
     R: gimli::Reader,
 {
     perf_dwarf_inherited_string(dwarf, unit, directory, entry, gimli::DW_AT_linkage_name, 17)
-        .and_then(|linkage| {
-            let text = linkage.to_string_lossy().ok()?;
-            Some(match addr2line::demangle_auto(text, None) {
-                Cow::Borrowed(_) => PerfDwarfDieName::Raw(linkage),
-                Cow::Owned(name) => PerfDwarfDieName::Rendered(name),
-            })
-        })
+        .map(PerfDwarfDieName::Linkage)
         .or_else(|| perf_dwarf_die_name(dwarf, unit, directory, entry).map(PerfDwarfDieName::Raw))
 }
 
@@ -6007,7 +6001,7 @@ fn perf_dwarf_uleb128<R: gimli::Reader>(value: &mut R) -> Result<u64, gimli::Err
 
 enum PerfDwarfDieName<R> {
     Raw(R),
-    Rendered(String),
+    Linkage(R),
 }
 
 enum PerfDwarfObjectBytes<'a> {
@@ -6129,22 +6123,56 @@ impl<'a> PerfDwarfBacking<'a> {
 enum PerfDwarfStoredName {
     Source(PerfDwarfNameSpan),
     Rendered(String),
+    Linkage(PerfDwarfNameId),
+}
+
+struct PerfDwarfLinkageName {
+    raw: PerfDwarfStoredName,
+    rendered: OnceLock<Option<String>>,
 }
 
 #[derive(Default)]
 struct PerfDwarfNames<'a> {
     backing: Option<Arc<PerfDwarfBacking<'a>>>,
     entries: Vec<PerfDwarfStoredName>,
+    linkage_names: Vec<PerfDwarfLinkageName>,
 }
 
 impl PerfDwarfNames<'_> {
     fn get(&self, index: usize) -> Option<&str> {
-        match self.entries.get(index)? {
+        let raw = self.raw_name(index)?;
+        let PerfDwarfStoredName::Linkage(id) = self.entries.get(index)? else {
+            return Some(raw);
+        };
+        let name = self.linkage_names.get(*id as usize)?;
+        let rendered = name.rendered.get_or_init(|| {
+            match addr2line::demangle_auto(Cow::Borrowed(raw), None) {
+                Cow::Borrowed(_) => None,
+                Cow::Owned(rendered) => Some(rendered),
+            }
+        });
+        Some(rendered.as_deref().unwrap_or(raw))
+    }
+
+    fn raw_name(&self, index: usize) -> Option<&str> {
+        let entry = match self.entries.get(index)? {
+            PerfDwarfStoredName::Linkage(id) => &self.linkage_names.get(*id as usize)?.raw,
+            entry => entry,
+        };
+        match entry {
             PerfDwarfStoredName::Source(span) => {
                 std::str::from_utf8(self.backing.as_ref()?.bytes(*span)?).ok()
             }
             PerfDwarfStoredName::Rendered(name) => Some(name),
+            PerfDwarfStoredName::Linkage(_) => None,
         }
+    }
+
+    fn is_linkage(&self, index: usize) -> bool {
+        matches!(
+            self.entries.get(index),
+            Some(PerfDwarfStoredName::Linkage(_))
+        )
     }
 
     #[cfg(test)]
@@ -6180,34 +6208,37 @@ impl<'a> PerfDwarfNameInterner<'a> {
             names: PerfDwarfNames {
                 backing: Some(backing),
                 entries: Vec::new(),
+                linkage_names: Vec::new(),
             },
             ids_by_name: HashTable::new(),
         }
     }
 
     fn intern<R: gimli::Reader>(&mut self, name: PerfDwarfDieName<R>) -> Option<PerfDwarfNameId> {
-        match name {
-            PerfDwarfDieName::Raw(reader) => {
-                let text = reader.to_string_lossy().ok()?;
-                let span = self
-                    .names
-                    .backing
-                    .as_ref()
-                    .and_then(|backing| backing.name_span(&reader));
-                Some(self.intern_text(text, span))
-            }
-            PerfDwarfDieName::Rendered(name) => Some(self.intern_text(Cow::Owned(name), None)),
-        }
+        let (reader, linkage) = match name {
+            PerfDwarfDieName::Raw(reader) => (reader, false),
+            PerfDwarfDieName::Linkage(reader) => (reader, true),
+        };
+        let text = reader.to_string_lossy().ok()?;
+        let span = self
+            .names
+            .backing
+            .as_ref()
+            .and_then(|backing| backing.name_span(&reader));
+        Some(self.intern_text(text, span, linkage))
     }
 
     fn intern_text(
         &mut self,
         name: Cow<'_, str>,
         span: Option<PerfDwarfNameSpan>,
+        linkage: bool,
     ) -> PerfDwarfNameId {
         let hash = perf_dwarf_name_hash(&name);
+        // Rehashing and duplicate detection must not render unused DIE names.
         if let Some(&id) = self.ids_by_name.find(hash, |&id| {
-            self.names.get(id as usize) == Some(name.as_ref())
+            self.names.is_linkage(id as usize) == linkage
+                && self.names.raw_name(id as usize) == Some(name.as_ref())
         }) {
             return id;
         }
@@ -6220,9 +6251,24 @@ impl<'a> PerfDwarfNameInterner<'a> {
             ),
             Cow::Owned(name) => PerfDwarfStoredName::Rendered(name),
         };
+        let stored = if linkage {
+            let id = PerfDwarfNameId::try_from(self.names.linkage_names.len())
+                .expect("dwarf linkage name table fits in u32");
+            self.names.linkage_names.push(PerfDwarfLinkageName {
+                raw: stored,
+                rendered: OnceLock::new(),
+            });
+            PerfDwarfStoredName::Linkage(id)
+        } else {
+            stored
+        };
         self.names.entries.push(stored);
         self.ids_by_name.insert_unique(hash, id, |&id| {
-            perf_dwarf_name_hash(self.names.get(id as usize).expect("valid DWARF name ID"))
+            perf_dwarf_name_hash(
+                self.names
+                    .raw_name(id as usize)
+                    .expect("valid DWARF name ID"),
+            )
         });
         id
     }
@@ -10324,7 +10370,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_frames_prefer_linkage_names_and_keep_the_outer_elf_symbol_like_perf() {
+    fn inline_linkage_names_stay_raw_until_lookup_and_keep_the_outer_elf_symbol_like_perf() {
         // Linux v7.2.9 tools/perf/util/libdw.c:85-108: the subprogram uses
         // args->sym; inline DIEs prefer die_get_linkage_name() over die_name().
         let abbrev = [
@@ -10349,12 +10395,30 @@ mod tests {
             &[test_range(0, 100)],
             &mut names,
         );
+        assert_eq!(names.names.raw_name(0), Some("_ZN2ns5outerEv"));
+        assert_eq!(names.names.raw_name(1), Some("_ZN2ns5innerEv"));
+        assert!(
+            names
+                .names
+                .linkage_names
+                .iter()
+                .all(|name| name.rendered.get().is_none())
+        );
         assert_eq!(
             perf_dwarf_frame_names_from_index(&index, &names.names, 15, Some("outer.constprop.0")),
             Some(PerfDwarfFrameNames {
                 frames: vec!["ns::inner()".into(), "outer.constprop.0".into()],
                 has_inline_frames: true,
             })
+        );
+        assert!(names.names.linkage_names[0].rendered.get().is_none());
+        assert_eq!(
+            names.names.linkage_names[1]
+                .rendered
+                .get()
+                .unwrap()
+                .as_deref(),
+            Some("ns::inner()")
         );
     }
 
@@ -10794,7 +10858,9 @@ mod tests {
             super::perf_dwarf_die_frame_name(&dwarf, unit, &directory, &entry)
                 .map(|name| match name {
                     super::PerfDwarfDieName::Raw(reader) => reader.to_string_lossy().into_owned(),
-                    super::PerfDwarfDieName::Rendered(name) => name,
+                    super::PerfDwarfDieName::Linkage(reader) => {
+                        addr2line::demangle_auto(reader.to_string_lossy(), None).into_owned()
+                    }
                 })
                 .as_deref(),
             expected,
@@ -11295,6 +11361,80 @@ mod tests {
     }
 
     #[test]
+    fn linkage_name_interning_and_rehashing_do_not_render_unused_names() {
+        let mut names = PerfDwarfNameInterner::default();
+        let reader = gimli::EndianSlice::new(b"_ZN2ns5innerEv", gimli::LittleEndian);
+        let id = names
+            .intern(super::PerfDwarfDieName::Linkage(reader))
+            .unwrap();
+        let literal = names.intern_text(std::borrow::Cow::Borrowed("_ZN2ns5innerEv"), None, false);
+        assert_ne!(id, literal);
+        assert_eq!(names.names.get(literal as usize), Some("_ZN2ns5innerEv"));
+        for index in 0..1024 {
+            names.intern_text(
+                std::borrow::Cow::Owned(format!("literal_{index}")),
+                None,
+                false,
+            );
+        }
+        assert_eq!(
+            names.intern(super::PerfDwarfDieName::Linkage(reader)),
+            Some(id)
+        );
+        assert_eq!(names.names.entries.len(), 1026);
+        assert_eq!(names.names.linkage_names.len(), 1);
+        assert!(names.names.linkage_names[0].rendered.get().is_none());
+        assert_eq!(names.names.get(id as usize), Some("ns::inner()"));
+        let pointer = names.names.get(id as usize).unwrap().as_ptr();
+        for index in 1024..4096 {
+            names.intern_text(
+                std::borrow::Cow::Owned(format!("literal_{index}")),
+                None,
+                false,
+            );
+        }
+        assert_eq!(
+            names.intern(super::PerfDwarfDieName::Linkage(reader)),
+            Some(id)
+        );
+        let names = names.into_names();
+        assert_eq!(names.get(id as usize).unwrap().as_ptr(), pointer);
+        assert_eq!(names.raw_name(id as usize), Some("_ZN2ns5innerEv"));
+    }
+
+    #[test]
+    fn unmangled_linkage_names_keep_source_backing_without_owned_rendered_text() {
+        let bytes = cross_cu_inline_fixture(CrossCuInlineName::IndexedString);
+        let backing = Arc::new(
+            super::PerfDwarfBacking::load(super::PerfDwarfObjectBytes::Shared(bytes.into()))
+                .unwrap(),
+        );
+        let weak = Arc::downgrade(&backing);
+        let mut names = PerfDwarfNameInterner::with_backing(Arc::clone(&backing));
+        let (id, pointer) = {
+            let dwarf = backing.dwarf();
+            let reader = dwarf.debug_str.get_str(gimli::DebugStrOffset(11)).unwrap();
+            let pointer = reader.slice().as_ptr();
+            let id = names
+                .intern(super::PerfDwarfDieName::Linkage(reader))
+                .unwrap();
+            (id, pointer)
+        };
+        drop(backing);
+        assert!(weak.upgrade().is_some());
+        assert!(matches!(
+            names.names.linkage_names[0].raw,
+            super::PerfDwarfStoredName::Source(_)
+        ));
+        assert!(names.names.linkage_names[0].rendered.get().is_none());
+        assert_eq!(names.names.get(id as usize), Some("read_at"));
+        assert_eq!(names.names.get(id as usize).unwrap().as_ptr(), pointer);
+        assert_eq!(names.names.linkage_names[0].rendered.get(), Some(&None));
+        drop(names);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
     fn raw_dwarf_name_ids_and_backing_survive_interner_growth() {
         let bytes = cross_cu_inline_fixture(CrossCuInlineName::IndexedString);
         let backing = Arc::new(
@@ -11309,7 +11449,11 @@ mod tests {
             let pointer = reader.slice().as_ptr();
             let id = names.intern(super::PerfDwarfDieName::Raw(reader)).unwrap();
             for index in 0..1024 {
-                names.intern_text(std::borrow::Cow::Owned(format!("rendered_{index}")), None);
+                names.intern_text(
+                    std::borrow::Cow::Owned(format!("rendered_{index}")),
+                    None,
+                    false,
+                );
             }
             let repeated = dwarf.debug_str.get_str(gimli::DebugStrOffset(11)).unwrap();
             assert_eq!(
@@ -11338,16 +11482,16 @@ mod tests {
         let mut names = PerfDwarfNameInterner::default();
         let rendered = "demangled_name".to_owned();
         let pointer = rendered.as_ptr();
-        let id = names.intern_text(std::borrow::Cow::Owned(rendered), None);
+        let id = names.intern_text(std::borrow::Cow::Owned(rendered), None, false);
         assert_eq!(names.names.get(id as usize).unwrap().as_ptr(), pointer);
         assert_eq!(
-            names.intern_text(std::borrow::Cow::Borrowed("demangled_name"), None),
+            names.intern_text(std::borrow::Cow::Borrowed("demangled_name"), None, false),
             id
         );
         let reader = gimli::EndianSlice::new(b"invalid_\xff", gimli::LittleEndian);
         let lossy = names.intern(super::PerfDwarfDieName::Raw(reader)).unwrap();
         assert_eq!(names.names.get(lossy as usize), Some("invalid_\u{fffd}"));
-        let empty = names.intern_text(std::borrow::Cow::Borrowed(""), None);
+        let empty = names.intern_text(std::borrow::Cow::Borrowed(""), None, false);
         assert_eq!(names.names.get(empty as usize), Some(""));
         assert_eq!(names.names.entries.len(), 3);
     }
