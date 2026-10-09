@@ -3576,6 +3576,10 @@ fn append_projected_resolved_frames(
     identity: Option<crate::symbols::MappingFramesIdentity>,
     cached: &CachedMappingFrames,
 ) {
+    if cached.kernel_dso == crate::symbols::SymbolDsoName::Unmapped {
+        append_cached_inferno_perf_folded_label_to_buffers(buffers, UNKNOWN_FRAME);
+        return;
+    }
     if !buffers.projecting {
         append_resolved_folded_frames(buffers, mapping, frame, expand, cached);
         return;
@@ -3916,10 +3920,10 @@ where
         return Ok(());
     };
     let cached = cache.resolve_script_mapping_ref(mapping, inline)?;
-    let dso_name = if cached.kernel_dso == crate::symbols::SymbolDsoName::KernelKallsyms {
-        "[kernel.kallsyms]"
-    } else {
-        display_path
+    let dso_name = match cached.kernel_dso {
+        crate::symbols::SymbolDsoName::KernelKallsyms => "[kernel.kallsyms]",
+        crate::symbols::SymbolDsoName::Unmapped => UNKNOWN_FRAME,
+        crate::symbols::SymbolDsoName::Mapping => display_path,
     };
     if !inline {
         if is_cookie {
@@ -4056,10 +4060,10 @@ where
 {
     if let Some(cache) = symbol_cache {
         let cached = cache.resolve_script_mapping_ref(mapping, false)?;
-        let dso_name = if cached.kernel_dso == crate::symbols::SymbolDsoName::KernelKallsyms {
-            "[kernel.kallsyms]"
-        } else {
-            display_path
+        let dso_name = match cached.kernel_dso {
+            crate::symbols::SymbolDsoName::KernelKallsyms => "[kernel.kallsyms]",
+            crate::symbols::SymbolDsoName::Unmapped => UNKNOWN_FRAME,
+            crate::symbols::SymbolDsoName::Mapping => display_path,
         };
         if let (true, Some(label)) = (cached.has_base_symbol, cached.frames.first()) {
             return write_perf_script_mapped_symbol_frame_fragment(

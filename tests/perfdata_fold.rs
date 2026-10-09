@@ -5339,6 +5339,126 @@ fn write_native_ordered_kcore_fixture(
 
 #[cfg(target_os = "linux")]
 #[test]
+fn native_ordinary_kallsyms_updates_kernel_map_coverage_after_loading() {
+    // symbol.c:dso__load_kernel_sym and map.c:map__fixup_start/end narrow
+    // the original MMAP after ordinary kallsyms has loaded.
+    let (root, bytes) =
+        write_native_ordered_kcore_fixture("[a]", &[0xffff_ffff_8100_5000, 0xffff_ffff_c100_0010]);
+    std::fs::remove_file(root.path().join("kcore")).unwrap();
+    let (_, _, native) = query_native_module_kallsyms(root.path(), &[]);
+    assert!(
+        std::str::from_utf8(&native)
+            .unwrap()
+            .contains("worker;[unknown] 1\n")
+    );
+    for inline in [false, true] {
+        let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+            StaticSymbolResolver,
+            &root.path().join("perf.data"),
+            root.path(),
+            [],
+            &root.path().join("kallsyms"),
+        );
+        let actual = fold_perfdata_callchains_with_symbols(
+            &bytes,
+            FoldOptions {
+                inline,
+                count_periods: true,
+            },
+            &resolver,
+        )
+        .unwrap();
+        assert_eq!(actual.as_bytes(), native);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_kcore_reference_ignores_data_names_before_function_names() {
+    assert_native_kcore_reference_selection(
+        "ffffffff81001000 D _stext\nffffffff81000000 T _stext\n",
+        true,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_kcore_reference_matches_full_name_including_module_suffix() {
+    assert_native_kcore_reference_selection(
+        "ffffffff81000000 T _stext\t[a]\nffffffff81001000 T _stext\n",
+        false,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_kcore_reference_keeps_first_eligible_zero_address() {
+    assert_native_kcore_reference_selection(
+        "0000000000000000 T _stext\nffffffff81000000 T _stext\n",
+        false,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_kcore_reference_accepts_function_and_absolute_alias_types() {
+    for kind in ['T', 't', 'W', 'w', 'A'] {
+        assert_native_kcore_reference_selection(
+            &format!("ffffffff81000000 {kind} _stext\nffffffff81001000 T _stext\n"),
+            true,
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn assert_native_kcore_reference_selection(reference_rows: &str, accepted: bool) {
+    // perf symbol.c:validate_kcore_addresses uses event.c:find_func_symbol_cb:
+    // first full-name T/t/W/w/A match, including a matching zero address.
+    let (root, bytes) = write_native_kcore_fixture("[a]");
+    let kallsyms = root.path().join("kallsyms");
+    let original = std::fs::read_to_string(&kallsyms).unwrap();
+    let (_, rest) = original.split_once('\n').unwrap();
+    std::fs::write(&kallsyms, format!("{reference_rows}{rest}")).unwrap();
+    let (script, stderr, native) = query_native_module_kallsyms(root.path(), &[]);
+    assert_eq!(
+        stderr.contains("/kcore for kernel data"),
+        accepted,
+        "{stderr}"
+    );
+    let dso = if accepted { "[kernel.kallsyms]" } else { "[a]" };
+    assert!(script.contains(&format!("first+0x10 ({dso})")), "{script}");
+    let summary = summarize_perfdata(&bytes).unwrap();
+    let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+        StaticSymbolResolver,
+        &root.path().join("perf.data"),
+        root.path(),
+        [],
+        &kallsyms,
+    );
+    let core = summary
+        .mmap_table
+        .resolve_ref(11, 0xffff_ffff_8100_0010)
+        .unwrap();
+    resolved_kernel_dso(&resolver, &core);
+    let module = summary
+        .mmap_table
+        .resolve_ref(11, 0xffff_ffff_c100_0010)
+        .unwrap();
+    assert_eq!(resolved_kernel_dso(&resolver, &module), dso);
+    let actual = fold_perfdata_callchains_with_symbols(
+        &bytes,
+        FoldOptions {
+            inline: true,
+            count_periods: true,
+        },
+        &resolver,
+    )
+    .unwrap();
+    assert_eq!(actual.as_bytes(), native);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn native_kcore_replaces_module_dso_names_only_when_recorded_addresses_match() {
     const MODULE_IP: u64 = 0xffff_ffff_c100_0010;
     let (root, bytes) = write_native_kcore_fixture("[a]");

@@ -266,13 +266,15 @@ pub enum SymbolDsoName {
     #[default]
     Mapping,
     KernelKallsyms,
+    /// Loading/fixing the kernel map removed this address from its coverage.
+    Unmapped,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ResolvedSymbolFrames {
     pub frames: Vec<String>,
     pub source_state: SymbolSourceState,
-    /// This result came from validated shared kcore replacement maps.
+    /// DSO identity after loading and fixing up the native kernel map.
     pub kernel_dso: SymbolDsoName,
     pub has_base_symbol: bool,
     pub has_inline_frames: bool,
@@ -1900,25 +1902,25 @@ impl Kallsyms {
         #[cfg(test)]
         MODULE_KALLSYMS_TREE_BUILDS.with(|count| count.set(count.get() + 1));
         let mut symbols = Vec::new();
-        for row in text
-            .lines()
-            .filter_map(parse_global_kallsyms_row)
-            .filter(|row| row.address != 0)
-        {
+        for line in text.split_terminator('\n') {
             // perf symbol.c:kallsyms__delta calls event.c:
             // kallsyms__get_function_start on the physical input. Relocation
-            // references survive even when symbol-tree alias selection loses them.
-            if row.module.is_none()
-                && (matches!(row.symbol_type.to_ascii_uppercase(), 'T' | 'W')
-                    || row.symbol_type == 'A')
-                && let Some(addresses) = relocation_addresses.as_deref_mut()
-                && let RawEntryMut::Vacant(entry) = addresses.raw_entry_mut().from_key(row.name)
+            // references include zero and survive symbol-tree alias selection.
+            if let Some(addresses) = relocation_addresses.as_deref_mut()
+                && let Some((address, name)) = parse_kallsyms_function_line(line)
+                && let RawEntryMut::Vacant(entry) = addresses.raw_entry_mut().from_key(name)
             {
-                entry.insert(Arc::from(row.name), row.address);
+                entry.insert(Arc::from(name), address);
             }
+            let Some(row) = parse_global_kallsyms_row(line) else {
+                continue;
+            };
             // symbol.c:dso__load_all_kallsyms filters before tree insertion;
             // event.c:find_func_symbol_cb separately accepts A references.
-            if !perf_kallsyms_type_is_kept(row.symbol_type) || row.name.starts_with('$') {
+            if row.address == 0
+                || !perf_kallsyms_type_is_kept(row.symbol_type)
+                || row.name.starts_with('$')
+            {
                 continue;
             }
             #[cfg(test)]
@@ -2092,6 +2094,20 @@ impl Kallsyms {
 
     fn address_of(&self, name: &str) -> Option<u64> {
         self.addresses_by_name.get(name).copied()
+    }
+
+    fn kernel_map_range(&self, relocation: Option<&KernelRelocation>) -> Option<(u64, u64)> {
+        // perf symbol.c:maps__split_kallsyms subtracts delta before
+        // map.c:map__fixup_start/end takes the first/last symbol bounds.
+        let delta = match relocation {
+            Some(relocation) => self
+                .address_of(&relocation.reference_symbol)?
+                .wrapping_sub(relocation.recorded_reference_address),
+            None => 0,
+        };
+        let (&start, _) = self.symbols.first_key_value()?;
+        let (_, last) = self.symbols.last_key_value()?;
+        Some((start.wrapping_sub(delta), last.end?.wrapping_sub(delta)))
     }
 }
 
@@ -2790,7 +2806,10 @@ where
                     resolved[index] = self.resolve_kernel_symbol(request);
                 }
             } else if is_kernel_symbol_path(&request.path) {
-                if let Some(symbol) = self.resolve_kernel_symbol(request) {
+                let symbol = self.resolve_kernel_symbol(request);
+                if self.ordinary_kernel_address_is_unmapped(request) {
+                    resolved[index] = None;
+                } else if let Some(symbol) = symbol {
                     resolved[index] = Some(symbol);
                 } else if let Some(kernel_elf) = self.kernel_elf_ref() {
                     if !object_build_id_matches(kernel_elf, request, &mut address_cache) {
@@ -2961,8 +2980,8 @@ where
                     resolved[index] = ResolvedSymbolFrames::from_frames(vec![symbol]);
                 }
             } else if is_kernel_symbol_path(&request.path) {
-                if let Some(symbol) = self.resolve_kernel_symbol(request) {
-                    resolved[index] = ResolvedSymbolFrames::from_frames(vec![symbol]);
+                if let Some(frames) = self.resolve_kernel_frames(request) {
+                    resolved[index] = frames;
                 } else if let Some(kernel_elf) = self.kernel_elf_ref() {
                     if !object_build_id_matches(kernel_elf, request, &mut address_cache) {
                         resolved[index].source_state = SymbolSourceState::Unavailable;
@@ -3248,6 +3267,33 @@ where
             })
             .as_ref()
             .filter(|symbols| !symbols.is_rejected())
+    }
+
+    fn resolve_kernel_frames(&self, request: &SymbolRequest) -> Option<ResolvedSymbolFrames> {
+        let symbol = self.resolve_kernel_symbol(request);
+        if self.ordinary_kernel_address_is_unmapped(request) {
+            return Some(ResolvedSymbolFrames {
+                kernel_dso: SymbolDsoName::Unmapped,
+                ..ResolvedSymbolFrames::default()
+            });
+        }
+        symbol.map(|symbol| ResolvedSymbolFrames::from_frames(vec![symbol]))
+    }
+
+    fn ordinary_kernel_address_is_unmapped(&self, request: &SymbolRequest) -> bool {
+        // Only ordinary live kallsyms applies symbol.c:dso__load_kernel_sym's
+        // map fixup here. Explicit objects and validated kcore own other maps.
+        if self.kallsyms_ref().is_some() || self.kernel_elf_ref().is_some() {
+            return false;
+        }
+        self.live_kallsyms_cache
+            .get()
+            .and_then(Option::as_ref)
+            .and_then(|snapshot| snapshot.core.as_ref())
+            .and_then(|core| core.kernel_map_range(request.kernel_relocation.as_ref()))
+            .is_some_and(|(start, end)| {
+                request.relative_address < start || request.relative_address >= end
+            })
     }
 
     fn resolve_kernel_symbol(&self, request: &SymbolRequest) -> Option<String> {
@@ -6370,6 +6416,23 @@ fn parse_kallsyms_line(line: &str) -> Option<(u64, &str)> {
     Some((address, symbol))
 }
 
+fn parse_kallsyms_function_line(line: &str) -> Option<(u64, &str)> {
+    // tools/lib/symbol/kallsyms.c:31-77 and api/io.h:io__get_hex require
+    // literal separators and accumulate hex modulo u64, without a sign.
+    let (hex, row) = line.split_once(' ')?;
+    if hex.is_empty() {
+        return None;
+    }
+    let address = hex.bytes().try_fold(0_u64, |value, byte| {
+        let digit = char::from(byte).to_digit(16)?;
+        Some((value << 4) | u64::from(digit))
+    })?;
+    let (kind, name) = row.split_once(' ')?;
+    // event.c:find_func_symbol_cb accepts only functions or uppercase A;
+    // strcmp sees the full name (including module suffix) up to the first NUL.
+    matches!(kind, "T" | "t" | "W" | "w" | "A").then_some((address, name.split('\0').next()?))
+}
+
 fn parse_global_kallsyms_row(line: &str) -> Option<BorrowedKallsymsRow<'_>> {
     #[cfg(test)]
     MODULE_KALLSYMS_ROW_VISITS.with(|count| count.set(count.get() + 1));
@@ -8692,6 +8755,96 @@ mod tests {
         );
         assert_eq!(
             alpha.resolve_module_with_offset_in_range(0x100f, Some((0x1000, 0x100f))),
+            None
+        );
+    }
+
+    #[test]
+    fn kallsyms_function_rows_preserve_native_separators_names_and_hex_accumulation() {
+        // tools/lib/symbol/kallsyms.c, api/io.h:io__get_hex, and
+        // perf util/event.c:find_func_symbol_cb define the physical row parser.
+        for (row, expected) in [
+            ("", None),
+            ("1 T function", Some((1, "function"))),
+            ("0 w function", Some((0, "function"))),
+            ("1 A alias", Some((1, "alias"))),
+            ("1 a alias", None),
+            ("1 D object", None),
+            ("1 TT function", None),
+            ("1\tT function", None),
+            ("1 T\tfunction", None),
+            (" 1 T function", None),
+            ("+1 T function", None),
+            ("1 T function\t[module]", Some((1, "function\t[module]"))),
+            ("1 T function ", Some((1, "function "))),
+            ("1 T function\r", Some((1, "function\r"))),
+            ("1 T function\0ignored", Some((1, "function"))),
+            ("10000000000000001 T function", Some((1, "function"))),
+        ] {
+            let parsed = super::parse_kallsyms_function_line(row);
+            assert_eq!(parsed, expected, "{row:?}");
+            if let Some((_, name)) = parsed {
+                assert!(row.as_bytes().as_ptr_range().contains(&name.as_ptr()));
+            }
+        }
+    }
+
+    #[test]
+    fn live_kallsyms_relocation_ignores_noncanonical_zero_reference_rows() {
+        // tools/lib/symbol/kallsyms.c requires one type byte and literal spaces;
+        // event.c:find_func_symbol_cb compares the complete remaining name.
+        for row in [
+            "0000000000000000\tT reference",
+            " 0000000000000000 T reference",
+            "0000000000000000 TT reference",
+            "0000000000000000 T reference ",
+        ] {
+            let text = format!("{row}\n0000000000001000 T reference\n0000000000001010 T next\n");
+            let (_root, path) = live_module_kallsyms_fixture(&text);
+            let resolver =
+                super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
+                    .with_system_kallsyms_from_path(&path);
+            let core = resolver.live_kallsyms_ref().unwrap();
+            assert_eq!(core.address_of("reference"), Some(0x1000), "{row:?}");
+            assert_eq!(
+                core.resolve_relocated_with_offset(0x2010, "reference", 0x2000),
+                Some("next+0x0".into())
+            );
+        }
+    }
+
+    #[test]
+    fn live_kallsyms_loaded_kernel_map_excludes_addresses_outside_symbol_extent() {
+        // perf symbol.c:dso__load_kernel_sym calls map.c:map__fixup_start/end
+        // after loading ordinary kallsyms; later map lookups use these bounds.
+        let (_root, path) =
+            live_module_kallsyms_fixture("0000000000001000 T first\n0000000000001100 T last\n");
+        let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
+            .with_system_kallsyms_from_path(&path);
+        let mut request = test_request("[kernel.kallsyms]", 0x3000);
+        request.kernel_mapping_range = Some((0x1000, 0x10000));
+        let frames = resolver
+            .resolve_frame_batch_with_metadata(&[request])
+            .unwrap();
+        assert_eq!(frames[0].kernel_dso, super::SymbolDsoName::Unmapped);
+        assert!(frames[0].frames.is_empty());
+    }
+
+    #[test]
+    fn live_kallsyms_relocation_keeps_the_first_eligible_zero_reference() {
+        // perf symbol.c:kallsyms__delta uses event.c:find_func_symbol_cb,
+        // which stops at the first eligible physical match, including zero.
+        let (_root, path) = live_module_kallsyms_fixture(
+            "0000000000000000 T reference\n\
+             0000000000001000 T reference\n\
+             0000000000001010 T next\n",
+        );
+        let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
+            .with_system_kallsyms_from_path(&path);
+        let core = resolver.live_kallsyms_ref().unwrap();
+        assert_eq!(core.address_of("reference"), Some(0));
+        assert_eq!(
+            core.resolve_relocated_with_offset(0x2010, "reference", 0x2000),
             None
         );
     }
