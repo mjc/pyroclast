@@ -3,6 +3,31 @@
 Status as of 2026-06-11. Goal: `pyroclast plumbing fold|flamegraph` fully replaces
 `perf script | inferno-collapse-perf | inferno-flamegraph`.
 
+## 2026-10-09 recorded kernel/user callchains still receive user unwinds
+
+A fresh C thread workload exposed a leader sample with recorded kernel and
+user frames followed by a DWARF caller in native perf, but not Pyroclast.
+A lossless synthetic ELF/recording reproduced the missing frames. The native
+folded comparison was red, and the previously green classifier test was
+converted to expect `LeafOnly`/`MustUnwind` rather than `SkipUnwind`.
+
+`tools/perf/util/machine.c:2987-3049` checks captured register/stack data and
+appends unwound frames after the recorded callchain for `ORDER_CALLEE`.
+There is no mixed kernel/user suppression. `unwind-libdw.c:314-338` calls
+the entry callback for the initial frame and each accepted caller, including
+duplicates and unmapped PCs. Inferno `collapse/perf.rs:580-599` retains these
+stack entries; it does not merge repeated labels.
+
+The mixed-callchain guards in classification, leaf-only eligibility, and
+accepted-frame handling are removed. The acceptance helper no longer takes
+a callchain state that cannot affect its result. The native regression covers
+both a caller-producing RBP fallback and a zero-BP leaf-only stack, through
+byte and file replay. Three older tests with no module mappings retain their
+assertions but now name the actual missing-module precondition.
+
+The workload also exposed empty native stacks for other TIDs. That is a
+separate investigation; this change does not establish threaded parity.
+
 ## 2026-10-09 kernel module section maps, not ELF-type rejection
 
 Two fresh native regressions disproved the blanket ET_DYN rejection. Keeping

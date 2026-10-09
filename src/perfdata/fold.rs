@@ -4459,8 +4459,6 @@ fn sample_callchain_state(
         .clone()
         .any(is_recorded_kernel_callchain_frame);
     if has_recorded_kernel_frame && has_recorded_user_frame {
-        // perf script keeps a recorded kernel-to-user callchain and does not
-        // append extra user DWARF callers after the user-space frame.
         return SampleCallchainState::KernelWithUserFrame;
     }
     if is_kernel_sample {
@@ -4560,11 +4558,11 @@ fn unwind_object_frame_addresses_like_perf(
     // Evaluate perf/libdw's skip and leaf-only cases before framehop. The result
     // is byte-identical to running framehop because the shared acceptance tail
     // applies the same libdw callback rules to the sampled IP.
-    let leaf_only = sample_is_leaf_only(state, pid, mmap_table, regs, context);
+    let leaf_only = sample_is_leaf_only(state, pid, mmap_table, regs);
     match classify_object_unwind(context, leaf_only) {
         ObjectUnwindClass::SkipUnwind => return Vec::new(),
         ObjectUnwindClass::LeafOnly => {
-            return perf_accepted_object_unwind_frames(regs, context.callchain, true, Vec::new());
+            return perf_accepted_object_unwind_frames(regs, true, Vec::new());
         }
         ObjectUnwindClass::MustUnwind => {}
     }
@@ -4572,7 +4570,7 @@ fn unwind_object_frame_addresses_like_perf(
     let (raw_frames, failed) =
         unwind_reported_frame_addresses_like_perf(state, pid, memory, regs, stack_bytes);
     if failed {
-        return perf_accepted_object_unwind_frames(regs, context.callchain, false, raw_frames);
+        return perf_accepted_object_unwind_frames(regs, false, raw_frames);
     }
     let initial_ip_has_reported_module = initial_ip_mapping_has_reported_unwind_module(
         Some(pid),
@@ -4597,7 +4595,7 @@ fn unwind_object_frame_addresses_like_perf(
         mmap_table,
         context,
     );
-    perf_accepted_object_unwind_frames(regs, context.callchain, leaf_only, raw_frames)
+    perf_accepted_object_unwind_frames(regs, leaf_only, raw_frames)
 }
 
 fn unwind_reported_frame_addresses_like_perf(
@@ -4683,13 +4681,7 @@ fn sample_is_leaf_only(
     pid: u32,
     mmap_table: &MmapTable,
     regs: &PerfUserRegs,
-    context: UserUnwindContext,
 ) -> bool {
-    // KernelWithUserFrame never appends extra user frames, so a leaf is never
-    // emitted there; leave that to the SkipUnwind class.
-    if context.callchain == SampleCallchainState::KernelWithUserFrame {
-        return false;
-    }
     let ip = regs.ip();
     if !mmap_table
         .user_mapping_for_pid_ip(pid, ip)
@@ -4747,11 +4739,8 @@ fn arch_fallback_provably_cannot_advance(regs: &PerfUserRegs) -> bool {
 
 /// Classifies a sample's object unwind before framehop runs.
 fn classify_object_unwind(context: UserUnwindContext, leaf_only: bool) -> ObjectUnwindClass {
-    // Research §3.5: a recorded kernel->user callchain is not extended with
-    // extra user DWARF callers — perf emits zero unwound frames here.
-    if context.callchain == SampleCallchainState::KernelWithUserFrame {
-        return ObjectUnwindClass::SkipUnwind;
-    }
+    // tools/perf/util/machine.c thread__resolve_callchain_unwind() gates on
+    // captured regs/stack, not on user PCs already in the recorded callchain.
     // Without a mapping for the sampled IP, perf's libdw path has no initial
     // module to seed DWFL and emits no object-unwind entries.
     if context.initial_ip_mapping == InitialIpMappingState::NoRecordedMapping {
@@ -5124,13 +5113,9 @@ fn truncate_user_unwind_at_first_unmapped_frame(
 /// basis) is gone.
 fn perf_accepted_object_unwind_frames(
     regs: &PerfUserRegs,
-    callchain: SampleCallchainState,
     leaf_only: bool,
     unwound_frames: Vec<u64>,
 ) -> Vec<u64> {
-    if callchain == SampleCallchainState::KernelWithUserFrame {
-        return Vec::new();
-    }
     // When the leaf-only predicate holds, perf/libdwfl fires frame_callback for
     // the seeded IP and then stops. No FDE row covers the IP, so advancement
     // depends on `ebl_unwind`; the x86_64 backend rejects zero BP or a caller
@@ -6494,15 +6479,7 @@ mod tests {
         // frame before attempting to unwind callers. If entry() accepted that
         // current IP, perf keeps it.
         assert_eq!(
-            super::perf_accepted_object_unwind_frames(
-                &test_regs(0x1000),
-                super::SampleCallchainState::Other {
-                    has_callchain: true,
-                    has_frames: false,
-                },
-                false,
-                vec![0x1000],
-            ),
+            super::perf_accepted_object_unwind_frames(&test_regs(0x1000), false, vec![0x1000],),
             vec![0x1000]
         );
     }
@@ -6514,10 +6491,6 @@ mod tests {
         assert_eq!(
             super::perf_accepted_object_unwind_frames(
                 &test_regs(0x1000),
-                super::SampleCallchainState::Other {
-                    has_callchain: false,
-                    has_frames: false,
-                },
                 false,
                 vec![0x1000, 0x1100],
             ),
@@ -6538,10 +6511,6 @@ mod tests {
         assert_eq!(
             super::perf_accepted_object_unwind_frames(
                 &PerfUserRegs::X86_64(regs),
-                super::SampleCallchainState::Other {
-                    has_callchain: true,
-                    has_frames: false,
-                },
                 false,
                 Vec::new(),
             ),
@@ -10293,7 +10262,6 @@ mod tests {
         assert_eq!(
             super::perf_accepted_object_unwind_frames(
                 &PerfUserRegs::X86_64(regs),
-                super::SampleCallchainState::KernelWithCallchain,
                 false,
                 vec![0x7fff_f7ea_3f4b, 0x5555_5578_8ba4, 0x5555_5578_8ba5],
             ),
@@ -10458,10 +10426,6 @@ mod tests {
         assert_eq!(
             super::perf_accepted_object_unwind_frames(
                 &PerfUserRegs::X86_64(regs),
-                super::SampleCallchainState::Other {
-                    has_callchain: true,
-                    has_frames: false,
-                },
                 false,
                 vec![0x5555_5578_c601, 0x5555_5579_6e23],
             ),
@@ -10484,10 +10448,6 @@ mod tests {
         assert_eq!(
             super::perf_accepted_object_unwind_frames(
                 &PerfUserRegs::X86_64(regs),
-                super::SampleCallchainState::Other {
-                    has_callchain: true,
-                    has_frames: false,
-                },
                 false,
                 vec![0x7fff_f7e2_ecb7],
             ),
@@ -10996,10 +10956,6 @@ mod tests {
         assert_eq!(
             super::perf_accepted_object_unwind_frames(
                 &PerfUserRegs::X86_64(regs),
-                super::SampleCallchainState::Other {
-                    has_callchain: true,
-                    has_frames: false,
-                },
                 false,
                 vec![0x7fff_f7f0_277b, 0x5555_5579_6e23, 0x5555_5579_6e23],
             ),
@@ -11024,10 +10980,6 @@ mod tests {
         assert_eq!(
             super::perf_accepted_object_unwind_frames(
                 &PerfUserRegs::X86_64(regs),
-                super::SampleCallchainState::Other {
-                    has_callchain: true,
-                    has_frames: false,
-                },
                 false,
                 vec![
                     0x7fff_f7e5_7982,
@@ -11061,10 +11013,6 @@ mod tests {
         assert_eq!(
             super::perf_accepted_object_unwind_frames(
                 &PerfUserRegs::X86_64(regs),
-                super::SampleCallchainState::Other {
-                    has_callchain: true,
-                    has_frames: false,
-                },
                 false,
                 vec![0x7fff_f7f0_277b, 0x5555_556b_ab79],
             ),
@@ -11230,7 +11178,6 @@ mod tests {
         assert_eq!(
             super::perf_accepted_object_unwind_frames(
                 &PerfUserRegs::X86_64(regs),
-                super::SampleCallchainState::KernelWithoutCallchain,
                 false,
                 vec![
                     0x7fff_f7f2_d344,
@@ -11611,7 +11558,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_object_unwind_routes_leaf_skip_and_unwind() {
+    fn classify_object_unwind_keeps_kernel_user_callchains_eligible_like_perf() {
         let leaf_only_ctx = super::UserUnwindContext {
             sample_callchain: super::SampleCallchainPresence::Present,
             callchain: other_callchain(),
@@ -11629,20 +11576,19 @@ mod tests {
             super::ObjectUnwindClass::MustUnwind
         );
 
-        // A recorded kernel->user callchain is never extended with user DWARF
-        // callers, so it skips unwinding entirely regardless of the leaf-only
-        // predicate.
+        // tools/perf/util/machine.c __thread__resolve_callchain() does not
+        // suppress the register/stack unwind after a recorded user frame.
         let kernel_user = super::UserUnwindContext {
             callchain: super::SampleCallchainState::KernelWithUserFrame,
             ..leaf_only_ctx
         };
         assert_eq!(
             super::classify_object_unwind(kernel_user, true),
-            super::ObjectUnwindClass::SkipUnwind
+            super::ObjectUnwindClass::LeafOnly
         );
         assert_eq!(
             super::classify_object_unwind(kernel_user, false),
-            super::ObjectUnwindClass::SkipUnwind
+            super::ObjectUnwindClass::MustUnwind
         );
     }
 
@@ -11653,16 +11599,11 @@ mod tests {
         // have stopped after the initial-frame callback.
         let regs = test_regs(0x4000);
         assert_eq!(
-            super::perf_accepted_object_unwind_frames(&regs, other_callchain(), true, Vec::new()),
+            super::perf_accepted_object_unwind_frames(&regs, true, Vec::new()),
             vec![0x4000]
         );
         assert_eq!(
-            super::perf_accepted_object_unwind_frames(
-                &regs,
-                other_callchain(),
-                true,
-                vec![0x4000, 0x9999],
-            ),
+            super::perf_accepted_object_unwind_frames(&regs, true, vec![0x4000, 0x9999],),
             vec![0x4000],
             "a framehop heuristic caller is dropped when perf/libdwfl emits only the leaf"
         );
@@ -11674,20 +11615,12 @@ mod tests {
         // is authoritative and every accepted frame is kept.
         let regs = test_regs(0x4000);
         assert_eq!(
-            super::perf_accepted_object_unwind_frames(
-                &regs,
-                other_callchain(),
-                false,
-                vec![0x4000, 0x9999],
-            ),
+            super::perf_accepted_object_unwind_frames(&regs, false, vec![0x4000, 0x9999],),
             vec![0x4000, 0x9999]
         );
         // A non-leaf-only sample with no accepted frames stays empty: the
         // sampled IP is never invented absent the leaf-only predicate.
-        assert!(
-            super::perf_accepted_object_unwind_frames(&regs, other_callchain(), false, Vec::new())
-                .is_empty()
-        );
+        assert!(super::perf_accepted_object_unwind_frames(&regs, false, Vec::new()).is_empty());
     }
 
     #[test]
@@ -11696,12 +11629,7 @@ mod tests {
         // each Dwfl_Frame, including repeated PCs. No deduplication occurs.
         let regs = test_regs(0x4000);
         assert_eq!(
-            super::perf_accepted_object_unwind_frames(
-                &regs,
-                other_callchain(),
-                false,
-                vec![0x4000, 0x4000, 0x5000],
-            ),
+            super::perf_accepted_object_unwind_frames(&regs, false, vec![0x4000, 0x4000, 0x5000],),
             vec![0x4000, 0x4000, 0x5000]
         );
     }

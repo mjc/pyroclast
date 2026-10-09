@@ -2019,7 +2019,7 @@ fn uses_recorded_kernel_callchain_only_without_initial_module_like_perf_script()
 }
 
 #[test]
-fn keeps_recorded_user_frame_without_dwarf_callers_for_kernel_user_context_like_perf_script() {
+fn keeps_kernel_user_context_without_dwarf_callers_when_initial_module_is_missing() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -2059,7 +2059,7 @@ fn keeps_recorded_user_frame_without_dwarf_callers_for_kernel_user_context_like_
 }
 
 #[test]
-fn keeps_recorded_user_frame_without_dwarf_callers_for_kernel_user_frame_like_perf_script() {
+fn keeps_kernel_user_frames_without_dwarf_callers_when_initial_module_is_missing() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -2094,7 +2094,7 @@ fn keeps_recorded_user_frame_without_dwarf_callers_for_kernel_user_frame_like_pe
 }
 
 #[test]
-fn keeps_recorded_user_frame_without_dwarf_callers_for_mixed_callchain_like_perf_script() {
+fn keeps_mixed_callchain_without_dwarf_callers_when_initial_module_is_missing() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -2326,6 +2326,86 @@ fn native_vdso_dwarf_leaf_is_not_dropped_without_build_id_metadata() {
         fold_perfdata_file_with_options(file.path(), FoldOptions::default()).unwrap(),
         expected
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn extends_recorded_kernel_user_callchain_with_dwarf_frames_like_native_perf() {
+    use inferno::collapse::Collapse;
+
+    // machine.c __thread__resolve_callchain() appends the register/stack
+    // unwind after the recorded callchain, even when it contains user PCs.
+    // unwind-libdw.c frame_callback() also retains the unmapped caller.
+    let fixture = SyntheticX86_64Object::create();
+    for bp in [0, 0x7fff_0008] {
+        let mut mmap = mmap_payload(11, 12, 0x4000, 0x1000, 0x4000, &fixture.path_string());
+        mmap.resize(mmap.len().next_multiple_of(8), 0);
+        let mut bytes = perfdata_with_records_and_attrs(
+            [file_attr_bytes_with_regs(
+                PERF_SAMPLE_IP
+                    | PERF_SAMPLE_TID
+                    | PERF_SAMPLE_CALLCHAIN
+                    | PERF_SAMPLE_REGS_USER
+                    | PERF_SAMPLE_STACK_USER,
+                (1 << 6) | (1 << 7) | (1 << 8),
+            )],
+            [
+                record_bytes(1, &mmap),
+                record_bytes_with_misc(
+                    9,
+                    PERF_RECORD_MISC_CPUMODE_KERNEL,
+                    &sample_payload_with_user_stack(
+                        0xffff_ffff_8100_0000,
+                        11,
+                        12,
+                        [
+                            0xffff_ffff_ffff_ff80,
+                            0xffff_ffff_8100_0000,
+                            0xffff_ffff_ffff_fe00,
+                            0x4000,
+                        ],
+                        1,
+                        [bp, 0x7fff_0000, 0x4000],
+                        [
+                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x34, 0x12, 0, 0, 0, 0,
+                            0, 0,
+                        ],
+                    ),
+                ),
+            ],
+        );
+        put_u64(&mut bytes, 16, 144);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), &bytes).unwrap();
+        let native = Command::new("perf")
+            .args(["script", "--force", "--no-inline", "-i"])
+            .arg(file.path())
+            .output()
+            .unwrap();
+        assert!(
+            native.status.success(),
+            "{}",
+            String::from_utf8_lossy(&native.stderr)
+        );
+        let script = String::from_utf8(native.stdout).unwrap();
+        assert_eq!(script.contains("1233 [unknown]"), bp != 0, "{script}");
+        assert_eq!(
+            script.matches("4000 [unknown]").count(),
+            2,
+            "native retains both the recorded and unwound leaf: {script}"
+        );
+        let mut expected = Vec::new();
+        inferno::collapse::perf::Folder::default()
+            .collapse(std::io::Cursor::new(script), &mut expected)
+            .unwrap();
+        let expected = String::from_utf8(expected).unwrap();
+        assert!(!expected.is_empty());
+        assert_eq!(fold_perfdata_callchains(&bytes).unwrap(), expected);
+        assert_eq!(
+            fold_perfdata_file_with_options(file.path(), FoldOptions::default()).unwrap(),
+            expected
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
