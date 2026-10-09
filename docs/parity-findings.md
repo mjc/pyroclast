@@ -3,6 +3,48 @@
 Status as of 2026-06-11. Goal: `pyroclast plumbing fold|flamegraph` fully replaces
 `perf script | inferno-collapse-perf | inferno-flamegraph`.
 
+## 2026-10-09 retained GNU helper and auxiliary lifetime
+
+External symbol-only batches previously launched a new helper each time. The
+primary bytes were retained, but each helper independently selected auxiliary
+files. A fresh native regression proved the difference: load a stripped ELF's
+debuglink, unlink the debug file, and query again. One retained unpatched GNU
+stdin process still returned the loaded function, while Pyroclast's next batch
+returned no symbol. This was observed red before changing production code.
+
+`tools/perf/util/addr2line.c:300-315` retains one helper per DSO. Binutils
+`binutils/addr2line.c:287-430` loops over stdin addresses with the same BFD and
+flushes each response. The real Unix runner now retains an owned helper per
+selected object. Linux keeps the original logical filename and sealed primary
+descriptor, so the provider's primary and auxiliary snapshots survive between
+batches. Separate DSOs retain separate helpers; unknown addresses and request
+order remain unchanged. Custom runners can decline sessions and implement
+their own existing whole-command contract.
+
+Each GNU `-f`/non-`-i` response has a function/file line pair. Nonblocking pipe
+I/O drains both streams while writing requests, keeps stdin open, and rejects
+EOF or malformed replies. A five-second response budget follows the duration
+in perf `tools/perf/util/symbol.c:72`. Perf applies that duration to read waits
+(`util/addr2line.c:335`); Pyroclast applies it to each complete response, not a
+whole batch or an idle helper. Timeout, protocol failure or cancellation closes
+and reaps the owned process group. A failed protocol is not automatically
+restarted against newly selected auxiliary files. The timeout regression was
+also observed red with the guard withheld and a bounded one-second child.
+
+Tests cover real retained GNU output after debuglink deletion, distinct stripped
+objects, batch ordering, mixed unknowns, cached failure, child identity/reaping,
+split replies, incomplete/extra lines, bidirectional large transfers, noisy
+stderr, cancellation, and first-cancellation finalization versus repeated
+signals. The latter was proved red before restoring the runner's existing
+finalization policy. Libdw retained module handling, binutils framing, and
+Inferno normalization were reread; unwind and output normalization do not
+change. Rust remains the default, with no GNU fallback or speedup claim.
+
+Non-Linux GNU still lacks the immutable-primary provider guarantee. Response
+deadlines do not bound parent-side filesystem acquisition, tool probing/spawn,
+or uninterruptible kernel I/O. These changes do not establish universal parity
+or a hard real-time process cleanup bound.
+
 ## 2026-10-09 live ELF build-ID discovery and DSO lookup order
 
 `tools/perf/util/symbol.c:1739-1746` (`dso__load`) reads a missing build ID

@@ -42,13 +42,27 @@ Linux memfd/procfs is required. Before invoking the helper, the caller supplies:
 Missing or invalid bootstrap data fails closed. Normal GNU help/version exits
 remain available without a primary. The existing GNU stdin address protocol
 is unchanged. Rust retains selected primary bytes and canonical names in its
-object cache and starts an owned, cancellable helper for each symbol-only batch.
+object cache and lazily starts one owned, cancellable helper per selected DSO
+for external symbol-only requests.
 It constructs the sealed transport once, lazily on the first external batch,
 from those bytes, not by reopening the path. The selected DSO owns that
 transport until its resolver is dropped; subsequent batches borrow the same
 sealed file. Base-only and in-process lookups do not create the transport.
 The child receives a dedicated descriptor without changing the parent's
-close-on-exec flags. Persistent per-DSO helper sessions are not implemented.
+close-on-exec flags. The helper retains its primary and auxiliary snapshots
+between batches and is killed/reaped when its selected DSO is dropped.
+
+GNU `-f` without `-i` emits a function/file line pair and flushes after each
+stdin address (`binutils/addr2line.c:287-430`). The real Unix runner keeps stdin
+open and exchanges one such framed response per address. A five-second deadline
+covers each response, not an entire batch or the helper's idle lifetime. The
+duration follows perf's default in `tools/perf/util/symbol.c:72`; perf's command
+backend applies it to read waits in `util/addr2line.c:335`, whereas Pyroclast
+uses a total request/response budget. Neither is a real-time filesystem bound.
+Malformed replies, EOF, cancellation or timeout close/reap the owned session
+and report an error; no partial response, live reopen, or automatic restart is
+substituted. Legacy custom `CommandRunner` implementations can explicitly
+decline sessions and retain their existing whole-command execution contract.
 
 Auxiliary candidates are opened once, nonblocking and without terminal
 acquisition; only regular files with finite observed lengths are copied.
@@ -103,12 +117,14 @@ growing file's EOF. Concurrent writes can affect acquisition: this is not an
 atomic filesystem snapshot, but the completed copy is immutable and shared by
 all CRC/parse/reopen consumers. `O_NONBLOCK` does not bound regular-file I/O on
 a stalled filesystem, and a very large finite file can consume time/storage.
-The Rust runner retains owned process-group cancellation; automatic wall-clock
-deadlines are not implemented yet.
+The Rust runner retains owned process-group cancellation and applies response
+deadlines once the helper is spawned. Parent-side regular-file acquisition,
+tool probing/spawn, and uninterruptible kernel I/O are not bounded by that
+response timer; kill/reap cannot promise a hard real-time bound for kernel I/O.
 Trusted plugin code loading is not sandboxed; this is not a general BFD sandbox.
 
-Remaining integration: wall-clock deadlines, supervised persistent per-DSO
-helper sessions, and immutable backing where Linux memfd/procfs is unavailable.
+Remaining integration: immutable backing where Linux memfd/procfs is unavailable
+and isolation for stalled parent-side filesystem acquisition.
 Non-Linux external GNU still has the legacy pathname handoff, without this
 provider's snapshot guarantee. The default in-process Rust path does not use
 that external handoff.

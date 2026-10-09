@@ -734,10 +734,22 @@ struct CachedObjectMetadata {
 
 struct SelectedGnuObject {
     metadata: Arc<CachedObjectMetadata>,
+    #[cfg(unix)]
+    helper: Mutex<GnuHelperState>,
     #[cfg(target_os = "linux")]
     canonical_name: PathBuf,
     #[cfg(target_os = "linux")]
     input: OnceLock<Result<Arc<std::fs::File>, String>>,
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+enum GnuHelperState {
+    #[default]
+    Uninitialized,
+    Batched,
+    Live(crate::process::CommandSession),
+    Failed(String),
 }
 
 /// Per-object memo of DWARF inline-frame indexes.
@@ -1384,6 +1396,8 @@ where
                     let canonical_name = std::fs::canonicalize(path).ok()?;
                     let bytes = read_regular_object(path)?;
                     Some(Arc::new(SelectedGnuObject {
+                        #[cfg(unix)]
+                        helper: Mutex::new(GnuHelperState::Uninitialized),
                         metadata: Arc::new(CachedObjectMetadata {
                             object_metadata: PreparedObjectMetadata::from_object_bytes(&bytes),
                             object_bytes: bytes.into(),
@@ -1415,8 +1429,12 @@ where
         );
         #[cfg(target_os = "linux")]
         let command = selected.attach_input(path, command)?;
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(unix))]
         let _ = selected;
+        #[cfg(unix)]
+        if let Some(stdout) = self.resolve_session_symbols(selected, &command)? {
+            return parse_addr2line_stdout(&stdout, indexes.len());
+        }
         let output = self
             .runner
             .run(&command)
@@ -1425,6 +1443,57 @@ where
             parse_addr2line_stdout(&output.stdout, indexes.len())
         } else {
             Ok(vec![None; indexes.len()])
+        }
+    }
+
+    #[cfg(unix)]
+    fn resolve_session_symbols(
+        &self,
+        selected: &SelectedGnuObject,
+        command: &CommandSpec,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let mut state = selected.helper.lock().expect("GNU helper lock");
+        if matches!(*state, GnuHelperState::Uninitialized) {
+            let mut startup = command.clone();
+            startup.stdin = None;
+            *state = match self.runner.start_session(&startup) {
+                Ok(Some(helper)) => GnuHelperState::Live(helper),
+                Ok(None) => GnuHelperState::Batched,
+                Err(error) => GnuHelperState::Failed(format!("failed to start addr2line: {error}")),
+            };
+        }
+        match &mut *state {
+            GnuHelperState::Live(helper) => {
+                // perf addr2line.c:300-335 retains one DSO helper and bounds
+                // response reads; symbol.c:72 defaults that wait to 5 seconds.
+                // GNU -f without -i emits exactly function/file lines, then
+                // flushes each stdin address in translate_addresses:422-429.
+                let result = (|| {
+                    let mut stdout = Vec::new();
+                    for address in command
+                        .stdin
+                        .as_deref()
+                        .unwrap_or_default()
+                        .split_inclusive(|byte| *byte == b'\n')
+                    {
+                        let response =
+                            helper.exchange_lines(address, 2, std::time::Duration::from_secs(5))?;
+                        stdout.extend(response);
+                    }
+                    Ok::<_, std::io::Error>(stdout)
+                })();
+                match result {
+                    Ok(stdout) => Ok(Some(stdout)),
+                    Err(error) => {
+                        let error = format!("addr2line session failed: {error}");
+                        *state = GnuHelperState::Failed(error.clone());
+                        Err(error)
+                    }
+                }
+            }
+            GnuHelperState::Failed(error) => Err(error.clone()),
+            GnuHelperState::Batched => Ok(None),
+            GnuHelperState::Uninitialized => unreachable!("helper state was initialized"),
         }
     }
 }

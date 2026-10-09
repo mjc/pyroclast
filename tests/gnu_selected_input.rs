@@ -86,6 +86,31 @@ fn independent_gnu_output(request: &SymbolRequest) -> Vec<u8> {
     output.stdout
 }
 
+fn strip_with_debuglink(selected: &Path, debug: &Path) {
+    for args in [
+        vec![
+            "--only-keep-debug".into(),
+            selected.to_owned(),
+            debug.to_owned(),
+        ],
+        vec!["--strip-all".into(), selected.to_owned()],
+        vec![
+            format!("--add-gnu-debuglink={}", debug.display()).into(),
+            selected.to_owned(),
+        ],
+    ] {
+        let output = std::process::Command::new("objcopy")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 fn resolves_selected_primary(in_place: bool, prime: bool) {
     // GNU process_file() opens -e again; BFD's debuglink and altlink probes
     // also close/reopen candidates (bfd/opncls.c). This test replaces the
@@ -208,24 +233,7 @@ fn gnu_backend_debuglink_discovery_keeps_original_logical_directory() {
     let debug_directory = directory.join(".debug");
     std::fs::create_dir(&debug_directory).unwrap();
     let debug = debug_directory.join("selected.debug");
-    for args in [
-        vec!["--only-keep-debug".into(), selected.clone(), debug.clone()],
-        vec!["--strip-all".into(), selected.clone()],
-        vec![
-            format!("--add-gnu-debuglink={}", debug.display()).into(),
-            selected.clone(),
-        ],
-    ] {
-        let output = std::process::Command::new("objcopy")
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    strip_with_debuglink(&selected, &debug);
     let bytes = std::fs::read(&selected).unwrap();
     assert_eq!(
         object::File::parse(bytes.as_slice())
@@ -256,4 +264,153 @@ fn gnu_backend_debuglink_discovery_keeps_original_logical_directory() {
     let outputs = runner.outputs.borrow();
     assert_eq!(outputs[0].status_code, Some(0));
     assert_eq!(outputs[0].stdout, expected_stdout);
+}
+
+#[test]
+fn gnu_backend_retains_loaded_debuglink_across_batches() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Child, ChildStdout, Stdio};
+
+    struct NativeSession {
+        child: Child,
+        stdout: BufReader<ChildStdout>,
+    }
+    impl NativeSession {
+        fn lookup(&mut self, address: u64) -> String {
+            writeln!(self.child.stdin.as_mut().unwrap(), "0x{address:x}").unwrap();
+            let mut result = String::new();
+            for _ in 0..2 {
+                assert!(self.stdout.read_line(&mut result).unwrap() > 0);
+            }
+            result
+        }
+    }
+    impl Drop for NativeSession {
+        fn drop(&mut self) {
+            // This unreaped Child owns the PID throughout kill/wait.
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    // perf addr2line.c:300-315 keeps one helper per DSO. GNU
+    // translate_addresses:287-430 keeps its BFD/debuglink inputs across
+    // stdin requests. Compare that real retained process, not saved output.
+    let root = tempfile::tempdir().unwrap();
+    let selected = fixture(root.path(), "selected_leaf");
+    let request = selected_request(&selected);
+    let debug = root.path().join("selected.debug");
+    strip_with_debuglink(&selected, &debug);
+    let mut child = std::process::Command::new("addr2line")
+        .args(["-f", "-C", "-e"])
+        .arg(&selected)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut native = NativeSession { child, stdout };
+    let expected = native.lookup(request.relative_address);
+    assert!(expected.starts_with("selected_leaf\n"));
+    let runner = RealCommandRunner::default();
+    let resolver = Addr2lineResolver::new(&runner);
+    assert_eq!(
+        resolver
+            .resolve_batch(std::slice::from_ref(&request))
+            .unwrap(),
+        [Some("selected_leaf".to_owned())]
+    );
+    std::fs::remove_file(debug).unwrap();
+    assert_eq!(native.lookup(request.relative_address), expected);
+    assert_eq!(
+        resolver.resolve_batch(&[request]).unwrap(),
+        [Some("selected_leaf".to_owned())],
+        "a later batch must retain the already loaded debuglink"
+    );
+}
+
+#[test]
+fn gnu_sessions_preserve_distinct_objects_unknowns_and_batch_order() {
+    let root = tempfile::tempdir().unwrap();
+    let first = fixture(root.path(), "selected_leaf");
+    let second = fixture(root.path(), "replacement_leaf");
+    let request = selected_request(&first);
+    let other = SymbolRequest {
+        path: second.clone(),
+        ..request.clone()
+    };
+    let unknown = SymbolRequest {
+        relative_address: 0,
+        ..request.clone()
+    };
+    let first_debug = root.path().join("first.debug");
+    let second_debug = root.path().join("second.debug");
+    strip_with_debuglink(&first, &first_debug);
+    strip_with_debuglink(&second, &second_debug);
+    let runner = RealCommandRunner::default();
+    let resolver = Addr2lineResolver::new(&runner);
+    assert_eq!(
+        resolver
+            .resolve_batch(&[
+                request.clone(),
+                unknown.clone(),
+                other.clone(),
+                request.clone()
+            ])
+            .unwrap(),
+        [
+            Some("selected_leaf".to_owned()),
+            None,
+            Some("replacement_leaf".to_owned()),
+            Some("selected_leaf".to_owned())
+        ]
+    );
+    std::fs::remove_file(first_debug).unwrap();
+    std::fs::remove_file(second_debug).unwrap();
+    assert_eq!(
+        resolver.resolve_batch(&[other, request, unknown]).unwrap(),
+        [
+            Some("replacement_leaf".to_owned()),
+            Some("selected_leaf".to_owned()),
+            None
+        ]
+    );
+}
+
+#[test]
+fn gnu_session_failure_is_not_restarted_with_different_auxiliary_inputs() {
+    struct FailingRunner {
+        starts: Cell<usize>,
+        native: RealCommandRunner,
+    }
+    impl CommandRunner for FailingRunner {
+        fn run(&self, _: &CommandSpec) -> std::io::Result<CommandOutput> {
+            panic!("a failed persistent protocol must not fall back to another process");
+        }
+
+        fn start_session(
+            &self,
+            _: &CommandSpec,
+        ) -> std::io::Result<Option<pyroclast::process::CommandSession>> {
+            self.starts.set(self.starts.get() + 1);
+            self.native.start_session(
+                &CommandSpec::new("sh").args(["-c", "read -r address; printf 'partial\\n'"]),
+            )
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let selected = fixture(root.path(), "selected_leaf");
+    let request = selected_request(&selected);
+    let runner = FailingRunner {
+        starts: Cell::new(0),
+        native: RealCommandRunner::default(),
+    };
+    let resolver = Addr2lineResolver::new(&runner);
+    let error = resolver
+        .resolve_batch(std::slice::from_ref(&request))
+        .unwrap_err();
+    assert!(error.contains("1/2 response lines"), "{error}");
+    assert_eq!(resolver.resolve_batch(&[request]).unwrap_err(), error);
+    assert_eq!(runner.starts.get(), 1);
 }
