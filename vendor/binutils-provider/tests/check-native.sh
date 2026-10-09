@@ -2,6 +2,10 @@
 set -euo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 provider=(--provider)
+libraries=()
+if [[ -n ${PYRO_PROVIDER_LIBRARY_PATH:-} ]]; then
+    libraries=(--library-path "$PYRO_PROVIDER_LIBRARY_PATH")
+fi
 if [[ ${1:-} == --stock ]]; then
     provider=()
     shift
@@ -53,7 +57,7 @@ run() {
     esac
     if ! python3 "$here/trace.py" "$binary" --name "$name" \
         --primary "$directory/$primary" --address "$pc" --leaf "$leaf" \
-        --oracle "$oracle" "${provider[@]}" "${mutation[@]}"; then
+        --oracle "$oracle" "${provider[@]}" "${libraries[@]}" "${mutation[@]}"; then
         failed=$((failed + 1))
     fi
 }
@@ -67,6 +71,7 @@ total=6
 if [[ ${#provider[@]} != 0 ]]; then
     total=7
     if env -u PYRO_PRIMARY_FD -u PYRO_PRIMARY_NAME -u PYRO_PRIMARY_CANONICAL \
+        LD_LIBRARY_PATH="${PYRO_PROVIDER_LIBRARY_PATH:-${LD_LIBRARY_PATH:-}}" \
         timeout --kill-after=1 4 "$binary" -f -e "$scratch/selected" "$selected_pc" \
         >"$scratch/no-bootstrap.stdout" 2>"$scratch/no-bootstrap.stderr"; then
         printf '%s\n' 'FAIL missing-selected-primary: live pathname fallback accepted'

@@ -21,7 +21,7 @@ def ptrace(request, pid, address=0, data=0):
     return result
 
 
-def trace(binary, primary, pc, after_close=None, replace=None, seed=None):
+def trace(binary, primary, pc, after_close=None, replace=None, seed=None, library_path=None):
     output = os.memfd_create("gnu-proof-output", 0)
     selected = os.memfd_create("gnu-selected", os.MFD_ALLOW_SEALING)
     with primary.open("rb") as source, os.fdopen(os.dup(selected), "wb") as destination:
@@ -38,6 +38,8 @@ def trace(binary, primary, pc, after_close=None, replace=None, seed=None):
         ptrace(0, 0)
         os.kill(os.getpid(), signal.SIGSTOP)
         env = dict(os.environ, PYRO_PRIMARY_FD=str(selected), PYRO_PRIMARY_NAME=str(primary), PYRO_PRIMARY_CANONICAL=canonical)
+        if library_path:
+            env["LD_LIBRARY_PATH"] = library_path
         os.execve(str(binary), [str(binary), "-f", "-e", str(primary), pc], env)
     os.close(selected)
     identity = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
@@ -126,6 +128,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", type=Path)
     parser.add_argument("--oracle", type=Path)
+    parser.add_argument("--library-path")
     parser.add_argument("--name", required=True)
     parser.add_argument("--primary", type=Path, required=True)
     parser.add_argument("--address", required=True)
@@ -154,7 +157,7 @@ def main():
         replace = lambda: os.replace(args.replace_after_close, args.watch)
     elif args.replace_primary:
         seed = lambda: os.replace(args.replace_primary, primary)
-    output, hung, replaced, status, opens = trace(binary, primary, args.address, args.watch, replace, seed)
+    output, hung, replaced, status, opens = trace(binary, primary, args.address, args.watch, replace, seed, args.library_path)
     lines = output.splitlines()
     ok = not hung and status == 0 and bool(lines) and lines[0] == args.leaf
     if args.provider:

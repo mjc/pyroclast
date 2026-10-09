@@ -47,15 +47,17 @@ base.overrideAttrs (old: {
   ];
   checkPhase = ''
     runHook preCheck
-    export LD_LIBRARY_PATH="$PWD/bfd/.libs:$PWD/libsframe/.libs"
-    bash ${vendor}/tests/check-native.sh \
-      "$PWD/binutils/.libs/addr2line" ${base}/bin/addr2line
+    # Scope build libraries to tracees, never the fixture compiler/assembler.
+    PYRO_PROVIDER_LIBRARY_PATH="$PWD/bfd/.libs:$PWD/libsframe/.libs" \
+      bash ${vendor}/tests/check-native.sh \
+        "$PWD/binutils/.libs/addr2line" ${base}/bin/addr2line
     source_dir=$(dirname "$configureScript")
     $CC -g -O2 -Wall -Wextra -Werror \
       -Ibfd -Ibinutils -I"$source_dir/bfd" -I"$source_dir/binutils" -I"$source_dir/include" \
-      ${vendor}/tests/api-proof.c -Lbfd/.libs -lbfd \
+      ${vendor}/tests/api-proof.c -Lbfd/.libs -lbfd -Llibsframe/.libs -lsframe \
       libiberty/libiberty.a -o api-proof
-    timeout --kill-after=1 4 ./api-proof "$PWD/api.primary" "$PWD/api.auxiliary"
+    LD_LIBRARY_PATH="$PWD/bfd/.libs:$PWD/libsframe/.libs" \
+      timeout --kill-after=1 4 ./api-proof "$PWD/api.primary" "$PWD/api.auxiliary"
     runHook postCheck
   '';
   installPhase = ''
