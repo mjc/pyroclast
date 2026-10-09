@@ -354,6 +354,78 @@ pub trait UserStackUnwinder {
     ) -> UserStackUnwindResult;
 }
 
+#[derive(Clone, Copy)]
+enum CursorRegisters {
+    X86_64(dwarf::Registers<17>),
+    Aarch64(dwarf::Registers<33>),
+}
+
+enum CursorStep {
+    Caller { signal: bool },
+    Retryable,
+    Terminal,
+}
+
+pub(crate) struct UnwindCursor {
+    registers: CursorRegisters,
+    next_registers: CursorRegisters,
+    next: CursorStep,
+    initial: bool,
+    signal: bool,
+}
+
+impl UnwindCursor {
+    pub(crate) fn new(regs: PerfUserRegs) -> Self {
+        let registers = match regs {
+            PerfUserRegs::X86_64(regs) => CursorRegisters::X86_64(dwarf::Registers::new(regs)),
+            PerfUserRegs::Aarch64(regs) => {
+                CursorRegisters::Aarch64(dwarf::Registers::new_aarch64(regs))
+            }
+        };
+        Self {
+            registers,
+            next_registers: registers,
+            next: CursorStep::Terminal,
+            initial: true,
+            signal: false,
+        }
+    }
+
+    pub(crate) fn raw_pc(&self) -> u64 {
+        match self.registers {
+            CursorRegisters::X86_64(regs) => regs.pc(),
+            CursorRegisters::Aarch64(regs) => regs.pc(),
+        }
+    }
+
+    pub(crate) fn requires_lookahead(&self) -> bool {
+        !self.initial && !self.signal
+    }
+
+    pub(crate) fn needs_retry(&self) -> bool {
+        matches!(self.next, CursorStep::Retryable)
+    }
+
+    pub(crate) fn entry_pc(&self) -> u64 {
+        if self.initial || self.signal || matches!(self.next, CursorStep::Caller { signal: true }) {
+            self.raw_pc()
+        } else {
+            self.raw_pc().wrapping_sub(1)
+        }
+    }
+
+    pub(crate) fn advance(&mut self) -> bool {
+        let CursorStep::Caller { signal } = std::mem::replace(&mut self.next, CursorStep::Terminal)
+        else {
+            return false;
+        };
+        self.registers = self.next_registers;
+        self.initial = false;
+        self.signal = signal;
+        true
+    }
+}
+
 #[derive(Clone)]
 struct ReportedModule {
     name: String,
@@ -718,18 +790,15 @@ impl FramehopUnwinder {
         )
     }
 
-    pub(crate) fn unwind_stack_with_diagnostics_and_memory(
+    pub(crate) fn prepare_cursor(
         &mut self,
-        regs: PerfUserRegs,
-        stack: &[u8],
-        max_frames: usize,
-        memory: impl FnMut(u64) -> Option<u64>,
-    ) -> UserStackUnwindResult {
+        cursor: &mut UnwindCursor,
+        read: &mut impl FnMut(u64) -> Result<u64, ()>,
+    ) {
         self.refresh_framehop_modules();
-        let modules = &self.reported_modules;
         let lookup = self.segment_lookup.borrow();
         self.arch
-            .unwind_stack(regs, stack, max_frames, modules, &lookup, memory)
+            .prepare_cursor(cursor, read, &self.reported_modules, &lookup);
     }
 }
 
@@ -784,20 +853,46 @@ impl ArchUnwinder {
         modules: &[ReportedModule],
         lookup: &DwflSegmentLookup,
     ) -> Vec<u64> {
-        match (self, regs) {
+        if !matches!(
+            (&*self, regs),
+            (Self::X86_64 { .. }, PerfUserRegs::X86_64(_))
+                | (Self::Aarch64 { .. }, PerfUserRegs::Aarch64(_))
+        ) {
+            return Vec::new();
+        }
+        let mut cursor = UnwindCursor::new(regs);
+        let mut frames = Vec::new();
+        for _ in 0..max_frames {
+            self.prepare_cursor(&mut cursor, read_stack, modules, lookup);
+            frames.push(cursor.entry_pc());
+            if !cursor.advance() {
+                break;
+            }
+        }
+        frames
+    }
+
+    fn prepare_cursor(
+        &mut self,
+        cursor: &mut UnwindCursor,
+        read: &mut impl FnMut(u64) -> Result<u64, ()>,
+        modules: &[ReportedModule],
+        lookup: &DwflSegmentLookup,
+    ) {
+        let (next, retryable) = match (self, cursor.registers) {
             (
                 Self::X86_64 {
                     unwinder,
                     cache,
                     dwarf_cache,
                 },
-                PerfUserRegs::X86_64(regs),
-            ) => Self::iter_dwarf_addresses(
-                dwarf::Registers::<17>::new(regs),
+                CursorRegisters::X86_64(regs),
+            ) => match Self::step_dwarf_address(
+                regs,
+                cursor.initial || cursor.signal,
                 modules,
                 lookup,
-                read_stack,
-                max_frames,
+                read,
                 dwarf_cache,
                 |address, regs, read| {
                     let mut platform_regs = regs.framehop_regs();
@@ -809,20 +904,26 @@ impl ArchUnwinder {
                         Ok(None) | Err(_) => dwarf::Step::Stop,
                     }
                 },
-            ),
+            ) {
+                dwarf::Step::Caller(regs, signal) => {
+                    (Some((CursorRegisters::X86_64(regs), signal)), false)
+                }
+                dwarf::Step::NoRow => (None, true),
+                dwarf::Step::Stop => (None, false),
+            },
             (
                 Self::Aarch64 {
                     unwinder,
                     cache,
                     dwarf_cache,
                 },
-                PerfUserRegs::Aarch64(regs),
-            ) => Self::iter_dwarf_addresses(
-                dwarf::Registers::<33>::new_aarch64(regs),
+                CursorRegisters::Aarch64(regs),
+            ) => match Self::step_dwarf_address(
+                regs,
+                cursor.initial || cursor.signal,
                 modules,
                 lookup,
-                read_stack,
-                max_frames,
+                read,
                 dwarf_cache,
                 |address, regs, read| {
                     let mut platform_regs = regs.framehop_regs();
@@ -834,75 +935,72 @@ impl ArchUnwinder {
                         Ok(None) | Err(_) => dwarf::Step::Stop,
                     }
                 },
-            ),
-            _ => Vec::new(),
-        }
+            ) {
+                dwarf::Step::Caller(regs, signal) => {
+                    (Some((CursorRegisters::Aarch64(regs), signal)), false)
+                }
+                dwarf::Step::NoRow => (None, true),
+                dwarf::Step::Stop => (None, false),
+            },
+            _ => (None, false),
+        };
+        cursor.next = if let Some((regs, signal)) = next {
+            cursor.next_registers = regs;
+            CursorStep::Caller { signal }
+        } else if retryable {
+            CursorStep::Retryable
+        } else {
+            CursorStep::Terminal
+        };
     }
 
-    fn iter_dwarf_addresses<const N: usize, F: FnMut(u64) -> Result<u64, ()>>(
-        mut regs: dwarf::Registers<N>,
+    fn step_dwarf_address<const N: usize, F: FnMut(u64) -> Result<u64, ()>>(
+        regs: dwarf::Registers<N>,
+        activation: bool,
         modules: &[ReportedModule],
         lookup: &DwflSegmentLookup,
         read: &mut F,
-        max_frames: usize,
         dwarf_cache: &mut dwarf::Cache,
         mut platform_step: impl FnMut(FrameAddress, dwarf::Registers<N>, &mut F) -> dwarf::Step<N>,
-    ) -> Vec<u64>
+    ) -> dwarf::Step<N>
     where
         dwarf::Registers<N>: dwarf::RegisterLayout<N>,
     {
-        let mut signal = false;
-        let mut frames = Vec::new();
-        while frames.len() < max_frames {
-            let pc = regs.pc();
-            let initial = frames.is_empty();
-            let address = if initial || signal {
-                pc
+        let pc = regs.pc();
+        let address = if activation { pc } else { pc.wrapping_sub(1) };
+        let module = lookup
+            .module_for_ip(address, |id| modules[id].range.end)
+            .map(|id| &modules[id]);
+        let step = if let Some(module) = module {
+            if let Some(dwarf) = &module.dwarf {
+                dwarf.step(address, regs, dwarf_cache, read)
             } else {
-                pc.wrapping_sub(1)
-            };
-            let module = lookup
-                .module_for_ip(address, |id| modules[id].range.end)
-                .map(|id| &modules[id]);
-            let step = if let Some(module) = module {
-                if let Some(dwarf) = &module.dwarf {
-                    dwarf.step(address, regs, dwarf_cache, read)
+                // Keep Framehop for non-ELF platform unwind formats.
+                let address = if activation {
+                    Some(FrameAddress::from_instruction_pointer(pc))
                 } else {
-                    // Keep Framehop for non-ELF platform unwind formats.
-                    let address = if initial || signal {
-                        Some(FrameAddress::from_instruction_pointer(pc))
-                    } else {
-                        FrameAddress::from_return_address(pc)
-                    };
-                    address.map_or(dwarf::Step::Stop, |address| {
-                        platform_step(address, regs, read)
-                    })
-                }
-            } else {
-                dwarf::Step::NoRow
-            };
-            let step = if matches!(step, dwarf::Step::NoRow) {
-                dwarf::RegisterLayout::arch_fallback(regs, read)
-            } else {
-                step
-            };
-            // dwfl_frame_pc.c:43-59: either adjacent frame being a signal
-            // frame makes this PC an activation address (no return adjustment).
-            let next_signal = matches!(step, dwarf::Step::Caller(_, true));
-            frames.push(if initial || signal || next_signal {
-                pc
-            } else {
-                pc.wrapping_sub(1)
-            });
-            match step {
-                dwarf::Step::Caller(caller, is_signal) => {
-                    regs = caller;
-                    signal = is_signal;
-                }
-                dwarf::Step::NoRow | dwarf::Step::Stop => break,
+                    FrameAddress::from_return_address(pc)
+                };
+                address.map_or(dwarf::Step::Stop, |address| {
+                    platform_step(address, regs, read)
+                })
             }
+        } else {
+            dwarf::Step::NoRow
+        };
+        if matches!(step, dwarf::Step::NoRow) {
+            let fallback = dwarf::RegisterLayout::arch_fallback(regs, read);
+            // frame_unwind.c:774-782 discards failed EBL attempts, unlike a
+            // decoded CFI terminal successor. Leave NoRow retryable for entry
+            // reporting to make an appropriate module available.
+            if matches!(fallback, dwarf::Step::Stop) {
+                dwarf::Step::NoRow
+            } else {
+                fallback
+            }
+        } else {
+            step
         }
-        frames
     }
 }
 

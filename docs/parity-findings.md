@@ -61,6 +61,29 @@ redundant outer call is removed; no label, address, or sample-count exception
 is added. The regression checks byte and file replay. The two-module control
 still preserves both callers on all three samples.
 
+Deleting that outer call did not complete real-profile parity: the helper
+still restarted the seed when a newly reported module changed the frame
+vector. A stronger native regression gives the later report a covering FDE
+for that seed; Pyroclast incorrectly replayed it and discarded the already
+accepted prefix. A separate native red reaches nine covering-CFI modules and
+then an invalid ELF: the eight-pass limit exposed an unreported tenth caller.
+
+The report-and-restart helper and its cap are now replaced by a forward
+cursor. Each raw callback PC is reported before activation lookup, its adjusted
+entry PC is validated before acceptance, and register/next-frame state advances
+once. `dwfl_frame_pc.c:43-59` requires lookahead only for non-initial,
+non-signal frames; initial/signal frames step after acceptance. Both the raw
+object API and lazy session replay share the same per-frame CFI/EBL step.
+Previously accepted prefixes are never recomputed when module state changes.
+
+Lookahead failures are not all terminal. `frame_unwind.c:774-782` discards a
+failed EBL attempt so the iterator can retry after entry reporting supplies a
+module; `frame_unwind.c:744-758` retains a decoded CFI successor, including a
+terminal one. Native regressions prove both cases: a later report must recover
+the missing third frame for failed EBL, but must not resurrect that frame after
+a decoded CFI stop. Both failed on the old restart implementation or its first
+cursor replacement before the retry distinction was implemented.
+
 ## 2026-10-09 recorded kernel/user callchains still receive user unwinds
 
 Investigation of a fresh C thread workload found an unsupported mixed-callchain

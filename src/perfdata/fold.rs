@@ -49,7 +49,10 @@ use crate::perfdata::samples::{
 use crate::perfdata::source::{
     FileSource, QueuedPerfRecord, RecordSource, SliceSource, WindowStore,
 };
-use crate::perfdata::unwind::{FramehopUnwinder, ObjectMappingResult, PerfArch, PerfUserRegs};
+use crate::perfdata::unwind::{
+    FramehopUnwinder, ObjectMappingResult, PerfArch, PerfUserMemoryReader, PerfUserRegs,
+    UnwindCursor,
+};
 #[cfg(test)]
 use crate::perfdata::unwind::{UserStackUnwindResult, UserStackUnwinder};
 use crate::symbols::{
@@ -284,7 +287,6 @@ enum LeafOnlyEligibility {
 
 type UnwindMappingKey = (String, u64, u64, u64);
 type UnwindModuleKey = (String, u64);
-const MAX_LIBDW_CALLBACK_REPORT_PASSES: usize = 8;
 
 enum FoldRecord<'a> {
     BuildId(BuildIdEvent),
@@ -4645,16 +4647,10 @@ fn unwind_object_frame_addresses_like_perf(
         return perf_accepted_object_unwind_frames(regs, true, Vec::new());
     }
 
-    let (raw_frames, failed) =
+    let raw_frames =
         unwind_reported_frame_addresses_like_perf(state, pid, memory, regs, stack_bytes);
-    if failed {
-        return perf_accepted_object_unwind_frames(regs, false, raw_frames);
-    }
     // The iterator chooses CFI or EBL per frame. A seed-only vector may be a
     // decoded CFI stop, so it must not trigger a second architecture walk.
-    // The helper has already processed every accepted callback. Repeating
-    // reporting here can reopen/GC the seed module and erase the valid prefix
-    // (perf util/unwind-libdw.c:326-338 processes each callback only once).
     let raw_frames = truncate_syscall_return_unwind_after_first_executable_frame(
         raw_frames,
         Some(pid),
@@ -4670,69 +4666,38 @@ fn unwind_reported_frame_addresses_like_perf(
     memory: &mut MappedMemory<'_>,
     regs: &PerfUserRegs,
     stack: &[u8],
-) -> (Vec<u64>, bool) {
-    let mut unwind = state
-        .object_unwinder
-        .unwind_stack_with_diagnostics_and_memory(*regs, stack, 256, |address| {
-            memory.read_u64(address)
-        });
-    for _ in 0..MAX_LIBDW_CALLBACK_REPORT_PASSES {
-        let (added, failed) = report_callback_entries_like_perf(
-            state,
-            memory.table,
-            pid,
-            &mut unwind.accepted_frames,
-            memory.debug_dir,
-        );
-        if failed {
-            return (unwind.accepted_frames, true);
+) -> Vec<u64> {
+    let table = memory.table;
+    let debug_dir = memory.debug_dir;
+    let mut reader =
+        PerfUserMemoryReader::new(regs.sp(), stack, |address| memory.read_u64(address));
+    let mut read = |address| reader.read_u64(address).ok_or(());
+    let mut cursor = UnwindCursor::new(*regs);
+    let mut frames = Vec::new();
+    for _ in 0..256 {
+        // unwind-libdw.c:326 reports raw PC before activation lookup, ignoring
+        // report failure. Activation lookup caches the next step only for
+        // non-initial, non-signal frames (dwfl_frame_pc.c:43-59).
+        report_unwind_module_for_ip_like_perf(state, table, pid, cursor.raw_pc(), debug_dir);
+        let lookahead = cursor.requires_lookahead();
+        if lookahead {
+            state.object_unwinder.prepare_cursor(&mut cursor, &mut read);
         }
-        if !added {
+        let ip = cursor.entry_pc();
+        if report_unwind_module_for_ip_like_perf(state, table, pid, ip, debug_dir)
+            == ReportModuleResult::Failed
+        {
             break;
         }
-        let next = state
-            .object_unwinder
-            .unwind_stack_with_diagnostics_and_memory(*regs, stack, 256, |address| {
-                memory.read_u64(address)
-            });
-        if next == unwind {
+        frames.push(ip);
+        if !lookahead || cursor.needs_retry() {
+            state.object_unwinder.prepare_cursor(&mut cursor, &mut read);
+        }
+        if !cursor.advance() {
             break;
         }
-        unwind = next;
     }
-    (unwind.accepted_frames, false)
-}
-
-fn report_callback_entries_like_perf(
-    state: &mut PidUnwindState,
-    mmap_table: &MmapTable,
-    pid: u32,
-    frames: &mut Vec<u64>,
-    debug_dir: Option<&Path>,
-) -> (bool, bool) {
-    let mut added = false;
-    for (index, &ip) in frames.iter().enumerate() {
-        // framehop's accepted caller PCs have already been decremented. perf
-        // first reports the raw callback PC, ignores failure, then entry reports
-        // the adjusted PC and gates acceptance (unwind-libdw.c:326-338,158).
-        let callback_ip = if index == 0 { ip } else { ip.saturating_add(1) };
-        added |= report_unwind_modules_for_frame_callbacks_like_perf(
-            state,
-            mmap_table,
-            pid,
-            &[callback_ip],
-            debug_dir,
-        );
-        match report_unwind_module_for_ip_like_perf(state, mmap_table, pid, ip, debug_dir) {
-            ReportModuleResult::Failed => {
-                frames.truncate(index);
-                return (added, true);
-            }
-            ReportModuleResult::NewlyReported => added = true,
-            ReportModuleResult::NoDso | ReportModuleResult::AlreadyReported => {}
-        }
-    }
-    (added, false)
+    frames
 }
 
 /// Whether perf/libdw would fire the initial-frame callback exactly once and
@@ -4824,6 +4789,7 @@ fn initial_ip_mapping_has_reported_unwind_module(
         && object_unwinder.has_reported_module_for_ip(ip)
 }
 
+#[cfg(test)]
 fn report_unwind_modules_for_frame_callbacks_like_perf(
     state: &mut PidUnwindState,
     mmap_table: &MmapTable,

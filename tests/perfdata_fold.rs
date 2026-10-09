@@ -3503,6 +3503,23 @@ fn callback_module_reporting_preserves_accepted_prefix_like_native_perf_libdw() 
     // unwind-libdw.c:326-338 accepts each callback once; it never restarts an
     // already accepted prefix after reporting the read-only caller's module.
     let fixture = SyntheticX86_64Object::create();
+    assert_native_callback_prefix(&fixture);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn callback_module_reporting_does_not_reunwind_prefix_after_cfi_changes_like_native_perf() {
+    let fixture = SyntheticX86_64Object::create_with_stack_cfi();
+    let mut elf = std::fs::read(&fixture.path).unwrap();
+    // The later report at the lower base gives the already accepted seed a
+    // covering FDE. Replaying it would read stack[0]==0 and discard its caller.
+    elf[0x120..0x124].copy_from_slice(&0x4ee0_i32.to_le_bytes());
+    std::fs::write(&fixture.path, elf).unwrap();
+    assert_native_callback_prefix(&fixture);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn assert_native_callback_prefix(fixture: &SyntheticX86_64Object) {
     let primer = SyntheticX86_64Object::create();
     let primer_path = primer.path.with_file_name("primer-x86-64");
     std::fs::rename(&primer.path, &primer_path).unwrap();
@@ -3548,6 +3565,155 @@ fn callback_module_reporting_preserves_accepted_prefix_like_native_perf_libdw() 
         ),
         "{script}"
     );
+    assert_eq!(
+        fold_perfdata_callchains(&bytes).unwrap(),
+        expected,
+        "{script}"
+    );
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), &bytes).unwrap();
+    assert_eq!(
+        fold_perfdata_file_with_options(file.path(), FoldOptions::default()).unwrap(),
+        expected
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn entry_module_report_retries_failed_ebl_lookahead_like_native_perf_libdw() {
+    // dwfl_frame_pc.c looks ahead before entry() reports the adjusted PC.
+    // frame_unwind.c:774-782 discards failed EBL attempts so that reporting
+    // can provide CFI before the next frame-unwind call.
+    assert_native_entry_module_report(false);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn decoded_cfi_stop_is_cached_across_entry_module_report_like_native_perf_libdw() {
+    // frame_unwind.c:744-758 keeps a decoded CFI successor, even when its
+    // return PC is undefined. Entry reporting must not replace that stop.
+    assert_native_entry_module_report(true);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn assert_native_entry_module_report(terminal_cfi: bool) {
+    let first = SyntheticX86_64Object::create_with_stack_cfi();
+    let second = SyntheticX86_64Object::create_with_stack_cfi();
+    if terminal_cfi {
+        let mut elf = std::fs::read(&first.path).unwrap();
+        let names = elf[0x140..0x155].to_vec();
+        elf[104..112].copy_from_slice(&0x30000_u64.to_le_bytes());
+        // Add a covering FDE at [0x1fffc,0x20000) with undefined RIP, while
+        // retaining the seed FDE. Move the section-name table out of its way.
+        elf[0x130..0x148].copy_from_slice(&[
+            0x14, 0, 0, 0, 0x34, 0, 0, 0, 0xc4, 0xfe, 1, 0, 4, 0, 0, 0, 0, 7, 16, 0, 0, 0, 0, 0,
+        ]);
+        elf[0x148..0x14c].fill(0);
+        elf[0x160..0x175].copy_from_slice(&names);
+        elf[0x1e0..0x1e8].copy_from_slice(&76_u64.to_le_bytes());
+        elf[0x218..0x220].copy_from_slice(&0x160_u64.to_le_bytes());
+        std::fs::write(&first.path, elf).unwrap();
+    }
+    let mut elf = std::fs::read(&second.path).unwrap();
+    elf[0x120..0x124].copy_from_slice(&0xfedc_i32.to_le_bytes());
+    std::fs::write(&second.path, elf).unwrap();
+    let mmap = |start, path: &str| {
+        let mut payload = mmap_payload(11, 11, start, 0x10000, 0, path);
+        payload.resize(payload.len().next_multiple_of(8), 0);
+        record_bytes(1, &payload)
+    };
+    let mut stack = [0_u8; 24];
+    stack[..8].copy_from_slice(&0x30000_u64.to_le_bytes());
+    stack[8..16].copy_from_slice(&0x40000_u64.to_le_bytes());
+    let bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            (1 << 6) | (1 << 7) | (1 << 8),
+        )],
+        [
+            mmap(0x10000, &first.path_string()),
+            mmap(0x20000, &second.path_string()),
+            record_bytes_with_misc(
+                9,
+                PERF_RECORD_MISC_CPUMODE_USER,
+                &sample_payload_with_user_stack(
+                    0x10100,
+                    11,
+                    11,
+                    [],
+                    1,
+                    [0, 0x7fff_0000, 0x10100],
+                    stack,
+                ),
+            ),
+        ],
+    );
+    let (script, expected) = native_script_and_fold(&bytes);
+    let unknown = if terminal_cfi { "" } else { ";[unknown]" };
+    assert_eq!(
+        expected,
+        format!(":11{unknown};[{0}];[{0}] 1\n", first.file_name()),
+        "{script}"
+    );
+    assert_eq!(
+        fold_perfdata_callchains(&bytes).unwrap(),
+        expected,
+        "{script}"
+    );
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), &bytes).unwrap();
+    assert_eq!(
+        fold_perfdata_file_with_options(file.path(), FoldOptions::default()).unwrap(),
+        expected
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn lazy_cfi_reports_every_caller_before_acceptance_like_native_perf_libdw() {
+    // unwind-libdw.c:158 validates each entry's report, regardless of how
+    // many modules the walk reaches. The tenth caller's ELF is invalid.
+    let fixture = SyntheticX86_64Object::create_with_stack_cfi();
+    let invalid_path = fixture.path.with_file_name("invalid-elf");
+    std::fs::write(&invalid_path, b"not an ELF").unwrap();
+    let mut records = Vec::new();
+    for module in 1_u64..=10 {
+        let path = if module == 10 {
+            invalid_path.to_str().unwrap().to_string()
+        } else {
+            fixture.path_string()
+        };
+        let mut payload = mmap_payload(11, 11, module * 0x10000, 0x10000, 0, &path);
+        payload.resize(payload.len().next_multiple_of(8), 0);
+        records.push(record_bytes(1, &payload));
+    }
+    let mut stack = [0_u8; 80];
+    for (index, module) in (2_u64..=10).enumerate() {
+        stack[index * 8..index * 8 + 8].copy_from_slice(&(module * 0x10000 + 0x101).to_le_bytes());
+    }
+    records.push(record_bytes_with_misc(
+        9,
+        PERF_RECORD_MISC_CPUMODE_USER,
+        &sample_payload_with_user_stack(0x10100, 11, 11, [], 1, [0, 0x7fff_0000, 0x10100], stack),
+    ));
+    let bytes = perfdata_with_records_and_attrs_vec(
+        vec![file_attr_bytes_with_regs(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_REGS_USER
+                | PERF_SAMPLE_STACK_USER,
+            (1 << 6) | (1 << 7) | (1 << 8),
+        )],
+        records,
+    );
+    let (script, expected) = native_script_and_fold(&bytes);
+    let frames = format!(";[{}]", fixture.file_name()).repeat(9);
+    assert_eq!(expected, format!(":11{frames} 1\n"), "{script}");
     assert_eq!(
         fold_perfdata_callchains(&bytes).unwrap(),
         expected,
