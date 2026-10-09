@@ -13,6 +13,7 @@ use std::io::Read;
 #[cfg(target_os = "linux")]
 use std::io::{Seek, SeekFrom, Write as IoWrite};
 use std::num::NonZeroU64;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -45,6 +46,7 @@ thread_local! {
     static MODULE_KALLSYMS_ROW_VISITS: Cell<usize> = const { Cell::new(0) };
     static MODULE_KALLSYMS_SYMBOL_INSERTIONS: Cell<usize> = const { Cell::new(0) };
     static MODULE_KALLSYMS_END_FIXUP_PASSES: Cell<usize> = const { Cell::new(0) };
+    static KALLSYMS_REFERENCE_ROW_VISITS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -943,6 +945,67 @@ struct OrdinaryKernelLoad {
 struct LiveKallsymsSnapshot {
     core: Option<Kallsyms>,
     modules: FxHashMap<String, Arc<Kallsyms>>,
+    source: Box<str>,
+    references: Mutex<Vec<KallsymsReference>>,
+}
+
+enum KallsymsReference {
+    Found { name: Range<usize>, address: u64 },
+    Missing(Box<str>),
+}
+
+impl LiveKallsymsSnapshot {
+    fn reference_address(&self, reference: &str) -> Option<u64> {
+        let mut references = self.references.lock().expect("kallsyms reference lock");
+        for cached in references.iter() {
+            match cached {
+                KallsymsReference::Found { name, address }
+                    if &self.source[name.clone()] == reference =>
+                {
+                    return Some(*address);
+                }
+                KallsymsReference::Missing(name) if name.as_ref() == reference => return None,
+                _ => {}
+            }
+        }
+        // perf symbol.c:kallsyms__delta -> event.c:get_function_start scans
+        // the physical source independently of display-tree alias selection.
+        if let Some((address, name)) = kallsyms_reference_span(&self.source, reference) {
+            references.push(KallsymsReference::Found { name, address });
+            Some(address)
+        } else {
+            // A missing name has no source span. Own only requested misses so
+            // repeated failed relocation does not rescan the complete source.
+            references.push(KallsymsReference::Missing(reference.into()));
+            None
+        }
+    }
+
+    fn relocation_delta(&self, relocation: Option<&KernelRelocation>) -> Option<u64> {
+        match relocation {
+            Some(relocation) => Some(
+                self.reference_address(&relocation.reference_symbol)?
+                    .wrapping_sub(relocation.recorded_reference_address),
+            ),
+            None => Some(0),
+        }
+    }
+
+    fn resolve_core(&self, request: &SymbolRequest) -> Option<String> {
+        let core = self.core.as_ref()?;
+        let delta = self.relocation_delta(request.kernel_relocation.as_ref())?;
+        core.resolve_with_offset(request.relative_address.wrapping_add(delta))
+    }
+
+    fn kernel_map_range(&self, relocation: Option<&KernelRelocation>) -> Option<(u64, u64)> {
+        // perf symbol.c:maps__split_kallsyms subtracts delta before
+        // map.c:map__fixup_start/end takes the first/last symbol bounds.
+        let core = self.core.as_ref()?;
+        let delta = self.relocation_delta(relocation)?;
+        let (&start, _) = core.symbols.first_key_value()?;
+        let (_, last) = core.symbols.last_key_value()?;
+        Some((start.wrapping_sub(delta), last.end?.wrapping_sub(delta)))
+    }
 }
 
 struct FileKernelCache {
@@ -1892,26 +1955,14 @@ impl Kallsyms {
     }
 
     fn parse_module_symbols(text: &str) -> Vec<BorrowedKallsymsRow<'_>> {
-        Self::parse_global_kallsyms(text, None)
+        Self::parse_global_kallsyms(text)
     }
 
-    fn parse_global_kallsyms<'a>(
-        text: &'a str,
-        mut relocation_addresses: Option<&mut FxHashMap<Arc<str>, u64>>,
-    ) -> Vec<BorrowedKallsymsRow<'a>> {
+    fn parse_global_kallsyms(text: &str) -> Vec<BorrowedKallsymsRow<'_>> {
         #[cfg(test)]
         MODULE_KALLSYMS_TREE_BUILDS.with(|count| count.set(count.get() + 1));
         let mut symbols = Vec::new();
         for line in text.split_terminator('\n') {
-            // perf symbol.c:kallsyms__delta calls event.c:
-            // kallsyms__get_function_start on the physical input. Relocation
-            // references include zero and survive symbol-tree alias selection.
-            if let Some(addresses) = relocation_addresses.as_deref_mut()
-                && let Some((address, name)) = parse_kallsyms_function_line(line)
-                && let RawEntryMut::Vacant(entry) = addresses.raw_entry_mut().from_key(name)
-            {
-                entry.insert(Arc::from(name), address);
-            }
             let Some(row) = parse_global_kallsyms_row(line) else {
                 continue;
             };
@@ -2094,20 +2145,6 @@ impl Kallsyms {
 
     fn address_of(&self, name: &str) -> Option<u64> {
         self.addresses_by_name.get(name).copied()
-    }
-
-    fn kernel_map_range(&self, relocation: Option<&KernelRelocation>) -> Option<(u64, u64)> {
-        // perf symbol.c:maps__split_kallsyms subtracts delta before
-        // map.c:map__fixup_start/end takes the first/last symbol bounds.
-        let delta = match relocation {
-            Some(relocation) => self
-                .address_of(&relocation.reference_symbol)?
-                .wrapping_sub(relocation.recorded_reference_address),
-            None => 0,
-        };
-        let (&start, _) = self.symbols.first_key_value()?;
-        let (_, last) = self.symbols.last_key_value()?;
-        Some((start.wrapping_sub(delta), last.end?.wrapping_sub(delta)))
     }
 }
 
@@ -3203,18 +3240,18 @@ where
     fn live_kallsyms_snapshot(&self) -> Option<&LiveKallsymsSnapshot> {
         self.live_kallsyms_cache
             .get_or_init(|| {
-                let text = std::fs::read_to_string(self.live_kallsyms_path.as_ref()?).ok()?;
+                let text = std::fs::read_to_string(self.live_kallsyms_path.as_ref()?)
+                    .ok()?
+                    .into_boxed_str();
                 // perf symbol.c:__dso__load_kallsyms (1494-1523) reads and
                 // splits the complete tree during core loading, not during
                 // each module's later first query. Both views own one snapshot.
                 let mut core = Kallsyms::default();
-                let rows =
-                    Kallsyms::parse_global_kallsyms(&text, Some(&mut core.addresses_by_name));
+                let rows = Kallsyms::parse_global_kallsyms(&text);
+                let mut names = FxHashMap::<&str, Arc<str>>::default();
                 for row in rows.iter().filter(|row| row.module.is_none()) {
-                    let name = core
-                        .addresses_by_name
-                        .get_key_value(row.name)
-                        .map_or_else(|| Arc::from(row.name), |(name, _)| Arc::clone(name));
+                    let name =
+                        Arc::clone(names.entry(row.name).or_insert_with(|| Arc::from(row.name)));
                     core.symbols.insert(
                         row.address,
                         KallsymsSymbol {
@@ -3224,9 +3261,13 @@ where
                         },
                     );
                 }
+                drop(names);
+                let modules = Kallsyms::module_views_from_symbols(rows);
                 Some(LiveKallsymsSnapshot {
                     core: (!core.symbols.is_empty()).then_some(core),
-                    modules: Kallsyms::module_views_from_symbols(rows),
+                    modules,
+                    source: text,
+                    references: Mutex::new(Vec::new()),
                 })
             })
             .as_ref()
@@ -3289,8 +3330,7 @@ where
         self.live_kallsyms_cache
             .get()
             .and_then(Option::as_ref)
-            .and_then(|snapshot| snapshot.core.as_ref())
-            .and_then(|core| core.kernel_map_range(request.kernel_relocation.as_ref()))
+            .and_then(|snapshot| snapshot.kernel_map_range(request.kernel_relocation.as_ref()))
             .is_some_and(|(start, end)| {
                 request.relative_address < start || request.relative_address >= end
             })
@@ -3343,8 +3383,10 @@ where
                     // tools/perf/util/symbol.c dso__find_kallsyms() tries the
                     // host/root /proc/kallsyms path before the final cached
                     // kallsyms fallback for host kernel maps.
-                    self.live_kallsyms_ref()
-                        .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
+                    match self.live_kallsyms.as_ref() {
+                        Some(kallsyms) => resolve_kernel_kallsyms(kallsyms, request),
+                        None => self.live_kallsyms_snapshot()?.resolve_core(request),
+                    }
                 })
                 .or_else(|| {
                     if !self.can_use_system_kernel_symbols(request) {
@@ -6424,6 +6466,23 @@ fn parse_kallsyms_function_line(line: &str) -> Option<(u64, &str)> {
     matches!(kind, "T" | "t" | "W" | "w" | "A").then_some((address, name.split('\0').next()?))
 }
 
+fn kallsyms_reference_span(text: &str, reference: &str) -> Option<(u64, Range<usize>)> {
+    let mut offset = 0;
+    for line in text.split_terminator('\n') {
+        #[cfg(test)]
+        KALLSYMS_REFERENCE_ROW_VISITS.with(|count| count.set(count.get() + 1));
+        if let Some((address, name)) = parse_kallsyms_function_line(line)
+            && name == reference
+        {
+            // The accepted parser requires one ASCII type byte between spaces.
+            let start = offset + line.find(' ')? + 3;
+            return Some((address, start..start + name.len()));
+        }
+        offset += line.len() + 1;
+    }
+    None
+}
+
 fn parse_global_kallsyms_row(line: &str) -> Option<BorrowedKallsymsRow<'_>> {
     #[cfg(test)]
     MODULE_KALLSYMS_ROW_VISITS.with(|count| count.set(count.get() + 1));
@@ -8866,12 +8925,18 @@ mod tests {
             let resolver =
                 super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
                     .with_system_kallsyms_from_path(&path);
-            let core = resolver.live_kallsyms_ref().unwrap();
-            assert_eq!(core.address_of("reference"), Some(0x1000), "{row:?}");
+            let snapshot = resolver.live_kallsyms_snapshot().unwrap();
             assert_eq!(
-                core.resolve_relocated_with_offset(0x2010, "reference", 0x2000),
-                Some("next+0x0".into())
+                snapshot.reference_address("reference"),
+                Some(0x1000),
+                "{row:?}"
             );
+            let mut request = test_request("[kernel.kallsyms]", 0x2010);
+            request.kernel_relocation = Some(super::KernelRelocation {
+                reference_symbol: "reference".into(),
+                recorded_reference_address: 0x2000,
+            });
+            assert_eq!(snapshot.resolve_core(&request), Some("next+0x0".into()));
         }
     }
 
@@ -8903,12 +8968,14 @@ mod tests {
         );
         let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
             .with_system_kallsyms_from_path(&path);
-        let core = resolver.live_kallsyms_ref().unwrap();
-        assert_eq!(core.address_of("reference"), Some(0));
-        assert_eq!(
-            core.resolve_relocated_with_offset(0x2010, "reference", 0x2000),
-            None
-        );
+        let snapshot = resolver.live_kallsyms_snapshot().unwrap();
+        assert_eq!(snapshot.reference_address("reference"), Some(0));
+        let mut request = test_request("[kernel.kallsyms]", 0x2010);
+        request.kernel_relocation = Some(super::KernelRelocation {
+            reference_symbol: "reference".into(),
+            recorded_reference_address: 0x2000,
+        });
+        assert_eq!(snapshot.resolve_core(&request), None);
     }
 
     #[test]
@@ -9113,7 +9180,7 @@ mod tests {
     }
 
     #[test]
-    fn kallsyms_live_core_name_index_shares_symbol_storage() {
+    fn kallsyms_live_core_reference_lookup_does_not_own_a_second_name_index() {
         let (_root, path) = live_module_kallsyms_fixture("1000 T retained\n2000 T next\n");
         let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
             .with_system_kallsyms_from_path(&path);
@@ -9123,13 +9190,54 @@ mod tests {
             .core
             .as_ref()
             .unwrap();
-        let name = &symbols.symbols[&0x1000].name;
-        let indexed = symbols
-            .addresses_by_name
-            .get_key_value("retained")
+        assert_eq!(symbols.symbols[&0x1000].name.as_ref(), "retained");
+        assert_eq!(
+            symbols.resolve_with_offset(0x1001),
+            Some("retained+0x1".into())
+        );
+        // perf symbol.c:kallsyms__delta requests one physical reference via
+        // event.c:get_function_start, not a second index of every input name.
+        assert!(symbols.addresses_by_name.is_empty());
+        assert_eq!(
+            resolver
+                .live_kallsyms_snapshot()
+                .unwrap()
+                .reference_address("retained"),
+            Some(0x1000)
+        );
+    }
+
+    #[test]
+    fn kallsyms_live_core_does_not_index_unrequested_absolute_references() {
+        use std::fmt::Write;
+
+        let mut text = String::from("1000 T retained\n2000 T next\n");
+        for i in 0..4096 {
+            writeln!(text, "{:x} A reference_{i}", 0x3000 + i).unwrap();
+        }
+        let (_root, path) = live_module_kallsyms_fixture(&text);
+        let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
+            .with_system_kallsyms_from_path(&path);
+        let core = resolver
+            .live_kallsyms_snapshot()
             .unwrap()
-            .0;
-        assert_eq!(name.as_ptr(), indexed.as_ptr());
+            .core
+            .as_ref()
+            .unwrap();
+        assert_eq!(core.symbols.len(), 2);
+        assert_eq!(
+            core.resolve_with_offset(0x1001),
+            Some("retained+0x1".into())
+        );
+        assert!(
+            core.addresses_by_name.is_empty(),
+            "{} owned reference names",
+            core.addresses_by_name.len()
+        );
+        let snapshot = resolver.live_kallsyms_snapshot().unwrap();
+        assert!(snapshot.references.lock().unwrap().is_empty());
+        assert_eq!(snapshot.reference_address("reference_4095"), Some(0x3fff));
+        assert_eq!(snapshot.references.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -9207,17 +9315,175 @@ mod tests {
         let snapshot = resolver.live_kallsyms_snapshot().unwrap();
         std::fs::remove_file(path).unwrap();
         let core = snapshot.core.as_ref().unwrap();
-        assert_eq!(core.address_of("repeat"), Some(0x2000));
-        assert_eq!(core.address_of("losing"), Some(0x3000));
-        assert_eq!(core.address_of("absolute"), Some(0x4000));
-        assert_eq!(core.address_of("data"), None);
+        assert_eq!(snapshot.reference_address("repeat"), Some(0x2000));
+        assert_eq!(snapshot.reference_address("losing"), Some(0x3000));
+        assert_eq!(snapshot.reference_address("absolute"), Some(0x4000));
+        assert_eq!(snapshot.reference_address("data"), None);
         assert_eq!(core.symbols[&0x3000].name.as_ref(), "winner");
         assert!(!core.symbols.contains_key(&0x4000));
         assert_eq!(core.symbols[&0x5000].name.as_ref(), "data");
-        let indexed = core.addresses_by_name.get_key_value("repeat").unwrap().0;
-        for address in [0x1000, 0x2000] {
-            assert!(Arc::ptr_eq(indexed, &core.symbols[&address].name));
+        assert!(Arc::ptr_eq(
+            &core.symbols[&0x1000].name,
+            &core.symbols[&0x2000].name
+        ));
+    }
+
+    #[test]
+    fn kallsyms_live_reference_cache_retains_source_spans_not_requested_names() {
+        let text = "0 T zero\n1000 T displayed\n2000 A physical\t[module]\0ignored\n";
+        let (_root, path) = live_module_kallsyms_fixture(text);
+        let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
+            .with_system_kallsyms_from_path(&path);
+        let snapshot = resolver.live_kallsyms_snapshot().unwrap();
+        assert!(snapshot.references.lock().unwrap().is_empty());
+        // Look up only after the file and the caller's name storage disappear.
+        std::fs::remove_file(path).unwrap();
+        for (name, address) in [("zero", 0), ("physical\t[module]", 0x2000)] {
+            let requested = name.to_owned();
+            assert_eq!(snapshot.reference_address(&requested), Some(address));
+            drop(requested);
         }
+        let references = snapshot.references.lock().unwrap();
+        assert_eq!(references.len(), 2);
+        for (cached, expected) in references
+            .iter()
+            .zip([("zero", 0), ("physical\t[module]", 0x2000)])
+        {
+            let super::KallsymsReference::Found { name, address } = cached else {
+                panic!("successful physical reference owns a copied name");
+            };
+            assert_eq!((&snapshot.source[name.clone()], *address), expected);
+        }
+    }
+
+    #[test]
+    fn kallsyms_live_reference_cache_does_not_rescan_hits_or_misses() {
+        let (_root, path) = live_module_kallsyms_fixture("1000 T first\n2000 T last\n");
+        let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
+            .with_system_kallsyms_from_path(&path);
+        let snapshot = resolver.live_kallsyms_snapshot().unwrap();
+        super::KALLSYMS_REFERENCE_ROW_VISITS.with(|count| count.set(0));
+        assert_eq!(snapshot.reference_address("last"), Some(0x2000));
+        assert_eq!(snapshot.reference_address("absent"), None);
+        super::KALLSYMS_REFERENCE_ROW_VISITS.with(|count| assert_eq!(count.get(), 4));
+        let (storage, capacity) = {
+            let references = snapshot.references.lock().unwrap();
+            (references.as_ptr(), references.capacity())
+        };
+        for _ in 0..100 {
+            assert_eq!(snapshot.reference_address("last"), Some(0x2000));
+            assert_eq!(snapshot.reference_address("absent"), None);
+        }
+        super::KALLSYMS_REFERENCE_ROW_VISITS.with(|count| assert_eq!(count.get(), 4));
+        let references = snapshot.references.lock().unwrap();
+        assert_eq!(references.len(), 2);
+        assert_eq!(
+            (references.as_ptr(), references.capacity()),
+            (storage, capacity)
+        );
+        drop(references);
+        // A cached miss must not match a different exact name.
+        assert_eq!(snapshot.reference_address("absent_suffix"), None);
+        assert_eq!(snapshot.references.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn kallsyms_reference_spans_preserve_physical_byte_boundaries() {
+        // event.c:find_func_symbol_cb compares the full physical C name;
+        // kallsyms.c strips only newline and strcmp stops at the first NUL.
+        for (text, name, address) in [
+            ("1000 D same\n2000 T same\n", "same", 0x2000),
+            ("0 A same\n2000 T same", "same", 0),
+            ("1 T first\r\n2 T last\r\n", "last\r", 2),
+            ("1 T first\n2 w last ", "last ", 2),
+            ("1 T first\n2 W last\0suffix", "last", 2),
+            (
+                "1 T before_\u{00e9}\n2 T matched_\u{00e9}\t[module]\n",
+                "matched_\u{00e9}\t[module]",
+                2,
+            ),
+            ("fffffffffffffffff A overflow", "overflow", u64::MAX),
+            ("1\tT same\n2 TT same\n3 T same", "same", 3),
+        ] {
+            let (found, span) = super::kallsyms_reference_span(text, name).unwrap();
+            assert_eq!(found, address);
+            assert_eq!(&text[span], name);
+        }
+        assert_eq!(
+            super::kallsyms_reference_span("1 T name [module]", "name"),
+            None
+        );
+        assert_eq!(super::kallsyms_reference_span("1 T name\r\n", "name"), None);
+        assert_eq!(super::kallsyms_reference_span("+1 T name", "name"), None);
+    }
+
+    #[test]
+    fn kallsyms_live_reference_cache_is_snapshot_local_and_concurrent() {
+        let (_root, path) = live_module_kallsyms_fixture("1000 T shared\n2000 T next\n");
+        let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
+            .with_system_kallsyms_from_path(&path);
+        let old = resolver.live_kallsyms_snapshot().unwrap();
+        std::fs::write(&path, "3000 T shared\n4000 T next\n").unwrap();
+        let replacement =
+            super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
+                .with_system_kallsyms_from_path(&path);
+        assert_eq!(
+            replacement
+                .live_kallsyms_snapshot()
+                .unwrap()
+                .reference_address("shared"),
+            Some(0x3000)
+        );
+        let barrier = std::sync::Barrier::new(8);
+        let visits = std::thread::scope(|scope| {
+            let threads = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        super::KALLSYMS_REFERENCE_ROW_VISITS.with(|count| count.set(0));
+                        barrier.wait();
+                        assert_eq!(old.reference_address("shared"), Some(0x1000));
+                        barrier.wait();
+                        assert_eq!(old.reference_address("missing"), None);
+                        super::KALLSYMS_REFERENCE_ROW_VISITS.with(Cell::get)
+                    })
+                })
+                .collect::<Vec<_>>();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .sum::<usize>()
+        });
+        assert_eq!(
+            visits, 3,
+            "cold hit and miss must each scan once under contention"
+        );
+        assert_eq!(old.references.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn kallsyms_live_reference_relocates_resolution_and_map_bounds_identically() {
+        let (_root, path) =
+            live_module_kallsyms_fixture("4000 A reference\n1000 T first\n2000 T last\n");
+        let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
+            .with_system_kallsyms_from_path(&path);
+        let snapshot = resolver.live_kallsyms_snapshot().unwrap();
+        let mut request = test_request("[kernel.kallsyms]", 0x5001);
+        request.kernel_relocation = Some(super::KernelRelocation {
+            reference_symbol: "reference".into(),
+            recorded_reference_address: 0x8000,
+        });
+        assert_eq!(snapshot.resolve_core(&request), Some("first+0x1".into()));
+        assert_eq!(
+            snapshot.kernel_map_range(request.kernel_relocation.as_ref()),
+            Some((0x5000, 0x7000))
+        );
+        assert_eq!(snapshot.references.lock().unwrap().len(), 1);
+        request.kernel_relocation.as_mut().unwrap().reference_symbol = "missing".into();
+        assert_eq!(snapshot.resolve_core(&request), None);
+        assert_eq!(
+            snapshot.kernel_map_range(request.kernel_relocation.as_ref()),
+            None
+        );
     }
 
     #[test]

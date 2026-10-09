@@ -143,9 +143,7 @@ fn reference_function_start(text: &str, reference: &str) -> Option<u64> {
     // perf symbol.c:validate_kcore_addresses -> event.c:find_func_symbol_cb
     // stops at the first T/t/W/w/A full-name match, without excluding zero.
     // tools/lib/symbol/kallsyms.c passes the module suffix as part of the name.
-    text.split_terminator('\n')
-        .filter_map(super::parse_kallsyms_function_line)
-        .find_map(|(address, name)| (name == reference).then_some(address))
+    super::kallsyms_reference_span(text, reference).map(|(address, _)| address)
 }
 
 pub(crate) fn module_short_name(path: &str) -> Option<Cow<'_, str>> {
