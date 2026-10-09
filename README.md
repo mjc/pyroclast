@@ -280,3 +280,15 @@ Folded per-stack counts saturate at `u64::MAX` on overflow in both direct and
 Inferno folding; representable counts and continuous-stream parser state are
 unchanged. Saturation is an explicit overflow policy, not native Inferno parity
 for sums beyond the representable range.
+
+## License
+
+Pyroclast's original code is licensed under either [Apache-2.0](LICENSE-APACHE)
+or [MIT](LICENSE-MIT), at your option. Third-party code retains its own licenses
+and notices; see the vendored components' license files and
+[GNU provider notices](vendor/binutils-provider/licenses/upstream-notices.txt).
+Redistributions must preserve the applicable third-party license and attribution
+notices rather than apply Pyroclast's license to dependencies. The Nix application
+package installs project and vendored Rust license files under
+`share/doc/pyroclast`; the optional GNU helper carries its own upstream notices
+under `share/doc/pyroclast-addr2line`.

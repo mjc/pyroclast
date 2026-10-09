@@ -46,6 +46,9 @@
                 || pkgs.lib.any (suffix: pkgs.lib.hasSuffix suffix (toString path)) [
                   "/vendor/inferno/src/flamegraph/flamegraph.css"
                   "/vendor/inferno/src/flamegraph/flamegraph.js"
+                  "/LICENSE-APACHE"
+                  "/LICENSE-MIT"
+                  "/vendor/inferno/LICENSE"
                 ];
             };
             strictDeps = true;
@@ -67,9 +70,20 @@
               inherit cargoArtifacts;
               cargoExtraArgs = "--bins";
               doCheck = false;
+              postInstall = ''
+                mkdir -p "$out/share/doc/pyroclast/vendor/addr2line" "$out/share/doc/pyroclast/vendor/inferno"
+                install -m644 LICENSE-APACHE LICENSE-MIT "$out/share/doc/pyroclast/"
+                install -m644 vendor/addr2line/LICENSE-APACHE vendor/addr2line/LICENSE-MIT \
+                  "$out/share/doc/pyroclast/vendor/addr2line/"
+                install -m644 vendor/inferno/LICENSE "$out/share/doc/pyroclast/vendor/inferno/"
+              '';
               meta = {
                 description = packageDescription;
                 mainProgram = "pyroclast";
+                license = with pkgs.lib.licenses; [
+                  asl20
+                  mit
+                ];
               };
             }
           );
@@ -88,6 +102,16 @@
           package-source-assets = pkgs.runCommand "pyroclast-package-source-assets" { } ''
             test -s ${self.packages.${system}.default.src}/vendor/inferno/src/flamegraph/flamegraph.css
             test -s ${self.packages.${system}.default.src}/vendor/inferno/src/flamegraph/flamegraph.js
+            for file in LICENSE-APACHE LICENSE-MIT vendor/addr2line/LICENSE-APACHE vendor/addr2line/LICENSE-MIT vendor/inferno/LICENSE; do
+              test -s ${self.packages.${system}.default.src}/"$file"
+            done
+            mkdir "$out"
+          '';
+          package-license-files = pkgs.runCommand "pyroclast-package-license-files" { } ''
+            for file in LICENSE-APACHE LICENSE-MIT vendor/addr2line/LICENSE-APACHE vendor/addr2line/LICENSE-MIT vendor/inferno/LICENSE; do
+              cmp ${self.packages.${system}.default.src}/"$file" \
+                ${self.packages.${system}.default}/share/doc/pyroclast/"$file"
+            done
             mkdir "$out"
           '';
         }
