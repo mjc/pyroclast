@@ -30,6 +30,50 @@ assertions but now name the actual missing-module precondition.
 The workload also exposed empty native stacks for other TIDs. That is a
 separate investigation; this change does not establish threaded parity.
 
+## 2026-10-09 shared-map libdw attachment retains its first TID
+
+A lossless recording with two TIDs in one process reproduced the empty native
+worker stacks independently of capture loss: native retains the first TID's
+two unwinds and a forked process's unwind, but not the second TID's unwind.
+Pyroclast emitted an extra folded row for that second TID, so the exact native
+comparison was red before changing attachment state.
+
+Perf `tools/perf/util/thread.c:398-411` shares the process's map group when
+forking a thread, but copies maps for a new process. `unwind-libdw.c:377-408`
+caches DWFL on that map group and attempts `dwfl_attach_state()` after initial
+module reporting. Elfutils `libdwfl/dwfl_frame.c:136-144` rejects reattachment;
+perf's `next_thread()` at `unwind-libdw.c:176-184` enumerates only the original
+`dwfl_pid()`. A request for another TID therefore returns ESRCH
+(`dwfl_frame.c:354-419`) with no unwind callbacks. This is a limitation of the
+native libdw-backed oracle, not missing FORK metadata or a universal thread
+unwinding rule; libunwind-backed perf is not covered by this conclusion.
+
+Replay now retains the first attached TID with its map-group unwind state.
+Threads sharing a group preserve that state; copying maps into a new process
+does not copy its attachment. Initial module
+report failures and missing modules do not reserve attachment. Tests compare
+fresh native folds through byte/file replay with first-TID order reversed,
+late thread creation, a separately forked process, missing-map/missing-ELF
+attachment retries, and recorded frames on the otherwise rejected TID. Only
+the user unwind is rejected; recorded callchain frames remain.
+
+Review exposed a red leader-exit case: a surviving thread retains the old map
+group, but a later thread joins a recreated leader's new group. A PID-only
+attachment rejected the new thread. Replay now tracks TID-to-group ownership
+separately from the recorded PID. Mapping and CFI lookups use the same internal
+group key; text headers retain the real PID/TID. The native control uses
+different old/new ELFs and compares both groups through byte/file replay.
+With HEADER_AUXTRACE, native retains exited threads (`session.c:62`), so the
+same control instead proves continued sharing. A separate native red proved
+that reused TIDs must not retain exited-thread comm names.
+
+Groups are retired only after their last thread/reference is released, without
+size caps. Four map-table tests were red against a no-op retirement helper;
+they now check arena removal, presence counters, idempotence, unrelated/global
+maps and retained DSO identities, and cache revalidation after slot reuse.
+Allocator controls ensure internal group keys cannot alias another real PID,
+and that temporary fork references survive replacement until maps are copied.
+
 ## 2026-10-09 kernel module section maps, not ELF-type rejection
 
 Two fresh native regressions disproved the blanket ET_DYN rejection. Keeping

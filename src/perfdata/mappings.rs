@@ -1012,6 +1012,15 @@ impl MmapTable {
         });
     }
 
+    pub(crate) fn remove_pid_mappings(&mut self, pid: u32) {
+        if let Some(bucket) = self.mappings_by_pid.remove(&pid) {
+            for indexed in bucket {
+                self.mappings.remove(indexed.index);
+            }
+        }
+        self.update_pid_presence(pid, false, false);
+    }
+
     pub fn clone_pid_mappings(&mut self, parent_pid: u32, child_pid: u32) {
         if parent_pid == child_pid {
             return;
@@ -2787,6 +2796,131 @@ mod tests {
         assert_eq!(table.executable_pids, executable);
         assert_eq!(table.has_global_mappings, global_present);
         assert_eq!(table.has_global_executable_mappings, global_executable);
+    }
+
+    #[test]
+    fn remove_pid_mappings_removes_bucket_arena_and_presence() {
+        let mut table = super::MmapTable::default();
+        table.insert_mmap(mutation_record(7, 0x1000, 0x100, 0, "/first"));
+        table.insert_mmap(mutation_record(7, 0x3000, 0x100, 0, "/second"));
+        let slots = table
+            .bucket(7)
+            .iter()
+            .map(|indexed| indexed.index)
+            .collect::<Vec<_>>();
+        assert!(table.has_mappings_for_pid(7));
+        assert!(table.has_executable_mappings_for_pid(7));
+
+        table.remove_pid_mappings(7);
+
+        assert!(!table.mappings_by_pid.contains_key(&7));
+        assert!(slots.iter().all(|&slot| table.mappings.get(slot).is_none()));
+        assert_eq!(table.mappings.iter().count(), 0);
+        assert!(!table.has_mappings_for_pid(7));
+        assert!(!table.has_executable_mappings_for_pid(7));
+        assert!(table.resolve(7, 0x1010).is_none());
+        assert!(table.resolve(7, 0x3010).is_none());
+        assert_mapping_arena_invariants(&table);
+    }
+
+    #[test]
+    fn remove_pid_mappings_is_idempotent() {
+        let mut table = super::MmapTable::default();
+        table.insert_mmap(mutation_record(7, 0x1000, 0x100, 0, "/removed"));
+        table.insert_mmap(mutation_record(8, 0x1000, 0x100, 0, "/retained"));
+        table.remove_pid_mappings(7);
+        assert!(table.resolve(7, 0x1010).is_none());
+        let removed = table.clone();
+
+        table.remove_pid_mappings(7);
+        table.remove_pid_mappings(999);
+
+        assert_eq!(table, removed);
+        assert_mapping_arena_invariants(&table);
+    }
+
+    #[test]
+    fn remove_pid_mappings_retains_other_global_mappings_and_native_dsos() {
+        let mut table = super::MmapTable::default();
+        for (pid, start, path) in [
+            (7, 0x1000, "/removed"),
+            (8, 0x1000, "/retained"),
+            (u32::MAX, 0x8000, "/global"),
+        ] {
+            table.insert_mmap(mutation_record(pid, start, 0x100, 0, path));
+        }
+        let retained = table.resolve(8, 0x1010).unwrap();
+        let global = table.resolve(7, 0x8010).unwrap();
+        let retained_slot = table.bucket(8)[0].index;
+        let global_slot = table.bucket(u32::MAX)[0].index;
+        let native_dsos = table.native_dsos.clone();
+
+        table.remove_pid_mappings(7);
+
+        assert!(table.resolve(7, 0x1010).is_none());
+        assert!(!table.pids_with_mappings.contains(&7));
+        assert!(!table.executable_pids.contains(&7));
+        assert_eq!(table.resolve(8, 0x1010).unwrap(), retained);
+        assert_eq!(table.resolve(7, 0x8010).unwrap(), global);
+        assert_eq!(table.bucket(8)[0].index, retained_slot);
+        assert_eq!(table.bucket(u32::MAX)[0].index, global_slot);
+        assert!(table.pids_with_mappings.contains(&8));
+        assert!(table.executable_pids.contains(&8));
+        assert!(table.has_global_mappings);
+        assert!(table.has_global_executable_mappings);
+        assert_eq!(table.native_dsos, native_dsos);
+        assert_mapping_arena_invariants(&table);
+    }
+
+    #[test]
+    fn remove_pid_mappings_reinsert_revalidates_cached_slots() {
+        let mut table = super::MmapTable::default();
+        let mut cache = super::MappingResolveCache::default();
+        table.insert_mmap(mutation_record(7, 0x1000, 0x100, 0x50, "/old"));
+        table.resolve_frame_cached(7, 0x1010, &mut cache).unwrap();
+        let old_slot = cache.pid_index.unwrap();
+        let mut vacant_cache = cache;
+
+        table.remove_pid_mappings(7);
+
+        assert!(table.mappings.get(old_slot).is_none());
+        assert!(
+            table
+                .resolve_frame_cached(7, 0x1010, &mut vacant_cache)
+                .is_none()
+        );
+        assert!(vacant_cache.pid_index.is_none());
+        assert_mapping_arena_invariants(&table);
+
+        table.insert_mmap(mutation_record(8, 0x1000, 0x100, 0x900, "/foreign"));
+        assert_eq!(table.bucket(8)[0].index, old_slot);
+        assert!(table.resolve_frame_cached(7, 0x1010, &mut cache).is_none());
+        let context = table.frame_context(7, &mut vacant_cache);
+        assert!(context.resolve_user(0x1010, &mut vacant_cache).is_none());
+
+        table.remove_pid_mappings(8);
+        table.insert_mmap(mutation_record(7, 0x2000, 0x100, 0x500, "/new-range"));
+        assert_eq!(table.bucket(7)[0].index, old_slot);
+        cache.pid_index = Some(old_slot);
+        assert!(table.resolve_frame_cached(7, 0x1010, &mut cache).is_none());
+        let frame = table.resolve_frame_cached(7, 0x2010, &mut cache).unwrap();
+        assert_eq!(
+            (frame.path(), frame.relative_address),
+            ("/new-range", 0x510)
+        );
+
+        table.remove_pid_mappings(7);
+        table.insert_mmap(mutation_record(7, 0x1000, 0x100, 0x700, "/new-source"));
+        assert_eq!(table.bucket(7)[0].index, old_slot);
+        let frame = table.resolve_frame_cached(7, 0x1010, &mut cache).unwrap();
+        assert_eq!(
+            (frame.path(), frame.relative_address),
+            ("/new-source", 0x710)
+        );
+        assert!(table.has_mappings_for_pid(7));
+        assert!(table.has_executable_mappings_for_pid(7));
+        assert_eq!(table.mappings.slots.len(), 1);
+        assert_mapping_arena_invariants(&table);
     }
 
     #[test]

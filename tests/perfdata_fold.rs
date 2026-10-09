@@ -2430,6 +2430,269 @@ fn extends_recorded_kernel_user_callchain_with_dwarf_frames_like_native_perf() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn shared_process_unwind_attachment_keeps_first_tid_like_native_perf_libdw() {
+    // unwind-libdw.c stores DWFL on shared maps and next_thread() enumerates
+    // only dwfl_pid(). dwfl_frame.c rejects reattachment and reports ESRCH
+    // for another TID. This is an attachment lifetime, not a worker-name rule.
+    let fixture = SyntheticX86_64Object::create();
+    for recorded in [false, true] {
+        for first_tid in [12, 13] {
+            let other_tid = if first_tid == 12 { 13 } else { 12 };
+            let mut mmap = mmap_payload(11, 11, 0, 0x10000, 0, &fixture.path_string());
+            mmap.resize(mmap.len().next_multiple_of(8), 0);
+            let sample = |pid, tid| {
+                let mut payload = if recorded {
+                    sample_payload(0x4000, pid, tid, [0x4000])
+                } else {
+                    sample_payload(0x4000, pid, tid, [])
+                };
+                append_user_stack_payload(&mut payload, 1, [0, 0x7fff_0000, 0x4000], [0; 24], 24);
+                record_bytes_with_misc(9, PERF_RECORD_MISC_CPUMODE_USER, &payload)
+            };
+            let mut bytes = perfdata_with_records_and_attrs(
+                [file_attr_bytes_with_regs(
+                    PERF_SAMPLE_IP
+                        | PERF_SAMPLE_TID
+                        | PERF_SAMPLE_CALLCHAIN
+                        | PERF_SAMPLE_REGS_USER
+                        | PERF_SAMPLE_STACK_USER,
+                    (1 << 6) | (1 << 7) | (1 << 8),
+                )],
+                [
+                    record_bytes(1, &mmap),
+                    record_bytes(PERF_RECORD_FORK, &fork_payload(11, 11, first_tid, 11, 0)),
+                    sample(11, first_tid),
+                    // A newly forked thread shares the already attached maps.
+                    record_bytes(
+                        PERF_RECORD_FORK,
+                        &fork_payload(11, 11, other_tid, first_tid, 0),
+                    ),
+                    sample(11, other_tid),
+                    sample(11, first_tid),
+                    // A new process copies maps, not its parent's attachment.
+                    record_bytes(PERF_RECORD_FORK, &fork_payload(22, 11, 22, first_tid, 0)),
+                    sample(22, 22),
+                ],
+            );
+            put_u64(&mut bytes, 16, 144);
+            let (script, expected) = native_script_and_fold(&bytes);
+            let label = format!("[{}]", fixture.file_name());
+            let frames = if recorded {
+                format!("{label};{label}")
+            } else {
+                label.clone()
+            };
+            let mut expected_rows = vec![
+                format!(":{first_tid};{frames} 2\n"),
+                format!(":22;{frames} 1\n"),
+            ];
+            if recorded {
+                expected_rows.push(format!(":{other_tid};{label} 1\n"));
+            }
+            expected_rows.sort();
+            assert_eq!(expected, expected_rows.concat(), "{script}");
+            assert_eq!(
+                fold_perfdata_callchains(&bytes).unwrap(),
+                expected,
+                "{script}"
+            );
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), &bytes).unwrap();
+            assert_eq!(
+                fold_perfdata_file_with_options(file.path(), FoldOptions::default()).unwrap(),
+                expected
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn leader_exit_splits_surviving_and_new_thread_maps_like_native_perf() {
+    let fixture = SyntheticX86_64Object::create();
+    let replacement = SyntheticX86_64Object::create();
+    let new_path = replacement.path.with_file_name("new-x86-64");
+    std::fs::copy(&replacement.path, &new_path).unwrap();
+    for keep_exited in [false, true] {
+        let mmap = |tid, path: &str| {
+            let mut payload = mmap_payload(11, tid, 0, 0x10000, 0, path);
+            payload.resize(payload.len().next_multiple_of(8), 0);
+            record_bytes(1, &payload)
+        };
+        let sample = |tid| {
+            record_bytes_with_misc(
+                9,
+                PERF_RECORD_MISC_CPUMODE_USER,
+                &sample_payload_with_user_stack(
+                    0x4000,
+                    11,
+                    tid,
+                    [],
+                    1,
+                    [0, 0x7fff_0000, 0x4000],
+                    [0; 24],
+                ),
+            )
+        };
+        let mut bytes = perfdata_with_records_and_attrs(
+            [file_attr_bytes_with_regs(
+                PERF_SAMPLE_IP
+                    | PERF_SAMPLE_TID
+                    | PERF_SAMPLE_CALLCHAIN
+                    | PERF_SAMPLE_REGS_USER
+                    | PERF_SAMPLE_STACK_USER,
+                (1 << 6) | (1 << 7) | (1 << 8),
+            )],
+            [
+                mmap(11, &fixture.path_string()),
+                record_bytes(PERF_RECORD_FORK, &fork_payload(11, 11, 12, 11, 0)),
+                sample(12),
+                record_bytes(4, &fork_payload(11, 11, 11, 11, 0)),
+                record_bytes(PERF_RECORD_FORK, &fork_payload(11, 11, 13, 12, 0)),
+                mmap(13, new_path.to_str().unwrap()),
+                sample(13),
+                sample(12),
+            ],
+        );
+        put_u64(&mut bytes, 16, 144);
+        if keep_exited {
+            // HEADER_AUXTRACE: an empty native auxtrace index is sufficient for
+            // session.c to retain exited threads without synthetic AUX samples.
+            put_u64(&mut bytes, 72, 1 << 18);
+            let offset = u64::try_from(bytes.len()).unwrap() + 16;
+            bytes.extend(offset.to_le_bytes());
+            bytes.extend(8_u64.to_le_bytes());
+            bytes.extend(0_u64.to_le_bytes());
+        }
+        let (script, expected) = native_script_and_fold(&bytes);
+        let expected_rows = if keep_exited {
+            format!(":12;[{}] 1\n:12;[new-x86-64] 1\n", fixture.file_name())
+        } else {
+            format!(":12;[{}] 2\n:13;[new-x86-64] 1\n", fixture.file_name())
+        };
+        assert_eq!(expected, expected_rows, "{script}");
+        assert_eq!(
+            fold_perfdata_callchains(&bytes).unwrap(),
+            expected,
+            "{script}"
+        );
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), &bytes).unwrap();
+        assert_eq!(
+            fold_perfdata_file_with_options(file.path(), FoldOptions::default()).unwrap(),
+            expected
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn reused_tid_does_not_keep_exited_threads_comm_like_native_perf() {
+    let mut comm = comm_payload(11, 12, "stale");
+    comm.resize(comm.len().next_multiple_of(8), 0);
+    let mut bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(3, &comm),
+            record_bytes_with_misc(
+                9,
+                PERF_RECORD_MISC_CPUMODE_USER,
+                &sample_payload(0x4000, 11, 12, [0x4000]),
+            ),
+            record_bytes(4, &fork_payload(11, 11, 12, 11, 0)),
+            record_bytes(PERF_RECORD_FORK, &fork_payload(11, 11, 12, 11, 0)),
+            record_bytes_with_misc(
+                9,
+                PERF_RECORD_MISC_CPUMODE_USER,
+                &sample_payload(0x4000, 11, 12, [0x4000]),
+            ),
+        ],
+    );
+    put_u64(&mut bytes, 16, 144);
+    let (script, expected) = native_script_and_fold(&bytes);
+    assert_eq!(expected, ":12;[unknown] 1\nstale;[unknown] 1\n", "{script}");
+    assert_eq!(
+        fold_perfdata_callchains(&bytes).unwrap(),
+        expected,
+        "{script}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn initial_module_failure_does_not_reserve_unwind_attachment_like_native_perf() {
+    let fixture = SyntheticX86_64Object::create();
+    for missing_mapping in [false, true] {
+        let mmap = |path: &str| {
+            let mut payload = mmap_payload(11, 11, 0, 0x10000, 0, path);
+            payload.resize(payload.len().next_multiple_of(8), 0);
+            record_bytes(1, &payload)
+        };
+        let sample = |tid| {
+            record_bytes_with_misc(
+                9,
+                PERF_RECORD_MISC_CPUMODE_USER,
+                &sample_payload_with_user_stack(
+                    0x4000,
+                    11,
+                    tid,
+                    [],
+                    1,
+                    [0, 0x7fff_0000, 0x4000],
+                    [0; 24],
+                ),
+            )
+        };
+        let mut records = Vec::new();
+        if !missing_mapping {
+            records.push(mmap(
+                fixture.path.with_file_name("missing-elf").to_str().unwrap(),
+            ));
+        }
+        records.extend([
+            sample(12),
+            mmap(&fixture.path_string()),
+            sample(13),
+            sample(12),
+        ]);
+        let mut bytes = perfdata_with_records_and_attrs_vec(
+            vec![file_attr_bytes_with_regs(
+                PERF_SAMPLE_IP
+                    | PERF_SAMPLE_TID
+                    | PERF_SAMPLE_CALLCHAIN
+                    | PERF_SAMPLE_REGS_USER
+                    | PERF_SAMPLE_STACK_USER,
+                (1 << 6) | (1 << 7) | (1 << 8),
+            )],
+            records,
+        );
+        put_u64(&mut bytes, 16, 144);
+        let (script, expected) = native_script_and_fold(&bytes);
+        assert_eq!(
+            expected,
+            format!(":13;[{}] 1\n", fixture.file_name()),
+            "{script}"
+        );
+        assert_eq!(
+            fold_perfdata_callchains(&bytes).unwrap(),
+            expected,
+            "{script}"
+        );
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), &bytes).unwrap();
+        assert_eq!(
+            fold_perfdata_file_with_options(file.path(), FoldOptions::default()).unwrap(),
+            expected
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn keeps_unwind_frame_for_valid_elf_named_perf_data_like_perf_libdw_and_inferno() {
     let fixture = SyntheticX86_64Object::create();
     let object_path = fixture.path.with_file_name("perf.data");
@@ -8670,6 +8933,7 @@ struct SyntheticX86_64Object {
 }
 
 impl SyntheticX86_64Object {
+    #[cfg(target_os = "linux")]
     fn create_with_stack_cfi() -> Self {
         let fixture = Self::create();
         let mut bytes = std::fs::read(&fixture.path).unwrap();

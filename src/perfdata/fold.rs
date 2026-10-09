@@ -1,4 +1,5 @@
 mod metadata;
+mod threads;
 pub(crate) use metadata::{
     PerfSampleMetadata, recorded_kernel_maps_file, visit_perfdata_file_metadata,
 };
@@ -36,8 +37,8 @@ use crate::perfdata::records::{
     PERF_RECORD_FINISHED_ROUND, PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_CPUMODE_KERNEL,
     PERF_RECORD_MISC_CPUMODE_MASK, PERF_RECORD_MISC_CPUMODE_USER, PERF_RECORD_MISC_FORK_EXEC,
     PERF_RECORD_MISC_MMAP_BUILD_ID, ParsedRecord, PerfRecord, parse_callchain_deferred_record,
-    parse_comm_record, parse_fork_record, parse_mmap_record, parse_mmap2_build_id_record,
-    parse_mmap2_record, parse_record,
+    parse_comm_record, parse_exit_record, parse_fork_record, parse_mmap_record,
+    parse_mmap2_build_id_record, parse_mmap2_record, parse_record,
 };
 use crate::perfdata::samples::{
     PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_ID,
@@ -214,6 +215,8 @@ struct SessionState {
     mmap_table: MmapTable,
     mapping_cache: MappingResolveCache,
     unwind_states: HashMap<u32, PidUnwindState, FxBuildHasher>,
+    thread_maps: threads::ThreadMaps,
+    keep_exited_threads: bool,
     unwind_memory: DsoMemorySources,
     header_build_ids: BTreeMap<String, RecordedBuildId>,
     deferred_samples: Vec<DeferredFoldSample>,
@@ -233,6 +236,9 @@ struct RecordedBuildId {
 struct PidUnwindState {
     arch: PerfArch,
     object_unwinder: FramehopUnwinder,
+    /// perf unwind-libdw.c caches DWFL on shared maps. `dwfl_attach_state()`
+    /// attaches once; `next_thread()` enumerates only that first TID.
+    attached_tid: Option<u32>,
     live_vdso_elf: OnceLock<Option<LiveVdsoElf>>,
     attempted_unwind_mappings: BTreeSet<UnwindMappingKey>,
     /// Original DSO path/load base to the reported module's stable identity.
@@ -241,11 +247,10 @@ struct PidUnwindState {
     /// Memo of the ip-intrinsic leaf-only eligibility per sampled IP. Only the
     /// `(pid, ip)`-stable facts are cached here: whether the module covering
     /// `ip` is reported and whether any CFI covers `ip`. The per-sample register
-    /// condition (caller-SP advancement on `x86_64` / `lr == 0` on aarch64) and the sample's
-    /// callchain state are combined fresh at query time, since both vary across
-    /// samples at the same IP. Mmap mutations clear this mapping-dependent memo
+    /// condition (caller-SP advancement on `x86_64` / `lr == 0` on aarch64)
+    /// is combined fresh at query time. Mmap mutations clear this mapping-dependent memo
     /// while retaining reported modules, like perf's inline overlap insertion.
-    /// New module reports also clear it; fork resets the whole unwind state.
+    /// New module reports also clear it; process forks start a fresh unwind state.
     leaf_only_eligibility: HashMap<u64, LeafOnlyEligibility, FxBuildHasher>,
 }
 
@@ -254,6 +259,7 @@ impl PidUnwindState {
         Self {
             arch,
             object_unwinder: FramehopUnwinder::with_arch(arch),
+            attached_tid: None,
             live_vdso_elf: OnceLock::new(),
             attempted_unwind_mappings: BTreeSet::new(),
             loaded_unwind_modules: BTreeMap::new(),
@@ -311,6 +317,7 @@ enum FoldRecord<'a> {
         record: crate::perfdata::records::Mmap2BuildIdRecord,
     },
     Fork(crate::perfdata::records::ForkRecord),
+    Exit(crate::perfdata::records::ExitRecord),
     Sample {
         misc: u16,
         payload: &'a [u8],
@@ -344,6 +351,7 @@ struct DeferredFoldSample {
 
 struct PreparedFoldSample<'layout, 'frames> {
     pid: Option<u32>,
+    map_group: u32,
     sample_ip: Option<u64>,
     cpumode: u16,
     tid: Option<u32>,
@@ -355,6 +363,12 @@ struct PreparedFoldSample<'layout, 'frames> {
     frames: &'frames [FoldFrame],
     cookie_to_suppress: Option<u64>,
     has_callchain: bool,
+}
+
+impl PreparedFoldSample<'_, '_> {
+    fn map_group(&self) -> Option<u32> {
+        self.pid.map(|_| self.map_group)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -997,6 +1011,9 @@ fn parse_fold_record(record: PerfRecord<'_>) -> Result<FoldRecord<'_>, String> {
             fork.clone_maps = record.header.misc & PERF_RECORD_MISC_FORK_EXEC == 0;
             fork
         }),
+        crate::perfdata::records::PERF_RECORD_EXIT => {
+            FoldRecord::Exit(parse_exit_record(record.payload)?)
+        }
         crate::perfdata::records::PERF_RECORD_SAMPLE => FoldRecord::Sample {
             misc: record.header.misc,
             payload: record.payload,
@@ -1024,7 +1041,9 @@ where
     validate_perfdata_sections(header, bytes.len())?;
     let layouts = sample_layouts(bytes, header)?;
     let arch = perf_arch_from_header(parse_header_arch(bytes, &header)?.as_deref());
-    let state = SessionState::new(header_build_ids_by_filename(bytes)?).with_arch(arch);
+    let state = SessionState::new(header_build_ids_by_filename(bytes)?)
+        .with_arch(arch)
+        .with_header(bytes)?;
     collect_fold_counts_from_source(
         &mut SliceSource(bytes),
         header,
@@ -1057,7 +1076,9 @@ fn collect_fold_counts_from_source<R: SymbolResolver>(
         let cache = sink.output.symbol_cache.take();
         let state = {
             let previous = sink.accumulator;
-            SessionState::new(previous.header_build_ids).with_arch(previous.arch)
+            let mut state = SessionState::new(previous.header_build_ids).with_arch(previous.arch);
+            state.keep_exited_threads = previous.keep_exited_threads;
+            state
         };
         drop(sink.output);
         return collect_stream_fold_counts(source, header, layouts, state, options, cache);
@@ -1288,7 +1309,11 @@ fn file_replay_state(file: &File) -> Result<(PerfHeader, SampleLayouts, SessionS
     let layouts = sample_layouts_from_file(file, header, &bytes)?;
     let ids = header_build_ids_by_filename_from_file(file)?;
     let arch = perf_arch_from_header(header_arch_from_file(file, header, &bytes)?.as_deref());
-    Ok((header, layouts, SessionState::new(ids).with_arch(arch)))
+    Ok((
+        header,
+        layouts,
+        SessionState::new(ids).with_arch(arch).with_header(&bytes)?,
+    ))
 }
 
 fn write_folded_perfdata_from_file<R, W>(
@@ -1550,7 +1575,7 @@ impl<R: SymbolResolver> SampleOutput for FoldedOutput<'_, '_, R> {
         self.buffers.projecting = true;
         let status = FoldFrameResolver::new(&accumulator.mmap_table, self.inline)
             .render_folded_stack_for_stack(
-                sample.pid,
+                sample.map_group(),
                 comm,
                 frames,
                 self.symbol_cache.as_deref_mut(),
@@ -1735,7 +1760,8 @@ fn preprocess_sample_ip<R: SymbolResolver>(
     if sample.cpumode != PERF_RECORD_MISC_CPUMODE_KERNEL {
         return;
     }
-    let (Some(cache), Some(address), Some(pid)) = (cache, sample.sample_ip, sample.pid) else {
+    let (Some(cache), Some(address), Some(pid)) = (cache, sample.sample_ip, sample.map_group())
+    else {
         return;
     };
     // perf builtin-script.c:2645 (process_sample_event, call at 2686) and
@@ -1779,7 +1805,7 @@ where
         if sample.has_callchain {
             self.write_sample_header(accumulator, sample)?;
             frame_resolver.write_script_frames_for_stack(
-                sample.pid,
+                sample.map_group(),
                 sample.frames,
                 self.symbol_cache.as_deref_mut(),
                 self.writer,
@@ -1787,7 +1813,7 @@ where
         } else {
             self.write_sample_inline_header(accumulator, sample)?;
             frame_resolver.write_inline_sample_frame_for_stack(
-                sample.pid,
+                sample.map_group(),
                 sample.frames,
                 self.symbol_cache.as_deref_mut(),
                 self.writer,
@@ -2239,6 +2265,8 @@ impl SessionState {
             mmap_table: MmapTable::default(),
             mapping_cache: MappingResolveCache::default(),
             unwind_states: HashMap::with_hasher(FxBuildHasher),
+            thread_maps: threads::ThreadMaps::default(),
+            keep_exited_threads: false,
             unwind_memory: DsoMemorySources::default(),
             header_build_ids,
             deferred_samples: Vec::new(),
@@ -2252,6 +2280,33 @@ impl SessionState {
         self
     }
 
+    fn with_header(mut self, bytes: &[u8]) -> Result<Self, String> {
+        // util/session.c:perf_session__open retains exited threads with
+        // HEADER_AUXTRACE (util/header.h feature 18).
+        self.keep_exited_threads = read_u64(bytes, 72)? & (1 << 18) != 0;
+        Ok(self)
+    }
+
+    fn maps_for_thread(&mut self, pid: u32, tid: u32) -> u32 {
+        let group = self.thread_maps.find_or_create(pid, tid);
+        self.release_retired_map_groups();
+        group
+    }
+
+    fn remove_thread(&mut self, tid: u32) {
+        self.thread_maps.remove(tid);
+        self.thread_comms.remove(&tid);
+        self.release_retired_map_groups();
+    }
+
+    fn release_retired_map_groups(&mut self) {
+        for group in self.thread_maps.take_retired() {
+            self.mmap_table.remove_pid_mappings(group);
+            self.unwind_states.remove(&group);
+            self.mapping_cache = MappingResolveCache::default();
+        }
+    }
+
     #[cfg(test)]
     fn apply_record(&mut self, record: ParsedRecord) {
         let record = match record {
@@ -2262,23 +2317,46 @@ impl SessionState {
                 FoldRecord::Mmap2BuildId { misc, record }
             }
             ParsedRecord::Fork(record) => FoldRecord::Fork(record),
+            ParsedRecord::Exit(record) => FoldRecord::Exit(record),
             _ => panic!("test adapter accepts only session metadata"),
         };
         self.apply_metadata(record);
     }
 
     fn apply_fork_record(&mut self, record: crate::perfdata::records::ForkRecord) {
+        // machine.c:machine__process_fork_event replaces an erroneous parent
+        // or an existing child TID before thread.c:thread__clone_maps.
+        if self
+            .thread_maps
+            .pid(record.ptid)
+            .is_some_and(|pid| pid != record.ppid)
+        {
+            self.remove_thread(record.ptid);
+        }
+        let parent = self.maps_for_thread(record.ppid, record.ptid);
+        self.thread_maps.retain(parent);
+        let parent_comm = if record.ptid == record.tid {
+            self.thread_comms.get(&record.ptid).cloned()
+        } else {
+            None
+        };
+        self.remove_thread(record.tid);
+        if let Some(comm) = parent_comm {
+            self.thread_comms.insert(record.tid, comm);
+        }
+        let child = self.maps_for_thread(record.pid, record.tid);
         inherit_fork_comm_tables(
             &mut self.process_comms,
             &mut self.exec_process_comms,
             &mut self.thread_comms,
             record,
         );
-        self.unwind_states.remove(&record.pid);
-        if record.clone_maps {
-            self.mmap_table.clone_pid_mappings(record.ppid, record.pid);
+        if record.pid != record.ppid && record.clone_maps {
+            self.mmap_table.clone_pid_mappings(parent, child);
             self.mapping_cache = MappingResolveCache::default();
         }
+        self.thread_maps.release(parent);
+        self.release_retired_map_groups();
     }
 
     #[cfg(test)]
@@ -2444,6 +2522,7 @@ impl SessionState {
                 }
             }
             FoldRecord::Comm(record) => {
+                self.maps_for_thread(record.pid, record.tid);
                 update_comm_tables(
                     &mut self.process_comms,
                     &mut self.exec_process_comms,
@@ -2451,7 +2530,10 @@ impl SessionState {
                     &record,
                 );
             }
-            FoldRecord::Mmap { misc, record } => {
+            FoldRecord::Mmap { misc, mut record } => {
+                if record.pid != u32::MAX {
+                    record.pid = self.maps_for_thread(record.pid, record.tid);
+                }
                 self.clear_mapping_dependent_unwind_memo(record.pid);
                 // map.c:map__new reuses the DSO populated from HEADER_BUILD_ID
                 // even for MMAP records, which carry no build ID themselves.
@@ -2463,7 +2545,10 @@ impl SessionState {
                     .insert_mmap_with_build_id_and_misc(record, build_id, misc);
                 self.mapping_cache = MappingResolveCache::default();
             }
-            FoldRecord::Mmap2 { misc, record } => {
+            FoldRecord::Mmap2 { misc, mut record } => {
+                if record.pid != u32::MAX {
+                    record.pid = self.maps_for_thread(record.pid, record.tid);
+                }
                 self.clear_mapping_dependent_unwind_memo(record.pid);
                 let build_id = self
                     .header_build_ids
@@ -2480,7 +2565,10 @@ impl SessionState {
                 }
                 self.mapping_cache = MappingResolveCache::default();
             }
-            FoldRecord::Mmap2BuildId { misc, record } => {
+            FoldRecord::Mmap2BuildId { misc, mut record } => {
+                if record.pid != u32::MAX {
+                    record.pid = self.maps_for_thread(record.pid, record.tid);
+                }
                 self.clear_mapping_dependent_unwind_memo(record.pid);
                 self.mmap_table
                     .insert_mmap2_build_id_with_misc(record, misc);
@@ -2488,6 +2576,11 @@ impl SessionState {
             }
             FoldRecord::Fork(record) => {
                 self.apply_fork_record(record);
+            }
+            FoldRecord::Exit(record) => {
+                if !self.keep_exited_threads {
+                    self.remove_thread(record.tid);
+                }
             }
             FoldRecord::Ignored => {}
             FoldRecord::Sample { .. } | FoldRecord::CallchainDeferred(_) => {
@@ -4275,6 +4368,9 @@ fn prepare_parsed_sample_for_fold<'layout, 'frames>(
     options: FoldOptions,
     frames: &'frames mut FoldFrameStack,
 ) -> PreparedFoldSample<'layout, 'frames> {
+    let map_group = sample
+        .pid
+        .map(|pid| accumulator.maps_for_thread(pid, sample.tid.unwrap_or(pid)));
     let count = sample_fold_count(sample.period, event.default_period, options);
     frames.clear();
     frames.reserve(sample.frames.len());
@@ -4288,9 +4384,10 @@ fn prepare_parsed_sample_for_fold<'layout, 'frames>(
     } else {
         extend_sample_ip_frame_like_perf_machine_resolve(frames, misc, sample.frames.clone());
     }
-    append_perf_user_unwind_frames(accumulator, misc, event, sample, frames);
+    append_perf_user_unwind_frames(accumulator, misc, event, sample, map_group, frames);
     PreparedFoldSample {
         pid: sample.pid,
+        map_group: map_group.unwrap_or_default(),
         sample_ip: sample.sample_ip,
         cpumode: misc & PERF_RECORD_MISC_CPUMODE_MASK,
         tid: sample.tid,
@@ -4369,6 +4466,7 @@ fn append_perf_user_unwind_frames(
     misc: u16,
     event: &SampleEventLayout,
     sample: &crate::perfdata::samples::SampleCallchain<'_>,
+    map_group: Option<u32>,
     frames: &mut FoldFrameStack,
 ) {
     let (Some(regs), Some(stack)) = (&sample.user_regs, &sample.user_stack) else {
@@ -4384,12 +4482,20 @@ fn append_perf_user_unwind_frames(
     ) else {
         return;
     };
-    let context =
-        build_user_unwind_context(accumulator, misc, event, sample, &regs, !frames.is_empty());
-    let mut unwound_frames = unwind_user_stack_like_perf(accumulator, sample, &regs, context);
+    let context = build_user_unwind_context(
+        accumulator,
+        misc,
+        event,
+        sample,
+        map_group,
+        &regs,
+        !frames.is_empty(),
+    );
+    let mut unwound_frames =
+        unwind_user_stack_like_perf(accumulator, sample, map_group, &regs, context);
     let mut mapping_cache = MappingResolveCache::default();
     truncate_user_unwind_at_first_unmapped_frame(
-        sample.pid,
+        map_group,
         &mut unwound_frames,
         &accumulator.mmap_table,
         &mut mapping_cache,
@@ -4402,6 +4508,7 @@ fn build_user_unwind_context(
     misc: u16,
     event: &SampleEventLayout,
     sample: &crate::perfdata::samples::SampleCallchain<'_>,
+    map_group: Option<u32>,
     regs: &PerfUserRegs,
     has_sample_frames: bool,
 ) -> UserUnwindContext {
@@ -4413,8 +4520,8 @@ fn build_user_unwind_context(
     UserUnwindContext {
         sample_callchain,
         callchain: sample_callchain_state(misc, event, sample, has_sample_frames),
-        initial_ip_mapping: initial_ip_mapping_state(accumulator, sample.pid, regs.ip()),
-        module_count: loaded_unwind_module_count(accumulator, sample.pid),
+        initial_ip_mapping: initial_ip_mapping_state(accumulator, map_group, regs.ip()),
+        module_count: loaded_unwind_module_count(accumulator, map_group),
         // x86_64-specific `ebl_unwind` precondition (false on aarch64, whose
         // backend has its own internal accept condition).
         frame_pointer_at_or_above_stack_pointer: regs.frame_pointer_at_or_above_stack_pointer(),
@@ -4474,6 +4581,7 @@ fn sample_callchain_state(
 fn unwind_user_stack_like_perf(
     accumulator: &mut SessionState,
     sample: &crate::perfdata::samples::SampleCallchain<'_>,
+    map_group: Option<u32>,
     regs: &PerfUserRegs,
     context: UserUnwindContext,
 ) -> Vec<FoldFrame> {
@@ -4485,20 +4593,26 @@ fn unwind_user_stack_like_perf(
     };
     match choose_user_unwind_source(context) {
         UserUnwindSource::None => Vec::new(),
-        UserUnwindSource::Object => {
-            unwind_object_stack_like_perf(accumulator, sample.pid, regs, stack_bytes, context)
-        }
+        UserUnwindSource::Object => unwind_object_stack_like_perf(
+            accumulator,
+            sample,
+            map_group,
+            regs,
+            stack_bytes,
+            context,
+        ),
     }
 }
 
 fn unwind_object_stack_like_perf(
     accumulator: &mut SessionState,
-    pid: Option<u32>,
+    sample: &crate::perfdata::samples::SampleCallchain<'_>,
+    map_group: Option<u32>,
     regs: &PerfUserRegs,
     stack_bytes: &[u8],
     context: UserUnwindContext,
 ) -> Vec<FoldFrame> {
-    let Some(pid_value) = pid else {
+    let (Some(pid_value), Some(tid)) = (map_group, sample.tid) else {
         return Vec::new();
     };
     let mut state = accumulator
@@ -4508,7 +4622,7 @@ fn unwind_object_stack_like_perf(
     let unwind_debug_dir = accumulator.unwind_debug_dir.clone();
     let frames = unwind_object_frame_addresses_like_perf(
         &mut state,
-        pid_value,
+        (pid_value, tid),
         &mut MappedMemory::new(
             pid_value,
             &accumulator.mmap_table,
@@ -4535,7 +4649,7 @@ fn unwind_object_stack_like_perf(
 
 fn unwind_object_frame_addresses_like_perf(
     state: &mut PidUnwindState,
-    pid: u32,
+    (pid, tid): (u32, u32),
     memory: &mut MappedMemory<'_>,
     regs: &PerfUserRegs,
     stack_bytes: &[u8],
@@ -4553,6 +4667,18 @@ fn unwind_object_frame_addresses_like_perf(
             context.initial_ip_mapping = InitialIpMappingState::RecordedMappingLoaded;
         }
         ReportModuleResult::NoDso => {}
+    }
+
+    // unwind-libdw.c:403-408 attempts attachment after reporting the initial
+    // module, then requests this TID. elfutils dwfl_frame.c:136-144 rejects
+    // reattachment; getthread() enumerates only dwfl_pid() via next_thread()
+    // and returns ESRCH for another TID. With no module, attachment cannot
+    // identify the architecture (dwfl_frame.c:166-195) and may be retried.
+    match state.attached_tid {
+        Some(attached) if attached != tid => return Vec::new(),
+        Some(_) => {}
+        None if state.object_unwinder.module_count() == 0 => return Vec::new(),
+        None => state.attached_tid = Some(tid),
     }
 
     // Evaluate perf/libdw's skip and leaf-only cases before framehop. The result
@@ -9738,6 +9864,7 @@ mod tests {
     ) -> super::PreparedFoldSample<'layout, 'frames> {
         super::PreparedFoldSample {
             pid: Some(7),
+            map_group: 7,
             sample_ip: None,
             cpumode: super::PERF_RECORD_MISC_CPUMODE_USER,
             tid: Some(7),
@@ -10539,16 +10666,16 @@ mod tests {
         let current_exe = std::env::current_exe().expect("current exe");
         let current_exe = current_exe.to_string_lossy().into_owned();
         let mut accumulator = super::SessionState::new(std::collections::BTreeMap::new());
-        accumulator
-            .mmap_table
-            .insert_mmap(crate::perfdata::records::MmapRecord {
+        accumulator.apply_record(crate::perfdata::records::ParsedRecord::Mmap(
+            crate::perfdata::records::MmapRecord {
                 pid: 11,
                 tid: 11,
                 start: 0x1000,
                 len: 0x1000_0000,
                 pgoff: 0,
                 path: current_exe.clone(),
-            });
+            },
+        ));
         accumulator.ensure_unwind_mapping_for_ip(Some(11), 0x2000);
         assert!(accumulator.unwind_states.contains_key(&11));
 
