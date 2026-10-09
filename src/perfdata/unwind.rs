@@ -21,7 +21,8 @@ mod dwarf;
 // The gap-2 skip gate queries `has_unwind_info_for_ip` once per sampled IP,
 // and the same hot leaves (libc `malloc`/`memmove`/`memcmp`) recur across
 // millions of samples. Memoizing collapses the otherwise-linear FDE-range scan
-// (`.ace-review-findings.md` PERF-6) into an O(1) lookup. The memo is keyed by
+// (PYROC-DOC-5, PERF-6: https://lific.mjc.lol/PYROC/pages/153) into an O(1)
+// lookup. The memo is keyed by
 // the EXACT ip, not `ip >> 12`: FDE pc-ranges are function-granular and two
 // functions (one covered, one not) can share a 4 KiB page, so a page-granular
 // memo could return a stale answer for a second IP in the page and perturb the
