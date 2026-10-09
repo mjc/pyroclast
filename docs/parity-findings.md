@@ -30,6 +30,40 @@ This is not general split-debug parity: native can select distinct symbol and
 runtime sources and substitutes runtime headers for NOBITS sections. That
 source-selection behavior still needs its own native fixtures.
 
+## 2026-10-09 module event-IP loading and original cursor addresses
+
+A fresh native regression put the event IP in a module while its callchain
+contained only a core frame. Perf loads that module first, including its data
+section map, and then rejects kcore. Pyroclast skipped the load and incorrectly
+used kcore for a later module frame. This was observed red before applying
+the module's map effects during event-IP preprocessing. The relevant order is
+`builtin-script.c:2686` -> `event.c:864` -> `map.c:385`, before callchain lookup.
+Validation does not activate replacement maps or advance the original cursor.
+
+A separate native red fixture removed the build-ID cache and used a live
+module. Its original cursor must translate the recorded module offset through
+the loaded `.text` section, rather than a generic PT_LOAD file offset. Cached
+and live modules now use one selector and retained, shared metadata containing
+the eligible text remap and additional section maps. An unused `.text` header
+does not remap the original map, and the first eligible remap is preserved per
+symtab/dynsym pass (`symbol-elf.c:1397`, `1781`). Both rules have red-tested
+controls. The retained primary owner's ID rejects wrong-ID and missing-ID live
+objects before publishing symbols or section maps (`symbol-elf.c:1193`).
+
+Direct scalar and metadata batches now complete state-changing kernel requests
+in order, preserving adjacent user batches and initialized kernel batching.
+Their combined-versus-sequential regression was red against a fresh native
+module/core recording. Per-replay event-IP preprocessing loads each module
+source once, including failures, rather than constructing owned requests for
+every sample; the counting regression was red at 100 loads instead of one.
+Native text/folded comparisons cover both providers, inline settings, byte/file
+replay, live/cache sources, ID failures, and data-map rejection/acceptance.
+
+Remaining review findings include ID-less event-IP discovery through frozen
+DSO identity and native short-name module binding across pathname changes.
+These are not covered by the above fixed-ID, stable-path proofs. General
+split-debug symbol/runtime selection remains outside this parity conclusion.
+
 ## 2026-10-09 retained GNU helper and auxiliary lifetime
 
 External symbol-only batches previously launched a new helper each time. The

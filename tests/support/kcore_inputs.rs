@@ -149,19 +149,26 @@ mod module_inputs {
 
     impl ReplacingModuleResolver {
         fn replace_selected_module(&self, requests: &[SymbolRequest]) {
+            assert_eq!(requests.len(), 1, "replace the first selected module only");
+            self.replace_selected_module_path(&requests[0].path);
+        }
+
+        fn replace_selected_module_path(&self, path: &Path) {
             if let Some(replacement) = self.replacement.borrow_mut().take() {
-                assert_eq!(requests.len(), 1, "replace the first selected module only");
-                std::fs::rename(replacement, &requests[0].path).unwrap();
+                std::fs::rename(replacement, path).unwrap();
             }
         }
     }
 
     impl SymbolResolver for ReplacingModuleResolver {
-        fn selected_object_module_maps(
+        fn selected_object_module_metadata(
             &self,
             path: &Path,
-        ) -> Vec<pyroclast::symbols::KernelModuleSectionMap> {
-            self.inner.selected_object_module_maps(path)
+        ) -> Option<std::sync::Arc<pyroclast::symbols::KernelModuleObjectMetadata>> {
+            if self.before_loading {
+                self.replace_selected_module_path(path);
+            }
+            self.inner.selected_object_module_metadata(path)
         }
 
         fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
@@ -227,7 +234,7 @@ mod module_inputs {
             assert_eq!(
                 actual,
                 std::fs::read_to_string(root.join("expected.folded")).unwrap(),
-                "replacement must not change the selected module's ELF type"
+                "replacement must not change the selected module's section maps"
             );
             return;
         }
@@ -365,7 +372,7 @@ mod module_inputs {
                 }
                 .into()
             )],
-            "later scalar cursors must retain the selected module's type"
+            "later scalar cursors must retain the selected module's section maps"
         );
     }
 
@@ -390,9 +397,9 @@ mod module_inputs {
     }
 
     #[test]
-    fn selected_shared_module_type_survives_exec_replacement_in_byte_fold() {
+    fn selected_dynamic_section_maps_survive_exec_replacement_in_byte_fold() {
         check_module_replacement(
-            "module_inputs::selected_shared_module_type_survives_exec_replacement_in_byte_fold",
+            "module_inputs::selected_dynamic_section_maps_survive_exec_replacement_in_byte_fold",
             Route::Bytes,
             true,
             Replacement::OppositeElfType,
@@ -400,9 +407,9 @@ mod module_inputs {
     }
 
     #[test]
-    fn selected_shared_module_type_survives_exec_replacement_in_file_fold() {
+    fn selected_dynamic_section_maps_survive_exec_replacement_in_file_fold() {
         check_module_replacement(
-            "module_inputs::selected_shared_module_type_survives_exec_replacement_in_file_fold",
+            "module_inputs::selected_dynamic_section_maps_survive_exec_replacement_in_file_fold",
             Route::File,
             true,
             Replacement::OppositeElfType,
@@ -410,9 +417,9 @@ mod module_inputs {
     }
 
     #[test]
-    fn selected_exec_module_type_survives_shared_replacement_in_byte_fold() {
+    fn selected_text_only_maps_survive_shared_replacement_in_byte_fold() {
         check_module_replacement(
-            "module_inputs::selected_exec_module_type_survives_shared_replacement_in_byte_fold",
+            "module_inputs::selected_text_only_maps_survive_shared_replacement_in_byte_fold",
             Route::Bytes,
             false,
             Replacement::OppositeElfType,
@@ -420,9 +427,9 @@ mod module_inputs {
     }
 
     #[test]
-    fn selected_exec_module_type_survives_shared_replacement_in_file_fold() {
+    fn selected_text_only_maps_survive_shared_replacement_in_file_fold() {
         check_module_replacement(
-            "module_inputs::selected_exec_module_type_survives_shared_replacement_in_file_fold",
+            "module_inputs::selected_text_only_maps_survive_shared_replacement_in_file_fold",
             Route::File,
             false,
             Replacement::OppositeElfType,
@@ -430,9 +437,9 @@ mod module_inputs {
     }
 
     #[test]
-    fn selected_shared_module_type_survives_exec_replacement_in_scalar_resolution() {
+    fn selected_dynamic_section_maps_survive_exec_replacement_in_scalar_resolution() {
         check_module_replacement(
-            "module_inputs::selected_shared_module_type_survives_exec_replacement_in_scalar_resolution",
+            "module_inputs::selected_dynamic_section_maps_survive_exec_replacement_in_scalar_resolution",
             Route::Scalar,
             true,
             Replacement::OppositeElfType,
@@ -450,9 +457,9 @@ mod module_inputs {
     }
 
     #[test]
-    fn module_classification_does_not_override_symbol_load_type_in_byte_fold() {
+    fn module_path_classification_does_not_freeze_selected_section_maps_in_byte_fold() {
         check_module_replacement(
-            "module_inputs::module_classification_does_not_override_symbol_load_type_in_byte_fold",
+            "module_inputs::module_path_classification_does_not_freeze_selected_section_maps_in_byte_fold",
             Route::Bytes,
             false,
             Replacement::BeforeLoadingOppositeElfType,
@@ -460,9 +467,9 @@ mod module_inputs {
     }
 
     #[test]
-    fn module_classification_does_not_override_symbol_load_type_in_file_fold() {
+    fn module_path_classification_does_not_freeze_selected_section_maps_in_file_fold() {
         check_module_replacement(
-            "module_inputs::module_classification_does_not_override_symbol_load_type_in_file_fold",
+            "module_inputs::module_path_classification_does_not_freeze_selected_section_maps_in_file_fold",
             Route::File,
             false,
             Replacement::BeforeLoadingOppositeElfType,

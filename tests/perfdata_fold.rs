@@ -4724,8 +4724,55 @@ fn write_native_cached_module_fixture_with_data(
 ) -> (tempfile::TempDir, Vec<u8>) {
     const MODULE: u64 = 0xffff_ffff_c100_0010;
     const CORE: u64 = 0xffff_ffff_8100_0010;
+    let queries: &[(u64, &[u64])] = if single_callchain {
+        &[(MODULE, &[MODULE, MODULE + 0x10, CORE, MODULE])]
+    } else {
+        &[
+            (MODULE, &[MODULE]),
+            (MODULE, &[MODULE]),
+            (CORE, &[CORE]),
+            (MODULE, &[MODULE]),
+        ]
+    };
+    write_native_cached_module_queries(shared, data_symbol, queries)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn write_native_cached_module_queries(
+    shared: bool,
+    data_symbol: bool,
+    queries: &[(u64, &[u64])],
+) -> (tempfile::TempDir, Vec<u8>) {
+    write_native_module_object_queries(shared, data_symbol, queries, false)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn write_native_module_object_queries(
+    shared: bool,
+    data_symbol: bool,
+    queries: &[(u64, &[u64])],
+    live: bool,
+) -> (tempfile::TempDir, Vec<u8>) {
+    use std::fmt::Write as _;
+
     let (root, _) = write_native_kcore_fixture("[a]");
     let id = write_cached_kernel_module_elf(root.path(), shared, data_symbol);
+    let module_path = if live {
+        let path = root.path().join("a.ko");
+        std::fs::copy(root.path().join("module.elf"), &path).unwrap();
+        let hex = id.iter().fold(String::new(), |mut hex, byte| {
+            write!(hex, "{byte:02x}").unwrap();
+            hex
+        });
+        std::fs::remove_file(pyroclast::symbols::perf_build_id_elf_path(
+            &root.path().join(".debug"),
+            &hex,
+        ))
+        .unwrap();
+        path.to_str().unwrap().to_owned()
+    } else {
+        "[a]".to_owned()
+    };
     let mut comm = comm_payload(11, 12, "worker");
     comm.resize(comm.len().next_multiple_of(8), 0);
     let mut records = vec![record_bytes(3, &comm)];
@@ -4746,8 +4793,14 @@ fn write_native_cached_module_fixture_with_data(
             &payload,
         ));
     }
-    let mut payload =
-        mmap2_build_id_payload(u32::MAX, u32::MAX, 0xffff_ffff_c100_0000, 0x4000, 0, "[a]");
+    let mut payload = mmap2_build_id_payload(
+        u32::MAX,
+        u32::MAX,
+        0xffff_ffff_c100_0000,
+        0x4000,
+        0,
+        &module_path,
+    );
     payload[32] = 20;
     payload[36..56].copy_from_slice(&id);
     payload.resize(payload.len().next_multiple_of(8), 0);
@@ -4756,22 +4809,17 @@ fn write_native_cached_module_fixture_with_data(
         PERF_RECORD_MISC_CPUMODE_KERNEL | PERF_RECORD_MISC_MMAP_BUILD_ID,
         &payload,
     ));
-    for (index, ip) in [MODULE, MODULE, CORE, MODULE].into_iter().enumerate() {
+    for (index, &(ip, chain)) in queries.iter().enumerate() {
         let time = 1_000_000_000 + u64::try_from(index).unwrap();
-        let payload = if single_callchain {
-            if index != 0 {
-                break;
-            }
-            sample_payload_with_time(
-                MODULE,
-                11,
-                12,
-                time,
-                [0xffff_ffff_ffff_ff80, MODULE, MODULE + 0x10, CORE, MODULE],
-            )
-        } else {
-            sample_payload_with_time(ip, 11, 12, time, [0xffff_ffff_ffff_ff80, ip])
-        };
+        let payload = sample_payload_with_time(
+            ip,
+            11,
+            12,
+            time,
+            std::iter::once(0xffff_ffff_ffff_ff80)
+                .chain(chain.iter().copied())
+                .collect::<Vec<_>>(),
+        );
         records.push(record_bytes_with_misc(
             PERF_RECORD_SAMPLE,
             PERF_RECORD_MISC_CPUMODE_KERNEL,
@@ -4798,11 +4846,11 @@ fn native_kcore_preserves_cached_module_objects_until_core_replacement() {
         calls: std::cell::Cell<usize>,
     }
     impl SymbolResolver for CountedObjectResolver {
-        fn selected_object_module_maps(
+        fn selected_object_module_metadata(
             &self,
             path: &std::path::Path,
-        ) -> Vec<pyroclast::symbols::KernelModuleSectionMap> {
-            self.inner.selected_object_module_maps(path)
+        ) -> Option<std::sync::Arc<pyroclast::symbols::KernelModuleObjectMetadata>> {
+            self.inner.selected_object_module_metadata(path)
         }
 
         fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
@@ -8030,13 +8078,14 @@ fn sample_payload<const N: usize>(ip: u64, pid: u32, tid: u32, callchain: [u64; 
     payload
 }
 
-fn sample_payload_with_time<const N: usize>(
+fn sample_payload_with_time(
     ip: u64,
     pid: u32,
     tid: u32,
     time: u64,
-    callchain: [u64; N],
+    callchain: impl AsRef<[u64]>,
 ) -> Vec<u8> {
+    let callchain = callchain.as_ref();
     let mut payload = Vec::new();
     payload.extend(ip.to_le_bytes());
     payload.extend(pid.to_le_bytes());
@@ -8964,4 +9013,314 @@ fn native_kcore_rejects_executable_module_with_a_separate_data_map() {
         .collapse(script.as_bytes(), &mut expected)
         .unwrap();
     assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &expected);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_kcore_validates_module_maps_loaded_by_an_unrendered_event_ip() {
+    use inferno::collapse::Collapse as _;
+    const MODULE: u64 = 0xffff_ffff_c100_0010;
+    const CORE: u64 = 0xffff_ffff_8100_0010;
+
+    for data_symbol in [true, false] {
+        let (root, bytes) = write_native_cached_module_queries(
+            false,
+            data_symbol,
+            &[(MODULE, &[CORE]), (MODULE, &[MODULE])],
+        );
+        let native = Command::new("perf")
+            .arg("--buildid-dir")
+            .arg(root.path().join(".debug"))
+            .args(["script", "--force", "-vvvv", "--kallsyms"])
+            .arg(root.path().join("kallsyms"))
+            .arg("-i")
+            .arg(root.path().join("perf.data"))
+            .output()
+            .unwrap();
+        assert!(
+            native.status.success(),
+            "{}",
+            String::from_utf8_lossy(&native.stderr)
+        );
+        let script = String::from_utf8(native.stdout).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&native.stderr).contains("/kcore for kernel data"),
+            !data_symbol,
+            "script={script}\nstderr={}",
+            String::from_utf8_lossy(&native.stderr)
+        );
+        assert_eq!(
+            script.matches("cached_module_object+0x10 ([a])").count(),
+            usize::from(data_symbol),
+            "{script}"
+        );
+        assert_eq!(
+            script.matches("first+0x10 ([kernel.kallsyms])").count(),
+            usize::from(!data_symbol),
+            "{script}"
+        );
+        let mut expected = Vec::new();
+        inferno::collapse::perf::Folder::default()
+            .collapse(script.as_bytes(), &mut expected)
+            .unwrap();
+        assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &expected);
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_kcore_preserves_live_module_objects_until_core_replacement() {
+    use inferno::collapse::Collapse as _;
+    const MODULE: u64 = 0xffff_ffff_c100_0010;
+    const CORE: u64 = 0xffff_ffff_8100_0010;
+
+    for data_symbol in [false, true] {
+        let (root, bytes) = write_native_module_object_queries(
+            false,
+            data_symbol,
+            &[
+                (MODULE, &[MODULE]),
+                (MODULE, &[MODULE]),
+                (CORE, &[CORE]),
+                (MODULE, &[MODULE]),
+            ],
+            true,
+        );
+        let native = Command::new("perf")
+            .arg("--buildid-dir")
+            .arg(root.path().join(".debug"))
+            .args(["script", "--force", "-vvvv", "--kallsyms"])
+            .arg(root.path().join("kallsyms"))
+            .arg("-i")
+            .arg(root.path().join("perf.data"))
+            .output()
+            .unwrap();
+        assert!(
+            native.status.success(),
+            "{}",
+            String::from_utf8_lossy(&native.stderr)
+        );
+        let script = String::from_utf8(native.stdout).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&native.stderr).contains("/kcore for kernel data"),
+            !data_symbol,
+            "script={script}\nstderr={}",
+            String::from_utf8_lossy(&native.stderr)
+        );
+        assert_eq!(
+            script.matches("cached_module_object+0x10 ([a])").count(),
+            if data_symbol { 3 } else { 1 },
+            "{script}"
+        );
+        let mut expected = Vec::new();
+        inferno::collapse::perf::Folder::default()
+            .collapse(script.as_bytes(), &mut expected)
+            .unwrap();
+        assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &expected);
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_kcore_ignores_live_module_section_maps_when_build_id_is_wrong_or_missing() {
+    use inferno::collapse::Collapse as _;
+    const MODULE: u64 = 0xffff_ffff_c100_0010;
+    const CORE: u64 = 0xffff_ffff_8100_0010;
+
+    for missing in [false, true] {
+        let (root, bytes) = write_native_module_object_queries(
+            false,
+            true,
+            &[(MODULE, &[MODULE]), (CORE, &[CORE]), (MODULE, &[MODULE])],
+            true,
+        );
+        let path = root.path().join("a.ko");
+        let original = std::fs::read(&path).unwrap();
+        let elf = object::File::parse(original.as_slice()).unwrap();
+        let recorded_id = elf.build_id().unwrap().unwrap();
+        let mut builder = object::build::elf::Builder::read(original.as_slice()).unwrap();
+        let note = builder
+            .sections
+            .iter_mut()
+            .find(|section| section.name.as_slice() == b".note.gnu.build-id")
+            .unwrap();
+        if missing {
+            note.delete = true;
+            builder.delete_orphan_segments();
+        } else {
+            let mut id = recorded_id.to_vec();
+            id[0] ^= 0xff;
+            let mut contents = Vec::new();
+            contents.extend(4_u32.to_le_bytes());
+            contents.extend(20_u32.to_le_bytes());
+            contents.extend(3_u32.to_le_bytes());
+            contents.extend(b"GNU\0");
+            contents.extend(id);
+            note.data = object::build::elf::SectionData::Data(contents.into());
+        }
+        let mut selected = Vec::new();
+        builder.write(&mut selected).unwrap();
+        let selected_id = object::File::parse(selected.as_slice())
+            .unwrap()
+            .build_id()
+            .unwrap();
+        assert_ne!(selected_id, Some(recorded_id));
+        assert_eq!(selected_id.is_none(), missing);
+        std::fs::write(path, selected).unwrap();
+
+        let native = Command::new("perf")
+            .arg("--buildid-dir")
+            .arg(root.path().join(".debug"))
+            .args(["script", "--force", "-vvvv", "--kallsyms"])
+            .arg(root.path().join("kallsyms"))
+            .arg("-i")
+            .arg(root.path().join("perf.data"))
+            .output()
+            .unwrap();
+        assert!(
+            native.status.success(),
+            "{}",
+            String::from_utf8_lossy(&native.stderr)
+        );
+        let script = String::from_utf8(native.stdout).unwrap();
+        assert!(
+            String::from_utf8_lossy(&native.stderr).contains("/kcore for kernel data"),
+            "script={script}\nstderr={}",
+            String::from_utf8_lossy(&native.stderr)
+        );
+        assert!(!script.contains("cached_module_object"), "{script}");
+        let mut expected = Vec::new();
+        inferno::collapse::perf::Folder::default()
+            .collapse(script.as_bytes(), &mut expected)
+            .unwrap();
+        assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &expected);
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn query_native_module_object(root: &std::path::Path) -> (String, String, Vec<u8>) {
+    use inferno::collapse::Collapse as _;
+    let native = Command::new("perf")
+        .arg("--buildid-dir")
+        .arg(root.join(".debug"))
+        .args(["script", "--force", "-vvvv", "--kallsyms"])
+        .arg(root.join("kallsyms"))
+        .arg("-i")
+        .arg(root.join("perf.data"))
+        .env("DEBUGINFOD_URLS", "")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(native.stderr).unwrap();
+    assert!(native.status.success(), "{stderr}");
+    let script = String::from_utf8(native.stdout).unwrap();
+    let mut folded = Vec::new();
+    inferno::collapse::perf::Folder::default()
+        .collapse(script.as_bytes(), &mut folded)
+        .unwrap();
+    (script, stderr, folded)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn kernel_symbol_batches_preserve_native_module_core_cursor_order() {
+    use pyroclast::symbols::{SelectedObjectResolver, SymbolizerKind};
+    use std::fmt::Write as _;
+    const MODULE: u64 = 0xffff_ffff_c100_0010;
+    const CORE: u64 = 0xffff_ffff_8100_0010;
+
+    for data_symbol in [true, false] {
+        let (root, bytes) = write_native_cached_module_queries(
+            false,
+            data_symbol,
+            &[
+                (MODULE, &[MODULE]),
+                (MODULE + 0x10, &[MODULE + 0x10]),
+                (CORE, &[CORE]),
+                (MODULE, &[MODULE]),
+            ],
+        );
+        let (script, _, folded) = query_native_module_object(root.path());
+        assert_eq!(
+            script.matches("cached_module_object+0x").count(),
+            if data_symbol { 3 } else { 1 },
+            "{script}"
+        );
+        assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &folded);
+        let summary = summarize_perfdata(&bytes).unwrap();
+        let requests = [MODULE, MODULE + 0x10, CORE, MODULE].map(|ip| {
+            let mapping = summary.mmap_table.resolve_ref(11, ip).unwrap();
+            SymbolRequest {
+                path: mapping.path.into(),
+                relative_address: mapping.relative_address,
+                kernel_module_address: mapping.kernel_module_address,
+                kernel_mapping_range: Some((mapping.start, mapping.end)),
+                build_id: mapping.build_id.map(|id| {
+                    id.iter().fold(String::new(), |mut hex, byte| {
+                        write!(hex, "{byte:02x}").unwrap();
+                        hex
+                    })
+                }),
+                file_identity: mapping.file_identity,
+                kernel_relocation: mapping.kernel_relocation,
+            }
+        });
+        let runner = pyroclast::process::RealCommandRunner::default();
+        for symbolizer in [SymbolizerKind::RustAddr2line, SymbolizerKind::Addr2line] {
+            let make_resolver = || {
+                perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+                    SelectedObjectResolver::new(&runner, symbolizer),
+                    &root.path().join("perf.data"),
+                    root.path(),
+                    [],
+                    &root.path().join("kallsyms"),
+                )
+            };
+            let sequential = make_resolver();
+            let expected = requests
+                .iter()
+                .flat_map(|request| {
+                    sequential
+                        .resolve_batch(std::slice::from_ref(request))
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(expected[0].as_deref(), Some("cached_module_object"));
+            assert_eq!(
+                expected[3].as_deref(),
+                Some(if data_symbol {
+                    "cached_module_object"
+                } else {
+                    "first+0x10"
+                })
+            );
+            assert_eq!(
+                make_resolver().resolve_batch(&requests).unwrap(),
+                expected,
+                "{symbolizer:?} data={data_symbol}: {script}"
+            );
+            for inline in [false, true] {
+                let resolve = |resolver: &pyroclast::symbols::PerfSymbolResolver<
+                    SelectedObjectResolver<'_, pyroclast::process::RealCommandRunner>,
+                >,
+                               batch: &[SymbolRequest]| {
+                    if inline {
+                        resolver.resolve_frame_batch_with_metadata(batch)
+                    } else {
+                        resolver.resolve_base_frame_batch_with_metadata(batch)
+                    }
+                    .unwrap()
+                };
+                let sequential = make_resolver();
+                let expected = requests
+                    .iter()
+                    .flat_map(|request| resolve(&sequential, std::slice::from_ref(request)))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    resolve(&make_resolver(), &requests),
+                    expected,
+                    "{symbolizer:?} inline={inline} data={data_symbol}"
+                );
+            }
+        }
+    }
 }

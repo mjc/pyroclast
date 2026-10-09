@@ -98,6 +98,13 @@ impl KcoreSymbols {
     }
 
     pub(super) fn finish_module_load(&self, path: &Path, maps: &[KernelModuleSectionMap]) {
+        self.validate_module_maps(path, maps);
+        if !self.is_rejected() {
+            self.activate(true);
+        }
+    }
+
+    pub(super) fn validate_module_maps(&self, path: &Path, maps: &[KernelModuleSectionMap]) {
         // perf symbol.c:do_validate_kcore_modules_cb checks every resulting
         // module map against /proc/modules by DSO short name and start.
         let module = module_short_name(path.to_str().unwrap_or_default());
@@ -108,8 +115,6 @@ impl KcoreSymbols {
             self.module_bases.get(&format!("{module}{}", map.section)) != Some(&map.start)
         }) {
             self.rejected.store(true, Ordering::Relaxed);
-        } else {
-            self.activate(true);
         }
     }
 

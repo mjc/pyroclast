@@ -1471,7 +1471,7 @@ impl<R: SymbolResolver> SampleOutput for FoldedOutput<'_, '_, R> {
         accumulator: &SessionState,
         sample: &PreparedFoldSample,
     ) -> Result<(), String> {
-        preprocess_sample_ip(accumulator, sample, self.symbol_cache.as_deref());
+        preprocess_sample_ip(accumulator, sample, self.symbol_cache.as_deref_mut());
         if self.requires_stream_parser {
             return Ok(());
         }
@@ -1700,7 +1700,7 @@ where
         accumulator: &SessionState,
         sample: &PreparedFoldSample,
     ) -> Result<(), String> {
-        preprocess_sample_ip(accumulator, sample, self.symbol_cache.as_deref());
+        preprocess_sample_ip(accumulator, sample, self.symbol_cache.as_deref_mut());
         self.write_preprocessed_sample_event(accumulator, sample)
     }
 }
@@ -1708,7 +1708,7 @@ where
 fn preprocess_sample_ip<R: SymbolResolver>(
     accumulator: &SessionState,
     sample: &PreparedFoldSample,
-    cache: Option<&SymbolFrameCache<'_, R>>,
+    cache: Option<&mut SymbolFrameCache<'_, R>>,
 ) {
     // event.c:thread__find_map selects kernel DSOs only in kernel CPU mode.
     // User event IPs cannot affect this kernel source-loading state.
