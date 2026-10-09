@@ -5101,17 +5101,23 @@ fn period_weights_with_and_without_timestamps_match_real_perf_script_and_inferno
 
 #[cfg(target_os = "linux")]
 fn native_script_and_fold(bytes: &[u8]) -> (String, String) {
+    native_script_and_fold_with_inline(bytes, None)
+}
+
+#[cfg(target_os = "linux")]
+fn native_script_and_fold_with_inline(bytes: &[u8], inline: Option<bool>) -> (String, String) {
     use inferno::collapse::Collapse as _;
     let mut bytes = bytes.to_vec();
     put_u64(&mut bytes, 16, 144);
     let root = tempfile::tempdir().expect("tempdir");
     let input = root.path().join("perf.data");
     std::fs::write(&input, bytes).expect("write fixture");
-    let perf = Command::new("perf")
-        .args(["script", "--force", "-i"])
-        .arg(&input)
-        .output()
-        .expect("perf script");
+    let mut perf = Command::new("perf");
+    perf.args(["script", "--force"]);
+    if let Some(inline) = inline {
+        perf.arg(if inline { "--inline" } else { "--no-inline" });
+    }
+    let perf = perf.arg("-i").arg(&input).output().expect("perf script");
     assert!(
         perf.status.success(),
         "{}",
@@ -5619,6 +5625,7 @@ fn resolved_kernel_dso<'a>(
     mapping: &pyroclast::perfdata::mappings::ResolvedMappingRef<'a>,
 ) -> &'a str {
     let request = SymbolRequest {
+        addr2line_address: None,
         kernel_module_address: None,
         path: mapping.path.into(),
         relative_address: mapping.relative_address,
@@ -5782,6 +5789,7 @@ fn native_ordinary_kallsyms_relocation_moves_resolution_and_both_map_boundaries(
             let mapping = summary.mmap_table.resolve_ref(11, ip).unwrap();
             assert!(mapping.build_id.is_none());
             let request = SymbolRequest {
+                addr2line_address: None,
                 path: mapping.path.into(),
                 relative_address: mapping.relative_address,
                 kernel_module_address: None,
@@ -5925,6 +5933,7 @@ fn native_kcore_replaces_module_dso_names_only_when_recorded_addresses_match() {
         "[kernel.kallsyms]"
     );
     let request = SymbolRequest {
+        addr2line_address: None,
         kernel_module_address: None,
         path: "[a]".into(),
         relative_address: MODULE_IP,
@@ -6774,6 +6783,7 @@ fn kcore_module_object_resolution_precedes_initial_core_loading() {
         &root.path().join("kallsyms"),
     );
     let module = SymbolRequest {
+        addr2line_address: None,
         kernel_module_address: None,
         path: "[a]".into(),
         relative_address: 0xffff_ffff_c100_0010,
@@ -6791,6 +6801,7 @@ fn kcore_module_object_resolution_precedes_initial_core_loading() {
         pyroclast::symbols::SymbolDsoName::Mapping
     );
     let core = SymbolRequest {
+        addr2line_address: None,
         kernel_module_address: None,
         path: "[kernel.kallsyms]".into(),
         relative_address: 0xffff_ffff_8100_0010,
@@ -7571,6 +7582,313 @@ fn leading_whitespace_in_elf_symbols_follows_native_inferno_row_trimming() {
 #[test]
 fn interior_carriage_returns_in_elf_symbols_are_preserved_like_native_inferno() {
     assert_elf_symbol_text_matches_native_pipeline("entry\rsuffix");
+}
+
+#[cfg(target_os = "linux")]
+fn elf_with_distinct_text_and_data_biases() -> Vec<u8> {
+    use object::{build::elf as build, elf};
+
+    let mut builder = build::Builder::new(object::Endianness::Little, true);
+    builder.header.e_type = elf::ET_EXEC;
+    builder.header.e_machine = elf::EM_X86_64;
+    builder.header.e_phoff = 64;
+    let mut sections = Vec::new();
+    for (name, address, offset, flags, permissions) in [
+        (
+            b".text".as_slice(),
+            0x0040_1000,
+            0x1000,
+            elf::SHF_ALLOC | elf::SHF_EXECINSTR,
+            elf::PF_R | elf::PF_X,
+        ),
+        (
+            b".data".as_slice(),
+            0x0040_4000,
+            0x2000,
+            elf::SHF_ALLOC | elf::SHF_WRITE,
+            elf::PF_R | elf::PF_W,
+        ),
+    ] {
+        let section = builder.sections.add();
+        section.name = name.into();
+        section.sh_type = elf::SHT_PROGBITS;
+        section.sh_flags = u64::from(flags);
+        section.sh_addr = address;
+        section.sh_offset = offset;
+        section.sh_addralign = 16;
+        section.data = build::SectionData::Data(vec![0; 32].into());
+        let id = section.id();
+        sections.push(id);
+        let segment = builder.segments.add();
+        segment.p_type = elf::PT_LOAD;
+        segment.p_flags = permissions;
+        segment.p_offset = offset;
+        segment.p_vaddr = address;
+        segment.p_paddr = address;
+        segment.p_filesz = 32;
+        segment.p_memsz = 32;
+        segment.p_align = 0x1000;
+        segment.sections.push(id);
+    }
+    for (name, address, binding, kind, section) in [
+        (
+            b"text_entry".as_slice(),
+            0x0040_1000,
+            elf::STB_GLOBAL,
+            elf::STT_FUNC,
+            sections[0],
+        ),
+        (
+            b"data_slot".as_slice(),
+            0x0040_4000,
+            elf::STB_LOCAL,
+            elf::STT_OBJECT,
+            sections[1],
+        ),
+        (
+            b"data_alias".as_slice(),
+            0x0040_4000,
+            elf::STB_GLOBAL,
+            elf::STT_NOTYPE,
+            sections[1],
+        ),
+    ] {
+        let symbol = builder.symbols.add();
+        symbol.name = name.into();
+        symbol.st_value = address;
+        symbol.st_size = 16;
+        symbol.set_st_info(binding, kind);
+        symbol.section = Some(section);
+    }
+    add_bias_fixture_symbol_tables(&mut builder);
+    for (name, data) in text_only_dwarf_sections() {
+        let section = builder.sections.add();
+        section.name = name.into();
+        section.sh_type = elf::SHT_PROGBITS;
+        section.sh_addralign = 1;
+        section.data = build::SectionData::Data(data.into());
+    }
+    builder.set_section_sizes();
+    let mut bytes = Vec::new();
+    builder.write(&mut bytes).expect("write distinct-bias ELF");
+    bytes
+}
+
+#[cfg(target_os = "linux")]
+fn add_bias_fixture_symbol_tables(builder: &mut object::build::elf::Builder<'_>) {
+    use object::{build::elf as build, elf};
+    for (name, kind, data) in [
+        (
+            b".shstrtab".as_slice(),
+            elf::SHT_STRTAB,
+            build::SectionData::SectionString,
+        ),
+        (
+            b".symtab".as_slice(),
+            elf::SHT_SYMTAB,
+            build::SectionData::Symbol,
+        ),
+        (
+            b".strtab".as_slice(),
+            elf::SHT_STRTAB,
+            build::SectionData::String,
+        ),
+    ] {
+        let section = builder.sections.add();
+        section.name = name.into();
+        section.sh_type = kind;
+        section.sh_addralign = if kind == elf::SHT_SYMTAB { 8 } else { 1 };
+        section.data = data;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn text_only_dwarf_sections() -> [(&'static [u8], Vec<u8>); 3] {
+    // A valid DWARF4 CU/line table covers only .text. At the data VMA,
+    // BFD's function fallback rejects STT_OBJECT and chooses data_alias.
+    let abbrev = vec![1, 0x11, 0, 3, 8, 0x10, 0x17, 0x11, 1, 0x12, 6, 0, 0, 0];
+    let mut info = vec![0; 4];
+    info.extend_from_slice(&4_u16.to_le_bytes());
+    info.extend_from_slice(&0_u32.to_le_bytes());
+    info.extend_from_slice(b"\x08\x01bias.c\0");
+    info.extend_from_slice(&0_u32.to_le_bytes());
+    info.extend_from_slice(&0x0040_1000_u64.to_le_bytes());
+    info.extend_from_slice(&32_u32.to_le_bytes());
+    let length = u32::try_from(info.len() - 4).unwrap();
+    info[..4].copy_from_slice(&length.to_le_bytes());
+    let header = b"\x01\x01\x01\xfb\x0e\x0d\x00\x01\x01\x01\x01\x00\x00\x00\x01\x00\x00\x01\x00bias.c\0\x00\x00\x00\x00";
+    let mut line = vec![0; 4];
+    line.extend_from_slice(&4_u16.to_le_bytes());
+    line.extend_from_slice(&u32::try_from(header.len()).unwrap().to_le_bytes());
+    line.extend_from_slice(header);
+    line.extend_from_slice(&[0, 9, 2]); // DW_LNE_set_address.
+    line.extend_from_slice(&0x0040_1000_u64.to_le_bytes());
+    line.extend_from_slice(&[1, 2, 32, 0, 1, 1]); // copy, advance_pc, end_sequence.
+    let length = u32::try_from(line.len() - 4).unwrap();
+    line[..4].copy_from_slice(&length.to_le_bytes());
+    [
+        (b".debug_abbrev".as_slice(), abbrev),
+        (b".debug_info".as_slice(), info),
+        (b".debug_line".as_slice(), line),
+    ]
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn data_symbol_inline_lookup_uses_text_bias_not_symbol_vma_like_native_perf() {
+    use object::ObjectSection as _;
+
+    let root = tempfile::tempdir().expect("distinct-bias fixture");
+    let path = root.path().join("bias.elf");
+    let elf_bytes = elf_with_distinct_text_and_data_biases();
+    std::fs::write(&path, &elf_bytes).unwrap();
+    let elf = object::File::parse(elf_bytes.as_slice()).unwrap();
+    let text = elf.section_by_name(".text").unwrap();
+    let data = elf.section_by_name(".data").unwrap();
+    let (offset, len) = data.file_range().unwrap();
+    let text_bias = text.address() - text.file_range().unwrap().0;
+    assert_ne!(text_bias, data.address() - offset);
+    let symbol_vma = data.address() + 7;
+    let inline_address = offset + 7 + text_bias;
+    assert_eq!(symbol_vma, 0x0040_4007);
+    assert_eq!(inline_address, 0x0040_2007);
+    assert!(!elf.sections().any(|section| {
+        section.address() <= inline_address && inline_address < section.address() + section.size()
+    }));
+
+    let input = root.path().join("perf.data");
+    for callchain in [false, true] {
+        let start = 0x7000_0000 + offset;
+        let ip = start + 7;
+        let mut comm = comm_payload(11, 12, "worker");
+        comm.resize(comm.len().next_multiple_of(8), 0);
+        let mut mmap = mmap_payload(11, 12, start, len, offset, path.to_str().unwrap());
+        mmap.resize(mmap.len().next_multiple_of(8), 0);
+        let sample = if callchain {
+            sample_payload_with_period(ip, 11, 12, 7, [ip])
+        } else {
+            sample_payload_with_period_no_callchain(ip, 11, 12, 7)
+        };
+        let mut bytes = perfdata_with_records_and_attrs(
+            [file_attr_bytes(
+                PERF_SAMPLE_IP
+                    | PERF_SAMPLE_TID
+                    | PERF_SAMPLE_TIME
+                    | PERF_SAMPLE_PERIOD
+                    | if callchain { PERF_SAMPLE_CALLCHAIN } else { 0 },
+                0,
+                0,
+            )],
+            [
+                record_bytes(3, &comm),
+                record_bytes_with_misc(1, PERF_RECORD_MISC_CPUMODE_USER, &mmap),
+                record_bytes_with_misc(
+                    PERF_RECORD_SAMPLE,
+                    PERF_RECORD_MISC_CPUMODE_USER,
+                    &sample_payload_with_optional_timestamp(sample, true),
+                ),
+            ],
+        );
+        put_u64(&mut bytes, 16, 144);
+        std::fs::write(&input, &bytes).unwrap();
+        // Base symbols use the segment's file offset (symbol-elf.c), but
+        // append_inlines -> map__rip_2objdump adds the global .text bias.
+        let native = [false, true].map(|inline| {
+            let (script, folded) = native_script_and_fold_with_inline(&bytes, Some(inline));
+            assert!(script.contains("data_slot+0x7"), "{script}");
+            assert!(!script.contains("data_alias"), "{script}");
+            assert!(!script.contains("(inlined)"), "{script}");
+            assert_eq!(folded, "worker;data_slot 7\n", "{script}");
+            (script, folded)
+        });
+        let query = Command::new("addr2line")
+            .args(["-f", "-e"])
+            .arg(&path)
+            .args([format!("{symbol_vma:x}"), format!("{inline_address:x}")])
+            .env("DEBUGINFOD_URLS", "")
+            .output()
+            .expect("addr2line address-domain control");
+        assert!(
+            query.status.success(),
+            "{}",
+            String::from_utf8_lossy(&query.stderr)
+        );
+        let query = String::from_utf8(query.stdout).unwrap();
+        let rows = query.lines().collect::<Vec<_>>();
+        assert_eq!(rows.len(), 4, "{query}");
+        assert_eq!(rows[0], "data_alias", "wrong-domain control: {query}");
+        assert_eq!(rows[2], "??", "native-domain control: {query}");
+
+        assert_data_symbol_routes_match_native(&input, root.path(), &bytes, &native, callchain);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn assert_data_symbol_routes_match_native(
+    input: &std::path::Path,
+    root: &std::path::Path,
+    bytes: &[u8],
+    native: &[(String, String); 2],
+    callchain: bool,
+) {
+    use pyroclast::symbols::{SelectedObjectResolver, SymbolizerKind};
+    let runner = pyroclast::process::RealCommandRunner::default();
+    for (symbolizer, name) in [
+        (SymbolizerKind::Addr2line, "addr2line"),
+        (SymbolizerKind::RustAddr2line, "rust-addr2line"),
+    ] {
+        for (inline, (script, expected)) in [false, true].into_iter().zip(native) {
+            let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+                SelectedObjectResolver::new(&runner, symbolizer),
+                input,
+                root,
+                [],
+                &root.join("missing-kallsyms"),
+            );
+            let options = FoldOptions {
+                count_periods: true,
+                inline,
+            };
+            assert_eq!(
+                fold_perfdata_callchains_with_symbols(bytes, options, &resolver).unwrap(),
+                *expected,
+                "{symbolizer:?}, inline={inline}, callchain={callchain}: {script}"
+            );
+            assert_eq!(
+                pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(
+                    input, options, &resolver
+                )
+                .unwrap(),
+                *expected,
+                "file: {symbolizer:?}, inline={inline}, callchain={callchain}: {script}"
+            );
+            let binary = std::env::var_os("PYROCLAST_NATIVE_TEST_BIN")
+                .unwrap_or_else(|| env!("CARGO_BIN_EXE_pyroclast").into());
+            let output = Command::new(binary)
+                .args([
+                    "plumbing",
+                    "perf-script",
+                    if inline { "--inline" } else { "--no-inline" },
+                    "--symbolizer",
+                    name,
+                ])
+                .arg(input)
+                .env("HOME", root)
+                .env("DEBUGINFOD_URLS", "")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                *script,
+                "text: {symbolizer:?}, inline={inline}, callchain={callchain}"
+            );
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -8956,6 +9274,7 @@ fn symbolized_fold_carries_mmap2_build_ids_to_symbol_requests() {
     assert_eq!(
         resolver.calls(),
         vec![vec![SymbolRequest {
+            addr2line_address: None,
             kernel_module_address: None,
             path: std::path::PathBuf::from("[igb]"),
             relative_address: 0x30,
@@ -9050,6 +9369,7 @@ fn symbolized_fold_carries_mmap2_file_identity_to_symbol_requests() {
     assert_eq!(
         resolver.calls(),
         vec![vec![SymbolRequest {
+            addr2line_address: None,
             kernel_module_address: None,
             path: std::path::PathBuf::from("/bin/app"),
             relative_address: 0x30,
@@ -9096,6 +9416,7 @@ fn symbolized_fold_carries_header_build_ids_to_mmap2_symbol_requests() {
     assert_eq!(
         resolver.calls(),
         vec![vec![SymbolRequest {
+            addr2line_address: None,
             kernel_module_address: None,
             path: std::path::PathBuf::from("/tmp/stale-app"),
             relative_address: 0x30,
@@ -9585,6 +9906,7 @@ fn resolves_unique_addresses_once_per_delivered_sample() {
         requests,
         vec![
             SymbolRequest {
+                addr2line_address: None,
                 kernel_module_address: None,
                 path: std::path::PathBuf::from("/bin/app"),
                 relative_address: 0x10,
@@ -9594,6 +9916,7 @@ fn resolves_unique_addresses_once_per_delivered_sample() {
                 kernel_relocation: None,
             },
             SymbolRequest {
+                addr2line_address: None,
                 kernel_module_address: None,
                 path: std::path::PathBuf::from("/bin/app"),
                 relative_address: 0x20,
@@ -10697,6 +11020,7 @@ fn kcore_failed_cached_module_loading_preserves_first_cursor_then_replaces_maps(
     std::fs::create_dir_all(object.parent().unwrap()).unwrap();
     std::fs::write(object, b"malformed ELF").unwrap();
     let module = SymbolRequest {
+        addr2line_address: None,
         kernel_module_address: None,
         path: "[a]".into(),
         relative_address: 0xffff_ffff_c100_0010,
@@ -11231,6 +11555,7 @@ fn split_debug_module_metadata_retains_each_runtime_source_pair() {
         let other_path = root.path().join("other.ko");
         std::fs::copy(&cache, &other_path).unwrap();
         let request = SymbolRequest {
+            addr2line_address: None,
             path: path.clone(),
             relative_address: 0,
             kernel_module_address: None,
@@ -11827,6 +12152,7 @@ fn kernel_symbol_batches_preserve_native_module_core_cursor_order() {
         let requests = [MODULE, MODULE + 0x10, CORE, MODULE].map(|ip| {
             let mapping = summary.mmap_table.resolve_ref(11, ip).unwrap();
             SymbolRequest {
+                addr2line_address: None,
                 path: mapping.path.into(),
                 relative_address: mapping.relative_address,
                 kernel_module_address: mapping.kernel_module_address,

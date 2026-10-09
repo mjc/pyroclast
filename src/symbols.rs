@@ -59,6 +59,9 @@ pub struct KernelRelocation {
 pub struct SymbolRequest {
     pub path: PathBuf,
     pub relative_address: u64,
+    /// Optional perf objdump address for DWARF/inline lookup. The base-symbol
+    /// VMA can differ when the mapping and .text have different ELF biases.
+    pub addr2line_address: Option<u64>,
     /// Original kernel IP when an absolute module mapping supplied this request.
     pub kernel_module_address: Option<u64>,
     pub kernel_mapping_range: Option<(u64, u64)>,
@@ -68,6 +71,10 @@ pub struct SymbolRequest {
 }
 
 impl SymbolRequest {
+    fn inline_address(&self) -> u64 {
+        self.addr2line_address.unwrap_or(self.relative_address)
+    }
+
     fn recorded_build_id(&self) -> Option<&str> {
         self.build_id
             .as_deref()
@@ -85,6 +92,7 @@ impl SymbolRequest {
 impl PartialEq for SymbolRequest {
     fn eq(&self, other: &Self) -> bool {
         self.relative_address == other.relative_address
+            && self.inline_address() == other.inline_address()
             && self.kernel_module_address == other.kernel_module_address
             && self.kernel_mapping_range == other.kernel_mapping_range
             && self.recorded_build_id() == other.recorded_build_id()
@@ -100,6 +108,7 @@ impl Hash for SymbolRequest {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.path.as_os_str().hash(state);
         self.relative_address.hash(state);
+        self.inline_address().hash(state);
         self.kernel_module_address.hash(state);
         self.kernel_mapping_range.hash(state);
         self.recorded_build_id().hash(state);
@@ -120,6 +129,7 @@ impl Ord for SymbolRequest {
             .as_os_str()
             .cmp(other.path.as_os_str())
             .then_with(|| self.relative_address.cmp(&other.relative_address))
+            .then_with(|| self.inline_address().cmp(&other.inline_address()))
             .then_with(|| self.kernel_module_address.cmp(&other.kernel_module_address))
             .then_with(|| self.kernel_mapping_range.cmp(&other.kernel_mapping_range))
             .then_with(|| self.recorded_build_id().cmp(&other.recorded_build_id()))
@@ -707,6 +717,7 @@ struct ObjectAddressCache {
 
 struct ObjectAddressMetadata {
     segments: Vec<ObjectSegmentRange>,
+    text_offset: u64,
     build_id: Option<String>,
 }
 
@@ -1615,6 +1626,7 @@ where
         requests: &[SymbolRequest],
         indexes: &[usize],
     ) -> Result<Vec<Option<String>>, String> {
+        // Scalar resolution follows perf's base-symbol path, not append_inlines.
         let command = addr2line_command(
             path,
             indexes
@@ -2197,10 +2209,7 @@ impl Kallsyms {
 
 #[must_use]
 pub fn build_addr2line_command(path: &Path, requests: &[SymbolRequest]) -> CommandSpec {
-    addr2line_command(
-        path,
-        requests.iter().map(|request| request.relative_address),
-    )
+    addr2line_command(path, requests.iter().map(SymbolRequest::inline_address))
 }
 
 fn addr2line_command(path: &Path, addresses: impl Iterator<Item = u64>) -> CommandSpec {
@@ -2904,6 +2913,7 @@ where
                         kernel_elf.clone(),
                         request.relative_address,
                         &mut address_cache,
+                        true,
                     ));
                 }
             } else {
@@ -3076,6 +3086,7 @@ where
                         kernel_elf.clone(),
                         request.relative_address,
                         &mut address_cache,
+                        true,
                     ));
                 }
             } else {
@@ -3105,12 +3116,11 @@ where
                 .zip(user_frames)
                 .zip(&user_requests)
             {
-                let old_module = old_module_objects.contains(&index);
                 resolved[index] = self.finish_module_frame(
                     frames,
                     &requests[index],
                     &object_request.path,
-                    old_module,
+                    old_module_objects.contains(&index),
                 );
             }
         }
@@ -3234,7 +3244,12 @@ where
         let build_id = request.recorded_build_id()?;
         let elf = perf_build_id_elf_path_for_dso(debug_dir, &request.path, build_id);
         (elf.exists() && object_build_id_matches(&elf, request, address_cache)).then(|| {
-            clean_object_symbol_request_with_cache(elf, request.relative_address, address_cache)
+            clean_object_symbol_request_with_cache(
+                elf,
+                request.relative_address,
+                address_cache,
+                is_kernel_symbol_request(request),
+            )
         })
     }
 
@@ -3248,6 +3263,7 @@ where
             request.path.clone(),
             request.relative_address,
             address_cache,
+            is_kernel_symbol_request(request),
         )
     }
 
@@ -3275,6 +3291,7 @@ where
             live_vdso.path.clone(),
             request.relative_address,
             address_cache,
+            false,
         ))
     }
 
@@ -3477,18 +3494,32 @@ where
 #[cfg(test)]
 fn clean_object_symbol_request(path: PathBuf, relative_address: u64) -> SymbolRequest {
     let mut address_cache = ObjectAddressCache::default();
-    clean_object_symbol_request_with_cache(path, relative_address, &mut address_cache)
+    clean_object_symbol_request_with_cache(path, relative_address, &mut address_cache, false)
 }
 
 fn clean_object_symbol_request_with_cache(
     path: PathBuf,
     relative_address: u64,
     address_cache: &mut ObjectAddressCache,
+    kernel: bool,
 ) -> SymbolRequest {
-    let relative_address =
-        object_virtual_address_for_file_offset_cached(&path, relative_address, address_cache)
-            .unwrap_or(relative_address);
+    // perf machine.c:2110 -> map.c:529 uses a user DSO's global .text bias
+    // for inline lookup, independently of its symbol's PT_LOAD bias.
+    // Kernel objects/modules use their kernel relocation instead (map.c:559).
+    let metadata = object_address_metadata(&path, address_cache);
+    let addr2line_address = metadata
+        .filter(|_| !kernel)
+        .map(|metadata| relative_address.wrapping_add(metadata.text_offset));
+    let relative_address = metadata
+        .and_then(|metadata| {
+            metadata.segments.iter().find_map(|segment| {
+                (relative_address >= segment.file_offset && relative_address < segment.file_end)
+                    .then(|| segment.virtual_address + (relative_address - segment.file_offset))
+            })
+        })
+        .unwrap_or(relative_address);
     SymbolRequest {
+        addr2line_address,
         kernel_module_address: None,
         path,
         relative_address,
@@ -3497,18 +3528,6 @@ fn clean_object_symbol_request_with_cache(
         file_identity: None,
         kernel_relocation: None,
     }
-}
-
-fn object_virtual_address_for_file_offset_cached(
-    path: &Path,
-    file_offset: u64,
-    address_cache: &mut ObjectAddressCache,
-) -> Option<u64> {
-    let metadata = object_address_metadata(path, address_cache)?;
-    metadata.segments.iter().find_map(|segment| {
-        (file_offset >= segment.file_offset && file_offset < segment.file_end)
-            .then(|| segment.virtual_address + (file_offset - segment.file_offset))
-    })
 }
 
 fn object_address_metadata<'a>(
@@ -3569,7 +3588,35 @@ fn object_load_segment_ranges(path: &Path) -> Option<ObjectAddressMetadata> {
             })
         })
         .collect::<Vec<_>>();
-    Some(ObjectAddressMetadata { segments, build_id })
+    Some(ObjectAddressMetadata {
+        segments,
+        text_offset: object_text_offset(&object),
+        build_id,
+    })
+}
+
+fn object_text_offset<'data, R: object::read::ReadRef<'data>>(
+    object: &object::File<'data, R>,
+) -> u64 {
+    use object::read::elf::SectionHeader;
+    // symbol-elf.c:1508 reads sh_offset even for NOBITS .text in debug files.
+    let (address, offset) = match object {
+        object::File::Elf32(file) => file.section_by_name(".text").map(|section| {
+            (
+                section.address(),
+                u64::from(section.elf_section_header().sh_offset(file.endian())),
+            )
+        }),
+        object::File::Elf64(file) => file.section_by_name(".text").map(|section| {
+            (
+                section.address(),
+                section.elf_section_header().sh_offset(file.endian()),
+            )
+        }),
+        _ => None,
+    }
+    .unwrap_or_default();
+    address.wrapping_sub(offset)
 }
 
 fn open_regular_object(path: &Path) -> Option<std::fs::File> {
@@ -3720,7 +3767,7 @@ where
                             .as_ref()
                             .and_then(|metadata| {
                                 metadata.dwarf_frame_names_for_base_symbol(
-                                    request.relative_address,
+                                    request.inline_address(),
                                     Some(object_symbol),
                                 )
                             })
@@ -3918,7 +3965,7 @@ impl SymbolResolver for RustAddr2lineResolver {
                 });
             for (index, object_symbols) in indexes.into_iter().zip(object_symbols) {
                 let request = &requests[index];
-                let address = request.relative_address;
+                let address = request.inline_address();
                 let object_symbol = object_symbols.bare;
                 let has_base_symbol = object_symbol.is_some();
                 let (mut frames, has_inline_frames, has_non_inline_base_frame) =
@@ -4022,7 +4069,7 @@ fn prepare_inline_object_symbols<'a>(
     let addresses: SmallVec<[u64; 16]> = indexes
         .iter()
         .zip(&symbols)
-        .filter_map(|(&index, symbol)| symbol.bare.map(|_| requests[index].relative_address))
+        .filter_map(|(&index, symbol)| symbol.bare.map(|_| requests[index].inline_address()))
         .collect();
     if !addresses.is_empty() {
         metadata.prepare_dwarf_frames_for_addresses(&addresses);
@@ -6223,6 +6270,7 @@ fn is_kernel_mapping_ref(mapping: &ResolvedMappingRef<'_>) -> bool {
 
 fn symbol_request_from_mapping_ref(mapping: &ResolvedMappingRef<'_>) -> SymbolRequest {
     let mut request = SymbolRequest {
+        addr2line_address: None,
         kernel_module_address: None,
         path: PathBuf::new(),
         relative_address: 0,
@@ -7779,6 +7827,7 @@ mod tests {
         // Conservatively keep these separate rather than introducing a
         // non-transitive missing-identity wildcard into cache equality.
         let inline = SymbolRequest {
+            addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("/usr/lib/libc.so.6"),
             relative_address: 0x1234,
@@ -7840,7 +7889,7 @@ mod tests {
     }
 
     #[test]
-    fn object_requests_use_elf_virtual_addresses_for_pie_file_offsets() {
+    fn object_requests_keep_the_containing_segment_vma_for_base_symbols() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let path = file.path().to_path_buf();
         let bytes = elf_with_dynamic_text_symbol(b"pie_function", 0x5000, 32);
@@ -7860,6 +7909,196 @@ mod tests {
         let request = clean_object_symbol_request(path, file_offset);
 
         assert_eq!(request.relative_address, virtual_address);
+    }
+
+    fn elf_with_distinct_text_and_data_biases() -> Vec<u8> {
+        let mut builder = build::elf::Builder::new(object::Endianness::Little, true);
+        builder.header.e_type = elf::ET_DYN;
+        builder.header.e_machine = elf::EM_X86_64;
+        builder.header.e_phoff = 0x40;
+        let section = builder.sections.add();
+        section.name = b".shstrtab"[..].into();
+        section.sh_type = elf::SHT_STRTAB;
+        section.data = build::elf::SectionData::SectionString;
+        let mut sections = Vec::new();
+        for (name, address, flags) in [
+            (
+                b".text".as_slice(),
+                0x1000,
+                elf::SHF_ALLOC | elf::SHF_EXECINSTR,
+            ),
+            (b".data".as_slice(), 0x4000, elf::SHF_ALLOC | elf::SHF_WRITE),
+        ] {
+            let section = builder.sections.add();
+            section.name = name.into();
+            section.sh_type = elf::SHT_PROGBITS;
+            section.sh_flags = u64::from(flags);
+            section.sh_addr = address;
+            section.sh_addralign = 16;
+            section.data = build::elf::SectionData::Data(vec![0; 64].into());
+            sections.push((section.id(), address, flags));
+        }
+        builder.set_section_sizes();
+        for (index, (section, address, flags)) in sections.into_iter().enumerate() {
+            let segment = builder.segments.add();
+            segment.p_type = elf::PT_LOAD;
+            segment.p_flags = elf::PF_R
+                | if flags & elf::SHF_EXECINSTR == 0 {
+                    elf::PF_W
+                } else {
+                    elf::PF_X
+                };
+            segment.p_vaddr = address;
+            segment.p_paddr = address;
+            segment.p_offset = (u64::try_from(index).unwrap() + 1) * 0x1000;
+            segment.p_align = 16;
+            segment.append_section(builder.sections.get_mut(section));
+        }
+        let mut bytes = Vec::new();
+        builder.write(&mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn object_requests_keep_symbol_vma_separate_from_text_biased_inline_address() {
+        // perf symbol-elf.c:dso__load_sym_internal converts symbols using
+        // their PT_LOAD bias, whereas machine.c:append_inlines passes
+        // file offset + .text's bias through map.c:map__rip_2objdump.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let bytes = elf_with_distinct_text_and_data_biases();
+        std::fs::write(file.path(), &bytes).unwrap();
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        let text = object.section_by_name(".text").unwrap();
+        let text_bias = text.address() - text.file_range().unwrap().0;
+        let data = object.section_by_name(".data").unwrap();
+        let file_offset = data.file_range().unwrap().0 + 15;
+        let symbol_address = data.address() + 15;
+        let inline_address = file_offset + text_bias;
+        assert_ne!(symbol_address, inline_address);
+        let request = clean_object_symbol_request(file.path().to_path_buf(), file_offset);
+        assert_eq!(request.relative_address, symbol_address);
+        let command = super::build_addr2line_command(file.path(), &[request]);
+        assert_eq!(
+            command.stdin,
+            Some(format!("0x{inline_address:x}\n").into_bytes())
+        );
+    }
+
+    #[test]
+    fn object_requests_without_text_keep_zero_objdump_bias_like_perf() {
+        // dso__text_offset defaults to zero when .text is absent; do not
+        // substitute the queried data segment's bias.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let bytes = elf_with_dynamic_symbol_in_section(
+            b"data_symbol",
+            0x4000,
+            32,
+            (elf::STT_OBJECT, elf::STV_DEFAULT, false),
+            b".data",
+            elf::SHF_ALLOC | elf::SHF_WRITE,
+        );
+        std::fs::write(file.path(), &bytes).unwrap();
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        assert!(object.section_by_name(".text").is_none());
+        let data = object.section_by_name(".data").unwrap();
+        let file_offset = data.file_range().unwrap().0 + 7;
+        let request = clean_object_symbol_request(file.path().to_path_buf(), file_offset);
+        assert_eq!(request.relative_address, data.address() + 7);
+        let command = super::build_addr2line_command(file.path(), &[request]);
+        assert_eq!(
+            command.stdin,
+            Some(format!("0x{file_offset:x}\n").into_bytes())
+        );
+    }
+
+    #[test]
+    fn kernel_object_requests_do_not_apply_the_user_text_bias() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let bytes = elf_with_distinct_text_and_data_biases();
+        std::fs::write(file.path(), &bytes).unwrap();
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        let data = object.section_by_name(".data").unwrap();
+        let mut cache = super::ObjectAddressCache::default();
+        let request = super::clean_object_symbol_request_with_cache(
+            file.path().to_path_buf(),
+            data.file_range().unwrap().0 + 15,
+            &mut cache,
+            true,
+        );
+        // map.c:map__rip_2objdump's kernel branch uses kernel relocation,
+        // not the user DSO .text offset. Keep the already translated VMA.
+        assert_eq!(request.relative_address, data.address() + 15);
+        assert_eq!(request.addr2line_address, None);
+        let command = super::build_addr2line_command(file.path(), &[request]);
+        assert_eq!(
+            command.stdin,
+            Some(format!("0x{:x}\n", data.address() + 15).into_bytes())
+        );
+    }
+
+    #[test]
+    fn objdump_text_bias_reads_nobits_section_offsets_for_both_elf_classes() {
+        // symbol-elf.c:dso__load_sym_internal uses the raw section header,
+        // even when .text's bytes are absent from a separate debug file.
+        for is_64 in [false, true] {
+            for address in [0_u64, 0x5000] {
+                let mut builder = build::elf::Builder::new(object::Endianness::Little, is_64);
+                builder.header.e_type = elf::ET_EXEC;
+                builder.header.e_machine = if is_64 { elf::EM_X86_64 } else { elf::EM_386 };
+                let section = builder.sections.add();
+                section.name = b".shstrtab"[..].into();
+                section.sh_type = elf::SHT_STRTAB;
+                section.data = build::elf::SectionData::SectionString;
+                let section = builder.sections.add();
+                section.name = b".text"[..].into();
+                section.sh_type = elf::SHT_NOBITS;
+                section.sh_addr = address;
+                section.sh_addralign = 1;
+                section.data = build::elf::SectionData::UninitializedData(64);
+                builder.set_section_sizes();
+                let mut bytes = Vec::new();
+                builder.write(&mut bytes).unwrap();
+                let object = object::File::parse(bytes.as_slice()).unwrap();
+                assert!(
+                    object
+                        .section_by_name(".text")
+                        .unwrap()
+                        .file_range()
+                        .is_none()
+                );
+                let offset = if is_64 { 64 } else { 52 };
+                assert_eq!(
+                    super::object_text_offset(&object),
+                    address.wrapping_sub(offset)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn symbol_request_identity_distinguishes_inline_queries_and_normalizes_default_address() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let hash = |request: &super::SymbolRequest| {
+            let mut hasher = DefaultHasher::new();
+            request.hash(&mut hasher);
+            hasher.finish()
+        };
+        let direct = test_request("/fixture", 0x400f);
+        let same = super::SymbolRequest {
+            addr2line_address: Some(direct.relative_address),
+            ..direct.clone()
+        };
+        assert_eq!(direct, same);
+        assert_eq!(direct.cmp(&same), std::cmp::Ordering::Equal);
+        assert_eq!(hash(&direct), hash(&same));
+        let translated = super::SymbolRequest {
+            addr2line_address: Some(0x200f),
+            ..direct.clone()
+        };
+        assert_ne!(direct, translated);
+        assert_ne!(direct.cmp(&translated), std::cmp::Ordering::Equal);
+        assert_ne!(hash(&direct), hash(&translated));
     }
 
     #[test]
@@ -8768,6 +9007,7 @@ mod tests {
 
         let frames = resolve_base_frames_from_object_metadata(
             &[SymbolRequest {
+                addr2line_address: None,
                 kernel_module_address: None,
                 path: PathBuf::from("/tmp/pyroclast-generic-symbol"),
                 relative_address: 0x1180,
@@ -10049,6 +10289,26 @@ mod tests {
         IndexedString,
     }
 
+    fn identity_map_fixture_text(builder: &mut build::elf::Builder<'_>) {
+        let text = builder
+            .sections
+            .iter()
+            .find(|section| section.name.as_slice() == b".text")
+            .unwrap()
+            .id();
+        let address = builder.sections.get(text).sh_addr;
+        // Keep both perf's PT_LOAD base bias and global .text inline bias zero.
+        let segment = builder.segments.add();
+        segment.p_type = elf::PT_LOAD;
+        segment.p_flags = elf::PF_R | elf::PF_X;
+        segment.p_offset = address;
+        segment.p_vaddr = address;
+        segment.p_paddr = address;
+        segment.p_align = 0x1000;
+        segment.append_section(builder.sections.get_mut(text));
+        builder.header.e_phoff = 64;
+    }
+
     fn cross_cu_inline_fixture(kind: CrossCuInlineName) -> Vec<u8> {
         let abbrev = vec![
             // CU: low/high PC, str_offsets_base, stmt_list.
@@ -10145,6 +10405,7 @@ mod tests {
             section.data = build::elf::SectionData::Data(data.into());
         }
         builder.set_section_sizes();
+        identity_map_fixture_text(&mut builder);
         let mut bytes = Vec::new();
         builder.write(&mut bytes).unwrap();
         bytes
@@ -10668,6 +10929,9 @@ mod tests {
     }
 
     fn cross_cu_reference_file(bytes: &[u8]) -> tempfile::NamedTempFile {
+        let object = object::File::parse(bytes).unwrap();
+        let text = object.section_by_name(".text").unwrap();
+        assert_eq!(text.file_range().unwrap().0, text.address());
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), bytes).unwrap();
         let loader = addr2line::Loader::new(file.path()).unwrap();
@@ -11164,6 +11428,7 @@ mod tests {
             section.data = build::elf::SectionData::Data(data.into());
         }
         builder.set_section_sizes();
+        identity_map_fixture_text(&mut builder);
         let mut bytes = Vec::new();
         builder.write(&mut bytes).expect("raw nested DWARF ELF");
         bytes
@@ -11190,6 +11455,8 @@ mod tests {
         use object::ObjectSection as _;
 
         let object = object::File::parse(bytes).expect("parse raw fixture ELF");
+        let text = object.section_by_name(".text").unwrap();
+        assert_eq!(text.file_range().unwrap().0, text.address());
         let dwarf = gimli::Dwarf::load(|id| {
             let data = object
                 .section_by_name(id.name())
@@ -12482,6 +12749,7 @@ mod tests {
         let resolver = RustAddr2lineResolver::new();
         resolver
             .resolve_frame_batch(&[SymbolRequest {
+                addr2line_address: None,
                 kernel_module_address: None,
                 path: path.clone(),
                 relative_address: addresses[0],
@@ -12495,6 +12763,7 @@ mod tests {
 
         resolver
             .resolve_frame_batch(&[SymbolRequest {
+                addr2line_address: None,
                 kernel_module_address: None,
                 path,
                 relative_address: addresses[1],
@@ -13769,6 +14038,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(i, path)| SymbolRequest {
+                    addr2line_address: None,
                     kernel_module_address: None,
                     path: PathBuf::from(path),
                     relative_address: i as u64,
@@ -13815,6 +14085,7 @@ mod tests {
 
     fn test_request(path: &str, relative_address: u64) -> SymbolRequest {
         SymbolRequest {
+            addr2line_address: None,
             kernel_module_address: None,
             path: path.into(),
             relative_address,
