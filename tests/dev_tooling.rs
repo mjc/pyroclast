@@ -58,9 +58,59 @@ fn precommit_uses_current_project_environment_and_preserves_required_gates() {
         .unwrap();
     assert!(
         output.status.success(),
-        "{}\n{}",
+        "status={}\n{}\n{}",
+        output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn hook_environment_fixture_does_not_modify_the_calling_repository() {
+    let root = tempfile::tempdir().unwrap();
+    for directory in [".githooks", "scripts/tests"] {
+        std::fs::create_dir_all(root.path().join(directory)).unwrap();
+    }
+    for path in [
+        ".githooks/pre-commit",
+        "scripts/install-hooks",
+        "scripts/tests/hook-environment.sh",
+    ] {
+        std::fs::copy(path, root.path().join(path)).unwrap();
+    }
+    // Keep Git's inherited hook variables away from the real checkout, even
+    // while constructing the disposable caller used to reproduce the bug.
+    let status = std::process::Command::new("git")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .args(["init", "-q"])
+        .arg(root.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let git_dir = root.path().join(".git");
+    let config = std::fs::read(git_dir.join("config")).unwrap();
+    let output = std::process::Command::new("timeout")
+        .args(["5", "bash"])
+        .current_dir(root.path())
+        .env("GIT_DIR", &git_dir)
+        .env("GIT_COMMON_DIR", &git_dir)
+        .env("GIT_WORK_TREE", root.path())
+        .env("GIT_INDEX_FILE", git_dir.join("index"))
+        .arg("scripts/tests/hook-environment.sh")
+        .output()
+        .unwrap();
+    assert_eq!(
+        std::fs::read(git_dir.join("config")).unwrap(),
+        config,
+        "the nested fixture must not reconfigure its caller"
+    );
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

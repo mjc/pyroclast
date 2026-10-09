@@ -2,6 +2,11 @@
 set -euo pipefail
 
 repo=$(git rev-parse --show-toplevel)
+# Git hooks export repository-local variables. The independent fixture must
+# never initialize or configure the caller's repository through them.
+while IFS= read -r variable; do
+    unset "$variable"
+done < <(git rev-parse --local-env-vars)
 mkdir -p "$repo/target"
 root=$(mktemp -d "$repo/target/hook-environment.XXXXXX")
 trap 'rm -rf "$root"' EXIT
