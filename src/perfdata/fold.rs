@@ -5861,10 +5861,12 @@ mod tests {
     }
 
     #[test]
-    fn ordered_backlog_stores_only_timestamp_offset_and_window_slot() {
+    fn ordered_backlog_stores_timestamp_offset_window_slot_and_validated_header() {
         assert!(
             std::mem::size_of::<super::PendingFoldRecord>()
-                <= std::mem::size_of::<u64>() + 2 * std::mem::size_of::<usize>(),
+                <= std::mem::size_of::<u64>()
+                    + 2 * std::mem::size_of::<usize>()
+                    + std::mem::size_of::<crate::perfdata::records::PerfRecordHeader>(),
             "pending records duplicate data already retained in the window: {} bytes",
             std::mem::size_of::<super::PendingFoldRecord>()
         );
@@ -5882,7 +5884,15 @@ mod tests {
             bytes.extend(8_u16.to_le_bytes());
             std::sync::Arc::new(bytes)
         });
-        super::QueuedPerfRecord { offset, window }
+        super::QueuedPerfRecord {
+            offset,
+            window,
+            header: crate::perfdata::records::PerfRecordHeader {
+                record_type: crate::perfdata::records::PERF_RECORD_SAMPLE,
+                misc: 0,
+                size: 8,
+            },
+        }
     }
 
     #[test]

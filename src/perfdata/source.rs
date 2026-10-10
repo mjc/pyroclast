@@ -7,9 +7,22 @@ use std::sync::Arc;
 
 use super::records::{PerfRecord, PerfRecordHeader, parse_record_header};
 
+#[cfg(test)]
+thread_local! {
+    static HEADER_DECODE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn decode_record_header(bytes: &[u8]) -> Result<PerfRecordHeader, String> {
+    #[cfg(test)]
+    HEADER_DECODE_CALLS.with(|calls| calls.set(calls.get() + 1));
+    parse_record_header(bytes)
+}
+
 pub(super) struct QueuedPerfRecord {
     pub offset: usize,
     pub(super) window: usize,
+    pub(super) header: PerfRecordHeader,
 }
 
 struct ReadWindow {
@@ -62,8 +75,7 @@ impl WindowStore {
             .as_ref()
             .expect("queued record retains its read window");
         let start = queued.offset - backing.start;
-        let header = parse_record_header(&backing.bytes[start..])
-            .expect("queued record header was validated before retaining its immutable window");
+        let header = queued.header;
         PerfRecord {
             offset: queued.offset,
             header,
@@ -89,20 +101,27 @@ pub(super) trait RecordSource {
         &mut self,
         offset: usize,
         end: usize,
-        _header: PerfRecordHeader,
+        header: PerfRecordHeader,
         windows: &mut WindowStore,
     ) -> Result<QueuedPerfRecord, String> {
-        let size = self.record_at(offset, end)?.header.size;
-        let bytes = self.bytes_at(offset, usize::from(size))?.to_vec();
+        let size = usize::from(header.size);
+        if size < 8 || offset.checked_add(size).is_none_or(|next| next > end) {
+            return Err(format!("invalid queued perf record at offset {offset}"));
+        }
+        let bytes = self.bytes_at(offset, size)?.to_vec();
         let window = windows.retain_with(offset, || Arc::new(bytes));
-        Ok(QueuedPerfRecord { offset, window })
+        Ok(QueuedPerfRecord {
+            offset,
+            window,
+            header,
+        })
     }
 
     fn record_at(&mut self, offset: usize, end: usize) -> Result<PerfRecord<'_>, String> {
         if offset.checked_add(8).is_none_or(|next| next > end) {
             return Err(format!("truncated perf record header at offset {offset}"));
         }
-        let header = parse_record_header(self.bytes_at(offset, 8)?)?;
+        let header = decode_record_header(self.bytes_at(offset, 8)?)?;
         let size = usize::from(header.size);
         if size < 8 {
             return Err(format!(
@@ -157,7 +176,7 @@ fn record_from_window(
         .min(source.len())
         .max(header_end);
     let bytes = source.bytes_at(offset, window_end - offset)?;
-    let header = parse_record_header(bytes)?;
+    let header = decode_record_header(bytes)?;
     let size = usize::from(header.size);
     if size < 8 {
         return Err(format!(
@@ -242,7 +261,11 @@ impl BufferedScanner<'_> {
             return Err(format!("truncated queued perf record at offset {offset}"));
         }
         let window = windows.retain_with(start, || Arc::clone(&self.bytes));
-        Ok(QueuedPerfRecord { offset, window })
+        Ok(QueuedPerfRecord {
+            offset,
+            window,
+            header,
+        })
     }
 }
 
@@ -450,6 +473,77 @@ mod tests {
         assert_eq!(retained.offset, 19);
         assert_eq!(retained.header, expected_header);
         assert_eq!(retained.payload, b"payload");
+    }
+
+    #[test]
+    fn validated_slice_queue_does_not_repeat_record_at_or_header_decode() {
+        struct ObservedSource<'a> {
+            source: SliceSource<'a>,
+            record_calls: usize,
+        }
+        impl RecordSource for ObservedSource<'_> {
+            fn len(&self) -> usize {
+                self.source.len()
+            }
+            fn bytes_at(&mut self, offset: usize, len: usize) -> Result<&[u8], String> {
+                self.source.bytes_at(offset, len)
+            }
+            fn record_at(
+                &mut self,
+                offset: usize,
+                end: usize,
+            ) -> Result<super::PerfRecord<'_>, String> {
+                self.record_calls += 1;
+                self.source.record_at(offset, end)
+            }
+        }
+        let mut bytes = vec![0; 19];
+        bytes.extend(record(b"owned payload"));
+        let mut source = ObservedSource {
+            source: SliceSource(&bytes),
+            record_calls: 0,
+        };
+        let mut windows = WindowStore::default();
+        let before = super::HEADER_DECODE_CALLS.with(std::cell::Cell::get);
+        let end = source.len();
+        let header = source.record_at(19, end).unwrap().header;
+        let queued = source.queue_record(19, end, header, &mut windows).unwrap();
+        let record_calls = source.record_calls;
+        drop(bytes);
+        for _ in 0..17 {
+            let retained = windows.record(&queued);
+            assert_eq!(retained.header, header);
+            assert_eq!(retained.payload, b"owned payload");
+        }
+        let decodes = super::HEADER_DECODE_CALLS.with(std::cell::Cell::get) - before;
+        windows.release(&queued);
+        assert_eq!(
+            (record_calls, decodes),
+            (1, 1),
+            "parsed header and immutable queued bytes must be reused"
+        );
+    }
+
+    #[test]
+    fn retained_file_record_delivery_does_not_decode_validated_headers_again() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), record(b"file payload")).unwrap();
+        let mut source = FileSource::new(file.as_file()).unwrap();
+        let mut windows = WindowStore::default();
+        let end = source.len();
+        let header = source.record_at(0, end).unwrap().header;
+        let queued = source.queue_record(0, end, header, &mut windows).unwrap();
+        let before = super::HEADER_DECODE_CALLS.with(std::cell::Cell::get);
+        for _ in 0..17 {
+            assert_eq!(windows.record(&queued).header, header);
+            assert_eq!(windows.record(&queued).payload, b"file payload");
+        }
+        let decodes = super::HEADER_DECODE_CALLS.with(std::cell::Cell::get) - before;
+        windows.release(&queued);
+        assert_eq!(
+            decodes, 0,
+            "delivery must not reparse an immutable validated header"
+        );
     }
 
     #[test]
