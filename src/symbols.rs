@@ -1268,13 +1268,24 @@ struct ModuleKallsymsIndex {
 struct ModuleKallsymsNode {
     address: u64,
     end: u64,
-    parent: Option<usize>,
-    left: Option<usize>,
-    right: Option<usize>,
+    parent: Option<std::num::NonZeroUsize>,
+    left: Option<std::num::NonZeroUsize>,
+    right: Option<std::num::NonZeroUsize>,
     red: bool,
 }
 
 impl ModuleKallsymsIndex {
+    fn link(index: usize) -> std::num::NonZeroUsize {
+        index
+            .checked_add(1)
+            .and_then(std::num::NonZeroUsize::new)
+            .expect("module kallsyms node index overflow")
+    }
+
+    fn link_index(link: std::num::NonZeroUsize) -> usize {
+        link.get() - 1
+    }
+
     fn insert_ascending(&mut self, address: u64, end: u64) {
         // symbol.c:878-991 moves ascending survivors into fresh module trees;
         // __symbols__insert:361 + tools/lib/rbtree.c:90 balance each insertion.
@@ -1285,18 +1296,18 @@ impl ModuleKallsymsIndex {
         self.nodes.push(ModuleKallsymsNode {
             address,
             end,
-            parent,
+            parent: parent.map(Self::link),
             left: None,
             right: None,
             red: true,
         });
         if let Some(parent) = parent {
             debug_assert!(self.nodes[parent].address < address);
-            self.nodes[parent].right = Some(new);
+            self.nodes[parent].right = Some(Self::link(new));
         }
         let mut node = new;
         loop {
-            let Some(parent) = self.nodes[node].parent else {
+            let Some(parent) = self.nodes[node].parent.map(Self::link_index) else {
                 self.root = Some(node);
                 self.nodes[node].red = false;
                 break;
@@ -1306,9 +1317,10 @@ impl ModuleKallsymsIndex {
             }
             let grandparent = self.nodes[parent]
                 .parent
+                .map(Self::link_index)
                 .expect("a red parent cannot be the black root");
-            debug_assert_eq!(self.nodes[grandparent].right, Some(parent));
-            if let Some(uncle) = self.nodes[grandparent].left
+            debug_assert_eq!(self.nodes[grandparent].right, Some(Self::link(parent)));
+            if let Some(uncle) = self.nodes[grandparent].left.map(Self::link_index)
                 && self.nodes[uncle].red
             {
                 self.nodes[uncle].red = false;
@@ -1325,20 +1337,20 @@ impl ModuleKallsymsIndex {
     fn rotate_left(&mut self, grandparent: usize, parent: usize) {
         let middle = self.nodes[parent].left;
         self.nodes[grandparent].right = middle;
-        if let Some(middle) = middle {
-            self.nodes[middle].parent = Some(grandparent);
+        if let Some(middle) = middle.map(Self::link_index) {
+            self.nodes[middle].parent = Some(Self::link(grandparent));
         }
-        self.nodes[parent].left = Some(grandparent);
+        self.nodes[parent].left = Some(Self::link(grandparent));
         let ancestor = self.nodes[grandparent].parent;
         self.nodes[parent].parent = ancestor;
         self.nodes[parent].red = self.nodes[grandparent].red;
-        self.nodes[grandparent].parent = Some(parent);
+        self.nodes[grandparent].parent = Some(Self::link(parent));
         self.nodes[grandparent].red = true;
-        if let Some(ancestor) = ancestor {
-            if self.nodes[ancestor].left == Some(grandparent) {
-                self.nodes[ancestor].left = Some(parent);
+        if let Some(ancestor) = ancestor.map(Self::link_index) {
+            if self.nodes[ancestor].left == Some(Self::link(grandparent)) {
+                self.nodes[ancestor].left = Some(Self::link(parent));
             } else {
-                self.nodes[ancestor].right = Some(parent);
+                self.nodes[ancestor].right = Some(Self::link(parent));
             }
         } else {
             self.root = Some(parent);
@@ -1352,9 +1364,9 @@ impl ModuleKallsymsIndex {
         while let Some(index) = cursor {
             let node = &self.nodes[index];
             if address < node.address {
-                cursor = node.left;
+                cursor = node.left.map(Self::link_index);
             } else if address > node.end || (address == node.end && node.end != node.address) {
-                cursor = node.right;
+                cursor = node.right.map(Self::link_index);
             } else {
                 return Some(node);
             }
@@ -11556,6 +11568,158 @@ mod tests {
         0000000000002010 T shared\t[beta]\n\
         0000000000002020 T beta_tail\t[beta]\n\
         0000000000004000 T alpha_tail\t[alpha]\n";
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn module_kallsyms_node_layout_uses_three_packed_links() {
+        assert_eq!(std::mem::size_of::<super::ModuleKallsymsNode>(), 48);
+    }
+
+    #[test]
+    fn module_kallsyms_index_zero_is_a_present_link_after_rotation() {
+        let mut index = super::ModuleKallsymsIndex::default();
+        index.insert_ascending(0x1000, 0x2000);
+        assert_eq!(index.root, Some(0));
+        assert_eq!(index.nodes[0].parent, None);
+        assert_eq!(index.nodes[0].left, None);
+        assert_eq!(index.nodes[0].right, None);
+        index.insert_ascending(0x1100, 0x2000);
+        assert_eq!(index.nodes[1].parent.unwrap().get(), 1);
+        index.insert_ascending(0x1200, 0x2000);
+        assert_eq!(index.root, Some(1));
+        let left = index.nodes[1].left.unwrap();
+        assert_eq!(left.get(), 1);
+        assert_eq!(super::ModuleKallsymsIndex::link_index(left), 0);
+        assert_eq!(index.find(0x1000).unwrap().address, 0x1000);
+        assert_eq!(index.find(0x1fff).unwrap().address, 0x1100);
+        assert!(index.find(0x2000).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "module kallsyms node index overflow")]
+    fn module_kallsyms_link_checks_one_based_overflow() {
+        super::ModuleKallsymsIndex::link(usize::MAX);
+    }
+
+    #[test]
+    fn module_kallsyms_multiple_rotations_keep_native_topology_and_colors() {
+        // tools/lib/rbtree.c:__rb_insert right-side cases 1/3, ascending input.
+        let mut index = super::ModuleKallsymsIndex::default();
+        for count in 1..=8 {
+            index.insert_ascending(count * 0x100, 0x2000);
+            if count == 3 {
+                assert_eq!(index.root, Some(1));
+                assert_eq!(
+                    index
+                        .nodes
+                        .iter()
+                        .map(|node| (
+                            node.parent.map(super::ModuleKallsymsIndex::link_index),
+                            node.left.map(super::ModuleKallsymsIndex::link_index),
+                            node.right.map(super::ModuleKallsymsIndex::link_index),
+                            node.red,
+                        ))
+                        .collect::<Vec<_>>(),
+                    [
+                        (Some(1), None, None, true),
+                        (None, Some(0), Some(2), false),
+                        (Some(1), None, None, true)
+                    ]
+                );
+            }
+        }
+        assert_eq!(index.root, Some(3));
+        assert_eq!(
+            index
+                .nodes
+                .iter()
+                .map(|node| (
+                    node.parent.map(super::ModuleKallsymsIndex::link_index),
+                    node.left.map(super::ModuleKallsymsIndex::link_index),
+                    node.right.map(super::ModuleKallsymsIndex::link_index),
+                    node.red,
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (Some(1), None, None, false),
+                (Some(3), Some(0), Some(2), true),
+                (Some(1), None, None, false),
+                (None, Some(1), Some(5), false),
+                (Some(5), None, None, false),
+                (Some(3), Some(4), Some(6), true),
+                (Some(5), None, Some(7), false),
+                (Some(6), None, None, true),
+            ]
+        );
+        assert_eq!(index.find(0x1fff).unwrap().address, 0x400);
+        assert_eq!(index, index.clone());
+    }
+
+    fn module_kallsyms_black_height(
+        index: &super::ModuleKallsymsIndex,
+        cursor: Option<usize>,
+        parent: Option<usize>,
+        seen: &mut [bool],
+    ) -> usize {
+        let Some(cursor) = cursor else {
+            return 1;
+        };
+        assert!(cursor < index.nodes.len());
+        assert!(!seen[cursor], "cycle or duplicate child at {cursor}");
+        seen[cursor] = true;
+        let node = &index.nodes[cursor];
+        assert_eq!(
+            node.parent.map(super::ModuleKallsymsIndex::link_index),
+            parent
+        );
+        let left = node.left.map(super::ModuleKallsymsIndex::link_index);
+        let right = node.right.map(super::ModuleKallsymsIndex::link_index);
+        for (child, is_left) in [(left, true), (right, false)] {
+            if let Some(child) = child {
+                assert!(child < index.nodes.len());
+                assert_eq!(index.nodes[child].address < node.address, is_left);
+                assert!(!node.red || !index.nodes[child].red);
+            }
+        }
+        let left_height = module_kallsyms_black_height(index, left, Some(cursor), seen);
+        let right_height = module_kallsyms_black_height(index, right, Some(cursor), seen);
+        assert_eq!(left_height, right_height, "black height at {cursor}");
+        left_height + usize::from(!node.red)
+    }
+
+    #[test]
+    fn module_kallsyms_ascending_rotations_keep_every_node_reachable_and_balanced() {
+        let mut index = super::ModuleKallsymsIndex::default();
+        for count in 1..=64 {
+            index.insert_ascending(count * 0x100, count * 0x100 + 0x80);
+            assert!(!index.nodes[index.root.unwrap()].red);
+            let mut seen = vec![false; index.nodes.len()];
+            module_kallsyms_black_height(&index, index.root, None, &mut seen);
+            assert!(seen.iter().all(|&visited| visited));
+            for node in &index.nodes {
+                assert_eq!(index.find(node.address).unwrap().address, node.address);
+                assert_eq!(index.find(node.end - 1).unwrap().address, node.address);
+                assert!(index.find(node.end).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn module_kallsyms_root_walk_keeps_zero_length_exact_match_and_half_open_ends() {
+        let mut index = super::ModuleKallsymsIndex::default();
+        index.insert_ascending(0x1000, 0x1000);
+        index.insert_ascending(0x1100, 0x1180);
+        index.insert_ascending(0x1200, 0x1280);
+        assert!(index.find(0xfff).is_none());
+        assert_eq!(index.find(0x1000).unwrap().address, 0x1000);
+        assert!(index.find(0x1001).is_none());
+        assert!(index.find(0x10ff).is_none());
+        assert_eq!(index.find(0x1100).unwrap().address, 0x1100);
+        assert_eq!(index.find(0x117f).unwrap().address, 0x1100);
+        assert!(index.find(0x1180).is_none());
+        assert_eq!(index.find(0x127f).unwrap().address, 0x1200);
+        assert!(index.find(0x1280).is_none());
+    }
 
     fn live_module_kallsyms_fixture(text: &str) -> (tempfile::TempDir, PathBuf) {
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-fixtures");
