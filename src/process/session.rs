@@ -57,9 +57,12 @@ impl CommandSession {
     /// The deadline covers this response, not the lifetime of the helper or a
     /// whole batch. Failure closes the session; later calls cannot retry a
     /// partially consumed protocol. Successful replies do not imply child exit.
+    /// Only observed bytes can be validated: this fixed-count protocol cannot
+    /// predict later extra output. Output already queued before a request is
+    /// unsolicited and closes the session rather than becoming that reply.
     ///
     /// # Errors
-    /// Returns an error on cancellation, timeout, EOF, extra response bytes,
+    /// Returns an error on cancellation, timeout, EOF, observed extra bytes,
     /// invalid framing, a closed session, or failed pipe I/O.
     pub fn exchange_lines(
         &mut self,
@@ -111,6 +114,15 @@ impl CommandSession {
                     "session response deadline exceeded",
                 ));
             }
+            if written == 0 {
+                drain_pipe(&mut self.stdout, &mut response)?;
+                if !response.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "session stdout was available before the request",
+                    ));
+                }
+            }
             self.write_request(request, &mut written)?;
             // Discard diagnostics after each bounded drain. We do not retain
             // a growing session-wide stderr log or block a noisy child's stdout.
@@ -120,15 +132,12 @@ impl CommandSession {
             drain_pipe(&mut self.stdout, &mut response)?;
             received_lines += memchr::memchr_iter(b'\n', &response[previous..]).count();
             if received_lines >= lines {
-                if received_lines != lines
-                    || response.last() != Some(&b'\n')
-                    || written != request.len()
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "unexpected session response framing",
-                    ));
-                }
+                Self::validate_response_framing(
+                    &response,
+                    received_lines,
+                    lines,
+                    written == request.len(),
+                )?;
                 return Ok(response);
             }
             if self.stdout.is_none() {
@@ -149,6 +158,21 @@ impl CommandSession {
                     .map(AsRawFd::as_raw_fd),
             ])?;
         }
+    }
+
+    fn validate_response_framing(
+        response: &[u8],
+        received_lines: usize,
+        lines: usize,
+        request_complete: bool,
+    ) -> io::Result<()> {
+        if received_lines != lines || response.last() != Some(&b'\n') || !request_complete {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected session response framing",
+            ));
+        }
+        Ok(())
     }
 
     fn write_request(&mut self, request: &[u8], written: &mut usize) -> io::Result<()> {
@@ -176,5 +200,133 @@ impl CommandSession {
             }
             Err(error) => Err(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CommandSession;
+    use crate::process::{CommandSpec, poll_child_pipes};
+    use std::io::{ErrorKind, Write};
+    use std::os::fd::AsRawFd;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn observed_response_framing_rejects_extra_or_incomplete_bytes() {
+        for response in [
+            b"a\nb\nc\n".as_slice(),
+            b"a\nb\npartial".as_slice(),
+            b"a\n".as_slice(),
+            b"partial".as_slice(),
+        ] {
+            assert_eq!(
+                CommandSession::validate_response_framing(
+                    response,
+                    memchr::memchr_iter(b'\n', response).count(),
+                    2,
+                    true,
+                )
+                .unwrap_err()
+                .kind(),
+                ErrorKind::InvalidData,
+                "{response:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn observed_response_framing_requires_the_whole_request_and_exact_lines() {
+        for response in [b"a\nb\n".as_slice(), b"\n\n".as_slice()] {
+            CommandSession::validate_response_framing(response, 2, 2, true).unwrap();
+            assert_eq!(
+                CommandSession::validate_response_framing(response, 2, 2, false)
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidData
+            );
+        }
+    }
+
+    fn wait_for_queued_stdout(session: &CommandSession, bytes: usize) {
+        let stdout = session.stdout.as_ref().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let mut available: libc::c_int = 0;
+            // SAFETY: stdout owns the live descriptor; available is writable.
+            assert_eq!(
+                unsafe { libc::ioctl(stdout.as_raw_fd(), libc::FIONREAD, &mut available) },
+                0
+            );
+            if usize::try_from(available).unwrap() >= bytes {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "stdout did not queue {bytes} bytes"
+            );
+            poll_child_pipes([Some(stdout.as_raw_fd()), None, None]).unwrap();
+        }
+    }
+
+    #[test]
+    fn session_rejects_stdout_queued_before_first_request() {
+        let mut session = CommandSession::start(&CommandSpec::new("sh").args([
+            "-c",
+            "printf 'stale\\nreply\\n'; read -r request; read -r later",
+        ]))
+        .unwrap();
+        wait_for_queued_stdout(&session, b"stale\nreply\n".len());
+        assert_eq!(
+            session
+                .exchange_lines(b"request\n", 2, Duration::from_secs(2))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
+        assert_eq!(
+            session
+                .exchange_lines(b"later\n", 2, Duration::from_secs(2))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn session_rejects_stdout_queued_between_requests() {
+        let mut session = CommandSession::start(&CommandSpec::new("sh").args([
+            "-c",
+            "read -r first; printf 'first\\nreply\\n'; read -r release; printf 'stale\\nreply\\n'; read -r request; read -r later",
+        ]))
+        .unwrap();
+        assert_eq!(
+            session
+                .exchange_lines(b"first\n", 2, Duration::from_secs(2))
+                .unwrap(),
+            b"first\nreply\n"
+        );
+        // Fixture-only release: the previous exchange is complete before the
+        // child publishes unsolicited output for the next boundary check.
+        session
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"release\n")
+            .unwrap();
+        wait_for_queued_stdout(&session, b"stale\nreply\n".len());
+        assert_eq!(
+            session
+                .exchange_lines(b"request\n", 2, Duration::from_secs(2))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
+        assert_eq!(
+            session
+                .exchange_lines(b"later\n", 2, Duration::from_secs(2))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::BrokenPipe
+        );
     }
 }

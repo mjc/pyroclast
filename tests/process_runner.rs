@@ -90,26 +90,25 @@ fn session_accepts_split_response_lines() {
 
 #[cfg(unix)]
 #[test]
-fn session_rejects_incomplete_or_extra_response_lines() {
+fn session_rejects_incomplete_response_lines_and_closes_protocol() {
     use std::io::ErrorKind;
     use std::time::Duration;
 
-    for (script, expected) in [
-        ("read -r line; printf 'partial'", ErrorKind::UnexpectedEof),
-        (
-            "read -r line; printf 'a\\nb\\nc\\n'; read -r later",
-            ErrorKind::InvalidData,
-        ),
-    ] {
-        let mut session = command_session(script);
-        assert_eq!(
-            session
-                .exchange_lines(b"request\n", 2, Duration::from_secs(2))
-                .unwrap_err()
-                .kind(),
-            expected
-        );
-    }
+    let mut session = command_session("read -r line; printf 'partial'");
+    assert_eq!(
+        session
+            .exchange_lines(b"request\n", 2, Duration::from_secs(2))
+            .unwrap_err()
+            .kind(),
+        ErrorKind::UnexpectedEof
+    );
+    assert_eq!(
+        session
+            .exchange_lines(b"later\n", 2, Duration::from_secs(2))
+            .unwrap_err()
+            .kind(),
+        ErrorKind::BrokenPipe
+    );
 }
 
 #[cfg(unix)]
