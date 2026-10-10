@@ -3918,6 +3918,209 @@ fn native_dwarf_caller_addresses_are_not_recorded_callchain_context_markers() {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn x86_arch_fallback_after_unmapped_caller(
+    bp: u64,
+    return_pc: u64,
+) -> (SyntheticX86_64Object, Vec<u8>) {
+    let fixture = SyntheticX86_64Object::create_with_stack_cfi();
+    let mut elf = std::fs::read(&fixture.path).unwrap();
+    // CFA=RSP+32, RIP=[CFA-32]. This leaves readable BP slots both below
+    // and above the recovered SP for the nonadvancing and successful cases.
+    elf[0x111..0x118].copy_from_slice(&[0x0c, 7, 32, 0x90, 4, 0, 0]);
+    std::fs::write(&fixture.path, elf).unwrap();
+    let mut mmap = mmap_payload(11, 11, 0x10000, 0x10000, 0, &fixture.path_string());
+    mmap.resize(mmap.len().next_multiple_of(8), 0);
+    let mut stack = [0_u8; 64];
+    stack[..8].copy_from_slice(&0x7a01_u64.to_le_bytes());
+    stack[24..32].copy_from_slice(&return_pc.to_le_bytes());
+    stack[48..56].copy_from_slice(&return_pc.to_le_bytes());
+    let mut attr = file_attr_bytes_with_regs(
+        PERF_SAMPLE_IP
+            | PERF_SAMPLE_TID
+            | PERF_SAMPLE_TIME
+            | PERF_SAMPLE_CALLCHAIN
+            | PERF_SAMPLE_REGS_USER
+            | PERF_SAMPLE_STACK_USER,
+        (1 << 6) | (1 << 7) | (1 << 8),
+    );
+    put_u64(&mut attr, 16, 1);
+    let mut bytes = perfdata_with_records_and_attrs(
+        [attr],
+        [
+            record_bytes_with_misc(1, PERF_RECORD_MISC_CPUMODE_USER, &mmap),
+            record_bytes_with_misc(
+                9,
+                PERF_RECORD_MISC_CPUMODE_USER,
+                &sample_payload_with_optional_timestamp(
+                    sample_payload_with_user_stack(
+                        0x10100,
+                        11,
+                        11,
+                        [],
+                        2,
+                        [bp, 0x7fff_0000, 0x10100],
+                        stack,
+                    ),
+                    true,
+                ),
+            ),
+        ],
+    );
+    put_u64(&mut bytes, 16, 144);
+    (fixture, bytes)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn assert_native_x86_arch_fallback_return(
+    name: &str,
+    bp: u64,
+    return_pc: u64,
+    expected_ips: &[u64],
+) {
+    use inferno::collapse::Collapse as _;
+    use pyroclast::symbols::{SelectedObjectResolver, SymbolizerKind};
+    let (fixture, bytes) = x86_arch_fallback_after_unmapped_caller(bp, return_pc);
+    let root = fixture.path.parent().unwrap();
+    let data = root.join("fallback.perf.data");
+    std::fs::write(&data, &bytes).unwrap();
+    let config = root.join("perfconfig");
+    std::fs::write(&config, "[addr2line]\nstyle = libdw\n").unwrap();
+    let mut unwinder = pyroclast::perfdata::unwind::FramehopUnwinder::new();
+    assert!(
+        unwinder
+            .add_object_mapping(&fixture.path, 0x10000, 0x10000, 0)
+            .unwrap()
+    );
+    assert!(unwinder.has_unwind_info_for_ip(0x10100));
+    assert!(!unwinder.has_reported_module_for_ip(0x7a01));
+    let mut oracles = Vec::new();
+    for inline in [false, true] {
+        let output = Command::new("perf")
+            .arg("--buildid-dir")
+            .arg(root.join("native-cache"))
+            .args([
+                "script",
+                "--force",
+                if inline { "--inline" } else { "--no-inline" },
+                "-i",
+            ])
+            .arg(&data)
+            .env("PERF_CONFIG", &config)
+            .env("DEBUGINFOD_URLS", "")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let script = String::from_utf8(output.stdout).unwrap();
+        let ips: Vec<_> = script
+            .lines()
+            .filter(|line| line.contains(" ("))
+            .map(|line| u64::from_str_radix(line.split_whitespace().next().unwrap(), 16).unwrap())
+            .collect();
+        assert_eq!(
+            ips, expected_ips,
+            "native geometry {name}, inline={inline}: {script}"
+        );
+        for pc in &expected_ips[1..] {
+            assert!(
+                script.contains(&format!("{pc:x} [unknown] ([unknown])")),
+                "{script}"
+            );
+        }
+        let mut folded = Vec::new();
+        inferno::collapse::perf::Folder::default()
+            .collapse(script.as_bytes(), &mut folded)
+            .unwrap();
+        let folded = String::from_utf8(folded).unwrap();
+        assert!(!folded.is_empty());
+        eprintln!("native {name}, inline={inline}:\n{script}FOLDED:\n{folded}");
+        oracles.push((inline, folded));
+    }
+    let runner = pyroclast::process::RealCommandRunner::default();
+    let mut failures = Vec::new();
+    for symbolizer in [SymbolizerKind::RustAddr2line, SymbolizerKind::Addr2line] {
+        for (inline, expected) in &oracles {
+            let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+                SelectedObjectResolver::new(&runner, symbolizer),
+                &data,
+                root,
+                [],
+                &root.join("missing-kallsyms"),
+            );
+            let options = FoldOptions {
+                inline: *inline,
+                count_periods: false,
+            };
+            for file_route in [false, true] {
+                let actual = if file_route {
+                    pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(
+                        &data, options, &resolver,
+                    )
+                } else {
+                    fold_perfdata_callchains_with_symbols(&bytes, options, &resolver)
+                };
+                eprintln!("{name} {symbolizer:?}, inline={inline}, file={file_route}: {actual:?}");
+                if actual.as_ref() != Ok(expected) {
+                    failures.push(format!("{symbolizer:?}, inline={inline}, file={file_route}: {actual:?}, native={expected:?}"));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{name}: {}", failures.join("\n"));
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_x86_arch_fallback_zero_return_is_adjusted_after_unmapped_caller() {
+    // elfutils 0.195 x86_64_unwind.c:48-91 accepts a readable zero return;
+    // perf 7.2.9 unwind-libdw.c:353-357 subtracts one for nonactivation PCs.
+    assert_native_x86_arch_fallback_return(
+        "zero-return",
+        0x7fff_0028,
+        0,
+        &[0x10100, 0x7a00, u64::MAX],
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_x86_arch_fallback_healthy_return_after_unmapped_caller() {
+    assert_native_x86_arch_fallback_return(
+        "healthy-return",
+        0x7fff_0028,
+        0x7b01,
+        &[0x10100, 0x7a00, 0x7b00],
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_x86_arch_fallback_zero_bp_stops_after_unmapped_caller() {
+    assert_native_x86_arch_fallback_return("zero-bp", 0, 0x7b01, &[0x10100, 0x7a00]);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_x86_arch_fallback_nonadvancing_sp_stops_after_unmapped_caller() {
+    assert_native_x86_arch_fallback_return(
+        "nonadvancing-sp",
+        0x7fff_0010,
+        0x7b01,
+        &[0x10100, 0x7a00],
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_x86_arch_fallback_unreadable_return_stops_after_unmapped_caller() {
+    assert_native_x86_arch_fallback_return(
+        "unreadable-return",
+        0x7fff_0040,
+        0x7b01,
+        &[0x10100, 0x7a00],
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn timestamp_ordered_dwarf_caller_addresses_are_not_recorded_context_markers() {
     assert_native_high_dwarf_callers(true);

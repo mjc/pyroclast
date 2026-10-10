@@ -142,7 +142,7 @@ impl Registers<17> {
             return Step::Stop;
         };
         let sp = fp.wrapping_add(16);
-        if self.get(Register(7)).unwrap_or(0) >= sp || pc == 0 {
+        if self.get(Register(7)).unwrap_or(0) >= sp {
             return Step::Stop;
         }
         let mut caller = Self::empty();
