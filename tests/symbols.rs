@@ -2990,6 +2990,101 @@ fn perf_symbol_resolver_core_first_rejects_live_module_symbol_start_before_recor
     check_live_module_recorded_bounds(true);
 }
 
+#[test]
+fn perf_symbol_resolver_core_first_rejects_live_symbols_from_other_modules() {
+    // Linux v7.2.9 symbol.c:maps__split_kallsyms assigns symbols by module
+    // name; maps.c:maps__find_symbol looks up only the address's selected map.
+    let root = tempfile::tempdir().expect("root");
+    let live_kallsyms = root.path().join("kallsyms");
+    std::fs::write(
+        &live_kallsyms,
+        "ffffffff846997a0 T __pi_memcpy\n\
+         ffffffffc0002000 T alpha_entry [alpha]\n\
+         ffffffffc0003000 T beta_entry [beta]\n",
+    )
+    .expect("kallsyms");
+    let runner = Addr2lineRunner::new(b"");
+    let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
+        .with_system_kallsyms_from_path(&live_kallsyms);
+    load_module_test_core(&resolver);
+
+    let request = SymbolRequest {
+        addr2line_address: None,
+        kernel_module_address: None,
+        path: PathBuf::from("[alpha]"),
+        relative_address: 0xffff_ffff_c000_2008,
+        kernel_mapping_range: None,
+        build_id: None,
+        file_identity: None,
+        kernel_relocation: None,
+    };
+    let actual = resolver
+        .resolve_batch(&[
+            request.clone(),
+            SymbolRequest {
+                relative_address: 0xffff_ffff_c000_3008,
+                ..request.clone()
+            },
+            SymbolRequest {
+                path: PathBuf::from("[missing]"),
+                relative_address: 0xffff_ffff_c000_3008,
+                ..request
+            },
+        ])
+        .expect("module lookups");
+    assert_eq!(actual, vec![Some("alpha_entry+0x8".into()), None, None]);
+    assert!(runner.commands().is_empty());
+}
+
+#[test]
+fn shared_kernel_resolution_rejects_addresses_beyond_file_backed_core_map() {
+    // perf v7.2.9 maps.c:731-738 selects a containing map before symbols;
+    // symbols__fixup_end bounds the final kallsyms symbol to its page.
+    let root = tempfile::tempdir().expect("root");
+    let kallsyms = root.path().join("kallsyms");
+    std::fs::write(
+        &kallsyms,
+        "ffffffff88000000 T _stext\nffffffff88001000 T core_tail\n",
+    )
+    .expect("file-backed kallsyms");
+    let resolver =
+        pyroclast::symbols::PerfSymbolResolver::from_object_resolver(RustAddr2lineResolver::new())
+            .with_system_kallsyms_from_path(&kallsyms);
+    let address = 0xffff_ffff_8800_7000;
+    let request = SymbolRequest {
+        addr2line_address: None,
+        kernel_module_address: None,
+        path: "[kernel.kallsyms]".into(),
+        relative_address: address,
+        kernel_mapping_range: Some((0xffff_ffff_8800_0000, 0xffff_ffff_8800_2000)),
+        build_id: None,
+        file_identity: None,
+        kernel_relocation: None,
+    };
+    let requests = [
+        SymbolRequest {
+            relative_address: 0xffff_ffff_8800_1010,
+            ..request.clone()
+        },
+        request,
+    ];
+    for ordinary in [
+        resolver
+            .resolve_base_frame_batch_with_metadata(&requests)
+            .expect("bounded base resolution"),
+        resolver
+            .resolve_frame_batch_with_metadata(&requests)
+            .expect("bounded inline resolution"),
+    ] {
+        assert_eq!(ordinary[0].frames, ["core_tail+0x10"]);
+        assert!(ordinary[1].frames.is_empty(), "{ordinary:?}");
+        assert_eq!(
+            ordinary[1].kernel_dso,
+            pyroclast::symbols::SymbolDsoName::Unmapped
+        );
+    }
+}
+
 fn check_live_module_recorded_bounds(core_first: bool) {
     let root = tempfile::tempdir().expect("root");
     let live_kallsyms = root.path().join("kallsyms");

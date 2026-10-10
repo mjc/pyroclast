@@ -2880,10 +2880,9 @@ struct FoldFrameResolver<'a> {
     cookie_to_suppress: Option<u64>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 enum FrameMappingDecision<'a> {
     Mapped(MappedFrame<'a>),
-    ResolvedKernelSymbol(String),
     KernelAddress,
     Unknown,
     Address,
@@ -2910,21 +2909,6 @@ fn resolve_frame_in_context<'a>(
         | FoldFrame::UserUnwind(_)
         | FoldFrame::InlineCurrentIp(_) => context.resolve_user(address, mapping_cache),
     }
-}
-
-#[inline]
-fn is_explicit_kernel_frame(frame: FoldFrame, address: u64) -> bool {
-    is_kernel_space_frame(address)
-        && match frame {
-            FoldFrame::SampleIp { cpumode, .. } => {
-                cpumode & PERF_RECORD_MISC_CPUMODE_MASK == PERF_RECORD_MISC_CPUMODE_KERNEL
-            }
-            FoldFrame::Callchain(_) => true,
-            FoldFrame::UserCallchain(_)
-            | FoldFrame::HypervisorCallchain(_)
-            | FoldFrame::UserUnwind(_)
-            | FoldFrame::InlineCurrentIp(_) => false,
-        }
 }
 
 #[derive(Default)]
@@ -3254,15 +3238,9 @@ impl<'a> FoldFrameResolver<'a> {
                 context.as_ref(),
                 frame,
                 symbol_cache.is_some(),
-                symbol_cache
-                    .as_deref()
-                    .map(|cache| cache.resolver() as &dyn SymbolResolver),
                 &mut buffers.mapping_cache,
             );
             match decision {
-                FrameMappingDecision::ResolvedKernelSymbol(symbol) => {
-                    append_cached_inferno_perf_folded_label_to_buffers(buffers, &symbol);
-                }
                 FrameMappingDecision::Mapped(mapping) => {
                     if mapping_requires_perf_text(&mapping) {
                         return Ok(FoldedRenderStatus::RequiresPerfText);
@@ -3297,7 +3275,6 @@ impl<'a> FoldFrameResolver<'a> {
                                 context.as_ref(),
                                 frame,
                                 true,
-                                Some(cache.resolver() as &dyn SymbolResolver),
                                 &mut buffers.mapping_cache,
                             );
                             (frame, decision, repeats)
@@ -3397,9 +3374,6 @@ impl<'a> FoldFrameResolver<'a> {
         };
         let address = frame.address();
         match self.mapping_decision(pid, frame, &mut mapping_cache) {
-            FrameMappingDecision::ResolvedKernelSymbol(symbol) => {
-                write_perf_script_frame_for_label(writer, address, &symbol)?;
-            }
             FrameMappingDecision::Mapped(mapping) => {
                 write_perf_script_inline_mapped_decision_frame(
                     writer,
@@ -3444,9 +3418,6 @@ impl<'a> FoldFrameResolver<'a> {
             self.mapping_decision(pid, frame, mapping_cache)
         };
         match decision {
-            FrameMappingDecision::ResolvedKernelSymbol(symbol) => {
-                write_perf_script_frame_for_label(writer, address, &symbol)?;
-            }
             FrameMappingDecision::Mapped(mapping) => {
                 write_perf_script_mapped_decision_frame(
                     writer,
@@ -3563,7 +3534,6 @@ impl<'a> FoldFrameResolver<'a> {
         context: Option<&FrameMappingContext<'a>>,
         frame: FoldFrame,
         symbolizing: bool,
-        resolver: Option<&dyn SymbolResolver>,
         mapping_cache: &mut MappingResolveCache,
     ) -> FrameMappingDecision<'a> {
         let address = frame.address();
@@ -3571,15 +3541,7 @@ impl<'a> FoldFrameResolver<'a> {
             return resolve_frame_in_context(context, frame, address, mapping_cache)
                 .map_or(FrameMappingDecision::Unknown, FrameMappingDecision::Mapped);
         }
-        let mut decision =
-            Self::mapping_decision_in_context(context, frame, address, mapping_cache);
-        if matches!(decision, FrameMappingDecision::Unknown)
-            && is_explicit_kernel_frame(frame, address)
-            && let Some(symbol) =
-                resolver.and_then(|resolver| resolver.resolve_unmapped_kernel_frame(address))
-        {
-            decision = FrameMappingDecision::ResolvedKernelSymbol(symbol);
-        }
+        let decision = Self::mapping_decision_in_context(context, frame, address, mapping_cache);
         if !symbolizing
             && matches!(
                 frame,
@@ -3618,7 +3580,7 @@ fn append_pending_folded_frames<R: SymbolResolver>(
         return Ok(FoldedRenderStatus::RequiresPerfText);
     }
     prefetch_sample_symbols(table, pending, cache, inline)?;
-    for (frame, decision, repeats) in pending.iter().cloned() {
+    for (frame, decision, repeats) in pending.iter().copied() {
         let segment_start = if repeats > 1 { buffers.stack_len() } else { 0 };
         let status = append_prefetched_folded_frame(buffers, frame, decision, cache, inline)?;
         if matches!(status, FoldedRenderStatus::RequiresPerfText) {
@@ -3639,9 +3601,6 @@ fn append_prefetched_folded_frame<R: SymbolResolver>(
     inline: bool,
 ) -> Result<FoldedRenderStatus, String> {
     match decision {
-        FrameMappingDecision::ResolvedKernelSymbol(symbol) => {
-            append_cached_inferno_perf_folded_label_to_buffers(buffers, &symbol);
-        }
         FrameMappingDecision::Mapped(mapping) => {
             let expand = inline && !matches!(frame, FoldFrame::SampleIp { .. });
             let (identity, cached) = cache
@@ -7078,53 +7037,85 @@ mod tests {
     }
 
     #[test]
-    fn unmapped_explicit_kernel_frame_uses_validated_resolver_fallback() {
-        struct KernelGapResolver;
-        impl SymbolResolver for KernelGapResolver {
-            fn resolve_batch(
-                &self,
-                requests: &[SymbolRequest],
-            ) -> Result<Vec<Option<String>>, String> {
-                Ok(vec![None; requests.len()])
-            }
+    fn unmapped_kernel_tail_direct_fold_matches_own_script_with_real_resolver() {
+        assert_unmapped_kernel_tail_matches_own_script(false);
+    }
 
-            fn resolve_unmapped_kernel_frame(&self, address: u64) -> Option<String> {
-                (address == 0xffff_ffff_8800_0010).then(|| "bpf_test_program".to_string())
-            }
-        }
+    #[test]
+    fn unmapped_kernel_tail_forced_perf_text_matches_own_script_with_real_resolver() {
+        assert_unmapped_kernel_tail_matches_own_script(true);
+    }
 
-        let mmap_table = super::MmapTable::default();
-        let resolver = KernelGapResolver;
-        let mut symbol_cache = SymbolFrameCache::new(&resolver);
-        let mut buffers = super::FoldedRenderBuffers::default();
-        super::FoldFrameResolver::new(&mmap_table, false)
-            .render_folded_stack_for_stack(
-                None,
-                Some(super::SampleComm::Name("kernel-test")),
-                [super::FoldFrame::SampleIp {
-                    address: 0xffff_ffff_8800_0010,
-                    cpumode: super::PERF_RECORD_MISC_CPUMODE_KERNEL,
-                }],
-                Some(&mut symbol_cache),
-                &mut buffers,
-            )
-            .expect("render kernel frame");
-        assert_eq!(buffers.rendered(), "kernel-test;bpf_test_program");
+    fn assert_unmapped_kernel_tail_matches_own_script(force_perf_text: bool) {
+        use super::SampleOutput as _;
+        use inferno::collapse::Collapse as _;
 
-        let mut user_buffers = super::FoldedRenderBuffers::default();
-        super::FoldFrameResolver::new(&mmap_table, false)
-            .render_folded_stack_for_stack(
-                None,
-                Some(super::SampleComm::Name("user-test")),
-                [super::FoldFrame::SampleIp {
-                    address: 0xffff_ffff_8800_0010,
-                    cpumode: super::PERF_RECORD_MISC_CPUMODE_USER,
-                }],
-                Some(&mut symbol_cache),
-                &mut user_buffers,
-            )
-            .expect("render user frame");
-        assert_eq!(user_buffers.rendered(), "user-test;[unknown]");
+        let root = tempfile::tempdir().expect("real kernel source");
+        let kallsyms = root.path().join("kallsyms");
+        std::fs::write(
+            &kallsyms,
+            "ffffffff88000000 T _stext\nffffffff88001000 T core_tail\n",
+        )
+        .expect("file-backed kallsyms");
+        let resolver = crate::symbols::PerfSymbolResolver::from_object_resolver(
+            crate::symbols::RustAddr2lineResolver::new(),
+        )
+        .with_system_kallsyms_from_path(&kallsyms);
+        let mut state = super::SessionState::new(std::collections::BTreeMap::new());
+        state.thread_comms.insert(7, "worker".into());
+        state
+            .mmap_table
+            .insert_mmap(crate::perfdata::records::MmapRecord {
+                pid: 7,
+                tid: 7,
+                start: 0x1000,
+                len: 0x100,
+                pgoff: 0,
+                path: if force_perf_text {
+                    "/missing/adjacent\nframe"
+                } else {
+                    "/missing/adjacent"
+                }
+                .into(),
+            });
+        let frames = [
+            super::FoldFrame::Callchain(0xffff_ffff_8800_7000),
+            super::FoldFrame::UserCallchain(0x1010),
+        ];
+        let (layouts, _) = event_test_sample("cpu-clock", 1, Some(1_000_000_000), true);
+        let sample = prepared_sample_for_event(&frames, layouts.fallback.as_ref().unwrap());
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let mut direct = super::FoldedOutput::new(
+            Some(&mut cache),
+            super::FoldOptions {
+                count_periods: false,
+                inline: false,
+            },
+            9,
+        );
+        direct.write_sample_event(&state, &sample).unwrap();
+        let mut script = Vec::new();
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let mut text = super::PerfScriptOutput {
+            symbol_cache: Some(&mut cache),
+            writer: &mut script,
+            event_name_width: 9,
+            inline: false,
+        };
+        text.write_sample_event(&state, &sample).unwrap();
+        let mut expected = Vec::new();
+        inferno::collapse::perf::Folder::default()
+            .collapse(std::io::Cursor::new(&script), &mut expected)
+            .unwrap();
+        assert!(!expected.is_empty());
+        let mut actual = Vec::new();
+        super::write_fold_counts(direct.buffers.counts, &mut actual).unwrap();
+        assert_eq!(
+            String::from_utf8(actual).unwrap(),
+            String::from_utf8(expected).unwrap(),
+            "force_perf_text={force_perf_text}, script={}",
+            String::from_utf8_lossy(&script)
+        );
     }
 
     #[test]
@@ -8977,7 +8968,6 @@ mod tests {
                     Some(&context),
                     frame,
                     symbolizing,
-                    None,
                     &mut cache,
                 );
                 let super::FrameMappingDecision::Mapped(mapping) = decision else {
@@ -10071,7 +10061,6 @@ mod tests {
                             Some(&context),
                             frame,
                             true,
-                            None,
                             &mut mapping_cache,
                         ),
                         1,

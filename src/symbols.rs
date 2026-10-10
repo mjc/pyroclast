@@ -185,13 +185,6 @@ pub trait SymbolResolver {
     /// before resolving any callchain nodes (`event.c:machine__resolve`).
     fn preprocess_sample_ip(&self, _mapping: &ResolvedMappingRef<'_>) {}
 
-    /// Resolves an explicitly kernel-space frame that has no perf mapping.
-    /// Implementations must validate the recorded kernel identity and symbol
-    /// range before returning a name.
-    fn resolve_unmapped_kernel_frame(&self, _address: u64) -> Option<String> {
-        None
-    }
-
     /// Resolves a batch of object-relative addresses.
     ///
     /// # Errors
@@ -2795,28 +2788,6 @@ impl<O> SymbolResolver for PerfSymbolResolver<O>
 where
     O: SymbolResolver,
 {
-    fn resolve_unmapped_kernel_frame(&self, address: u64) -> Option<String> {
-        let request = SymbolRequest {
-            path: PathBuf::from("[kernel.kallsyms]"),
-            relative_address: address,
-            addr2line_address: None,
-            kernel_module_address: None,
-            kernel_mapping_range: None,
-            build_id: self.recorded_kernel_build_id_ref().map(str::to_owned),
-            file_identity: None,
-            kernel_relocation: None,
-        };
-        self.kallsyms_ref()
-            .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, &request))
-            .or_else(|| {
-                (self.recorded_kernel_build_id_ref().is_none()
-                    || self.live_kernel_matches_recorded())
-                .then(|| self.live_kallsyms_ref())
-                .flatten()
-                .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, &request))
-            })
-    }
-
     fn initialize_kernel_maps(&self, table: &MmapTable) {
         // A module without a delivered core map cannot load that core DSO yet.
         if self.kcore_symbols.get().is_some() {
@@ -9397,6 +9368,47 @@ mod tests {
             (1, MULTI_MODULE_KALLSYMS.lines().count(), 12, 1),
             "one global build, one visit per physical row, one insertion per accepted row, one end-fixup pass"
         );
+    }
+
+    #[test]
+    fn live_kernel_symbol_fallback_does_not_resurrect_module_rows_without_a_map() {
+        // perf v7.2.9 symbol.c:1034-1041 discards a module row without a
+        // named map; maps.c:731-738 searches only the selected address map.
+        let (_root, path) = live_module_kallsyms_fixture(
+            "0000000000001000 T core_entry\n\
+             0000000000005000 t bpf_prog_abc [bpf]\n\
+             0000000000005020 t bpf_prog_def [bpf]\n\
+             0000000000003000 T core_tail\n",
+        );
+        let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
+            .with_system_kallsyms_from_path(&path);
+        assert!(!path.with_file_name("modules").exists());
+        let snapshot = resolver.live_kallsyms_snapshot().unwrap();
+        assert_eq!(
+            snapshot.modules["[bpf]"]
+                .resolve_module_with_offset(0x5008)
+                .as_deref(),
+            Some("bpf_prog_abc+0x8"),
+            "the module row is present in the source, but has no module map"
+        );
+        resolver.ordinary_kernel_load.lock().unwrap().core_loaded = true;
+        let requests = [
+            test_request("[unknown]", 0x5008),
+            test_request("[kernel.kallsyms]", 0x5008),
+        ];
+        assert_eq!(
+            requests.map(|request| resolver
+                .resolve_kernel_frames(&request)
+                .map(|resolved| resolved.frames)),
+            [Some(Vec::new()), Some(Vec::new())],
+            "module symbol ranges must not substitute for an absent module map"
+        );
+        let request = test_request("[kernel.kallsyms]", 0x7000);
+        assert_eq!(
+            resolver.resolve_kernel_frames(&request).unwrap().frames,
+            Vec::<String>::new()
+        );
+        assert!(resolver.ordinary_kernel_address_is_unmapped(&request));
     }
 
     #[test]

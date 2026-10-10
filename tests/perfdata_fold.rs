@@ -10019,6 +10019,83 @@ fn folds_unmapped_kernel_frames_as_unknown_like_inferno() {
     assert_eq!(folded, ":12;[unknown] 1\n");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn file_fold_rejects_unmapped_kernel_tail_like_native_perf() {
+    // perf v7.2.9 maps.c:731-738 searches only a containing map, even when
+    // a preceding kallsyms symbol exists. Load the source on the first sample.
+    let root = tempfile::tempdir().expect("native kernel fixture");
+    std::fs::create_dir(root.path().join("symfs")).expect("empty native symfs");
+    let kallsyms = root.path().join("kallsyms");
+    std::fs::write(
+        &kallsyms,
+        "ffffffff88000000 T _stext\nffffffff88001000 T core_tail\n",
+    )
+    .expect("file-backed kallsyms");
+    let mut comm = comm_payload(11, 12, "worker");
+    comm.resize(comm.len().next_multiple_of(8), 0);
+    let mut mmap = mmap_payload(
+        u32::MAX,
+        u32::MAX,
+        0xffff_ffff_8800_0000,
+        0x2000,
+        0xffff_ffff_8800_0000,
+        "[kernel.kallsyms]_stext",
+    );
+    mmap.resize(mmap.len().next_multiple_of(8), 0);
+    let mut records = vec![
+        record_bytes(3, &comm),
+        record_bytes_with_misc(1, PERF_RECORD_MISC_CPUMODE_KERNEL, &mmap),
+    ];
+    for (index, ip) in [0xffff_ffff_8800_0010, 0xffff_ffff_8800_7000]
+        .into_iter()
+        .enumerate()
+    {
+        records.push(record_bytes_with_misc(
+            PERF_RECORD_SAMPLE,
+            PERF_RECORD_MISC_CPUMODE_KERNEL,
+            &sample_payload_with_time(
+                ip,
+                11,
+                12,
+                1_000_000_000 + u64::try_from(index).unwrap(),
+                [0xffff_ffff_ffff_ff80, ip],
+            ),
+        ));
+    }
+    let mut attr = file_attr_bytes(
+        PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CALLCHAIN,
+        0,
+        0,
+    );
+    put_u64(&mut attr, 16, 1);
+    let mut bytes = perfdata_with_records_and_attrs_vec(vec![attr], records);
+    put_u64(&mut bytes, 16, 144);
+    let input = root.path().join("perf.data");
+    std::fs::write(&input, bytes).expect("native perf fixture");
+
+    let (script, stderr, native) = query_native_module_kallsyms(root.path(), &[]);
+    assert!(script.contains("_stext+0x10"), "{script}\n{stderr}");
+    assert_eq!(
+        native, b"worker;[unknown] 1\nworker;_stext 1\n",
+        "native script={script}\nstderr={stderr}"
+    );
+    let resolver = pyroclast::symbols::PerfSymbolResolver::from_object_resolver(
+        pyroclast::symbols::RustAddr2lineResolver::new(),
+    )
+    .with_system_kallsyms_from_path(&kallsyms);
+    let actual = pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(
+        &input,
+        FoldOptions {
+            count_periods: false,
+            inline: false,
+        },
+        &resolver,
+    )
+    .expect("public file fold");
+    assert_eq!(actual.as_bytes(), native, "native script={script}");
+}
+
 #[test]
 fn kernel_looking_user_callchain_without_kernel_context_stays_unknown_like_perf_script() {
     let bytes = perfdata_with_records_and_attrs(
