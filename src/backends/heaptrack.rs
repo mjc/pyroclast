@@ -60,6 +60,9 @@ where
             command
         };
         let output = self.runner.run(&command)?;
+        // Snapshot cancellation at recorder return; this only permits artifact
+        // finalization and does not classify the workload's exit status.
+        let recorder_cancellation_signal = self.runner.cancellation_signal();
         std::fs::write(layout.stdout_log(), &output.stdout)?;
         std::fs::write(layout.stderr_log(), &output.stderr)?;
         std::fs::write(
@@ -67,7 +70,9 @@ where
             format!("{}\n", request.command.join(" ")),
         )?;
 
-        if !output.succeeded_or_interrupted() {
+        let matching_parent_cancellation =
+            matching_parent_cancellation(recorder_cancellation_signal, output.status_code);
+        if !output.succeeded_or_interrupted() && !matching_parent_cancellation {
             let error = format!(
                 "heaptrack exited with {:?}: {}",
                 output.status_code,
@@ -139,6 +144,20 @@ where
             manifest,
         })
     }
+}
+
+#[cfg(unix)]
+fn matching_parent_cancellation(signal: Option<i32>, status: Option<i32>) -> bool {
+    match (signal, status) {
+        (Some(libc::SIGINT), Some(status)) => status == 128 + libc::SIGINT,
+        (Some(libc::SIGTERM), Some(status)) => status == 128 + libc::SIGTERM,
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+const fn matching_parent_cancellation(_signal: Option<i32>, _status: Option<i32>) -> bool {
+    false
 }
 
 fn locate_heaptrack_output(output_prefix: &Path) -> std::io::Result<PathBuf> {
