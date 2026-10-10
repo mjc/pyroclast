@@ -8867,6 +8867,12 @@ fn module_kallsyms_sixteen_overlapping_rows_match_native_tree_boundaries() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn module_kallsyms_sixty_four_overlapping_rows_match_native_tree_boundaries() {
+    assert_native_overlapping_module_tree_parity(64);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn hypervisor_callchain_context_does_not_resolve_host_user_mappings_like_perf() {
     // tools/perf/util/machine.c:add_callchain_ip switches PERF_CONTEXT_HV to
     // PERF_RECORD_MISC_HYPERVISOR. util/event.c:thread__find_map returns NULL
