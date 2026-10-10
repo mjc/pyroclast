@@ -721,6 +721,7 @@ struct ObjectAddressMetadata {
     segments: Vec<ObjectSegmentRange>,
     text_offset: u64,
     build_id: Option<String>,
+    kernel_symbols_usable: OnceLock<bool>,
 }
 
 struct ObjectSegmentRange {
@@ -932,6 +933,7 @@ pub struct PerfSymbolResolver<O> {
     kernel_elf: Option<PathBuf>,
     recorded_kernel_build_id: Option<String>,
     file_kernel_cache: Option<FileKernelCache>,
+    cached_kernel_symbols: Option<CachedKernelSymbols>,
     kallsyms: Option<Kallsyms>,
     live_kallsyms: Option<Kallsyms>,
     live_kallsyms_path: Option<PathBuf>,
@@ -1739,6 +1741,7 @@ where
             kernel_elf: None,
             recorded_kernel_build_id: None,
             file_kernel_cache: None,
+            cached_kernel_symbols: None,
             kallsyms: None,
             live_kallsyms: None,
             live_kallsyms_path: None,
@@ -1840,15 +1843,13 @@ where
         }
         self_with_debug_dir.recorded_kernel_build_id = Some(build_id.to_string());
         let kernel_elf = perf_build_id_elf_path(debug_dir, build_id);
-        let self_with_kallsyms = match Kallsyms::load_perf_build_id_cache(debug_dir, build_id) {
-            Some(kallsyms) => self_with_debug_dir.with_kallsyms(kallsyms),
-            None => self_with_debug_dir,
-        };
-        if kernel_elf.exists() {
-            self_with_kallsyms.with_kernel_elf(kernel_elf)
-        } else {
-            self_with_kallsyms
-        }
+        // Automatic cache discovery is not an explicit --kallsyms selection.
+        self_with_debug_dir.cached_kernel_symbols = Some(CachedKernelSymbols {
+            build_id: Some(build_id.to_owned()),
+            kallsyms: Kallsyms::load_perf_build_id_cache(debug_dir, build_id),
+            elf: kernel_elf.exists().then_some(kernel_elf),
+        });
+        self_with_debug_dir
     }
 
     #[must_use]
@@ -1913,17 +1914,21 @@ where
     fn kernel_elf_ref(&self) -> Option<&PathBuf> {
         self.kernel_elf
             .as_ref()
+            .or_else(|| self.cached_kernel_symbols.as_ref()?.elf.as_ref())
             .or_else(|| self.file_kernel_cache.as_ref()?.symbols()?.elf.as_ref())
     }
 
     fn kallsyms_ref(&self) -> Option<&Kallsyms> {
-        self.kallsyms.as_ref().or_else(|| {
-            self.file_kernel_cache
-                .as_ref()?
-                .symbols()?
-                .kallsyms
-                .as_ref()
-        })
+        self.kallsyms
+            .as_ref()
+            .or_else(|| self.cached_kernel_symbols.as_ref()?.kallsyms.as_ref())
+            .or_else(|| {
+                self.file_kernel_cache
+                    .as_ref()?
+                    .symbols()?
+                    .kallsyms
+                    .as_ref()
+            })
     }
 }
 
@@ -2956,19 +2961,13 @@ where
                         .and_then(|frames| frames.frames.into_iter().next());
                 }
             } else if is_kernel_symbol_path(&request.path) {
-                if let Some(frames) = self.resolve_kernel_frames(request) {
-                    resolved[index] = frames.frames.into_iter().next();
-                } else if let Some(kernel_elf) = self.kernel_elf_ref() {
-                    if !object_build_id_matches(kernel_elf, request, &mut address_cache) {
-                        continue;
-                    }
+                if let Some(object_request) =
+                    self.kernel_object_symbol_request(request, &mut address_cache)
+                {
                     kernel_elf_indexes.push(index);
-                    kernel_elf_requests.push(clean_object_symbol_request_with_cache(
-                        kernel_elf.clone(),
-                        request.relative_address,
-                        &mut address_cache,
-                        true,
-                    ));
+                    kernel_elf_requests.push(object_request);
+                } else if let Some(frames) = self.resolve_kernel_frames(request) {
+                    resolved[index] = frames.frames.into_iter().next();
                 }
             } else {
                 let object_request = self.object_symbol_request(request, &mut address_cache);
@@ -3128,20 +3127,13 @@ where
                     resolved[index] = frames;
                 }
             } else if is_kernel_symbol_path(&request.path) {
-                if let Some(frames) = self.resolve_kernel_frames(request) {
-                    resolved[index] = frames;
-                } else if let Some(kernel_elf) = self.kernel_elf_ref() {
-                    if !object_build_id_matches(kernel_elf, request, &mut address_cache) {
-                        resolved[index].source_state = SymbolSourceState::Unavailable;
-                        continue;
-                    }
+                if let Some(object_request) =
+                    self.kernel_object_symbol_request(request, &mut address_cache)
+                {
                     kernel_elf_indexes.push(index);
-                    kernel_elf_requests.push(clean_object_symbol_request_with_cache(
-                        kernel_elf.clone(),
-                        request.relative_address,
-                        &mut address_cache,
-                        true,
-                    ));
+                    kernel_elf_requests.push(object_request);
+                } else if let Some(frames) = self.resolve_kernel_frames(request) {
+                    resolved[index] = frames;
                 }
             } else {
                 let object_request = self.object_symbol_request(request, &mut address_cache);
@@ -3269,6 +3261,35 @@ where
             .unwrap_or_else(|| Self::live_object_symbol_request(request, address_cache))
     }
 
+    fn kernel_object_symbol_request(
+        &self,
+        request: &SymbolRequest,
+        address_cache: &mut ObjectAddressCache,
+    ) -> Option<SymbolRequest> {
+        // perf v7.2.9 symbol.c:2199-2245 selects explicit kallsyms first,
+        // then a usable build-ID ELF, before automatic kallsyms discovery.
+        if self.kallsyms.is_some() {
+            return None;
+        }
+        let path = self.kernel_elf_ref()?;
+        let build_id = request
+            .recorded_build_id()
+            .or(self.recorded_kernel_build_id_ref());
+        if !kernel_object_is_usable(path, build_id, address_cache) {
+            return None;
+        }
+        self.ordinary_kernel_load
+            .lock()
+            .expect("kernel DSO load lock")
+            .core_loaded = true;
+        Some(clean_object_symbol_request_with_cache(
+            path.clone(),
+            request.relative_address,
+            address_cache,
+            true,
+        ))
+    }
+
     fn module_object_symbol_request(
         &self,
         request: &SymbolRequest,
@@ -3281,6 +3302,9 @@ where
         } else {
             self.cached_object_symbol_request(request, address_cache)
         }?;
+        if !kernel_object_is_usable(&selected.path, request.recorded_build_id(), address_cache) {
+            return None;
+        }
         if request.kernel_module_address.is_some()
             && let Some(recorded) = request.recorded_build_id()
             && self
@@ -3636,6 +3660,44 @@ fn object_build_id_matches(
         .is_some_and(|actual| actual.eq_ignore_ascii_case(recorded))
 }
 
+fn kernel_object_is_usable(
+    path: &Path,
+    recorded_build_id: Option<&str>,
+    address_cache: &mut ObjectAddressCache,
+) -> bool {
+    let Some(metadata) = object_address_metadata(path, address_cache) else {
+        return false;
+    };
+    if recorded_build_id.is_some_and(|recorded| {
+        !metadata
+            .build_id
+            .as_deref()
+            .is_some_and(|actual| actual.eq_ignore_ascii_case(recorded))
+    }) {
+        return false;
+    }
+    *metadata.kernel_symbols_usable.get_or_init(|| {
+        let Some(file) = open_regular_object(path) else {
+            return false;
+        };
+        let Ok(metadata) = file.metadata() else {
+            return false;
+        };
+        let cache = object::read::ReadCache::new(file);
+        let Ok(object) = object::File::parse(cache.range(0, metadata.len())) else {
+            return false;
+        };
+        // perf v7.2.9 symbol-elf.c:1807-1848 rejects every kernel DSO
+        // without SYMTAB before considering DYNSYM. Check only kernel
+        // candidates, once per retained object, never per sampled address.
+        object.symbol_table().is_some()
+            && object
+                .symbols()
+                .chain(object.dynamic_symbols())
+                .any(|symbol| perf_symbol_is_candidate(&object, &symbol))
+    })
+}
+
 fn object_load_segment_ranges(path: &Path) -> Option<ObjectAddressMetadata> {
     let file = open_regular_object(path)?;
     let len = file.metadata().ok()?.len();
@@ -3667,6 +3729,7 @@ fn object_load_segment_ranges(path: &Path) -> Option<ObjectAddressMetadata> {
         segments,
         text_offset: object_text_offset(&object),
         build_id,
+        kernel_symbols_usable: OnceLock::new(),
     })
 }
 
@@ -4289,7 +4352,10 @@ enum PerfSymbolBinding {
     Weak,
 }
 
-fn perf_symbol_is_candidate(object: &object::File<'_>, symbol: &object::Symbol<'_, '_>) -> bool {
+fn perf_symbol_is_candidate<'data, R: object::read::ReadRef<'data>>(
+    object: &object::File<'data, R>,
+    symbol: &object::Symbol<'data, '_, R>,
+) -> bool {
     if !perf_symbol_is_allocated_candidate(object, symbol) {
         return false;
     }
@@ -4303,14 +4369,16 @@ fn perf_symbol_is_candidate(object: &object::File<'_>, symbol: &object::Symbol<'
         .is_some_and(|name| name.contains("text") || name.contains("data"))
 }
 
-fn elf_symbol_is_label(symbol: &object::Symbol<'_, '_>) -> bool {
+fn elf_symbol_is_label<'data, R: object::read::ReadRef<'data>>(
+    symbol: &object::Symbol<'data, '_, R>,
+) -> bool {
     matches!(symbol.flags(), object::SymbolFlags::Elf { st_info, .. }
         if st_info & 0xf == object::elf::STT_NOTYPE)
 }
 
-fn perf_symbol_is_allocated_candidate(
-    object: &object::File<'_>,
-    symbol: &object::Symbol<'_, '_>,
+fn perf_symbol_is_allocated_candidate<'data, R: object::read::ReadRef<'data>>(
+    object: &object::File<'data, R>,
+    symbol: &object::Symbol<'data, '_, R>,
 ) -> bool {
     if symbol.is_undefined() || symbol.name().unwrap_or_default().is_empty() {
         return false;
@@ -14705,7 +14773,15 @@ mod tests {
     #[test]
     fn routed_frame_batches_use_kernel_elf_without_a_selected_kallsyms_source() {
         let root = tempfile::tempdir().unwrap();
-        let kernel = root.path().join("missing-kernel-object");
+        let kernel = root.path().join("kernel-object");
+        std::fs::write(
+            &kernel,
+            elf_with_text_symbol_fixtures(
+                elf::EM_X86_64,
+                &[(b"entry", 0x1000, 16, elf::STB_GLOBAL, elf::STT_FUNC)],
+            ),
+        )
+        .unwrap();
         let user = root.path().join("missing-user-object");
         let resolver = super::PerfSymbolResolver::from_object_resolver(RoutedModeResolver)
             .with_kernel_elf(kernel.clone());
@@ -14736,6 +14812,24 @@ mod tests {
                     super::SymbolSourceState::AddressDependent
                 );
             }
+        }
+    }
+
+    #[test]
+    fn routed_frame_batches_reject_missing_kernel_elf_before_backend_routing() {
+        let root = tempfile::tempdir().unwrap();
+        let resolver = super::PerfSymbolResolver::from_object_resolver(RoutedModeResolver)
+            .with_kernel_elf(root.path().join("missing-kernel-object"))
+            .with_system_kallsyms_from_path(&root.path().join("missing-kallsyms"));
+        let request = test_request("[kernel.kallsyms]", 0x50);
+        for inline in [true, false] {
+            let frames = if inline {
+                resolver.resolve_frame_batch_with_metadata(std::slice::from_ref(&request))
+            } else {
+                resolver.resolve_base_frame_batch_with_metadata(std::slice::from_ref(&request))
+            }
+            .unwrap();
+            assert!(frames[0].frames.is_empty());
         }
     }
 

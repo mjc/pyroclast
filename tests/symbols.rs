@@ -5,9 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-use object::ObjectSection;
-use object::{Object, ObjectSegment, ObjectSymbol, SymbolKind, build, elf};
+use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol, SymbolKind, build, elf};
 use proptest::prelude::*;
 use pyroclast::cli::SymbolizerKind;
 use pyroclast::perfdata::mappings::FileIdentity;
@@ -2275,7 +2273,23 @@ ffffffffc0e66200 t zpl_iter_read_next [zfs]
 fn perf_symbol_resolver_module_gap_uses_one_backend_lookup_and_preserves_user_mode() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("module.ko");
-    std::fs::write(&path, elf_with_dynamic_text_symbol(b"entry", 0x1000, 64)).unwrap();
+    std::fs::write(&path, elf_with_static_text_symbol(b"entry", 0x1000, 64)).unwrap();
+    let fixture_resolver = RustAddr2lineResolver::new();
+    assert_eq!(
+        fixture_resolver
+            .resolve_batch(&[SymbolRequest {
+                path: path.clone(),
+                relative_address: 0x1010,
+                addr2line_address: None,
+                kernel_module_address: None,
+                kernel_mapping_range: None,
+                build_id: None,
+                file_identity: None,
+                kernel_relocation: None,
+            }])
+            .unwrap(),
+        [Some("entry".into())]
+    );
     let object = ObservedRustResolver {
         inner: RustAddr2lineResolver::new(),
         calls: RefCell::new(Vec::new()),
@@ -2301,6 +2315,7 @@ fn perf_symbol_resolver_module_gap_uses_one_backend_lookup_and_preserves_user_mo
             ..request.clone()
         },
         SymbolRequest {
+            relative_address: 0x1010,
             kernel_module_address: None,
             kernel_mapping_range: None,
             ..request
@@ -2834,7 +2849,7 @@ ffffffff914e8fa0 t mp_map_pin_to_irq
 }
 
 #[test]
-fn perf_symbol_resolver_prefers_perfdata_kallsyms_over_kernel_elf() {
+fn perf_symbol_resolver_uses_perfdata_kallsyms_when_cached_kernel_elf_is_invalid() {
     let home = tempfile::tempdir().expect("home");
     let perfdata = home.path().join("perf.data");
     std::fs::write(&perfdata, perfdata_with_kernel_build_id()).expect("perfdata");
@@ -2910,7 +2925,16 @@ fn perf_symbol_resolver_rejects_invalid_kernel_build_id_elf_when_kallsyms_is_mis
 }
 
 #[test]
-fn perf_symbol_resolver_uses_valid_kernel_build_id_elf_when_kallsyms_is_missing() {
+fn perf_symbol_resolver_rejects_kernel_elf_without_a_build_id_note_when_request_omits_id() {
+    check_kernel_build_id_elf_note(false);
+}
+
+#[test]
+fn perf_symbol_resolver_uses_matching_kernel_build_id_elf_when_kallsyms_is_missing() {
+    check_kernel_build_id_elf_note(true);
+}
+
+fn check_kernel_build_id_elf_note(matching_note: bool) {
     let home = tempfile::tempdir().expect("home");
     let perfdata = home.path().join("perf.data");
     std::fs::write(&perfdata, perfdata_with_kernel_build_id()).expect("perfdata");
@@ -2918,14 +2942,31 @@ fn perf_symbol_resolver_uses_valid_kernel_build_id_elf_when_kallsyms_is_missing(
     let kernel_elf =
         pyroclast::symbols::perf_build_id_elf_path(&perf_debug_dir(home.path()), build_id);
     std::fs::create_dir_all(kernel_elf.parent().expect("kernel elf parent")).expect("cache dir");
-    std::fs::write(
-        &kernel_elf,
-        elf_with_dynamic_text_symbol(b"asm_exc_page_fault", 0xffff_ffff_8800_0080, 46),
-    )
-    .expect("regular kernel elf");
-    let runner = Addr2lineRunner::new(b"asm_exc_page_fault\n??:0\n");
-    let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
-        .with_perfdata_file_kernel_cache(&perfdata, &perf_debug_dir(home.path()));
+    let image = elf_with_static_text_symbol(b"asm_exc_page_fault", 0xffff_ffff_8800_0080, 46);
+    let bytes = if matching_note {
+        let mut builder = build::elf::Builder::read(image.as_slice()).unwrap();
+        let note_image = elf_with_recorded_build_id(build_id);
+        let note_object = object::File::parse(note_image.as_slice()).unwrap();
+        let note = note_object.section_by_name(".note.gnu.build-id").unwrap();
+        let section = builder.sections.add();
+        section.name = b".note.gnu.build-id"[..].into();
+        section.sh_type = elf::SHT_NOTE;
+        section.sh_addralign = 4;
+        section.data =
+            build::elf::SectionData::Data(object::ObjectSection::data(&note).unwrap().into());
+        builder.set_section_sizes();
+        let mut bytes = Vec::new();
+        builder.write(&mut bytes).unwrap();
+        bytes
+    } else {
+        image
+    };
+    std::fs::write(&kernel_elf, bytes).expect("regular kernel elf");
+    // Native-first missing/matching note coverage lives in perfdata_fold;
+    // symbol-elf.c:1228-1247 validates the DSO ID, not just a request's ID.
+    let resolver =
+        pyroclast::symbols::PerfSymbolResolver::from_object_resolver(RustAddr2lineResolver::new())
+            .with_perfdata_file_kernel_cache(&perfdata, &perf_debug_dir(home.path()));
     resolver.initialize_kernel_maps(&kernel_build_id_maps());
     let symbols = resolver
         .resolve_batch(&[SymbolRequest {
@@ -2939,20 +2980,14 @@ fn perf_symbol_resolver_uses_valid_kernel_build_id_elf_when_kallsyms_is_missing(
             kernel_relocation: None,
         }])
         .expect("symbols");
-    assert_eq!(symbols, vec![Some("asm_exc_page_fault".to_string())]);
     assert_eq!(
-        runner.commands()[0].args,
-        vec![
-            "-f".to_string(),
-            "-C".to_string(),
-            "-e".to_string(),
-            kernel_elf.display().to_string(),
-        ]
+        symbols,
+        vec![matching_note.then(|| "asm_exc_page_fault".to_string())]
     );
 }
 
 #[test]
-fn perf_symbol_resolver_prefers_system_kallsyms_over_kernel_elf() {
+fn perf_symbol_resolver_uses_system_kallsyms_when_kernel_elf_is_invalid() {
     let root = tempfile::tempdir().expect("root");
     let kernel_elf = root.path().join("vmlinux");
     std::fs::write(&kernel_elf, b"not a real elf; runner is faked").expect("kernel elf");
@@ -3523,13 +3558,26 @@ fn perf_symbol_resolver_note_only_module_elf_stays_unknown_without_bare_gnu_look
 }
 
 #[test]
-fn perf_symbol_resolver_uses_module_build_id_elf() {
+fn perf_symbol_resolver_rejects_dynsym_only_module_build_id_elf() {
+    check_module_build_id_elf(false);
+}
+
+#[test]
+fn perf_symbol_resolver_uses_symtab_module_build_id_elf() {
+    check_module_build_id_elf(true);
+}
+
+fn check_module_build_id_elf(has_symtab: bool) {
     let home = tempfile::tempdir().expect("home");
     let build_id = "d6ed2003b20b59c61cdc649124d920215521fc00";
     let module_elf =
         pyroclast::symbols::perf_build_id_elf_path(&perf_debug_dir(home.path()), build_id);
     std::fs::create_dir_all(module_elf.parent().expect("module elf parent")).expect("cache dir");
-    let image = elf_with_dynamic_text_symbol(b"igb_clean_rx_irq", 0, 64);
+    let image = if has_symtab {
+        elf_with_static_text_symbol(b"igb_clean_rx_irq", 0, 64)
+    } else {
+        elf_with_dynamic_text_symbol(b"igb_clean_rx_irq", 0, 64)
+    };
     let mut builder = build::elf::Builder::read(image.as_slice()).unwrap();
     let note_image = elf_with_recorded_build_id(build_id);
     let note_object = object::File::parse(note_image.as_slice()).unwrap();
@@ -3562,8 +3610,8 @@ fn perf_symbol_resolver_uses_module_build_id_elf() {
         }])
         .expect("symbols");
 
-    assert_eq!(symbols, vec![Some("igb_clean_rx_irq".to_string())]);
-    // The selected ELF owns the base symbol; no addr2line query is necessary.
+    assert_eq!(symbols, vec![has_symtab.then(|| "igb_clean_rx_irq".into())]);
+    // Kernel DSOs require SYMTAB even if DYNSYM contains an eligible symbol.
     assert!(runner.commands().is_empty());
 }
 
@@ -4217,6 +4265,55 @@ fn elf_with_recorded_build_id(build_id: &str) -> Vec<u8> {
     builder.write(&mut bytes).unwrap();
     let object = object::File::parse(bytes.as_slice()).unwrap();
     assert_eq!(object.build_id().unwrap(), Some(id.as_slice()));
+    bytes
+}
+
+fn elf_with_static_text_symbol(name: &'static [u8], address: u64, size: usize) -> Vec<u8> {
+    let mut object = object::write::Object::new(
+        object::BinaryFormat::Elf,
+        object::Architecture::X86_64,
+        object::Endianness::Little,
+    );
+    let text = object.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
+    object.section_mut(text).set_data(vec![0xcc; size], 16);
+    object.add_symbol(object::write::Symbol {
+        name: name.to_vec(),
+        value: 0,
+        size: u64::try_from(size).unwrap(),
+        kind: object::SymbolKind::Text,
+        scope: object::SymbolScope::Linkage,
+        weak: false,
+        section: object::write::SymbolSection::Section(text),
+        flags: object::SymbolFlags::None,
+    });
+    let image = object.write().unwrap();
+    let mut builder = build::elf::Builder::read(image.as_slice()).unwrap();
+    builder.header.e_type = elf::ET_EXEC;
+    let text = builder
+        .sections
+        .iter_mut()
+        .find(|section| section.name.as_slice() == b".text")
+        .unwrap();
+    text.sh_addr = address;
+    let text_id = text.id();
+    for symbol in builder
+        .symbols
+        .iter_mut()
+        .filter(|symbol| symbol.section == Some(text_id))
+    {
+        symbol.st_value += address;
+    }
+    let mut bytes = Vec::new();
+    builder.write(&mut bytes).unwrap();
+    let parsed = object::File::parse(bytes.as_slice()).unwrap();
+    assert!(parsed.symbol_table().is_some());
+    let text = parsed.section_by_name(".text").unwrap();
+    let symbol = parsed
+        .symbols()
+        .find(|symbol| symbol.name_bytes() == Ok(name))
+        .unwrap();
+    assert!(symbol.address() >= text.address());
+    assert!(symbol.address() + symbol.size() <= text.address() + text.size());
     bytes
 }
 
