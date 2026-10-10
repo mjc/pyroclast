@@ -433,6 +433,7 @@ pub struct SymbolFrameCache<'a, R> {
     scratch_missing_keys: Vec<MappingFrameKey>,
     scratch_missing_requests: Vec<SymbolRequest>,
     replaced_kernel_entries: SmallVec<[(bool, MappingFrameKey, bool); 2]>,
+    pending_kernel_module_misses: SmallVec<[(bool, MappingFrameKey); 2]>,
     kernel_cursor_hint: Option<(MappingFrameKey, bool)>,
     retained_sample_ip: Option<(MappingFrameKey, CachedMappingFrames)>,
     preprocessed_kernel_modules: FxHashSet<usize>,
@@ -2939,6 +2940,7 @@ where
             scratch_missing_keys: Vec::new(),
             scratch_missing_requests: Vec::new(),
             replaced_kernel_entries: SmallVec::new(),
+            pending_kernel_module_misses: SmallVec::new(),
             kernel_cursor_hint: None,
             retained_sample_ip: None,
             preprocessed_kernel_modules: FxHashSet::default(),
@@ -2988,7 +2990,8 @@ where
         // actually occurs. Repeated module-only samples must not symbolize
         // the same object address again on every cursor.
         if self.kernel_cursor_hint.is_some()
-            || self.replaced_kernel_entries.is_empty()
+            || (self.replaced_kernel_entries.is_empty()
+                && self.pending_kernel_module_misses.is_empty())
             || self.resolver.requires_kernel_cursor_order()
         {
             return;
@@ -3001,6 +3004,17 @@ where
             };
             // These entries are old host-kernel module cursors only. Their
             // rendered projections stay valid; later lookups get a new revision.
+            table.kernel.remove(&key);
+        }
+        // perf v7.2.9 symbol.c:1044-1046/1118-1130 can populate a previously
+        // failed module during core loading. Retire consumed misses without
+        // treating them as map-replacement hints or evicting object symbols.
+        for (inline, key) in self.pending_kernel_module_misses.drain(..) {
+            let table = if inline {
+                &mut self.resolved_by_mapping
+            } else {
+                &mut self.resolved_base_by_mapping
+            };
             table.kernel.remove(&key);
         }
     }
@@ -3336,6 +3350,11 @@ where
                 return Ok(());
             }
             let requests = &requests[..keys.len()];
+            // Resolution may load core midway through this batch. Observe its
+            // readiness before any request, and only for kernel-module misses.
+            let pending_core = keys.iter().zip(requests).any(|(key, request)| {
+                key.kernel_mapping_range.is_some() && is_kernel_module_request(request)
+            }) && self.resolver.requires_kernel_cursor_order();
             let resolved = if inline {
                 self.resolver.resolve_frame_batch_with_metadata(requests)?
             } else {
@@ -3349,7 +3368,7 @@ where
                     requests.len()
                 ));
             }
-            for (key, frames) in keys.drain(..).zip(resolved) {
+            for ((key, request), frames) in keys.drain(..).zip(requests).zip(resolved) {
                 if matches!(
                     frames.source_state,
                     SymbolSourceState::KernelMapReplaced
@@ -3363,6 +3382,13 @@ where
                 }
                 let unavailable = frames.source_state == SymbolSourceState::Unavailable;
                 let frames = CachedMappingFrames::from_resolved(frames);
+                if pending_core
+                    && key.kernel_mapping_range.is_some()
+                    && is_kernel_module_request(request)
+                    && frames.is_fully_unresolved()
+                {
+                    self.pending_kernel_module_misses.push((inline, key));
+                }
                 if unavailable && key.kernel_mapping_range.is_none() && frames.is_fully_unresolved()
                 {
                     self.resolved_by_mapping
@@ -20275,6 +20301,142 @@ mod tests {
             file_identity: None,
             kernel_relocation: None,
         }
+    }
+
+    #[derive(Default)]
+    struct KernelModuleCacheLifecycleResolver {
+        core_ready: Cell<bool>,
+        calls: Cell<usize>,
+    }
+
+    impl SymbolResolver for KernelModuleCacheLifecycleResolver {
+        fn requires_kernel_cursor_order(&self) -> bool {
+            !self.core_ready.get()
+        }
+
+        fn resolve_batch(&self, _: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
+            Err("metadata routing required".into())
+        }
+
+        fn resolve_frame_batch_with_metadata(
+            &self,
+            requests: &[SymbolRequest],
+        ) -> Result<Vec<ResolvedSymbolFrames>, String> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(requests
+                .iter()
+                .map(|request| match request.path.to_str().unwrap() {
+                    "[kernel.kallsyms]" if request.relative_address == 0xffff_ffff_8100_0040 => {
+                        self.core_ready.set(true);
+                        ResolvedSymbolFrames::default()
+                    }
+                    "[positive]" => ResolvedSymbolFrames::from_frames(vec!["object_symbol".into()]),
+                    "[module]" if self.core_ready.get() => {
+                        ResolvedSymbolFrames::from_frames(vec!["loaded_module_symbol".into()])
+                    }
+                    _ => ResolvedSymbolFrames::default(),
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn pre_core_module_misses_expire_after_consumption_without_evicting_positive_or_other_keys() {
+        // perf v7.2.9 symbol.c:1044-1046/1118-1130 can populate a previously
+        // failed module during core loading; machine.c:2256-2259 looks it up
+        // again for later frames. A retained cursor still consumes its old result.
+        for inline in [false, true] {
+            let resolver = KernelModuleCacheLifecycleResolver::default();
+            let mut cache = SymbolFrameCache::new(&resolver);
+            let module = test_mapping_ref("[module]", 0xffff_ffff_c100_0030);
+            let positive = test_mapping_ref("[positive]", 0xffff_ffff_c200_0030);
+            let core_miss = test_mapping_ref("[kernel.kallsyms]", 0xffff_ffff_8100_0030);
+            let user_miss = test_mapping_ref("/missing-user", 0x30);
+            let activate = test_mapping_ref("[kernel.kallsyms]_activate", 0xffff_ffff_8100_0040);
+            cache
+                .prefetch_mapping_refs_with_mode(
+                    [&module, &positive, &core_miss, &user_miss, &activate],
+                    inline,
+                )
+                .unwrap();
+            assert!(resolver.core_ready.get());
+            assert!(cache.kernel_cursor_hint.is_none());
+            assert!(cache.replaced_kernel_entries.is_empty());
+            assert!(
+                cache
+                    .resolve_cached_mapping(&module, inline)
+                    .unwrap()
+                    .frames
+                    .is_empty()
+            );
+            let positive_ptr = cache
+                .resolve_cached_mapping(&positive, inline)
+                .unwrap()
+                .frames
+                .as_ptr();
+            assert_eq!(resolver.calls.get(), 1);
+            cache.finish_kernel_sample();
+            assert!(cache.mapping_ref_cached(&positive, inline));
+            assert!(cache.mapping_ref_cached(&core_miss, inline));
+            assert!(cache.mapping_ref_cached(&user_miss, inline));
+            assert_eq!(
+                cache
+                    .resolve_cached_mapping(&positive, inline)
+                    .unwrap()
+                    .frames
+                    .as_ptr(),
+                positive_ptr
+            );
+            assert_eq!(resolver.calls.get(), 1);
+            assert_eq!(
+                cache
+                    .resolve_cached_mapping(&module, inline)
+                    .unwrap()
+                    .frames,
+                ["loaded_module_symbol"]
+            );
+            assert_eq!(resolver.calls.get(), 2);
+            cache.finish_kernel_cursor();
+            cache.resolve_cached_mapping(&module, inline).unwrap();
+            assert_eq!(resolver.calls.get(), 2);
+        }
+    }
+
+    #[test]
+    fn pre_core_module_misses_remain_cached_until_core_is_ready_in_both_modes() {
+        let resolver = KernelModuleCacheLifecycleResolver::default();
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let module = test_mapping_ref("[module]", 0xffff_ffff_c100_0030);
+        for inline in [false, true] {
+            cache.resolve_cached_mapping(&module, inline).unwrap();
+        }
+        assert_eq!(resolver.calls.get(), 2);
+        for _ in 0..3 {
+            cache.finish_kernel_cursor();
+            cache.finish_kernel_sample();
+            for inline in [false, true] {
+                assert!(
+                    cache
+                        .resolve_cached_mapping(&module, inline)
+                        .unwrap()
+                        .frames
+                        .is_empty()
+                );
+            }
+        }
+        assert_eq!(resolver.calls.get(), 2);
+        resolver.core_ready.set(true);
+        cache.finish_kernel_cursor();
+        for inline in [false, true] {
+            assert_eq!(
+                cache
+                    .resolve_cached_mapping(&module, inline)
+                    .unwrap()
+                    .frames,
+                ["loaded_module_symbol"]
+            );
+        }
+        assert_eq!(resolver.calls.get(), 4);
     }
 
     struct CountingFrameResolver {

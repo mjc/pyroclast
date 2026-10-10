@@ -8918,6 +8918,210 @@ fn native_loaded_module_switch_discards_first_row_but_keeps_second_row() {
 }
 
 #[cfg(target_os = "linux")]
+fn write_native_module_miss_refresh_fixture() -> (tempfile::TempDir, Vec<u8>) {
+    const CORE: u64 = 0xffff_ffff_8100_0000;
+    const MODULE: u64 = 0xffff_ffff_c100_0000;
+    let rows = "ffffffff81000000 T _stext\n\
+                ffffffffc1000000 T first\t[a]\n\
+                ffffffffc1000020 T second\t[a]\n";
+    let (root, original) = write_native_kallsyms_fixture_with_mappings(
+        rows,
+        &[],
+        false,
+        &[
+            (CORE, 0x1000, CORE, "[kernel.kallsyms]_stext"),
+            (MODULE, 0x4000, 0, "[a]"),
+            (MODULE + 0x1_0000, 0x4000, 0, "[b]"),
+        ],
+    );
+    let header = pyroclast::perfdata::header::parse_header(&original).unwrap();
+    let mut records = pyroclast::perfdata::records::iter_records(&original, header)
+        .unwrap()
+        .into_iter()
+        .map(|record| {
+            record_bytes_with_misc(
+                record.header.record_type,
+                record.header.misc,
+                record.payload,
+            )
+        })
+        .collect::<Vec<_>>();
+    for (index, (ip, chain)) in [
+        (
+            MODULE + 0x30,
+            vec![
+                0xffff_ffff_ffff_ff80,
+                MODULE + 0x30,
+                MODULE + 0x31,
+                CORE + 0x10,
+            ],
+        ),
+        (
+            CORE + 0x10,
+            vec![
+                0xffff_ffff_ffff_ff80,
+                CORE + 0x10,
+                MODULE + 0x30,
+                MODULE + 0x31,
+                MODULE + 0x32,
+                MODULE + 0x10,
+            ],
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut comm = comm_payload(11, 12, &format!("query_{index:02}"));
+        comm.resize(comm.len().next_multiple_of(8), 0);
+        records.push(record_bytes(3, &comm));
+        records.push(record_bytes_with_misc(
+            PERF_RECORD_SAMPLE,
+            PERF_RECORD_MISC_CPUMODE_KERNEL,
+            &sample_payload_with_time(
+                ip,
+                11,
+                12,
+                1_000_000_000 * (u64::try_from(index).unwrap() + 1),
+                chain,
+            ),
+        ));
+    }
+    let mut attr = file_attr_bytes(
+        PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CALLCHAIN,
+        0,
+        0,
+    );
+    put_u64(&mut attr, 16, 1);
+    let mut bytes = perfdata_with_records_and_attrs_vec(vec![attr], records);
+    put_u64(&mut bytes, 16, 144);
+    std::fs::write(root.path().join("perf.data"), &bytes).unwrap();
+    assert_native_split_kallsyms_fixture(root.path(), &bytes, rows);
+    (root, bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn native_module_miss_refresh_fold(root: &std::path::Path, inline: bool) -> Vec<u8> {
+    use inferno::collapse::Collapse as _;
+
+    // perf7.2.9 symbol.c:1044-1046 discards only the namespace-switch row;
+    // subsequent rows enter the loaded DSO. machine.c:2256-2259 looks up
+    // each later cursor IP again, including previously unresolved addresses.
+    let mut command = Command::new("perf");
+    command
+        .arg("--buildid-dir")
+        .arg(root.join("native-cache"))
+        .args(["script", "--force", "-vvvv"]);
+    if !inline {
+        command.arg("--no-inline");
+    }
+    let perf = command
+        .arg("--kallsyms")
+        .arg(root.join("kallsyms"))
+        .arg("--symfs")
+        .arg(root.join("symfs"))
+        .arg("-i")
+        .arg(root.join("perf.data"))
+        .env("DEBUGINFOD_URLS", "")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&perf.stderr);
+    assert!(perf.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "Using {} for symbols",
+            root.join("kallsyms").display()
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("/kcore for kernel data"), "{stderr}");
+    let script = String::from_utf8(perf.stdout).unwrap();
+    let events = script
+        .split("\n\n")
+        .filter(|event| !event.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 2, "{script}");
+    let frames = events
+        .iter()
+        .map(|event| event.split('\n').skip(1).map(str::trim).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        frames,
+        [
+            vec![
+                "ffffffffc1000030 [unknown] ([a])",
+                "ffffffffc1000031 [unknown] ([a])",
+                "ffffffff81000010 _stext+0x10 ([kernel.kallsyms])"
+            ],
+            vec![
+                "ffffffff81000010 _stext+0x10 ([kernel.kallsyms])",
+                "ffffffffc1000030 second+0x10 ([a])",
+                "ffffffffc1000031 second+0x11 ([a])",
+                "ffffffffc1000032 second+0x12 ([a])",
+                "ffffffffc1000010 [unknown] ([a])"
+            ],
+        ],
+        "native source/cursor prerequisites inline={inline}: {script}\n{stderr}"
+    );
+    let mut folded = Vec::new();
+    inferno::collapse::perf::Folder::default()
+        .collapse(script.as_bytes(), &mut folded)
+        .unwrap();
+    assert!(!folded.is_empty());
+    eprintln!(
+        "native inline={inline}:\n{script}FOLDED:\n{}",
+        String::from_utf8_lossy(&folded)
+    );
+    folded
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_module_misses_before_core_load_refresh_in_the_next_sample() {
+    use pyroclast::symbols::{SelectedObjectResolver, SymbolizerKind};
+
+    let (root, bytes) = write_native_module_miss_refresh_fixture();
+    let native = [false, true].map(|inline| native_module_miss_refresh_fold(root.path(), inline));
+    let runner = pyroclast::process::RealCommandRunner::default();
+    let input = root.path().join("perf.data");
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    for symbolizer in [SymbolizerKind::RustAddr2line, SymbolizerKind::Addr2line] {
+        for (mode, inline) in [false, true].into_iter().enumerate() {
+            for file_route in [false, true] {
+                let resolver =
+                    perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+                        SelectedObjectResolver::new(&runner, symbolizer),
+                        &input,
+                        root.path(),
+                        [],
+                        &root.path().join("kallsyms"),
+                    );
+                let options = FoldOptions {
+                    inline,
+                    count_periods: true,
+                };
+                let result = if file_route {
+                    pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(
+                        &input, options, &resolver,
+                    )
+                } else {
+                    fold_perfdata_callchains_with_symbols(&bytes, options, &resolver)
+                }
+                .unwrap();
+                eprintln!("{symbolizer:?} inline={inline} file={file_route}:\n{result}");
+                actual.push(result.into_bytes());
+                expected.push(native[mode].clone());
+            }
+        }
+    }
+    assert_eq!(actual.len(), 8);
+    assert_eq!(
+        actual, expected,
+        "all eight public routes collected before comparison"
+    );
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn independent_module_sample_ip_loads_before_core_callchain_like_native_perf() {
     assert_native_independent_sample_ip(0xffff_ffff_c100_0010, 0xffff_ffff_8100_0010);
