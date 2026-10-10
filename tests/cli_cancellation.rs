@@ -295,13 +295,15 @@ fn check_recording_flush_cancellation(signal: i32, flush_signal: &str) {
         "recorder did not publish the completed data; stderr={}",
         std::fs::read_to_string(root.path().join("stderr")).unwrap()
     );
-    let data_path =
-        PathBuf::from(std::fs::read_to_string(root.path().join("flush-data-path")).unwrap());
-    assert_eq!(
-        std::fs::read_to_string(data_path).unwrap(),
-        "@offcpu[\n    1 wait+0 ([kernel.kallsyms])\n]: 200\n"
-    );
     assert!(wait_until(|| probe.exited(), Duration::from_secs(3)));
+    // The backend retires its private recorder file before CLI exit; the
+    // published raw artifact must remain available after that boundary.
+    let raw_profile =
+        pyroclast::artifacts::ArtifactLayout::new(out.clone()).raw_profile("bpftrace");
+    assert_eq!(
+        std::fs::read(&raw_profile).unwrap(),
+        b"@offcpu[\n    1 wait+0 ([kernel.kallsyms])\n]: 200\n"
+    );
     assert!(
         probe.owned.iter().all(|process| !process.alive()),
         "CLI exited without stopping every owned process"
@@ -311,6 +313,12 @@ fn check_recording_flush_cancellation(signal: i32, flush_signal: &str) {
         serde_json::from_slice(&std::fs::read(out.join("run.json")).unwrap()).unwrap();
     let summary: serde_json::Value =
         serde_json::from_slice(&std::fs::read(out.join("summary.json")).unwrap()).unwrap();
+    assert!(
+        manifest["artifacts"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::to_value(&raw_profile).unwrap())
+    );
     assert!(manifest["exit_status"].is_null());
     assert_eq!(summary["cancellation_signal"], signal);
     assert_eq!(summary["recorder_status"], 0);
