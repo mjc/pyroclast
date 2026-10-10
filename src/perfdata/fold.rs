@@ -1439,7 +1439,7 @@ impl<'a, 'cache, R: SymbolResolver> FoldedOutput<'a, 'cache, R> {
 
     fn fold_perf_text(
         &mut self,
-        accumulator: &SessionState,
+        accumulator: &mut SessionState,
         sample: &PreparedFoldSample,
     ) -> Result<(), String> {
         use inferno::collapse::Collapse as _;
@@ -1553,7 +1553,7 @@ fn parse_inferno_fold_header(line: &str) -> Option<InfernoFoldHeader<'_>> {
 impl<R: SymbolResolver> SampleOutput for FoldedOutput<'_, '_, R> {
     fn write_sample_event(
         &mut self,
-        accumulator: &SessionState,
+        accumulator: &mut SessionState,
         sample: &PreparedFoldSample,
     ) -> Result<(), String> {
         preprocess_sample_ip(accumulator, sample, self.symbol_cache.as_deref_mut());
@@ -1613,7 +1613,7 @@ impl<R: SymbolResolver> SampleOutput for FoldedOutput<'_, '_, R> {
         // numeric values overlap that recorded-callchain encoding.
         let frames = sample.frames.iter().rev().copied();
         self.buffers.projecting = true;
-        let status = FoldFrameResolver::new(&accumulator.mmap_table, self.inline)
+        let status = FoldFrameResolver::new(&mut accumulator.mmap_table, self.inline)
             .render_folded_stack_for_stack(
                 sample.map_group(),
                 comm,
@@ -1641,7 +1641,7 @@ impl<R: SymbolResolver> SampleOutput for FoldedOutput<'_, '_, R> {
 trait SampleOutput {
     fn write_sample_event(
         &mut self,
-        accumulator: &SessionState,
+        accumulator: &mut SessionState,
         sample: &PreparedFoldSample,
     ) -> Result<(), String>;
 }
@@ -1728,7 +1728,8 @@ impl<O: SampleOutput> SampleSink<O> {
             options,
             &mut self.sample_frames,
         );
-        self.output.write_sample_event(&self.accumulator, &sample)
+        self.output
+            .write_sample_event(&mut self.accumulator, &sample)
     }
 
     fn write_deferred_callchain(
@@ -1771,7 +1772,8 @@ impl<O: SampleOutput> SampleSink<O> {
         // evsel_fprintf.c:171 prints (cookie) for every equal-IP node while
         // deferred metadata is set. Inferno perf.rs:507 omits those names.
         sample.cookie_to_suppress = deferred.cookie_to_suppress;
-        self.output.write_sample_event(&self.accumulator, &sample)
+        self.output
+            .write_sample_event(&mut self.accumulator, &sample)
     }
 }
 
@@ -1782,7 +1784,7 @@ where
 {
     fn write_sample_event(
         &mut self,
-        accumulator: &SessionState,
+        accumulator: &mut SessionState,
         sample: &PreparedFoldSample,
     ) -> Result<(), String> {
         preprocess_sample_ip(accumulator, sample, self.symbol_cache.as_deref_mut());
@@ -1791,7 +1793,7 @@ where
 }
 
 fn preprocess_sample_ip<R: SymbolResolver>(
-    accumulator: &SessionState,
+    accumulator: &mut SessionState,
     sample: &PreparedFoldSample,
     cache: Option<&mut SymbolFrameCache<'_, R>>,
 ) {
@@ -1828,6 +1830,12 @@ fn preprocess_sample_ip<R: SymbolResolver>(
             .symbol_mapping_ref(mapping, Some(cache.resolver()));
         cache.preprocess_sample_ip(&mapping);
     }
+    FoldFrameResolver::new(&mut accumulator.mmap_table, false).prepare_kernel_cursor(
+        Some(pid),
+        frame,
+        &mut mapping_cache,
+        Some(cache.resolver()),
+    );
 }
 
 impl<R, W> PerfScriptOutput<'_, '_, R, W>
@@ -1837,13 +1845,14 @@ where
 {
     fn write_preprocessed_sample_event(
         &mut self,
-        accumulator: &SessionState,
+        accumulator: &mut SessionState,
         sample: &PreparedFoldSample,
     ) -> Result<(), String> {
-        let mut frame_resolver = FoldFrameResolver::new(&accumulator.mmap_table, self.inline);
-        frame_resolver.cookie_to_suppress = sample.cookie_to_suppress;
         if sample.has_callchain {
             self.write_sample_header(accumulator, sample)?;
+            let mut frame_resolver =
+                FoldFrameResolver::new(&mut accumulator.mmap_table, self.inline);
+            frame_resolver.cookie_to_suppress = sample.cookie_to_suppress;
             frame_resolver.write_script_frames_for_stack(
                 sample.map_group(),
                 sample.frames,
@@ -1852,6 +1861,9 @@ where
             )?;
         } else {
             self.write_sample_inline_header(accumulator, sample)?;
+            let mut frame_resolver =
+                FoldFrameResolver::new(&mut accumulator.mmap_table, self.inline);
+            frame_resolver.cookie_to_suppress = sample.cookie_to_suppress;
             frame_resolver.write_inline_sample_frame_for_stack(
                 sample.map_group(),
                 sample.frames,
@@ -2875,7 +2887,7 @@ fn prefetch_sample_symbols<R: SymbolResolver>(
 }
 
 struct FoldFrameResolver<'a> {
-    mmap_table: &'a MmapTable,
+    mmap_table: &'a mut MmapTable,
     inline: bool,
     cookie_to_suppress: Option<u64>,
 }
@@ -3176,7 +3188,34 @@ impl SymbolResolver for NoopSymbolResolver {
 }
 
 impl<'a> FoldFrameResolver<'a> {
-    fn new(mmap_table: &'a MmapTable, inline: bool) -> Self {
+    fn prepare_kernel_cursor<R: SymbolResolver>(
+        &mut self,
+        pid: Option<u32>,
+        frame: FoldFrame,
+        mapping_cache: &mut MappingResolveCache,
+        resolver: Option<&R>,
+    ) -> Option<crate::perfdata::mappings::KernelMapCursor> {
+        let resolver = resolver?;
+        let FrameMappingDecision::Mapped(mapping) =
+            self.mapping_decision(pid, frame, mapping_cache)
+        else {
+            return None;
+        };
+        if !self.mmap_table.module_needs_publication(mapping) {
+            return None;
+        }
+        let native_dso_id = mapping.native_dso_id();
+        let reference = self.mmap_table.symbol_mapping_ref(mapping, Some(resolver));
+        let Some(loaded) = resolver.loaded_kernel_module(&reference) else {
+            self.mmap_table.finish_failed_module_attempt(native_dso_id);
+            return None;
+        };
+        let cursor = self.mmap_table.kernel_cursor(mapping)?;
+        self.mmap_table.publish_kernel_module(cursor, &loaded);
+        Some(cursor)
+    }
+
+    fn new(mmap_table: &'a mut MmapTable, inline: bool) -> Self {
         Self {
             mmap_table,
             inline,
@@ -3189,17 +3228,17 @@ impl<'a> FoldFrameResolver<'a> {
         pid: Option<u32>,
         frame: FoldFrame,
         mapping_cache: &mut MappingResolveCache,
-    ) -> FrameMappingDecision<'a> {
+    ) -> FrameMappingDecision<'_> {
         let context = pid.map(|pid| self.mmap_table.frame_context(pid, mapping_cache));
         Self::mapping_decision_in_context(context.as_ref(), frame, frame.address(), mapping_cache)
     }
 
-    fn mapping_decision_in_context(
-        context: Option<&FrameMappingContext<'a>>,
+    fn mapping_decision_in_context<'mapping>(
+        context: Option<&FrameMappingContext<'mapping>>,
         frame: FoldFrame,
         address: u64,
         mapping_cache: &mut MappingResolveCache,
-    ) -> FrameMappingDecision<'a> {
+    ) -> FrameMappingDecision<'mapping> {
         if let Some(mapping) = resolve_frame_in_context(context, frame, address, mapping_cache) {
             if is_kernel_space_frame(address) && !mapping.is_kernel() {
                 FrameMappingDecision::KernelAddress
@@ -3242,6 +3281,11 @@ impl<'a> FoldFrameResolver<'a> {
             );
             match decision {
                 FrameMappingDecision::Mapped(mapping) => {
+                    if symbol_cache.is_some() && self.mmap_table.module_needs_publication(mapping) {
+                        // Only an unpublished module load can change later
+                        // cursor selection. Warm kernel maps stream normally.
+                        return Ok(FoldedRenderStatus::RequiresPerfText);
+                    }
                     if mapping_requires_perf_text(&mapping) {
                         return Ok(FoldedRenderStatus::RequiresPerfText);
                     }
@@ -3279,6 +3323,10 @@ impl<'a> FoldFrameResolver<'a> {
                             );
                             (frame, decision, repeats)
                         }));
+                        if pending.iter().any(|(_, decision, _)| matches!(decision,
+                            FrameMappingDecision::Mapped(mapping) if self.mmap_table.module_needs_publication(*mapping))) {
+                            return Ok(FoldedRenderStatus::RequiresPerfText);
+                        }
                         let status = append_pending_folded_frames(
                             self.mmap_table,
                             &pending,
@@ -3309,7 +3357,7 @@ impl<'a> FoldFrameResolver<'a> {
     }
 
     fn write_script_frames_for_stack<R, W>(
-        &self,
+        &mut self,
         pid: Option<u32>,
         callchain: &[FoldFrame],
         mut symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
@@ -3358,7 +3406,7 @@ impl<'a> FoldFrameResolver<'a> {
     }
 
     fn write_inline_sample_frame_for_stack<R, W>(
-        &self,
+        &mut self,
         pid: Option<u32>,
         callchain: &[FoldFrame],
         symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
@@ -3373,7 +3421,19 @@ impl<'a> FoldFrameResolver<'a> {
             return Ok(());
         };
         let address = frame.address();
-        match self.mapping_decision(pid, frame, &mut mapping_cache) {
+        let cursor = self.prepare_kernel_cursor(
+            pid,
+            frame,
+            &mut mapping_cache,
+            symbol_cache.as_ref().map(|cache| cache.resolver()),
+        );
+        let decision = cursor
+            .and_then(|cursor| self.mmap_table.retained_kernel_frame(cursor, address))
+            .map_or_else(
+                || self.mapping_decision(pid, frame, &mut mapping_cache),
+                FrameMappingDecision::Mapped,
+            );
+        match decision {
             FrameMappingDecision::Mapped(mapping) => {
                 write_perf_script_inline_mapped_decision_frame(
                     writer,
@@ -3397,7 +3457,7 @@ impl<'a> FoldFrameResolver<'a> {
     }
 
     fn write_regular_script_frame<R, W>(
-        &self,
+        &mut self,
         pid: Option<u32>,
         frame: FoldFrame,
         symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
@@ -3410,7 +3470,17 @@ impl<'a> FoldFrameResolver<'a> {
     {
         let address = frame.address();
         let is_cookie = self.cookie_to_suppress == Some(address);
-        let decision = if is_cookie {
+        let cursor = self.prepare_kernel_cursor(
+            pid,
+            frame,
+            mapping_cache,
+            symbol_cache.as_ref().map(|cache| cache.resolver()),
+        );
+        let decision = if let Some(mapping) =
+            cursor.and_then(|cursor| self.mmap_table.retained_kernel_frame(cursor, address))
+        {
+            FrameMappingDecision::Mapped(mapping)
+        } else if is_cookie {
             let context = pid.map(|pid| self.mmap_table.frame_context(pid, mapping_cache));
             resolve_frame_in_context(context.as_ref(), frame, address, mapping_cache)
                 .map_or(FrameMappingDecision::Unknown, FrameMappingDecision::Mapped)
@@ -3452,7 +3522,7 @@ impl<'a> FoldFrameResolver<'a> {
     }
 
     fn write_inline_current_ip_script_frames<R, W>(
-        &self,
+        &mut self,
         pid: Option<u32>,
         address: u64,
         symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
@@ -3530,12 +3600,12 @@ impl<'a> FoldFrameResolver<'a> {
         Ok(Some(frames))
     }
 
-    fn mapping_decision_for_folded_frame(
-        context: Option<&FrameMappingContext<'a>>,
+    fn mapping_decision_for_folded_frame<'mapping>(
+        context: Option<&FrameMappingContext<'mapping>>,
         frame: FoldFrame,
         symbolizing: bool,
         mapping_cache: &mut MappingResolveCache,
-    ) -> FrameMappingDecision<'a> {
+    ) -> FrameMappingDecision<'mapping> {
         let address = frame.address();
         if symbolizing && matches!(frame, FoldFrame::InlineCurrentIp(_)) {
             return resolve_frame_in_context(context, frame, address, mapping_cache)
@@ -6685,7 +6755,7 @@ mod tests {
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut buffers = super::FoldedRenderBuffers::default();
 
-        super::FoldFrameResolver::new(&mmap_table, false)
+        super::FoldFrameResolver::new(&mut mmap_table, false)
             .render_folded_stack_for_stack(
                 Some(11),
                 Some(super::SampleComm::Name("pyroclast")),
@@ -6726,6 +6796,7 @@ mod tests {
             path: "[module]",
             relative_address: 0xffff_ffff_c100_0010,
             kernel_module_address: None,
+            kernel_module_lookup: None,
             start: 0xffff_ffff_c100_0000,
             end: 0xffff_ffff_c100_1000,
             build_id: None,
@@ -6773,7 +6844,7 @@ mod tests {
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut written = Vec::new();
 
-        super::FoldFrameResolver::new(&mmap_table, true)
+        super::FoldFrameResolver::new(&mut mmap_table, true)
             .write_inline_sample_frame_for_stack(
                 Some(11),
                 &[super::FoldFrame::SampleIp {
@@ -6817,7 +6888,7 @@ mod tests {
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut written = Vec::new();
 
-        super::FoldFrameResolver::new(&mmap_table, true)
+        super::FoldFrameResolver::new(&mut mmap_table, true)
             .write_inline_sample_frame_for_stack(
                 Some(11),
                 &[super::FoldFrame::SampleIp {
@@ -6858,7 +6929,7 @@ mod tests {
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut buffers = super::FoldedRenderBuffers::default();
 
-        super::FoldFrameResolver::new(&mmap_table, false)
+        super::FoldFrameResolver::new(&mut mmap_table, false)
             .render_folded_stack_for_stack(
                 Some(11),
                 Some(super::SampleComm::Name("pyroclast")),
@@ -6903,7 +6974,7 @@ mod tests {
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut buffers = super::FoldedRenderBuffers::default();
 
-        super::FoldFrameResolver::new(&mmap_table, false)
+        super::FoldFrameResolver::new(&mut mmap_table, false)
             .render_folded_stack_for_stack(
                 Some(11),
                 Some(super::SampleComm::Name("pyroclast")),
@@ -6944,7 +7015,7 @@ mod tests {
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut buffers = super::FoldedRenderBuffers::default();
 
-        super::FoldFrameResolver::new(&mmap_table, false)
+        super::FoldFrameResolver::new(&mut mmap_table, false)
             .render_folded_stack_for_stack(
                 Some(11),
                 Some(super::SampleComm::Name("pyroclast")),
@@ -6984,7 +7055,7 @@ mod tests {
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut buffers = super::FoldedRenderBuffers::default();
 
-        super::FoldFrameResolver::new(&mmap_table, true)
+        super::FoldFrameResolver::new(&mut mmap_table, true)
             .render_folded_stack_for_stack(
                 Some(11),
                 Some(super::SampleComm::Name("burn-00")),
@@ -7020,7 +7091,7 @@ mod tests {
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut buffers = super::FoldedRenderBuffers::default();
 
-        super::FoldFrameResolver::new(&mmap_table, true)
+        super::FoldFrameResolver::new(&mut mmap_table, true)
             .render_folded_stack_for_stack(
                 Some(11),
                 Some(super::SampleComm::Name("burn-00")),
@@ -7093,7 +7164,7 @@ mod tests {
             },
             9,
         );
-        direct.write_sample_event(&state, &sample).unwrap();
+        direct.write_sample_event(&mut state, &sample).unwrap();
         let mut script = Vec::new();
         let mut cache = SymbolFrameCache::new(&resolver);
         let mut text = super::PerfScriptOutput {
@@ -7102,7 +7173,7 @@ mod tests {
             event_name_width: 9,
             inline: false,
         };
-        text.write_sample_event(&state, &sample).unwrap();
+        text.write_sample_event(&mut state, &sample).unwrap();
         let mut expected = Vec::new();
         inferno::collapse::perf::Folder::default()
             .collapse(std::io::Cursor::new(&script), &mut expected)
@@ -7143,7 +7214,7 @@ mod tests {
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut buffers = super::FoldedRenderBuffers::default();
 
-        super::FoldFrameResolver::new(&mmap_table, true)
+        super::FoldFrameResolver::new(&mut mmap_table, true)
             .render_folded_stack_for_stack(
                 Some(11),
                 Some(super::SampleComm::Name("burn-00")),
@@ -7190,7 +7261,7 @@ mod tests {
             ] {
                 let mut symbol_cache = SymbolFrameCache::new(&resolver);
                 let mut written = Vec::new();
-                let mut frame_resolver = super::FoldFrameResolver::new(&mmap_table, true);
+                let mut frame_resolver = super::FoldFrameResolver::new(&mut mmap_table, true);
                 frame_resolver.cookie_to_suppress = Some(0x1427);
                 frame_resolver
                     .write_script_frames_for_stack(
@@ -7235,7 +7306,7 @@ mod tests {
         };
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut written = Vec::new();
-        let mut frame_resolver = super::FoldFrameResolver::new(&mmap_table, true);
+        let mut frame_resolver = super::FoldFrameResolver::new(&mut mmap_table, true);
         frame_resolver.cookie_to_suppress = Some(0x1427);
         frame_resolver
             .write_script_frames_for_stack(
@@ -7270,7 +7341,7 @@ mod tests {
             (super::FoldFrame::HypervisorCallchain(address), "[unknown]"),
             (super::FoldFrame::UserUnwind(0x1040), "[unknown]"),
         ] {
-            let mut frame_resolver = super::FoldFrameResolver::new(&mmap_table, true);
+            let mut frame_resolver = super::FoldFrameResolver::new(&mut mmap_table, true);
             frame_resolver.cookie_to_suppress = Some(frame.address());
             let mut written = Vec::new();
             frame_resolver
@@ -7316,7 +7387,7 @@ mod tests {
                     ..StaticFrameResolver::default()
                 };
                 let mut symbol_cache = SymbolFrameCache::new(&resolver);
-                let mut frame_resolver = super::FoldFrameResolver::new(&mmap_table, inline);
+                let mut frame_resolver = super::FoldFrameResolver::new(&mut mmap_table, inline);
                 frame_resolver.cookie_to_suppress = Some(0x1427);
                 for frame in [
                     super::FoldFrame::UserCallchain(0x1427),
@@ -7364,7 +7435,7 @@ mod tests {
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut written = Vec::new();
 
-        super::FoldFrameResolver::new(&mmap_table, false)
+        super::FoldFrameResolver::new(&mut mmap_table, false)
             .write_script_frames_for_stack(
                 Some(11),
                 &[super::FoldFrame::UserUnwind(0x1048)],
@@ -7410,7 +7481,7 @@ mod tests {
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut written = Vec::new();
 
-        super::FoldFrameResolver::new(&mmap_table, true)
+        super::FoldFrameResolver::new(&mut mmap_table, true)
             .write_script_frames_for_stack(
                 Some(11),
                 &[super::FoldFrame::UserUnwind(0x1427)],
@@ -7456,7 +7527,7 @@ mod tests {
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut written = Vec::new();
 
-        super::FoldFrameResolver::new(&mmap_table, true)
+        super::FoldFrameResolver::new(&mut mmap_table, true)
             .write_script_frames_for_stack(
                 Some(11),
                 &[super::FoldFrame::UserUnwind(0x1427)],
@@ -7498,7 +7569,7 @@ mod tests {
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut written = Vec::new();
 
-        super::FoldFrameResolver::new(&mmap_table, true)
+        super::FoldFrameResolver::new(&mut mmap_table, true)
             .write_script_frames_for_stack(
                 Some(11),
                 &[super::FoldFrame::UserUnwind(0x449b)],
@@ -7536,7 +7607,7 @@ mod tests {
         let mut symbol_cache = SymbolFrameCache::new(&resolver);
         let mut written = Vec::new();
 
-        super::FoldFrameResolver::new(&mmap_table, true)
+        super::FoldFrameResolver::new(&mut mmap_table, true)
             .write_script_frames_for_stack(
                 Some(11),
                 &[super::FoldFrame::UserUnwind(0x16cb)],
@@ -7602,10 +7673,10 @@ mod tests {
             },
             0,
         );
-        output.write_sample_event(&state, &sample).unwrap();
+        output.write_sample_event(&mut state, &sample).unwrap();
         assert_eq!(output.buffers.rendered(), "worker_task;[unknown]");
         let capacity = output.buffers.current.capacity();
-        output.write_sample_event(&state, &sample).unwrap();
+        output.write_sample_event(&mut state, &sample).unwrap();
         assert_eq!(output.buffers.rendered(), "worker_task;[unknown]");
         assert_eq!(output.buffers.current.capacity(), capacity);
         assert_eq!(
@@ -7661,7 +7732,7 @@ mod tests {
             },
             0,
         );
-        output.write_sample_event(&state, &sample).unwrap();
+        output.write_sample_event(&mut state, &sample).unwrap();
         let mut actual = Vec::new();
         super::write_fold_counts(output.buffers.counts, &mut actual).unwrap();
         let script = format!("{comm} 7 1.000000: 1 cpu-clock:\n\t1010 [unknown] ([unknown])\n\n");
@@ -7802,7 +7873,7 @@ mod tests {
                     std::ptr::from_ref(sample.event_fields),
                     std::ptr::from_ref(&layouts.fallback.as_ref().unwrap().event_fields),
                 ));
-                output.write_sample_event(&state, &sample).unwrap();
+                output.write_sample_event(&mut state, &sample).unwrap();
             }
             assert!(!output.buffers.counts.scratch_stack.is_empty());
             super::EVENT_NAME_PARSES.with(|parses| assert_eq!(parses.get(), 0, "{name:?}"));
@@ -7960,8 +8031,8 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-            direct.write_sample_event(&state, &sample).unwrap();
-            text.write_sample_event(&state, &sample).unwrap();
+            direct.write_sample_event(&mut state, &sample).unwrap();
+            text.write_sample_event(&mut state, &sample).unwrap();
         }
         let mut options = inferno::collapse::perf::Options::default();
         options.nthreads = 1;
@@ -8037,7 +8108,7 @@ mod tests {
         let resolver = RecordingFrameResolver::default();
         let mut cache = SymbolFrameCache::new(&resolver);
         let mut buffers = super::FoldedRenderBuffers::default();
-        super::FoldFrameResolver::new(&table, true)
+        super::FoldFrameResolver::new(&mut table, true)
             .render_folded_stack_for_stack(
                 Some(7),
                 Some(super::SampleComm::Name("worker")),
@@ -8103,7 +8174,7 @@ mod tests {
         let resolver = RecordingFrameResolver::default();
         let mut cache = SymbolFrameCache::new(&resolver);
         let mut buffers = super::FoldedRenderBuffers::default();
-        super::FoldFrameResolver::new(&table, true)
+        super::FoldFrameResolver::new(&mut table, true)
             .render_folded_stack_for_stack(
                 Some(7),
                 Some(super::SampleComm::Name("worker")),
@@ -8139,7 +8210,7 @@ mod tests {
         let resolver = RecordingFrameResolver::default();
         let mut cache = SymbolFrameCache::new(&resolver);
         let mut buffers = super::FoldedRenderBuffers::default();
-        let renderer = super::FoldFrameResolver::new(&table, true);
+        let renderer = super::FoldFrameResolver::new(&mut table, true);
         renderer
             .render_folded_stack_for_stack(
                 Some(7),
@@ -8224,7 +8295,7 @@ mod tests {
             },
             0,
         );
-        output.write_sample_event(&state, &sample).unwrap();
+        output.write_sample_event(&mut state, &sample).unwrap();
         let expected = (1..=40)
             .rev()
             .fold(String::from("worker"), |mut text, index| {
@@ -8329,7 +8400,7 @@ mod tests {
         let sample = prepared_sample(&frames);
         let before = super::COMM_SYNTAX_SCANS.with(std::cell::Cell::get);
         for _ in 0..512 {
-            output.write_sample_event(&state, &sample).unwrap();
+            output.write_sample_event(&mut state, &sample).unwrap();
         }
         let after = super::COMM_SYNTAX_SCANS.with(std::cell::Cell::get);
         assert_eq!(
@@ -8416,9 +8487,9 @@ mod tests {
 
     #[test]
     fn singleton_frame_runs_never_enter_the_segment_copy_path() {
-        let maps = super::MmapTable::default();
+        let mut maps = super::MmapTable::default();
         let mut buffers = super::FoldedRenderBuffers::default();
-        super::FoldFrameResolver::new(&maps, true)
+        super::FoldFrameResolver::new(&mut maps, true)
             .render_folded_stack_for_stack::<super::NoopSymbolResolver, _>(
                 Some(7),
                 Some(super::SampleComm::Name("worker")),
@@ -8481,14 +8552,14 @@ mod tests {
             for tid in [7, 8] {
                 sample.pid = Some(tid);
                 sample.tid = Some(tid);
-                direct.write_sample_event(&state, &sample).unwrap();
+                direct.write_sample_event(&mut state, &sample).unwrap();
                 super::PerfScriptOutput::<super::NoopSymbolResolver, _> {
                     symbol_cache: None,
                     writer: &mut script,
                     event_name_width: 9,
                     inline: true,
                 }
-                .write_sample_event(&state, &sample)
+                .write_sample_event(&mut state, &sample)
                 .unwrap();
             }
         }
@@ -8525,7 +8596,7 @@ mod tests {
                         is_exec: false,
                     },
                 ));
-                output.write_sample_event(&state, &sample).unwrap();
+                output.write_sample_event(&mut state, &sample).unwrap();
             }
             assert!(output.requires_stream_parser, "comm {comm:?}");
         }
@@ -8589,8 +8660,8 @@ mod tests {
                     inline: true,
                 };
                 for _ in 0..2 {
-                    direct.write_sample_event(&state, &sample).unwrap();
-                    text.write_sample_event(&state, &sample).unwrap();
+                    direct.write_sample_event(&mut state, &sample).unwrap();
+                    text.write_sample_event(&mut state, &sample).unwrap();
                 }
                 let mut options = inferno::collapse::perf::Options::default();
                 options.nthreads = 1;
@@ -8998,7 +9069,7 @@ mod tests {
             for _ in 0..2 {
                 let before = buffers.stack_len_reads.get();
                 let span_reads = super::PROJECTION_SPAN_READS.with(std::cell::Cell::get);
-                super::FoldFrameResolver::new(&maps, true)
+                super::FoldFrameResolver::new(&mut maps, true)
                     .render_folded_stack_for_stack(
                         Some(7),
                         Some(super::SampleComm::Name("worker")),
@@ -9024,14 +9095,300 @@ mod tests {
     }
 
     #[test]
+    fn cold_module_detection_does_not_load_reversed_future_cursors() {
+        struct Sources(std::cell::Cell<usize>);
+        impl crate::symbols::SymbolResolver for Sources {
+            fn loaded_kernel_module(
+                &self,
+                _: &super::ResolvedMappingRef<'_>,
+            ) -> Option<crate::symbols::LoadedKernelModule> {
+                self.0.set(self.0.get() + 1);
+                None
+            }
+            fn resolve_batch(
+                &self,
+                requests: &[crate::symbols::SymbolRequest],
+            ) -> Result<Vec<Option<String>>, String> {
+                Ok(vec![None; requests.len()])
+            }
+        }
+        let mut table = super::MmapTable::default();
+        for (path, start) in [
+            ("/tmp/a.ko", 0xffff_ffff_c100_0000),
+            ("/tmp/b.ko", 0xffff_ffff_c200_0000),
+        ] {
+            table.insert_mmap_with_misc(
+                crate::perfdata::records::MmapRecord {
+                    pid: u32::MAX,
+                    tid: 7,
+                    start,
+                    len: 0x100,
+                    pgoff: 0,
+                    path: path.into(),
+                },
+                super::PERF_RECORD_MISC_CPUMODE_KERNEL,
+            );
+        }
+        let sources = Sources(std::cell::Cell::new(0));
+        let mut cache = SymbolFrameCache::new(&sources);
+        let mut buffers = super::FoldedRenderBuffers::default();
+        let status = super::FoldFrameResolver::new(&mut table, true)
+            .render_folded_stack_for_stack(
+                Some(7),
+                None,
+                [
+                    super::FoldFrame::Callchain(0xffff_ffff_c200_0010),
+                    super::FoldFrame::Callchain(0xffff_ffff_c100_0010),
+                ],
+                Some(&mut cache),
+                &mut buffers,
+            )
+            .unwrap();
+        assert_eq!(
+            sources.0.get(),
+            0,
+            "cold detection must not select/load a future source"
+        );
+        assert!(matches!(
+            status,
+            super::FoldedRenderStatus::RequiresPerfText
+        ));
+    }
+
+    struct PublicationResolver {
+        loaded: Option<crate::symbols::LoadedKernelModule>,
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl SymbolResolver for PublicationResolver {
+        fn loaded_kernel_module(
+            &self,
+            _: &super::ResolvedMappingRef<'_>,
+        ) -> Option<crate::symbols::LoadedKernelModule> {
+            self.calls.set(self.calls.get() + 1);
+            self.loaded.clone()
+        }
+
+        fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
+            Ok(requests
+                .iter()
+                .map(|request| Some(format!("symbol_{:x}", request.relative_address)))
+                .collect())
+        }
+    }
+
+    fn publication_state() -> super::SessionState {
+        let mut state = super::SessionState::new(std::collections::BTreeMap::new());
+        state.thread_comms.insert(7, "worker".into());
+        insert_test_mapping(&mut state.mmap_table, 7, 0x1000, 0x100, "/bin/user");
+        state.mmap_table.insert_mmap_with_misc(
+            crate::perfdata::records::MmapRecord {
+                pid: u32::MAX,
+                tid: 7,
+                start: 0xffff_ffff_c100_0000,
+                len: 0x100,
+                pgoff: 0,
+                path: "/tmp/a.ko".into(),
+            },
+            super::PERF_RECORD_MISC_CPUMODE_KERNEL,
+        );
+        state
+    }
+
+    fn publication_resolver(populated: Option<bool>) -> PublicationResolver {
+        PublicationResolver {
+            calls: std::cell::Cell::new(0),
+            loaded: populated.map(|has_symbols| crate::symbols::LoadedKernelModule {
+                path: std::sync::Arc::from(std::path::Path::new("/tmp/a.ko")),
+                metadata: std::sync::Arc::new(crate::symbols::KernelModuleObjectMetadata {
+                    has_symbols,
+                    text_section: has_symbols.then_some((1, 0x1000)),
+                    table_map_counts: if has_symbols { vec![0, 0] } else { vec![] },
+                    ..Default::default()
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn failed_empty_and_populated_module_loads_are_terminal_per_dso() {
+        for populated in [None, Some(false), Some(true)] {
+            let mut state = publication_state();
+            let resolver = publication_resolver(populated);
+            let mut maps = super::MappingResolveCache::default();
+            for _ in 0..3 {
+                super::FoldFrameResolver::new(&mut state.mmap_table, false).prepare_kernel_cursor(
+                    Some(7),
+                    super::FoldFrame::Callchain(0xffff_ffff_c100_0010),
+                    &mut maps,
+                    Some(&resolver),
+                );
+            }
+            assert_eq!(resolver.calls.get(), 1, "outcome {populated:?}");
+            let snapshot = state.mmap_table.clone();
+            super::FoldFrameResolver::new(&mut state.mmap_table, false).prepare_kernel_cursor(
+                Some(7),
+                super::FoldFrame::Callchain(0xffff_ffff_c100_0020),
+                &mut maps,
+                Some(&resolver),
+            );
+            assert_eq!(
+                state.mmap_table.user_mappings().collect::<Vec<_>>(),
+                snapshot.user_mappings().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                state
+                    .mmap_table
+                    .host_kernel_mappings()
+                    .map(|map| (map.start, map.pgoff, map.path))
+                    .collect::<Vec<_>>(),
+                snapshot
+                    .host_kernel_mappings()
+                    .map(|map| (map.start, map.pgoff, map.path))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(resolver.calls.get(), 1);
+            let frame = state
+                .mmap_table
+                .resolve_ref(7, 0xffff_ffff_c100_0010)
+                .unwrap();
+            assert_eq!(
+                frame.relative_address,
+                if populated == Some(true) {
+                    0x1010
+                } else {
+                    0x10
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn cached_prefix_abort_then_warm_module_event_commits_each_weight_once() {
+        use super::SampleOutput as _;
+        use inferno::collapse::Collapse as _;
+        let mut state = publication_state();
+        let mut text_state = publication_state();
+        let resolver = publication_resolver(Some(true));
+        let text_resolver = publication_resolver(Some(true));
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let mut text_cache = SymbolFrameCache::new(&text_resolver);
+        let mut direct = super::FoldedOutput::new(
+            Some(&mut cache),
+            super::FoldOptions {
+                count_periods: true,
+                ..Default::default()
+            },
+            9,
+        );
+        let mut script = Vec::new();
+        let mut text = super::PerfScriptOutput {
+            symbol_cache: Some(&mut text_cache),
+            writer: &mut script,
+            event_name_width: 9,
+            inline: false,
+        };
+        let warm = [super::FoldFrame::UserUnwind(0x1010)];
+        let mixed = [
+            super::FoldFrame::Callchain(0xffff_ffff_c100_0010),
+            super::FoldFrame::UserUnwind(0x1010),
+        ];
+        for (frames, weight) in [
+            (warm.as_slice(), 2),
+            (mixed.as_slice(), 3),
+            (mixed.as_slice(), 5),
+        ] {
+            let (layouts, _) = event_test_sample("cpu-clock", weight, Some(1_000_000_000), true);
+            let mut sample = prepared_sample_for_event(frames, layouts.fallback.as_ref().unwrap());
+            sample.count = weight;
+            direct.write_sample_event(&mut state, &sample).unwrap();
+            text.write_sample_event(&mut text_state, &sample).unwrap();
+        }
+        assert_eq!(resolver.calls.get(), 1);
+        assert_eq!(text_resolver.calls.get(), 1);
+        let mut actual = Vec::new();
+        super::write_fold_counts(direct.buffers.counts, &mut actual).unwrap();
+        let mut options = inferno::collapse::perf::Options::default();
+        options.nthreads = 1;
+        let mut expected = Vec::new();
+        inferno::collapse::perf::Folder::from(options)
+            .collapse(std::io::Cursor::new(script), &mut expected)
+            .unwrap();
+        assert_eq!(actual, expected);
+        let output = String::from_utf8(actual).unwrap();
+        assert_eq!(
+            output.lines().count(),
+            2,
+            "no aborted prefix-only stack: {output}"
+        );
+        assert!(output.lines().any(|line| line.ends_with(" 2")), "{output}");
+        assert!(output.lines().any(|line| line.ends_with(" 8")), "{output}");
+    }
+
+    #[test]
+    fn warm_kernel_and_failed_module_cursors_keep_direct_projection_without_slot_recovery() {
+        let start = 0xffff_ffff_c100_0000;
+        let mut table = super::MmapTable::default();
+        for index in 0..1024 {
+            insert_test_mapping(&mut table, 7, 0x1000 + index * 0x1000, 0x100, "/bin/user");
+        }
+        for (path, base) in [("[kernel.kallsyms]", start), ("/tmp/a.ko", start + 0x1000)] {
+            table.insert_mmap_with_misc(
+                crate::perfdata::records::MmapRecord {
+                    pid: u32::MAX,
+                    tid: 7,
+                    start: base,
+                    len: 0x100,
+                    pgoff: 0,
+                    path: path.into(),
+                },
+                super::PERF_RECORD_MISC_CPUMODE_KERNEL,
+            );
+        }
+        let resolver = RecordingFrameResolver::default();
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let mut mapping_cache = super::MappingResolveCache::default();
+        // A failed load is terminal, just as an accepted empty table is.
+        super::FoldFrameResolver::new(&mut table, true).prepare_kernel_cursor(
+            Some(7),
+            super::FoldFrame::Callchain(start + 0x1010),
+            &mut mapping_cache,
+            Some(&resolver),
+        );
+        let mut buffers = super::FoldedRenderBuffers {
+            projecting: true,
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            let status = super::FoldFrameResolver::new(&mut table, true)
+                .render_folded_stack_for_stack(
+                    Some(7),
+                    Some(super::SampleComm::Name("worker")),
+                    [
+                        super::FoldFrame::Callchain(start + 0x10),
+                        super::FoldFrame::Callchain(start + 0x1010),
+                    ],
+                    Some(&mut cache),
+                    &mut buffers,
+                )
+                .unwrap();
+            assert!(matches!(status, super::FoldedRenderStatus::Rendered));
+            assert_eq!(buffers.counts.scratch_stack.len(), 3);
+        }
+        assert_eq!(table.cursor_slot_visit_count(), 0);
+        assert_eq!(std::mem::size_of::<super::MappedFrame<'_>>(), 16);
+        assert_eq!(resolver.full_batch_sizes.borrow().iter().sum::<usize>(), 2);
+    }
+
+    #[test]
     fn singleton_frames_do_not_read_stack_lengths_for_unused_repeat_segments() {
-        let maps = super::MmapTable::default();
+        let mut maps = super::MmapTable::default();
         for projecting in [false, true] {
             let mut buffers = super::FoldedRenderBuffers {
                 projecting,
                 ..Default::default()
             };
-            super::FoldFrameResolver::new(&maps, true)
+            super::FoldFrameResolver::new(&mut maps, true)
                 .render_folded_stack_for_stack::<super::NoopSymbolResolver, _>(
                     Some(7),
                     Some(super::SampleComm::Name("worker")),
@@ -9061,7 +9418,7 @@ mod tests {
         for address in 1..=512 {
             let frames = [super::FoldFrame::Callchain(address)];
             output
-                .write_sample_event(&state, &prepared_sample(&frames))
+                .write_sample_event(&mut state, &prepared_sample(&frames))
                 .unwrap();
         }
         assert_eq!(output.buffers.rendered(), "worker;[unknown]");
@@ -9099,7 +9456,7 @@ mod tests {
             projecting: true,
             ..Default::default()
         };
-        super::FoldFrameResolver::new(&table, true)
+        super::FoldFrameResolver::new(&mut table, true)
             .render_folded_stack_for_stack::<super::NoopSymbolResolver, _>(
                 Some(7),
                 Some(super::SampleComm::Name("worker")),
@@ -9140,7 +9497,7 @@ mod tests {
             ..Default::default()
         };
         for _ in 0..2 {
-            super::FoldFrameResolver::new(&table, true)
+            super::FoldFrameResolver::new(&mut table, true)
                 .render_folded_stack_for_stack::<super::NoopSymbolResolver, _>(
                     Some(7),
                     Some(super::SampleComm::Name("worker")),
@@ -9192,7 +9549,7 @@ mod tests {
                     ..Default::default()
                 };
                 let mut cache = SymbolFrameCache::new(&resolver);
-                let renderer = super::FoldFrameResolver::new(&table, inline);
+                let renderer = super::FoldFrameResolver::new(&mut table, inline);
                 let frames = [
                     super::FoldFrame::Callchain(0x1010),
                     super::FoldFrame::Callchain(0x1010),
@@ -9257,7 +9614,7 @@ mod tests {
         let frames = [super::FoldFrame::Callchain(0x1010)];
         let sample = prepared_sample(&frames);
         for _ in 0..512 {
-            output.write_sample_event(&state, &sample).unwrap();
+            output.write_sample_event(&mut state, &sample).unwrap();
         }
         assert_eq!(output.buffers.rendered(), "worker;outer;inner_[i]");
         assert_eq!(
@@ -9280,7 +9637,7 @@ mod tests {
         let mut buffers = super::FoldedRenderBuffers::default();
         for _ in 0..2 {
             let frames = (0..512).map(|offset| super::FoldFrame::UserUnwind(0x1000 + offset));
-            super::FoldFrameResolver::new(&table, true)
+            super::FoldFrameResolver::new(&mut table, true)
                 .render_folded_stack_for_stack(
                     Some(7),
                     Some(super::SampleComm::Name("worker")),
@@ -9327,7 +9684,7 @@ mod tests {
         );
         let frames = [super::FoldFrame::UserUnwind(0x1010); 512];
         let sample = prepared_sample(&frames);
-        output.write_sample_event(&state, &sample).unwrap();
+        output.write_sample_event(&mut state, &sample).unwrap();
         assert_eq!(
             output.buffers.rendered(),
             format!("worker{}", ";symbol_10".repeat(512))
@@ -9342,7 +9699,7 @@ mod tests {
             lookups, 4,
             "cold runs need one miss, prefetch, insert, and render lookup"
         );
-        output.write_sample_event(&state, &sample).unwrap();
+        output.write_sample_event(&mut state, &sample).unwrap();
         assert_eq!(
             output
                 .symbol_cache
@@ -9398,10 +9755,10 @@ mod tests {
             super::FoldFrame::UserUnwind(0x1020),
             super::FoldFrame::UserUnwind(0x2020),
         ]);
-        output.write_sample_event(&state, &sample).unwrap();
+        output.write_sample_event(&mut state, &sample).unwrap();
         let searches = state.mmap_table.index_search_count();
         let buckets = state.mmap_table.bucket_search_count();
-        output.write_sample_event(&state, &sample).unwrap();
+        output.write_sample_event(&mut state, &sample).unwrap();
         assert_eq!(
             state.mmap_table.index_search_count() - searches,
             4,
@@ -9570,7 +9927,7 @@ mod tests {
             0,
         );
         for _ in 0..2 {
-            output.write_sample_event(&state, &sample).unwrap();
+            output.write_sample_event(&mut state, &sample).unwrap();
         }
         assert_eq!(*resolver.full_batch_sizes.borrow(), [2]);
         assert_eq!(*resolver.base_batch_sizes.borrow(), [1]);
@@ -9610,7 +9967,7 @@ mod tests {
                         path: path.into(),
                     });
                 for _ in 0..2 {
-                    output.write_sample_event(&state, &sample).unwrap();
+                    output.write_sample_event(&mut state, &sample).unwrap();
                 }
             }
             let (requests, batches) = if inline {
@@ -9663,7 +10020,7 @@ mod tests {
         impl super::SampleOutput for ObservingOutput {
             fn write_sample_event(
                 &mut self,
-                _state: &super::SessionState,
+                _state: &mut super::SessionState,
                 sample: &super::PreparedFoldSample,
             ) -> Result<(), String> {
                 self.seen
@@ -9898,7 +10255,7 @@ mod tests {
         use super::SampleOutput as _;
         // Inferno after_event() counts final normalized stacks. Distinct raw
         // addresses that all print [unknown] must not build a raw-IP arena.
-        let state = super::SessionState::new(std::collections::BTreeMap::new());
+        let mut state = super::SessionState::new(std::collections::BTreeMap::new());
         let mut output = super::FoldedOutput::<super::NoopSymbolResolver>::new(
             None,
             super::FoldOptions {
@@ -9911,7 +10268,7 @@ mod tests {
             for address in 1..=4096 {
                 output
                     .write_sample_event(
-                        &state,
+                        &mut state,
                         &prepared_sample(&[super::FoldFrame::UserUnwind(address)]),
                     )
                     .unwrap();
@@ -9959,7 +10316,7 @@ mod tests {
                 });
             output
                 .write_sample_event(
-                    &state,
+                    &mut state,
                     &prepared_sample(&[super::FoldFrame::UserUnwind(0x1010)]),
                 )
                 .unwrap();
@@ -10015,7 +10372,7 @@ mod tests {
         );
 
         let mut written = Vec::new();
-        super::FoldFrameResolver::new(&mmap_table, false)
+        super::FoldFrameResolver::new(&mut mmap_table, false)
             .write_script_frames_for_stack(
                 Some(7),
                 &[super::FoldFrame::UserUnwind(0xffff_ffff_8100_0010)],
@@ -11365,6 +11722,7 @@ mod tests {
             path: "/usr/lib/libdemo.so",
             relative_address: 0x1234,
             kernel_module_address: None,
+            kernel_module_lookup: None,
             start: 0,
             end: u64::MAX,
             build_id: None,
@@ -11390,6 +11748,7 @@ mod tests {
             path: "/tmp/a;b\\c\r\n\u{e9}",
             relative_address: 0x1234,
             kernel_module_address: None,
+            kernel_module_lookup: None,
             start: 0,
             end: u64::MAX,
             build_id: None,
@@ -11420,6 +11779,7 @@ mod tests {
                 path,
                 relative_address: address,
                 kernel_module_address: None,
+                kernel_module_lookup: None,
                 start: 0,
                 end: u64::MAX,
                 build_id: None,
@@ -11516,7 +11876,7 @@ mod tests {
         ];
         let (layouts, _) = event_test_sample("cpu-clock", 1, Some(1_000_000_000), true);
         let sample = prepared_sample_for_event(&frames, layouts.fallback.as_ref().unwrap());
-        direct.write_sample_event(&state, &sample).unwrap();
+        direct.write_sample_event(&mut state, &sample).unwrap();
         let mut script = Vec::new();
         let mut cache = SymbolFrameCache::new(&resolver);
         let mut text = super::PerfScriptOutput {
@@ -11525,7 +11885,7 @@ mod tests {
             event_name_width: 9,
             inline: false,
         };
-        text.write_sample_event(&state, &sample).unwrap();
+        text.write_sample_event(&mut state, &sample).unwrap();
         let mut options = inferno::collapse::perf::Options::default();
         options.nthreads = 1;
         let mut expected = Vec::new();
@@ -11592,7 +11952,7 @@ mod tests {
                 .unwrap();
                 output
                     .write_sample_event(
-                        &state,
+                        &mut state,
                         &prepared_sample(&[super::FoldFrame::UserUnwind(0x1010)]),
                     )
                     .unwrap();

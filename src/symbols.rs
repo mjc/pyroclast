@@ -168,6 +168,9 @@ impl Ord for SymbolRequest {
 pub struct KernelModuleSectionMap {
     pub section: String,
     pub start: u64,
+    pub size: u64,
+    pub file_offset: u64,
+    pub lookup_section: u32,
 }
 
 /// Mapping effects and object address of the original module's text section.
@@ -176,9 +179,11 @@ pub struct KernelModuleObjectMetadata {
     pub text_address: Option<u64>,
     pub text_section: Option<(u32, u64)>,
     pub maps: Vec<KernelModuleSectionMap>,
+    pub table_map_counts: Vec<usize>,
     pub lookup_projection: Option<u64>,
     /// Accepted rows after SOURCE allocation and paired runtime label filtering.
     pub has_symbols: bool,
+    pub relocatable: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -189,6 +194,13 @@ struct KernelModuleSectionLayout {
     executable: bool,
     text: bool,
     labels_eligible: bool,
+    group: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct LoadedKernelModule {
+    pub path: Arc<Path>,
+    pub metadata: Arc<KernelModuleObjectMetadata>,
 }
 
 #[derive(Clone, Debug)]
@@ -232,6 +244,14 @@ pub trait SymbolResolver {
     /// perf `builtin-script.c:process_sample_event` loads the event IP's map
     /// before resolving any callchain nodes (`event.c:machine__resolve`).
     fn preprocess_sample_ip(&self, _mapping: &ResolvedMappingRef<'_>) {}
+
+    /// Retains the selected module's symbol-load map effects for the session.
+    fn loaded_kernel_module(
+        &self,
+        _mapping: &ResolvedMappingRef<'_>,
+    ) -> Option<LoadedKernelModule> {
+        None
+    }
 
     /// Resolves a batch of object-relative addresses.
     ///
@@ -763,6 +783,7 @@ pub struct RustAddr2lineResolver {
 #[derive(Default)]
 struct ObjectAddressCache {
     segments_by_path: FxHashMap<OsString, Option<ObjectAddressMetadata>>,
+    module_projection_sources: FxHashMap<u64, Arc<Path>>,
 }
 
 struct ObjectAddressMetadata {
@@ -2929,6 +2950,44 @@ impl<O> SymbolResolver for PerfSymbolResolver<O>
 where
     O: SymbolResolver,
 {
+    fn loaded_kernel_module(&self, mapping: &ResolvedMappingRef<'_>) -> Option<LoadedKernelModule> {
+        // perf v7.2.9 symbol.c: remove_old_maps (1422-1430), dso__load_kcore
+        // (1484-1485) retire the original non-BPF maps after kcore acceptance.
+        // Check that lifecycle before selecting any original module object.
+        if self
+            .kcore_symbols_ref()
+            .is_some_and(kcore::KcoreSymbols::is_active)
+        {
+            return None;
+        }
+        if mapping.kernel_module_lookup.is_some()
+            || !(is_kernel_module_symbol_path_str(mapping.path)
+                || mapping.kernel_module_address.is_some())
+        {
+            return None;
+        }
+        let request = symbol_request_from_mapping_ref(mapping);
+        let selected = self.module_object_symbol_request(
+            &request,
+            &mut self
+                .address_cache
+                .lock()
+                .expect("object address cache lock"),
+        )?;
+        let metadata = self
+            .object_resolver
+            .selected_object_module_metadata(selected.path(), &request)?;
+        let path: Arc<Path> = Arc::from(selected.path());
+        if let Some(projection) = metadata.lookup_projection {
+            self.address_cache
+                .lock()
+                .expect("object address cache lock")
+                .module_projection_sources
+                .entry(projection)
+                .or_insert_with(|| Arc::clone(&path));
+        }
+        Some(LoadedKernelModule { path, metadata })
+    }
     fn initialize_kernel_maps(&self, table: &MmapTable) {
         // A module without a delivered core map cannot load that core DSO yet.
         if self.kcore_symbols.get().is_some() {
@@ -3041,6 +3100,12 @@ where
         let Some(KernelModuleObjectRequest::Mapped(object_request)) = object_request else {
             return Ok(ResolvedSymbolFrames::default());
         };
+        if matches!(
+            request.symbol_lookup,
+            SymbolLookup::KernelModuleSection { .. }
+        ) {
+            return self.resolve_child_object_frames(request, &object_request, inline);
+        }
         self.resolve_object_frame_batch(std::slice::from_ref(&object_request), inline)?
             .into_iter()
             .next()
@@ -3265,8 +3330,13 @@ where
                 self.record_ordinary_module_load(request);
                 match self.module_object_symbol_request(request, &mut address_cache) {
                     Some(KernelModuleObjectRequest::Mapped(object_request)) => {
-                        user_indexes.push(index);
-                        user_requests.push(object_request);
+                        if let SymbolLookup::KernelModuleSection { .. } = request.symbol_lookup {
+                            resolved[index] =
+                                self.resolve_child_object_frames(request, &object_request, inline)?;
+                        } else {
+                            user_indexes.push(index);
+                            user_requests.push(object_request);
+                        }
                     }
                     Some(KernelModuleObjectRequest::LoadedEmpty(_)) => {}
                     None => {
@@ -3306,19 +3376,38 @@ where
             }
         }
 
-        if !user_requests.is_empty() {
-            let frames = self.resolve_object_frame_batch(&user_requests, inline)?;
-            let results = user_indexes.into_iter().zip(&user_requests).zip(frames);
-            for ((index, object_request), frames) in results {
-                resolved[index] = self.finish_module_frame(
-                    frames,
-                    &requests[index],
-                    &object_request.path,
-                    old_module_objects.contains(&index),
-                );
-            }
-        }
+        self.resolve_selected_frame_batch(
+            requests,
+            (&user_indexes, &user_requests),
+            &old_module_objects,
+            inline,
+            &mut resolved,
+        )?;
         Ok(resolved)
+    }
+
+    fn resolve_selected_frame_batch(
+        &self,
+        original: &[SymbolRequest],
+        selected: (&[usize], &[SymbolRequest]),
+        old_modules: &[usize],
+        inline: bool,
+        output: &mut [ResolvedSymbolFrames],
+    ) -> Result<(), String> {
+        let (indexes, requests) = selected;
+        if requests.is_empty() {
+            return Ok(());
+        }
+        let frames = self.resolve_object_frame_batch(requests, inline)?;
+        for ((&index, request), frames) in indexes.iter().zip(requests).zip(frames) {
+            output[index] = self.finish_module_frame(
+                frames,
+                &original[index],
+                &request.path,
+                old_modules.contains(&index),
+            );
+        }
+        Ok(())
     }
 
     fn finish_module_symbol(
@@ -3397,6 +3486,39 @@ where
             self.object_resolver
                 .resolve_base_frame_batch_with_metadata(requests)
         }
+    }
+
+    fn resolve_child_object_frames(
+        &self,
+        request: &SymbolRequest,
+        selected: &SymbolRequest,
+        inline: bool,
+    ) -> Result<ResolvedSymbolFrames, String> {
+        let base = self
+            .resolve_object_frame_batch(std::slice::from_ref(selected), false)?
+            .into_iter()
+            .next()
+            .ok_or("missing child base frame result")?;
+        if !inline || !base.has_base_symbol {
+            return Ok(base);
+        }
+        // symbol-elf.c:1481 copies long_name, not symsrc_filename. libdw.c:35
+        // and srcline.c:26 consequently open the child's inherited runtime file.
+        let mut runtime = request.clone();
+        runtime.relative_address = request.inline_address();
+        runtime.symbol_lookup = SymbolLookup::VirtualAddress;
+        let mut frames = self
+            .resolve_object_frame_batch(std::slice::from_ref(&runtime), true)?
+            .into_iter()
+            .next()
+            .ok_or("missing child inline frame result")?;
+        if !frames.has_inline_frames {
+            return Ok(base);
+        }
+        frames.base_offset = base.base_offset;
+        frames.has_base_symbol = base.has_base_symbol;
+        frames.source_state = base.source_state;
+        Ok(frames)
     }
 
     fn object_symbol_request(
@@ -3500,6 +3622,13 @@ where
         request: &SymbolRequest,
         address_cache: &mut ObjectAddressCache,
     ) -> Option<KernelModuleObjectRequest> {
+        if let SymbolLookup::KernelModuleSection { projection, .. } = request.symbol_lookup {
+            let source = address_cache.module_projection_sources.get(&projection)?;
+            let mut selected = request.clone();
+            selected.path = source.to_path_buf();
+            selected.relative_address = request.inline_address();
+            return Some(KernelModuleObjectRequest::Mapped(selected));
+        }
         // perf symbol.c:dso__load tries the regular system module pathname
         // after build-ID sources. Bracketed paths have no live object name.
         let mut selected = if request.kernel_module_address.is_some() {
@@ -4984,6 +5113,24 @@ fn kernel_module_max_text_offset(runtime: &object::File<'_>) -> u64 {
     max_text_offset
 }
 
+fn kernel_module_selected_section<'file, 'data>(
+    object: &'file object::File<'data>,
+    runtime: &'file object::File<'data>,
+    index: object::SectionIndex,
+) -> Option<(object::Section<'file, 'data>, u64)> {
+    // symbol-elf.c:1697-1717: allocation was checked on SOURCE; NOBITS
+    // selects the same-index runtime header before label/name dispatch.
+    let (kind, _) = elf_section_layout(object, index)?;
+    let owner = if kind == object::elf::SHT_NOBITS {
+        runtime
+    } else {
+        object
+    };
+    let section = owner.section_by_index(index).ok()?;
+    let (_, offset) = elf_section_layout(owner, index)?;
+    Some((section, offset))
+}
+
 fn kernel_module_object_metadata(
     bytes: &[u8],
     runtime_bytes: &[u8],
@@ -4991,10 +5138,7 @@ fn kernel_module_object_metadata(
     KernelModuleObjectMetadata,
     Option<Arc<KernelModuleSymbolProjection>>,
 ) {
-    let Ok(object) = object::File::parse(bytes) else {
-        return (KernelModuleObjectMetadata::default(), None);
-    };
-    let Ok(runtime) = object::File::parse(runtime_bytes) else {
+    let [Ok(object), Ok(runtime)] = [bytes, runtime_bytes].map(object::File::parse) else {
         return (KernelModuleObjectMetadata::default(), None);
     };
     // symbol-elf.c:dso__load_sym requires a kernel symtab before dynsym,
@@ -5013,37 +5157,26 @@ fn kernel_module_object_metadata(
     let max_text_offset = kernel_module_max_text_offset(&runtime);
     let mut projection = kernel_module_symbol_projection(&object, &runtime, max_text_offset);
     let projection_id = NEXT_KERNEL_MODULE_PROJECTION.fetch_add(1, AtomicOrdering::Relaxed);
-    let mut maps = Vec::new();
-    let mut seen = FxHashSet::default();
+    let mut maps: Vec<KernelModuleSectionMap> = Vec::new();
+    let mut table_map_counts = Vec::new();
+    let mut seen = FxHashMap::default();
     let mut text_address = None;
     let mut text_section = None;
     for table in [object.symbols(), object.dynamic_symbols()] {
         // dso__load_sym_internal resets remap_kernel for each table pass.
         let mut text_remapped = false;
+        let mut accepted = false;
         for symbol in table {
-            if !symbol.name().is_ok_and(kernel_elf_name_is_eligible)
-                || !perf_symbol_is_allocated_candidate(&object, &symbol)
-            {
-                continue;
-            }
-            let Some(index) = symbol.section_index() else {
+            let Some(index) = symbol.section_index().filter(|_| {
+                symbol.name().is_ok_and(kernel_elf_name_is_eligible)
+                    && perf_symbol_is_allocated_candidate(&object, &symbol)
+            }) else {
                 continue;
             };
-            let Ok(symbol_section) = object.section_by_index(index) else {
+            let Some((section, file_offset)) =
+                kernel_module_selected_section(&object, &runtime, index)
+            else {
                 continue;
-            };
-            // symbol-elf.c:1656 replaces a NOBITS symbol-section header with
-            // the runtime source's header at the same index, not by name.
-            let use_runtime = elf_section_layout(&object, index)
-                .is_some_and(|(kind, _)| kind == object::elf::SHT_NOBITS);
-            let section_owner = if use_runtime { &runtime } else { &object };
-            let section = if use_runtime {
-                let Ok(section) = runtime.section_by_index(index) else {
-                    continue;
-                };
-                section
-            } else {
-                symbol_section
             };
             let Ok(name) = section.name() else {
                 continue;
@@ -5053,6 +5186,7 @@ fn kernel_module_object_metadata(
                 continue;
             }
             projection.has_symbols = true;
+            accepted = true;
             if name == ".text" {
                 if !text_remapped {
                     text_address = Some(if object.kind() == object::ObjectKind::Relocatable {
@@ -5060,29 +5194,42 @@ fn kernel_module_object_metadata(
                     } else {
                         section.address()
                     });
-                    text_section =
-                        elf_section_layout(section_owner, index).and_then(|(_, file_offset)| {
-                            u32::try_from(index.0)
-                                .ok()
-                                .map(|section| (section, file_offset))
-                        });
+                    text_section = u32::try_from(index.0)
+                        .ok()
+                        .map(|section| (section, file_offset));
                     text_remapped = true;
                 }
                 continue;
             }
-            if (elf_section_is_executable(&section)
-                && elf_section_layout(section_owner, index)
-                    .is_some_and(|(_, offset)| offset <= max_text_offset))
-                || !seen.insert(name)
-            {
+            if elf_section_is_executable(&section) && file_offset <= max_text_offset {
                 continue;
             }
             // dso__process_kernel_symbol: additional module DSOs use the section
             // suffix and sh_addr as their adjusted map start (module reloc is 0).
-            maps.push(KernelModuleSectionMap {
-                section: name.to_owned(),
-                start: section.address(),
+            let Ok(lookup_section) = u32::try_from(index.0) else {
+                continue;
+            };
+            let map_index = *seen.entry(name).or_insert_with(|| {
+                let map_index = maps.len();
+                maps.push(KernelModuleSectionMap {
+                    section: name.to_owned(),
+                    start: section.address(),
+                    size: section.size(),
+                    file_offset,
+                    lookup_section,
+                });
+                map_index
             });
+            if let Some(layout) = projection
+                .sections
+                .iter_mut()
+                .find(|layout| layout.index == lookup_section)
+            {
+                layout.group = maps[map_index].lookup_section;
+            }
+        }
+        if accepted {
+            table_map_counts.push(maps.len());
         }
     }
     (
@@ -5090,8 +5237,10 @@ fn kernel_module_object_metadata(
             text_address,
             text_section,
             maps,
+            table_map_counts,
             lookup_projection: Some(projection_id),
             has_symbols: projection.has_symbols,
+            relocatable: projection.relocatable,
         },
         Some(Arc::new(projection)),
     )
@@ -5109,18 +5258,8 @@ fn kernel_module_symbol_projection(
         {
             continue;
         }
-        let Some((source_type, _)) = elf_section_layout(object, source_section.index()) else {
-            continue;
-        };
-        let section_owner = if source_type == object::elf::SHT_NOBITS {
-            runtime
-        } else {
-            object
-        };
-        let Ok(section) = section_owner.section_by_index(source_section.index()) else {
-            continue;
-        };
-        let Some((_, file_offset)) = elf_section_layout(section_owner, source_section.index())
+        let Some((section, file_offset)) =
+            kernel_module_selected_section(object, runtime, source_section.index())
         else {
             continue;
         };
@@ -5139,6 +5278,7 @@ fn kernel_module_symbol_projection(
             labels_eligible: section
                 .name()
                 .is_ok_and(|name| name.contains("text") || name.contains("data")),
+            group: index,
         });
     }
     let core_sections = sections
@@ -5525,11 +5665,18 @@ impl PerfObjectSymbolIndex {
         section: u32,
     ) -> PerfSymbolLookupIndex {
         let is_core = projection.core_sections.contains(&section);
-        let included_sections = if is_core {
-            projection.core_sections.as_slice()
-        } else {
-            std::slice::from_ref(&section)
-        };
+        let included_sections = projection
+            .sections
+            .iter()
+            .filter(|layout| {
+                if is_core {
+                    projection.core_sections.contains(&layout.index)
+                } else {
+                    layout.group == section
+                }
+            })
+            .map(|layout| layout.index)
+            .collect::<Vec<_>>();
         let records = self
             .candidates
             .iter()
@@ -7401,6 +7548,16 @@ fn update_symbol_request_from_mapping_ref(
     } else {
         SymbolLookup::UserFileOffset(mapping.relative_address)
     };
+    if let Some(lookup) = mapping.kernel_module_lookup {
+        request.symbol_lookup = SymbolLookup::KernelModuleSection {
+            projection: lookup.projection,
+            section: lookup.section,
+            offset: mapping.relative_address,
+        };
+        request.addr2line_address = Some(lookup.inline_address);
+    } else {
+        request.addr2line_address = None;
+    }
     request.kernel_module_address = mapping.kernel_module_address;
     request.kernel_mapping_range = kernel_mapping_range_from_ref(mapping);
     if let Some(build_id) = mapping
@@ -7824,6 +7981,11 @@ mod tests {
                         vec![super::KernelModuleSectionMap {
                             section: ".data".into(),
                             start: section.address(),
+                            size: section.size(),
+                            file_offset: super::elf_section_layout(&elf, section.index())
+                                .unwrap()
+                                .1,
+                            lookup_section: u32::try_from(section.index().0).unwrap(),
                         }]
                     })
                     .unwrap_or_default();
@@ -7911,6 +8073,175 @@ mod tests {
                 .0
                 .text_address,
             Some(first)
+        );
+    }
+
+    #[test]
+    fn shared_module_source_retains_distinct_runtime_projection_contexts() {
+        let bytes = elf_with_text_symbol_fixtures(
+            elf::EM_X86_64,
+            &[(
+                b"shared_function",
+                0x1000,
+                16,
+                elf::STB_GLOBAL,
+                elf::STT_FUNC,
+            )],
+        );
+        let root = tempfile::tempdir().unwrap();
+        let selected = root.path().join("shared.debug");
+        let mut source = build::elf::Builder::read(bytes.as_slice()).unwrap();
+        let section = source
+            .sections
+            .iter_mut()
+            .find(|section| section.name.as_slice() == b".text")
+            .unwrap();
+        section.name = b".cold"[..].into();
+        section.sh_type = elf::SHT_NOBITS;
+        section.data = build::elf::SectionData::UninitializedData(16);
+        source.set_section_sizes();
+        let mut source_bytes = Vec::new();
+        source.write(&mut source_bytes).unwrap();
+        std::fs::write(&selected, &source_bytes).unwrap();
+        let resolver = super::RustAddr2lineResolver::new();
+        let mut contexts = Vec::new();
+        for (name, offset) in [(".data", 0x3000), (".rodata", 0x5000)] {
+            let path = root.path().join(format!("runtime{offset:x}.ko"));
+            let mut runtime = build::elf::Builder::read(bytes.as_slice()).unwrap();
+            let section = runtime
+                .sections
+                .iter_mut()
+                .find(|section| section.name.as_slice() == b".text")
+                .unwrap();
+            section.name = name.as_bytes().into();
+            section.sh_offset = offset;
+            section.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_WRITE);
+            let opd = runtime.sections.add();
+            opd.name = b".opd"[..].into();
+            opd.sh_type = elf::SHT_PROGBITS;
+            opd.sh_addralign = 8;
+            opd.data = build::elf::SectionData::Data(vec![0; 8].into());
+            runtime.set_section_sizes();
+            let mut runtime_bytes = Vec::new();
+            runtime.write(&mut runtime_bytes).unwrap();
+            std::fs::write(&path, &runtime_bytes).unwrap();
+            let object = object::File::parse(runtime_bytes.as_slice()).unwrap();
+            assert!(super::elf_possibly_runtime(&object));
+            let section = object.section_by_name(name).unwrap();
+            let offset = super::elf_section_layout(&object, section.index())
+                .unwrap()
+                .1;
+            let module = test_request(path.to_str().unwrap(), 0x1008);
+            let metadata = resolver
+                .selected_object_module_metadata(&selected, &module)
+                .unwrap();
+            assert_eq!(metadata.maps[0].section, name);
+            assert_eq!(metadata.maps[0].file_offset, offset);
+            assert!(Arc::ptr_eq(
+                &metadata,
+                &resolver
+                    .selected_object_module_metadata(&selected, &module)
+                    .unwrap()
+            ));
+            contexts.push((module, metadata, offset));
+        }
+        assert_ne!(
+            contexts[0].1.lookup_projection,
+            contexts[1].1.lookup_projection
+        );
+        for _ in 0..3 {
+            for (module, metadata, offset) in &contexts {
+                let mut request = test_request(selected.to_str().unwrap(), 0x1008);
+                request.symbol_lookup = SymbolLookup::KernelModuleSection {
+                    projection: metadata.lookup_projection.unwrap(),
+                    section: metadata.maps[0].lookup_section,
+                    offset: offset + 8,
+                };
+                assert_eq!(
+                    resolver
+                        .resolve_base_frame_batch_with_metadata(&[request])
+                        .unwrap()[0]
+                        .frames,
+                    ["shared_function+0x8"]
+                );
+                assert!(Arc::ptr_eq(
+                    metadata,
+                    &resolver
+                        .selected_object_module_metadata(&selected, module)
+                        .unwrap()
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn relocatable_module_child_separates_inline_pc_from_native_file_offset() {
+        let bytes = module_metadata_retention_fixture(true);
+        let mut builder = build::elf::Builder::read(bytes.as_slice()).unwrap();
+        builder.header.e_type = elf::ET_REL;
+        for symbol in &mut builder.symbols {
+            if symbol.section.is_some() {
+                symbol.st_value = 0;
+            }
+        }
+        for symbol in &mut builder.dynamic_symbols {
+            if symbol.section.is_some() {
+                symbol.st_value = 0;
+            }
+        }
+        let mut bytes = Vec::new();
+        builder.write(&mut bytes).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("a.ko");
+        std::fs::write(&path, bytes).unwrap();
+        let resolver = super::RustAddr2lineResolver::new();
+        let request = test_request(path.to_str().unwrap(), 8);
+        let metadata = resolver
+            .selected_object_module_metadata(&path, &request)
+            .unwrap();
+        assert!(metadata.relocatable);
+        let section = &metadata.maps[0];
+        let (start, offset) = (section.start, section.file_offset);
+        let mut table = super::MmapTable::default();
+        table.insert_mmap_with_misc(
+            crate::perfdata::records::MmapRecord {
+                pid: u32::MAX,
+                tid: 7,
+                start: 0x4000,
+                len: 0x100,
+                pgoff: 0,
+                path: path.to_str().unwrap().into(),
+            },
+            crate::perfdata::records::PERF_RECORD_MISC_CPUMODE_KERNEL,
+        );
+        let mut cache = crate::perfdata::mappings::MappingResolveCache::default();
+        let parent = table
+            .frame_context(7, &mut cache)
+            .resolve(0x4008, &mut cache)
+            .unwrap();
+        let cursor = table.kernel_cursor(parent).unwrap();
+        table.publish_kernel_module(
+            cursor,
+            &super::LoadedKernelModule {
+                path: Arc::from(path.as_path()),
+                metadata,
+            },
+        );
+        let child = table
+            .frame_context(7, &mut cache)
+            .resolve(start + 8, &mut cache)
+            .unwrap()
+            .resolved_ref();
+        // map.c:553-559 subtracts map pgoff only for the inline/objdump PC.
+        assert_eq!(child.relative_address, offset + 8);
+        assert_eq!(child.kernel_module_lookup.unwrap().inline_address, 8);
+        assert_eq!(
+            child.kernel_module_lookup.unwrap().projection,
+            resolver
+                .selected_object_module_metadata(&path, &request)
+                .unwrap()
+                .lookup_projection
+                .unwrap()
         );
     }
 
@@ -8041,11 +8372,18 @@ mod tests {
         builder.set_section_sizes();
         let mut bytes = Vec::new();
         builder.write(&mut bytes).unwrap();
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        let section = object.section_by_name(".data").unwrap();
         assert_eq!(
             super::kernel_module_object_metadata(&bytes, &bytes).0.maps,
             [super::KernelModuleSectionMap {
                 section: ".data".into(),
                 start: 0x2000,
+                size: section.size(),
+                file_offset: super::elf_section_layout(&object, section.index())
+                    .unwrap()
+                    .1,
+                lookup_section: u32::try_from(section.index().0).unwrap(),
             }]
         );
     }
@@ -10611,6 +10949,21 @@ mod tests {
         assert_eq!(metadata.text_address, None);
         assert_eq!(metadata.text_section, None);
         assert!(metadata.maps.is_empty());
+        assert!(metadata.table_map_counts.is_empty());
+    }
+
+    #[test]
+    fn module_metadata_records_only_accepted_table_publication_passes() {
+        let bytes = elf_with_text_symbol_fixtures(
+            elf::EM_X86_64,
+            &[(b"core_function", 0x1000, 16, elf::STB_GLOBAL, elf::STT_FUNC)],
+        );
+        let (metadata, _) = super::kernel_module_object_metadata(&bytes, &bytes);
+        assert_eq!(metadata.table_map_counts, [0]);
+        let bytes = module_metadata_retention_fixture(true);
+        let (metadata, _) = super::kernel_module_object_metadata(&bytes, &bytes);
+        assert_eq!(metadata.maps.len(), 1);
+        assert_eq!(metadata.table_map_counts, [1, 1]);
     }
 
     #[test]
@@ -16991,6 +17344,7 @@ mod tests {
             path,
             relative_address,
             kernel_module_address: None,
+            kernel_module_lookup: None,
             start: relative_address,
             end: relative_address.saturating_add(1),
             build_id: None,

@@ -36,6 +36,10 @@ mod native_module_lookup;
 #[path = "support/native_label_eligibility.rs"]
 mod native_label_eligibility;
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "support/native_module_overlay.rs"]
+mod native_module_overlay;
+
 #[cfg(target_os = "linux")]
 use std::io::Write as _;
 #[cfg(target_os = "linux")]
@@ -13814,6 +13818,7 @@ fn native_split_debug_module_runtime_requires_matching_id_and_runtime_sections()
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn split_debug_module_metadata_retains_each_runtime_source_pair() {
+    use object::{Object, ObjectSection};
     use pyroclast::symbols::{KernelModuleSectionMap, SelectedObjectResolver, SymbolizerKind};
     let runner = pyroclast::process::RealCommandRunner::default();
     for kind in [SymbolizerKind::RustAddr2line, SymbolizerKind::Addr2line] {
@@ -13843,11 +13848,17 @@ fn split_debug_module_metadata_retains_each_runtime_source_pair() {
         let second = resolver
             .selected_object_module_metadata(&cache, &other_request)
             .unwrap();
+        let runtime_bytes = std::fs::read(&path).unwrap();
+        let runtime = object::File::parse(runtime_bytes.as_slice()).unwrap();
+        let section = runtime.section_by_name(".noinstr.text").unwrap();
         assert_eq!(
             first.maps,
             [KernelModuleSectionMap {
                 section: ".noinstr.text".into(),
                 start: 0xffff_ffff_c100_8000,
+                size: section.size(),
+                file_offset: section.file_range().unwrap().0,
+                lookup_section: u32::try_from(section.index().0).unwrap(),
             }]
         );
         assert!(second.maps.is_empty());

@@ -46,6 +46,8 @@ pub struct MmapTable {
     executable_pids: HashSet<u32, FxBuildHasher>,
     has_global_mappings: bool,
     has_global_executable_mappings: bool,
+    generation: u64,
+    loaded_modules: HashSet<usize, FxBuildHasher>,
     #[cfg(test)]
     index_searches: std::cell::Cell<usize>,
     #[cfg(test)]
@@ -54,6 +56,10 @@ pub struct MmapTable {
     cache_index_probes: std::cell::Cell<usize>,
     #[cfg(test)]
     gap_computations: std::cell::Cell<usize>,
+    #[cfg(test)]
+    cursor_slot_visits: Cell<usize>,
+    #[cfg(test)]
+    publication_passes: usize,
     #[cfg(test)]
     mutation_row_work: std::cell::RefCell<HashMap<u32, MappingMutationRowWork, FxBuildHasher>>,
 }
@@ -76,11 +82,19 @@ pub struct ResolvedMappingRef<'a> {
     pub relative_address: u64,
     /// Original IP for an absolute module path recorded in kernel CPU mode.
     pub kernel_module_address: Option<u64>,
+    pub kernel_module_lookup: Option<KernelModuleLookup>,
     pub start: u64,
     pub end: u64,
     pub build_id: Option<&'a [u8]>,
     pub file_identity: Option<FileIdentity>,
     pub kernel_relocation: Option<KernelRelocation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KernelModuleLookup {
+    pub projection: u64,
+    pub section: u32,
+    pub inline_address: u64,
 }
 
 pub(crate) struct HostKernelMappingRef<'a> {
@@ -103,6 +117,12 @@ pub(super) struct DsoMemoryMapping<'a> {
 pub(crate) struct MappedFrame<'a> {
     mapping: &'a Mapping,
     pub(crate) relative_address: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KernelMapCursor {
+    slot: usize,
+    insertion_id: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -178,6 +198,9 @@ impl<'a> MappedFrame<'a> {
     pub(crate) fn symbol_source_id(self) -> usize {
         self.mapping.symbol_source_id
     }
+    pub(crate) fn native_dso_id(self) -> usize {
+        self.mapping.native_dso_id
+    }
     pub(crate) fn display_path_id(self) -> usize {
         self.mapping.path_layout.display_path_id
     }
@@ -215,6 +238,10 @@ impl<'a> MappedFrame<'a> {
             path: &self.mapping.path,
             relative_address: self.relative_address,
             kernel_module_address: self.kernel_module_address(),
+            kernel_module_lookup: self.mapping.module_lookup(
+                self.kernel_module_address()
+                    .unwrap_or(self.relative_address),
+            ),
             start: self.mapping.start,
             end: self.mapping.end(),
             build_id: self.mapping.build_id.as_deref(),
@@ -226,6 +253,7 @@ impl<'a> MappedFrame<'a> {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MappingResolveCache {
+    generation: u64,
     pid: Option<u32>,
     pid_index: Option<usize>,
     global_index: Option<usize>,
@@ -775,6 +803,9 @@ struct Mapping {
     file_identity: Option<FileIdentity>,
     prot: Option<u32>,
     cpumode: u16,
+    kernel_module_lookup: Option<(u64, u32)>,
+    kernel_module_relocatable: bool,
+    synthetic_module_child: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -795,6 +826,12 @@ struct MappingSlot {
 }
 
 impl MappingArena {
+    fn get_cursor(&self, cursor: KernelMapCursor) -> Option<&Mapping> {
+        let slot = self.slots.get(cursor.slot)?;
+        (slot.insertion_id == cursor.insertion_id)
+            .then_some(slot.mapping.as_ref())
+            .flatten()
+    }
     fn insert(&mut self, mapping: Mapping) -> usize {
         let insertion_id = self.next_insertion_id;
         self.next_insertion_id = insertion_id
@@ -866,6 +903,15 @@ impl std::ops::Index<usize> for MappingArena {
     }
 }
 
+impl std::ops::IndexMut<usize> for MappingArena {
+    fn index_mut(&mut self, index: usize) -> &mut Mapping {
+        self.slots[index]
+            .mapping
+            .as_mut()
+            .expect("indexed mapping slot is live")
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct IndexedMapping {
     start: u64,
@@ -879,6 +925,7 @@ struct SymbolSourceKey {
     build_id: Option<Vec<u8>>,
     file_identity: Option<FileIdentity>,
     kernel_relocation: Option<KernelRelocation>,
+    kernel_module_lookup: Option<(u64, u32)>,
 }
 
 impl MmapTable {
@@ -890,6 +937,10 @@ impl MmapTable {
     #[cfg(test)]
     pub(crate) fn bucket_search_count(&self) -> usize {
         self.bucket_searches.get()
+    }
+    #[cfg(test)]
+    pub(crate) fn cursor_slot_visit_count(&self) -> usize {
+        self.cursor_slot_visits.get()
     }
 
     fn bucket(&self, pid: u32) -> &[IndexedMapping] {
@@ -903,6 +954,12 @@ impl MmapTable {
         pid: u32,
         cache: &mut MappingResolveCache,
     ) -> FrameMappingContext<'_> {
+        if cache.generation != self.generation {
+            *cache = MappingResolveCache {
+                generation: self.generation,
+                ..MappingResolveCache::default()
+            };
+        }
         if cache.pid != Some(pid) {
             cache.pid = Some(pid);
             cache.pid_index = None;
@@ -970,6 +1027,9 @@ impl MmapTable {
             file_identity: None,
             prot: None,
             cpumode: mapping_cpumode_from_misc(misc),
+            kernel_module_lookup: None,
+            kernel_module_relocatable: false,
+            synthetic_module_child: false,
         });
     }
 
@@ -1014,6 +1074,9 @@ impl MmapTable {
             }),
             prot: Some(record.prot),
             cpumode: mapping_cpumode_from_misc(misc),
+            kernel_module_lookup: None,
+            kernel_module_relocatable: false,
+            synthetic_module_child: false,
         });
     }
 
@@ -1041,6 +1104,9 @@ impl MmapTable {
             file_identity: None,
             prot: Some(record.prot),
             cpumode: mapping_cpumode_from_misc(misc),
+            kernel_module_lookup: None,
+            kernel_module_relocatable: false,
+            synthetic_module_child: false,
         });
     }
 
@@ -1379,6 +1445,7 @@ impl MmapTable {
                 path: mapping.path.as_str(),
                 relative_address: mapping.relative_address(ip),
                 kernel_module_address: mapping.kernel_module_address(ip),
+                kernel_module_lookup: mapping.module_lookup(ip),
                 start: mapping.start,
                 end: mapping.end(),
                 build_id: mapping.build_id.as_deref(),
@@ -1467,6 +1534,11 @@ impl MmapTable {
         let Some(resolver) = resolver else {
             return frame.resolved_ref();
         };
+        // symbol-elf.c:1506 marks synthetic section DSOs loaded. They retain
+        // their selected symbol arena and never discover a fresh live ID.
+        if frame.mapping.synthetic_module_child {
+            return frame.resolved_ref();
+        }
         // symbol.c:1705/1866 loads a DSO once, including failed loads. Later
         // stream metadata changes the current DSO ID, not its loaded symbols.
         let dso = &self.native_dsos.entries[frame.mapping.native_dso_id];
@@ -1489,6 +1561,179 @@ impl MmapTable {
             resolver.initialize_kernel_maps(self);
         }
         mapping
+    }
+
+    pub(crate) fn kernel_cursor(&self, frame: MappedFrame<'_>) -> Option<KernelMapCursor> {
+        (frame.is_kernel() && !self.loaded_modules.contains(&frame.mapping.native_dso_id))
+            .then(|| {
+                self.mappings.slots.iter().position(|slot| {
+                    #[cfg(test)]
+                    self.cursor_slot_visits
+                        .set(self.cursor_slot_visits.get() + 1);
+                    slot.mapping
+                        .as_ref()
+                        .is_some_and(|mapping| std::ptr::eq(mapping, frame.mapping))
+                })
+            })
+            .flatten()
+            .map(|slot| KernelMapCursor {
+                slot,
+                insertion_id: self.mappings.insertion_id(slot),
+            })
+    }
+
+    pub(crate) fn module_needs_publication(&self, frame: MappedFrame<'_>) -> bool {
+        frame.mapping.cpumode == PERF_RECORD_MISC_CPUMODE_KERNEL
+            && frame.mapping.module_display.is_some()
+            && frame.mapping.kernel_module_lookup.is_none()
+            && !self.loaded_modules.contains(&frame.mapping.native_dso_id)
+    }
+
+    pub(crate) fn publish_kernel_module(
+        &mut self,
+        cursor: KernelMapCursor,
+        loaded: &crate::symbols::LoadedKernelModule,
+    ) {
+        let Some(parent) = self.mappings.get_cursor(cursor) else {
+            return;
+        };
+        if !self.loaded_modules.insert(parent.native_dso_id) {
+            return;
+        }
+        let parent = parent.clone();
+        let index = cursor.slot;
+        let metadata = &loaded.metadata;
+        if !metadata.has_symbols {
+            return;
+        }
+        if let Some((_, offset)) = metadata.text_section {
+            self.mappings[index].pgoff = offset;
+        }
+        let short_name = self.native_dsos.entries[parent.native_dso_id]
+            .short_name
+            .clone();
+        let mut published = 0;
+        for &count in &metadata.table_map_counts {
+            debug_assert!(published <= count && count <= metadata.maps.len());
+            for section in &metadata.maps[published..count] {
+                let child_name = format!("{short_name}{}", section.section);
+                // symbol-elf.c:1469 reuses the first same-name kernel map.
+                if self.bucket(parent.pid).iter().any(|row| {
+                    self.mappings[row.index].cpumode == PERF_RECORD_MISC_CPUMODE_KERNEL
+                        && self.mappings[row.index].display_path() == child_name
+                }) {
+                    continue;
+                }
+                let mut child = parent.clone();
+                child.start = section.start;
+                child.len = section.size;
+                child.pgoff = section.file_offset;
+                // symbol-elf.c:1481 inherits the parent's long filename;
+                // the selected source is retained by its projection owner.
+                child.native_dso_id =
+                    self.native_dsos
+                        .add(&child.path, child_name.clone(), None, None);
+                // Native marks a new section DSO loaded even without a
+                // usable projection. Same-name reuse retains existing state.
+                self.loaded_modules.insert(child.native_dso_id);
+                child.synthetic_module_child = true;
+                child.module_display = Some(Arc::from(child_name));
+                child.kernel_module_lookup = metadata
+                    .lookup_projection
+                    .map(|projection| (projection, section.lookup_section));
+                child.kernel_module_relocatable = metadata.relocatable;
+                child.build_id = None;
+                child.mmap_build_id = false;
+                child.file_identity = None;
+                child.path_layout = MappingPathLayout::new(child.display_path());
+                let next_id = self.display_path_ids.len();
+                child.path_layout.display_path_id = *self
+                    .display_path_ids
+                    .entry(child.display_path().to_owned())
+                    .or_insert(next_id);
+                self.insert_mapping_without_overlap_fix(child);
+            }
+            published = count;
+            // maps.c:1241 clips existing ends after every accepted ELF table,
+            // including a pass that creates no new map. Current cursor ID stays.
+            let indices: Vec<_> = self
+                .bucket(parent.pid)
+                .iter()
+                .map(|row| row.index)
+                .filter(|&index| self.mappings[index].cpumode == PERF_RECORD_MISC_CPUMODE_KERNEL)
+                .collect();
+            for pair in indices.windows(2) {
+                let next_start = self.mappings[pair[1]].start;
+                let previous = &mut self.mappings[pair[0]];
+                if previous.end() == 0 || previous.end() > next_start {
+                    previous.len = next_start.saturating_sub(previous.start);
+                }
+            }
+            if let Some(&last) = indices.last()
+                && self.mappings[last].end() == 0
+            {
+                self.mappings[last].len = u64::MAX - self.mappings[last].start;
+            }
+            self.rebuild_pid_index(parent.pid);
+            #[cfg(debug_assertions)]
+            self.check_kernel_publication(parent.pid, &indices);
+            #[cfg(test)]
+            {
+                self.publication_passes += 1;
+            }
+        }
+        debug_assert_eq!(published, metadata.maps.len());
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .expect("mapping generation overflow");
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_kernel_publication(&self, pid: u32, indices: &[usize]) {
+        // maps.c:71-125 checks native bounds only at the cold fixup boundary.
+        for &index in indices {
+            let map = &self.mappings[index];
+            debug_assert!(map.end() == 0 || map.start <= map.end());
+            debug_assert_eq!(
+                self.native_dsos.entries[map.native_dso_id].id,
+                map.native_dso_id
+            );
+            debug_assert_eq!(
+                self.symbol_source_ids[&map.symbol_source_key()],
+                map.symbol_source_id
+            );
+            debug_assert_eq!(
+                self.display_path_ids[map.display_path()],
+                map.path_layout.display_path_id
+            );
+        }
+        for pair in indices.windows(2) {
+            let (previous, next) = (&self.mappings[pair[0]], &self.mappings[pair[1]]);
+            debug_assert!(previous.start <= next.start && previous.end() <= next.end());
+            debug_assert!(previous.end() <= next.start || previous.start == next.start);
+        }
+        let mut max_end = 0;
+        for row in self.bucket(pid) {
+            let map = &self.mappings[row.index];
+            max_end = max_end.max(map.end());
+            debug_assert_eq!(row.start, map.start);
+            debug_assert_eq!(row.max_end, max_end);
+        }
+    }
+
+    pub(crate) fn retained_kernel_frame(
+        &self,
+        cursor: KernelMapCursor,
+        address: u64,
+    ) -> Option<MappedFrame<'_>> {
+        self.mappings
+            .get_cursor(cursor)
+            .map(|mapping| MappedFrame::new(mapping, address))
+    }
+
+    pub(crate) fn finish_failed_module_attempt(&mut self, native_dso_id: usize) {
+        self.loaded_modules.insert(native_dso_id);
     }
 
     pub(crate) fn host_kernel_mappings(&self) -> impl Iterator<Item = HostKernelMappingRef<'_>> {
@@ -1809,6 +2054,18 @@ fn mapping_cpumode_from_misc(misc: u16) -> u16 {
 }
 
 impl Mapping {
+    fn module_lookup(&self, ip: u64) -> Option<KernelModuleLookup> {
+        self.kernel_module_lookup
+            .map(|(projection, section)| KernelModuleLookup {
+                projection,
+                section,
+                inline_address: if self.kernel_module_relocatable {
+                    ip.wrapping_sub(self.start)
+                } else {
+                    ip
+                },
+            })
+    }
     fn display_path(&self) -> &str {
         self.module_display.as_deref().unwrap_or(&self.path)
     }
@@ -1892,6 +2149,7 @@ impl Mapping {
             build_id: self.build_id.clone(),
             file_identity: self.file_identity,
             kernel_relocation: self.kernel_relocation(),
+            kernel_module_lookup: self.kernel_module_lookup,
         }
     }
 }
@@ -1905,6 +2163,315 @@ fn is_perf_data_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
+
+    fn publish_test_module(
+        table: &mut super::MmapTable,
+        size: u64,
+    ) -> (super::KernelMapCursor, crate::symbols::LoadedKernelModule) {
+        use crate::symbols::{
+            KernelModuleObjectMetadata, KernelModuleSectionMap, LoadedKernelModule,
+        };
+        let metadata = KernelModuleObjectMetadata {
+            has_symbols: true,
+            text_section: Some((1, 0x1000)),
+            maps: vec![KernelModuleSectionMap {
+                section: ".data".into(),
+                start: 0x8000,
+                size,
+                file_offset: 0x2000,
+                lookup_section: 2,
+            }],
+            // A second accepted table creates no new section map.
+            table_map_counts: vec![1, 1],
+            ..KernelModuleObjectMetadata::default()
+        };
+        let mut cache = super::MappingResolveCache::default();
+        let context = table.frame_context(7, &mut cache);
+        let frame = context.resolve(0x1010, &mut cache).unwrap();
+        let cursor = table.kernel_cursor(frame).unwrap();
+        let loaded = LoadedKernelModule {
+            path: std::sync::Arc::from(std::path::Path::new("/tmp/a.ko")),
+            metadata: std::sync::Arc::new(metadata),
+        };
+        table.publish_kernel_module(cursor, &loaded);
+        (cursor, loaded)
+    }
+
+    fn test_module_mapping(table: &mut super::MmapTable) {
+        table.insert_mmap_with_misc(
+            crate::perfdata::records::MmapRecord {
+                pid: u32::MAX,
+                tid: 7,
+                start: 0x1000,
+                len: 0x100,
+                pgoff: 0,
+                path: "/tmp/a.ko".into(),
+            },
+            super::PERF_RECORD_MISC_CPUMODE_KERNEL,
+        );
+    }
+
+    #[test]
+    fn accepted_zero_sized_module_section_keeps_nonzero_empty_end() {
+        let mut table = super::MmapTable::default();
+        test_module_mapping(&mut table);
+        publish_test_module(&mut table, 0);
+        let child = table
+            .mappings
+            .iter()
+            .find(|mapping| mapping.display_path() == "[a].data")
+            .unwrap();
+        assert_eq!((child.start, child.end()), (0x8000, 0x8000));
+        assert!(table.resolve_ref(7, 0x8001).is_none());
+    }
+
+    #[test]
+    fn same_name_user_global_map_does_not_replace_kernel_section_map() {
+        let mut table = super::MmapTable::default();
+        test_module_mapping(&mut table);
+        table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: u32::MAX,
+            tid: 7,
+            start: 0x5000,
+            len: 0x100,
+            pgoff: 0,
+            path: "[a].data".into(),
+        });
+        publish_test_module(&mut table, 0x100);
+        let children: Vec<_> = table
+            .mappings
+            .iter()
+            .filter(|mapping| mapping.display_path() == "[a].data")
+            .collect();
+        assert_eq!(children.len(), 2);
+        assert!(children.iter().any(|mapping| mapping.cpumode
+            == super::PERF_RECORD_MISC_CPUMODE_USER
+            && mapping.start == 0x5000));
+        assert!(children.iter().any(|mapping| mapping.cpumode
+            == super::PERF_RECORD_MISC_CPUMODE_KERNEL
+            && mapping.start == 0x8000));
+    }
+
+    #[test]
+    fn module_publication_is_idempotent_and_preserves_cursor_coordinates() {
+        for size in [0, 8, 0x100] {
+            let mut table = super::MmapTable::default();
+            test_module_mapping(&mut table);
+            let index = table.bucket(u32::MAX)[0].index;
+            table.mappings[index].len = 0x9000;
+            table.rebuild_pid_index(u32::MAX);
+            let (cursor, loaded) = publish_test_module(&mut table, size);
+            assert_eq!(
+                table.publication_passes, 2,
+                "accepted no-new-map pass still fixes ends"
+            );
+            let current = table.retained_kernel_frame(cursor, 0x8010).unwrap();
+            assert_eq!(current.display_path(), "[a]");
+            assert_eq!(current.kernel_range(), Some((0x1000, 0x8000)));
+            assert_eq!(current.relative_address, 0x8010);
+            let snapshot = table.clone();
+            table.publish_kernel_module(cursor, &loaded);
+            assert_eq!(
+                table, snapshot,
+                "no new child/source IDs or generation on repeated publication"
+            );
+            assert_mapping_arena_invariants(&table);
+        }
+    }
+
+    #[test]
+    fn publication_invalidates_cached_gap_and_hit_geometry() {
+        let mut table = super::MmapTable::default();
+        test_module_mapping(&mut table);
+        let mut cache = super::MappingResolveCache::default();
+        {
+            let context = table.frame_context(7, &mut cache);
+            assert!(context.resolve(0x8010, &mut cache).is_none());
+            assert_eq!(
+                context
+                    .resolve(0x1010, &mut cache)
+                    .unwrap()
+                    .relative_address,
+                0x10
+            );
+        }
+        publish_test_module(&mut table, 0x100);
+        assert_ne!(cache.generation, table.generation);
+        let context = table.frame_context(7, &mut cache);
+        assert_eq!(cache.generation, table.generation);
+        assert_eq!(
+            context
+                .resolve(0x8010, &mut cache)
+                .unwrap()
+                .relative_address,
+            0x2010
+        );
+        assert_eq!(
+            context
+                .resolve(0x1010, &mut cache)
+                .unwrap()
+                .relative_address,
+            0x1010
+        );
+        assert!(
+            context.resolve(0x8100, &mut cache).is_none(),
+            "exclusive child end"
+        );
+        assert_mapping_arena_invariants(&table);
+    }
+
+    #[test]
+    fn published_child_without_projection_is_loaded_without_identity_discovery() {
+        struct Probe {
+            ids: std::cell::Cell<usize>,
+            initializations: std::cell::Cell<usize>,
+        }
+        impl crate::symbols::SymbolResolver for Probe {
+            fn object_build_id(&self, _: &std::path::Path) -> Option<Vec<u8>> {
+                self.ids.set(self.ids.get() + 1);
+                None
+            }
+            fn initialize_kernel_maps(&self, _: &super::MmapTable) {
+                self.initializations.set(self.initializations.get() + 1);
+            }
+            fn resolve_batch(
+                &self,
+                _: &[crate::symbols::SymbolRequest],
+            ) -> Result<Vec<Option<String>>, String> {
+                unreachable!()
+            }
+        }
+        let probe = Probe {
+            ids: std::cell::Cell::new(0),
+            initializations: std::cell::Cell::new(0),
+        };
+        let mut table = super::MmapTable::default();
+        test_module_mapping(&mut table);
+        let (cursor, loaded) = publish_test_module(&mut table, 0x100);
+        assert_eq!(loaded.metadata.lookup_projection, None);
+        let mut cache = super::MappingResolveCache::default();
+        let child = table
+            .frame_context(7, &mut cache)
+            .resolve(0x8010, &mut cache)
+            .unwrap();
+        for _ in 0..3 {
+            table.symbol_mapping_ref(child, Some(&probe));
+        }
+        assert_eq!(
+            probe.ids.get(),
+            0,
+            "loaded child must not discover a new ID"
+        );
+        assert_eq!(probe.initializations.get(), 0);
+        assert!(table.loaded_modules.contains(&child.native_dso_id()));
+        assert!(!table.module_needs_publication(child));
+        let parent = table.retained_kernel_frame(cursor, 0x1010).unwrap();
+        table.symbol_mapping_ref(parent, Some(&probe));
+        assert_eq!(
+            probe.ids.get(),
+            1,
+            "ordinary loaded parent still initializes identity"
+        );
+        assert_eq!(probe.initializations.get(), 1);
+    }
+
+    #[test]
+    fn publication_keeps_warm_symbol_hits_and_misses_bound_to_live_coordinates() {
+        struct Symbols;
+        impl crate::symbols::SymbolResolver for Symbols {
+            fn resolve_batch(
+                &self,
+                requests: &[crate::symbols::SymbolRequest],
+            ) -> Result<Vec<Option<String>>, String> {
+                Ok(requests
+                    .iter()
+                    .map(|request| {
+                        (request.relative_address != 0x8010)
+                            .then(|| format!("symbol_{:x}", request.relative_address))
+                    })
+                    .collect())
+            }
+        }
+        let mut table = super::MmapTable::default();
+        test_module_mapping(&mut table);
+        let index = table.bucket(u32::MAX)[0].index;
+        table.mappings[index].len = 0x9000;
+        table.rebuild_pid_index(u32::MAX);
+        let mut maps = super::MappingResolveCache::default();
+        let mut symbols = crate::symbols::SymbolFrameCache::new(&Symbols);
+        for (ip, expected) in [(0x1010, vec!["symbol_10".to_owned()]), (0x9010, vec![])] {
+            let frame = table
+                .frame_context(7, &mut maps)
+                .resolve(ip, &mut maps)
+                .unwrap();
+            assert_eq!(
+                symbols.resolve_mapping_ref(&frame.resolved_ref()).unwrap(),
+                expected
+            );
+        }
+        let (cursor, _) = publish_test_module(&mut table, 0x2000);
+        let current = table.retained_kernel_frame(cursor, 0x9010).unwrap();
+        assert_eq!(current.display_path(), "[a]");
+        assert_eq!(current.relative_address, 0x9010);
+        for _ in 0..2 {
+            for (ip, expected) in [(0x1010, "symbol_1010"), (0x9010, "symbol_3010")] {
+                let frame = table
+                    .frame_context(7, &mut maps)
+                    .resolve(ip, &mut maps)
+                    .unwrap();
+                assert_eq!(
+                    symbols.resolve_mapping_ref(&frame.resolved_ref()).unwrap(),
+                    [expected]
+                );
+            }
+        }
+        assert_mapping_arena_invariants(&table);
+    }
+
+    #[test]
+    fn selected_empty_module_is_terminal_without_map_mutation() {
+        let mut table = super::MmapTable::default();
+        test_module_mapping(&mut table);
+        let mut cache = super::MappingResolveCache::default();
+        let frame = table
+            .frame_context(7, &mut cache)
+            .resolve(0x1010, &mut cache)
+            .unwrap();
+        let cursor = table.kernel_cursor(frame).unwrap();
+        let loaded = crate::symbols::LoadedKernelModule {
+            path: std::sync::Arc::from(std::path::Path::new("/tmp/a.ko")),
+            metadata: std::sync::Arc::new(crate::symbols::KernelModuleObjectMetadata::default()),
+        };
+        let generation = table.generation;
+        table.publish_kernel_module(cursor, &loaded);
+        let current = table.retained_kernel_frame(cursor, 0x1010).unwrap();
+        assert!(!table.module_needs_publication(current));
+        assert_eq!(current.relative_address, 0x10);
+        assert_eq!(table.generation, generation);
+        assert_eq!(table.mappings.iter().count(), 1);
+    }
+
+    #[test]
+    fn removed_or_reused_cursor_cannot_resolve_or_mutate_replacement() {
+        let mut table = super::MmapTable::default();
+        test_module_mapping(&mut table);
+        let mut cache = super::MappingResolveCache::default();
+        let frame = table
+            .frame_context(7, &mut cache)
+            .resolve(0x1010, &mut cache)
+            .unwrap();
+        let cursor = table.kernel_cursor(frame).unwrap();
+        table.remove_pid_mappings(u32::MAX);
+        assert!(table.retained_kernel_frame(cursor, 0x1010).is_none());
+        test_module_mapping(&mut table);
+        assert!(table.retained_kernel_frame(cursor, 0x1010).is_none());
+        let snapshot = table.clone();
+        table.publish_kernel_module(cursor, &crate::symbols::LoadedKernelModule {
+            path: std::sync::Arc::from(std::path::Path::new("/tmp/a.ko")),
+            metadata: std::sync::Arc::new(crate::symbols::KernelModuleObjectMetadata::default()),
+        });
+        assert_eq!(table, snapshot);
+    }
 
     #[test]
     fn zero_build_id_header_keeps_the_kernel_dso_classification() {
