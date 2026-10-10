@@ -12513,6 +12513,213 @@ mod tests {
         3000 T beta_only\t[beta]\n";
 
     #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn frozen_native_core_layout_and_borrowed_names_do_not_grow_on_warm_lookup() {
+        assert_eq!(std::mem::size_of::<super::FrozenCoreNode>(), 48);
+        let text = "0 T zero\n1000 T full \u{e9} name\r\0ignored\n2000 T last\n";
+        let (_root, path) = live_module_kallsyms_fixture(text);
+        let source = super::LiveKallsymsSnapshot::load(&path).unwrap();
+        let backing = source.physical.source.as_ptr();
+        let table = &source.ordinary(None).core;
+        assert_eq!(table.nodes.len(), 3);
+        assert!(source.prepared.lock().unwrap().is_none());
+        assert_eq!(Arc::strong_count(&source.physical), 1);
+        let capacity = table.nodes.capacity();
+        let storage = table.nodes.as_ptr();
+        std::fs::write(&path, "3000 T replacement\n").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        for (node, expected) in table
+            .nodes
+            .iter()
+            .zip(["zero", "full \u{e9} name\r", "last"])
+        {
+            assert!(node.name.end <= text.len());
+            assert!(text.is_char_boundary(node.name.start));
+            assert!(text.is_char_boundary(node.name.end));
+            let borrowed = &source.physical.source[node.name.clone()];
+            assert_eq!(borrowed, expected);
+            assert_eq!(borrowed.as_ptr(), backing.wrapping_add(node.name.start));
+        }
+        for _ in 0..100 {
+            assert_eq!(
+                table
+                    .resolve_with_offset(&source.physical.source, 0x1001)
+                    .as_deref(),
+                Some("full \u{e9} name\r+0x1")
+            );
+            assert!(table.find(0x4000).is_none());
+            assert_eq!(
+                (table.nodes.as_ptr(), table.nodes.capacity()),
+                (storage, capacity)
+            );
+            assert_eq!(Arc::strong_count(&source.physical), 1);
+        }
+        assert!(source.physical.references.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn native_review_live_selection_keeps_ignored_cache_unprepared() {
+        let (root, path) = live_module_kallsyms_fixture("1000 T live\n2000 T module\t[a]\n");
+        let id = "a5".repeat(20);
+        let cache_path = super::perf_build_id_kallsyms_paths(root.path(), &id)[0].clone();
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        std::fs::write(&cache_path, "1000 T cached\n2000 T cached_module\t[a]\n").unwrap();
+        let mut resolver =
+            super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
+                .with_system_kallsyms_from_path(&path);
+        resolver.cached_kernel_symbols = Some(super::CachedKernelSymbols {
+            build_id: Some(id),
+            debug_dir: root.path().into(),
+            kallsyms: std::sync::OnceLock::new(),
+            elf: None,
+        });
+        let request = SymbolRequest {
+            path: "[kernel.kallsyms]".into(),
+            relative_address: 0x1001,
+            symbol_lookup: super::SymbolLookup::VirtualAddress,
+            addr2line_address: None,
+            kernel_module_address: None,
+            kernel_mapping_range: None,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        };
+        let source = resolver.complete_native_source(&request).unwrap();
+        assert!(
+            resolver
+                .cached_kernel_symbols
+                .as_ref()
+                .unwrap()
+                .kallsyms
+                .get()
+                .is_none(),
+            "ignored plain cache must not prepare a second tree"
+        );
+        assert_eq!(source.resolve_core(&request).as_deref(), Some("live+0x1"));
+        let backing = source.physical.source.as_ptr();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&cache_path, "1000 T replacement\n").unwrap();
+        for _ in 0..4 {
+            let retained = resolver.complete_native_source(&request).unwrap();
+            assert!(std::ptr::eq(source, retained));
+            assert_eq!(retained.physical.source.as_ptr(), backing);
+            assert_eq!(retained.resolve_core(&request).as_deref(), Some("live+0x1"));
+            assert!(
+                resolver
+                    .cached_kernel_symbols
+                    .as_ref()
+                    .unwrap()
+                    .kallsyms
+                    .get()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn frozen_native_projection_preserves_original_ids_links_and_root_after_erasure() {
+        let text = "1000 T first\n3000 T module\t[a]\n1020 T fresh\n1030 T third[marker]\n1040 T root\n1050 T fifth[marker]\n1060 T sixth\n1070 T last\n";
+        let mut prepared = super::NativePrepared::new(text);
+        assert_eq!(prepared.tree.root_index(), Some(4));
+        assert!(prepared.tree.remove(1));
+        let order = prepared.tree.indices_in_order();
+        let frozen = prepared.freeze();
+        assert_eq!(frozen.nodes.len(), 7);
+        let dense = |id| order.iter().position(|&candidate| candidate == id).unwrap();
+        assert_eq!(frozen.root, Some(dense(4)));
+        let mut seen = vec![false; frozen.nodes.len()];
+        let mut pending = vec![frozen.root.unwrap()];
+        while let Some(index) = pending.pop() {
+            assert!(!seen[index]);
+            seen[index] = true;
+            let node = &frozen.nodes[index];
+            for link in [node.left, node.right].into_iter().flatten() {
+                assert!(link.get() <= frozen.nodes.len());
+                pending.push(link.get() - 1);
+            }
+        }
+        assert!(seen.into_iter().all(|seen| seen));
+        for (index, &id) in order.iter().enumerate() {
+            let node = &frozen.nodes[index];
+            let (left, right) = prepared.tree.children(id).unwrap();
+            assert_eq!(node.left.map(|link| link.get() - 1), left.map(dense));
+            assert_eq!(node.right.map(|link| link.get() - 1), right.map(dense));
+            assert_eq!(node.name, prepared.rows[id].name);
+            assert_eq!(node.end, prepared.rows[id].end);
+        }
+        assert_eq!(
+            frozen.resolve_with_offset(text, 0x1f80).as_deref(),
+            Some("root+0xf40")
+        );
+        assert_eq!(frozen.nodes[0].address, 0x1000);
+        assert!(
+            frozen
+                .nodes
+                .iter()
+                .any(|node| node.left.is_some_and(|link| link.get() == 1))
+        );
+        assert!(frozen.find(0x3000).is_none());
+    }
+
+    #[test]
+    fn frozen_native_projection_handles_empty_singleton_and_varied_erasure() {
+        let text = "1000 T first\n1010 T second\n1020 T third\n1030 T root\n1040 T fifth\n1050 T sixth\n1060 T seventh\n1070 T last\n";
+        for removed in [
+            &[][..],
+            &[3],
+            &[0],
+            &[7],
+            &[1, 6, 3],
+            &[0, 1, 2, 3, 4, 5, 6, 7],
+            &[0, 1, 2, 3, 4, 5, 6],
+            &[7, 6, 5, 4, 3, 2, 1],
+        ] {
+            let mut prepared = super::NativePrepared::new(text);
+            assert_eq!(prepared.tree.root_index(), Some(3));
+            for &id in removed {
+                assert!(prepared.tree.remove(id));
+            }
+            let order = prepared.tree.indices_in_order();
+            assert_eq!(order.len(), 8 - removed.len());
+            let frozen = prepared.freeze();
+            assert_eq!(frozen.nodes.len(), order.len());
+            let dense = |id| order.iter().position(|&candidate| candidate == id).unwrap();
+            assert_eq!(frozen.root, prepared.tree.root_index().map(dense));
+            let mut seen = vec![false; frozen.nodes.len()];
+            let mut pending: Vec<_> = frozen.root.into_iter().collect();
+            while let Some(index) = pending.pop() {
+                assert!(index < frozen.nodes.len());
+                assert!(!seen[index]);
+                seen[index] = true;
+                let node = &frozen.nodes[index];
+                let id = order[index];
+                let (left, right) = prepared.tree.children(id).unwrap();
+                assert_eq!(node.left.map(|link| link.get() - 1), left.map(dense));
+                assert_eq!(node.right.map(|link| link.get() - 1), right.map(dense));
+                assert_eq!(node.name, prepared.rows[id].name);
+                assert_eq!(
+                    (node.address, node.end),
+                    (prepared.rows[id].address, prepared.rows[id].end)
+                );
+                assert!(node.name.end <= text.len());
+                assert!(text.is_char_boundary(node.name.start));
+                assert!(text.is_char_boundary(node.name.end));
+                assert_eq!(
+                    text[node.name.clone()].as_ptr(),
+                    text.as_ptr().wrapping_add(node.name.start)
+                );
+                pending.extend(
+                    [node.left, node.right]
+                        .into_iter()
+                        .flatten()
+                        .map(|link| link.get() - 1),
+                );
+            }
+            assert!(seen.into_iter().all(|seen| seen));
+        }
+    }
+
+    #[test]
     fn dense_live_module_retains_one_record_per_survivor() {
         let (_root, path) = live_module_kallsyms_fixture(DENSE_LIVE_MODULE_FIXTURE);
         let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
