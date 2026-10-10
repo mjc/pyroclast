@@ -40,6 +40,10 @@ mod native_label_eligibility;
 #[path = "support/native_module_overlay.rs"]
 mod native_module_overlay;
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "support/native_kallsyms_grammar.rs"]
+mod native_kallsyms_grammar;
+
 #[cfg(target_os = "linux")]
 use std::io::Write as _;
 #[cfg(target_os = "linux")]

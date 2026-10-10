@@ -2100,13 +2100,16 @@ impl Kallsyms {
     }
 
     fn parse_symbols(text: &str, index_names: bool) -> Result<Self, String> {
+        Self::parse_symbol_rows(text.lines().filter_map(parse_kallsyms_line), index_names)
+    }
+
+    fn parse_symbol_rows<'a>(
+        rows: impl Iterator<Item = (u64, &'a str)>,
+        index_names: bool,
+    ) -> Result<Self, String> {
         let mut symbols = BTreeMap::new();
         let mut addresses_by_name = FxHashMap::default();
-        for (address, symbol) in text
-            .lines()
-            .filter_map(parse_kallsyms_line)
-            .filter(|(address, _)| *address != 0)
-        {
+        for (address, symbol) in rows.filter(|(address, _)| *address != 0) {
             insert_kallsyms_symbol(
                 &mut symbols,
                 index_names.then_some(&mut addresses_by_name),
@@ -2196,9 +2199,19 @@ impl Kallsyms {
         #[cfg(test)]
         MODULE_KALLSYMS_TREE_BUILDS.with(|count| count.set(count.get() + 1));
         let mut symbols = Vec::new();
-        for line in text.split_terminator('\n') {
-            let Some(row) = parse_global_kallsyms_row(line) else {
+        for raw in NativeKallsymsRows::new(text) {
+            #[cfg(test)]
+            MODULE_KALLSYMS_ROW_VISITS.with(|count| count.set(count.get() + 1));
+            let Some(raw) = raw else {
                 continue;
+            };
+            let row = BorrowedKallsymsRow {
+                address: raw.address,
+                end: raw.address,
+                name: raw.name,
+                full_name: raw.name,
+                module: None,
+                symbol_type: char::from(raw.symbol_type),
             };
             // symbol.c:dso__load_all_kallsyms filters before tree insertion;
             // event.c:find_func_symbol_cb separately accepts A references.
@@ -2228,6 +2241,14 @@ impl Kallsyms {
             }
             true
         });
+        // symbol.c:maps__split_kallsyms uses the first literal TAB and the
+        // entire remaining DSO suffix, after full-name fixups and deduplication.
+        for row in &mut symbols {
+            if let Some((name, module)) = row.full_name.split_once('\t') {
+                row.name = name;
+                row.module = Some(module);
+            }
+        }
         symbols
     }
 
@@ -2289,7 +2310,14 @@ impl Kallsyms {
                 // perf symbol.c:1480 kallsyms__delta uses event.c:132
                 // kallsyms__get_function_start on the selected cached file,
                 // not a name index of its display symbols.
-                let mut symbols = Self::parse_symbols(&text, false).ok()?;
+                let rows = NativeKallsymsRows::new(&text)
+                    .flatten()
+                    .filter(|row| {
+                        perf_kallsyms_type_is_kept(char::from(row.symbol_type))
+                            && !row.name.starts_with('$')
+                    })
+                    .map(|row| (row.address, row.name));
+                let mut symbols = Self::parse_symbol_rows(rows, false).ok()?;
                 symbols.physical = Some(Arc::new(KallsymsReferenceSource::new(
                     text.into_boxed_str(),
                 )));
@@ -7805,62 +7833,107 @@ fn parse_kallsyms_line(line: &str) -> Option<(u64, &str)> {
     Some((address, symbol))
 }
 
-fn parse_kallsyms_function_line(line: &str) -> Option<(u64, &str)> {
-    // tools/lib/symbol/kallsyms.c:31-77 and api/io.h:io__get_hex require
-    // literal separators and accumulate hex modulo u64, without a sign.
-    let (hex, row) = line.split_once(' ')?;
-    if hex.is_empty() {
-        return None;
+struct NativeKallsymsRow<'a> {
+    address: u64,
+    symbol_type: u8,
+    name: &'a str,
+    name_start: usize,
+}
+
+struct NativeKallsymsRows<'a> {
+    source: &'a str,
+    offset: usize,
+}
+
+impl<'a> NativeKallsymsRows<'a> {
+    fn new(source: &'a str) -> Self {
+        Self { source, offset: 0 }
     }
-    let address = hex.bytes().try_fold(0_u64, |value, byte| {
-        let digit = char::from(byte).to_digit(16)?;
-        Some((value << 4) | u64::from(digit))
-    })?;
-    let (kind, name) = row.split_once(' ')?;
-    // event.c:find_func_symbol_cb accepts only functions or uppercase A;
-    // strcmp sees the full name (including module suffix) up to the first NUL.
-    matches!(kind, "T" | "t" | "W" | "w" | "A").then_some((address, name.split('\0').next()?))
+
+    fn read_byte(&mut self) -> Option<u8> {
+        let byte = *self.source.as_bytes().get(self.offset)?;
+        self.offset += 1;
+        Some(byte)
+    }
+
+    fn skip_line(&mut self) {
+        let remaining = &self.source.as_bytes()[self.offset..];
+        self.offset += remaining
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map_or(remaining.len(), |end| end + 1);
+    }
+}
+
+impl<'a> Iterator for NativeKallsymsRows<'a> {
+    // Include rejected attempts so callers can account for actual cursor visits.
+    type Item = Option<NativeKallsymsRow<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset == self.source.len() {
+            return None;
+        }
+        // perf tools/lib/api/io.h:io__get_hex consumes the non-hex byte and
+        // wraps u64. kallsyms.c:54-63 then skips from that consumed position;
+        // a consumed LF therefore discards the following physical row too.
+        let mut address = 0_u64;
+        let mut has_hex = false;
+        loop {
+            let byte = self.read_byte();
+            if let Some(digit) = byte.and_then(|byte| char::from(byte).to_digit(16)) {
+                address = (address << 4) | u64::from(digit);
+                has_hex = true;
+            } else {
+                if !has_hex || byte != Some(b' ') {
+                    self.skip_line();
+                    return Some(None);
+                }
+                break;
+            }
+        }
+        let symbol_type = self.read_byte();
+        if self.read_byte() != Some(b' ') {
+            self.skip_line();
+            return Some(None);
+        }
+        let name_start = self.offset;
+        let remaining = &self.source[name_start..];
+        let end = remaining.find('\n').unwrap_or(remaining.len());
+        self.offset += end + usize::from(end < remaining.len());
+        let full_name = &remaining[..end];
+        let name = full_name.split('\0').next().unwrap_or_default();
+        Some(Some(NativeKallsymsRow {
+            address,
+            symbol_type: symbol_type?,
+            name,
+            name_start,
+        }))
+    }
+}
+
+#[cfg(test)]
+fn parse_kallsyms_function_line(line: &str) -> Option<(u64, &str)> {
+    let row = NativeKallsymsRows::new(line).flatten().next()?;
+    kallsyms_reference_type_is_kept(row.symbol_type).then_some((row.address, row.name))
+}
+
+fn kallsyms_reference_type_is_kept(symbol_type: u8) -> bool {
+    // event.c:find_func_symbol_cb has a separate function/absolute filter.
+    matches!(symbol_type, b'T' | b't' | b'W' | b'w' | b'A')
 }
 
 fn kallsyms_reference_span(text: &str, reference: &str) -> Option<(u64, Range<usize>)> {
-    let mut offset = 0;
-    for line in text.split_terminator('\n') {
+    for row in NativeKallsymsRows::new(text) {
         #[cfg(test)]
         KALLSYMS_REFERENCE_ROW_VISITS.with(|count| count.set(count.get() + 1));
-        if let Some((address, name)) = parse_kallsyms_function_line(line)
-            && name == reference
+        if let Some(row) = row
+            && kallsyms_reference_type_is_kept(row.symbol_type)
+            && row.name == reference
         {
-            // The accepted parser requires one ASCII type byte between spaces.
-            let start = offset + line.find(' ')? + 3;
-            return Some((address, start..start + name.len()));
+            return Some((row.address, row.name_start..row.name_start + row.name.len()));
         }
-        offset += line.len() + 1;
     }
     None
-}
-
-fn parse_global_kallsyms_row(line: &str) -> Option<BorrowedKallsymsRow<'_>> {
-    #[cfg(test)]
-    MODULE_KALLSYMS_ROW_VISITS.with(|count| count.set(count.get() + 1));
-    let (address, rest) = line.trim_start().split_once(char::is_whitespace)?;
-    let address = u64::from_str_radix(address, 16).ok()?;
-    let (symbol_type, full_name) = rest.trim_start().split_once(char::is_whitespace)?;
-    let symbol_type = symbol_type.chars().next()?;
-    let full_name = full_name.trim_start();
-    let mut fields = full_name.split_whitespace();
-    let name = fields.next()?;
-    let module = fields.next();
-    if module.is_some_and(|module| !module.starts_with('[') || !module.ends_with(']')) {
-        return None;
-    }
-    Some(BorrowedKallsymsRow {
-        address,
-        end: address,
-        name,
-        full_name,
-        module,
-        symbol_type,
-    })
 }
 
 fn perf_kallsyms_type_is_kept(symbol_type: char) -> bool {
@@ -11468,6 +11541,22 @@ mod tests {
         0000000000002020 T beta_tail [beta]\n\
         0000000000004000 T alpha_tail [alpha]\n";
 
+    const TAB_MULTI_MODULE_KALLSYMS: &str = "not a kallsyms row\n\
+        0000000000000800 T accepted_core\n\
+        0000000000000000 T zero\t[alpha]\n\
+        0000000000000990 R excluded\t[alpha]\n\
+        0000000000001040 T shared\t[alpha]\n\
+        0000000000005000 T gamma_tail\t[gamma]\n\
+        0000000000001000 T alias_first\t[alpha]\n\
+        0000000000001000 T alias_last\t[alpha]\n\
+        0000000000001010 W weak\t[alpha]\n\
+        0000000000001020 t shared\t[alpha]\n\
+        0000000000001030 D data\t[alpha]\n\
+        0000000000001800 B gamma_head\t[gamma]\n\
+        0000000000002010 T shared\t[beta]\n\
+        0000000000002020 T beta_tail\t[beta]\n\
+        0000000000004000 T alpha_tail\t[alpha]\n";
+
     fn live_module_kallsyms_fixture(text: &str) -> (tempfile::TempDir, PathBuf) {
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-fixtures");
         std::fs::create_dir_all(&fixtures).unwrap();
@@ -11475,6 +11564,31 @@ mod tests {
         let path = root.path().join("kallsyms");
         std::fs::write(&path, text).unwrap();
         (root, path)
+    }
+
+    fn assert_space_suffix_core_rows(text: &str, expected_count: usize) {
+        let rows = Kallsyms::parse_module_symbols(text);
+        assert_eq!(rows.len(), expected_count, "{text:?}");
+        assert!(rows.iter().all(|row| row.module.is_none()), "{text:?}");
+        assert!(rows.iter().all(|row| row.name == row.full_name));
+        assert!(Kallsyms::parse_modules(text).is_err());
+        for module in ["[alpha]", "[beta]", "[gamma]", "[a]", "[b]"] {
+            assert!(Kallsyms::parse_modules_for_path(text, module).is_err());
+        }
+        let (_root, path) = live_module_kallsyms_fixture(text);
+        let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
+            .with_system_kallsyms_from_path(&path);
+        let snapshot = resolver.live_kallsyms_snapshot().unwrap();
+        assert!(snapshot.modules.is_empty());
+        assert_eq!(
+            snapshot.core.as_ref().map_or(0, |core| core.symbols.len()),
+            expected_count
+        );
+        for row in rows {
+            let symbol = &snapshot.core.as_ref().unwrap().symbols[&row.address];
+            assert_eq!(symbol.name.as_ref(), row.full_name);
+            assert_eq!(symbol.end, Some(row.end));
+        }
     }
 
     fn assert_multi_module_kallsyms_views(alpha: &Kallsyms, beta: &Kallsyms, gamma: &Kallsyms) {
@@ -11520,6 +11634,86 @@ mod tests {
             alpha.resolve_module_with_offset_in_range(0x100f, Some((0x1000, 0x100f))),
             None
         );
+    }
+
+    #[test]
+    fn native_kallsyms_cursor_advances_and_borrows_visible_source_spans() {
+        for (source, expected) in [
+            (
+                "\n1 T skipped\n2 T kept_\u{e9}\0ignored\n3 T \n4 T \0ignored\n5 T full name\r\n",
+                vec![(2, "kept_\u{e9}"), (3, ""), (4, ""), (5, "full name\r")],
+            ),
+            (
+                "\u{00a0}1 T rejected\n2 T \u{e9}prefix\0ignored\n",
+                vec![(2, "\u{e9}prefix")],
+            ),
+            ("80\n1 T skipped\n2 T final", vec![(2, "final")]),
+            ("80 T\n1 T skipped\n2 T final", vec![(2, "final")]),
+            ("80 \n1 T skipped\n2 T final", vec![(2, "final")]),
+            ("1 T ", vec![(1, "")]),
+            ("80", Vec::new()),
+            ("80 T", Vec::new()),
+            ("", Vec::new()),
+        ] {
+            let mut cursor = super::NativeKallsymsRows::new(source);
+            let mut actual = Vec::new();
+            loop {
+                let before = cursor.offset;
+                let Some(row) = cursor.next() else {
+                    assert_eq!(cursor.offset, source.len(), "{source:?}");
+                    assert!(cursor.next().is_none());
+                    break;
+                };
+                assert!(cursor.offset > before);
+                assert!(cursor.offset <= source.len());
+                if let Some(row) = row {
+                    let span = row.name_start..row.name_start + row.name.len();
+                    assert!(span.start >= before);
+                    assert!(span.end <= cursor.offset);
+                    assert!(source.is_char_boundary(span.start));
+                    assert!(source.is_char_boundary(span.end));
+                    assert_eq!(source.get(span.clone()), Some(row.name));
+                    assert_eq!(source[span].as_ptr(), row.name.as_ptr());
+                    actual.push((row.address, row.name));
+                }
+            }
+            assert_eq!(actual, expected, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn kallsyms_reference_recovery_keeps_first_match_and_memo_snapshot_local() {
+        let text = "\n1000 T reference\n2000 T reference\n3000 T reference\n";
+        let (_root, path) = live_module_kallsyms_fixture(text);
+        let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
+            .with_system_kallsyms_from_path(&path);
+        let snapshot = resolver.live_kallsyms_snapshot().unwrap();
+        super::KALLSYMS_REFERENCE_ROW_VISITS.with(|count| count.set(0));
+        assert_eq!(snapshot.reference_address("reference"), Some(0x2000));
+        super::KALLSYMS_REFERENCE_ROW_VISITS.with(|count| assert_eq!(count.get(), 2));
+        assert_eq!(snapshot.reference_address("absent"), None);
+        let visits = super::KALLSYMS_REFERENCE_ROW_VISITS.with(Cell::get);
+        assert_eq!(snapshot.reference_address("reference"), Some(0x2000));
+        assert_eq!(snapshot.reference_address("absent"), None);
+        super::KALLSYMS_REFERENCE_ROW_VISITS.with(|count| assert_eq!(count.get(), visits));
+        std::fs::write(&path, "4000 T reference\n5000 T absent\n").unwrap();
+        let newer = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
+            .with_system_kallsyms_from_path(&path);
+        let newer = newer.live_kallsyms_snapshot().unwrap();
+        assert_eq!(newer.reference_address("reference"), Some(0x4000));
+        assert_eq!(newer.reference_address("absent"), Some(0x5000));
+        assert_eq!(snapshot.reference_address("reference"), Some(0x2000));
+        assert_eq!(snapshot.reference_address("absent"), None);
+    }
+
+    #[test]
+    fn kallsyms_reference_lf_recovery_skips_consumed_following_rows() {
+        for prefix in ["\n", "80\n", "80 T\n", "80 \n"] {
+            let text = format!("{prefix}1000 T reference\n2000 T reference\n");
+            let (address, span) = super::kallsyms_reference_span(&text, "reference").unwrap();
+            assert_eq!(address, 0x2000, "{text:?}");
+            assert_eq!(&text[span], "reference");
+        }
     }
 
     #[test]
@@ -11621,8 +11815,14 @@ mod tests {
     }
 
     #[test]
-    fn live_module_kallsyms_builds_the_global_tree_once_for_all_module_views() {
-        let (_root, path) = live_module_kallsyms_fixture(MULTI_MODULE_KALLSYMS);
+    fn kallsyms_space_suffix_live_tree_contains_raw_core_names() {
+        assert_space_suffix_core_rows(MULTI_MODULE_KALLSYMS, 11);
+        assert_space_suffix_core_rows("0000000000001000 T replacement [alpha]\n", 1);
+    }
+
+    #[test]
+    fn live_module_kallsyms_builds_the_global_tree_once_for_all_module_views_canonical_tab() {
+        let (_root, path) = live_module_kallsyms_fixture(TAB_MULTI_MODULE_KALLSYMS);
         let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
             .with_system_kallsyms_from_path(&path);
         super::MODULE_KALLSYMS_TREE_BUILDS.with(|count| count.set(0));
@@ -11633,7 +11833,7 @@ mod tests {
         let alpha = resolver.live_module_kallsyms_for_name("[alpha]").unwrap();
         // The source lifetime already retains its first successful read.
         // New module views must not reread or reparse that source snapshot.
-        std::fs::write(&path, "0000000000001000 T replacement [alpha]\n").unwrap();
+        std::fs::write(&path, "0000000000001000 T replacement\t[alpha]\n").unwrap();
         let beta = resolver.live_module_kallsyms_for_name("[beta]").unwrap();
         let gamma = resolver.live_module_kallsyms_for_name("[gamma]").unwrap();
         assert_multi_module_kallsyms_views(&alpha, &beta, &gamma);
@@ -11651,19 +11851,30 @@ mod tests {
                 super::MODULE_KALLSYMS_SYMBOL_INSERTIONS.with(Cell::get),
                 super::MODULE_KALLSYMS_END_FIXUP_PASSES.with(Cell::get),
             ),
-            (1, MULTI_MODULE_KALLSYMS.lines().count(), 12, 1),
+            (1, TAB_MULTI_MODULE_KALLSYMS.lines().count(), 12, 1),
             "one global build, one visit per physical row, one insertion per accepted row, one end-fixup pass"
         );
     }
 
     #[test]
-    fn live_kernel_symbol_fallback_does_not_resurrect_module_rows_without_a_map() {
+    fn kallsyms_space_suffix_bpf_names_remain_core() {
+        assert_space_suffix_core_rows(
+            "0000000000001000 T core_entry\n\
+             0000000000005000 t bpf_prog_abc [bpf]\n\
+             0000000000005020 t bpf_prog_def [bpf]\n\
+             0000000000003000 T core_tail\n",
+            4,
+        );
+    }
+
+    #[test]
+    fn live_kernel_symbol_fallback_does_not_resurrect_module_rows_without_a_map_canonical_tab() {
         // perf v7.2.9 symbol.c:1034-1041 discards a module row without a
         // named map; maps.c:731-738 searches only the selected address map.
         let (_root, path) = live_module_kallsyms_fixture(
             "0000000000001000 T core_entry\n\
-             0000000000005000 t bpf_prog_abc [bpf]\n\
-             0000000000005020 t bpf_prog_def [bpf]\n\
+             0000000000005000 t bpf_prog_abc\t[bpf]\n\
+             0000000000005020 t bpf_prog_def\t[bpf]\n\
              0000000000003000 T core_tail\n",
         );
         let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
@@ -11698,20 +11909,32 @@ mod tests {
     }
 
     #[test]
-    fn module_kallsyms_views_preserve_global_ends_aliases_and_address_ordered_names() {
-        let alpha = Kallsyms::parse_modules_for_path(MULTI_MODULE_KALLSYMS, "[alpha]").unwrap();
-        let beta = Kallsyms::parse_modules_for_path(MULTI_MODULE_KALLSYMS, "[beta]").unwrap();
-        let gamma = Kallsyms::parse_modules_for_path(MULTI_MODULE_KALLSYMS, "[gamma]").unwrap();
+    fn kallsyms_space_suffix_aliases_do_not_create_module_views() {
+        assert_space_suffix_core_rows(MULTI_MODULE_KALLSYMS, 11);
+    }
+
+    #[test]
+    fn module_kallsyms_views_preserve_global_ends_aliases_and_address_ordered_names_canonical_tab()
+    {
+        let alpha = Kallsyms::parse_modules_for_path(TAB_MULTI_MODULE_KALLSYMS, "[alpha]").unwrap();
+        let beta = Kallsyms::parse_modules_for_path(TAB_MULTI_MODULE_KALLSYMS, "[beta]").unwrap();
+        let gamma = Kallsyms::parse_modules_for_path(TAB_MULTI_MODULE_KALLSYMS, "[gamma]").unwrap();
         assert_multi_module_kallsyms_views(&alpha, &beta, &gamma);
     }
 
     #[test]
-    fn live_module_kallsyms_source_snapshots_remain_isolated_between_resolvers() {
-        let (_root, path) = live_module_kallsyms_fixture(MULTI_MODULE_KALLSYMS);
+    fn kallsyms_space_suffix_replacement_is_core() {
+        assert_space_suffix_core_rows(MULTI_MODULE_KALLSYMS, 11);
+        assert_space_suffix_core_rows("0000000000001000 T replacement [alpha]\n", 1);
+    }
+
+    #[test]
+    fn live_module_kallsyms_source_snapshots_remain_isolated_between_resolvers_canonical_tab() {
+        let (_root, path) = live_module_kallsyms_fixture(TAB_MULTI_MODULE_KALLSYMS);
         let first = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
             .with_system_kallsyms_from_path(&path);
         let first_alpha = first.live_module_kallsyms_for_name("[alpha]").unwrap();
-        std::fs::write(&path, "0000000000001000 T replacement [alpha]\n").unwrap();
+        std::fs::write(&path, "0000000000001000 T replacement\t[alpha]\n").unwrap();
         let second = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
             .with_system_kallsyms_from_path(&path);
         let second_alpha = second.live_module_kallsyms_for_name("[alpha]").unwrap();
@@ -11731,22 +11954,36 @@ mod tests {
     }
 
     #[test]
-    fn module_kallsyms_rejects_dollar_core_and_module_rows_before_global_end_fixup() {
+    fn kallsyms_space_suffix_dollar_rows_remain_filtered() {
+        assert_space_suffix_core_rows("0000000000001150 T $module [b]", 0);
+        assert_space_suffix_core_rows("0000000000001200 T $alias [a]", 0);
+        assert_space_suffix_core_rows(
+            "0000000000001000 T first [a]\n\
+                    0000000000001100 T $core\n\
+                    0000000000001150 T $module [b]\n\
+                    0000000000001200 T next [a]\n\
+                    0000000000001200 T $alias [a]\n",
+            2,
+        );
+    }
+
+    #[test]
+    fn module_kallsyms_rejects_dollar_core_and_module_rows_before_global_end_fixup_canonical_tab() {
         // map__process_kallsym_symbol (symbol.c:774) applies the same name
         // filter to core and module rows before symbols__fixup_end (1512).
         let rejected = [
             "0000000000001100 T $core",
-            "0000000000001150 T $module [b]",
-            "0000000000001200 T $alias [a]",
+            "0000000000001150 T $module\t[b]",
+            "0000000000001200 T $alias\t[a]",
         ];
         for line in rejected {
             assert!(Kallsyms::parse_module_symbols(line).is_empty(), "{line}");
         }
-        let text = "0000000000001000 T first [a]\n\
+        let text = "0000000000001000 T first\t[a]\n\
                     0000000000001100 T $core\n\
-                    0000000000001150 T $module [b]\n\
-                    0000000000001200 T next [a]\n\
-                    0000000000001200 T $alias [a]\n";
+                    0000000000001150 T $module\t[b]\n\
+                    0000000000001200 T next\t[a]\n\
+                    0000000000001200 T $alias\t[a]\n";
         let rows = Kallsyms::parse_module_symbols(text);
         // symbol.c:305: terminal end = roundup(start, 4096) + 4096.
         assert_eq!(
@@ -11768,14 +12005,24 @@ mod tests {
     }
 
     #[test]
-    fn module_kallsyms_core_rows_determine_ends_before_module_views_are_split() {
+    fn kallsyms_space_suffix_core_interleaving_keeps_raw_names() {
+        assert_space_suffix_core_rows(
+            "0000000000001000 T first [a]\n\
+             0000000000001100 T core\n\
+             0000000000001200 T next [a]\n",
+            3,
+        );
+    }
+
+    #[test]
+    fn module_kallsyms_core_rows_determine_ends_before_module_views_are_split_canonical_tab() {
         // tools/perf/util/symbol.c:1512 runs symbols__fixup_end over accepted
         // core and module rows before maps__split_kallsyms (1523). Filtering
         // the intervening core row first would incorrectly set end to 0x1200.
         let view = Kallsyms::parse_modules_for_path(
-            "0000000000001000 T first [a]\n\
+            "0000000000001000 T first\t[a]\n\
              0000000000001100 T core\n\
-             0000000000001200 T next [a]\n",
+             0000000000001200 T next\t[a]\n",
             "[a]",
         )
         .unwrap();
@@ -11784,13 +12031,23 @@ mod tests {
     }
 
     #[test]
-    fn module_kallsyms_cross_module_aliases_prefer_nonweak_after_global_end_fixup() {
+    fn kallsyms_space_suffix_weak_aliases_remain_in_core_tree() {
+        assert_space_suffix_core_rows(
+            "0000000000001000 T strong [a]\n\
+                    0000000000001000 W weak [b]\n\
+                    0000000000001100 T next [b]\n",
+            2,
+        );
+    }
+
+    #[test]
+    fn module_kallsyms_cross_module_aliases_prefer_nonweak_after_global_end_fixup_canonical_tab() {
         // tools/perf/util/symbol.c:246 gives both cross-module aliases nonzero
         // ends; choose_best_symbol:173 then prefers nonweak over STB_WEAK.
         // Duplicate removal (1513) happens before the DSO split (1523).
-        let text = "0000000000001000 T strong [a]\n\
-                    0000000000001000 W weak [b]\n\
-                    0000000000001100 T next [b]\n";
+        let text = "0000000000001000 T strong\t[a]\n\
+                    0000000000001000 W weak\t[b]\n\
+                    0000000000001100 T next\t[b]\n";
         let strong = Kallsyms::parse_modules_for_path(text, "[a]").unwrap();
         assert_eq!(strong.symbols[&0x1000].name.as_ref(), "strong");
         assert_eq!(strong.symbols[&0x1000].end, Some(0x2000));
@@ -11801,15 +12058,26 @@ mod tests {
     }
 
     #[test]
-    fn module_kallsyms_duplicate_removal_does_not_recompute_preceding_symbol_ends() {
-        // tools/perf/util/symbol.c:1512-1523 fixes ends, removes duplicates,
-        // then splits without recomputing ends. The losing [b] alias still
-        // establishes the preceding [a] symbol's page-boundary end.
-        let view = Kallsyms::parse_modules_for_path(
+    fn kallsyms_space_suffix_duplicate_fixups_precede_raw_core_delivery() {
+        assert_space_suffix_core_rows(
             "0000000000001000 T preceding [a]\n\
              0000000000001100 W losing [b]\n\
              0000000000001100 T winner [a]\n\
              0000000000001200 T next [a]\n",
+            3,
+        );
+    }
+
+    #[test]
+    fn module_kallsyms_duplicate_removal_does_not_recompute_preceding_symbol_ends_canonical_tab() {
+        // tools/perf/util/symbol.c:1512-1523 fixes ends, removes duplicates,
+        // then splits without recomputing ends. The losing [b] alias still
+        // establishes the preceding [a] symbol's page-boundary end.
+        let view = Kallsyms::parse_modules_for_path(
+            "0000000000001000 T preceding\t[a]\n\
+             0000000000001100 W losing\t[b]\n\
+             0000000000001100 T winner\t[a]\n\
+             0000000000001200 T next\t[a]\n",
             "[a]",
         )
         .unwrap();
@@ -11834,9 +12102,14 @@ mod tests {
     }
 
     #[test]
-    fn kallsyms_module_name_index_shares_symbol_storage() {
+    fn kallsyms_space_suffix_names_do_not_create_module_index() {
+        assert_space_suffix_core_rows("1000 T retained [alpha]\n2000 T next [alpha]\n", 2);
+    }
+
+    #[test]
+    fn kallsyms_module_name_index_shares_symbol_storage_canonical_tab() {
         let symbols =
-            Kallsyms::parse_modules("1000 T retained [alpha]\n2000 T next [alpha]\n").unwrap();
+            Kallsyms::parse_modules("1000 T retained\t[alpha]\n2000 T next\t[alpha]\n").unwrap();
         let name = &symbols.symbols[&0x1000].name;
         let indexed = symbols
             .addresses_by_name
@@ -11847,9 +12120,14 @@ mod tests {
     }
 
     #[test]
-    fn kallsyms_module_path_name_index_shares_symbol_storage() {
+    fn kallsyms_space_suffix_names_do_not_create_path_index() {
+        assert_space_suffix_core_rows("1000 T retained [alpha]\n2000 T next [alpha]\n", 2);
+    }
+
+    #[test]
+    fn kallsyms_module_path_name_index_shares_symbol_storage_canonical_tab() {
         let symbols = Kallsyms::parse_modules_for_path(
-            "1000 T retained [alpha]\n2000 T next [alpha]\n",
+            "1000 T retained\t[alpha]\n2000 T next\t[alpha]\n",
             "[alpha]",
         )
         .unwrap();
@@ -11924,9 +12202,14 @@ mod tests {
     }
 
     #[test]
-    fn kallsyms_live_module_name_index_shares_symbol_storage() {
+    fn kallsyms_space_suffix_live_names_have_no_module_index() {
+        assert_space_suffix_core_rows("1000 T retained [alpha]\n2000 T next [alpha]\n", 2);
+    }
+
+    #[test]
+    fn kallsyms_live_module_name_index_shares_symbol_storage_canonical_tab() {
         let (_root, path) =
-            live_module_kallsyms_fixture("1000 T retained [alpha]\n2000 T next [alpha]\n");
+            live_module_kallsyms_fixture("1000 T retained\t[alpha]\n2000 T next\t[alpha]\n");
         let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
             .with_system_kallsyms_from_path(&path);
         let symbols = resolver.live_module_kallsyms_for_name("[alpha]").unwrap();
@@ -12097,13 +12380,26 @@ mod tests {
         assert_eq!(first.address_of("reference"), Some(0x2000));
         assert_eq!(first.address_of("missing"), None);
         assert_eq!(first, second);
-        // event.c:find_func_symbol_cb accepts A but not D. Identical display
-        // trees can have different physical relocation references.
+        // event.c:find_func_symbol_cb accepts A but not D; symbol.c's
+        // display callback accepts D but not A. Both policies remain distinct.
         std::fs::write(&path, "1000 A reference\n2000 T reference\n").unwrap();
         let third = Kallsyms::load_perf_build_id_cache(root.path(), "fixture").unwrap();
-        assert_eq!(first.symbols, third.symbols);
+        assert_ne!(first.symbols, third.symbols);
         assert_eq!(third.address_of("reference"), Some(0x1000));
         assert_ne!(first, third);
+
+        // Equal display trees must still distinguish retained physical sources.
+        std::fs::write(&path, "1000 A reference\n3000 T reference\n").unwrap();
+        let source_first = Kallsyms::load_perf_build_id_cache(root.path(), "fixture").unwrap();
+        let source_copy = Kallsyms::load_perf_build_id_cache(root.path(), "fixture").unwrap();
+        std::fs::write(&path, "2000 A reference\n3000 T reference\n").unwrap();
+        let source_other = Kallsyms::load_perf_build_id_cache(root.path(), "fixture").unwrap();
+        assert_eq!(source_first.symbols, source_other.symbols);
+        assert_eq!(source_first.address_of("reference"), Some(0x1000));
+        assert_eq!(source_other.address_of("reference"), Some(0x2000));
+        assert_ne!(source_first, source_other);
+        assert_eq!(source_first.address_of("missing"), None);
+        assert_eq!(source_first, source_copy);
     }
 
     #[test]
@@ -17214,10 +17510,12 @@ mod tests {
         );
         std::fs::create_dir_all(elf.parent().unwrap()).unwrap();
         std::fs::write(&elf, []).unwrap();
+        let space_row = "0000000000001000 t handler [demo]\n";
+        assert!(super::Kallsyms::parse_modules(space_row).is_err());
         let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
             .with_debug_dir(root.path().into())
             .with_kallsyms(
-                super::Kallsyms::parse_modules("0000000000001000 t handler [demo]\n").unwrap(),
+                super::Kallsyms::parse_modules("0000000000001000 t handler\t[demo]\n").unwrap(),
             );
         for inline in [true, false] {
             let mut cache = SymbolFrameCache::new(&resolver);

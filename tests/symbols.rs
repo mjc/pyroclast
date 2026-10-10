@@ -1931,12 +1931,50 @@ ffffffff812f5920 t do_user_addr_fault
 }
 
 #[test]
-fn kallsyms_parse_modules_only_keeps_module_symbols() {
-    let symbols = Kallsyms::parse_modules(
-        "\
+fn kallsyms_space_suffixes_do_not_create_module_views() {
+    let original = "\
 ffffffff81001280 T asm_exc_page_fault
 ffffffffc0e17dae t zfs_read [zfs]
 ffffffffc0e17e10 t zfs_write [zfs]
+";
+    assert!(Kallsyms::parse_modules(original).is_err());
+    assert_live_space_suffix_name(original, 0xffff_ffff_c0e1_7dae, "zfs_read [zfs]");
+    for module in ["[zfs]", "[igb]", "[nf_tables]"] {
+        assert!(Kallsyms::parse_modules_for_path(original, module).is_err());
+    }
+}
+
+fn assert_live_space_suffix_name(text: &str, address: u64, expected: &str) {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("kallsyms");
+    std::fs::write(&path, text).unwrap();
+    let runner = Addr2lineRunner::new(b"");
+    let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
+        .with_system_map_candidates([])
+        .with_system_kallsyms_from_path(&path);
+    let actual = resolver
+        .resolve_batch(&[SymbolRequest {
+            addr2line_address: None,
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
+            path: PathBuf::from("[kernel.kallsyms]"),
+            relative_address: address,
+            kernel_module_address: None,
+            kernel_mapping_range: None,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        }])
+        .unwrap();
+    assert_eq!(actual, [Some(format!("{expected}+0x0"))]);
+}
+
+#[test]
+fn kallsyms_parse_modules_only_keeps_module_symbols_canonical_tab() {
+    let symbols = Kallsyms::parse_modules(
+        "\
+ffffffff81001280 T asm_exc_page_fault
+ffffffffc0e17dae t zfs_read\t[zfs]
+ffffffffc0e17e10 t zfs_write\t[zfs]
 ",
     )
     .expect("module kallsyms");
@@ -1947,15 +1985,29 @@ ffffffffc0e17e10 t zfs_write [zfs]
     );
     assert_eq!(symbols.resolve(0xffff_ffff_8100_1280), None);
 }
-
 #[test]
-fn kallsyms_parse_modules_for_path_only_keeps_requested_module() {
-    let symbols = Kallsyms::parse_modules_for_path(
-        "\
+fn kallsyms_space_suffixes_do_not_select_requested_module() {
+    let original = "\
 ffffffff81001280 T asm_exc_page_fault
 ffffffffc0e17dae t zfs_read [zfs]
 ffffffffc0e17e10 t zfs_write [zfs]
 ffffffffc1e17dae t igb_clean_rx_irq [igb]
+";
+    assert!(Kallsyms::parse_modules(original).is_err());
+    assert_live_space_suffix_name(original, 0xffff_ffff_c1e1_7dae, "igb_clean_rx_irq [igb]");
+    for module in ["[zfs]", "[igb]", "[nf_tables]"] {
+        assert!(Kallsyms::parse_modules_for_path(original, module).is_err());
+    }
+}
+
+#[test]
+fn kallsyms_parse_modules_for_path_only_keeps_requested_module_canonical_tab() {
+    let symbols = Kallsyms::parse_modules_for_path(
+        "\
+ffffffff81001280 T asm_exc_page_fault
+ffffffffc0e17dae t zfs_read\t[zfs]
+ffffffffc0e17e10 t zfs_write\t[zfs]
+ffffffffc1e17dae t igb_clean_rx_irq\t[igb]
 ",
         "[zfs]",
     )
@@ -1971,15 +2023,33 @@ ffffffffc1e17dae t igb_clean_rx_irq [igb]
     );
     assert_eq!(symbols.resolve(0xffff_ffff_8100_1280), None);
 }
-
 #[test]
-fn kallsyms_module_resolution_keeps_data_symbols_inside_perf_module_map() {
-    let symbols = Kallsyms::parse_modules_for_path(
-        "\
+fn kallsyms_space_suffix_data_rows_remain_core_only() {
+    let original = "\
 ffffffffc0cd6220 d empty_dataset_kstats [zfs]
 ffffffffc0ce2e00 d __this_module [zfs]
 ffffffffc0e53510 t __pfx_zfs_ZSTD_getCParamsFromCCtxParams [zfs]
 ffffffffc0e53520 t zfs_ZSTD_getCParamsFromCCtxParams [zfs]
+";
+    assert!(Kallsyms::parse_modules(original).is_err());
+    assert_live_space_suffix_name(
+        original,
+        0xffff_ffff_c0cd_6220,
+        "empty_dataset_kstats [zfs]",
+    );
+    for module in ["[zfs]", "[igb]", "[nf_tables]"] {
+        assert!(Kallsyms::parse_modules_for_path(original, module).is_err());
+    }
+}
+
+#[test]
+fn kallsyms_module_resolution_keeps_data_symbols_inside_perf_module_map_canonical_tab() {
+    let symbols = Kallsyms::parse_modules_for_path(
+        "\
+ffffffffc0cd6220 d empty_dataset_kstats\t[zfs]
+ffffffffc0ce2e00 d __this_module\t[zfs]
+ffffffffc0e53510 t __pfx_zfs_ZSTD_getCParamsFromCCtxParams\t[zfs]
+ffffffffc0e53520 t zfs_ZSTD_getCParamsFromCCtxParams\t[zfs]
 ",
         "[zfs]",
     )
@@ -2011,14 +2081,28 @@ ffffffffc0e53520 t zfs_ZSTD_getCParamsFromCCtxParams [zfs]
         None
     );
 }
-
 #[test]
-fn kallsyms_module_resolution_caps_symbol_end_at_next_global_module_symbol_like_perf_script() {
-    let symbols = Kallsyms::parse_modules_for_path(
-        "\
+fn kallsyms_space_suffix_rows_do_not_bound_module_symbols() {
+    let original = "\
 ffffffffc0ce2e00 d __this_module [zfs]
 ffffffffc0ce31a0 t nft_do_chain [nf_tables]
 ffffffffc0e53520 t zfs_ZSTD_getCParamsFromCCtxParams [zfs]
+";
+    assert!(Kallsyms::parse_modules(original).is_err());
+    assert_live_space_suffix_name(original, 0xffff_ffff_c0ce_2e00, "__this_module [zfs]");
+    for module in ["[zfs]", "[igb]", "[nf_tables]"] {
+        assert!(Kallsyms::parse_modules_for_path(original, module).is_err());
+    }
+}
+
+#[test]
+fn kallsyms_module_resolution_caps_symbol_end_at_next_global_module_symbol_like_perf_script_canonical_tab()
+ {
+    let symbols = Kallsyms::parse_modules_for_path(
+        "\
+ffffffffc0ce2e00 d __this_module\t[zfs]
+ffffffffc0ce31a0 t nft_do_chain\t[nf_tables]
+ffffffffc0e53520 t zfs_ZSTD_getCParamsFromCCtxParams\t[zfs]
 ",
         "[zfs]",
     )
@@ -2031,12 +2115,27 @@ ffffffffc0e53520 t zfs_ZSTD_getCParamsFromCCtxParams [zfs]
         None
     );
 }
+#[test]
+fn kallsyms_space_suffix_far_row_does_not_create_module() {
+    let original = "\
+ffffffffc11dc2b0 T nft_chain_route_init [nf_tables]
+";
+    assert!(Kallsyms::parse_modules(original).is_err());
+    assert_live_space_suffix_name(
+        original,
+        0xffff_ffff_c11d_c2b0,
+        "nft_chain_route_init [nf_tables]",
+    );
+    for module in ["[zfs]", "[igb]", "[nf_tables]"] {
+        assert!(Kallsyms::parse_modules_for_path(original, module).is_err());
+    }
+}
 
 #[test]
-fn kallsyms_module_resolution_rejects_far_gaps_like_perf_script_symbols_find() {
+fn kallsyms_module_resolution_rejects_far_gaps_like_perf_script_symbols_find_canonical_tab() {
     let symbols = Kallsyms::parse_modules_for_path(
         "\
-ffffffffc11dc2b0 T nft_chain_route_init [nf_tables]
+ffffffffc11dc2b0 T nft_chain_route_init\t[nf_tables]
 ",
         "[nf_tables]",
     )
@@ -2053,7 +2152,6 @@ ffffffffc11dc2b0 T nft_chain_route_init [nf_tables]
         None
     );
 }
-
 #[test]
 fn kallsyms_resolves_relocated_kernel_addresses() {
     let symbols = Kallsyms::parse(
@@ -2255,12 +2353,14 @@ fn check_selected_core_only_kallsyms_with_live_modules(core_first: bool) {
         "ffffffff846997a0 T __pi_memcpy\nffffffff8501cd2c R xen_elfnote_phys32_entry\n",
     )
     .expect("cached kallsyms");
-    let live = Kallsyms::parse_modules(
-        "\
+    let space_rows = "\
 ffffffff8501cd2c R xen_elfnote_phys32_entry
 ffffffffc0e66100 t zpl_iter_read [zfs]
 ffffffffc0e66200 t zpl_iter_read_next [zfs]
-",
+";
+    assert!(Kallsyms::parse_modules(space_rows).is_err());
+    let live = Kallsyms::parse_modules(
+        "ffffffff8501cd2c R xen_elfnote_phys32_entry\nffffffffc0e66100 t zpl_iter_read\t[zfs]\nffffffffc0e66200 t zpl_iter_read_next\t[zfs]\n",
     )
     .expect("live module kallsyms");
     let runner = Addr2lineRunner::new(b"");
@@ -2770,24 +2870,38 @@ fn perf_symbol_resolver_does_not_use_system_map_for_recorded_kernel_build_id_wit
 
 #[test]
 fn perf_symbol_resolver_module_first_build_id_without_cache_stays_unknown() {
-    check_live_module_build_id_without_cache(false);
+    check_live_module_build_id_without_cache(false, false);
 }
 
 #[test]
-fn perf_symbol_resolver_core_first_uses_live_module_kallsyms_without_build_id_cache() {
-    check_live_module_build_id_without_cache(true);
+fn kallsyms_space_suffix_build_id_rows_do_not_create_live_modules() {
+    check_live_module_build_id_without_cache(true, false);
 }
 
-fn check_live_module_build_id_without_cache(core_first: bool) {
+#[test]
+fn perf_symbol_resolver_core_first_uses_live_module_kallsyms_without_build_id_cache_canonical_tab()
+{
+    check_live_module_build_id_without_cache(true, true);
+}
+
+#[test]
+fn perf_symbol_resolver_module_first_build_id_without_cache_stays_unknown_canonical_tab() {
+    check_live_module_build_id_without_cache(false, true);
+}
+
+fn check_live_module_build_id_without_cache(core_first: bool, canonical_tab: bool) {
     let home = tempfile::tempdir().expect("home");
     let perfdata = home.path().join("perf.data");
     std::fs::write(&perfdata, perfdata_with_kernel_build_id()).expect("perfdata");
     let live_kallsyms = home.path().join("kallsyms");
-    std::fs::write(
-        &live_kallsyms,
-        "ffffffff846997a0 T __pi_memcpy\nffffffffc0ed5900 t arc_read [zfs]\n",
-    )
-    .expect("kallsyms");
+    let space_rows = "ffffffff846997a0 T __pi_memcpy\nffffffffc0ed5900 t arc_read [zfs]\n";
+    let rows = if canonical_tab {
+        "ffffffff846997a0 T __pi_memcpy\nffffffffc0ed5900 t arc_read\t[zfs]\n"
+    } else {
+        assert_live_space_suffix_name(space_rows, 0xffff_ffff_c0ed_5900, "arc_read [zfs]");
+        space_rows
+    };
+    std::fs::write(&live_kallsyms, rows).expect("kallsyms");
 
     let runner = Addr2lineRunner::new(b"");
     let resolver = perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
@@ -2822,7 +2936,7 @@ fn check_live_module_build_id_without_cache(core_first: bool) {
     // but it does not let a failed module-first load repopulate its DSO.
     assert_eq!(
         symbols,
-        vec![core_first.then(|| "arc_read+0x6fa".to_string())]
+        vec![(core_first && canonical_tab).then(|| "arc_read+0x6fa".to_string())]
     );
     if !core_first {
         load_module_test_core(&resolver);
@@ -3122,15 +3236,25 @@ ffffffff846997a0 T memcpy
 
 #[test]
 fn perf_symbol_resolver_module_first_does_not_load_live_kallsyms() {
-    check_lazy_live_module_kallsyms(false);
+    check_lazy_live_module_kallsyms(false, false);
 }
 
 #[test]
-fn perf_symbol_resolver_core_first_loads_live_module_kallsyms_lazily() {
-    check_lazy_live_module_kallsyms(true);
+fn kallsyms_space_suffix_lazy_rows_do_not_create_live_modules() {
+    check_lazy_live_module_kallsyms(true, false);
 }
 
-fn check_lazy_live_module_kallsyms(core_first: bool) {
+#[test]
+fn perf_symbol_resolver_core_first_loads_live_module_kallsyms_lazily_canonical_tab() {
+    check_lazy_live_module_kallsyms(true, true);
+}
+
+#[test]
+fn perf_symbol_resolver_module_first_does_not_load_live_kallsyms_canonical_tab() {
+    check_lazy_live_module_kallsyms(false, true);
+}
+
+fn check_lazy_live_module_kallsyms(core_first: bool, canonical_tab: bool) {
     let root = tempfile::tempdir().expect("root");
     let live_kallsyms = root.path().join("kallsyms");
 
@@ -3138,14 +3262,17 @@ fn check_lazy_live_module_kallsyms(core_first: bool) {
     let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
         .with_system_kallsyms_from_path(&live_kallsyms);
 
-    std::fs::write(
-        &live_kallsyms,
-        "\
+    let space_rows = "\
 ffffffff846997a0 T __pi_memcpy
 ffffffffc0e17dae t zfs_read [zfs]
-",
-    )
-    .expect("kallsyms");
+";
+    let rows = if canonical_tab {
+        "ffffffff846997a0 T __pi_memcpy\nffffffffc0e17dae t zfs_read\t[zfs]\n"
+    } else {
+        assert_live_space_suffix_name(space_rows, 0xffff_ffff_c0e1_7dae, "zfs_read [zfs]");
+        space_rows
+    };
+    std::fs::write(&live_kallsyms, rows).expect("kallsyms");
     std::fs::write(
         root.path().join("modules"),
         "zfs 4096 0 - Live 0xffffffffc0e17000\n",
@@ -3172,7 +3299,7 @@ ffffffffc0e17dae t zfs_read [zfs]
     // perf-script kernel/module frames carry +0x<off> (symbol_fprintf.c).
     assert_eq!(
         symbols,
-        vec![core_first.then(|| "zfs_read+0x0".to_string())]
+        vec![(core_first && canonical_tab).then(|| "zfs_read+0x0".to_string())]
     );
     if !core_first {
         load_module_test_core(&resolver);
@@ -3196,27 +3323,51 @@ ffffffffc0e17dae t zfs_read [zfs]
 
 #[test]
 fn perf_symbol_resolver_module_first_stays_unknown_regardless_of_recorded_bounds() {
-    check_live_module_recorded_bounds(false);
+    check_live_module_recorded_bounds(false, false);
 }
 
 #[test]
-fn perf_symbol_resolver_core_first_rejects_live_module_symbol_start_before_recorded_map() {
-    check_live_module_recorded_bounds(true);
+fn kallsyms_space_suffix_recorded_bounds_do_not_create_live_modules() {
+    check_live_module_recorded_bounds(true, false);
 }
 
 #[test]
-fn perf_symbol_resolver_core_first_rejects_live_symbols_from_other_modules() {
+fn perf_symbol_resolver_core_first_rejects_live_module_symbol_start_before_recorded_map_canonical_tab()
+ {
+    check_live_module_recorded_bounds(true, true);
+}
+
+#[test]
+fn perf_symbol_resolver_module_first_stays_unknown_regardless_of_recorded_bounds_canonical_tab() {
+    check_live_module_recorded_bounds(false, true);
+}
+
+#[test]
+fn kallsyms_space_suffix_owner_names_do_not_create_live_modules() {
+    check_live_module_owners(false);
+}
+
+#[test]
+fn perf_symbol_resolver_core_first_rejects_live_symbols_from_other_modules_canonical_tab() {
+    check_live_module_owners(true);
+}
+
+fn check_live_module_owners(canonical_tab: bool) {
     // Linux v7.2.9 symbol.c:maps__split_kallsyms assigns symbols by module
     // name; maps.c:maps__find_symbol looks up only the address's selected map.
     let root = tempfile::tempdir().expect("root");
     let live_kallsyms = root.path().join("kallsyms");
-    std::fs::write(
-        &live_kallsyms,
-        "ffffffff846997a0 T __pi_memcpy\n\
+    let space_rows = "ffffffff846997a0 T __pi_memcpy\n\
          ffffffffc0002000 T alpha_entry [alpha]\n\
-         ffffffffc0003000 T beta_entry [beta]\n",
-    )
-    .expect("kallsyms");
+         ffffffffc0003000 T beta_entry [beta]\n";
+    let rows = if canonical_tab {
+        "ffffffff846997a0 T __pi_memcpy\nffffffffc0002000 T alpha_entry\t[alpha]\nffffffffc0003000 T beta_entry\t[beta]\n"
+    } else {
+        assert_live_space_suffix_name(space_rows, 0xffff_ffff_c000_2000, "alpha_entry [alpha]");
+        assert_live_space_suffix_name(space_rows, 0xffff_ffff_c000_3000, "beta_entry [beta]");
+        space_rows
+    };
+    std::fs::write(&live_kallsyms, rows).expect("kallsyms");
     let runner = Addr2lineRunner::new(b"");
     let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
         .with_system_kallsyms_from_path(&live_kallsyms);
@@ -3249,7 +3400,10 @@ fn perf_symbol_resolver_core_first_rejects_live_symbols_from_other_modules() {
             },
         ])
         .expect("module lookups");
-    assert_eq!(actual, vec![Some("alpha_entry+0x8".into()), None, None]);
+    assert_eq!(
+        actual,
+        vec![canonical_tab.then(|| "alpha_entry+0x8".into()), None, None]
+    );
     assert!(runner.commands().is_empty());
 }
 
@@ -3371,18 +3525,30 @@ fn module_projection_metadata_is_scoped_to_its_resolver_owner() {
     assert!(owned[0].has_base_symbol);
 }
 
-fn check_live_module_recorded_bounds(core_first: bool) {
+fn check_live_module_recorded_bounds(core_first: bool, canonical_tab: bool) {
     let root = tempfile::tempdir().expect("root");
     let live_kallsyms = root.path().join("kallsyms");
-    std::fs::write(
-        &live_kallsyms,
-        "\
+    let space_rows = "\
 ffffffff846997a0 T __pi_memcpy
 ffffffffc11dc2b0 T nft_chain_route_init [nf_tables]
 ffffffffc1800000 T later_nf_tables_symbol [nf_tables]
-",
-    )
-    .expect("kallsyms");
+";
+    let rows = if canonical_tab {
+        "ffffffff846997a0 T __pi_memcpy\nffffffffc11dc2b0 T nft_chain_route_init\t[nf_tables]\nffffffffc1800000 T later_nf_tables_symbol\t[nf_tables]\n"
+    } else {
+        assert_live_space_suffix_name(
+            space_rows,
+            0xffff_ffff_c11d_c2b0,
+            "nft_chain_route_init [nf_tables]",
+        );
+        assert_live_space_suffix_name(
+            space_rows,
+            0xffff_ffff_c180_0000,
+            "later_nf_tables_symbol [nf_tables]",
+        );
+        space_rows
+    };
+    std::fs::write(&live_kallsyms, rows).expect("kallsyms");
     std::fs::write(
         root.path().join("modules"),
         "nf_tables 401408 201 nft_compat,nft_chain_nat, Live 0xffffffffc11dc000\n",
@@ -3425,7 +3591,7 @@ ffffffffc1800000 T later_nf_tables_symbol [nf_tables]
     assert_eq!(
         symbols,
         vec![
-            core_first.then(|| "nft_chain_route_init+0x10".to_string()),
+            (core_first && canonical_tab).then(|| "nft_chain_route_init+0x10".to_string()),
             None
         ]
     );
@@ -3441,15 +3607,26 @@ ffffffffc1800000 T later_nf_tables_symbol [nf_tables]
 
 #[test]
 fn perf_symbol_resolver_module_first_stays_unknown_across_core_snapshot_loading() {
-    check_live_module_kallsyms_snapshot(false);
+    check_live_module_kallsyms_snapshot(false, false);
 }
 
 #[test]
-fn perf_symbol_resolver_core_first_uses_a_single_live_kallsyms_snapshot_for_modules() {
-    check_live_module_kallsyms_snapshot(true);
+fn kallsyms_space_suffix_snapshot_rows_do_not_create_live_modules() {
+    check_live_module_kallsyms_snapshot(true, false);
 }
 
-fn check_live_module_kallsyms_snapshot(core_first: bool) {
+#[test]
+fn perf_symbol_resolver_core_first_uses_a_single_live_kallsyms_snapshot_for_modules_canonical_tab()
+{
+    check_live_module_kallsyms_snapshot(true, true);
+}
+
+#[test]
+fn perf_symbol_resolver_module_first_stays_unknown_across_core_snapshot_loading_canonical_tab() {
+    check_live_module_kallsyms_snapshot(false, true);
+}
+
+fn check_live_module_kallsyms_snapshot(core_first: bool, canonical_tab: bool) {
     let root = tempfile::tempdir().expect("root");
     let live_kallsyms = root.path().join("kallsyms");
 
@@ -3457,15 +3634,19 @@ fn check_live_module_kallsyms_snapshot(core_first: bool) {
     let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
         .with_system_kallsyms_from_path(&live_kallsyms);
 
-    std::fs::write(
-        &live_kallsyms,
-        "\
+    let space_rows = "\
 ffffffff846997a0 T __pi_memcpy
 ffffffffc0e17dae t zfs_read [zfs]
 ffffffffc1e17dae t igb_clean_rx_irq [igb]
-",
-    )
-    .expect("kallsyms");
+";
+    let rows = if canonical_tab {
+        "ffffffff846997a0 T __pi_memcpy\nffffffffc0e17dae t zfs_read\t[zfs]\nffffffffc1e17dae t igb_clean_rx_irq\t[igb]\n"
+    } else {
+        assert_live_space_suffix_name(space_rows, 0xffff_ffff_c0e1_7dae, "zfs_read [zfs]");
+        assert_live_space_suffix_name(space_rows, 0xffff_ffff_c1e1_7dae, "igb_clean_rx_irq [igb]");
+        space_rows
+    };
+    std::fs::write(&live_kallsyms, rows).expect("kallsyms");
     std::fs::write(
         root.path().join("modules"),
         "\
@@ -3495,7 +3676,7 @@ igb 4096 0 - Live 0xffffffffc1e17000
     // perf-script kernel/module frames carry +0x<off> (symbol_fprintf.c).
     assert_eq!(
         symbols,
-        vec![core_first.then(|| "zfs_read+0x0".to_string())]
+        vec![(core_first && canonical_tab).then(|| "zfs_read+0x0".to_string())]
     );
     if !core_first {
         // Capture the core snapshot only after zfs has completed its failed
@@ -3503,14 +3684,16 @@ igb 4096 0 - Live 0xffffffffc1e17000
         load_module_test_core(&resolver);
     }
 
-    std::fs::write(
-        &live_kallsyms,
-        "\
+    let replacement_space_rows = "\
 ffffffff846997a0 T __pi_memcpy
 ffffffffc2e17dae t unrelated_module_symbol [mlx5]
-",
-    )
-    .expect("kallsyms");
+";
+    let replacement_rows = if canonical_tab {
+        "ffffffff846997a0 T __pi_memcpy\nffffffffc2e17dae t unrelated_module_symbol\t[mlx5]\n"
+    } else {
+        replacement_space_rows
+    };
+    std::fs::write(&live_kallsyms, replacement_rows).expect("kallsyms");
 
     let igb = SymbolRequest {
         addr2line_address: None,
@@ -3528,8 +3711,8 @@ ffffffffc2e17dae t unrelated_module_symbol [mlx5]
     assert_eq!(
         symbols,
         vec![
-            core_first.then(|| "zfs_read+0x0".to_string()),
-            Some("igb_clean_rx_irq+0x0".to_string())
+            (core_first && canonical_tab).then(|| "zfs_read+0x0".to_string()),
+            canonical_tab.then(|| "igb_clean_rx_irq+0x0".to_string())
         ]
     );
     assert!(runner.commands().is_empty());
@@ -3537,15 +3720,25 @@ ffffffffc2e17dae t unrelated_module_symbol [mlx5]
 
 #[test]
 fn perf_symbol_resolver_base_module_first_build_id_miss_stays_unknown() {
-    check_base_module_build_id_miss(false);
+    check_base_module_build_id_miss(false, false);
 }
 
 #[test]
-fn perf_symbol_resolver_base_core_first_uses_module_kallsyms_after_build_id_miss() {
-    check_base_module_build_id_miss(true);
+fn kallsyms_space_suffix_base_build_id_miss_does_not_create_live_modules() {
+    check_base_module_build_id_miss(true, false);
 }
 
-fn check_base_module_build_id_miss(core_first: bool) {
+#[test]
+fn perf_symbol_resolver_base_core_first_uses_module_kallsyms_after_build_id_miss_canonical_tab() {
+    check_base_module_build_id_miss(true, true);
+}
+
+#[test]
+fn perf_symbol_resolver_base_module_first_build_id_miss_stays_unknown_canonical_tab() {
+    check_base_module_build_id_miss(false, true);
+}
+
+fn check_base_module_build_id_miss(core_first: bool, canonical_tab: bool) {
     let root = tempfile::tempdir().expect("root");
     let debug_dir = perf_debug_dir(root.path());
     let live_kallsyms = root.path().join("kallsyms");
@@ -3553,14 +3746,17 @@ fn check_base_module_build_id_miss(core_first: bool) {
     let cached_module = perf_build_id_elf_path_for_dso(&debug_dir, Path::new("[zfs]"), build_id);
     std::fs::create_dir_all(cached_module.parent().expect("parent")).expect("cache dir");
     std::fs::write(&cached_module, b"not an elf").expect("cached module marker");
-    std::fs::write(
-        &live_kallsyms,
-        "\
+    let space_rows = "\
 ffffffff846997a0 T __pi_memcpy
 ffffffffc0e38940 t nvs_xdr_nvp_op [zfs]
-",
-    )
-    .expect("kallsyms");
+";
+    let rows = if canonical_tab {
+        "ffffffff846997a0 T __pi_memcpy\nffffffffc0e38940 t nvs_xdr_nvp_op\t[zfs]\n"
+    } else {
+        assert_live_space_suffix_name(space_rows, 0xffff_ffff_c0e3_8940, "nvs_xdr_nvp_op [zfs]");
+        space_rows
+    };
+    std::fs::write(&live_kallsyms, rows).expect("kallsyms");
 
     let runner = Addr2lineRunner::new(b"");
     let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
@@ -3589,15 +3785,15 @@ ffffffffc0e38940 t nvs_xdr_nvp_op [zfs]
     assert_eq!(
         frames,
         vec![pyroclast::symbols::ResolvedSymbolFrames {
-            frames: core_first
+            frames: (core_first && canonical_tab)
                 .then(|| "nvs_xdr_nvp_op+0x231".to_string())
                 .into_iter()
                 .collect(),
             source_state: pyroclast::symbols::SymbolSourceState::AddressDependent,
             kernel_dso: pyroclast::symbols::SymbolDsoName::Mapping,
-            has_base_symbol: core_first,
+            has_base_symbol: core_first && canonical_tab,
             has_inline_frames: false,
-            has_non_inline_base_frame: core_first,
+            has_non_inline_base_frame: core_first && canonical_tab,
             base_offset: None,
         }]
     );
