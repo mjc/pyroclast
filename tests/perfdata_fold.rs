@@ -10937,6 +10937,813 @@ fn data_symbol_inline_lookup_uses_text_bias_not_symbol_vma_like_native_perf() {
 }
 
 #[cfg(target_os = "linux")]
+fn elf_with_inline_range_tail(truncated: bool, outer_has_pc: bool) -> Vec<u8> {
+    let original = elf_with_distinct_text_and_data_biases();
+    let mut builder = object::build::elf::Builder::read(original.as_slice()).unwrap();
+    // Keep the real line program, text mapping and text_entry ELF symbol.
+    let mut abbrev = vec![
+        1, 0x11, 1, 3, 8, 0x10, 0x17, 0x11, 1, 0x12, 6, 0, 0, 2, 0x2e, 1, 3, 8,
+    ];
+    if outer_has_pc {
+        abbrev.extend_from_slice(&[0x11, 1, 0x12, 6]);
+    }
+    abbrev.extend_from_slice(&[0, 0, 3, 0x1d, 0, 3, 8, 0x55, 0x17, 0, 0, 0]);
+    let mut info = vec![0; 4];
+    info.extend_from_slice(&4_u16.to_le_bytes());
+    info.extend_from_slice(&0_u32.to_le_bytes());
+    info.extend_from_slice(b"\x08\x01bias.c\0");
+    info.extend_from_slice(&0_u32.to_le_bytes());
+    info.extend_from_slice(&0x0040_1000_u64.to_le_bytes());
+    info.extend_from_slice(&32_u32.to_le_bytes());
+    info.extend_from_slice(b"\x02text_entry\0");
+    if outer_has_pc {
+        info.extend_from_slice(&0x0040_1000_u64.to_le_bytes());
+        info.extend_from_slice(&32_u32.to_le_bytes());
+    }
+    info.extend_from_slice(b"\x03malformed_inline\0");
+    info.extend_from_slice(&0_u32.to_le_bytes());
+    info.extend_from_slice(&[0, 0]);
+    let length = u32::try_from(info.len() - 4).unwrap();
+    info[..4].copy_from_slice(&length.to_le_bytes());
+    for (name, data) in [
+        (b".debug_abbrev".as_slice(), abbrev),
+        (b".debug_info", info),
+    ] {
+        builder
+            .sections
+            .iter_mut()
+            .find(|section| section.name.as_slice() == name)
+            .unwrap()
+            .data = object::build::elf::SectionData::Data(data.into());
+    }
+    let mut ranges = Vec::new();
+    for address in [4_u64, 8, if truncated { 16 } else { 0 }] {
+        ranges.extend_from_slice(&address.to_le_bytes());
+    }
+    if !truncated {
+        ranges.extend_from_slice(&0_u64.to_le_bytes());
+    }
+    let section = builder.sections.add();
+    section.name = b".debug_ranges".as_slice().into();
+    section.sh_type = object::elf::SHT_PROGBITS;
+    section.sh_addralign = 1;
+    section.data = object::build::elf::SectionData::Data(ranges.into());
+    builder.set_section_sizes();
+    let mut bytes = Vec::new();
+    builder.write(&mut bytes).unwrap();
+    assert_inline_range_tail_layout(&bytes, truncated, outer_has_pc);
+    bytes
+}
+
+#[cfg(target_os = "linux")]
+fn assert_inline_range_tail_layout(bytes: &[u8], truncated: bool, outer_has_pc: bool) {
+    use object::ObjectSection as _;
+
+    let elf = object::File::parse(bytes).unwrap();
+    let text = elf.section_by_name(".text").unwrap();
+    assert_eq!(text.address(), 0x0040_1000);
+    assert_eq!(text.file_range(), Some((0x1000, 32)));
+    let symbol = elf
+        .symbols()
+        .find(|symbol| symbol.name() == Ok("text_entry"))
+        .unwrap();
+    assert_eq!((symbol.address(), symbol.size()), (0x0040_1000, 16));
+    assert_eq!(
+        elf.section_by_name(".debug_ranges").unwrap().size(),
+        if truncated { 24 } else { 32 }
+    );
+    let dwarf = gimli::Dwarf::load(|section| {
+        let data = elf
+            .section_by_name(section.name())
+            .map_or(&[][..], |section| section.data().unwrap());
+        Ok::<_, gimli::Error>(gimli::EndianSlice::new(data, gimli::LittleEndian))
+    })
+    .unwrap();
+    let header = dwarf.units().next().unwrap().unwrap();
+    let unit = dwarf.unit(header).unwrap();
+    let (_, sequences) = unit.line_program.clone().unwrap().sequences().unwrap();
+    assert_eq!(sequences.len(), 1);
+    assert_eq!(
+        (sequences[0].start, sequences[0].end),
+        (0x0040_1000, 0x0040_1020)
+    );
+    let mut entries = unit.entries();
+    let mut names = Vec::new();
+    while let Some(die) = entries.next_dfs().unwrap() {
+        names.push(
+            dwarf
+                .attr_string(&unit, die.attr(gimli::DW_AT_name).unwrap().value())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        if die.tag() == gimli::DW_TAG_subprogram && !outer_has_pc {
+            for attribute in [
+                gimli::DW_AT_low_pc,
+                gimli::DW_AT_high_pc,
+                gimli::DW_AT_ranges,
+            ] {
+                assert!(die.attr(attribute).is_none());
+            }
+            assert!(
+                dwarf
+                    .die_ranges(&unit, die)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        if die.tag() == gimli::DW_TAG_inlined_subroutine {
+            let mut ranges = dwarf.die_ranges(&unit, die).unwrap();
+            let prefix = ranges.next().unwrap().unwrap();
+            assert_eq!((prefix.begin, prefix.end), (0x0040_1004, 0x0040_1008));
+            if truncated {
+                assert!(
+                    ranges.next().is_err(),
+                    "fixture must end in an incomplete pair"
+                );
+            } else {
+                assert!(ranges.next().unwrap().is_none());
+            }
+        }
+    }
+    assert_eq!(names, ["bias.c", "text_entry", "malformed_inline"]);
+}
+
+#[cfg(target_os = "linux")]
+fn inline_range_tail_perfdata(binary: &std::path::Path, ip: u64) -> Vec<u8> {
+    assert!((0x0040_1000..0x0040_1010).contains(&ip));
+    let mut mmap = mmap_payload(11, 12, 0x0040_1000, 32, 0x1000, binary.to_str().unwrap());
+    mmap.resize(mmap.len().next_multiple_of(8), 0);
+    let mut bytes = perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_TIME
+                | PERF_SAMPLE_PERIOD
+                | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes_with_misc(1, PERF_RECORD_MISC_CPUMODE_USER, &mmap),
+            record_bytes_with_misc(
+                PERF_RECORD_SAMPLE,
+                PERF_RECORD_MISC_CPUMODE_USER,
+                &sample_payload_with_optional_timestamp(
+                    sample_payload_with_period(ip, 11, 12, 1, [ip]),
+                    true,
+                ),
+            ),
+        ],
+    );
+    put_u64(&mut bytes, 16, 144);
+    bytes
+}
+
+#[cfg(target_os = "linux")]
+fn native_inline_range_tail(
+    root: &std::path::Path,
+    input: &std::path::Path,
+    inline: bool,
+) -> (String, String) {
+    use inferno::collapse::Collapse as _;
+
+    let native = Command::new("perf")
+        .arg("--buildid-dir")
+        .arg(root.join(".debug"))
+        .args([
+            "script",
+            "--force",
+            if inline { "--inline" } else { "--no-inline" },
+            "-i",
+        ])
+        .arg(input)
+        .env("PERF_CONFIG", root.join("perfconfig"))
+        .env("DEBUGINFOD_URLS", "")
+        .output()
+        .unwrap();
+    assert!(
+        native.status.success(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    let script = String::from_utf8(native.stdout).unwrap();
+    assert!(
+        script.contains("text_entry+0x"),
+        "native base symbol prerequisite: {script}"
+    );
+    assert!(
+        !script.contains("[unknown]"),
+        "native DSO/source admission failed: {script}"
+    );
+    let mut folded = Vec::new();
+    inferno::collapse::perf::Folder::default()
+        .collapse(std::io::Cursor::new(script.as_bytes()), &mut folded)
+        .unwrap();
+    let folded = String::from_utf8(folded).unwrap();
+    assert!(!folded.is_empty());
+    (script, folded)
+}
+
+#[cfg(target_os = "linux")]
+fn assert_inline_range_tail_parity(truncated: bool, ip: u64, inline: bool, from_file: bool) {
+    // Source hypothesis: local perf dwarf-aux.c:669-675 treats haspc(-1) as
+    // true; installed 7.2.9/libdw 0.195 must establish the actual output first.
+    let root = tempfile::tempdir().unwrap();
+    let binary = root.path().join("range-tail.elf");
+    std::fs::write(&binary, elf_with_inline_range_tail(truncated, true)).unwrap();
+    std::fs::write(
+        root.path().join("perfconfig"),
+        "[addr2line]\nstyle = libdw\n",
+    )
+    .unwrap();
+    let input = root.path().join("perf.data");
+    std::fs::write(&input, inline_range_tail_perfdata(&binary, 0x0040_1006)).unwrap();
+    let (prefix, _) = native_inline_range_tail(root.path(), &input, true);
+    assert!(
+        prefix.contains("malformed_inline+0x"),
+        "native positive inline prerequisite: {prefix}"
+    );
+    let bytes = inline_range_tail_perfdata(&binary, ip);
+    std::fs::write(&input, &bytes).unwrap();
+    let (script, expected) = native_inline_range_tail(root.path(), &input, inline);
+    if !inline || (!truncated && ip == 0x0040_100c) {
+        assert!(
+            !script.contains("malformed_inline"),
+            "terminated/no-inline control: {script}"
+        );
+    }
+    eprintln!(
+        "range-tail truncated={truncated} ip={ip:#x} inline={inline} from_file={from_file}\nNATIVE SCRIPT:\n{script}NATIVE FOLDED:\n{expected}"
+    );
+    let resolver = pyroclast::symbols::PerfSymbolResolver::from_object_resolver(
+        pyroclast::symbols::RustAddr2lineResolver::new(),
+    );
+    let options = FoldOptions {
+        count_periods: false,
+        inline,
+    };
+    let actual = if from_file {
+        pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(&input, options, &resolver)
+            .unwrap()
+    } else {
+        fold_perfdata_callchains_with_symbols(&bytes, options, &resolver).unwrap()
+    };
+    assert_eq!(
+        actual, expected,
+        "public Rust range-tail route; native script:\n{script}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_inline_range_tail_terminated_list_selects_only_containing_inline() {
+    for from_file in [false, true] {
+        for ip in [0x0040_1006, 0x0040_100c] {
+            assert_inline_range_tail_parity(false, ip, true, from_file);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_inline_range_tail_truncated_prefix_selects_inline() {
+    for from_file in [false, true] {
+        assert_inline_range_tail_parity(true, 0x0040_1006, true, from_file);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_inline_range_tail_truncated_miss_bytes() {
+    assert_inline_range_tail_parity(true, 0x0040_100c, true, false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_inline_range_tail_truncated_miss_file() {
+    assert_inline_range_tail_parity(true, 0x0040_100c, true, true);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_inline_range_tail_no_inline_keeps_elf_function() {
+    for from_file in [false, true] {
+        assert_inline_range_tail_parity(true, 0x0040_100c, false, from_file);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn assert_absent_parent_inline_range_parity(inline: bool, from_file: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let binary = root.path().join("range-tail.elf");
+    let input = root.path().join("perf.data");
+    std::fs::write(
+        root.path().join("perfconfig"),
+        "[addr2line]\nstyle = libdw\n",
+    )
+    .unwrap();
+    let bytes = inline_range_tail_perfdata(&binary, 0x0040_1006);
+    std::fs::write(&input, &bytes).unwrap();
+    std::fs::write(&binary, elf_with_inline_range_tail(false, true)).unwrap();
+    let (healthy, _) = native_inline_range_tail(root.path(), &input, true);
+    assert!(
+        healthy.contains("malformed_inline+0x"),
+        "healthy parent control: {healthy}"
+    );
+
+    // Change only the subprogram's PC attributes. CU, line table, ELF symbol
+    // and the child's complete, terminated range remain independently valid.
+    std::fs::write(&binary, elf_with_inline_range_tail(false, false)).unwrap();
+    let (script, expected) = native_inline_range_tail(root.path(), &input, inline);
+    if !inline {
+        assert!(!script.contains("malformed_inline"));
+    }
+    eprintln!(
+        "absent-parent ip=0x401006 inline={inline} from_file={from_file}\nNATIVE SCRIPT:\n{script}NATIVE FOLDED:\n{expected}"
+    );
+    let resolver = pyroclast::symbols::PerfSymbolResolver::from_object_resolver(
+        pyroclast::symbols::RustAddr2lineResolver::new(),
+    );
+    let options = FoldOptions {
+        count_periods: false,
+        inline,
+    };
+    let actual = if from_file {
+        pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(&input, options, &resolver)
+            .unwrap()
+    } else {
+        fold_perfdata_callchains_with_symbols(&bytes, options, &resolver).unwrap()
+    };
+    assert_eq!(
+        actual, expected,
+        "public Rust absent-parent route; native script:\n{script}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_inline_range_tail_absent_parent_bytes() {
+    assert_absent_parent_inline_range_parity(true, false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_inline_range_tail_absent_parent_file() {
+    assert_absent_parent_inline_range_parity(true, true);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_inline_range_tail_absent_parent_no_inline_keeps_elf_function() {
+    for from_file in [false, true] {
+        assert_absent_parent_inline_range_parity(false, from_file);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+enum InlineTraversalGeometry {
+    AbsentInline,
+    NoncontainingInline,
+    NestedSubprogram,
+    NestedRoot,
+    UnnamedInline,
+    ChildOutsideRoot,
+    OverlappingSiblings,
+    Declaration(bool),
+}
+
+#[cfg(target_os = "linux")]
+fn push_inline_traversal_die(info: &mut Vec<u8>, code: u8, name: &str, range: Option<(u64, u32)>) {
+    info.push(code);
+    info.extend_from_slice(name.as_bytes());
+    info.push(0);
+    if let Some((begin, size)) = range {
+        info.extend_from_slice(&begin.to_le_bytes());
+        info.extend_from_slice(&size.to_le_bytes());
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn inline_traversal_sections(geometry: InlineTraversalGeometry) -> (Vec<u8>, Vec<u8>) {
+    let abbrev = vec![
+        1, 0x11, 1, 3, 8, 0x10, 0x17, 0x11, 1, 0x12, 6, 0, 0, 2, 0x2e, 1, 3, 8, 0x11, 1, 0x12, 6,
+        0, 0, 3, 0x1d, 1, 3, 8, 0x11, 1, 0x12, 6, 0, 0, 4, 0x1d, 1, 3, 8, 0, 0, 5, 0x2e, 1, 3, 8,
+        0, 0, 6, 0x2e, 1, 3, 8, 0x11, 1, 0x12, 6, 0x3c, 0x0c, 0, 0, 7, 0x1d, 1, 0x11, 1, 0x12, 6,
+        0, 0, 0,
+    ];
+    let mut info = vec![0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 8, 1];
+    info.extend_from_slice(b"bias.c\0");
+    info.extend_from_slice(&0_u32.to_le_bytes());
+    info.extend_from_slice(&0x0040_1000_u64.to_le_bytes());
+    info.extend_from_slice(&32_u32.to_le_bytes());
+    match geometry {
+        InlineTraversalGeometry::UnnamedInline => {
+            push_inline_traversal_die(&mut info, 2, "text_entry", Some((0x0040_1000, 32)));
+            info.push(7);
+            info.extend_from_slice(&0x0040_1004_u64.to_le_bytes());
+            info.extend_from_slice(&4_u32.to_le_bytes());
+            push_inline_traversal_die(&mut info, 3, "selected_leaf", Some((0x0040_1004, 4)));
+            info.extend_from_slice(&[0, 0, 0]);
+        }
+        InlineTraversalGeometry::NestedRoot => {
+            push_inline_traversal_die(&mut info, 5, "unselected_outer", None);
+            push_inline_traversal_die(&mut info, 2, "nested_function", Some((0x0040_1004, 4)));
+            push_inline_traversal_die(&mut info, 3, "selected_leaf", Some((0x0040_1004, 4)));
+            info.extend_from_slice(&[0, 0, 0]);
+        }
+        InlineTraversalGeometry::OverlappingSiblings => {
+            push_inline_traversal_die(&mut info, 2, "text_entry", Some((0x0040_1000, 32)));
+            for name in ["first_inline", "second_inline"] {
+                push_inline_traversal_die(&mut info, 3, name, Some((0x0040_1004, 4)));
+                info.push(0);
+            }
+            info.push(0);
+        }
+        InlineTraversalGeometry::Declaration(value) => {
+            push_inline_traversal_die(&mut info, 6, "text_entry", Some((0x0040_1000, 32)));
+            info.push(u8::from(value));
+            push_inline_traversal_die(&mut info, 3, "selected_leaf", Some((0x0040_1004, 4)));
+            info.extend_from_slice(&[0, 0]);
+        }
+        InlineTraversalGeometry::ChildOutsideRoot => {
+            push_inline_traversal_die(&mut info, 2, "text_entry", Some((0x0040_1000, 4)));
+            push_inline_traversal_die(&mut info, 3, "selected_leaf", Some((0x0040_1004, 4)));
+            info.extend_from_slice(&[0, 0]);
+        }
+        InlineTraversalGeometry::AbsentInline
+        | InlineTraversalGeometry::NoncontainingInline
+        | InlineTraversalGeometry::NestedSubprogram => {
+            push_inline_traversal_die(&mut info, 2, "text_entry", Some((0x0040_1000, 32)));
+            let (code, name, range) = match geometry {
+                InlineTraversalGeometry::AbsentInline => (4, "unselected_inline", None),
+                InlineTraversalGeometry::NoncontainingInline => {
+                    (3, "unselected_inline", Some((0x0040_100c, 4)))
+                }
+                InlineTraversalGeometry::NestedSubprogram => {
+                    (2, "nested_function", Some((0x0040_1004, 4)))
+                }
+                _ => unreachable!(),
+            };
+            push_inline_traversal_die(&mut info, code, name, range);
+            push_inline_traversal_die(&mut info, 3, "selected_leaf", Some((0x0040_1004, 4)));
+            info.extend_from_slice(&[0, 0, 0]);
+        }
+    }
+    info.push(0); // Close the CU, not a function/inline node.
+    let length = u32::try_from(info.len() - 4).unwrap();
+    info[..4].copy_from_slice(&length.to_le_bytes());
+    (abbrev, info)
+}
+
+#[cfg(target_os = "linux")]
+fn inline_traversal_elf(geometry: InlineTraversalGeometry, source_gap: bool) -> Vec<u8> {
+    let original = elf_with_inline_range_tail(false, true);
+    let mut builder = object::build::elf::Builder::read(original.as_slice()).unwrap();
+    let (abbrev, info) = inline_traversal_sections(geometry);
+    for (name, data) in [
+        (b".debug_abbrev".as_slice(), abbrev),
+        (b".debug_info", info),
+    ] {
+        builder
+            .sections
+            .iter_mut()
+            .find(|section| section.name.as_slice() == name)
+            .unwrap()
+            .data = object::build::elf::SectionData::Data(data.into());
+    }
+    if source_gap {
+        let mut line = text_only_dwarf_sections()
+            .into_iter()
+            .find(|(name, _)| *name == b".debug_line")
+            .unwrap()
+            .1;
+        assert!(line.ends_with(&[1, 2, 32, 0, 1, 1]));
+        line.truncate(line.len() - 6);
+        line.extend_from_slice(&[1, 2, 4, 0, 1, 1]);
+        builder
+            .sections
+            .iter_mut()
+            .find(|section| section.name.as_slice() == b".debug_line")
+            .unwrap()
+            .data = object::build::elf::SectionData::Data(line.into());
+    }
+    builder.set_section_sizes();
+    let mut bytes = Vec::new();
+    builder.write(&mut bytes).unwrap();
+    assert_inline_traversal_layout(&bytes, geometry, source_gap);
+    bytes
+}
+
+#[cfg(target_os = "linux")]
+fn assert_inline_traversal_layout(
+    bytes: &[u8],
+    geometry: InlineTraversalGeometry,
+    source_gap: bool,
+) {
+    use object::ObjectSection as _;
+
+    let elf = object::File::parse(bytes).unwrap();
+    assert_eq!(
+        elf.section_by_name(".text").unwrap().file_range(),
+        Some((0x1000, 32))
+    );
+    let symbol = elf
+        .symbols()
+        .find(|symbol| symbol.name() == Ok("text_entry"))
+        .unwrap();
+    assert_eq!((symbol.address(), symbol.size()), (0x0040_1000, 16));
+    let dwarf = gimli::Dwarf::load(|section| {
+        let data = elf
+            .section_by_name(section.name())
+            .map_or(&[][..], |section| section.data().unwrap());
+        Ok::<_, gimli::Error>(gimli::EndianSlice::new(data, gimli::LittleEndian))
+    })
+    .unwrap();
+    let unit = dwarf.unit(dwarf.units().next().unwrap().unwrap()).unwrap();
+    let (_, sequences) = unit.line_program.clone().unwrap().sequences().unwrap();
+    assert_eq!(sequences.len(), 1);
+    assert_eq!(
+        (sequences[0].start, sequences[0].end),
+        (
+            0x0040_1000,
+            if source_gap { 0x0040_1004 } else { 0x0040_1020 }
+        )
+    );
+    let mut entries = unit.entries();
+    let mut names = Vec::new();
+    let mut unnamed = 0;
+    while let Some(die) = entries.next_dfs().unwrap() {
+        let Some(name_attr) = die.attr(gimli::DW_AT_name) else {
+            assert_eq!(die.tag(), gimli::DW_TAG_inlined_subroutine);
+            assert!(die.attr(gimli::DW_AT_abstract_origin).is_none());
+            unnamed += 1;
+            continue;
+        };
+        let name = dwarf
+            .attr_string(&unit, name_attr.value())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        if name == "selected_leaf" {
+            let range = dwarf
+                .die_ranges(&unit, die)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap();
+            assert_eq!((range.begin, range.end), (0x0040_1004, 0x0040_1008));
+        }
+        names.push(name);
+    }
+    let expected_names = match geometry {
+        InlineTraversalGeometry::NestedRoot => vec![
+            "bias.c",
+            "unselected_outer",
+            "nested_function",
+            "selected_leaf",
+        ],
+        InlineTraversalGeometry::OverlappingSiblings => {
+            vec!["bias.c", "text_entry", "first_inline", "second_inline"]
+        }
+        InlineTraversalGeometry::Declaration(_) | InlineTraversalGeometry::ChildOutsideRoot => {
+            vec!["bias.c", "text_entry", "selected_leaf"]
+        }
+        InlineTraversalGeometry::UnnamedInline => vec!["bias.c", "text_entry", "selected_leaf"],
+        InlineTraversalGeometry::NestedSubprogram => {
+            vec!["bias.c", "text_entry", "nested_function", "selected_leaf"]
+        }
+        _ => vec!["bias.c", "text_entry", "unselected_inline", "selected_leaf"],
+    };
+    assert_eq!(names, expected_names);
+    assert_eq!(
+        unnamed,
+        usize::from(matches!(geometry, InlineTraversalGeometry::UnnamedInline))
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn assert_inline_traversal_parity(
+    geometry: InlineTraversalGeometry,
+    source_gap: bool,
+    inline: bool,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let binary = root.path().join("range-tail.elf");
+    let input = root.path().join("perf.data");
+    std::fs::write(
+        root.path().join("perfconfig"),
+        "[addr2line]\nstyle = libdw\n",
+    )
+    .unwrap();
+    let bytes = inline_range_tail_perfdata(&binary, 0x0040_1006);
+    std::fs::write(&input, &bytes).unwrap();
+    std::fs::write(&binary, elf_with_inline_range_tail(false, true)).unwrap();
+    let (healthy, _) = native_inline_range_tail(root.path(), &input, true);
+    assert!(
+        healthy.contains("malformed_inline+0x"),
+        "healthy native inline prerequisite: {healthy}"
+    );
+    std::fs::write(&binary, inline_traversal_elf(geometry, source_gap)).unwrap();
+    let (script, expected) = native_inline_range_tail(root.path(), &input, inline);
+    eprintln!(
+        "geometry={geometry:?} source_gap={source_gap} inline={inline}\nNATIVE SCRIPT:\n{script}NATIVE FOLDED:\n{expected}"
+    );
+    let options = FoldOptions {
+        count_periods: false,
+        inline,
+    };
+    let mut actual = Vec::new();
+    for from_file in [false, true] {
+        let resolver = pyroclast::symbols::PerfSymbolResolver::from_object_resolver(
+            pyroclast::symbols::RustAddr2lineResolver::new(),
+        );
+        let folded = if from_file {
+            pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(&input, options, &resolver)
+                .unwrap()
+        } else {
+            fold_perfdata_callchains_with_symbols(&bytes, options, &resolver).unwrap()
+        };
+        eprintln!("Rust from_file={from_file}: {folded}");
+        actual.push(folded);
+    }
+    assert_eq!(
+        actual,
+        [expected.clone(), expected],
+        "geometry={geometry:?}; BOTH routes captured before assertion"
+    );
+}
+
+#[cfg(target_os = "linux")]
+macro_rules! native_inline_traversal_case {
+    ($name:ident, $geometry:expr, $gap:expr, $inline:expr) => {
+        #[test]
+        fn $name() {
+            assert_inline_traversal_parity($geometry, $gap, $inline);
+        }
+    };
+}
+
+#[cfg(target_os = "linux")]
+native_inline_traversal_case!(
+    native_inline_traversal_absent_inline_ancestor,
+    InlineTraversalGeometry::AbsentInline,
+    false,
+    true
+);
+#[cfg(target_os = "linux")]
+native_inline_traversal_case!(
+    native_inline_traversal_noncontaining_inline_ancestor,
+    InlineTraversalGeometry::NoncontainingInline,
+    false,
+    true
+);
+#[cfg(target_os = "linux")]
+native_inline_traversal_case!(
+    native_inline_traversal_nested_subprogram,
+    InlineTraversalGeometry::NestedSubprogram,
+    false,
+    true
+);
+#[cfg(target_os = "linux")]
+native_inline_traversal_case!(
+    native_inline_traversal_nested_independent_root,
+    InlineTraversalGeometry::NestedRoot,
+    false,
+    true
+);
+#[cfg(target_os = "linux")]
+native_inline_traversal_case!(
+    native_inline_traversal_child_outside_root,
+    InlineTraversalGeometry::ChildOutsideRoot,
+    false,
+    true
+);
+#[cfg(target_os = "linux")]
+native_inline_traversal_case!(
+    native_inline_traversal_first_overlapping_sibling,
+    InlineTraversalGeometry::OverlappingSiblings,
+    false,
+    true
+);
+#[cfg(target_os = "linux")]
+native_inline_traversal_case!(
+    native_inline_traversal_declaration_present_true,
+    InlineTraversalGeometry::Declaration(true),
+    false,
+    true
+);
+#[cfg(target_os = "linux")]
+native_inline_traversal_case!(
+    native_inline_traversal_declaration_present_false,
+    InlineTraversalGeometry::Declaration(false),
+    false,
+    true
+);
+#[cfg(target_os = "linux")]
+native_inline_traversal_case!(
+    native_inline_traversal_source_line_gap,
+    InlineTraversalGeometry::AbsentInline,
+    true,
+    true
+);
+#[cfg(target_os = "linux")]
+native_inline_traversal_case!(
+    native_inline_traversal_no_inline,
+    InlineTraversalGeometry::AbsentInline,
+    false,
+    false
+);
+
+#[cfg(target_os = "linux")]
+native_inline_traversal_case!(
+    native_inline_traversal_unnamed_inline,
+    InlineTraversalGeometry::UnnamedInline,
+    false,
+    true
+);
+#[cfg(target_os = "linux")]
+native_inline_traversal_case!(
+    native_inline_traversal_unnamed_inline_no_inline,
+    InlineTraversalGeometry::UnnamedInline,
+    false,
+    false
+);
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_inline_range_tail_truncated_before_first_row() {
+    use object::ObjectSection as _;
+
+    let root = tempfile::tempdir().unwrap();
+    let binary = root.path().join("range-tail.elf");
+    let input = root.path().join("perf.data");
+    std::fs::write(
+        root.path().join("perfconfig"),
+        "[addr2line]\nstyle = libdw\n",
+    )
+    .unwrap();
+    let original = elf_with_inline_range_tail(false, true);
+    std::fs::write(&binary, &original).unwrap();
+    std::fs::write(&input, inline_range_tail_perfdata(&binary, 0x0040_1006)).unwrap();
+    let (healthy, _) = native_inline_range_tail(root.path(), &input, true);
+    assert!(healthy.contains("malformed_inline+0x"));
+    let mut builder = object::build::elf::Builder::read(original.as_slice()).unwrap();
+    builder
+        .sections
+        .iter_mut()
+        .find(|section| section.name.as_slice() == b".debug_ranges")
+        .unwrap()
+        .data = object::build::elf::SectionData::Data(4_u64.to_le_bytes().to_vec().into());
+    builder.set_section_sizes();
+    let mut elf_bytes = Vec::new();
+    builder.write(&mut elf_bytes).unwrap();
+    let elf = object::File::parse(elf_bytes.as_slice()).unwrap();
+    assert_eq!(
+        elf.section_by_name(".debug_ranges")
+            .unwrap()
+            .data()
+            .unwrap(),
+        4_u64.to_le_bytes()
+    );
+    std::fs::write(&binary, elf_bytes).unwrap();
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    for ip in [0x0040_1006, 0x0040_100c] {
+        let bytes = inline_range_tail_perfdata(&binary, ip);
+        std::fs::write(&input, &bytes).unwrap();
+        let (script, folded) = native_inline_range_tail(root.path(), &input, true);
+        eprintln!(
+            "truncated BEFORE first pair ip={ip:#x}\nNATIVE SCRIPT:\n{script}NATIVE FOLDED:\n{folded}"
+        );
+        for from_file in [false, true] {
+            let resolver = pyroclast::symbols::PerfSymbolResolver::from_object_resolver(
+                pyroclast::symbols::RustAddr2lineResolver::new(),
+            );
+            let options = FoldOptions {
+                count_periods: false,
+                inline: true,
+            };
+            let result = if from_file {
+                pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(
+                    &input, options, &resolver,
+                )
+                .unwrap()
+            } else {
+                fold_perfdata_callchains_with_symbols(&bytes, options, &resolver).unwrap()
+            };
+            eprintln!("Rust from_file={from_file}: {result}");
+            actual.push(result);
+            expected.push(folded.clone());
+        }
+    }
+    assert_eq!(actual, expected);
+}
+
+#[cfg(target_os = "linux")]
 fn assert_data_symbol_routes_match_native(
     input: &std::path::Path,
     root: &std::path::Path,
