@@ -5615,6 +5615,184 @@ fn write_native_cached_kernel_elf_fixture(
 }
 
 #[cfg(target_os = "linux")]
+fn rewrite_native_cached_kernel_elf_fixture_mapping(
+    root: &std::path::Path,
+    original: &[u8],
+    kaslr_slide: u64,
+    zero_reference: bool,
+    sample_offset: u64,
+) -> Vec<u8> {
+    let header = pyroclast::perfdata::header::parse_header(original).unwrap();
+    let mut saw_kernel_mapping = false;
+    let records = pyroclast::perfdata::records::iter_records(original, header)
+        .unwrap()
+        .into_iter()
+        .map(|record| {
+            let payload = if record.header.record_type
+                == pyroclast::perfdata::records::PERF_RECORD_MMAP
+                && matches!(
+                    pyroclast::perfdata::records::parse_mmap_record(record.payload),
+                    Ok(ref mmap) if mmap.path == "[kernel.kallsyms]_stext"
+                ) {
+                assert!(!saw_kernel_mapping, "duplicate kernel reference mapping");
+                saw_kernel_mapping = true;
+                let mut payload = record.payload.to_vec();
+                let runtime_stext = 0xffff_ffff_8100_0000_u64.wrapping_add(kaslr_slide);
+                put_u64(&mut payload, 8, runtime_stext);
+                put_u64(
+                    &mut payload,
+                    24,
+                    if zero_reference { 0 } else { runtime_stext },
+                );
+                payload
+            } else if record.header.record_type == PERF_RECORD_SAMPLE {
+                let runtime_entry = 0xffff_ffff_8100_0000_u64
+                    .wrapping_add(kaslr_slide)
+                    .wrapping_add(sample_offset);
+                sample_payload_with_time(
+                    runtime_entry,
+                    11,
+                    12,
+                    1_000_000_000,
+                    [0xffff_ffff_ffff_ff80, runtime_entry],
+                )
+            } else {
+                record.payload.to_vec()
+            };
+            record_bytes_with_misc(record.header.record_type, record.header.misc, &payload)
+        })
+        .collect::<Vec<_>>();
+    assert!(saw_kernel_mapping, "missing kernel reference mapping");
+    let mut attr = file_attr_bytes(
+        PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CALLCHAIN,
+        0,
+        0,
+    );
+    put_u64(&mut attr, 16, 1);
+    let mut feature = build_id_event_payload(u32::MAX, &[0xa5; 20], "[kernel.kallsyms]");
+    feature[4..6].copy_from_slice(&PERF_RECORD_MISC_CPUMODE_KERNEL.to_le_bytes());
+    let mut bytes = perfdata_with_records_attrs_and_build_id_feature([attr], records, &feature);
+    put_u64(&mut bytes, 16, 144);
+    std::fs::write(root.join("perf.data"), &bytes).unwrap();
+    bytes
+}
+
+#[cfg(target_os = "linux")]
+fn rewrite_native_cached_kernel_elf_with_ignored_text_symbols(elf: &std::path::Path) {
+    let original = std::fs::read(elf).unwrap();
+    let mut builder = object::build::elf::Builder::read(original.as_slice()).unwrap();
+    let text_id = builder
+        .sections
+        .iter()
+        .find(|section| section.name.as_slice() == b".text")
+        .unwrap()
+        .id();
+    for (index, symbol) in builder
+        .symbols
+        .iter_mut()
+        .filter(|symbol| symbol.section == Some(text_id))
+        .enumerate()
+    {
+        symbol.name = [
+            b".Lignored".as_slice(),
+            &[b'0' + u8::try_from(index).unwrap()],
+        ]
+        .concat()
+        .into();
+        symbol.st_size = 1;
+    }
+    let data = builder.sections.add();
+    data.name = b".data"[..].into();
+    data.sh_type = object::elf::SHT_PROGBITS;
+    data.sh_flags = u64::from(object::elf::SHF_ALLOC | object::elf::SHF_WRITE);
+    data.sh_addr = 0xffff_ffff_8100_1000;
+    data.data = object::build::elf::SectionData::Data(vec![0; 16].into());
+    let data_id = data.id();
+    let symbol = builder.symbols.add();
+    symbol.name = b"kernel_data"[..].into();
+    symbol.st_value = 0xffff_ffff_8100_1000;
+    symbol.st_size = 4;
+    symbol.set_st_info(object::elf::STB_GLOBAL, object::elf::STT_OBJECT);
+    symbol.section = Some(data_id);
+    builder.set_section_sizes();
+    let mut bytes = Vec::new();
+    builder.write(&mut bytes).unwrap();
+    std::fs::write(elf, bytes).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn rewrite_native_cached_kernel_elf_text_address(elf: &std::path::Path, elf_text_address: u64) {
+    let original = std::fs::read(elf).unwrap();
+    let mut builder = object::build::elf::Builder::read(original.as_slice()).unwrap();
+    let text_id = builder
+        .sections
+        .iter_mut()
+        .find(|section| section.name.as_slice() == b".text")
+        .unwrap()
+        .id();
+    let text = builder
+        .sections
+        .iter_mut()
+        .find(|section| section.name.as_slice() == b".text")
+        .unwrap();
+    text.sh_addr = elf_text_address;
+    for symbol in builder
+        .symbols
+        .iter_mut()
+        .filter(|symbol| symbol.section == Some(text_id))
+    {
+        symbol.st_value =
+            elf_text_address.wrapping_add(symbol.st_value.wrapping_sub(0xffff_ffff_8100_0000));
+    }
+    let mut bytes = Vec::new();
+    builder.write(&mut bytes).unwrap();
+    std::fs::write(elf, bytes).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn rewrite_native_cached_kernel_elf_reference(elf: &std::path::Path, zero_first: bool) {
+    let original = std::fs::read(elf).unwrap();
+    let mut builder = object::build::elf::Builder::read(original.as_slice()).unwrap();
+    for symbol in &mut builder.symbols {
+        if symbol.section.is_none() {
+            continue;
+        }
+        if symbol.name.as_slice() == b"_stext" {
+            if zero_first {
+                symbol.st_value = 0;
+            } else {
+                symbol.name = b"not_stext"[..].into();
+            }
+        } else if zero_first && symbol.name.as_slice() == b"_etext" {
+            symbol.name = b"_stext"[..].into();
+        }
+    }
+    let mut bytes = Vec::new();
+    builder.write(&mut bytes).unwrap();
+    std::fs::write(elf, bytes).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn assert_native_cached_kernel_elf_selected(
+    root: &std::path::Path,
+    elf: &std::path::Path,
+    script: &str,
+    stderr: &str,
+) {
+    let native_elf = root
+        .join("symfs/.debug")
+        .join(elf.strip_prefix(root.join(".debug")).unwrap());
+    assert_eq!(
+        std::fs::canonicalize(&native_elf).unwrap(),
+        std::fs::canonicalize(elf).unwrap()
+    );
+    assert!(
+        stderr.contains(&format!("Using {} for symbols", native_elf.display())),
+        "perf did not select the fixture ELF: {script}\n{stderr}"
+    );
+}
+
+#[cfg(target_os = "linux")]
 fn query_native_automatic_kernel_cache(root: &std::path::Path) -> (String, String, Vec<u8>) {
     use inferno::collapse::Collapse as _;
     let output = Command::new("perf")
@@ -5816,6 +5994,120 @@ fn automatic_matching_kernel_elf_precedes_cached_kallsyms_like_native_perf() {
         "{script}\n{stderr}"
     );
     assert_eq!(native, b"worker;elf_kernel_entry 1\n");
+    assert_automatic_kernel_routes(root.path(), &bytes, &native);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn automatic_kernel_elf_resolves_shifted_kaslr_mapping_like_native_perf() {
+    // perf v7.2.9 machine.c:1695-1715 (local 1707-1711) records nonzero mmap
+    // pgoff as runtime _stext; symbol-elf.c:1593-1606 (local 1548-1558) matches
+    // its first exact SYMTAB row and applies recorded minus ELF st_value.
+    let (root, original, elf) = write_native_cached_kernel_elf_fixture(Some(&[0xa5; 20]), true);
+    let bytes = rewrite_native_cached_kernel_elf_fixture_mapping(
+        root.path(),
+        &original,
+        0x20_0000,
+        false,
+        0x10,
+    );
+    let (script, stderr, native) = query_native_automatic_kernel_cache(root.path());
+    assert_native_cached_kernel_elf_selected(root.path(), &elf, &script, &stderr);
+    assert!(
+        script.contains("ffffffff81200010 elf_kernel_entry+0x0 ("),
+        "native perf did not relocate the sampled IP: {script}\n{stderr}"
+    );
+    assert_eq!(native, b"worker;elf_kernel_entry 1\n");
+    assert_automatic_kernel_routes(root.path(), &bytes, &native);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn automatic_kernel_elf_missing_reference_keeps_zero_relocation_like_native_perf() {
+    let (root, original, elf) = write_native_cached_kernel_elf_fixture(Some(&[0xa5; 20]), true);
+    rewrite_native_cached_kernel_elf_reference(&elf, false);
+    let bytes = rewrite_native_cached_kernel_elf_fixture_mapping(
+        root.path(),
+        &original,
+        0x20_0000,
+        false,
+        0x10,
+    );
+    let (script, stderr, native) = query_native_automatic_kernel_cache(root.path());
+    assert_native_cached_kernel_elf_selected(root.path(), &elf, &script, &stderr);
+    assert!(script.contains(" [unknown] ("), "{script}\n{stderr}");
+    assert_automatic_kernel_routes(root.path(), &bytes, &native);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn automatic_kernel_elf_zero_reference_stops_at_first_physical_alias_like_native_perf() {
+    let (root, original, elf) = write_native_cached_kernel_elf_fixture(Some(&[0xa5; 20]), true);
+    rewrite_native_cached_kernel_elf_reference(&elf, true);
+    let bytes = rewrite_native_cached_kernel_elf_fixture_mapping(
+        root.path(),
+        &original,
+        0x20_0000,
+        false,
+        0x10,
+    );
+    let (script, stderr, native) = query_native_automatic_kernel_cache(root.path());
+    assert_native_cached_kernel_elf_selected(root.path(), &elf, &script, &stderr);
+    assert!(script.contains(" [unknown] ("), "{script}\n{stderr}");
+    assert_automatic_kernel_routes(root.path(), &bytes, &native);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn automatic_kernel_elf_wraparound_relocation_matches_native_perf() {
+    let (root, original, elf) = write_native_cached_kernel_elf_fixture(Some(&[0xa5; 20]), true);
+    rewrite_native_cached_kernel_elf_text_address(&elf, 0xffff_ffff_ffff_f000);
+    let bytes = rewrite_native_cached_kernel_elf_fixture_mapping(
+        root.path(),
+        &original,
+        0x7f00_1000,
+        false,
+        0x10,
+    );
+    let (script, stderr, native) = query_native_automatic_kernel_cache(root.path());
+    assert_native_cached_kernel_elf_selected(root.path(), &elf, &script, &stderr);
+    assert!(
+        script.contains("1010 elf_kernel_entry+0x0 ("),
+        "native perf did not wrap the relocation: {script}\n{stderr}"
+    );
+    assert_eq!(native, b"worker;elf_kernel_entry 1\n");
+    assert_automatic_kernel_routes(root.path(), &bytes, &native);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn automatic_kernel_elf_zero_pgoff_keeps_unshifted_reference_like_native_perf() {
+    let (root, original, elf) = write_native_cached_kernel_elf_fixture(Some(&[0xa5; 20]), true);
+    let bytes =
+        rewrite_native_cached_kernel_elf_fixture_mapping(root.path(), &original, 0, true, 0x10);
+    let (script, stderr, native) = query_native_automatic_kernel_cache(root.path());
+    assert_native_cached_kernel_elf_selected(root.path(), &elf, &script, &stderr);
+    assert!(
+        script.contains("ffffffff81000010 elf_kernel_entry+0x0 ("),
+        "{script}\n{stderr}"
+    );
+    assert_eq!(native, b"worker;elf_kernel_entry 1\n");
+    assert_automatic_kernel_routes(root.path(), &bytes, &native);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn automatic_kernel_elf_ignored_text_labels_preserve_native_core_map() {
+    let (root, original, elf) = write_native_cached_kernel_elf_fixture(Some(&[0xa5; 20]), true);
+    rewrite_native_cached_kernel_elf_with_ignored_text_symbols(&elf);
+    let bytes =
+        rewrite_native_cached_kernel_elf_fixture_mapping(root.path(), &original, 0, true, 0x90);
+    let (script, stderr, native) = query_native_automatic_kernel_cache(root.path());
+    assert_native_cached_kernel_elf_selected(root.path(), &elf, &script, &stderr);
+    assert!(
+        script.contains(" [unknown] ("),
+        "native perf should retain mapped-unknown in the core map: {script}\n{stderr}"
+    );
     assert_automatic_kernel_routes(root.path(), &bytes, &native);
 }
 

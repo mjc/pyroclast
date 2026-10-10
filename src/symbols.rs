@@ -719,15 +719,32 @@ struct ObjectAddressCache {
 
 struct ObjectAddressMetadata {
     segments: Vec<ObjectSegmentRange>,
+    kernel_map_metadata: OnceLock<Option<KernelElfMapMetadata>>,
     text_offset: u64,
     build_id: Option<String>,
     kernel_symbols_usable: OnceLock<bool>,
+    kernel_reference_symbols: FxHashMap<Box<str>, Option<u64>>,
 }
 
 struct ObjectSegmentRange {
     file_offset: u64,
     file_end: u64,
     virtual_address: u64,
+}
+
+struct ObjectSectionRange {
+    virtual_address: u64,
+    size: u64,
+}
+
+struct KernelElfMapMetadata {
+    sections: Vec<ObjectSectionRange>,
+    has_text_section: bool,
+}
+
+enum KernelObjectRequest {
+    Mapped(SymbolRequest),
+    Unmapped,
 }
 
 struct PerfDwarfNameResolver<'a> {
@@ -2961,11 +2978,13 @@ where
                         .and_then(|frames| frames.frames.into_iter().next());
                 }
             } else if is_kernel_symbol_path(&request.path) {
-                if let Some(object_request) =
+                if let Some(kernel_request) =
                     self.kernel_object_symbol_request(request, &mut address_cache)
                 {
-                    kernel_elf_indexes.push(index);
-                    kernel_elf_requests.push(object_request);
+                    if let KernelObjectRequest::Mapped(object_request) = kernel_request {
+                        kernel_elf_indexes.push(index);
+                        kernel_elf_requests.push(object_request);
+                    }
                 } else if let Some(frames) = self.resolve_kernel_frames(request) {
                     resolved[index] = frames.frames.into_iter().next();
                 }
@@ -3127,11 +3146,18 @@ where
                     resolved[index] = frames;
                 }
             } else if is_kernel_symbol_path(&request.path) {
-                if let Some(object_request) =
+                if let Some(kernel_request) =
                     self.kernel_object_symbol_request(request, &mut address_cache)
                 {
-                    kernel_elf_indexes.push(index);
-                    kernel_elf_requests.push(object_request);
+                    match kernel_request {
+                        KernelObjectRequest::Unmapped => {
+                            resolved[index].kernel_dso = SymbolDsoName::Unmapped;
+                        }
+                        KernelObjectRequest::Mapped(object_request) => {
+                            kernel_elf_indexes.push(index);
+                            kernel_elf_requests.push(object_request);
+                        }
+                    }
                 } else if let Some(frames) = self.resolve_kernel_frames(request) {
                     resolved[index] = frames;
                 }
@@ -3265,7 +3291,7 @@ where
         &self,
         request: &SymbolRequest,
         address_cache: &mut ObjectAddressCache,
-    ) -> Option<SymbolRequest> {
+    ) -> Option<KernelObjectRequest> {
         // perf v7.2.9 symbol.c:2199-2245 selects explicit kallsyms first,
         // then a usable build-ID ELF, before automatic kallsyms discovery.
         if self.kallsyms.is_some() {
@@ -3282,12 +3308,43 @@ where
             .lock()
             .expect("kernel DSO load lock")
             .core_loaded = true;
-        Some(clean_object_symbol_request_with_cache(
-            path.clone(),
-            request.relative_address,
-            address_cache,
-            true,
-        ))
+        // perf v7.2.9 map.c:529-559 converts the runtime RIP by subtracting
+        // the kernel map relocation; symbol-elf.c:1593-1606 supplies that
+        // relocation from recorded reference minus the selected ELF st_value.
+        let relative_address = match request
+            .kernel_relocation
+            .as_ref()
+            .filter(|relocation| relocation.recorded_reference_address != 0)
+        {
+            Some(relocation) => object_kernel_reference_symbol_address(
+                path,
+                &relocation.reference_symbol,
+                address_cache,
+            )
+            .filter(|address| *address != 0)
+            .map_or(request.relative_address, |symbol_address| {
+                let relocation_delta = relocation
+                    .recorded_reference_address
+                    .wrapping_sub(symbol_address);
+                request.relative_address.wrapping_sub(relocation_delta)
+            }),
+            None => request.relative_address,
+        };
+        let object_request = SymbolRequest {
+            path: path.clone(),
+            relative_address,
+            addr2line_address: None,
+            kernel_module_address: None,
+            kernel_mapping_range: None,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        };
+        if Self::kernel_elf_address_is_unmapped(request, &object_request, address_cache) {
+            Some(KernelObjectRequest::Unmapped)
+        } else {
+            Some(KernelObjectRequest::Mapped(object_request))
+        }
     }
 
     fn module_object_symbol_request(
@@ -3493,6 +3550,33 @@ where
             })
     }
 
+    fn kernel_elf_address_is_unmapped(
+        request: &SymbolRequest,
+        object_request: &SymbolRequest,
+        address_cache: &mut ObjectAddressCache,
+    ) -> bool {
+        let Some(metadata) = object_address_metadata(&object_request.path, address_cache) else {
+            return false;
+        };
+        let map_metadata = metadata
+            .kernel_map_metadata
+            .get_or_init(|| read_kernel_elf_map_metadata(&object_request.path));
+        let Some(map_metadata) = map_metadata.as_ref() else {
+            return false;
+        };
+        if !map_metadata.has_text_section {
+            return false;
+        }
+        let relocation = request
+            .relative_address
+            .wrapping_sub(object_request.relative_address);
+        !map_metadata.sections.iter().any(|section| {
+            let start = section.virtual_address.wrapping_add(relocation);
+            let end = start.wrapping_add(section.size);
+            start <= request.relative_address && request.relative_address < end
+        })
+    }
+
     // None means no source loaded; an empty frame result is a selected-source miss.
     fn resolve_kernel_source(&self, request: &SymbolRequest) -> Option<ResolvedSymbolFrames> {
         let symbol = if is_kernel_module_request(request) {
@@ -3629,10 +3713,10 @@ fn clean_object_symbol_request_with_cache(
     }
 }
 
-fn object_address_metadata<'a>(
+fn object_address_metadata_mut<'a>(
     path: &Path,
     address_cache: &'a mut ObjectAddressCache,
-) -> Option<&'a ObjectAddressMetadata> {
+) -> Option<&'a mut ObjectAddressMetadata> {
     let metadata = match address_cache
         .segments_by_path
         .raw_entry_mut()
@@ -3644,7 +3728,42 @@ fn object_address_metadata<'a>(
             entry.insert(path.as_os_str().to_owned(), segments).1
         }
     };
-    metadata.as_ref()
+    metadata.as_mut()
+}
+
+fn object_address_metadata<'a>(
+    path: &Path,
+    address_cache: &'a mut ObjectAddressCache,
+) -> Option<&'a ObjectAddressMetadata> {
+    object_address_metadata_mut(path, address_cache).map(|metadata| &*metadata)
+}
+
+fn object_kernel_reference_symbol_address(
+    path: &Path,
+    reference_symbol: &str,
+    address_cache: &mut ObjectAddressCache,
+) -> Option<u64> {
+    let metadata = object_address_metadata_mut(path, address_cache)?;
+    if let Some(address) = metadata.kernel_reference_symbols.get(reference_symbol) {
+        return *address;
+    }
+    let address = read_regular_symbol_address(path, reference_symbol);
+    metadata
+        .kernel_reference_symbols
+        .insert(reference_symbol.into(), address);
+    address
+}
+
+fn read_regular_symbol_address(path: &Path, name: &str) -> Option<u64> {
+    // perf v7.2.9 symbol-elf.c:1593-1606 (local 1548-1558) stops at the first
+    // exact regular-SYMTAB name, before candidate/type filtering.
+    let file = open_regular_object(path)?;
+    let len = file.metadata().ok()?.len();
+    let cache = object::read::ReadCache::new(file);
+    let object = object::File::parse(cache.range(0, len)).ok()?;
+    object
+        .symbols()
+        .find_map(|symbol| (symbol.name().ok() == Some(name)).then(|| symbol.address()))
 }
 
 fn object_build_id_matches(
@@ -3694,7 +3813,7 @@ fn kernel_object_is_usable(
             && object
                 .symbols()
                 .chain(object.dynamic_symbols())
-                .any(|symbol| perf_symbol_is_candidate(&object, &symbol))
+                .any(|symbol| perf_kernel_symbol_is_candidate(&object, &symbol))
     })
 }
 
@@ -3727,10 +3846,65 @@ fn object_load_segment_ranges(path: &Path) -> Option<ObjectAddressMetadata> {
         .collect::<Vec<_>>();
     Some(ObjectAddressMetadata {
         segments,
+        kernel_map_metadata: OnceLock::new(),
         text_offset: object_text_offset(&object),
         build_id,
         kernel_symbols_usable: OnceLock::new(),
+        kernel_reference_symbols: FxHashMap::default(),
     })
+}
+
+fn read_kernel_elf_map_metadata(path: &Path) -> Option<KernelElfMapMetadata> {
+    let file = open_regular_object(path)?;
+    let len = file.metadata().ok()?.len();
+    let cache = object::read::ReadCache::new(file);
+    let object = object::File::parse(cache.range(0, len)).ok()?;
+    if object.format() != object::BinaryFormat::Elf {
+        return None;
+    }
+    let accepted_sections = object
+        .symbols()
+        .chain(object.dynamic_symbols())
+        .filter(|symbol| perf_kernel_symbol_is_candidate(&object, symbol))
+        .filter_map(|symbol| symbol.section_index())
+        .collect::<FxHashSet<_>>();
+    let mut sections = Vec::with_capacity(accepted_sections.len());
+    let mut has_text_section = false;
+    for section in object.sections() {
+        if !accepted_sections.contains(&section.index()) {
+            continue;
+        }
+        let object::SectionFlags::Elf { sh_flags } = section.flags() else {
+            continue;
+        };
+        if sh_flags & u64::from(object::elf::SHF_ALLOC) == 0 {
+            continue;
+        }
+        has_text_section |= section.name().ok() == Some(".text");
+        if section.size() > 0 {
+            sections.push(ObjectSectionRange {
+                virtual_address: section.address(),
+                size: section.size(),
+            });
+        }
+    }
+    Some(KernelElfMapMetadata {
+        sections,
+        has_text_section,
+    })
+}
+
+fn perf_kernel_symbol_is_candidate<'data, R: object::read::ReadRef<'data>>(
+    object: &object::File<'data, R>,
+    symbol: &object::Symbol<'data, '_, R>,
+) -> bool {
+    // perf v7.2.9 tools/perf/util/symbol.h:34-45 and symbol-elf.c:1659
+    // exclude mapping labels only for kernel ELF symbol loading.
+    let name = symbol.name().unwrap_or_default();
+    !name.starts_with(".L")
+        && !name.starts_with("L0")
+        && !name.starts_with('$')
+        && perf_symbol_is_candidate(object, symbol)
 }
 
 fn object_text_offset<'data, R: object::read::ReadRef<'data>>(
@@ -7757,6 +7931,278 @@ mod tests {
             "FIFO bytes must not translate a recorded offset"
         );
         assert!(super::object_load_segment_ranges(dir.path()).is_none());
+    }
+
+    #[test]
+    fn kernel_reference_lookup_caches_first_symtab_match_and_requested_misses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kernel.elf");
+        std::fs::write(
+            &path,
+            elf_with_text_symbol_fixtures(
+                elf::EM_X86_64,
+                &[
+                    (b"_stext", 0, 0, elf::STB_GLOBAL, elf::STT_NOTYPE),
+                    (b"_stext", 0x2000, 0, elf::STB_GLOBAL, elf::STT_NOTYPE),
+                ],
+            ),
+        )
+        .unwrap();
+        let mut cache = super::ObjectAddressCache::default();
+
+        assert_eq!(
+            super::object_kernel_reference_symbol_address(&path, "_stext", &mut cache),
+            Some(0)
+        );
+        assert_eq!(
+            super::object_kernel_reference_symbol_address(&path, "missing", &mut cache),
+            None
+        );
+        std::fs::write(
+            &path,
+            elf_with_text_symbol_fixtures(
+                elf::EM_X86_64,
+                &[
+                    (b"_stext", 0x3000, 0, elf::STB_GLOBAL, elf::STT_NOTYPE),
+                    (b"missing", 0x4000, 0, elf::STB_GLOBAL, elf::STT_NOTYPE),
+                ],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            super::object_kernel_reference_symbol_address(&path, "_stext", &mut cache),
+            Some(0)
+        );
+        assert_eq!(
+            super::object_kernel_reference_symbol_address(&path, "missing", &mut cache),
+            None
+        );
+        let metadata = super::object_address_metadata(&path, &mut cache).unwrap();
+        assert_eq!(metadata.kernel_reference_symbols.len(), 2);
+        assert_eq!(
+            metadata.kernel_reference_symbols.get("_stext"),
+            Some(&Some(0))
+        );
+        assert_eq!(
+            metadata.kernel_reference_symbols.get("missing"),
+            Some(&None)
+        );
+    }
+
+    #[test]
+    fn kernel_elf_coverage_uses_eligible_text_symbol_and_half_open_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kernel.elf");
+        std::fs::write(
+            &path,
+            elf_with_text_symbol_fixtures(
+                elf::EM_X86_64,
+                &[(b"_stext", 0x1000, 1, elf::STB_GLOBAL, elf::STT_NOTYPE)],
+            ),
+        )
+        .unwrap();
+        let mut cache = super::ObjectAddressCache::default();
+        let request = test_request("[kernel.kallsyms]", 0);
+        let object_request = test_request(path.to_str().unwrap(), 0x1000);
+
+        for address in [0x1000, 0x103f] {
+            let mut runtime_request = request.clone();
+            runtime_request.relative_address = address;
+            let mut elf_request = object_request.clone();
+            elf_request.relative_address = address;
+            assert!(
+                !super::PerfSymbolResolver::<RustAddr2lineResolver>::kernel_elf_address_is_unmapped(
+                    &runtime_request,
+                    &elf_request,
+                    &mut cache,
+                )
+            );
+        }
+        let mut runtime_request = request;
+        runtime_request.relative_address = 0x1040;
+        let mut elf_request = object_request;
+        elf_request.relative_address = 0x1040;
+        assert!(
+            super::PerfSymbolResolver::<RustAddr2lineResolver>::kernel_elf_address_is_unmapped(
+                &runtime_request,
+                &elf_request,
+                &mut cache,
+            )
+        );
+    }
+
+    #[test]
+    fn kernel_elf_text_header_without_eligible_symbol_does_not_shrink_core_map() {
+        let mut builder = build::elf::Builder::new(object::Endianness::Little, true);
+        builder.header.e_type = elf::ET_EXEC;
+        builder.header.e_machine = elf::EM_X86_64;
+
+        let section = builder.sections.add();
+        section.name = b".shstrtab"[..].into();
+        section.sh_type = elf::SHT_STRTAB;
+        section.data = build::elf::SectionData::SectionString;
+        let text = builder.sections.add();
+        text.name = b".text"[..].into();
+        text.sh_type = elf::SHT_PROGBITS;
+        text.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_EXECINSTR);
+        text.sh_addr = 0x1000;
+        text.data = build::elf::SectionData::Data(vec![0; 64].into());
+        let data = builder.sections.add();
+        data.name = b".data"[..].into();
+        data.sh_type = elf::SHT_PROGBITS;
+        data.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_WRITE);
+        data.sh_addr = 0x3000;
+        data.data = build::elf::SectionData::Data(vec![0; 32].into());
+        let data_id = data.id();
+        let section = builder.sections.add();
+        section.name = b".symtab"[..].into();
+        section.sh_type = elf::SHT_SYMTAB;
+        section.sh_addralign = 8;
+        section.data = build::elf::SectionData::Symbol;
+        let section = builder.sections.add();
+        section.name = b".strtab"[..].into();
+        section.sh_type = elf::SHT_STRTAB;
+        section.data = build::elf::SectionData::String;
+        let symbol = builder.symbols.add();
+        symbol.name = b"kernel_data"[..].into();
+        symbol.st_value = 0x3000;
+        symbol.st_size = 4;
+        symbol.set_st_info(elf::STB_GLOBAL, elf::STT_OBJECT);
+        symbol.section = Some(data_id);
+        builder.set_section_sizes();
+        let mut bytes = Vec::new();
+        builder.write(&mut bytes).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kernel.elf");
+        std::fs::write(&path, bytes).unwrap();
+        let mut cache = super::ObjectAddressCache::default();
+        let request = test_request("[kernel.kallsyms]", 0x2000);
+        let object_request = test_request(path.to_str().unwrap(), 0x2000);
+        assert!(
+            !super::PerfSymbolResolver::<RustAddr2lineResolver>::kernel_elf_address_is_unmapped(
+                &request,
+                &object_request,
+                &mut cache,
+            )
+        );
+        let maps = super::object_address_metadata(path.as_path(), &mut cache)
+            .unwrap()
+            .kernel_map_metadata
+            .get()
+            .unwrap()
+            .as_ref()
+            .unwrap();
+        assert!(!maps.has_text_section);
+        assert_eq!(maps.sections.len(), 1);
+        assert_eq!(maps.sections[0].virtual_address, 0x3000);
+    }
+
+    #[test]
+    fn kernel_elf_coverage_ignores_kernel_only_text_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kernel.elf");
+        std::fs::write(
+            &path,
+            elf_with_text_symbol_fixtures(
+                elf::EM_X86_64,
+                &[
+                    (b".Llocal", 0x1000, 1, elf::STB_LOCAL, elf::STT_NOTYPE),
+                    (b"L0", 0x1010, 1, elf::STB_LOCAL, elf::STT_NOTYPE),
+                    (b"$veneer", 0x1020, 1, elf::STB_GLOBAL, elf::STT_NOTYPE),
+                ],
+            ),
+        )
+        .unwrap();
+        let mut cache = super::ObjectAddressCache::default();
+        let maps = super::object_address_metadata(path.as_path(), &mut cache)
+            .unwrap()
+            .kernel_map_metadata
+            .get_or_init(|| super::read_kernel_elf_map_metadata(path.as_path()))
+            .as_ref()
+            .unwrap();
+        assert!(
+            !maps.has_text_section,
+            "kernel-only labels must not create an ELF .text map"
+        );
+        assert!(maps.sections.is_empty());
+    }
+
+    #[test]
+    fn kernel_elf_coverage_includes_additional_eligible_allocated_sections() {
+        let mut builder = build::elf::Builder::new(object::Endianness::Little, true);
+        builder.header.e_type = elf::ET_EXEC;
+        builder.header.e_machine = elf::EM_X86_64;
+
+        let section = builder.sections.add();
+        section.name = b".shstrtab"[..].into();
+        section.sh_type = elf::SHT_STRTAB;
+        section.data = build::elf::SectionData::SectionString;
+        let text = builder.sections.add();
+        text.name = b".text"[..].into();
+        text.sh_type = elf::SHT_PROGBITS;
+        text.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_EXECINSTR);
+        text.sh_addr = 0x1000;
+        text.data = build::elf::SectionData::Data(vec![0; 64].into());
+        let text_id = text.id();
+        let data = builder.sections.add();
+        data.name = b".data"[..].into();
+        data.sh_type = elf::SHT_PROGBITS;
+        data.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_WRITE);
+        data.sh_addr = 0x3000;
+        data.data = build::elf::SectionData::Data(vec![0; 32].into());
+        let data_id = data.id();
+        let section = builder.sections.add();
+        section.name = b".symtab"[..].into();
+        section.sh_type = elf::SHT_SYMTAB;
+        section.sh_addralign = 8;
+        section.data = build::elf::SectionData::Symbol;
+        let section = builder.sections.add();
+        section.name = b".strtab"[..].into();
+        section.sh_type = elf::SHT_STRTAB;
+        section.data = build::elf::SectionData::String;
+        for (name, address, symbol_type, section_id) in [
+            (b"_stext".as_slice(), 0x1000, elf::STT_NOTYPE, text_id),
+            (b"kernel_data".as_slice(), 0x3000, elf::STT_OBJECT, data_id),
+        ] {
+            let symbol = builder.symbols.add();
+            symbol.name = name.into();
+            symbol.st_value = address;
+            symbol.st_size = 1;
+            symbol.set_st_info(elf::STB_GLOBAL, symbol_type);
+            symbol.section = Some(section_id);
+        }
+        builder.set_section_sizes();
+        let mut bytes = Vec::new();
+        builder.write(&mut bytes).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kernel.elf");
+        std::fs::write(&path, bytes).unwrap();
+        let mut cache = super::ObjectAddressCache::default();
+        let maps = super::object_address_metadata(path.as_path(), &mut cache)
+            .unwrap()
+            .kernel_map_metadata
+            .get_or_init(|| super::read_kernel_elf_map_metadata(path.as_path()))
+            .as_ref()
+            .unwrap();
+        assert!(maps.has_text_section);
+        assert_eq!(
+            maps.sections
+                .iter()
+                .map(|section| (section.virtual_address, section.size))
+                .collect::<Vec<_>>(),
+            [(0x1000, 64), (0x3000, 32)]
+        );
+        let request = test_request("[kernel.kallsyms]", 0x3000);
+        let object_request = test_request(path.to_str().unwrap(), 0x3000);
+        assert!(
+            !super::PerfSymbolResolver::<RustAddr2lineResolver>::kernel_elf_address_is_unmapped(
+                &request,
+                &object_request,
+                &mut cache,
+            )
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -14771,7 +15217,7 @@ mod tests {
     }
 
     #[test]
-    fn routed_frame_batches_use_kernel_elf_without_a_selected_kallsyms_source() {
+    fn routed_frame_batches_use_kernel_elf_for_addresses_in_loaded_map_without_kallsyms() {
         let root = tempfile::tempdir().unwrap();
         let kernel = root.path().join("kernel-object");
         std::fs::write(
@@ -14787,7 +15233,7 @@ mod tests {
             .with_kernel_elf(kernel.clone());
         let requests = [
             test_request(user.to_str().unwrap(), 0x10),
-            test_request("[kernel.kallsyms]", 0x50),
+            test_request("[kernel.kallsyms]", 0x1010),
             test_request(user.to_str().unwrap(), 0x20),
         ];
         for inline in [true, false] {
@@ -14799,7 +15245,7 @@ mod tests {
             .unwrap();
             let mode = if inline { "inline" } else { "base" };
             assert_eq!(results.len(), requests.len());
-            for ((path, address), frames) in [(&user, 0x10), (&kernel, 0x50), (&user, 0x20)]
+            for ((path, address), frames) in [(&user, 0x10), (&kernel, 0x1010), (&user, 0x20)]
                 .into_iter()
                 .zip(results)
             {
@@ -14812,6 +15258,98 @@ mod tests {
                     super::SymbolSourceState::AddressDependent
                 );
             }
+        }
+    }
+
+    #[test]
+    fn kernel_elf_frame_batches_keep_below_text_address_unmapped_without_backend_routing() {
+        struct CountingKernelResolver(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl SymbolResolver for CountingKernelResolver {
+            fn resolve_batch(
+                &self,
+                requests: &[SymbolRequest],
+            ) -> Result<Vec<Option<String>>, String> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(vec![None; requests.len()])
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let kernel = root.path().join("kernel-object");
+        std::fs::write(
+            &kernel,
+            elf_with_text_symbol_fixtures(
+                elf::EM_X86_64,
+                &[(b"entry", 0x1000, 16, elf::STB_GLOBAL, elf::STT_FUNC)],
+            ),
+        )
+        .unwrap();
+        let backend_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resolver = super::PerfSymbolResolver::from_object_resolver(CountingKernelResolver(
+            backend_calls.clone(),
+        ))
+        .with_kernel_elf(kernel);
+        let request = test_request("[kernel.kallsyms]", 0x50);
+
+        for frames in [
+            resolver
+                .resolve_frame_batch_with_metadata(std::slice::from_ref(&request))
+                .unwrap(),
+            resolver
+                .resolve_base_frame_batch_with_metadata(std::slice::from_ref(&request))
+                .unwrap(),
+        ] {
+            assert!(frames[0].frames.is_empty());
+            assert_eq!(frames[0].kernel_dso, super::SymbolDsoName::Unmapped);
+        }
+        assert_eq!(backend_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn scalar_kernel_elf_resolution_respects_frame_coverage() {
+        struct ScalarKernelResolver;
+        impl SymbolResolver for ScalarKernelResolver {
+            fn resolve_batch(
+                &self,
+                requests: &[SymbolRequest],
+            ) -> Result<Vec<Option<String>>, String> {
+                Ok(requests
+                    .iter()
+                    .map(|_| Some("selected-elf".into()))
+                    .collect())
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let kernel = root.path().join("kernel-object");
+        std::fs::write(
+            &kernel,
+            elf_with_text_symbol_fixtures(
+                elf::EM_X86_64,
+                &[(b"entry", 0x1000, 16, elf::STB_GLOBAL, elf::STT_FUNC)],
+            ),
+        )
+        .unwrap();
+        let resolver = super::PerfSymbolResolver::from_object_resolver(ScalarKernelResolver)
+            .with_kernel_elf(kernel);
+        let request = test_request("[kernel.kallsyms]", 0x1080);
+
+        assert_eq!(
+            resolver
+                .resolve_batch(std::slice::from_ref(&request))
+                .unwrap(),
+            [None]
+        );
+        for frames in [
+            resolver
+                .resolve_frame_batch_with_metadata(std::slice::from_ref(&request))
+                .unwrap(),
+            resolver
+                .resolve_base_frame_batch_with_metadata(&[request])
+                .unwrap(),
+        ] {
+            assert!(frames[0].frames.is_empty());
+            assert_eq!(frames[0].kernel_dso, super::SymbolDsoName::Unmapped);
         }
     }
 
