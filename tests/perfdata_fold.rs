@@ -11744,6 +11744,367 @@ fn native_inline_range_tail_truncated_before_first_row() {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InlineRangeBoundary {
+    CompleteRowEof,
+    MissingSection,
+    InvalidOffset,
+    LowHighPriority,
+    InvalidForm,
+    InvalidBase,
+}
+
+#[cfg(target_os = "linux")]
+fn inline_range_boundary_elf(case: InlineRangeBoundary) -> Vec<u8> {
+    use object::ObjectSection as _;
+
+    let original = elf_with_inline_range_tail(false, true);
+    let elf = object::File::parse(original.as_slice()).unwrap();
+    let mut info = elf
+        .section_by_name(".debug_info")
+        .unwrap()
+        .data()
+        .unwrap()
+        .to_vec();
+    assert!(info.ends_with(&[0; 6])); // ranges offset, inline's two closing DIEs.
+    info.truncate(info.len() - 6);
+    let offset = if matches!(
+        case,
+        InlineRangeBoundary::InvalidOffset | InlineRangeBoundary::LowHighPriority
+    ) {
+        0x40_u32
+    } else {
+        0
+    };
+    if case == InlineRangeBoundary::InvalidForm {
+        info.extend_from_slice(b"bad\0");
+    } else {
+        info.extend_from_slice(&offset.to_le_bytes());
+    }
+    let mut abbrev = elf
+        .section_by_name(".debug_abbrev")
+        .unwrap()
+        .data()
+        .unwrap()
+        .to_vec();
+    if case == InlineRangeBoundary::InvalidForm {
+        assert!(abbrev.ends_with(&[3, 0x1d, 0, 3, 8, 0x55, 0x17, 0, 0, 0]));
+        let form = abbrev.len() - 4;
+        abbrev[form] = 0x08; // DW_FORM_string instead of sec_offset.
+    }
+    if case == InlineRangeBoundary::LowHighPriority {
+        assert!(abbrev.ends_with(&[3, 0x1d, 0, 3, 8, 0x55, 0x17, 0, 0, 0]));
+        abbrev.truncate(abbrev.len() - 3);
+        abbrev.extend_from_slice(&[0x11, 1, 0x12, 6, 0, 0, 0]);
+        info.extend_from_slice(&0x0040_1004_u64.to_le_bytes());
+        info.extend_from_slice(&4_u32.to_le_bytes());
+    }
+    info.extend_from_slice(&[0, 0]);
+    let length = u32::try_from(info.len() - 4).unwrap();
+    info[..4].copy_from_slice(&length.to_le_bytes());
+    let mut builder = object::build::elf::Builder::read(original.as_slice()).unwrap();
+    for (name, data) in [
+        (b".debug_info".as_slice(), info),
+        (b".debug_abbrev", abbrev),
+    ] {
+        builder
+            .sections
+            .iter_mut()
+            .find(|section| section.name.as_slice() == name)
+            .unwrap()
+            .data = object::build::elf::SectionData::Data(data.into());
+    }
+    let section = builder
+        .sections
+        .iter_mut()
+        .find(|section| section.name.as_slice() == b".debug_ranges")
+        .unwrap();
+    match case {
+        InlineRangeBoundary::CompleteRowEof => {
+            let ranges: Vec<u8> = [4_u64, 8].into_iter().flat_map(u64::to_le_bytes).collect();
+            section.data = object::build::elf::SectionData::Data(ranges.into());
+        }
+        InlineRangeBoundary::MissingSection => section.delete = true,
+        InlineRangeBoundary::InvalidBase => {
+            let ranges: Vec<u8> = [u64::MAX, u64::MAX, 0, 0]
+                .into_iter()
+                .flat_map(u64::to_le_bytes)
+                .collect();
+            section.data = object::build::elf::SectionData::Data(ranges.into());
+        }
+        InlineRangeBoundary::InvalidOffset
+        | InlineRangeBoundary::LowHighPriority
+        | InlineRangeBoundary::InvalidForm => {}
+    }
+    builder.set_section_sizes();
+    let mut bytes = Vec::new();
+    builder.write(&mut bytes).unwrap();
+    assert_inline_range_boundary_layout(&bytes, case);
+    bytes
+}
+
+#[cfg(target_os = "linux")]
+fn assert_inline_range_boundary_layout(bytes: &[u8], case: InlineRangeBoundary) {
+    use object::ObjectSection as _;
+
+    let elf = object::File::parse(bytes).unwrap();
+    let text = elf.section_by_name(".text").unwrap();
+    assert_eq!(
+        (text.address(), text.file_range()),
+        (0x0040_1000, Some((0x1000, 32)))
+    );
+    let symbol = elf
+        .symbols()
+        .find(|symbol| symbol.name() == Ok("text_entry"))
+        .unwrap();
+    assert_eq!((symbol.address(), symbol.size()), (0x0040_1000, 16));
+    let ranges = elf.section_by_name(".debug_ranges");
+    if case == InlineRangeBoundary::MissingSection {
+        assert!(ranges.is_none());
+    } else {
+        let expected: Vec<u8> = if case == InlineRangeBoundary::CompleteRowEof {
+            vec![4_u64, 8]
+        } else if case == InlineRangeBoundary::InvalidBase {
+            vec![u64::MAX, u64::MAX, 0, 0]
+        } else {
+            vec![4, 8, 0, 0]
+        }
+        .into_iter()
+        .flat_map(u64::to_le_bytes)
+        .collect();
+        assert_eq!(ranges.unwrap().data().unwrap(), expected);
+    }
+    let dwarf = gimli::Dwarf::load(|section| {
+        let data = elf
+            .section_by_name(section.name())
+            .map_or(&[][..], |section| section.data().unwrap());
+        Ok::<_, gimli::Error>(gimli::EndianSlice::new(data, gimli::LittleEndian))
+    })
+    .unwrap();
+    let unit = dwarf.unit(dwarf.units().next().unwrap().unwrap()).unwrap();
+    let (_, sequences) = unit.line_program.clone().unwrap().sequences().unwrap();
+    assert_eq!(sequences.len(), 1);
+    assert_eq!(
+        (sequences[0].start, sequences[0].end),
+        (0x0040_1000, 0x0040_1020)
+    );
+    let mut entries = unit.entries();
+    let mut names = Vec::new();
+    while let Some(die) = entries.next_dfs().unwrap() {
+        names.push(
+            dwarf
+                .attr_string(&unit, die.attr_value(gimli::DW_AT_name).unwrap())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        if die.tag() != gimli::DW_TAG_inlined_subroutine {
+            let range = dwarf
+                .die_ranges(&unit, die)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap();
+            assert_eq!((range.begin, range.end), (0x0040_1000, 0x0040_1020));
+            continue;
+        }
+        assert_inline_range_boundary_die(&dwarf, &unit, die, case);
+    }
+    assert_eq!(names, ["bias.c", "text_entry", "malformed_inline"]);
+}
+
+#[cfg(target_os = "linux")]
+fn assert_inline_range_boundary_die<R: gimli::Reader<Offset = usize> + PartialEq>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    die: &gimli::DebuggingInformationEntry<R>,
+    case: InlineRangeBoundary,
+) {
+    let offset = if matches!(
+        case,
+        InlineRangeBoundary::InvalidOffset | InlineRangeBoundary::LowHighPriority
+    ) {
+        0x40
+    } else {
+        0
+    };
+    if case == InlineRangeBoundary::InvalidForm {
+        let attr = die.attr(gimli::DW_AT_ranges).unwrap();
+        assert_eq!(attr.form(), gimli::DW_FORM_string);
+        assert_eq!(
+            dwarf
+                .attr_string(unit, attr.value())
+                .unwrap()
+                .to_string_lossy()
+                .unwrap(),
+            "bad"
+        );
+    } else {
+        assert_eq!(
+            die.attr_value(gimli::DW_AT_ranges),
+            Some(gimli::AttributeValue::RangeListsRef(
+                gimli::RawRangeListsOffset(offset)
+            ))
+        );
+    }
+    if case == InlineRangeBoundary::LowHighPriority {
+        assert_eq!(
+            die.attr_value(gimli::DW_AT_low_pc),
+            Some(gimli::AttributeValue::Addr(0x0040_1004))
+        );
+        assert_eq!(
+            die.attr_value(gimli::DW_AT_high_pc),
+            Some(gimli::AttributeValue::Udata(4))
+        );
+    } else {
+        assert!(die.attr(gimli::DW_AT_low_pc).is_none());
+        assert!(die.attr(gimli::DW_AT_high_pc).is_none());
+    }
+    match case {
+        InlineRangeBoundary::CompleteRowEof => {
+            let mut ranges = dwarf.die_ranges(unit, die).unwrap();
+            let prefix = ranges.next().unwrap().unwrap();
+            assert_eq!((prefix.begin, prefix.end), (0x0040_1004, 0x0040_1008));
+            assert!(
+                ranges.next().unwrap().is_none(),
+                "Gimli clean EOF, not partial-row error"
+            );
+            eprintln!("{case:?}: Gimli completed [0x401004,0x401008), clean EOF");
+        }
+        InlineRangeBoundary::MissingSection => {
+            assert!(
+                dwarf
+                    .die_ranges(unit, die)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .is_none()
+            );
+            eprintln!("{case:?}: Gimli initialized empty iterator at offset zero");
+        }
+        InlineRangeBoundary::InvalidOffset | InlineRangeBoundary::LowHighPriority => {
+            assert!(dwarf.die_ranges(unit, die).is_err());
+            eprintln!(
+                "{case:?}: Gimli initialization error; low/high valid={}",
+                case == InlineRangeBoundary::LowHighPriority
+            );
+        }
+        InlineRangeBoundary::InvalidForm | InlineRangeBoundary::InvalidBase => {
+            assert!(
+                dwarf
+                    .die_ranges(unit, die)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .is_none()
+            );
+            eprintln!("{case:?}: Gimli initialized empty iterator");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn assert_inline_range_boundary_parity(case: InlineRangeBoundary) {
+    // elfutils 0.195 dwarf_ranges.c:470-480/524-555 distinguishes low/high,
+    // explicit termination and range offset errors. perf 7.2.9
+    // dwarf-aux.c:673-677 uses the actual haspc result as a boolean.
+    let root = tempfile::tempdir().unwrap();
+    let binary = root.path().join("range-tail.elf");
+    let input = root.path().join("perf.data");
+    std::fs::write(
+        root.path().join("perfconfig"),
+        "[addr2line]\nstyle = libdw\n",
+    )
+    .unwrap();
+    std::fs::write(&binary, elf_with_inline_range_tail(false, true)).unwrap();
+    std::fs::write(&input, inline_range_tail_perfdata(&binary, 0x0040_1006)).unwrap();
+    let (healthy, _) = native_inline_range_tail(root.path(), &input, true);
+    assert!(
+        healthy.contains("malformed_inline+0x"),
+        "healthy native prerequisite: {healthy}"
+    );
+    std::fs::write(&binary, inline_range_boundary_elf(case)).unwrap();
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    for ip in [0x0040_1006, 0x0040_100c] {
+        let bytes = inline_range_tail_perfdata(&binary, ip);
+        std::fs::write(&input, &bytes).unwrap();
+        for inline in [false, true] {
+            let (script, folded) = native_inline_range_tail(root.path(), &input, inline);
+            if !inline {
+                assert!(
+                    !script.contains("malformed_inline"),
+                    "no-inline prerequisite: {script}"
+                );
+            }
+            eprintln!(
+                "{case:?} ip={ip:#x} inline={inline}\nNATIVE SCRIPT:\n{script}NATIVE FOLDED:\n{folded}"
+            );
+            for from_file in [false, true] {
+                let resolver = pyroclast::symbols::PerfSymbolResolver::from_object_resolver(
+                    pyroclast::symbols::RustAddr2lineResolver::new(),
+                );
+                let options = FoldOptions {
+                    count_periods: false,
+                    inline,
+                };
+                let result = if from_file {
+                    pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(
+                        &input, options, &resolver,
+                    )
+                    .unwrap()
+                } else {
+                    fold_perfdata_callchains_with_symbols(&bytes, options, &resolver).unwrap()
+                };
+                eprintln!("Rust from_file={from_file}: {result}");
+                actual.push(result);
+                expected.push(folded.clone());
+            }
+        }
+    }
+    assert_eq!(
+        actual, expected,
+        "{case:?}: all native and byte/file routes captured before comparison"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_inline_range_boundary_complete_row_without_terminator() {
+    assert_inline_range_boundary_parity(InlineRangeBoundary::CompleteRowEof);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_inline_range_boundary_missing_section() {
+    assert_inline_range_boundary_parity(InlineRangeBoundary::MissingSection);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_inline_range_boundary_out_of_section_offset() {
+    assert_inline_range_boundary_parity(InlineRangeBoundary::InvalidOffset);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_inline_range_boundary_low_high_precedes_bad_ranges() {
+    assert_inline_range_boundary_parity(InlineRangeBoundary::LowHighPriority);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_inline_range_boundary_invalid_attribute_form() {
+    assert_inline_range_boundary_parity(InlineRangeBoundary::InvalidForm);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_inline_range_boundary_invalid_base_escape() {
+    assert_inline_range_boundary_parity(InlineRangeBoundary::InvalidBase);
+}
+
+#[cfg(target_os = "linux")]
 fn assert_data_symbol_routes_match_native(
     input: &std::path::Path,
     root: &std::path::Path,

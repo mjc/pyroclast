@@ -7520,9 +7520,25 @@ fn perf_dwarf_append_node_ranges<R: gimli::Reader>(
     {
         return PerfDwarfRangeStatus::Absent;
     }
+    if unit.encoding().version < 5
+        && let Some(attribute) = entry.attr(gimli::DW_AT_ranges)
+    {
+        // elfutils0.195 dwarf_formudata.c:102-103 permits only sec_offset
+        // after DWARF3. Attribute presence matters: absent ranges is not an
+        // initialization fault, and valid low/high above still takes priority.
+        if unit.encoding().version == 4 && attribute.form() != gimli::DW_FORM_sec_offset {
+            return PerfDwarfRangeStatus::ReadError;
+        }
+        if let value @ gimli::AttributeValue::RangeListsRef(_) = attribute.value() {
+            let Ok(Some(offset)) = dwarf.attr_ranges_offset(unit, value) else {
+                return PerfDwarfRangeStatus::InitializationError;
+            };
+            return perf_dwarf_append_legacy_ranges(dwarf, unit, offset, frame, segments);
+        }
+    }
     let Ok(mut ranges) = dwarf.die_ranges(unit, entry) else {
-        // Initialization errors are not proved equivalent to libdw's
-        // reached range-read error. Do not authorize a truthy predicate here.
+        // DWARF5 and unsupported attribute initialization errors are not
+        // covered by the legacy-list oracle. Keep their existing policy.
         return PerfDwarfRangeStatus::InitializationError;
     };
     loop {
@@ -7538,6 +7554,61 @@ fn perf_dwarf_append_node_ranges<R: gimli::Reader>(
             Ok(None) => return PerfDwarfRangeStatus::Complete,
             // dwarf_haspc.c:47-53 returns -1 after any completed prefix.
             // perf 7.2.9 dwarf-aux.c:638-641/673-677 tests that as a bool.
+            Err(_) => return PerfDwarfRangeStatus::ReadError,
+        }
+    }
+}
+
+fn perf_dwarf_append_legacy_ranges<R: gimli::Reader>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    offset: gimli::RangeListsOffset<R::Offset>,
+    frame: std::num::NonZeroUsize,
+    segments: &mut Vec<PerfDwarfFrameRange>,
+) -> PerfDwarfRangeStatus {
+    use gimli::Section as _;
+
+    // elfutils 0.195 dwarf_ranges.c:450-456/526-555 rejects invalid offsets
+    // and EOF without an explicit end pair. Gimli's raw iterator instead
+    // accepts empty input as exhaustion. RawRange is crate-private; use its
+    // typed address-pair reads, then Gimli's shared conversion state.
+    let mut reader = dwarf.ranges.debug_ranges().reader().clone();
+    if reader.skip(offset.0).is_err() {
+        return PerfDwarfRangeStatus::ReadError;
+    }
+    let Ok(mut converter) = dwarf.ranges(unit, offset) else {
+        return PerfDwarfRangeStatus::ReadError;
+    };
+    let address_size = unit.encoding().address_size;
+    loop {
+        let (Ok(begin), Ok(end)) = (
+            reader.read_address(address_size),
+            reader.read_address(address_size),
+        ) else {
+            return PerfDwarfRangeStatus::ReadError;
+        };
+        if begin == 0 && end == 0 {
+            return PerfDwarfRangeStatus::Complete;
+        }
+        let raw = if begin == u64::MAX >> (64 - u32::from(address_size) * 8) {
+            // elfutils0.195 dwarf_ranges.c:137-141 rejects MAX/MAX.
+            if end == begin {
+                return PerfDwarfRangeStatus::ReadError;
+            }
+            gimli::RawRngListEntry::BaseAddress { addr: end }
+        } else {
+            gimli::RawRngListEntry::AddressOrOffsetPair { begin, end }
+        };
+        match converter.convert_raw(raw) {
+            Ok(Some(range)) => perf_dwarf_push_range(
+                segments,
+                PerfAddressRange {
+                    begin: range.begin,
+                    end: range.end,
+                },
+                frame,
+            ),
+            Ok(None) => {}
             Err(_) => return PerfDwarfRangeStatus::ReadError,
         }
     }
@@ -18798,6 +18869,223 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn dwarf_legacy_complete_row_eof_keeps_prefix_and_native_fault_candidate() {
+        let (abbrev, info, mut ranges) = test_dwarf_sections(&[
+            (
+                1,
+                gimli::DW_TAG_subprogram,
+                Some("outer"),
+                &[test_range(0, 100)],
+            ),
+            (
+                2,
+                gimli::DW_TAG_inlined_subroutine,
+                Some("inline"),
+                &[test_range(10, 20)],
+            ),
+        ]);
+        ranges.truncate(ranges.len() - 16);
+        let mut names = PerfDwarfNameInterner::default();
+        let index = test_dwarf_frame_index_from_sections(
+            &abbrev,
+            &info,
+            &ranges,
+            &[test_range(0, 100)],
+            &mut names,
+        );
+        assert_eq!(
+            index.nodes[1].range_status,
+            super::PerfDwarfRangeStatus::ReadError
+        );
+        assert_eq!(index.segments.len(), 2);
+        assert_eq!(index.segments[1].range, test_range(10, 20));
+        for address in [15, 20, 35] {
+            assert_eq!(frame_names(&names, &index, address), ["outer", "inline"]);
+        }
+        assert!(frame_names(&names, &index, 100).is_empty());
+    }
+
+    fn assert_dwarf_legacy_offset_fault(ranges: &[u8], offset: u32) {
+        let abbrev = [
+            1, 0x11, 1, 0, 0, 2, 0x2e, 1, 3, 8, 0x11, 1, 0x12, 6, 0, 0, 3, 0x1d, 0, 3, 8, 0x55,
+            0x17, 0, 0, 0,
+        ];
+        let mut info = vec![0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 8, 1];
+        info.extend_from_slice(b"\x02outer\0");
+        info.extend_from_slice(&0_u64.to_le_bytes());
+        info.extend_from_slice(&100_u32.to_le_bytes());
+        info.extend_from_slice(b"\x03inline\0");
+        info.extend_from_slice(&offset.to_le_bytes());
+        info.extend_from_slice(&[0, 0]);
+        let length = u32::try_from(info.len() - 4).unwrap();
+        info[..4].copy_from_slice(&length.to_le_bytes());
+        let mut names = PerfDwarfNameInterner::default();
+        let index = test_dwarf_frame_index_from_sections(
+            &abbrev,
+            &info,
+            ranges,
+            &[test_range(0, 100)],
+            &mut names,
+        );
+        assert_eq!(
+            index.nodes[0].range_status,
+            super::PerfDwarfRangeStatus::Complete
+        );
+        assert_eq!(
+            index.nodes[1].range_status,
+            super::PerfDwarfRangeStatus::ReadError
+        );
+        assert!(index.nodes[1].ranges.is_empty());
+        assert_eq!(index.segments.len(), 1); // No fabricated universal range.
+        for address in [6, 12] {
+            assert_eq!(frame_names(&names, &index, address), ["outer", "inline"]);
+        }
+        assert!(frame_names(&names, &index, 100).is_empty());
+    }
+
+    #[test]
+    fn dwarf_legacy_missing_range_section_is_a_native_read_fault() {
+        assert_dwarf_legacy_offset_fault(&[], 0);
+    }
+
+    #[test]
+    fn dwarf_legacy_out_of_section_offset_is_a_native_read_fault() {
+        assert_dwarf_legacy_offset_fault(&[0; 32], 0x40);
+    }
+
+    #[test]
+    fn dwarf_legacy_base_selection_and_explicit_end_preserve_half_open_ranges() {
+        let (abbrev, info, mut ranges) = test_dwarf_sections(&[
+            (
+                1,
+                gimli::DW_TAG_subprogram,
+                Some("outer"),
+                &[test_range(0, 100)],
+            ),
+            (2, gimli::DW_TAG_inlined_subroutine, Some("inline"), &[]),
+        ]);
+        ranges.truncate(32); // Keep the parent's complete list.
+        for value in [u64::MAX, 40, 4, 8, 8, 8, 9, 8, 0, 0, 99] {
+            ranges.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut names = PerfDwarfNameInterner::default();
+        let index = test_dwarf_frame_index_from_sections(
+            &abbrev,
+            &info,
+            &ranges,
+            &[test_range(0, 100)],
+            &mut names,
+        );
+        assert_eq!(
+            index.nodes[1].range_status,
+            super::PerfDwarfRangeStatus::Complete
+        );
+        assert_eq!(index.segments.len(), 2);
+        assert_eq!(index.segments[1].range, test_range(44, 48));
+        for address in [43, 48, 99] {
+            assert_eq!(frame_names(&names, &index, address), ["outer"]);
+        }
+        for address in [44, 47] {
+            assert_eq!(frame_names(&names, &index, address), ["outer", "inline"]);
+        }
+    }
+
+    #[test]
+    fn dwarf_legacy_absent_ranges_and_incomplete_pc_keep_existing_empty_policy() {
+        let abbrev = [
+            1, 0x11, 1, 0, 0, 2, 0x2e, 1, 3, 8, 0x11, 1, 0x12, 6, 0, 0, 3, 0x1d, 0, 3, 8, 0, 0, 4,
+            0x1d, 0, 3, 8, 0x11, 1, 0, 0, 5, 0x1d, 0, 3, 8, 0x11, 8, 0x12, 6, 0, 0, 0,
+        ];
+        let mut info = vec![0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 8, 1];
+        info.extend_from_slice(b"\x02outer\0");
+        info.extend_from_slice(&0_u64.to_le_bytes());
+        info.extend_from_slice(&100_u32.to_le_bytes());
+        info.extend_from_slice(b"\x03absent\0\x04low_only\0");
+        info.extend_from_slice(&20_u64.to_le_bytes());
+        info.extend_from_slice(b"\x05bad_low\0bad\0");
+        info.extend_from_slice(&4_u32.to_le_bytes());
+        info.extend_from_slice(&[0, 0]);
+        let length = u32::try_from(info.len() - 4).unwrap();
+        info[..4].copy_from_slice(&length.to_le_bytes());
+        let mut names = PerfDwarfNameInterner::default();
+        let index = test_dwarf_frame_index_from_sections(
+            &abbrev,
+            &info,
+            &[],
+            &[test_range(0, 100)],
+            &mut names,
+        );
+        assert_eq!(index.nodes.len(), 4);
+        assert_eq!(index.segments.len(), 1);
+        assert_eq!(
+            index.nodes[1].range_status,
+            super::PerfDwarfRangeStatus::Absent
+        );
+        assert_eq!(
+            index.nodes[2].range_status,
+            super::PerfDwarfRangeStatus::Complete
+        );
+        assert_eq!(
+            index.nodes[3].range_status,
+            super::PerfDwarfRangeStatus::InitializationError
+        );
+        assert!(index.range_errors.is_empty());
+        for address in [0, 20, 99] {
+            assert_eq!(frame_names(&names, &index, address), ["outer"]);
+        }
+    }
+
+    #[test]
+    fn dwarf_legacy_invalid_ranges_form_is_a_native_read_fault() {
+        // Native perf7.2.9/libdw0.195 selected this DWARF4 string-form
+        // range attribute; dwarf_formudata.c:102-103 rejects its form.
+        let abbrev = [
+            1, 0x11, 1, 0, 0, 2, 0x2e, 1, 3, 8, 0x11, 1, 0x12, 6, 0, 0, 6, 0x1d, 0, 3, 8, 0x55, 8,
+            0, 0, 0,
+        ];
+        let mut info = vec![0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 8, 1];
+        info.extend_from_slice(b"\x02outer\0");
+        info.extend_from_slice(&0_u64.to_le_bytes());
+        info.extend_from_slice(&100_u32.to_le_bytes());
+        info.extend_from_slice(b"\x06bad_ranges\0bad\0\0\0");
+        let length = u32::try_from(info.len() - 4).unwrap();
+        info[..4].copy_from_slice(&length.to_le_bytes());
+        let mut names = PerfDwarfNameInterner::default();
+        let index = test_dwarf_frame_index_from_sections(
+            &abbrev,
+            &info,
+            &[0; 32],
+            &[test_range(0, 100)],
+            &mut names,
+        );
+        assert_eq!(index.nodes.len(), 2);
+        assert_eq!(index.segments.len(), 1);
+        assert!(index.nodes[1].ranges.is_empty());
+        assert_eq!(
+            index.nodes[1].range_status,
+            super::PerfDwarfRangeStatus::ReadError
+        );
+        for address in [0, 20, 99] {
+            assert_eq!(
+                frame_names(&names, &index, address),
+                ["outer", "bad_ranges"]
+            );
+        }
+        assert!(frame_names(&names, &index, 100).is_empty());
+    }
+
+    #[test]
+    fn dwarf_legacy_invalid_base_escape_is_a_native_read_fault() {
+        // elfutils0.195 dwarf_ranges.c:137-141 rejects MAX/MAX, rather
+        // than selecting MAX as a base. The serialized native oracle agrees.
+        let ranges: Vec<u8> = [u64::MAX, u64::MAX, 0, 0]
+            .into_iter()
+            .flat_map(u64::to_le_bytes)
+            .collect();
+        assert_dwarf_legacy_offset_fault(&ranges, 0);
     }
 
     #[test]
