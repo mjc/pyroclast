@@ -1605,6 +1605,10 @@ impl<R: SymbolResolver> SampleOutput for FoldedOutput<'_, '_, R> {
         if combined_frame
             || (sample.time.is_none() && !sample.has_callchain)
             || sample.cookie_to_suppress.is_some()
+            || self
+                .symbol_cache
+                .as_ref()
+                .is_some_and(|cache| cache.has_retained_sample_ip())
         {
             return self.fold_perf_text(accumulator, sample);
         }
@@ -1797,19 +1801,23 @@ fn preprocess_sample_ip<R: SymbolResolver>(
     sample: &PreparedFoldSample,
     cache: Option<&mut SymbolFrameCache<'_, R>>,
 ) {
+    let Some(cache) = cache else {
+        return;
+    };
+    cache.finish_kernel_sample();
     // event.c:thread__find_map selects kernel DSOs only in kernel CPU mode.
     // User event IPs cannot affect this kernel source-loading state.
     if sample.cpumode != PERF_RECORD_MISC_CPUMODE_KERNEL {
         return;
     }
-    let (Some(cache), Some(address), Some(pid)) = (cache, sample.sample_ip, sample.map_group())
-    else {
+    let (Some(address), Some(pid)) = (sample.sample_ip, sample.map_group()) else {
         return;
     };
     // perf builtin-script.c:2645 (process_sample_event, call at 2686) and
     // util/event.c:804 (machine__resolve) resolve sample->ip
     // using sample->cpumode before expanding the independently recorded chain.
-    // This is load ordering only: never resolve frames or advance cursor hints.
+    // The no-callchain event prints this selected map; callchains instead
+    // perform their own post-load map lookups. Do not cache event-local frames.
     let mut mapping_cache = MappingResolveCache::default();
     let context = accumulator
         .mmap_table
@@ -1828,7 +1836,7 @@ fn preprocess_sample_ip<R: SymbolResolver>(
         let mapping = accumulator
             .mmap_table
             .symbol_mapping_ref(mapping, Some(cache.resolver()));
-        cache.preprocess_sample_ip(&mapping);
+        cache.preprocess_sample_ip(&mapping, !sample.has_callchain);
     }
     FoldFrameResolver::new(&mut accumulator.mmap_table, false).prepare_kernel_cursor(
         Some(pid),
@@ -5483,6 +5491,78 @@ mod tests {
         PerfArch, PerfUserRegs, PerfX86_64Regs, UserStackUnwindResult, UserStackUnwinder,
     };
     use crate::symbols::{ResolvedSymbolFrames, SymbolFrameCache, SymbolRequest, SymbolResolver};
+
+    #[test]
+    fn sample_ip_text_cursor_is_event_local_at_same_address() {
+        use super::SampleOutput as _;
+        use crate::symbols::{PerfSymbolResolver, SelectedObjectResolver, SymbolizerKind};
+
+        const CORE: u64 = 0xffff_ffff_8100_0000;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("kallsyms");
+        std::fs::write(
+            &source,
+            "ffffffff81000000 T _stext\nffffffff81000010 T last\n",
+        )
+        .unwrap();
+        let runner = crate::process::RealCommandRunner::default();
+        let mut outcomes = Vec::new();
+        for kind in [SymbolizerKind::RustAddr2line, SymbolizerKind::Addr2line] {
+            for inline in [false, true] {
+                let resolver = PerfSymbolResolver::from_object_resolver(
+                    SelectedObjectResolver::new(&runner, kind),
+                )
+                .with_system_kallsyms_from_path(&source)
+                .with_system_map_candidates([])
+                .with_live_kernel_notes_path(root.path().join("missing-notes"));
+                let mut state = super::SessionState::new(std::collections::BTreeMap::new());
+                state.thread_comms.insert(7, "worker".into());
+                state.mmap_table.insert_mmap_with_misc(
+                    crate::perfdata::records::MmapRecord {
+                        pid: u32::MAX,
+                        tid: u32::MAX,
+                        start: CORE - 0x1000,
+                        len: 0x4000,
+                        pgoff: CORE,
+                        path: "[kernel.kallsyms]_stext".into(),
+                    },
+                    super::PERF_RECORD_MISC_CPUMODE_KERNEL,
+                );
+                let (layouts, _) = event_test_sample("cpu-clock", 1, Some(1_000_000_000), false);
+                let frames = [super::FoldFrame::SampleIp {
+                    address: CORE - 0x10,
+                    cpumode: super::PERF_RECORD_MISC_CPUMODE_KERNEL,
+                }];
+                let mut sample =
+                    prepared_sample_for_event(&frames, layouts.fallback.as_ref().unwrap());
+                sample.sample_ip = Some(CORE - 0x10);
+                sample.cpumode = super::PERF_RECORD_MISC_CPUMODE_KERNEL;
+                sample.has_callchain = false;
+                let mut cache = SymbolFrameCache::new(&resolver);
+                let mut script = Vec::new();
+                let mut text = super::PerfScriptOutput {
+                    symbol_cache: Some(&mut cache),
+                    writer: &mut script,
+                    event_name_width: 9,
+                    inline,
+                };
+                text.write_sample_event(&mut state, &sample).unwrap();
+                text.write_sample_event(&mut state, &sample).unwrap();
+                outcomes.push((
+                    format!("{kind:?},inline={inline}"),
+                    String::from_utf8(script).unwrap(),
+                ));
+            }
+        }
+        // event.c:machine__resolve retains the first map across map__load;
+        // evsel_fprintf.c's cursor==NULL path prints that map. Independently
+        // native-guarded by native_first_event_cursor_* integration fixtures.
+        let expected = outcomes.iter().map(|(route, _)| (route.clone(), concat!(
+            "          worker       7     1.000000:          1 cpu-clock:  ffffffff80fffff0 [unknown] ([kernel.kallsyms])\n",
+            "          worker       7     1.000000:          1 cpu-clock:  ffffffff80fffff0 [unknown] ([unknown])\n",
+        ).to_owned())).collect::<Vec<_>>();
+        assert_eq!(outcomes, expected);
+    }
 
     fn attr_with_id_range(offset: u64, size: u64, config: u64) -> super::PerfFileAttr {
         super::PerfFileAttr {

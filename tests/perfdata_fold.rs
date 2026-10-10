@@ -5372,6 +5372,31 @@ fn write_native_module_sample_and_chain_fixture(
     const KERNEL_START: u64 = 0xffff_ffff_8100_0000;
     const MODULE_START: u64 = 0xffff_ffff_c100_0000;
 
+    // The original fixtures deliberately keep later core rows in the main DSO.
+    write_native_kallsyms_fixture_with_mappings(
+        kallsyms,
+        queries,
+        distinct_queries,
+        &[
+            (
+                KERNEL_START,
+                MODULE_START + 0x4000 - KERNEL_START,
+                KERNEL_START,
+                "[kernel.kallsyms]_stext",
+            ),
+            (MODULE_START, 0x4000, 0, module_paths[0]),
+            (MODULE_START + 0x1_0000, 0x4000, 0, module_paths[1]),
+        ],
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn write_native_kallsyms_fixture_with_mappings(
+    kallsyms: &str,
+    queries: &[(u64, u64)],
+    distinct_queries: bool,
+    mappings: &[(u64, u64, u64, &str)],
+) -> (tempfile::TempDir, Vec<u8>) {
     let fixture_parent =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/native-kallsyms-fixtures");
     std::fs::create_dir_all(&fixture_parent).expect("fixture parent");
@@ -5387,19 +5412,8 @@ fn write_native_module_sample_and_chain_fixture(
     let mut comm = comm_payload(11, 12, "worker");
     comm.resize(comm.len().next_multiple_of(8), 0);
     let mut records = vec![record_bytes(3, &comm)];
-    // machine.c:machine__process_kernel_mmap_event creates module maps by
-    // name. The broad initial kernel map also contains the synthetic core
-    // boundary; symbol.c:maps__split_kallsyms therefore keeps it in that DSO.
-    for (start, len, pgoff, path) in [
-        (
-            KERNEL_START,
-            MODULE_START + 0x4000 - KERNEL_START,
-            KERNEL_START,
-            "[kernel.kallsyms]_stext",
-        ),
-        (MODULE_START, 0x4000, 0, module_paths[0]),
-        (MODULE_START + 0x1_0000, 0x4000, 0, module_paths[1]),
-    ] {
+    // Native split decisions use these recorded bounds, before symbol fixup.
+    for &(start, len, pgoff, path) in mappings {
         let mut payload = mmap_payload(u32::MAX, u32::MAX, start, len, pgoff, path);
         payload.resize(payload.len().next_multiple_of(8), 0);
         records.push(record_bytes_with_misc(
@@ -5483,12 +5497,17 @@ fn write_native_cached_kallsyms_reference_fixture(
     rows: &str,
     old_layout: bool,
 ) -> (tempfile::TempDir, Vec<u8>) {
-    let (root, original) = write_native_ordered_module_kallsyms_fixture(
-        rows,
-        &[0xffff_ffff_8100_0010],
-        false,
-        ["[a]", "[b]"],
-    );
+    write_native_cached_kallsyms_queries_fixture(rows, old_layout, &[0xffff_ffff_8100_0010])
+}
+
+#[cfg(target_os = "linux")]
+fn write_native_cached_kallsyms_queries_fixture(
+    rows: &str,
+    old_layout: bool,
+    queries: &[u64],
+) -> (tempfile::TempDir, Vec<u8>) {
+    let (root, original) =
+        write_native_ordered_module_kallsyms_fixture(rows, queries, false, ["[a]", "[b]"]);
     let header = pyroclast::perfdata::header::parse_header(&original).unwrap();
     let records = pyroclast::perfdata::records::iter_records(&original, header)
         .unwrap()
@@ -6884,8 +6903,6 @@ fn assert_native_cached_kallsyms_reference(
     old_layout: bool,
     expected_symbol: Option<&str>,
 ) {
-    use pyroclast::symbols::{PerfSymbolResolver, SelectedObjectResolver, SymbolizerKind};
-
     let (root, bytes) = write_native_cached_kallsyms_reference_fixture(rows, old_layout);
     // Explicit --kallsyms selects an alias of the SAME physical cached file.
     // This proves file semantics, not native automatic cache discovery.
@@ -6913,6 +6930,43 @@ fn assert_native_cached_kallsyms_reference(
         assert_eq!(std::str::from_utf8(&native).unwrap().lines().count(), 1);
     }
 
+    assert_cached_kallsyms_routes_match_native(
+        &root, &bytes, &script, &stderr, &native, old_layout,
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn assert_cached_kallsyms_routes_match_native(
+    root: &tempfile::TempDir,
+    bytes: &[u8],
+    script: &str,
+    stderr: &str,
+    native: &[u8],
+    old_layout: bool,
+) {
+    assert_cached_kallsyms_routes_with_live_source(
+        root,
+        bytes,
+        script,
+        stderr,
+        native,
+        old_layout,
+        &root.path().join("missing-system-source"),
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn assert_cached_kallsyms_routes_with_live_source(
+    root: &tempfile::TempDir,
+    bytes: &[u8],
+    script: &str,
+    stderr: &str,
+    native: &[u8],
+    old_layout: bool,
+    live: &std::path::Path,
+) {
+    use pyroclast::symbols::{PerfSymbolResolver, SelectedObjectResolver, SymbolizerKind};
+
     let runner = pyroclast::process::RealCommandRunner::default();
     let input = root.path().join("perf.data");
     let missing = root.path().join("missing-system-source");
@@ -6923,16 +6977,16 @@ fn assert_native_cached_kallsyms_reference(
                     let object = SelectedObjectResolver::new(&runner, symbolizer);
                     let resolver = if eager {
                         PerfSymbolResolver::from_object_resolver(object)
-                            .with_perfdata_kernel_cache(&bytes, &root.path().join(".debug"))
+                            .with_perfdata_kernel_cache(bytes, &root.path().join(".debug"))
                             .with_system_map_candidates([])
-                            .with_system_kallsyms_from_path(&missing)
+                            .with_system_kallsyms_from_path(live)
                     } else {
                         perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
                             object,
                             &input,
                             root.path(),
                             [],
-                            &missing,
+                            live,
                         )
                     }
                     .with_live_kernel_notes_path(missing.clone());
@@ -6945,7 +6999,7 @@ fn assert_native_cached_kallsyms_reference(
                             &input, options, &resolver,
                         )
                     } else {
-                        fold_perfdata_callchains_with_symbols(&bytes, options, &resolver)
+                        fold_perfdata_callchains_with_symbols(bytes, options, &resolver)
                     }
                     .unwrap();
                     assert_eq!(
@@ -6973,6 +7027,836 @@ fn native_cached_kallsyms_reference_ignores_data_rows() {
             Some("native_target"),
         );
     }
+}
+
+#[cfg(target_os = "linux")]
+fn assert_native_core_kallsyms_fixture(
+    root: &std::path::Path,
+    bytes: &[u8],
+    rows: &str,
+    sampled_ips: &[u64],
+) {
+    const REFERENCE: u64 = 0xffff_ffff_8100_0000;
+    assert_eq!(
+        std::fs::read_to_string(root.join("kallsyms")).unwrap(),
+        rows
+    );
+    assert!(rows.starts_with("ffffffff81000000 T _stext\n"));
+    assert!(
+        !rows.contains('\t'),
+        "all full names must remain core symbols"
+    );
+    assert!(!root.join("kcore").exists());
+    assert!(
+        std::fs::read_dir(root.join("symfs"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    let maps = summarize_perfdata(bytes).unwrap().mmap_table;
+    for &ip in sampled_ips {
+        let mapping = maps.resolve_ref(11, ip).expect("admitted core query");
+        assert!(mapping.path.starts_with("[kernel.kallsyms]"));
+        assert_eq!(mapping.start, REFERENCE);
+        assert!(mapping.start <= ip && ip < mapping.end);
+        assert_eq!(mapping.relative_address, ip);
+        let relocation = mapping
+            .kernel_relocation
+            .expect("recorded physical reference");
+        assert_eq!(relocation.reference_symbol, "_stext");
+        assert_eq!(relocation.recorded_reference_address, REFERENCE);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_cached_kallsyms_prefers_strong_alias_with_bracket_extent() {
+    for old_layout in [false, true] {
+        assert_native_cached_strong_alias(old_layout);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn assert_native_cached_strong_alias(old_layout: bool) {
+    let rows = "ffffffff81000000 T _stext\n\
+                ffffffff81000010 T strong\n\
+                ffffffff81000010 W weak[marker]\n\
+                ffffffff81000100 T next\n";
+    let (root, bytes) = write_native_cached_kallsyms_reference_fixture(rows, old_layout);
+    assert_native_core_kallsyms_fixture(root.path(), &bytes, rows, &[0xffff_ffff_8100_0010]);
+    // symbol.c:252-310 fixes both raw-name extents before 158-245 chooses
+    // the nonweak alias. No TAB means [marker] is not a module suffix.
+    let (script, stderr, native) = query_native_module_kallsyms(
+        root.path(),
+        &[
+            ("strong", 0xffff_ffff_8100_2000),
+            ("weak[marker]", 0xffff_ffff_8100_2000),
+        ],
+    );
+    assert!(
+        stderr.contains(&format!(
+            "Using {} for symbols",
+            root.path().join("kallsyms").display()
+        )),
+        "{script}\n{stderr}"
+    );
+    assert!(script.contains("strong+0x0 ("), "{script}\n{stderr}");
+    assert_eq!(native, b"worker;strong 1\n", "{script}\n{stderr}");
+    assert_cached_kallsyms_routes_match_native(
+        &root, &bytes, &script, &stderr, &native, old_layout,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_first_event_cursor_retains_main_map_before_ordinary_fixup() {
+    const CORE: u64 = 0xffff_ffff_8100_0000;
+    assert_native_first_event_cursor([CORE - 0x10, CORE - 0x20], false, false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_first_event_cursor_does_not_survive_same_address_warm_lookup() {
+    const CORE: u64 = 0xffff_ffff_8100_0000;
+    assert_native_first_event_cursor([CORE - 0x10; 2], false, false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_first_event_cursor_is_not_reused_by_interleaved_user_or_other_thread() {
+    const CORE: u64 = 0xffff_ffff_8100_0000;
+    assert_native_first_event_cursor([CORE - 0x10; 2], true, false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn source_backed_rejected_kernel_elf_retains_first_event_cursor() {
+    const CORE: u64 = 0xffff_ffff_8100_0000;
+    assert_native_first_event_cursor([CORE - 0x10; 2], false, true);
+}
+
+#[cfg(target_os = "linux")]
+fn assert_native_first_event_cursor(ips: [u64; 2], interleave: bool, rejected_elf: bool) {
+    const CORE: u64 = 0xffff_ffff_8100_0000;
+    let rows = "ffffffff81000000 T _stext\nffffffff81000010 T last\n";
+    let (root, _) = write_native_cached_kallsyms_reference_fixture(rows, false);
+    let mut comm = comm_payload(11, 12, "worker");
+    comm.resize(comm.len().next_multiple_of(8), 0);
+    let mut mmap = mmap_payload(
+        u32::MAX,
+        u32::MAX,
+        CORE - 0x1000,
+        0x4000,
+        CORE,
+        "[kernel.kallsyms]_stext",
+    );
+    mmap.resize(mmap.len().next_multiple_of(8), 0);
+    let mut records = vec![
+        record_bytes(3, &comm),
+        record_bytes_with_misc(1, PERF_RECORD_MISC_CPUMODE_KERNEL, &mmap),
+    ];
+    let mut events = vec![(12_u32, PERF_RECORD_MISC_CPUMODE_KERNEL, ips[0])];
+    if interleave {
+        let mut other_comm = comm_payload(11, 13, "other");
+        other_comm.resize(other_comm.len().next_multiple_of(8), 0);
+        records.push(record_bytes(3, &other_comm));
+        events.push((12, PERF_RECORD_MISC_CPUMODE_USER, ips[0]));
+        events.push((13, PERF_RECORD_MISC_CPUMODE_KERNEL, ips[0]));
+    }
+    events.push((12, PERF_RECORD_MISC_CPUMODE_KERNEL, ips[1]));
+    for (index, (tid, cpumode, ip)) in events.into_iter().enumerate() {
+        let mut payload = Vec::new();
+        payload.extend(ip.to_le_bytes());
+        payload.extend(11_u32.to_le_bytes());
+        payload.extend(tid.to_le_bytes());
+        payload.extend((1_000_000_000 + u64::try_from(index).unwrap()).to_le_bytes());
+        records.push(record_bytes_with_misc(
+            PERF_RECORD_SAMPLE,
+            cpumode,
+            &payload,
+        ));
+    }
+    let sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME;
+    let mut attr = file_attr_bytes(sample_type, 0, 0);
+    put_u64(&mut attr, 16, 1);
+    let mut feature = build_id_event_payload(u32::MAX, &[0xa5; 20], "[kernel.kallsyms]");
+    feature[4..6].copy_from_slice(&PERF_RECORD_MISC_CPUMODE_KERNEL.to_le_bytes());
+    let mut bytes = perfdata_with_records_attrs_and_build_id_feature([attr], records, &feature);
+    put_u64(&mut bytes, 16, 144);
+    std::fs::write(root.path().join("perf.data"), &bytes).unwrap();
+    if rejected_elf {
+        install_and_guard_rejected_kernel_elf(root.path());
+    }
+    let summary = summarize_perfdata(&bytes).unwrap();
+    let header = pyroclast::perfdata::header::parse_header(&bytes).unwrap();
+    let attrs = pyroclast::perfdata::attrs::parse_file_attrs(&bytes, header).unwrap();
+    assert_eq!(attrs.len(), 1);
+    assert_eq!(attrs[0].sample_type, sample_type);
+    assert_eq!(attrs[0].sample_type & PERF_SAMPLE_CALLCHAIN, 0);
+    for ip in ips {
+        let mapping = summary.mmap_table.resolve_ref(11, ip).unwrap();
+        assert_eq!((mapping.start, mapping.end), (CORE - 0x1000, CORE + 0x3000));
+        assert_eq!(
+            mapping
+                .kernel_relocation
+                .unwrap()
+                .recorded_reference_address,
+            CORE
+        );
+    }
+    let (script, stderr, native) = query_native_module_kallsyms(root.path(), &[]);
+    assert!(
+        stderr.contains(&format!(
+            "Using {} for symbols",
+            root.path().join("kallsyms").display()
+        )),
+        "{stderr}"
+    );
+    assert_eq!(
+        native_split_map_range(&stderr, "[kernel.kallsyms]"),
+        (CORE, CORE + 0x2000)
+    );
+    assert!(
+        script.contains(&format!("{:x} [unknown] ([kernel.kallsyms])", ips[0])),
+        "{script}"
+    );
+    assert!(
+        script.contains(&format!("{:x} [unknown] ([unknown])", ips[1])),
+        "{script}"
+    );
+    let expected: &[u8] = if interleave {
+        b"other;[unknown] 1\nworker;[[kernel.kallsyms]] 1\nworker;[unknown] 2\n"
+    } else {
+        b"worker;[[kernel.kallsyms]] 1\nworker;[unknown] 1\n"
+    };
+    assert_eq!(native, expected, "{script}");
+    assert_first_event_cursor_routes(&root, &bytes, &native);
+}
+
+#[cfg(target_os = "linux")]
+fn install_and_guard_rejected_kernel_elf(root: &std::path::Path) {
+    let (_elf_root, _, elf) = write_native_cached_kernel_elf_fixture(Some(&[0x5a; 20]), true);
+    let target = pyroclast::symbols::perf_build_id_elf_path(&root.join(".debug"), &"a5".repeat(20));
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::copy(&elf, &target).unwrap();
+    std::os::unix::fs::symlink(root.join(".debug"), root.join("symfs/.debug")).unwrap();
+    assert_eq!(
+        object::File::parse(std::fs::read(&target).unwrap().as_slice())
+            .unwrap()
+            .build_id()
+            .unwrap(),
+        Some(&[0x5a; 20][..])
+    );
+    // Source-backed composition, not a single native composed oracle:
+    // automatic selection proves rejection; explicit --kallsyms in the
+    // caller independently proves the positive ordinary-source cursor/fixup.
+    let (_, rejected, _) = query_native_automatic_kernel_cache(root);
+    assert!(rejected.contains("build id mismatch"), "{rejected}");
+}
+
+#[cfg(target_os = "linux")]
+fn assert_first_event_cursor_routes(root: &tempfile::TempDir, bytes: &[u8], native: &[u8]) {
+    use pyroclast::symbols::{PerfSymbolResolver, SelectedObjectResolver, SymbolizerKind};
+    let runner = pyroclast::process::RealCommandRunner::default();
+    let missing = root.path().join("missing-system-source");
+    let input = root.path().join("perf.data");
+    let mut actual = Vec::new();
+    for eager in [None, Some(false), Some(true)] {
+        for kind in [SymbolizerKind::RustAddr2line, SymbolizerKind::Addr2line] {
+            for inline in [false, true] {
+                for file in [false, true] {
+                    let object = SelectedObjectResolver::new(&runner, kind);
+                    let resolver = match eager {
+                        None => PerfSymbolResolver::from_object_resolver(object)
+                            .with_system_kallsyms_from_path(&root.path().join("kallsyms"))
+                            .with_system_map_candidates([]),
+                        Some(true) => PerfSymbolResolver::from_object_resolver(object)
+                            .with_perfdata_kernel_cache(bytes, &root.path().join(".debug"))
+                            .with_system_kallsyms_from_path(&missing)
+                            .with_system_map_candidates([]),
+                        Some(false) => {
+                            perf_symbol_resolver_for_perfdata_file_with_object_and_system_sources(
+                                object,
+                                &input,
+                                root.path(),
+                                [],
+                                &missing,
+                            )
+                        }
+                    }
+                    .with_live_kernel_notes_path(missing.clone());
+                    let options = FoldOptions {
+                        inline,
+                        count_periods: true,
+                    };
+                    let folded = if file {
+                        pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(
+                            &input, options, &resolver,
+                        )
+                    } else {
+                        fold_perfdata_callchains_with_symbols(bytes, options, &resolver)
+                    }
+                    .unwrap();
+                    actual.push((
+                        format!("eager={eager:?},{kind:?},inline={inline},file={file}"),
+                        folded,
+                    ));
+                }
+            }
+        }
+    }
+    let expected = actual
+        .iter()
+        .map(|(route, _)| (route.clone(), String::from_utf8(native.to_vec()).unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_review_kallsyms_relocation_wraps_both_endpoints() {
+    let rows = "0000000000000000 A reference\nfffffffffffff000 T before\nfffffffffffff100 T tail\n";
+    let (root, bytes) = write_native_kallsyms_fixture_with_mappings(
+        rows,
+        &[(0x1110, 0x1110)],
+        false,
+        &[(0x1000, 0x4000, 0x2000, "[kernel.kallsyms]reference")],
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("kallsyms")).unwrap(),
+        rows
+    );
+    assert!(!root.path().join("kcore").exists());
+    let maps = summarize_perfdata(&bytes).unwrap().mmap_table;
+    let mapping = maps.resolve_ref(11, 0x1110).unwrap();
+    assert_eq!((mapping.start, mapping.end), (0x1000, 0x5000));
+    let reference = mapping.kernel_relocation.unwrap();
+    assert_eq!(reference.reference_symbol, "reference");
+    assert_eq!(reference.recorded_reference_address, 0x2000);
+    let (script, stderr, native) = query_native_module_kallsyms(root.path(), &[]);
+    assert!(
+        stderr.contains(&format!(
+            "Using {} for symbols",
+            root.path().join("kallsyms").display()
+        )),
+        "{stderr}"
+    );
+    assert_eq!(
+        assert_native_split_map(&stderr, "[kernel.kallsyms]", 0x1110),
+        (0x1000, 0x3000)
+    );
+    assert!(script.contains("tail+0x10 ([kernel.kallsyms])"), "{script}");
+    assert_eq!(native, b"worker;tail 1\n", "{script}");
+    assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &native);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_review_active_kcore_out_of_range_does_not_reopen_ordinary_source() {
+    const CORE: u64 = 0xffff_ffff_8100_0000;
+    let (root, bytes) =
+        write_native_ordered_kcore_fixture("[a]", &[CORE + 0x10, CORE + 0x10000, CORE + 0x10001]);
+    let maps = summarize_perfdata(&bytes).unwrap().mmap_table;
+    assert!(maps.resolve_ref(11, CORE + 0x10001).is_some());
+    let (script, stderr, native) = query_native_module_kallsyms(root.path(), &[]);
+    assert!(stderr.contains("/kcore for kernel data"), "{stderr}");
+    assert!(
+        script.contains("_stext+0x10 ([kernel.kallsyms])"),
+        "{script}"
+    );
+    assert_eq!(
+        script.matches("[unknown] ([unknown])").count(),
+        2,
+        "{script}"
+    );
+    assert_eq!(native, b"worker;[unknown] 2\nworker;_stext 1\n", "{script}");
+    assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &native);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn source_backed_rejected_kernel_elf_keeps_kallsyms_terminal_admission() {
+    const CORE: u64 = 0xffff_ffff_8100_0000;
+    let rows = "ffffffff81000000 T _stext\nffffffff81000010 T last\n";
+    let (root, _, elf) = write_native_cached_kernel_elf_fixture(Some(&[0x5a; 20]), true);
+    let (_queries, bytes) = write_native_cached_kallsyms_queries_fixture(
+        rows,
+        false,
+        &[CORE + 0x1fff, CORE + 0x2000, CORE + 0x2001],
+    );
+    std::fs::write(root.path().join("perf.data"), &bytes).unwrap();
+    std::fs::write(root.path().join("kallsyms"), rows).unwrap();
+    assert_ne!(
+        object::File::parse(std::fs::read(&elf).unwrap().as_slice())
+            .unwrap()
+            .build_id()
+            .unwrap(),
+        Some(&[0xa5; 20][..])
+    );
+    // Explicit --kallsyms bypasses ELF selection in perf. Check automatic
+    // rejection independently before comparing the selected kallsyms map.
+    let (_, rejected, _) = query_native_automatic_kernel_cache(root.path());
+    assert!(rejected.contains("build id mismatch"), "{rejected}");
+    let (script, stderr, native) = query_native_module_kallsyms(root.path(), &[]);
+    assert!(
+        stderr.contains(&format!(
+            "Using {} for symbols",
+            root.path().join("kallsyms").display()
+        )),
+        "{stderr}"
+    );
+    assert_eq!(
+        assert_native_split_map(&stderr, "[kernel.kallsyms]", CORE + 0x1fff),
+        (CORE, CORE + 0x2000)
+    );
+    assert_eq!(native, b"worker;[unknown] 2\nworker;last 1\n", "{script}");
+    assert_cached_kallsyms_routes_match_native(&root, &bytes, &script, &stderr, &native, false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_review_live_source_outranks_readable_plain_cache() {
+    assert_native_live_source_competition(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_review_live_source_outranks_readable_zero_plain_cache() {
+    assert_native_live_source_competition(true);
+}
+
+#[cfg(target_os = "linux")]
+fn assert_native_live_source_competition(zero_cache: bool) {
+    const CORE: u64 = 0xffff_ffff_8100_0000;
+    let cache = if zero_cache {
+        "0000000000000000 T _stext\n0000000000000000 T cache_core\n0000000000000000 T cache_module\t[a]\n"
+    } else {
+        "ffffffff81000000 T _stext\nffffffff81000010 T cache_core\nffffffffc1000000 T cache_module\t[a]\n"
+    };
+    let live = "ffffffff81000000 T _stext\nffffffff81000010 T live_core\nffffffffc1000000 T live_module\t[a]\n";
+    let (root, bytes) = write_native_cached_kallsyms_queries_fixture(
+        cache,
+        false,
+        &[CORE + 0x10, 0xffff_ffff_c100_0010],
+    );
+    let path = root.path().join("kallsyms");
+    let cache_path = std::fs::canonicalize(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::fs::write(&path, live).unwrap();
+    assert_eq!(std::fs::read_to_string(&cache_path).unwrap(), cache);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), live);
+    assert_ne!(std::fs::canonicalize(&path).unwrap(), cache_path);
+    assert!(!root.path().join("kcore").exists());
+    assert!(
+        !pyroclast::symbols::perf_build_id_elf_path(&root.path().join(".debug"), &"a5".repeat(20))
+            .exists()
+    );
+    let (script, stderr, native) = query_native_module_kallsyms(root.path(), &[]);
+    assert!(
+        stderr.contains(&format!("Using {} for symbols", path.display())),
+        "{stderr}"
+    );
+    assert!(
+        script.contains("live_core+0x0 ([kernel.kallsyms])"),
+        "{script}"
+    );
+    assert!(script.contains("live_module+0x10 ([a])"), "{script}");
+    assert!(
+        !script.contains("cache_core") && !script.contains("cache_module"),
+        "{script}"
+    );
+    assert_eq!(
+        native, b"worker;live_core 1\nworker;live_module 1\n",
+        "{script}"
+    );
+    assert_cached_kallsyms_routes_with_live_source(
+        &root, &bytes, &script, &stderr, &native, false, &path,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_cached_kallsyms_terminal_end_is_exclusive_after_main_map_fixup() {
+    const CORE: u64 = 0xffff_ffff_8100_0000;
+    let rows = "ffffffff81000000 T _stext\nffffffff81000010 T last\n";
+    let queries = [CORE + 0x1fff, CORE + 0x2000, CORE + 0x2001];
+    for old_layout in [false, true] {
+        let (root, bytes) =
+            write_native_cached_kallsyms_queries_fixture(rows, old_layout, &queries);
+        assert_native_core_kallsyms_fixture(root.path(), &bytes, rows, &queries);
+        let (script, stderr, native) = query_native_module_kallsyms(root.path(), &[]);
+        assert!(
+            stderr.contains(&format!(
+                "Using {} for symbols",
+                root.path().join("kallsyms").display()
+            )),
+            "{stderr}"
+        );
+        assert_eq!(
+            assert_native_split_map(&stderr, "[kernel.kallsyms]", queries[0]),
+            (CORE, CORE + 0x2000)
+        );
+        assert!(
+            script.contains("last+0x1fef ([kernel.kallsyms])"),
+            "{script}"
+        );
+        assert_eq!(
+            script.matches("[unknown] ([unknown])").count(),
+            2,
+            "{script}"
+        );
+        assert_eq!(native, b"worker;[unknown] 2\nworker;last 1\n", "{script}");
+        assert_cached_kallsyms_routes_match_native(
+            &root, &bytes, &script, &stderr, &native, old_layout,
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_live_core_kallsyms_uses_first_containing_tree_symbol() {
+    let rows = "ffffffff81000000 T _stext\n\
+                ffffffff81000010 T first\n\
+                ffffffff81000020 T later[marker]\n\
+                ffffffff81000100 T next\n";
+    let (root, bytes) =
+        write_native_module_kallsyms_fixture(rows, &[0xffff_ffff_8100_0050], false, ["[a]", "[b]"]);
+    assert_native_core_kallsyms_fixture(
+        root.path(),
+        &bytes,
+        rows,
+        &[0xffff_ffff_8100_0010, 0xffff_ffff_8100_0050],
+    );
+    // Original four-row insertion makes first the native root. Both first
+    // and later contain the second query; greatest-start is not the oracle.
+    let (script, stderr, native) = query_native_module_kallsyms(
+        root.path(),
+        &[
+            ("first", 0xffff_ffff_8100_2000),
+            ("later[marker]", 0xffff_ffff_8100_2000),
+        ],
+    );
+    assert!(
+        stderr.contains(&format!(
+            "Using {} for symbols",
+            root.path().join("kallsyms").display()
+        )),
+        "{script}\n{stderr}"
+    );
+    assert!(script.contains("first+0x0 ("), "{script}\n{stderr}");
+    assert!(script.contains("first+0x40 ("), "{script}\n{stderr}");
+    assert_eq!(native, b"worker;first 2\n", "{script}\n{stderr}");
+    assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &native);
+}
+
+#[cfg(target_os = "linux")]
+fn assert_native_split_kallsyms_fixture(root: &std::path::Path, bytes: &[u8], rows: &str) {
+    assert_eq!(
+        std::fs::read_to_string(root.join("kallsyms")).unwrap(),
+        rows
+    );
+    assert!(rows.starts_with("ffffffff81000000 T _stext\n"));
+    assert!(!root.join("kcore").exists());
+    assert!(!root.join(".debug").exists());
+    assert!(
+        std::fs::read_dir(root.join("symfs"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    let header = pyroclast::perfdata::header::parse_header(bytes).unwrap();
+    let maps = pyroclast::perfdata::records::iter_records(bytes, header)
+        .unwrap()
+        .into_iter()
+        .filter(|record| record.header.record_type == 1)
+        .map(|record| {
+            assert_eq!(record.header.misc, PERF_RECORD_MISC_CPUMODE_KERNEL);
+            let map = pyroclast::perfdata::records::parse_mmap_record(record.payload).unwrap();
+            (map.start, map.len, map.pgoff, map.path)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        maps,
+        [
+            (
+                0xffff_ffff_8100_0000,
+                0x1000,
+                0xffff_ffff_8100_0000,
+                "[kernel.kallsyms]_stext".into()
+            ),
+            (0xffff_ffff_c100_0000, 0x4000, 0, "[a]".into()),
+            (0xffff_ffff_c101_0000, 0x4000, 0, "[b]".into()),
+        ]
+    );
+    let maps = summarize_perfdata(bytes).unwrap().mmap_table;
+    let core = maps.resolve_ref(11, 0xffff_ffff_8100_0000).unwrap();
+    assert_eq!(
+        (core.start, core.end),
+        (0xffff_ffff_8100_0000, 0xffff_ffff_8100_1000)
+    );
+    let reference = core.kernel_relocation.unwrap();
+    assert_eq!(reference.reference_symbol, "_stext");
+    assert_eq!(reference.recorded_reference_address, core.start);
+    let module = maps.resolve_ref(11, 0xffff_ffff_c100_0010).unwrap();
+    assert_eq!(module.path, "[a]");
+    assert_eq!(
+        (module.start, module.end),
+        (0xffff_ffff_c100_0000, 0xffff_ffff_c100_4000)
+    );
+    assert_eq!(
+        0xffff_ffff_c100_0010_u64.checked_sub(module.start),
+        Some(0x10)
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn native_split_map_range(stderr: &str, dso: &str) -> (u64, u64) {
+    let suffix = format!(" 0 {dso}");
+    let range = stderr
+        .split('\n')
+        .find_map(|line| line.strip_prefix("Map: ")?.strip_suffix(&suffix))
+        .unwrap_or_else(|| panic!("missing native destination {dso}: {stderr}"));
+    let (start, end) = range.split_once('-').unwrap();
+    let start = u64::from_str_radix(start, 16).unwrap();
+    let end = u64::from_str_radix(end, 16).unwrap();
+    (start, end)
+}
+
+#[cfg(target_os = "linux")]
+fn assert_native_split_map(stderr: &str, dso: &str, query: u64) -> (u64, u64) {
+    let (start, end) = native_split_map_range(stderr, dso);
+    assert!(
+        start <= query && query < end,
+        "native destination did not admit {query:#x}: {stderr}"
+    );
+    (start, end)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_live_core_kallsyms_retains_global_topology_after_module_move() {
+    const CORE: u64 = 0xffff_ffff_8100_0000;
+    const MODULE: u64 = 0xffff_ffff_c100_0000;
+    let rows = "ffffffff81000000 T _stext\n\
+                ffffffffc1000000 T module_member\t[a]\n\
+                ffffffff81000020 T fresh_root\n\
+                ffffffff81000030 T marker_three[marker]\n\
+                ffffffff81000040 T original_root\n\
+                ffffffff81000050 T marker_five[marker]\n\
+                ffffffff81000060 T penultimate\n\
+                ffffffff81000070 T terminal\n";
+    // Physical ID1 is the real high-address module. Removing it preserves
+    // original root ID4; reinserting seven sorted core survivors chooses ID2.
+    let (root, bytes) = write_native_kallsyms_fixture_with_mappings(
+        rows,
+        &[
+            (CORE, CORE),
+            (CORE + 0xf80, CORE + 0xf80),
+            (MODULE + 0x10, MODULE + 0x10),
+        ],
+        true,
+        &[
+            (CORE, 0x1000, CORE, "[kernel.kallsyms]_stext"),
+            (MODULE, 0x4000, 0, "[a]"),
+            (MODULE + 0x1_0000, 0x4000, 0, "[b]"),
+        ],
+    );
+    assert_native_split_kallsyms_fixture(root.path(), &bytes, rows);
+    const { assert!(CORE + 0xf80 < CORE + 0x1000) };
+    let (script, stderr, native) = query_native_module_kallsyms(
+        root.path(),
+        &[
+            ("fresh_root", CORE + 0x2000),
+            ("original_root", CORE + 0x2000),
+        ],
+    );
+    assert!(
+        stderr.contains(&format!(
+            "Using {} for symbols",
+            root.path().join("kallsyms").display()
+        )),
+        "{script}\n{stderr}"
+    );
+    assert_eq!(
+        stderr
+            .split('\n')
+            .filter(|line| line.starts_with("symbol__new:"))
+            .count(),
+        8,
+        "{stderr}"
+    );
+    assert_native_split_map(&stderr, "[kernel.kallsyms]", CORE + 0xf80);
+    assert_native_split_map(&stderr, "[a]", MODULE + 0x10);
+    assert!(
+        !stderr.contains("[kernel].0"),
+        "later main rows must stay in the initial DSO: {stderr}"
+    );
+    assert!(
+        script.contains("original_root+0xf40 ([kernel.kallsyms])"),
+        "{script}\n{stderr}"
+    );
+    assert!(
+        script.contains("module_member+0x10 ([a])"),
+        "{script}\n{stderr}"
+    );
+    assert_eq!(
+        native, b"query_00;_stext 1\nquery_01;original_root 1\nquery_02;module_member 1\n",
+        "{script}\n{stderr}"
+    );
+    assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &native);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_live_kallsyms_leaves_zero_end_later_core_child_unmapped() {
+    const CORE: u64 = 0xffff_ffff_8100_0000;
+    const MODULE: u64 = 0xffff_ffff_c100_0000;
+    const CHILD: u64 = MODULE + 0x8000;
+    let rows = "ffffffff81000000 T _stext\n\
+                ffffffff81000100 T _etext\n\
+                ffffffffc1000000 T module_member\t[a]\n\
+                ffffffffc1008000 T later_core\n\
+                ffffffffc1010000 T sentinel\t[b]\n";
+    let (root, bytes) = write_native_kallsyms_fixture_with_mappings(
+        rows,
+        &[
+            (CORE, CORE),
+            (MODULE + 0x10, MODULE + 0x10),
+            (CHILD + 0x10, CHILD + 0x10),
+            (CORE + 0x10, CHILD + 0x10),
+        ],
+        true,
+        &[
+            (CORE, 0x1000, CORE, "[kernel.kallsyms]_stext"),
+            (MODULE, 0x4000, 0, "[a]"),
+            (MODULE + 0x1_0000, 0x4000, 0, "[b]"),
+        ],
+    );
+    assert_native_split_kallsyms_fixture(root.path(), &bytes, rows);
+    let maps = summarize_perfdata(&bytes).unwrap().mmap_table;
+    assert!(
+        maps.resolve_ref(11, CHILD + 0x10).is_none(),
+        "child must not be supplied by an input MMAP"
+    );
+    const { assert!(CHILD > CORE + 0x1000 && CHILD > MODULE + 0x4000) };
+    let (script, stderr, native) = query_native_module_kallsyms(
+        root.path(),
+        &[
+            ("_etext", CORE + 0x2000),
+            ("module_member\t[a]", MODULE + 0x1000),
+            ("later_core", MODULE + 0x9000),
+        ],
+    );
+    assert!(
+        stderr.contains(&format!(
+            "Using {} for symbols",
+            root.path().join("kallsyms").display()
+        )),
+        "{script}\n{stderr}"
+    );
+    assert!(
+        script.contains("_stext+0x0 ([kernel.kallsyms])"),
+        "{script}\n{stderr}"
+    );
+    assert!(
+        script.contains("module_member+0x10 ([a])"),
+        "{script}\n{stderr}"
+    );
+    // Native creates the child but does not fix its end. maps.c:map__addr_cmp
+    // rejects both the child sample and a child chain from an admitted main IP.
+    assert_eq!(native_split_map_range(&stderr, "[kernel].0"), (CHILD, 0));
+    let main_range = assert_native_split_map(&stderr, "[kernel.kallsyms]", CORE + 0x10);
+    assert_eq!(main_range, (CORE, CORE + 0x2000));
+    assert!(CHILD > main_range.1);
+    assert_eq!(
+        script
+            .split('\n')
+            .filter(|line| { line.ends_with("ffffffffc1008010 [unknown] ([unknown])") })
+            .count(),
+        2,
+        "{script}\n{stderr}"
+    );
+    assert!(!script.contains("later_core+"), "{script}\n{stderr}");
+    let native_text = std::str::from_utf8(&native).unwrap();
+    assert!(
+        native_text.starts_with("query_00;_stext 1\nquery_01;module_member 1\n"),
+        "{native_text}"
+    );
+    assert_eq!(
+        native_text
+            .split('\n')
+            .filter(|line| !line.is_empty())
+            .count(),
+        4,
+        "{native_text}"
+    );
+    assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &native);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_live_kallsyms_keeps_zero_address_display_reference() {
+    let rows = "0000000000000000 T reference\n\
+                0000000000001000 T reference\n\
+                0000000000001010 T next\n";
+    let (root, bytes) = write_native_kallsyms_fixture_with_mappings(
+        rows,
+        &[(0x2010, 0x2010)],
+        false,
+        &[(0x2000, 0x2000, 0x2000, "[kernel.kallsyms]reference")],
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("kallsyms")).unwrap(),
+        rows
+    );
+    assert!(!root.path().join("kcore").exists());
+    assert!(
+        std::fs::read_dir(root.path().join("symfs"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    let maps = summarize_perfdata(&bytes).unwrap().mmap_table;
+    let mapping = maps
+        .resolve_ref(11, 0x2010)
+        .expect("recorded low kernel query");
+    assert_eq!(
+        (mapping.start, mapping.end, mapping.relative_address),
+        (0x2000, 0x4000, 0x2010)
+    );
+    let reference = mapping.kernel_relocation.unwrap();
+    assert_eq!(
+        (
+            reference.reference_symbol.as_str(),
+            reference.recorded_reference_address
+        ),
+        ("reference", 0x2000)
+    );
+    // The first physical reference is zero. Native keeps that DISPLAY row,
+    // too: wrapping delta -0x2000 translates recorded query0x2010 to source0x10.
+    let (script, stderr, native) =
+        query_native_module_kallsyms(root.path(), &[("reference", 0x1000), ("reference", 0x1010)]);
+    assert!(
+        stderr.contains(&format!(
+            "Using {} for symbols",
+            root.path().join("kallsyms").display()
+        )),
+        "{script}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("symbol__new: reference 0-0"),
+        "{script}\n{stderr}"
+    );
+    assert!(
+        script.contains("2010 reference+0x10 ([kernel.kallsyms])"),
+        "{script}\n{stderr}"
+    );
+    assert_eq!(
+        assert_native_split_map(&stderr, "[kernel.kallsyms]", 0x2010),
+        (0x2000, 0x5000)
+    );
+    assert_eq!(native, b"worker;reference 1\n", "{script}\n{stderr}");
+    assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &native);
 }
 
 #[cfg(target_os = "linux")]
@@ -7999,6 +8883,38 @@ fn assert_module_object_bare_queries(
 #[test]
 fn bracketed_module_first_failed_load_stays_unknown_after_ordinary_core_loading() {
     assert_module_first_queries_match_native("[a]", false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_loaded_module_switch_discards_first_row_but_keeps_second_row() {
+    const CORE: u64 = 0xffff_ffff_8100_0000;
+    const MODULE: u64 = 0xffff_ffff_c100_0000;
+    let rows = "ffffffff81000000 T _stext\n\
+                ffffffffc1000000 T first\t[a]\n\
+                ffffffffc1000020 T second\t[a]\n";
+    let (root, bytes) = write_native_kallsyms_fixture_with_mappings(
+        rows,
+        &[
+            (MODULE + 0x10, MODULE + 0x10),
+            (CORE + 0x10, CORE + 0x10),
+            (MODULE + 0x30, MODULE + 0x30),
+        ],
+        true,
+        &[
+            (CORE, 0x1000, CORE, "[kernel.kallsyms]_stext"),
+            (MODULE, 0x4000, 0, "[a]"),
+            (MODULE + 0x1_0000, 0x4000, 0, "[b]"),
+        ],
+    );
+    assert_native_split_kallsyms_fixture(root.path(), &bytes, rows);
+    let (script, stderr, native) =
+        query_native_module_kallsyms(root.path(), &[("first\t[a]", MODULE + 0x20)]);
+    assert!(!stderr.contains("/kcore for kernel data"), "{stderr}");
+    assert!(script.contains("second+0x10 ([a])"), "{script}\n{stderr}");
+    assert!(script.contains("[unknown] ([a])"), "{script}");
+    assert!(!native.is_empty());
+    assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &native);
 }
 
 #[cfg(target_os = "linux")]

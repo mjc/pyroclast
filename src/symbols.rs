@@ -218,6 +218,11 @@ pub trait SymbolResolver {
     /// Direct callers must provide this context explicitly; no recording is replayed.
     fn initialize_kernel_maps(&self, _table: &MmapTable) {}
 
+    /// Supplies the selected map at the cold kernel-source load boundary.
+    fn initialize_kernel_mapping(&self, table: &MmapTable, _mapping: &ResolvedMappingRef<'_>) {
+        self.initialize_kernel_maps(table);
+    }
+
     /// Reports the live ELF's ID before a DSO's first symbol lookup, as perf's
     /// `symbol.c:dso__load` does before selecting build-ID cache candidates.
     fn object_build_id(&self, _path: &Path) -> Option<Vec<u8>> {
@@ -244,6 +249,16 @@ pub trait SymbolResolver {
     /// perf `builtin-script.c:process_sample_event` loads the event IP's map
     /// before resolving any callchain nodes (`event.c:machine__resolve`).
     fn preprocess_sample_ip(&self, _mapping: &ResolvedMappingRef<'_>) {}
+
+    /// Loads an event IP's map and retains its pre-load cursor when loading
+    /// changes admission. This result belongs to this event, not its address.
+    fn preprocess_sample_ip_with_cursor(
+        &self,
+        mapping: &ResolvedMappingRef<'_>,
+    ) -> Option<ResolvedSymbolFrames> {
+        self.preprocess_sample_ip(mapping);
+        None
+    }
 
     /// Retains the selected module's symbol-load map effects for the session.
     fn loaded_kernel_module(
@@ -403,6 +418,7 @@ pub struct SymbolFrameCache<'a, R> {
     scratch_missing_requests: Vec<SymbolRequest>,
     replaced_kernel_entries: SmallVec<[(bool, MappingFrameKey, bool); 2]>,
     kernel_cursor_hint: Option<(MappingFrameKey, bool)>,
+    retained_sample_ip: Option<(MappingFrameKey, CachedMappingFrames)>,
     preprocessed_kernel_modules: FxHashSet<usize>,
 }
 
@@ -1095,6 +1111,7 @@ pub struct PerfSymbolResolver<O> {
     live_kallsyms: Option<Kallsyms>,
     live_kallsyms_path: Option<PathBuf>,
     live_kallsyms_cache: OnceLock<Option<LiveKallsymsSnapshot>>,
+    native_source: OnceLock<Option<NativeSourceKind>>,
     kcore_symbols: OnceLock<Option<kcore::KcoreSymbols>>,
     ordinary_kernel_load: Mutex<OrdinaryKernelLoad>,
     system_map_kallsyms: Option<Kallsyms>,
@@ -1113,12 +1130,291 @@ pub struct PerfSymbolResolver<O> {
 struct OrdinaryKernelLoad {
     core_loaded: bool,
     modules_loaded_before_core: FxHashSet<String>,
+    context: Option<CoreLoadContext>,
 }
 
 struct LiveKallsymsSnapshot {
-    core: Option<Kallsyms>,
+    prepared: Mutex<Option<NativePrepared>>,
+    ordinary: OnceLock<NativeOrdinary>,
+    physical: Arc<KallsymsReferenceSource>,
+}
+
+#[derive(Default)]
+struct CoreLoadContext {
+    range: Option<(u64, u64)>,
+    modules: Option<FxHashSet<String>>,
+    loaded_modules: FxHashSet<String>,
+}
+
+struct NativeOrdinary {
+    core: FrozenCoreTable,
     modules: FxHashMap<String, ModuleSymbols>,
-    physical: KallsymsReferenceSource,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum NativeSourceKind {
+    Live,
+    Cached,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FrozenCoreNode {
+    address: u64,
+    end: u64,
+    name: Range<usize>,
+    left: Option<std::num::NonZeroUsize>,
+    right: Option<std::num::NonZeroUsize>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct FrozenCoreTable {
+    nodes: Vec<FrozenCoreNode>,
+    root: Option<usize>,
+}
+
+impl FrozenCoreTable {
+    fn find(&self, address: u64) -> Option<&FrozenCoreNode> {
+        self.find_relocated(address, 0)
+    }
+
+    fn find_relocated(&self, address: u64, delta: u64) -> Option<&FrozenCoreNode> {
+        let mut cursor = self.root;
+        while let Some(index) = cursor {
+            let node = &self.nodes[index];
+            // symbol.c:1112-1115 relocates both endpoints without reinserting
+            // nodes. Translating only the query differs when an end wraps.
+            let start = node.address.wrapping_sub(delta);
+            let end = node.end.wrapping_sub(delta);
+            cursor = if address < start {
+                node.left
+            } else if address >= end && !(start == end && address == end) {
+                node.right
+            } else {
+                return Some(node);
+            }
+            .map(|link| link.get() - 1);
+        }
+        None
+    }
+
+    fn resolve_with_offset(&self, source: &str, address: u64) -> Option<String> {
+        self.resolve_relocated(source, address, 0)
+    }
+
+    fn resolve_relocated(&self, source: &str, address: u64, delta: u64) -> Option<String> {
+        let node = self.find_relocated(address, delta)?;
+        Some(format!(
+            "{}+0x{:x}",
+            &source[node.name.clone()],
+            address.wrapping_sub(node.address.wrapping_sub(delta))
+        ))
+    }
+}
+
+struct NativePreparedRow {
+    address: u64,
+    end: u64,
+    name: Range<usize>,
+    symbol_type: char,
+}
+
+struct NativePrepared {
+    rows: Vec<NativePreparedRow>,
+    tree: perf_tree::PerfSymbolTree,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum NativeDestination<'a> {
+    Main,
+    Module(&'a str),
+    Child,
+}
+
+impl NativePrepared {
+    fn new(source: &str) -> Self {
+        #[cfg(test)]
+        MODULE_KALLSYMS_TREE_BUILDS.with(|count| count.set(count.get() + 1));
+        let mut rows = Vec::new();
+        for raw in NativeKallsymsRows::new(source) {
+            #[cfg(test)]
+            MODULE_KALLSYMS_ROW_VISITS.with(|count| count.set(count.get() + 1));
+            let Some(raw) = raw else { continue };
+            let symbol_type = char::from(raw.symbol_type);
+            // perf v7.2.9 symbol.c:873-899 does not reject address zero.
+            if !perf_kallsyms_type_is_kept(symbol_type) || raw.name.starts_with('$') {
+                continue;
+            }
+            #[cfg(test)]
+            MODULE_KALLSYMS_SYMBOL_INSERTIONS.with(|count| count.set(count.get() + 1));
+            rows.push(NativePreparedRow {
+                address: raw.address,
+                end: raw.address,
+                name: raw.name_start..raw.name_start + raw.name.len(),
+                symbol_type,
+            });
+        }
+        let mut tree = perf_tree::PerfSymbolTree::new(rows.len());
+        for (id, row) in rows.iter().enumerate() {
+            assert!(tree.insert(id, row.address));
+        }
+        let order = tree.indices_in_order();
+        #[cfg(test)]
+        MODULE_KALLSYMS_END_FIXUP_PASSES.with(|count| count.set(count.get() + 1));
+        for pair in order.windows(2) {
+            let current = &rows[pair[1]];
+            let next_address = current.address;
+            let next_module = source[current.name.clone()]
+                .find('[')
+                .map(|start| &source[current.name.start + start..current.name.end]);
+            let previous = &mut rows[pair[0]];
+            let previous_module = source[previous.name.clone()]
+                .find('[')
+                .map(|start| &source[previous.name.start + start..previous.name.end]);
+            previous.end = if previous_module == next_module {
+                next_address
+            } else {
+                previous.address.wrapping_add(4096).wrapping_add(4095) & !4095
+            };
+        }
+        if let Some(&last) = order.last() {
+            rows[last].end = rows[last]
+                .address
+                .wrapping_add(4095)
+                .wrapping_div(4096)
+                .wrapping_mul(4096)
+                .wrapping_add(4096);
+        }
+        // symbol.c:214-245 erases the losing original ID, never replaces the
+        // payload of the surviving node or rebuilds its insertion topology.
+        let mut current: Option<usize> = None;
+        for id in order {
+            if let Some(previous) = current
+                && rows[previous].address == rows[id].address
+            {
+                let previous_row = Self::borrow_row(&rows[previous], source);
+                let next_row = Self::borrow_row(&rows[id], source);
+                if kallsyms_next_alias_is_better(&previous_row, &next_row) {
+                    tree.remove(previous);
+                } else {
+                    tree.remove(id);
+                    continue;
+                }
+            }
+            current = Some(id);
+        }
+        Self { rows, tree }
+    }
+
+    fn borrow_row<'a>(row: &NativePreparedRow, source: &'a str) -> BorrowedKallsymsRow<'a> {
+        let full_name = &source[row.name.clone()];
+        let (name, module) = full_name
+            .split_once('\t')
+            .map_or((full_name, None), |(name, module)| (name, Some(module)));
+        BorrowedKallsymsRow {
+            address: row.address,
+            end: row.end,
+            name,
+            full_name,
+            module,
+            symbol_type: row.symbol_type,
+        }
+    }
+
+    fn survivor_rows<'a>(
+        &'a self,
+        source: &'a str,
+    ) -> impl Iterator<Item = BorrowedKallsymsRow<'a>> {
+        self.tree
+            .indices_in_order()
+            .into_iter()
+            .map(move |id| Self::borrow_row(&self.rows[id], source))
+    }
+
+    fn freeze(&self) -> FrozenCoreTable {
+        let order = self.tree.indices_in_order();
+        let mut dense = vec![None; self.rows.len()];
+        for (index, &id) in order.iter().enumerate() {
+            dense[id] = Some(index);
+        }
+        let nodes = order
+            .iter()
+            .map(|&id| {
+                let row = &self.rows[id];
+                let (left, right) = self.tree.children(id).expect("surviving native node");
+                let link = |id: usize| {
+                    ModuleKallsymsIndex::<()>::link(dense[id].expect("surviving child"))
+                };
+                FrozenCoreNode {
+                    address: row.address,
+                    end: row.end,
+                    name: row.name.clone(),
+                    left: left.map(link),
+                    right: right.map(link),
+                }
+            })
+            .collect();
+        FrozenCoreTable {
+            nodes,
+            root: self.tree.root_index().and_then(|id| dense[id]),
+        }
+    }
+
+    fn finish_ordinary(
+        mut self,
+        source: &str,
+        context: Option<&CoreLoadContext>,
+    ) -> NativeOrdinary {
+        let mut modules = FxHashMap::<String, ModuleSymbols>::default();
+        // symbol.c:986-1150 keeps the current destination across discarded
+        // rows. A later core child has end zero and supplies no MAIN symbols.
+        let mut destination = NativeDestination::Main;
+        for id in self.tree.indices_in_order() {
+            let row = Self::borrow_row(&self.rows[id], source);
+            if let Some(module) = row.module {
+                if destination != NativeDestination::Module(module) {
+                    if let Some(context) = context {
+                        if context
+                            .modules
+                            .as_ref()
+                            .is_some_and(|modules| !modules.contains(module))
+                        {
+                            destination = NativeDestination::Main;
+                            self.tree.remove(id);
+                            continue;
+                        }
+                        if context.loaded_modules.contains(module) {
+                            destination = NativeDestination::Module(module);
+                            self.tree.remove(id);
+                            continue;
+                        }
+                    }
+                    destination = NativeDestination::Module(module);
+                }
+                let view = match modules.raw_entry_mut().from_key(module) {
+                    RawEntryMut::Occupied(entry) => entry.into_mut(),
+                    RawEntryMut::Vacant(entry) => {
+                        entry.insert(module.to_owned(), ModuleSymbols::default()).1
+                    }
+                };
+                view.index
+                    .insert_ascending(row.address, row.end, Arc::from(row.name));
+                self.tree.remove(id);
+            } else if destination != NativeDestination::Main
+                && context
+                    .and_then(|context| context.range)
+                    .is_some_and(|(start, end)| row.address < start || row.address >= end)
+            {
+                destination = NativeDestination::Child;
+                self.tree.remove(id);
+            } else {
+                destination = NativeDestination::Main;
+            }
+        }
+        NativeOrdinary {
+            core: self.freeze(),
+            modules,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1177,6 +1473,43 @@ impl KallsymsReferenceSource {
 }
 
 impl LiveKallsymsSnapshot {
+    fn load(path: &Path) -> Option<Self> {
+        let text = std::fs::read_to_string(path).ok()?.into_boxed_str();
+        let prepared = NativePrepared::new(&text);
+        Some(Self {
+            physical: Arc::new(KallsymsReferenceSource::new(text)),
+            prepared: Mutex::new(Some(prepared)),
+            ordinary: OnceLock::new(),
+        })
+    }
+
+    fn load_cache(debug_dir: &Path, build_id: &str) -> Option<Self> {
+        perf_build_id_kallsyms_paths(debug_dir, build_id)
+            .into_iter()
+            .filter_map(|path| Self::load(&path))
+            .find(|source| {
+                !source
+                    .prepared
+                    .lock()
+                    .expect("native preparation lock")
+                    .as_ref()
+                    .expect("pending native source")
+                    .rows
+                    .is_empty()
+            })
+    }
+
+    fn ordinary(&self, context: Option<&CoreLoadContext>) -> &NativeOrdinary {
+        self.ordinary.get_or_init(|| {
+            self.prepared
+                .lock()
+                .expect("native preparation lock")
+                .take()
+                .expect("native source completes once")
+                .finish_ordinary(&self.physical.source, context)
+        })
+    }
+
     fn reference_address(&self, reference: &str) -> Option<u64> {
         self.physical.reference_address(reference)
     }
@@ -1192,19 +1525,22 @@ impl LiveKallsymsSnapshot {
     }
 
     fn resolve_core(&self, request: &SymbolRequest) -> Option<String> {
-        let core = self.core.as_ref()?;
         let delta = self.relocation_delta(request.kernel_relocation.as_ref())?;
-        core.resolve_with_offset(request.relative_address.wrapping_add(delta))
+        self.ordinary(None).core.resolve_relocated(
+            &self.physical.source,
+            request.relative_address,
+            delta,
+        )
     }
 
     fn kernel_map_range(&self, relocation: Option<&KernelRelocation>) -> Option<(u64, u64)> {
         // perf symbol.c:maps__split_kallsyms subtracts delta before
         // map.c:map__fixup_start/end takes the first/last symbol bounds.
-        let core = self.core.as_ref()?;
+        let core = &self.ordinary(None).core;
         let delta = self.relocation_delta(relocation)?;
-        let (&start, _) = core.symbols.first_key_value()?;
-        let (_, last) = core.symbols.last_key_value()?;
-        Some((start.wrapping_sub(delta), last.end?.wrapping_sub(delta)))
+        let start = core.nodes.first()?.address;
+        let last = core.nodes.last()?;
+        Some((start.wrapping_sub(delta), last.end.wrapping_sub(delta)))
     }
 }
 
@@ -1218,8 +1554,19 @@ struct FileKernelCache {
 #[derive(Default)]
 struct CachedKernelSymbols {
     build_id: Option<String>,
-    kallsyms: Option<Kallsyms>,
+    debug_dir: PathBuf,
+    kallsyms: OnceLock<Option<LiveKallsymsSnapshot>>,
     elf: Option<PathBuf>,
+}
+
+impl CachedKernelSymbols {
+    fn kallsyms(&self) -> Option<&LiveKallsymsSnapshot> {
+        self.kallsyms
+            .get_or_init(|| {
+                LiveKallsymsSnapshot::load_cache(&self.debug_dir, self.build_id.as_deref()?)
+            })
+            .as_ref()
+    }
 }
 
 impl FileKernelCache {
@@ -1238,7 +1585,8 @@ impl FileKernelCache {
             let build_id = build_id_hex(build_id);
             let elf = perf_build_id_elf_path(&self.debug_dir, &build_id);
             CachedKernelSymbols {
-                kallsyms: Kallsyms::load_perf_build_id_cache(&self.debug_dir, &build_id),
+                debug_dir: self.debug_dir.clone(),
+                kallsyms: OnceLock::new(),
                 elf: elf.exists().then_some(elf),
                 build_id: Some(build_id),
             }
@@ -1256,6 +1604,7 @@ pub struct Kallsyms {
     addresses_by_name: FxHashMap<Arc<str>, u64>,
     module_indexes: FxHashMap<String, ModuleKallsymsIndex>,
     physical: Option<Arc<KallsymsReferenceSource>>,
+    native: Option<FrozenCoreTable>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1383,13 +1732,6 @@ struct ModuleSymbols {
 }
 
 impl ModuleSymbols {
-    fn rows(&self) -> impl Iterator<Item = (u64, u64, &Arc<str>)> {
-        self.index
-            .nodes
-            .iter()
-            .map(|node| (node.address, node.end, &node.payload))
-    }
-
     fn resolve_module_with_offset_in_range(
         &self,
         address: u64,
@@ -1964,6 +2306,7 @@ where
             live_kallsyms: None,
             live_kallsyms_path: None,
             live_kallsyms_cache: OnceLock::new(),
+            native_source: OnceLock::new(),
             kcore_symbols: OnceLock::new(),
             ordinary_kernel_load: Mutex::new(OrdinaryKernelLoad::default()),
             system_map_kallsyms: None,
@@ -2064,7 +2407,8 @@ where
         // Automatic cache discovery is not an explicit --kallsyms selection.
         self_with_debug_dir.cached_kernel_symbols = Some(CachedKernelSymbols {
             build_id: Some(build_id.to_owned()),
-            kallsyms: Kallsyms::load_perf_build_id_cache(debug_dir, build_id),
+            debug_dir: debug_dir.to_owned(),
+            kallsyms: OnceLock::new(),
             elf: kernel_elf.exists().then_some(kernel_elf),
         });
         self_with_debug_dir
@@ -2137,16 +2481,31 @@ where
     }
 
     fn kallsyms_ref(&self) -> Option<&Kallsyms> {
-        self.kallsyms
+        self.kallsyms.as_ref()
+    }
+
+    fn cached_native_source(&self) -> Option<&LiveKallsymsSnapshot> {
+        self.cached_kernel_symbols
             .as_ref()
-            .or_else(|| self.cached_kernel_symbols.as_ref()?.kallsyms.as_ref())
-            .or_else(|| {
-                self.file_kernel_cache
-                    .as_ref()?
-                    .symbols()?
-                    .kallsyms
-                    .as_ref()
-            })
+            .and_then(CachedKernelSymbols::kallsyms)
+            .or_else(|| self.file_kernel_cache.as_ref()?.symbols()?.kallsyms())
+    }
+
+    fn selected_native_source(&self) -> Option<&LiveKallsymsSnapshot> {
+        // symbol.c:dso__find_kallsyms (2143-2188) chooses the root proc source
+        // before plain cached kallsyms. Pin provenance, not per-address hits.
+        match self.native_source.get_or_init(|| {
+            if self.live_kallsyms_snapshot().is_some() {
+                Some(NativeSourceKind::Live)
+            } else {
+                self.cached_native_source()
+                    .map(|_| NativeSourceKind::Cached)
+            }
+        }) {
+            Some(NativeSourceKind::Live) => self.live_kallsyms_snapshot(),
+            Some(NativeSourceKind::Cached) => self.cached_native_source(),
+            None => None,
+        }
     }
 }
 
@@ -2186,6 +2545,7 @@ impl Kallsyms {
             addresses_by_name,
             module_indexes: FxHashMap::default(),
             physical: None,
+            native: None,
         })
     }
 
@@ -2215,6 +2575,7 @@ impl Kallsyms {
             addresses_by_name,
             module_indexes: FxHashMap::default(),
             physical: None,
+            native: None,
         };
         result.build_module_indexes();
         Ok(result)
@@ -2247,6 +2608,7 @@ impl Kallsyms {
             addresses_by_name,
             module_indexes: FxHashMap::default(),
             physical: None,
+            native: None,
         };
         result.build_module_indexes();
         Ok(result)
@@ -2313,28 +2675,6 @@ impl Kallsyms {
         symbols
     }
 
-    fn module_views_from_symbols<'a>(
-        symbols: impl IntoIterator<Item = BorrowedKallsymsRow<'a>>,
-    ) -> FxHashMap<String, ModuleSymbols> {
-        let mut modules = FxHashMap::<String, ModuleSymbols>::default();
-        for row in symbols {
-            let Some(module) = row.module else {
-                continue;
-            };
-            let view = match modules.raw_entry_mut().from_key(module) {
-                RawEntryMut::Occupied(entry) => entry.into_mut(),
-                RawEntryMut::Vacant(entry) => {
-                    entry.insert(module.to_owned(), ModuleSymbols::default()).1
-                }
-            };
-            // Global fixups and alias removal precede the split. Retain one
-            // name-bearing node, in the same ascending order as native perf.
-            view.index
-                .insert_ascending(row.address, row.end, Arc::from(row.name));
-        }
-        modules
-    }
-
     fn build_module_indexes(&mut self) {
         for (&address, symbol) in &self.symbols {
             let Some(module) = symbol.module.as_deref() else {
@@ -2358,26 +2698,13 @@ impl Kallsyms {
 
     #[must_use]
     pub fn load_perf_build_id_cache(debug_dir: &Path, build_id: &str) -> Option<Self> {
-        perf_build_id_kallsyms_paths(debug_dir, build_id)
-            .into_iter()
-            .filter_map(|path| std::fs::read_to_string(path).ok())
-            .find_map(|text| {
-                // perf symbol.c:1480 kallsyms__delta uses event.c:132
-                // kallsyms__get_function_start on the selected cached file,
-                // not a name index of its display symbols.
-                let rows = NativeKallsymsRows::new(&text)
-                    .flatten()
-                    .filter(|row| {
-                        perf_kallsyms_type_is_kept(char::from(row.symbol_type))
-                            && !row.name.starts_with('$')
-                    })
-                    .map(|row| (row.address, row.name));
-                let mut symbols = Self::parse_symbol_rows(rows, false).ok()?;
-                symbols.physical = Some(Arc::new(KallsymsReferenceSource::new(
-                    text.into_boxed_str(),
-                )));
-                Some(symbols)
-            })
+        let source = LiveKallsymsSnapshot::load_cache(debug_dir, build_id)?;
+        let prepared = source.prepared.into_inner().ok()??;
+        Some(Self {
+            native: Some(prepared.freeze()),
+            physical: Some(source.physical),
+            ..Self::default()
+        })
     }
 
     pub fn load_first_system_map_candidate(
@@ -2391,6 +2718,10 @@ impl Kallsyms {
 
     #[must_use]
     pub fn resolve(&self, address: u64) -> Option<String> {
+        if let Some(native) = &self.native {
+            let node = native.find(address)?;
+            return Some(self.physical.as_ref()?.source[node.name.clone()].to_owned());
+        }
         self.symbols
             .range(..=address)
             .next_back()
@@ -2402,6 +2733,9 @@ impl Kallsyms {
     /// prints the offset from the containing symbol, including `+0x0`).
     #[must_use]
     pub fn resolve_with_offset(&self, address: u64) -> Option<String> {
+        if let Some(native) = &self.native {
+            return native.resolve_with_offset(&self.physical.as_ref()?.source, address);
+        }
         self.symbols
             .range(..=address)
             .next_back()
@@ -2585,6 +2919,7 @@ where
             scratch_missing_requests: Vec::new(),
             replaced_kernel_entries: SmallVec::new(),
             kernel_cursor_hint: None,
+            retained_sample_ip: None,
             preprocessed_kernel_modules: FxHashSet::default(),
         }
     }
@@ -2593,7 +2928,11 @@ where
         self.resolver.requires_kernel_cursor_order()
     }
 
-    pub(crate) fn preprocess_sample_ip(&mut self, mapping: &ResolvedMappingRef<'_>) {
+    pub(crate) fn preprocess_sample_ip(
+        &mut self,
+        mapping: &ResolvedMappingRef<'_>,
+        retain_cursor: bool,
+    ) {
         // map.c:map__load and symbol.c:dso__load retain a module's first load,
         // including failures. Replay source IDs distinguish same-path DSOs.
         if (is_kernel_module_symbol_path_str(mapping.path)
@@ -2604,7 +2943,23 @@ where
         {
             return;
         }
-        self.resolver.preprocess_sample_ip(mapping);
+        if retain_cursor {
+            self.retained_sample_ip =
+                self.resolver
+                    .preprocess_sample_ip_with_cursor(mapping)
+                    .map(|frames| {
+                        (
+                            mapping_frame_key(mapping),
+                            CachedMappingFrames::from_resolved(frames),
+                        )
+                    });
+        } else {
+            self.resolver.preprocess_sample_ip(mapping);
+        }
+    }
+
+    pub(crate) fn has_retained_sample_ip(&self) -> bool {
+        self.retained_sample_ip.is_some()
     }
 
     pub(crate) fn finish_kernel_cursor(&mut self) {
@@ -2630,6 +2985,7 @@ where
     }
 
     pub(crate) fn finish_kernel_sample(&mut self) {
+        self.retained_sample_ip = None;
         self.kernel_cursor_hint = None;
         self.finish_kernel_cursor();
     }
@@ -2640,6 +2996,17 @@ where
         inline: bool,
     ) -> Result<&CachedMappingFrames, String> {
         let key = mapping_frame_key(mapping);
+        if self
+            .retained_sample_ip
+            .as_ref()
+            .is_some_and(|(event_key, _)| *event_key == key)
+        {
+            return self
+                .retained_sample_ip
+                .as_ref()
+                .map(|(_, frames)| frames)
+                .ok_or_else(|| "retained event cursor missing".to_owned());
+        }
         if let Some((previous, object)) = self.kernel_cursor_hint {
             if previous.symbol_source_id == key.symbol_source_id
                 && previous.kernel_mapping_range == key.kernel_mapping_range
@@ -3086,7 +3453,7 @@ where
             cache.initialize_symbols(core.build_id);
         }
         self.kcore_symbols.get_or_init(|| {
-            // Explicit/cached sources retain their original mapping identity.
+            // An ordinary plain cache must not suppress matching live kcore.
             if self.kallsyms_ref().is_some() || self.kernel_elf_ref().is_some() {
                 return None;
             }
@@ -3096,6 +3463,32 @@ where
             }
             let arch = self.file_kernel_cache.as_ref()?.arch()?;
             kcore::KcoreSymbols::load(table, arch, kallsyms_path, self.live_kallsyms_snapshot()?)
+        });
+    }
+
+    fn initialize_kernel_mapping(&self, table: &MmapTable, mapping: &ResolvedMappingRef<'_>) {
+        self.initialize_kernel_maps(table);
+        if !mapping.path.starts_with("[kernel.kallsyms]") {
+            return;
+        }
+        let mut load = self
+            .ordinary_kernel_load
+            .lock()
+            .expect("kernel DSO load lock");
+        if load.core_loaded || load.context.is_some() {
+            return;
+        }
+        let modules = table
+            .host_kernel_mappings()
+            .filter_map(|module| {
+                let name = module.module_name?;
+                Some(name.to_owned())
+            })
+            .collect();
+        load.context = Some(CoreLoadContext {
+            range: Some((mapping.start, mapping.end)),
+            modules: Some(modules),
+            loaded_modules: load.modules_loaded_before_core.clone(),
         });
     }
 
@@ -3127,9 +3520,9 @@ where
             }
         } else if is_kernel_symbol_path(Path::new(mapping.path)) {
             if let Some(symbols) = self.kcore_symbols_ref() {
-                symbols.activate(false);
+                self.activate_kcore(symbols, false);
             } else if self.kallsyms_ref().is_none() && self.kernel_elf_ref().is_none() {
-                self.live_kallsyms_ref();
+                self.complete_native_source(&symbol_request_from_mapping_ref(mapping));
             }
             self.ordinary_kernel_load
                 .lock()
@@ -3137,6 +3530,47 @@ where
                 .core_loaded = true;
         }
     }
+    fn preprocess_sample_ip_with_cursor(
+        &self,
+        mapping: &ResolvedMappingRef<'_>,
+    ) -> Option<ResolvedSymbolFrames> {
+        let main = is_kernel_symbol_path(Path::new(mapping.path))
+            && !is_kernel_module_symbol_path_str(mapping.path);
+        // Peek only an already-selected source. A usable primary ELF must
+        // not prepare an ignored ordinary source just to check readiness.
+        let was_ready = main
+            && self.native_source.get().is_some()
+            && self
+                .selected_native_source()
+                .is_some_and(|source| source.ordinary.get().is_some());
+        self.preprocess_sample_ip(mapping);
+        if !main || was_ready || self.kcore_symbols_ref().is_some() || self.kallsyms_ref().is_some()
+        {
+            return None;
+        }
+        let request = symbol_request_from_mapping_ref(mapping);
+        if self
+            .kernel_object_symbol_request(
+                &request,
+                &mut self
+                    .address_cache
+                    .lock()
+                    .expect("object address cache lock"),
+            )
+            .is_some()
+        {
+            return None;
+        }
+        let source = self.complete_native_source(&request)?;
+        source.kernel_map_range(request.kernel_relocation.as_ref())?;
+        // perf event.c:737-745 retains al->map across map__load. Its no-cursor
+        // evsel_fprintf.c:229-251 branch prints that selected map, even when
+        // symbol.c:2252-2263 has just fixed MAIN's bounds around another IP.
+        let mut frames = self.resolve_kernel_source(&request)?;
+        frames.kernel_dso = SymbolDsoName::KernelKallsyms;
+        Some(frames)
+    }
+
     fn selected_object_module_metadata(
         &self,
         path: &Path,
@@ -3218,7 +3652,7 @@ where
                 .unwrap_or(request.relative_address);
             if is_kernel_symbol_request(request)
                 && let Some(symbols) = self.kcore_symbols_ref()
-                && symbols.contains(kernel_address)
+                && (symbols.contains(kernel_address) || symbols.is_active())
             {
                 let module = is_kernel_module_request(request);
                 if module
@@ -3233,7 +3667,7 @@ where
                     } else {
                         self.finish_module_object_load(request, object_request.path());
                     }
-                } else if symbols.activate(module) {
+                } else if symbols.contains(kernel_address) && self.activate_kcore(symbols, module) {
                     resolved[index] = symbols.resolve(kernel_address);
                 }
             } else if is_kernel_module_request(request) {
@@ -3386,7 +3820,7 @@ where
                 .unwrap_or(request.relative_address);
             if is_kernel_symbol_request(request)
                 && let Some(symbols) = self.kcore_symbols_ref()
-                && symbols.contains(kernel_address)
+                && (symbols.contains(kernel_address) || symbols.is_active())
             {
                 let module = is_kernel_module_request(request);
                 if module
@@ -3402,10 +3836,9 @@ where
                         self.finish_module_object_load(request, object_request.path());
                         resolved[index].source_state = SymbolSourceState::KernelObjectMapReplaced;
                     }
-                } else if symbols.activate(module) {
-                    let frames = symbols.resolve(kernel_address).into_iter().collect();
-                    resolved[index] = ResolvedSymbolFrames::from_frames(frames);
-                    resolved[index].kernel_dso = SymbolDsoName::KernelKallsyms;
+                } else if !symbols.contains(kernel_address) || self.activate_kcore(symbols, module)
+                {
+                    resolved[index] = Self::kcore_frames(symbols, kernel_address);
                 } else {
                     resolved[index].source_state = SymbolSourceState::KernelMapReplaced;
                 }
@@ -3547,6 +3980,7 @@ where
 
     fn finish_module_object_load(&self, module: &SymbolRequest, selected: &Path) {
         if let Some(symbols) = self.kcore_symbols_ref() {
+            let was_active = symbols.is_active();
             let metadata = self
                 .object_resolver
                 .selected_object_module_metadata(selected, module);
@@ -3554,6 +3988,9 @@ where
                 &module.path,
                 metadata.as_deref().map_or(&[], |metadata| &metadata.maps),
             );
+            if !was_active && symbols.is_active() && !symbols.is_rejected() {
+                self.release_kcore_preparation();
+            }
         }
     }
 
@@ -3848,51 +4285,42 @@ where
         ))
     }
 
-    fn live_kallsyms_ref(&self) -> Option<&Kallsyms> {
-        self.live_kallsyms
-            .as_ref()
-            .or_else(|| self.live_kallsyms_snapshot()?.core.as_ref())
-    }
-
     fn live_kallsyms_snapshot(&self) -> Option<&LiveKallsymsSnapshot> {
         self.live_kallsyms_cache
-            .get_or_init(|| {
-                let text = std::fs::read_to_string(self.live_kallsyms_path.as_ref()?)
-                    .ok()?
-                    .into_boxed_str();
-                // perf symbol.c:__dso__load_kallsyms (1494-1523) reads and
-                // splits the complete tree during core loading, not during
-                // each module's later first query. Both views own one snapshot.
-                let mut core = Kallsyms::default();
-                let rows = Kallsyms::parse_global_kallsyms(&text);
-                let mut names = FxHashMap::<&str, Arc<str>>::default();
-                for row in rows.iter().filter(|row| row.module.is_none()) {
-                    let name =
-                        Arc::clone(names.entry(row.name).or_insert_with(|| Arc::from(row.name)));
-                    core.symbols.insert(
-                        row.address,
-                        KallsymsSymbol {
-                            name,
-                            end: Some(row.end),
-                            module: None,
-                        },
-                    );
-                }
-                drop(names);
-                let modules = Kallsyms::module_views_from_symbols(rows);
-                Some(LiveKallsymsSnapshot {
-                    core: (!core.symbols.is_empty()).then_some(core),
-                    modules,
-                    physical: KallsymsReferenceSource::new(text),
-                })
-            })
+            .get_or_init(|| LiveKallsymsSnapshot::load(self.live_kallsyms_path.as_deref()?))
             .as_ref()
+    }
+
+    fn complete_native_source(&self, request: &SymbolRequest) -> Option<&LiveKallsymsSnapshot> {
+        if self
+            .kcore_symbols_ref()
+            .is_some_and(kcore::KcoreSymbols::is_active)
+        {
+            return None;
+        }
+        let source = self.selected_native_source()?;
+        if source.ordinary.get().is_none() {
+            let load = self
+                .ordinary_kernel_load
+                .lock()
+                .expect("kernel DSO load lock");
+            let scalar = CoreLoadContext {
+                range: request.kernel_mapping_range,
+                modules: None,
+                loaded_modules: load.modules_loaded_before_core.clone(),
+            };
+            source.ordinary(Some(load.context.as_ref().unwrap_or(&scalar)));
+        }
+        Some(source)
     }
 
     fn live_module_kallsyms_for_name(&self, module_name: &str) -> Option<&ModuleSymbols> {
         // symbol.c:maps__split_kallsyms (914) looks up the bound DSO short
         // name. Do not reinterpret it as a raw MMAP filename here.
-        self.live_kallsyms_snapshot()?.modules.get(module_name)
+        self.selected_native_source()?
+            .ordinary(None)
+            .modules
+            .get(module_name)
     }
 
     fn system_map_kallsyms_ref(&self) -> Option<&Kallsyms> {
@@ -3914,6 +4342,25 @@ where
             .filter(|symbols| !symbols.is_rejected())
     }
 
+    fn activate_kcore(&self, symbols: &kcore::KcoreSymbols, module: bool) -> bool {
+        let was_active = symbols.is_active();
+        let result = symbols.activate(module);
+        if !was_active {
+            self.release_kcore_preparation();
+        }
+        result
+    }
+
+    fn release_kcore_preparation(&self) {
+        if let Some(source) = self.live_kallsyms_cache.get().and_then(Option::as_ref) {
+            source
+                .prepared
+                .lock()
+                .expect("native preparation lock")
+                .take();
+        }
+    }
+
     fn resolve_kernel_frames(&self, request: &SymbolRequest) -> Option<ResolvedSymbolFrames> {
         let frames = self.resolve_kernel_source(request);
         if self.ordinary_kernel_address_is_unmapped(request) {
@@ -3926,14 +4373,13 @@ where
     }
 
     fn ordinary_kernel_address_is_unmapped(&self, request: &SymbolRequest) -> bool {
-        // Only ordinary live kallsyms applies symbol.c:dso__load_kernel_sym's
-        // map fixup here. Explicit objects and validated kcore own other maps.
-        if self.kallsyms_ref().is_some() || self.kernel_elf_ref().is_some() {
+        // Apply symbol.c:2252-2264 to the completed selected source, not an
+        // ELF candidate pathname which may have failed build-ID validation.
+        if self.kallsyms_ref().is_some() || self.kcore_symbols_ref().is_some() {
             return false;
         }
-        self.live_kallsyms_cache
-            .get()
-            .and_then(Option::as_ref)
+        self.selected_native_source()
+            .filter(|source| source.ordinary.get().is_some())
             .and_then(|snapshot| snapshot.kernel_map_range(request.kernel_relocation.as_ref()))
             .is_some_and(|(start, end)| {
                 request.relative_address < start || request.relative_address >= end
@@ -4011,8 +4457,32 @@ where
             .unwrap_or(KernelElfAddressDecision::Unmapped)
     }
 
+    fn kcore_frames(symbols: &kcore::KcoreSymbols, address: u64) -> ResolvedSymbolFrames {
+        // symbol.c:1484-1485 retires the old maps on activation; an outside
+        // lookup cannot resurrect ordinary preparation or its mapping label.
+        if !symbols.contains(address) {
+            return ResolvedSymbolFrames {
+                kernel_dso: SymbolDsoName::Unmapped,
+                ..ResolvedSymbolFrames::default()
+            };
+        }
+        ResolvedSymbolFrames {
+            kernel_dso: SymbolDsoName::KernelKallsyms,
+            ..ResolvedSymbolFrames::from_frames(symbols.resolve(address).into_iter().collect())
+        }
+    }
+
     // None means no source loaded; an empty frame result is a selected-source miss.
     fn resolve_kernel_source(&self, request: &SymbolRequest) -> Option<ResolvedSymbolFrames> {
+        if let Some(symbols) = self
+            .kcore_symbols_ref()
+            .filter(|symbols| symbols.is_active())
+        {
+            let address = request
+                .kernel_module_address
+                .unwrap_or(request.relative_address);
+            return Some(Self::kcore_frames(symbols, address));
+        }
         let symbol = if is_kernel_module_request(request) {
             let module_name = kcore::module_dso_short_name(request.path.to_str()?);
             {
@@ -4029,12 +4499,29 @@ where
                 if load
                     .modules_loaded_before_core
                     .contains(module_name.as_ref())
+                    && (self.kallsyms.is_some() || self.live_kallsyms.is_some())
                 {
                     return None;
                 }
             }
             self.kallsyms_ref()
                 .map(|kallsyms| resolve_module_kallsyms(kallsyms, request))
+                .or_else(|| {
+                    self.selected_native_source().map(|source| {
+                        source
+                            .ordinary(None)
+                            .modules
+                            .get(module_name.as_ref())
+                            .and_then(|symbols| {
+                                symbols.resolve_module_with_offset_in_range(
+                                    request
+                                        .kernel_module_address
+                                        .unwrap_or(request.relative_address),
+                                    request.kernel_mapping_range,
+                                )
+                            })
+                    })
+                })
                 .or_else(|| {
                     // tools/perf/util/symbol.c dso__find_kallsyms() does not
                     // reject /proc/kallsyms for kernel/module maps merely
@@ -4069,8 +4556,12 @@ where
                     if let Some(kallsyms) = self.live_kallsyms.as_ref() {
                         Some(resolve_kernel_kallsyms(kallsyms, request))
                     } else {
-                        let snapshot = self.live_kallsyms_snapshot()?;
-                        snapshot.core.as_ref()?;
+                        let snapshot = self.complete_native_source(request)?;
+                        if self.native_source.get() == Some(&Some(NativeSourceKind::Live))
+                            && snapshot.ordinary(None).core.nodes.is_empty()
+                        {
+                            return None;
+                        }
                         Some(snapshot.resolve_core(request))
                     }
                 })
@@ -8415,6 +8906,116 @@ mod tests {
     }
 
     #[test]
+    fn retained_sample_ip_cursor_never_enters_address_cache_or_other_sessions() {
+        const CORE: u64 = 0xffff_ffff_8100_0000;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("kallsyms");
+        std::fs::write(
+            &source,
+            "ffffffff81000000 T _stext\nffffffff81000010 T last\n",
+        )
+        .unwrap();
+        let resolver =
+            super::PerfSymbolResolver::from_object_resolver(super::RustAddr2lineResolver::new())
+                .with_system_kallsyms_from_path(&source)
+                .with_system_map_candidates([])
+                .with_live_kernel_notes_path(root.path().join("missing-notes"));
+        let mut mapping = test_mapping_ref("[kernel.kallsyms]_stext", CORE - 0x10);
+        mapping.start = CORE - 0x1000;
+        mapping.end = CORE + 0x3000;
+        mapping.kernel_relocation = Some(super::KernelRelocation {
+            reference_symbol: "_stext".into(),
+            recorded_reference_address: CORE,
+        });
+        let mut cache = SymbolFrameCache::new(&resolver);
+        cache.preprocess_sample_ip(&mapping, true);
+        assert!(cache.has_retained_sample_ip());
+        for inline in [false, true] {
+            assert_eq!(
+                cache
+                    .resolve_script_mapping_ref(&mapping, inline)
+                    .unwrap()
+                    .kernel_dso,
+                super::SymbolDsoName::KernelKallsyms
+            );
+        }
+        assert!(cache.resolved_base_by_mapping.frames.is_empty());
+        assert!(cache.resolved_by_mapping.frames.is_empty());
+        // A scalar or recorded-chain lookup at the very same IP is fresh,
+        // not this event's already-selected al->map.
+        let request = super::symbol_request_from_mapping_ref(&mapping);
+        assert_eq!(
+            resolver
+                .resolve_frame_batch_with_metadata(&[request])
+                .unwrap()[0]
+                .kernel_dso,
+            super::SymbolDsoName::Unmapped
+        );
+        let mut other_thread = SymbolFrameCache::new(&resolver);
+        other_thread.preprocess_sample_ip(&mapping, true);
+        assert!(!other_thread.has_retained_sample_ip());
+        assert_eq!(
+            other_thread
+                .resolve_script_mapping_ref(&mapping, false)
+                .unwrap()
+                .kernel_dso,
+            super::SymbolDsoName::Unmapped
+        );
+        cache.finish_kernel_sample();
+        assert!(!cache.has_retained_sample_ip());
+        cache.preprocess_sample_ip(&mapping, true);
+        assert!(!cache.has_retained_sample_ip());
+        assert_eq!(
+            cache
+                .resolve_script_mapping_ref(&mapping, false)
+                .unwrap()
+                .kernel_dso,
+            super::SymbolDsoName::Unmapped
+        );
+    }
+
+    #[test]
+    fn retained_sample_ip_cursor_requires_a_completed_nonempty_ordinary_map() {
+        const CORE: u64 = 0xffff_ffff_8100_0000;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("kallsyms");
+        let mut mapping = test_mapping_ref("[kernel.kallsyms]_stext", CORE - 0x10);
+        mapping.start = CORE - 0x1000;
+        mapping.end = CORE + 0x3000;
+        mapping.kernel_relocation = Some(super::KernelRelocation {
+            reference_symbol: "_stext".into(),
+            recorded_reference_address: CORE,
+        });
+        for rows in [
+            None,
+            Some("0000000000000000 A _stext\n0000000000000010 R excluded\n"),
+        ] {
+            if let Some(rows) = rows {
+                std::fs::write(&source, rows).unwrap();
+            }
+            let resolver = super::PerfSymbolResolver::from_object_resolver(
+                super::RustAddr2lineResolver::new(),
+            )
+            .with_system_kallsyms_from_path(&source)
+            .with_system_map_candidates([])
+            .with_live_kernel_notes_path(root.path().join("missing-notes"));
+            let mut cache = SymbolFrameCache::new(&resolver);
+            cache.preprocess_sample_ip(&mapping, true);
+            assert!(
+                !cache.has_retained_sample_ip(),
+                "missing/filtered source must not rename MAIN"
+            );
+            assert_eq!(
+                cache
+                    .resolve_script_mapping_ref(&mapping, false)
+                    .unwrap()
+                    .kernel_dso,
+                super::SymbolDsoName::Mapping
+            );
+        }
+    }
+
+    #[test]
     fn module_event_ip_preprocessing_loads_each_dso_once_without_skipping_core_lookups() {
         // perf map.c:map__load returns immediately once dso__loaded is set;
         // symbol.c:dso__load sets it even when loading fails. A new source ID
@@ -8437,19 +9038,19 @@ mod tests {
         let mut module = test_mapping_ref("[a]", 0x10);
         module.symbol_source_id = 7;
         for _ in 0..100 {
-            cache.preprocess_sample_ip(&module);
+            cache.preprocess_sample_ip(&module, false);
         }
         assert_eq!(resolver.calls.get(), 1);
         module.relative_address = 0x20;
-        cache.preprocess_sample_ip(&module);
+        cache.preprocess_sample_ip(&module, false);
         assert_eq!(resolver.calls.get(), 1);
         module.symbol_source_id = 8;
-        cache.preprocess_sample_ip(&module);
+        cache.preprocess_sample_ip(&module, false);
         assert_eq!(resolver.calls.get(), 2);
         let mut core = test_mapping_ref("[kernel.kallsyms]", 0x10);
         core.symbol_source_id = 9;
-        cache.preprocess_sample_ip(&core);
-        cache.preprocess_sample_ip(&core);
+        cache.preprocess_sample_ip(&core, false);
+        cache.preprocess_sample_ip(&core, false);
         assert_eq!(resolver.calls.get(), 4);
     }
 
@@ -11918,11 +12519,12 @@ mod tests {
             .with_system_kallsyms_from_path(&path);
         let snapshot = resolver.live_kallsyms_snapshot().unwrap();
         let records: usize = snapshot
+            .ordinary(None)
             .modules
             .values()
             .map(|view| view.index.nodes.len())
             .sum();
-        assert_eq!(snapshot.modules.len(), 2);
+        assert_eq!(snapshot.ordinary(None).modules.len(), 2);
         assert_eq!(
             records, 3,
             "one retained address/end/name record per survivor"
@@ -11937,13 +12539,13 @@ mod tests {
         let snapshot = resolver.live_kallsyms_snapshot().unwrap();
         // ModuleSymbols has only the name-bearing index: no row namespace,
         // nested module dictionary, or eager exact-name index is retained.
-        for view in snapshot.modules.values() {
+        for view in snapshot.ordinary(None).modules.values() {
             assert_eq!(
                 std::mem::size_of_val(view),
                 std::mem::size_of_val(&view.index)
             );
         }
-        let namespaces = snapshot.modules.len();
+        let namespaces = snapshot.ordinary(None).modules.len();
         assert_eq!(
             namespaces, 2,
             "only the two outer module-map keys own namespaces"
@@ -11957,6 +12559,7 @@ mod tests {
             .with_system_kallsyms_from_path(&path);
         let snapshot = resolver.live_kallsyms_snapshot().unwrap();
         let owners: Vec<_> = snapshot
+            .ordinary(None)
             .modules
             .values()
             .flat_map(|view| {
@@ -12008,8 +12611,12 @@ mod tests {
     }
 
     fn assert_space_suffix_core_rows(text: &str, expected_count: usize) {
+        assert_space_suffix_core_row_counts(text, expected_count, expected_count);
+    }
+
+    fn assert_space_suffix_core_row_counts(text: &str, utility_count: usize, native_count: usize) {
         let rows = Kallsyms::parse_module_symbols(text);
-        assert_eq!(rows.len(), expected_count, "{text:?}");
+        assert_eq!(rows.len(), utility_count, "{text:?}");
         assert!(rows.iter().all(|row| row.module.is_none()), "{text:?}");
         assert!(rows.iter().all(|row| row.name == row.full_name));
         assert!(Kallsyms::parse_modules(text).is_err());
@@ -12020,15 +12627,31 @@ mod tests {
         let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
             .with_system_kallsyms_from_path(&path);
         let snapshot = resolver.live_kallsyms_snapshot().unwrap();
-        assert!(snapshot.modules.is_empty());
-        assert_eq!(
-            snapshot.core.as_ref().map_or(0, |core| core.symbols.len()),
-            expected_count
-        );
+        assert!(snapshot.ordinary(None).modules.is_empty());
+        assert_eq!(snapshot.ordinary(None).core.nodes.len(), native_count);
         for row in rows {
-            let symbol = &snapshot.core.as_ref().unwrap().symbols[&row.address];
-            assert_eq!(symbol.name.as_ref(), row.full_name);
-            assert_eq!(symbol.end, Some(row.end));
+            let symbol = snapshot
+                .ordinary(None)
+                .core
+                .nodes
+                .iter()
+                .find(|node| node.address == row.address)
+                .unwrap();
+            assert_eq!(
+                &snapshot.physical.source[symbol.name.clone()],
+                row.full_name
+            );
+            assert_eq!(symbol.end, row.end);
+        }
+        if native_count != utility_count {
+            let node = snapshot
+                .ordinary(None)
+                .core
+                .nodes
+                .iter()
+                .find(|node| node.address == 0)
+                .unwrap();
+            assert_eq!(&snapshot.physical.source[node.name.clone()], "zero [alpha]");
         }
     }
 
@@ -12109,10 +12732,13 @@ mod tests {
         }
         for (view, end) in [(alpha, 0x3000), (beta, 0x4000), (gamma, 0x6000)] {
             assert_eq!(view.resolve_module_with_offset(end), None);
-            for name in ["accepted_core", "alias_first", "zero", "excluded"] {
+            for name in ["accepted_core", "alias_first", "excluded"] {
                 assert_eq!(view.address_of(name), None);
             }
         }
+        assert_eq!(alpha.address_of("zero"), Some(0));
+        assert_eq!(beta.address_of("zero"), None);
+        assert_eq!(gamma.address_of("zero"), None);
         assert_eq!(alpha.address_of("shared"), Some(0x1020));
         assert_eq!(beta.address_of("shared"), Some(0x2010));
         assert_eq!(gamma.address_of("shared"), None);
@@ -12289,7 +12915,7 @@ mod tests {
     }
 
     #[test]
-    fn live_kallsyms_relocation_keeps_the_first_eligible_zero_reference() {
+    fn live_kallsyms_relocation_resolves_zero_display_symbol_from_first_reference() {
         // perf symbol.c:kallsyms__delta uses event.c:find_func_symbol_cb,
         // which stops at the first eligible physical match, including zero.
         let (_root, path) = live_module_kallsyms_fixture(
@@ -12306,12 +12932,15 @@ mod tests {
             reference_symbol: "reference".into(),
             recorded_reference_address: 0x2000,
         });
-        assert_eq!(snapshot.resolve_core(&request), None);
+        assert_eq!(
+            snapshot.resolve_core(&request),
+            Some("reference+0x10".into())
+        );
     }
 
     #[test]
     fn kallsyms_space_suffix_live_tree_contains_raw_core_names() {
-        assert_space_suffix_core_rows(MULTI_MODULE_KALLSYMS, 11);
+        assert_space_suffix_core_row_counts(MULTI_MODULE_KALLSYMS, 11, 12);
         assert_space_suffix_core_rows("0000000000001000 T replacement [alpha]\n", 1);
     }
 
@@ -12346,7 +12975,7 @@ mod tests {
                 super::MODULE_KALLSYMS_SYMBOL_INSERTIONS.with(Cell::get),
                 super::MODULE_KALLSYMS_END_FIXUP_PASSES.with(Cell::get),
             ),
-            (1, TAB_MULTI_MODULE_KALLSYMS.lines().count(), 12, 1),
+            (1, TAB_MULTI_MODULE_KALLSYMS.lines().count(), 13, 1),
             "one global build, one visit per physical row, one insertion per accepted row, one end-fixup pass"
         );
     }
@@ -12377,7 +13006,7 @@ mod tests {
         assert!(!path.with_file_name("modules").exists());
         let snapshot = resolver.live_kallsyms_snapshot().unwrap();
         assert_eq!(
-            snapshot.modules["[bpf]"]
+            snapshot.ordinary(None).modules["[bpf]"]
                 .resolve_module_with_offset(0x5008)
                 .as_deref(),
             Some("bpf_prog_abc+0x8"),
@@ -12405,7 +13034,7 @@ mod tests {
 
     #[test]
     fn kallsyms_space_suffix_aliases_do_not_create_module_views() {
-        assert_space_suffix_core_rows(MULTI_MODULE_KALLSYMS, 11);
+        assert_space_suffix_core_row_counts(MULTI_MODULE_KALLSYMS, 11, 12);
     }
 
     #[test]
@@ -12419,7 +13048,7 @@ mod tests {
 
     #[test]
     fn kallsyms_space_suffix_replacement_is_core() {
-        assert_space_suffix_core_rows(MULTI_MODULE_KALLSYMS, 11);
+        assert_space_suffix_core_row_counts(MULTI_MODULE_KALLSYMS, 11, 12);
         assert_space_suffix_core_rows("0000000000001000 T replacement [alpha]\n", 1);
     }
 
@@ -12640,20 +13269,17 @@ mod tests {
         let (_root, path) = live_module_kallsyms_fixture("1000 T retained\n2000 T next\n");
         let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
             .with_system_kallsyms_from_path(&path);
-        let symbols = resolver
-            .live_kallsyms_snapshot()
-            .unwrap()
-            .core
-            .as_ref()
-            .unwrap();
-        assert_eq!(symbols.symbols[&0x1000].name.as_ref(), "retained");
+        let snapshot = resolver.live_kallsyms_snapshot().unwrap();
+        let symbols = &snapshot.ordinary(None).core;
+        let name = symbols.find(0x1000).unwrap().name.clone();
+        assert_eq!(&snapshot.physical.source[name], "retained");
         assert_eq!(
-            symbols.resolve_with_offset(0x1001),
+            symbols.resolve_with_offset(&snapshot.physical.source, 0x1001),
             Some("retained+0x1".into())
         );
         // perf symbol.c:kallsyms__delta requests one physical reference via
         // event.c:get_function_start, not a second index of every input name.
-        assert!(symbols.addresses_by_name.is_empty());
+        assert!(snapshot.physical.references.lock().unwrap().is_empty());
         assert_eq!(
             resolver
                 .live_kallsyms_snapshot()
@@ -12674,23 +13300,13 @@ mod tests {
         let (_root, path) = live_module_kallsyms_fixture(&text);
         let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
             .with_system_kallsyms_from_path(&path);
-        let core = resolver
-            .live_kallsyms_snapshot()
-            .unwrap()
-            .core
-            .as_ref()
-            .unwrap();
-        assert_eq!(core.symbols.len(), 2);
+        let snapshot = resolver.live_kallsyms_snapshot().unwrap();
+        let core = &snapshot.ordinary(None).core;
+        assert_eq!(core.nodes.len(), 2);
         assert_eq!(
-            core.resolve_with_offset(0x1001),
+            core.resolve_with_offset(&snapshot.physical.source, 0x1001),
             Some("retained+0x1".into())
         );
-        assert!(
-            core.addresses_by_name.is_empty(),
-            "{} owned reference names",
-            core.addresses_by_name.len()
-        );
-        let snapshot = resolver.live_kallsyms_snapshot().unwrap();
         assert!(snapshot.physical.references.lock().unwrap().is_empty());
         assert_eq!(snapshot.reference_address("reference_4095"), Some(0x3fff));
         assert_eq!(snapshot.physical.references.lock().unwrap().len(), 1);
@@ -12779,18 +13395,36 @@ mod tests {
             .with_system_kallsyms_from_path(&path);
         let snapshot = resolver.live_kallsyms_snapshot().unwrap();
         std::fs::remove_file(path).unwrap();
-        let core = snapshot.core.as_ref().unwrap();
+        let core = &snapshot.ordinary(None).core;
         assert_eq!(snapshot.reference_address("repeat"), Some(0x2000));
         assert_eq!(snapshot.reference_address("losing"), Some(0x3000));
         assert_eq!(snapshot.reference_address("absolute"), Some(0x4000));
         assert_eq!(snapshot.reference_address("data"), None);
-        assert_eq!(core.symbols[&0x3000].name.as_ref(), "winner");
-        assert!(!core.symbols.contains_key(&0x4000));
-        assert_eq!(core.symbols[&0x5000].name.as_ref(), "data");
-        assert!(Arc::ptr_eq(
-            &core.symbols[&0x1000].name,
-            &core.symbols[&0x2000].name
-        ));
+        for (address, name) in [
+            (0x3000, "winner"),
+            (0x5000, "data"),
+            (0x1000, "repeat"),
+            (0x2000, "repeat"),
+        ] {
+            let span = core
+                .nodes
+                .iter()
+                .find(|node| node.address == address)
+                .unwrap()
+                .name
+                .clone();
+            let borrowed = &snapshot.physical.source[span];
+            assert_eq!(borrowed, name);
+            assert!(
+                snapshot
+                    .physical
+                    .source
+                    .as_bytes()
+                    .as_ptr_range()
+                    .contains(&borrowed.as_ptr())
+            );
+        }
+        assert!(core.nodes.iter().all(|node| node.address != 0x4000));
     }
 
     #[test]
@@ -12883,7 +13517,7 @@ mod tests {
         // display callback accepts D but not A. Both policies remain distinct.
         std::fs::write(&path, "1000 A reference\n2000 T reference\n").unwrap();
         let third = Kallsyms::load_perf_build_id_cache(root.path(), "fixture").unwrap();
-        assert_ne!(first.symbols, third.symbols);
+        assert_ne!(first.native, third.native);
         assert_eq!(third.address_of("reference"), Some(0x1000));
         assert_ne!(first, third);
 
@@ -12893,7 +13527,7 @@ mod tests {
         let source_copy = Kallsyms::load_perf_build_id_cache(root.path(), "fixture").unwrap();
         std::fs::write(&path, "2000 A reference\n3000 T reference\n").unwrap();
         let source_other = Kallsyms::load_perf_build_id_cache(root.path(), "fixture").unwrap();
-        assert_eq!(source_first.symbols, source_other.symbols);
+        assert_eq!(source_first.native, source_other.native);
         assert_eq!(source_first.address_of("reference"), Some(0x1000));
         assert_eq!(source_other.address_of("reference"), Some(0x2000));
         assert_ne!(source_first, source_other);

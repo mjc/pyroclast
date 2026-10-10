@@ -69,26 +69,19 @@ impl KcoreSymbols {
         }
         // symbol.c:maps__split_kallsyms_for_kcore shares the globally fixed
         // symbol tree across replacement maps, stripping module suffixes.
-        let symbols: BTreeMap<_, _> = snapshot
-            .core
-            .iter()
-            .flat_map(|symbols| &symbols.symbols)
-            .filter_map(|(&address, symbol)| Some((address, symbol.end?, &symbol.name)))
-            .chain(
-                snapshot
-                    .modules
-                    .values()
-                    .flat_map(super::ModuleSymbols::rows),
-            )
-            .filter_map(|(address, symbol_end, name)| {
+        let preparation = snapshot.prepared.lock().expect("native preparation lock");
+        let symbols: BTreeMap<_, _> = preparation
+            .as_ref()?
+            .survivor_rows(&snapshot.physical.source)
+            .filter_map(|row| {
                 let (_, end) = ranges
                     .iter()
-                    .find(|&&(start, end)| start <= address && address < end)?;
+                    .find(|&&(start, end)| start <= row.address && row.address < end)?;
                 Some((
-                    address,
+                    row.address,
                     KallsymsSymbol {
-                        name: std::sync::Arc::clone(name),
-                        end: Some(symbol_end.min(*end)),
+                        name: std::sync::Arc::from(row.name),
+                        end: Some(row.end.min(*end)),
                         module: None,
                     },
                 ))
@@ -287,12 +280,13 @@ mod tests {
         bytes
     }
 
-    #[test]
-    fn dense_module_rows_keep_global_ends_and_share_names_when_kcore_clips() {
+    fn native_preparation_fixture() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        crate::perfdata::mappings::MmapTable,
+    ) {
         use crate::perfdata::mappings::MmapTable;
         use crate::perfdata::records::{MmapRecord, PERF_RECORD_MISC_CPUMODE_KERNEL};
-        use crate::symbols::{PerfSymbolResolver, RustAddr2lineResolver};
-        use std::sync::Arc;
 
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("kallsyms");
@@ -332,13 +326,31 @@ mod tests {
                 PERF_RECORD_MISC_CPUMODE_KERNEL,
             );
         }
+        (root, path, table)
+    }
+
+    #[test]
+    fn native_preparation_keeps_global_ends_and_survives_rejected_kcore() {
+        use crate::symbols::{PerfSymbolResolver, RustAddr2lineResolver};
+        use std::sync::Arc;
+        let (_root, path, table) = native_preparation_fixture();
+        let directory = path.parent().unwrap();
         let resolver = PerfSymbolResolver::from_object_resolver(RustAddr2lineResolver::new())
             .with_system_kallsyms_from_path(&path);
         let snapshot = resolver.live_kallsyms_snapshot().unwrap();
-        let beta = &snapshot.modules["[beta]"].index.nodes[0];
-        assert_eq!(beta.end, 0x4000);
-        assert_eq!(Arc::strong_count(&beta.payload), 1);
+        {
+            let preparation = snapshot.prepared.lock().unwrap();
+            let beta = preparation
+                .as_ref()
+                .unwrap()
+                .survivor_rows(&snapshot.physical.source)
+                .find(|row| row.name == "beta_last")
+                .unwrap();
+            assert_eq!(beta.end, 0x4000);
+        }
         let symbols = super::KcoreSymbols::load(&table, PerfArch::X86_64, &path, snapshot).unwrap();
+        assert!(snapshot.prepared.lock().unwrap().is_some());
+        assert!(snapshot.ordinary.get().is_none());
         assert_eq!(symbols.symbols.len(), 4);
         assert!(!symbols.symbols.contains_key(&0x800));
         assert!(!symbols.symbols.contains_key(&0x4000));
@@ -353,28 +365,128 @@ mod tests {
             assert_eq!(symbol.name.as_ref(), name);
             assert!(symbol.module.is_none());
         }
-        assert!(Arc::ptr_eq(&symbols.symbols[&0x3000].name, &beta.payload));
-        assert_eq!(Arc::strong_count(&beta.payload), 2);
+        let beta = &symbols.symbols[&0x3000].name;
+        assert_eq!(Arc::strong_count(beta), 1);
+        let retained = Arc::downgrade(beta);
         assert_eq!(symbols.resolve(0x34ff).as_deref(), Some("beta_last+0x4ff"));
         assert!(symbols.resolve(0x3500).is_none());
         assert!(!symbols.is_active());
+        symbols.validate_module_maps(
+            std::path::Path::new("[beta]"),
+            &[crate::symbols::KernelModuleSectionMap {
+                section: ".text".into(),
+                start: 0x3001,
+                size: 0x4ff,
+                file_offset: 0,
+                lookup_section: 1,
+            }],
+        );
+        assert!(symbols.is_rejected());
+        assert!(snapshot.prepared.lock().unwrap().is_some());
         drop(symbols);
-        assert_eq!(Arc::strong_count(&beta.payload), 1);
-        // Rejected validation must not consume or modify the frozen module view.
+        assert!(retained.upgrade().is_none());
+        // Rejected validation must not consume the prepared source rows.
         std::fs::write(
             directory.join("modules"),
             "alpha 1 0 - Live 0x1101\nbeta 1 0 - Live 0x3000\n",
         )
         .unwrap();
         assert!(super::KcoreSymbols::load(&table, PerfArch::X86_64, &path, snapshot).is_none());
+        assert!(snapshot.prepared.lock().unwrap().is_some());
+        let beta = &snapshot.ordinary(None).modules["[beta]"].index.nodes[0];
         assert_eq!(beta.end, 0x4000);
         assert_eq!(Arc::strong_count(&beta.payload), 1);
         assert_eq!(
-            snapshot.modules["[beta]"]
+            snapshot.ordinary(None).modules["[beta]"]
                 .resolve_module_with_offset(0x3fff)
                 .as_deref(),
             Some("beta_last+0xfff")
         );
+        assert!(snapshot.prepared.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn native_review_active_kcore_scalar_miss_keeps_preparation_released() {
+        assert_active_kcore_miss_keeps_preparation_released(0);
+    }
+
+    #[test]
+    fn native_review_active_kcore_base_miss_keeps_preparation_released() {
+        assert_active_kcore_miss_keeps_preparation_released(1);
+    }
+
+    #[test]
+    fn native_review_active_kcore_inline_miss_keeps_preparation_released() {
+        assert_active_kcore_miss_keeps_preparation_released(2);
+    }
+
+    fn assert_active_kcore_miss_keeps_preparation_released(route: u8) {
+        use crate::symbols::{
+            PerfSymbolResolver, RustAddr2lineResolver, SymbolDsoName, SymbolLookup, SymbolRequest,
+            SymbolResolver,
+        };
+        let (_root, path, table) = native_preparation_fixture();
+        let resolver = PerfSymbolResolver::from_object_resolver(RustAddr2lineResolver::new())
+            .with_system_kallsyms_from_path(&path);
+        let source = resolver.live_kallsyms_snapshot().unwrap();
+        let symbols = super::KcoreSymbols::load(&table, PerfArch::X86_64, &path, source).unwrap();
+        assert!(resolver.kcore_symbols.set(Some(symbols)).is_ok());
+        let mut request = SymbolRequest {
+            path: "[kernel.kallsyms]".into(),
+            relative_address: 0x1000,
+            symbol_lookup: SymbolLookup::VirtualAddress,
+            addr2line_address: None,
+            kernel_module_address: None,
+            kernel_mapping_range: Some((0x1000, 0x4000)),
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        };
+        assert_eq!(
+            resolver
+                .resolve_batch(std::slice::from_ref(&request))
+                .unwrap(),
+            [Some("core+0x0".into())]
+        );
+        assert!(source.prepared.lock().unwrap().is_none());
+        request.relative_address = 0x3500;
+        if route == 0 {
+            assert_eq!(resolver.resolve_batch(&[request]).unwrap(), [None]);
+        } else {
+            let frames = if route == 1 {
+                resolver.resolve_base_frame_batch_with_metadata(&[request])
+            } else {
+                resolver.resolve_frame_batch_with_metadata(&[request])
+            }
+            .unwrap();
+            assert!(frames[0].frames.is_empty());
+            assert_eq!(frames[0].kernel_dso, SymbolDsoName::Unmapped);
+        }
+        assert!(source.prepared.lock().unwrap().is_none());
+        assert!(
+            source.ordinary.get().is_none(),
+            "active kcore cannot rebuild ordinary tables"
+        );
+    }
+
+    #[test]
+    fn native_preparation_releases_only_on_kcore_activation() {
+        use crate::symbols::{PerfSymbolResolver, RustAddr2lineResolver};
+        let (_root, path, table) = native_preparation_fixture();
+        let accepted = PerfSymbolResolver::from_object_resolver(RustAddr2lineResolver::new())
+            .with_system_kallsyms_from_path(&path);
+        let source = accepted.live_kallsyms_snapshot().unwrap();
+        let symbols = super::KcoreSymbols::load(&table, PerfArch::X86_64, &path, source).unwrap();
+        assert!(source.prepared.lock().unwrap().is_some());
+        assert!(!symbols.is_active());
+        assert!(accepted.activate_kcore(&symbols, false));
+        assert!(symbols.is_active());
+        assert!(source.prepared.lock().unwrap().is_none());
+        assert!(
+            source.ordinary.get().is_none(),
+            "no unused ordinary projection for active kcore"
+        );
+        assert_eq!(symbols.resolve(0x34ff).as_deref(), Some("beta_last+0x4ff"));
     }
 
     #[test]

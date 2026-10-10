@@ -1558,7 +1558,7 @@ impl MmapTable {
             })
             .as_deref();
         if frame.mapping.cpumode == PERF_RECORD_MISC_CPUMODE_KERNEL {
-            resolver.initialize_kernel_maps(self);
+            resolver.initialize_kernel_mapping(self, &mapping);
         }
         mapping
     }
