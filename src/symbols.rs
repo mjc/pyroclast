@@ -1117,7 +1117,7 @@ struct OrdinaryKernelLoad {
 
 struct LiveKallsymsSnapshot {
     core: Option<Kallsyms>,
-    modules: FxHashMap<String, Arc<Kallsyms>>,
+    modules: FxHashMap<String, ModuleSymbols>,
     physical: KallsymsReferenceSource,
 }
 
@@ -1259,22 +1259,23 @@ pub struct Kallsyms {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct ModuleKallsymsIndex {
-    nodes: Vec<ModuleKallsymsNode>,
+struct ModuleKallsymsIndex<P = ()> {
+    nodes: Vec<ModuleKallsymsNode<P>>,
     root: Option<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ModuleKallsymsNode {
+struct ModuleKallsymsNode<P = ()> {
     address: u64,
     end: u64,
+    payload: P,
     parent: Option<std::num::NonZeroUsize>,
     left: Option<std::num::NonZeroUsize>,
     right: Option<std::num::NonZeroUsize>,
     red: bool,
 }
 
-impl ModuleKallsymsIndex {
+impl<P> ModuleKallsymsIndex<P> {
     fn link(index: usize) -> std::num::NonZeroUsize {
         index
             .checked_add(1)
@@ -1286,7 +1287,7 @@ impl ModuleKallsymsIndex {
         link.get() - 1
     }
 
-    fn insert_ascending(&mut self, address: u64, end: u64) {
+    fn insert_ascending(&mut self, address: u64, end: u64, payload: P) {
         // symbol.c:878-991 moves ascending survivors into fresh module trees;
         // __symbols__insert:361 + tools/lib/rbtree.c:90 balance each insertion.
         // The previous row is the rightmost node, so no insertion search or
@@ -1296,6 +1297,7 @@ impl ModuleKallsymsIndex {
         self.nodes.push(ModuleKallsymsNode {
             address,
             end,
+            payload,
             parent: parent.map(Self::link),
             left: None,
             right: None,
@@ -1357,7 +1359,7 @@ impl ModuleKallsymsIndex {
         }
     }
 
-    fn find(&self, address: u64) -> Option<&ModuleKallsymsNode> {
+    fn find(&self, address: u64) -> Option<&ModuleKallsymsNode<P>> {
         // symbol.c:401 symbols__find returns the FIRST containing node in
         // the root walk, including an exact match to a zero-length symbol.
         let mut cursor = self.root;
@@ -1372,6 +1374,53 @@ impl ModuleKallsymsIndex {
             }
         }
         None
+    }
+}
+
+#[derive(Default)]
+struct ModuleSymbols {
+    index: ModuleKallsymsIndex<Arc<str>>,
+}
+
+impl ModuleSymbols {
+    fn rows(&self) -> impl Iterator<Item = (u64, u64, &Arc<str>)> {
+        self.index
+            .nodes
+            .iter()
+            .map(|node| (node.address, node.end, &node.payload))
+    }
+
+    fn resolve_module_with_offset_in_range(
+        &self,
+        address: u64,
+        range: Option<(u64, u64)>,
+    ) -> Option<String> {
+        let node = self.index.find(address)?;
+        if let Some((range_start, range_end)) = range
+            && (node.address < range_start || range_end <= address)
+        {
+            return None;
+        }
+        Some(format!("{}+0x{:x}", node.payload, address - node.address))
+    }
+
+    #[cfg(test)]
+    fn resolve_module_with_offset(&self, address: u64) -> Option<String> {
+        self.resolve_module_with_offset_in_range(address, None)
+    }
+
+    #[cfg(test)]
+    fn symbol_by_name(&self, name: &str) -> Option<&ModuleKallsymsNode<Arc<str>>> {
+        // Nodes retain ascending global survivor order, including repeated names.
+        self.index
+            .nodes
+            .iter()
+            .find(|node| node.payload.as_ref() == name)
+    }
+
+    #[cfg(test)]
+    fn address_of(&self, name: &str) -> Option<u64> {
+        self.symbol_by_name(name).map(|node| node.address)
     }
 }
 
@@ -2266,31 +2315,24 @@ impl Kallsyms {
 
     fn module_views_from_symbols<'a>(
         symbols: impl IntoIterator<Item = BorrowedKallsymsRow<'a>>,
-    ) -> FxHashMap<String, Arc<Self>> {
-        let mut modules = FxHashMap::<String, Self>::default();
+    ) -> FxHashMap<String, ModuleSymbols> {
+        let mut modules = FxHashMap::<String, ModuleSymbols>::default();
         for row in symbols {
             let Some(module) = row.module else {
                 continue;
             };
             let view = match modules.raw_entry_mut().from_key(module) {
                 RawEntryMut::Occupied(entry) => entry.into_mut(),
-                RawEntryMut::Vacant(entry) => entry.insert(module.to_owned(), Self::default()).1,
+                RawEntryMut::Vacant(entry) => {
+                    entry.insert(module.to_owned(), ModuleSymbols::default()).1
+                }
             };
-            // Ascending global addresses preserve the path API's first-by-IP
-            // name index, even when the input rows were not address ordered.
-            let symbol = row.into_module_symbol(module);
-            view.addresses_by_name
-                .entry(Arc::clone(&symbol.name))
-                .or_insert(row.address);
-            view.symbols.insert(row.address, symbol);
+            // Global fixups and alias removal precede the split. Retain one
+            // name-bearing node, in the same ascending order as native perf.
+            view.index
+                .insert_ascending(row.address, row.end, Arc::from(row.name));
         }
         modules
-            .into_iter()
-            .map(|(module, mut symbols)| {
-                symbols.build_module_indexes();
-                (module, Arc::new(symbols))
-            })
-            .collect()
     }
 
     fn build_module_indexes(&mut self) {
@@ -2309,6 +2351,7 @@ impl Kallsyms {
             index.insert_ascending(
                 address,
                 symbol.end.expect("module ends were fixed globally"),
+                (),
             );
         }
     }
@@ -3846,13 +3889,10 @@ where
             .as_ref()
     }
 
-    fn live_module_kallsyms_for_name(&self, module_name: &str) -> Option<Arc<Kallsyms>> {
+    fn live_module_kallsyms_for_name(&self, module_name: &str) -> Option<&ModuleSymbols> {
         // symbol.c:maps__split_kallsyms (914) looks up the bound DSO short
         // name. Do not reinterpret it as a raw MMAP filename here.
-        self.live_kallsyms_snapshot()?
-            .modules
-            .get(module_name)
-            .cloned()
+        self.live_kallsyms_snapshot()?.modules.get(module_name)
     }
 
     fn system_map_kallsyms_ref(&self) -> Option<&Kallsyms> {
@@ -4006,7 +4046,14 @@ where
                 })
                 .or_else(|| {
                     self.live_module_kallsyms_for_name(&module_name)
-                        .map(|kallsyms| resolve_module_kallsyms(kallsyms.as_ref(), request))
+                        .map(|symbols| {
+                            symbols.resolve_module_with_offset_in_range(
+                                request
+                                    .kernel_module_address
+                                    .unwrap_or(request.relative_address),
+                                request.kernel_mapping_range,
+                            )
+                        })
                 })
         } else {
             self.ordinary_kernel_load
@@ -11578,18 +11625,18 @@ mod tests {
     #[test]
     fn module_kallsyms_index_zero_is_a_present_link_after_rotation() {
         let mut index = super::ModuleKallsymsIndex::default();
-        index.insert_ascending(0x1000, 0x2000);
+        index.insert_ascending(0x1000, 0x2000, ());
         assert_eq!(index.root, Some(0));
         assert_eq!(index.nodes[0].parent, None);
         assert_eq!(index.nodes[0].left, None);
         assert_eq!(index.nodes[0].right, None);
-        index.insert_ascending(0x1100, 0x2000);
+        index.insert_ascending(0x1100, 0x2000, ());
         assert_eq!(index.nodes[1].parent.unwrap().get(), 1);
-        index.insert_ascending(0x1200, 0x2000);
+        index.insert_ascending(0x1200, 0x2000, ());
         assert_eq!(index.root, Some(1));
         let left = index.nodes[1].left.unwrap();
         assert_eq!(left.get(), 1);
-        assert_eq!(super::ModuleKallsymsIndex::link_index(left), 0);
+        assert_eq!(super::ModuleKallsymsIndex::<()>::link_index(left), 0);
         assert_eq!(index.find(0x1000).unwrap().address, 0x1000);
         assert_eq!(index.find(0x1fff).unwrap().address, 0x1100);
         assert!(index.find(0x2000).is_none());
@@ -11598,7 +11645,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "module kallsyms node index overflow")]
     fn module_kallsyms_link_checks_one_based_overflow() {
-        super::ModuleKallsymsIndex::link(usize::MAX);
+        super::ModuleKallsymsIndex::<()>::link(usize::MAX);
     }
 
     #[test]
@@ -11606,7 +11653,7 @@ mod tests {
         // tools/lib/rbtree.c:__rb_insert right-side cases 1/3, ascending input.
         let mut index = super::ModuleKallsymsIndex::default();
         for count in 1..=8 {
-            index.insert_ascending(count * 0x100, 0x2000);
+            index.insert_ascending(count * 0x100, 0x2000, ());
             if count == 3 {
                 assert_eq!(index.root, Some(1));
                 assert_eq!(
@@ -11614,9 +11661,10 @@ mod tests {
                         .nodes
                         .iter()
                         .map(|node| (
-                            node.parent.map(super::ModuleKallsymsIndex::link_index),
-                            node.left.map(super::ModuleKallsymsIndex::link_index),
-                            node.right.map(super::ModuleKallsymsIndex::link_index),
+                            node.parent
+                                .map(super::ModuleKallsymsIndex::<()>::link_index),
+                            node.left.map(super::ModuleKallsymsIndex::<()>::link_index),
+                            node.right.map(super::ModuleKallsymsIndex::<()>::link_index),
                             node.red,
                         ))
                         .collect::<Vec<_>>(),
@@ -11634,9 +11682,10 @@ mod tests {
                 .nodes
                 .iter()
                 .map(|node| (
-                    node.parent.map(super::ModuleKallsymsIndex::link_index),
-                    node.left.map(super::ModuleKallsymsIndex::link_index),
-                    node.right.map(super::ModuleKallsymsIndex::link_index),
+                    node.parent
+                        .map(super::ModuleKallsymsIndex::<()>::link_index),
+                    node.left.map(super::ModuleKallsymsIndex::<()>::link_index),
+                    node.right.map(super::ModuleKallsymsIndex::<()>::link_index),
                     node.red,
                 ))
                 .collect::<Vec<_>>(),
@@ -11655,10 +11704,11 @@ mod tests {
         assert_eq!(index, index.clone());
     }
 
-    fn module_kallsyms_black_height(
-        index: &super::ModuleKallsymsIndex,
+    fn module_kallsyms_black_height<P>(
+        index: &super::ModuleKallsymsIndex<P>,
         cursor: Option<usize>,
         parent: Option<usize>,
+        bounds: (Option<u64>, Option<u64>),
         seen: &mut [bool],
     ) -> usize {
         let Some(cursor) = cursor else {
@@ -11668,12 +11718,14 @@ mod tests {
         assert!(!seen[cursor], "cycle or duplicate child at {cursor}");
         seen[cursor] = true;
         let node = &index.nodes[cursor];
+        assert!(bounds.0.is_none_or(|lower| lower < node.address));
+        assert!(bounds.1.is_none_or(|upper| node.address < upper));
         assert_eq!(
-            node.parent.map(super::ModuleKallsymsIndex::link_index),
+            node.parent.map(super::ModuleKallsymsIndex::<P>::link_index),
             parent
         );
-        let left = node.left.map(super::ModuleKallsymsIndex::link_index);
-        let right = node.right.map(super::ModuleKallsymsIndex::link_index);
+        let left = node.left.map(super::ModuleKallsymsIndex::<P>::link_index);
+        let right = node.right.map(super::ModuleKallsymsIndex::<P>::link_index);
         for (child, is_left) in [(left, true), (right, false)] {
             if let Some(child) = child {
                 assert!(child < index.nodes.len());
@@ -11681,8 +11733,20 @@ mod tests {
                 assert!(!node.red || !index.nodes[child].red);
             }
         }
-        let left_height = module_kallsyms_black_height(index, left, Some(cursor), seen);
-        let right_height = module_kallsyms_black_height(index, right, Some(cursor), seen);
+        let left_height = module_kallsyms_black_height(
+            index,
+            left,
+            Some(cursor),
+            (bounds.0, Some(node.address)),
+            seen,
+        );
+        let right_height = module_kallsyms_black_height(
+            index,
+            right,
+            Some(cursor),
+            (Some(node.address), bounds.1),
+            seen,
+        );
         assert_eq!(left_height, right_height, "black height at {cursor}");
         left_height + usize::from(!node.red)
     }
@@ -11691,10 +11755,10 @@ mod tests {
     fn module_kallsyms_ascending_rotations_keep_every_node_reachable_and_balanced() {
         let mut index = super::ModuleKallsymsIndex::default();
         for count in 1..=64 {
-            index.insert_ascending(count * 0x100, count * 0x100 + 0x80);
+            index.insert_ascending(count * 0x100, count * 0x100 + 0x80, ());
             assert!(!index.nodes[index.root.unwrap()].red);
             let mut seen = vec![false; index.nodes.len()];
-            module_kallsyms_black_height(&index, index.root, None, &mut seen);
+            module_kallsyms_black_height(&index, index.root, None, (None, None), &mut seen);
             assert!(seen.iter().all(|&visited| visited));
             for node in &index.nodes {
                 assert_eq!(index.find(node.address).unwrap().address, node.address);
@@ -11707,9 +11771,9 @@ mod tests {
     #[test]
     fn module_kallsyms_root_walk_keeps_zero_length_exact_match_and_half_open_ends() {
         let mut index = super::ModuleKallsymsIndex::default();
-        index.insert_ascending(0x1000, 0x1000);
-        index.insert_ascending(0x1100, 0x1180);
-        index.insert_ascending(0x1200, 0x1280);
+        index.insert_ascending(0x1000, 0x1000, ());
+        index.insert_ascending(0x1100, 0x1180, ());
+        index.insert_ascending(0x1200, 0x1280, ());
         assert!(index.find(0xfff).is_none());
         assert_eq!(index.find(0x1000).unwrap().address, 0x1000);
         assert!(index.find(0x1001).is_none());
@@ -11721,6 +11785,118 @@ mod tests {
         assert!(index.find(0x1280).is_none());
     }
 
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn module_kallsyms_name_payload_layout_and_capacity_are_dense() {
+        use super::{ModuleKallsymsIndex, ModuleKallsymsNode};
+        assert_eq!(std::mem::size_of::<ModuleKallsymsNode<Arc<str>>>(), 64);
+        assert_eq!(
+            std::mem::size_of::<ModuleKallsymsNode<Arc<str>>>(),
+            std::mem::size_of::<ModuleKallsymsNode>() + std::mem::size_of::<Arc<str>>()
+        );
+        let mut index = ModuleKallsymsIndex::<Arc<str>>::default();
+        for count in 1..=64 {
+            index.insert_ascending(count, count + 1, Arc::from("row"));
+        }
+        assert_eq!(index.nodes.len(), 64);
+        assert_eq!(index.nodes.capacity(), 64);
+        assert_eq!(
+            index.nodes.capacity() * std::mem::size_of_val(&index.nodes[0]),
+            4096
+        );
+    }
+
+    #[test]
+    fn module_kallsyms_name_payload_rotations_preserve_backing_and_subtree_bounds() {
+        let mut index = super::ModuleKallsymsIndex::<Arc<str>>::default();
+        let mut backing = Vec::new();
+        for count in 1..=64 {
+            let name: Arc<str> = format!("row_{count}").into();
+            backing.push(name.as_ptr());
+            index.insert_ascending(count * 0x100, count * 0x100 + 0x80, name);
+            assert!(!index.nodes[index.root.unwrap()].red);
+            let mut seen = vec![false; index.nodes.len()];
+            module_kallsyms_black_height(&index, index.root, None, (None, None), &mut seen);
+            assert!(seen.iter().all(|&visited| visited));
+            for (ordinal, node) in index.nodes.iter().enumerate() {
+                assert_eq!(node.payload.as_ref(), format!("row_{}", ordinal + 1));
+                assert_eq!(node.payload.as_ptr(), backing[ordinal]);
+                assert_eq!(Arc::strong_count(&node.payload), 1);
+                assert!(std::ptr::eq(index.find(node.address).unwrap(), node));
+                assert!(std::ptr::eq(index.find(node.end - 1).unwrap(), node));
+                assert!(index.find(node.end).is_none());
+            }
+            if count == 3 {
+                assert_eq!(index.root, Some(1));
+                assert_eq!(index.nodes[1].left.unwrap().get(), 1);
+                assert_eq!(
+                    super::ModuleKallsymsIndex::<Arc<str>>::link_index(
+                        index.nodes[1].left.unwrap()
+                    ),
+                    0
+                );
+            }
+            if count == 8 {
+                assert_eq!(index.root, Some(3));
+            }
+        }
+    }
+
+    #[test]
+    fn module_kallsyms_checker_rejects_misplaced_deeper_descendant() {
+        let mut index = super::ModuleKallsymsIndex::<Arc<str>>::default();
+        for count in 1..=8 {
+            index.insert_ascending(count * 0x100, count * 0x100 + 0x80, Arc::from("row"));
+        }
+        module_kallsyms_black_height(&index, index.root, None, (None, None), &mut [false; 8]);
+        assert_eq!(index.root, Some(3));
+        assert_eq!(index.nodes[2].parent.unwrap().get(), 2);
+        // Still right of its immediate parent, but now outside the ancestor's
+        // left subtree. An immediate-child-only ordering check misses this.
+        index.nodes[2].address = 0x450;
+        assert!(index.nodes[1].address < index.nodes[2].address);
+        assert!(
+            std::panic::catch_unwind(|| {
+                module_kallsyms_black_height(
+                    &index,
+                    index.root,
+                    None,
+                    (None, None),
+                    &mut [false; 8],
+                );
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn module_kallsyms_name_payload_root_walk_preserves_winner_and_u64_boundaries() {
+        let mut index = super::ModuleKallsymsIndex::<Arc<str>>::default();
+        for (start, end, name) in [
+            (u64::MAX - 4, u64::MAX - 4, "exact"),
+            (u64::MAX - 2, u64::MAX, "root"),
+            (u64::MAX - 1, u64::MAX, "last"),
+        ] {
+            index.insert_ascending(start, end, Arc::from(name));
+        }
+        assert_eq!(index.find(u64::MAX - 4).unwrap().payload.as_ref(), "exact");
+        assert!(index.find(u64::MAX - 3).is_none());
+        assert_eq!(index.find(u64::MAX - 1).unwrap().payload.as_ref(), "root");
+        assert!(index.find(u64::MAX).is_none());
+        let view = super::ModuleSymbols { index };
+        assert_eq!(
+            view.resolve_module_with_offset_in_range(u64::MAX - 1, Some((u64::MAX - 1, u64::MAX))),
+            None,
+            "reject the root winner rather than substituting the later overlapping node"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "module kallsyms node index overflow")]
+    fn module_kallsyms_name_payload_link_checks_one_based_overflow() {
+        super::ModuleKallsymsIndex::<Arc<str>>::link(usize::MAX);
+    }
+
     fn live_module_kallsyms_fixture(text: &str) -> (tempfile::TempDir, PathBuf) {
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-fixtures");
         std::fs::create_dir_all(&fixtures).unwrap();
@@ -11728,6 +11904,107 @@ mod tests {
         let path = root.path().join("kallsyms");
         std::fs::write(&path, text).unwrap();
         (root, path)
+    }
+
+    const DENSE_LIVE_MODULE_FIXTURE: &str = "1000 T alpha_first\t[alpha]\n\
+        1100 T alpha_last\t[alpha]\n\
+        2000 T core\n\
+        3000 T beta_only\t[beta]\n";
+
+    #[test]
+    fn dense_live_module_retains_one_record_per_survivor() {
+        let (_root, path) = live_module_kallsyms_fixture(DENSE_LIVE_MODULE_FIXTURE);
+        let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
+            .with_system_kallsyms_from_path(&path);
+        let snapshot = resolver.live_kallsyms_snapshot().unwrap();
+        let records: usize = snapshot
+            .modules
+            .values()
+            .map(|view| view.index.nodes.len())
+            .sum();
+        assert_eq!(snapshot.modules.len(), 2);
+        assert_eq!(
+            records, 3,
+            "one retained address/end/name record per survivor"
+        );
+    }
+
+    #[test]
+    fn dense_live_module_owns_only_outer_namespace_keys() {
+        let (_root, path) = live_module_kallsyms_fixture(DENSE_LIVE_MODULE_FIXTURE);
+        let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
+            .with_system_kallsyms_from_path(&path);
+        let snapshot = resolver.live_kallsyms_snapshot().unwrap();
+        // ModuleSymbols has only the name-bearing index: no row namespace,
+        // nested module dictionary, or eager exact-name index is retained.
+        for view in snapshot.modules.values() {
+            assert_eq!(
+                std::mem::size_of_val(view),
+                std::mem::size_of_val(&view.index)
+            );
+        }
+        let namespaces = snapshot.modules.len();
+        assert_eq!(
+            namespaces, 2,
+            "only the two outer module-map keys own namespaces"
+        );
+    }
+
+    #[test]
+    fn dense_live_module_unique_names_have_one_cold_owner() {
+        let (_root, path) = live_module_kallsyms_fixture(DENSE_LIVE_MODULE_FIXTURE);
+        let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
+            .with_system_kallsyms_from_path(&path);
+        let snapshot = resolver.live_kallsyms_snapshot().unwrap();
+        let owners: Vec<_> = snapshot
+            .modules
+            .values()
+            .flat_map(|view| {
+                view.index
+                    .nodes
+                    .iter()
+                    .map(|node| Arc::strong_count(&node.payload))
+            })
+            .collect();
+        assert_eq!(owners.len(), 3);
+        assert_eq!(owners, [1, 1, 1], "no eager name-index Arc owners");
+    }
+
+    #[test]
+    fn dense_live_module_names_borrow_snapshot_backing_and_release_with_its_owner() {
+        let (_root, path) = live_module_kallsyms_fixture(
+            "2000 T repeated\t[alpha]\n1000 T repeated\t[alpha]\n\
+             3000 T full \u{e9} name\t[alpha]\textra\n",
+        );
+        let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
+            .with_system_kallsyms_from_path(&path);
+        let alpha = resolver.live_module_kallsyms_for_name("[alpha]").unwrap();
+        let row = alpha.symbol_by_name("repeated").unwrap();
+        assert_eq!(
+            row.address, 0x1000,
+            "first ascending name, not first input row"
+        );
+        let accepted = &alpha.index.nodes[0];
+        assert!(std::ptr::eq(row, accepted));
+        let weak = Arc::downgrade(&row.payload);
+        std::fs::remove_file(&path).unwrap();
+        assert!(std::ptr::eq(
+            alpha,
+            resolver.live_module_kallsyms_for_name("[alpha]").unwrap()
+        ));
+        let whole_suffix = resolver
+            .live_module_kallsyms_for_name("[alpha]\textra")
+            .unwrap();
+        let full_name = whole_suffix.symbol_by_name("full \u{e9} name").unwrap();
+        assert_eq!(full_name.address, 0x3000);
+        assert_eq!(Arc::strong_count(&row.payload), 1);
+        assert_eq!(Arc::strong_count(&full_name.payload), 1);
+        assert_eq!(
+            whole_suffix.resolve_module_with_offset(0x3001).as_deref(),
+            Some("full \u{e9} name+0x1")
+        );
+        drop(resolver);
+        assert!(weak.upgrade().is_none());
     }
 
     fn assert_space_suffix_core_rows(text: &str, expected_count: usize) {
@@ -11796,6 +12073,60 @@ mod tests {
         );
         assert_eq!(
             alpha.resolve_module_with_offset_in_range(0x100f, Some((0x1000, 0x100f))),
+            None
+        );
+    }
+
+    fn assert_dense_multi_module_views(
+        alpha: &super::ModuleSymbols,
+        beta: &super::ModuleSymbols,
+        gamma: &super::ModuleSymbols,
+    ) {
+        for (view, start, end, name) in [
+            (alpha, 0x1000, 0x1010, "alias_last"),
+            (alpha, 0x1010, 0x1020, "weak"),
+            (alpha, 0x1020, 0x1030, "shared"),
+            (alpha, 0x1030, 0x1040, "data"),
+            (alpha, 0x1040, 0x3000, "shared"),
+            (alpha, 0x4000, 0x5000, "alpha_tail"),
+            (beta, 0x2010, 0x2020, "shared"),
+            (beta, 0x2020, 0x4000, "beta_tail"),
+            (gamma, 0x1800, 0x3000, "gamma_head"),
+            (gamma, 0x5000, 0x6000, "gamma_tail"),
+        ] {
+            let node = view
+                .index
+                .nodes
+                .iter()
+                .find(|node| node.address == start)
+                .unwrap();
+            assert_eq!(node.payload.as_ref(), name);
+            assert_eq!(node.end, end, "{name} at {start:#x}");
+            assert_eq!(
+                view.resolve_module_with_offset(start + 1),
+                Some(format!("{name}+0x1"))
+            );
+        }
+        for (view, end) in [(alpha, 0x3000), (beta, 0x4000), (gamma, 0x6000)] {
+            assert_eq!(view.resolve_module_with_offset(end), None);
+            for name in ["accepted_core", "alias_first", "zero", "excluded"] {
+                assert_eq!(view.address_of(name), None);
+            }
+        }
+        assert_eq!(alpha.address_of("shared"), Some(0x1020));
+        assert_eq!(beta.address_of("shared"), Some(0x2010));
+        assert_eq!(gamma.address_of("shared"), None);
+        assert_eq!(beta.resolve_module_with_offset(0x1000), None);
+        assert_eq!(
+            alpha.resolve_module_with_offset_in_range(0x100f, Some((0x1000, 0x1010))),
+            Some("alias_last+0xf".into())
+        );
+        assert_eq!(
+            alpha.resolve_module_with_offset_in_range(0x100f, Some((0x1000, 0x100f))),
+            None
+        );
+        assert_eq!(
+            alpha.resolve_module_with_offset_in_range(0x2800, Some((0x1050, 0x3000))),
             None
         );
     }
@@ -12000,13 +12331,13 @@ mod tests {
         std::fs::write(&path, "0000000000001000 T replacement\t[alpha]\n").unwrap();
         let beta = resolver.live_module_kallsyms_for_name("[beta]").unwrap();
         let gamma = resolver.live_module_kallsyms_for_name("[gamma]").unwrap();
-        assert_multi_module_kallsyms_views(&alpha, &beta, &gamma);
+        assert_dense_multi_module_views(alpha, beta, gamma);
         for module in ["[missing-one]", "[missing-two]", "[missing-one]"] {
             assert!(resolver.live_module_kallsyms_for_name(module).is_none());
         }
-        assert!(Arc::ptr_eq(
-            &alpha,
-            &resolver.live_module_kallsyms_for_name("[alpha]").unwrap()
+        assert!(std::ptr::eq(
+            alpha,
+            resolver.live_module_kallsyms_for_name("[alpha]").unwrap()
         ));
         assert_eq!(
             (
@@ -12106,7 +12437,7 @@ mod tests {
         assert_eq!(first_alpha.address_of("replacement"), None);
         assert_eq!(second_alpha.address_of("replacement"), Some(0x1000));
         assert_eq!(second_alpha.address_of("alias_last"), None);
-        assert!(!Arc::ptr_eq(&first_alpha, &second_alpha));
+        assert!(!std::ptr::eq(first_alpha, second_alpha));
         assert_eq!(
             first
                 .live_module_kallsyms_for_name("[beta]")
@@ -12371,19 +12702,23 @@ mod tests {
     }
 
     #[test]
-    fn kallsyms_live_module_name_index_shares_symbol_storage_canonical_tab() {
+    fn kallsyms_live_module_name_queries_borrow_node_storage_canonical_tab() {
         let (_root, path) =
             live_module_kallsyms_fixture("1000 T retained\t[alpha]\n2000 T next\t[alpha]\n");
         let resolver = super::PerfSymbolResolver::from_object_resolver(UnavailableObjectResolver)
             .with_system_kallsyms_from_path(&path);
         let symbols = resolver.live_module_kallsyms_for_name("[alpha]").unwrap();
-        let name = &symbols.symbols[&0x1000].name;
-        let indexed = symbols
-            .addresses_by_name
-            .get_key_value("retained")
-            .unwrap()
-            .0;
-        assert_eq!(name.as_ptr(), indexed.as_ptr());
+        let name = &symbols.index.nodes[0].payload;
+        assert_eq!(Arc::strong_count(name), 1);
+        let capacity = symbols.index.nodes.capacity();
+        for _ in 0..4 {
+            let borrowed = &symbols.symbol_by_name("retained").unwrap().payload;
+            assert!(std::ptr::eq(name, borrowed));
+            assert!(symbols.symbol_by_name("missing").is_none());
+            assert_eq!(symbols.address_of("retained"), Some(0x1000));
+            assert_eq!(Arc::strong_count(name), 1);
+            assert_eq!(symbols.index.nodes.capacity(), capacity);
+        }
     }
 
     #[test]

@@ -72,17 +72,23 @@ impl KcoreSymbols {
         let symbols: BTreeMap<_, _> = snapshot
             .core
             .iter()
-            .chain(snapshot.modules.values().map(AsRef::as_ref))
             .flat_map(|symbols| &symbols.symbols)
-            .filter_map(|(&address, symbol)| {
+            .filter_map(|(&address, symbol)| Some((address, symbol.end?, &symbol.name)))
+            .chain(
+                snapshot
+                    .modules
+                    .values()
+                    .flat_map(super::ModuleSymbols::rows),
+            )
+            .filter_map(|(address, symbol_end, name)| {
                 let (_, end) = ranges
                     .iter()
                     .find(|&&(start, end)| start <= address && address < end)?;
                 Some((
                     address,
                     KallsymsSymbol {
-                        name: std::sync::Arc::clone(&symbol.name),
-                        end: Some(symbol.end?.min(*end)),
+                        name: std::sync::Arc::clone(name),
+                        end: Some(symbol_end.min(*end)),
                         module: None,
                     },
                 ))
@@ -279,6 +285,96 @@ mod tests {
         bytes[96..104].copy_from_slice(&(1_u64 << 40).to_le_bytes());
         bytes[104..112].copy_from_slice(&(1_u64 << 41).to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn dense_module_rows_keep_global_ends_and_share_names_when_kcore_clips() {
+        use crate::perfdata::mappings::MmapTable;
+        use crate::perfdata::records::{MmapRecord, PERF_RECORD_MISC_CPUMODE_KERNEL};
+        use crate::symbols::{PerfSymbolResolver, RustAddr2lineResolver};
+        use std::sync::Arc;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("kallsyms");
+        std::fs::write(
+            &path,
+            "0800 T before\n1000 T core\n1100 T alpha_first\t[alpha]\n\
+             2000 T alpha_last\t[alpha]\n3000 T beta_last\t[beta]\n\
+             4000 T after\t[beta]\n",
+        )
+        .unwrap();
+        let directory = path.parent().unwrap();
+        std::fs::write(
+            directory.join("modules"),
+            "alpha 1 0 - Live 0x1100\nbeta 1 0 - Live 0x3000\n",
+        )
+        .unwrap();
+        let mut elf = fixture();
+        elf[80..88].copy_from_slice(&0x1000_u64.to_le_bytes());
+        elf[96..104].copy_from_slice(&0x2500_u64.to_le_bytes());
+        elf[104..112].copy_from_slice(&0x2500_u64.to_le_bytes());
+        std::fs::write(directory.join("kcore"), elf).unwrap();
+        let mut table = MmapTable::default();
+        for (start, len, name) in [
+            (0x1000, 0x100, "[kernel.kallsyms]"),
+            (0x1100, 0x1f00, "[alpha]"),
+            (0x3000, 0x1000, "[beta]"),
+        ] {
+            table.insert_mmap_with_misc(
+                MmapRecord {
+                    pid: u32::MAX,
+                    tid: 1,
+                    start,
+                    len,
+                    pgoff: 0,
+                    path: name.into(),
+                },
+                PERF_RECORD_MISC_CPUMODE_KERNEL,
+            );
+        }
+        let resolver = PerfSymbolResolver::from_object_resolver(RustAddr2lineResolver::new())
+            .with_system_kallsyms_from_path(&path);
+        let snapshot = resolver.live_kallsyms_snapshot().unwrap();
+        let beta = &snapshot.modules["[beta]"].index.nodes[0];
+        assert_eq!(beta.end, 0x4000);
+        assert_eq!(Arc::strong_count(&beta.payload), 1);
+        let symbols = super::KcoreSymbols::load(&table, PerfArch::X86_64, &path, snapshot).unwrap();
+        assert_eq!(symbols.symbols.len(), 4);
+        assert!(!symbols.symbols.contains_key(&0x800));
+        assert!(!symbols.symbols.contains_key(&0x4000));
+        for (address, end, name) in [
+            (0x1000, 0x2000, "core"),
+            (0x1100, 0x2000, "alpha_first"),
+            (0x2000, 0x3000, "alpha_last"),
+            (0x3000, 0x3500, "beta_last"),
+        ] {
+            let symbol = &symbols.symbols[&address];
+            assert_eq!(symbol.end, Some(end));
+            assert_eq!(symbol.name.as_ref(), name);
+            assert!(symbol.module.is_none());
+        }
+        assert!(Arc::ptr_eq(&symbols.symbols[&0x3000].name, &beta.payload));
+        assert_eq!(Arc::strong_count(&beta.payload), 2);
+        assert_eq!(symbols.resolve(0x34ff).as_deref(), Some("beta_last+0x4ff"));
+        assert!(symbols.resolve(0x3500).is_none());
+        assert!(!symbols.is_active());
+        drop(symbols);
+        assert_eq!(Arc::strong_count(&beta.payload), 1);
+        // Rejected validation must not consume or modify the frozen module view.
+        std::fs::write(
+            directory.join("modules"),
+            "alpha 1 0 - Live 0x1101\nbeta 1 0 - Live 0x3000\n",
+        )
+        .unwrap();
+        assert!(super::KcoreSymbols::load(&table, PerfArch::X86_64, &path, snapshot).is_none());
+        assert_eq!(beta.end, 0x4000);
+        assert_eq!(Arc::strong_count(&beta.payload), 1);
+        assert_eq!(
+            snapshot.modules["[beta]"]
+                .resolve_module_with_offset(0x3fff)
+                .as_deref(),
+            Some("beta_last+0xfff")
+        );
     }
 
     #[test]
