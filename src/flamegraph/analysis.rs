@@ -338,7 +338,7 @@ pub fn categorize_flamegraph_frame(name: &str) -> &'static str {
         "Locks/Futex"
     } else if lower.contains("epoll") || lower.contains("poll") || lower.contains("mio") {
         "Event Loop"
-    } else if lower.contains("tokio") || lower.contains("runtime") {
+    } else if lower.contains("tokio") {
         "Tokio Runtime"
     } else if lower.contains("futures") || lower.contains("async") || lower.contains("waker") {
         "Async/Futures"
@@ -610,4 +610,108 @@ fn entries_by_name(entries: &[FlamegraphEntry]) -> BTreeMap<&str, FlamegraphEntr
         value.percent += entry.percent;
     }
     aggregated
+}
+
+#[cfg(test)]
+mod category_tests {
+    use super::{
+        categorize_flamegraph_frame, categorize_profile, category_name, parse_category_rules,
+        parse_flamegraph,
+    };
+
+    #[test]
+    fn explicit_tokio_frames_keep_the_tokio_category() {
+        for name in ["tokio::runtime::drive", "Tokio::task::spawn"] {
+            assert_eq!(categorize_flamegraph_frame(name), "Tokio Runtime", "{name}");
+        }
+    }
+
+    #[test]
+    fn generic_runtime_frames_do_not_imply_tokio() {
+        for name in [
+            "runtime",
+            "service::runtime::execute",
+            "bytes::scan_runtime",
+        ] {
+            assert_eq!(categorize_flamegraph_frame(name), "Other", "{name}");
+        }
+    }
+
+    #[test]
+    fn runtime_frames_keep_other_builtin_categories() {
+        for (name, expected) in [
+            ("allocator::alloc_impl_runtime", "Memory"),
+            ("allocator::runtime::grow_alloc", "Memory"),
+            ("service::runtime::async_work", "Async/Futures"),
+            ("service::runtime::schedule", "Scheduling"),
+        ] {
+            assert_eq!(categorize_flamegraph_frame(name), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn custom_runtime_rules_override_builtins_in_order() {
+        let rules = parse_category_rules(
+            r#"[
+                {"name":"Project Runtime","contains":["RUNTIME"]},
+                {"name":"Project Tokio","contains":["tokio"]},
+                {"name":"Project Memory","contains":["alloc"]}
+            ]"#,
+        )
+        .expect("category rules");
+        for name in [
+            "service::runtime::execute",
+            "tokio::runtime::drive",
+            "allocator::alloc_impl_runtime",
+        ] {
+            assert_eq!(category_name(name, &rules), "Project Runtime", "{name}");
+        }
+        assert_eq!(category_name("zfs_read", &rules), "Disk I/O");
+    }
+
+    #[test]
+    fn native_svg_runtime_categories_preserve_samples_and_function_names() {
+        for direction in [
+            inferno::flamegraph::Direction::Straight,
+            inferno::flamegraph::Direction::Inverted,
+        ] {
+            let mut options = inferno::flamegraph::Options::default();
+            options.direction = direction;
+            let mut svg = Vec::new();
+            inferno::flamegraph::from_lines(
+                &mut options,
+                [
+                    "service::runtime::execute 30",
+                    "allocator::alloc_impl_runtime 50",
+                    "tokio::runtime::drive 20",
+                ],
+                &mut svg,
+            )
+            .expect("native SVG");
+            let mut profile =
+                parse_flamegraph(std::str::from_utf8(&svg).expect("UTF-8 SVG")).expect("profile");
+            assert_eq!(profile.total_samples, 100);
+            let categories = profile
+                .categories
+                .iter()
+                .map(|category| (category.name.as_str(), category.samples))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                categories,
+                [("Memory", 50), ("Other", 30), ("Tokio Runtime", 20)]
+            );
+            let inclusive = profile.inclusive.clone();
+            let self_samples = profile.self_samples.clone();
+            let rules =
+                parse_category_rules(r#"[{"name":"Project Runtime","contains":["runtime"]}]"#)
+                    .expect("category rules");
+            categorize_profile(&mut profile, &rules, 10, 0.0);
+            assert_eq!(profile.inclusive, inclusive);
+            assert_eq!(profile.self_samples, self_samples);
+            assert_eq!(profile.categories.len(), 1);
+            assert_eq!(profile.categories[0].name, "Project Runtime");
+            assert_eq!(profile.categories[0].samples, 100);
+            assert_eq!(profile.categories[0].inclusive_functions, inclusive);
+        }
+    }
 }
