@@ -334,12 +334,15 @@ Missing or rejected kcore falls back to ordinary kallsyms in the covered
 core-first fixtures, with regular module ELF sources retaining precedence.
 The event IP is preserved independently of its callchain and preprocesses the
 kernel DSO load state first (`builtin-script.c:process_sample_event`,
-`event.c:machine__resolve`). Failed and successful module loads both exclude
-that DSO from a later ordinary kallsyms split (`symbol.c:dso__load`,
-`maps__split_kallsyms`). Core and module views share one source snapshot;
+`event.c:machine__resolve`). Failed and successful module loads both mark
+that DSO loaded (`symbol.c:dso__load`). When a later ordinary kallsyms split
+switches to an already-loaded module namespace, native discards the first
+row but retains the current destination; subsequent rows in that namespace
+can be inserted (`maps__split_kallsyms`). Core and module views share one
+source snapshot;
 module short display names remain separate from their long ELF source paths.
-Initially loaded ET_DYN modules and broader kernel/version source-selection
-parity remain tracked work.
+Initially loaded ET_DYN module behavior is covered by native perf 7.2.9
+fixtures. Broader kernel/version source-selection parity remains tracked work.
 
 Process completed recordings: keep the input file unchanged until analysis
 finishes. Timestamp-ordered records retain read windows until delivery, avoiding
