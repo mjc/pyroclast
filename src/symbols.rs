@@ -177,6 +177,8 @@ pub struct KernelModuleObjectMetadata {
     pub text_section: Option<(u32, u64)>,
     pub maps: Vec<KernelModuleSectionMap>,
     pub lookup_projection: Option<u64>,
+    /// Accepted rows after SOURCE allocation and paired runtime label filtering.
+    pub has_symbols: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -186,6 +188,7 @@ struct KernelModuleSectionLayout {
     file_offset: u64,
     executable: bool,
     text: bool,
+    labels_eligible: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -193,6 +196,7 @@ struct KernelModuleSymbolProjection {
     sections: Vec<KernelModuleSectionLayout>,
     core_sections: Vec<u32>,
     relocatable: bool,
+    has_symbols: bool,
 }
 
 static NEXT_KERNEL_MODULE_PROJECTION: AtomicU64 = AtomicU64::new(1);
@@ -813,6 +817,20 @@ enum KernelObjectRequest {
     Unmapped,
 }
 
+enum KernelModuleObjectRequest {
+    Mapped(SymbolRequest),
+    LoadedEmpty(PathBuf),
+}
+
+impl KernelModuleObjectRequest {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Mapped(request) => &request.path,
+            Self::LoadedEmpty(path) => path,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum KernelElfAddressDecision {
     Mapped {
@@ -996,6 +1014,8 @@ struct PerfObjectSymbolIndex {
     candidates: Vec<PerfSymbolCandidate>,
     sections_by_candidate: Vec<Option<u32>>,
     kernel_base_eligible: Vec<bool>,
+    user_eligible: Vec<bool>,
+    user_candidate_count: usize,
     regular_count: usize,
     table_candidate_count: usize,
     plt_header_phase: Option<PerfPltHeaderPhase>,
@@ -1039,6 +1059,7 @@ struct ObjectSymbolCandidates {
     regular_count: usize,
     sections_by_candidate: Vec<Option<u32>>,
     kernel_base_eligible: Vec<bool>,
+    user_eligible: Vec<bool>,
 }
 
 pub struct PerfSymbolResolver<O> {
@@ -2954,7 +2975,7 @@ where
                 if let Some(object_request) = object_request
                     && let Some(metadata) = self
                         .object_resolver
-                        .selected_object_module_metadata(&object_request.path, &request)
+                        .selected_object_module_metadata(object_request.path(), &request)
                 {
                     // event.c:machine__resolve loads this DSO before callchain
                     // lookup. Apply its section maps without initializing core
@@ -3017,7 +3038,7 @@ where
                 .lock()
                 .expect("object address cache lock"),
         );
-        let Some(object_request) = object_request else {
+        let Some(KernelModuleObjectRequest::Mapped(object_request)) = object_request else {
             return Ok(ResolvedSymbolFrames::default());
         };
         self.resolve_object_frame_batch(std::slice::from_ref(&object_request), inline)?
@@ -3047,7 +3068,7 @@ where
             let kernel_address = request
                 .kernel_module_address
                 .unwrap_or(request.relative_address);
-            if (is_kernel_symbol_path(&request.path) || request.kernel_module_address.is_some())
+            if is_kernel_symbol_request(request)
                 && let Some(symbols) = self.kcore_symbols_ref()
                 && symbols.contains(kernel_address)
             {
@@ -3057,9 +3078,13 @@ where
                     && let Some(object_request) =
                         self.module_object_symbol_request(request, &mut address_cache)
                 {
-                    old_module_objects.push(index);
-                    module_indexes.push(index);
-                    module_requests.push(object_request);
+                    if let KernelModuleObjectRequest::Mapped(object_request) = object_request {
+                        old_module_objects.push(index);
+                        module_indexes.push(index);
+                        module_requests.push(object_request);
+                    } else {
+                        self.finish_module_object_load(request, object_request.path());
+                    }
                 } else if symbols.activate(module) {
                     resolved[index] = symbols.resolve(kernel_address);
                 }
@@ -3068,8 +3093,10 @@ where
                 if let Some(object_request) =
                     self.module_object_symbol_request(request, &mut address_cache)
                 {
-                    module_indexes.push(index);
-                    module_requests.push(object_request);
+                    if let KernelModuleObjectRequest::Mapped(object_request) = object_request {
+                        module_indexes.push(index);
+                        module_requests.push(object_request);
+                    }
                 } else {
                     resolved[index] = self
                         .resolve_kernel_source(request)
@@ -3105,12 +3132,9 @@ where
         }
 
         if !module_requests.is_empty() {
-            let module_frames = self.resolve_object_frame_batch(&module_requests, false)?;
-            for ((index, frames), object_request) in module_indexes
-                .into_iter()
-                .zip(module_frames)
-                .zip(&module_requests)
-            {
+            let frames = self.resolve_object_frame_batch(&module_requests, false)?;
+            let results = module_indexes.into_iter().zip(frames).zip(&module_requests);
+            for ((index, frames), object_request) in results {
                 resolved[index] = self.finish_module_symbol(
                     frames,
                     &requests[index],
@@ -3212,7 +3236,7 @@ where
             let kernel_address = request
                 .kernel_module_address
                 .unwrap_or(request.relative_address);
-            if (is_kernel_symbol_path(&request.path) || request.kernel_module_address.is_some())
+            if is_kernel_symbol_request(request)
                 && let Some(symbols) = self.kcore_symbols_ref()
                 && symbols.contains(kernel_address)
             {
@@ -3222,42 +3246,45 @@ where
                     && let Some(object_request) =
                         self.module_object_symbol_request(request, &mut address_cache)
                 {
-                    old_module_objects.push(index);
-                    user_indexes.push(index);
-                    user_requests.push(object_request);
+                    if let KernelModuleObjectRequest::Mapped(object_request) = object_request {
+                        old_module_objects.push(index);
+                        user_indexes.push(index);
+                        user_requests.push(object_request);
+                    } else {
+                        self.finish_module_object_load(request, object_request.path());
+                        resolved[index].source_state = SymbolSourceState::KernelObjectMapReplaced;
+                    }
                 } else if symbols.activate(module) {
-                    resolved[index] = ResolvedSymbolFrames::from_frames(
-                        symbols.resolve(kernel_address).into_iter().collect(),
-                    );
+                    let frames = symbols.resolve(kernel_address).into_iter().collect();
+                    resolved[index] = ResolvedSymbolFrames::from_frames(frames);
                     resolved[index].kernel_dso = SymbolDsoName::KernelKallsyms;
                 } else {
                     resolved[index].source_state = SymbolSourceState::KernelMapReplaced;
                 }
             } else if is_kernel_module_request(request) {
                 self.record_ordinary_module_load(request);
-                if let Some(object_request) =
-                    self.module_object_symbol_request(request, &mut address_cache)
-                {
-                    user_indexes.push(index);
-                    user_requests.push(object_request);
-                } else if let Some(frames) = self.resolve_kernel_source(request) {
-                    resolved[index] = frames;
+                match self.module_object_symbol_request(request, &mut address_cache) {
+                    Some(KernelModuleObjectRequest::Mapped(object_request)) => {
+                        user_indexes.push(index);
+                        user_requests.push(object_request);
+                    }
+                    Some(KernelModuleObjectRequest::LoadedEmpty(_)) => {}
+                    None => {
+                        resolved[index] = self.resolve_kernel_source(request).unwrap_or_default();
+                    }
                 }
             } else if is_kernel_symbol_path(&request.path) {
-                if let Some(kernel_request) =
-                    self.kernel_object_symbol_request(request, &mut address_cache)
-                {
-                    match kernel_request {
-                        KernelObjectRequest::Unmapped => {
-                            resolved[index].kernel_dso = SymbolDsoName::Unmapped;
-                        }
-                        KernelObjectRequest::Mapped(object_request) => {
-                            kernel_elf_indexes.push(index);
-                            kernel_elf_requests.push(object_request);
-                        }
+                match self.kernel_object_symbol_request(request, &mut address_cache) {
+                    Some(KernelObjectRequest::Mapped(object_request)) => {
+                        kernel_elf_indexes.push(index);
+                        kernel_elf_requests.push(object_request);
                     }
-                } else if let Some(frames) = self.resolve_kernel_frames(request) {
-                    resolved[index] = frames;
+                    Some(KernelObjectRequest::Unmapped) => {
+                        resolved[index].kernel_dso = SymbolDsoName::Unmapped;
+                    }
+                    None => {
+                        resolved[index] = self.resolve_kernel_frames(request).unwrap_or_default();
+                    }
                 }
             } else {
                 let object_request = self.object_symbol_request(request, &mut address_cache);
@@ -3280,12 +3307,9 @@ where
         }
 
         if !user_requests.is_empty() {
-            let user_frames = self.resolve_object_frame_batch(&user_requests, inline)?;
-            for ((index, frames), object_request) in user_indexes
-                .into_iter()
-                .zip(user_frames)
-                .zip(&user_requests)
-            {
+            let frames = self.resolve_object_frame_batch(&user_requests, inline)?;
+            let results = user_indexes.into_iter().zip(&user_requests).zip(frames);
+            for ((index, object_request), frames) in results {
                 resolved[index] = self.finish_module_frame(
                     frames,
                     &requests[index],
@@ -3475,7 +3499,7 @@ where
         &self,
         request: &SymbolRequest,
         address_cache: &mut ObjectAddressCache,
-    ) -> Option<SymbolRequest> {
+    ) -> Option<KernelModuleObjectRequest> {
         // perf symbol.c:dso__load tries the regular system module pathname
         // after build-ID sources. Bracketed paths have no live object name.
         let mut selected = if request.kernel_module_address.is_some() {
@@ -3483,7 +3507,7 @@ where
         } else {
             self.cached_object_symbol_request(request, address_cache)
         }?;
-        if !kernel_object_is_usable(&selected.path, request.recorded_build_id(), address_cache) {
+        if !object_build_id_matches(&selected.path, request, address_cache) {
             return None;
         }
         if request.kernel_module_address.is_some()
@@ -3500,14 +3524,29 @@ where
             // loading any symbols or section maps, including the live fallback.
             return None;
         }
+        let module_metadata = self
+            .object_resolver
+            .selected_object_module_metadata(&selected.path, request);
+        if !module_metadata.as_ref().map_or_else(
+            || kernel_object_is_usable(&selected.path, request.recorded_build_id(), address_cache),
+            |metadata| metadata.lookup_projection.is_some(),
+        ) {
+            return None;
+        }
+        if module_metadata
+            .as_ref()
+            .is_some_and(|metadata| !metadata.has_symbols)
+        {
+            // symbol-elf.c:1818 deletes module kallsyms even if the selected
+            // table returns zero; symbol.c:2001 still marks that DSO loaded.
+            return Some(KernelModuleObjectRequest::LoadedEmpty(selected.path));
+        }
         if let Some((start, _)) = request.kernel_mapping_range
             && let Some(offset) = request
                 .kernel_module_address
                 .unwrap_or(request.relative_address)
                 .checked_sub(start)
-            && let Some(metadata) = self
-                .object_resolver
-                .selected_object_module_metadata(&selected.path, request)
+            && let Some(metadata) = module_metadata
             && let Some(text_address) = metadata.text_address
             && let Some(address) = text_address.checked_add(offset)
         {
@@ -3531,7 +3570,7 @@ where
                 );
             }
         }
-        Some(selected)
+        Some(KernelModuleObjectRequest::Mapped(selected))
     }
 
     fn cached_object_symbol_request(
@@ -4295,15 +4334,16 @@ where
         requests: &[SymbolRequest],
     ) -> Result<Vec<ResolvedSymbolFrames>, String> {
         let mut resolved = vec![ResolvedSymbolFrames::default(); requests.len()];
-        for (path, indexes) in grouped_request_indexes(requests) {
+        for (path, mut indexes) in grouped_request_indexes(requests) {
             let path = Path::new(path);
             let object_metadata = self.object_metadata(path);
-            if object_source_state(object_metadata.as_deref()) == SymbolSourceState::Unavailable {
-                for index in indexes {
-                    resolved[index].source_state = SymbolSourceState::Unavailable;
-                }
-                continue;
-            }
+            indexes.retain(|index| {
+                let index = *index;
+                let state =
+                    object_source_state(object_metadata.as_deref(), requests[index].symbol_lookup);
+                resolved[index].source_state = state;
+                state != SymbolSourceState::Unavailable
+            });
             let object_symbols = object_metadata
                 .as_ref()
                 .map_or_else(SmallVec::new, |metadata| {
@@ -4501,15 +4541,16 @@ impl SymbolResolver for RustAddr2lineResolver {
         requests: &[SymbolRequest],
     ) -> Result<Vec<ResolvedSymbolFrames>, String> {
         let mut resolved = vec![ResolvedSymbolFrames::default(); requests.len()];
-        for (path, indexes) in grouped_request_indexes(requests) {
+        for (path, mut indexes) in grouped_request_indexes(requests) {
             let path = Path::new(path);
             let object_metadata = self.object_metadata(path);
-            if object_source_state(object_metadata.as_deref()) == SymbolSourceState::Unavailable {
-                for index in indexes {
-                    resolved[index].source_state = SymbolSourceState::Unavailable;
-                }
-                continue;
-            }
+            indexes.retain(|index| {
+                let index = *index;
+                let state =
+                    object_source_state(object_metadata.as_deref(), requests[index].symbol_lookup);
+                resolved[index].source_state = state;
+                state != SymbolSourceState::Unavailable
+            });
             let object_symbols = object_metadata
                 .as_ref()
                 .map_or_else(SmallVec::new, |metadata| {
@@ -4596,13 +4637,21 @@ impl SymbolResolver for RustAddr2lineResolver {
     }
 }
 
-fn object_source_state(metadata: Option<&CachedObjectMetadata>) -> SymbolSourceState {
+fn object_source_state(
+    metadata: Option<&CachedObjectMetadata>,
+    lookup: SymbolLookup,
+) -> SymbolSourceState {
     if metadata.is_none_or(|metadata| {
-        metadata
-            .object_metadata
-            .object_symbols
-            .candidates
-            .is_empty()
+        let symbols = &metadata.object_metadata.object_symbols;
+        if let SymbolLookup::KernelModuleSection { projection, .. } = lookup {
+            !symbols
+                .kernel_module_projections
+                .lock()
+                .expect("kernel module projections")
+                .contains_key(&projection)
+        } else {
+            symbols.user_candidate_count == 0
+        }
     }) {
         SymbolSourceState::Unavailable
     } else {
@@ -4644,14 +4693,14 @@ fn resolve_base_frames_from_object_metadata(
     for (path, indexes) in grouped_request_indexes(requests) {
         let path = Path::new(path);
         let metadata = object_metadata(path);
-        if object_source_state(metadata.as_deref()) == SymbolSourceState::Unavailable {
-            for index in indexes {
-                resolved[index].source_state = SymbolSourceState::Unavailable;
-            }
-            continue;
-        }
         for index in indexes {
             let request = &requests[index];
+            if object_source_state(metadata.as_deref(), request.symbol_lookup)
+                == SymbolSourceState::Unavailable
+            {
+                resolved[index].source_state = SymbolSourceState::Unavailable;
+                continue;
+            }
             let object_symbols = object_symbols_for_frame(
                 metadata.as_ref(),
                 request.symbol_lookup,
@@ -4962,11 +5011,7 @@ fn kernel_module_object_metadata(
         return (KernelModuleObjectMetadata::default(), None);
     }
     let max_text_offset = kernel_module_max_text_offset(&runtime);
-    let projection = Arc::new(kernel_module_symbol_projection(
-        &object,
-        &runtime,
-        max_text_offset,
-    ));
+    let mut projection = kernel_module_symbol_projection(&object, &runtime, max_text_offset);
     let projection_id = NEXT_KERNEL_MODULE_PROJECTION.fetch_add(1, AtomicOrdering::Relaxed);
     let mut maps = Vec::new();
     let mut seen = FxHashSet::default();
@@ -5007,6 +5052,7 @@ fn kernel_module_object_metadata(
             if elf_symbol_is_label(&symbol) && !name.contains("text") && !name.contains("data") {
                 continue;
             }
+            projection.has_symbols = true;
             if name == ".text" {
                 if !text_remapped {
                     text_address = Some(if object.kind() == object::ObjectKind::Relocatable {
@@ -5045,8 +5091,9 @@ fn kernel_module_object_metadata(
             text_section,
             maps,
             lookup_projection: Some(projection_id),
+            has_symbols: projection.has_symbols,
         },
-        Some(projection),
+        Some(Arc::new(projection)),
     )
 }
 
@@ -5089,6 +5136,9 @@ fn kernel_module_symbol_projection(
             file_offset,
             executable,
             text: section.name().ok() == Some(".text"),
+            labels_eligible: section
+                .name()
+                .is_ok_and(|name| name.contains("text") || name.contains("data")),
         });
     }
     let core_sections = sections
@@ -5105,6 +5155,7 @@ fn kernel_module_symbol_projection(
         sections,
         core_sections,
         relocatable: object.kind() == object::ObjectKind::Relocatable,
+        has_symbols: false,
     }
 }
 
@@ -5223,6 +5274,8 @@ impl PerfObjectSymbolIndex {
             candidates,
             sections_by_candidate: vec![None; count],
             kernel_base_eligible: vec![true; count],
+            user_eligible: vec![true; count],
+            user_candidate_count: count,
             regular_count: count,
             table_candidate_count: count,
             user_file_offsets,
@@ -5242,8 +5295,10 @@ impl PerfObjectSymbolIndex {
             regular_count,
             mut sections_by_candidate,
             mut kernel_base_eligible,
+            mut user_eligible,
         } = object_symbol_candidates(&object, &mut bfd_sections);
         let table_candidate_count = candidates.len();
+        let user_candidate_count = user_eligible.iter().filter(|&&eligible| eligible).count();
         let load_segments = object
             .segments()
             .filter_map(|segment| {
@@ -5278,10 +5333,10 @@ impl PerfObjectSymbolIndex {
             })
             .collect();
         let relocatable = object.kind() == object::ObjectKind::Relocatable;
-        let (synthesized, remove_plt_header, synthetic_sections) = if table_candidate_count == 0 {
+        let (synthesized, remove_plt_header, synthetic_sections) = if user_candidate_count == 0 {
             (Vec::new(), None, Vec::new())
         } else {
-            perf_synthesized_plt_symbols(&object, &candidates)
+            perf_synthesized_plt_symbols(&object, &candidates, &user_eligible)
         };
         let plt_header_phase = remove_plt_header.map(|remove_before_entries| PerfPltHeaderPhase {
             candidate: table_candidate_count,
@@ -5289,22 +5344,17 @@ impl PerfObjectSymbolIndex {
         });
         sections_by_candidate.extend(synthetic_sections);
         kernel_base_eligible.extend(std::iter::repeat_n(true, synthesized.len()));
+        user_eligible.extend(std::iter::repeat_n(true, synthesized.len()));
         candidates.extend(synthesized);
         let table_ranges = [0..regular_count, regular_count..table_candidate_count];
         let user_records = candidate_records(&candidates, 0..candidates.len(), |index| {
-            if index >= table_candidate_count {
-                normalize_section_symbol_address(
-                    &object,
-                    &candidates[index],
-                    sections_by_candidate[index],
-                )
+            user_eligible[index].then_some(())?;
+            let normalize = if index >= table_candidate_count {
+                normalize_section_symbol_address
             } else {
-                normalize_user_symbol_address(
-                    &object,
-                    &candidates[index],
-                    sections_by_candidate[index],
-                )
-            }
+                normalize_user_symbol_address
+            };
+            normalize(&object, &candidates[index], sections_by_candidate[index])
         });
         // tools/perf/util/symbol-elf.c:1790 fixes and prunes each native
         // symbol table before inserting later-table and synthetic rows.
@@ -5320,6 +5370,8 @@ impl PerfObjectSymbolIndex {
             candidates,
             sections_by_candidate,
             kernel_base_eligible,
+            user_eligible,
+            user_candidate_count,
             regular_count,
             table_candidate_count,
             plt_header_phase,
@@ -5327,12 +5379,9 @@ impl PerfObjectSymbolIndex {
             elf_sections,
             relocatable,
             user_file_offsets,
-            kernel_sections: Mutex::default(),
-            kernel_module_projections: Mutex::default(),
-            kernel_module_sections: Mutex::default(),
             bfd_only_symbols,
             bfd_sections,
-            bfd_function_cache: Mutex::default(),
+            ..Self::default()
         }
     }
 
@@ -5424,6 +5473,7 @@ impl PerfObjectSymbolIndex {
             .enumerate()
             .filter(|(index, _)| self.sections_by_candidate[*index] == Some(section))
             .filter(|(index, _)| self.kernel_base_eligible[*index])
+            .filter(|(index, _)| self.user_eligible[*index])
             .filter_map(|(candidate, symbol)| {
                 let header = section_header?;
                 let start = if self.relocatable {
@@ -5496,6 +5546,11 @@ impl PerfObjectSymbolIndex {
                     .sections
                     .iter()
                     .find(|layout| layout.index == candidate_section)?;
+                // symbol-elf.c:1697-1717 tests SOURCE allocation, substitutes
+                // the runtime NOBITS header, then filters labels by its name.
+                if symbol.elf_type == Some(object::elf::STT_NOTYPE) && !layout.labels_eligible {
+                    return None;
+                }
                 let start = if projection.relocatable {
                     symbol.address.checked_add(layout.file_offset)?
                 } else {
@@ -5646,6 +5701,7 @@ fn object_symbol_candidates(
     let mut bfd_only_symbols = Vec::new();
     let mut candidate_sections = Vec::new();
     let mut kernel_base_eligible = Vec::new();
+    let mut user_eligible = Vec::new();
     let bfd_section_by_index: FxHashMap<_, _> = bfd_sections
         .iter()
         .enumerate()
@@ -5660,7 +5716,9 @@ fn object_symbol_candidates(
             // symbol-elf.c:1659 filters ignored kernel ELF names before
             // dso__demangle_sym(), so retain this bit beside the raw row.
             let keep_kernel_base = symbol.name().is_ok_and(kernel_elf_name_is_eligible);
-            let perf_candidate = perf_symbol_candidate_from_object_symbol(object, &symbol);
+            let keep_user = perf_symbol_is_candidate(object, &symbol);
+            let perf_candidate = perf_symbol_is_allocated_candidate(object, &symbol)
+                .then(|| symbol_candidate_from_object_symbol(object.architecture(), &symbol));
             let bfd_function_like = perf_candidate.as_ref().map_or_else(
                 || bfd_symbol_is_function_like(object.architecture(), &symbol),
                 |candidate| candidate.bfd_function_like,
@@ -5688,6 +5746,7 @@ fn object_symbol_candidates(
                         .and_then(|section| u32::try_from(section.0).ok()),
                 );
                 kernel_base_eligible.push(keep_kernel_base);
+                user_eligible.push(keep_user);
                 index
             } else {
                 let index = BfdSymbolIndex::BfdOnly(bfd_only_symbols.len());
@@ -5708,6 +5767,7 @@ fn object_symbol_candidates(
         regular_count,
         sections_by_candidate: candidate_sections,
         kernel_base_eligible,
+        user_eligible,
     }
 }
 
@@ -5819,6 +5879,7 @@ fn bfd_function_record_better_fit(
 fn perf_synthesized_plt_symbols(
     object: &object::File<'_>,
     base_symbols: &[PerfSymbolCandidate],
+    user_eligible: &[bool],
 ) -> (Vec<PerfSymbolCandidate>, Option<bool>, Vec<Option<u32>>) {
     if object.architecture() != object::Architecture::X86_64 {
         return (Vec::new(), None, Vec::new());
@@ -5904,7 +5965,7 @@ fn perf_synthesized_plt_symbols(
             .or_else(|| {
                 relocation
                     .ifunc_addend
-                    .and_then(|addend| perf_best_symbol_at(base_symbols, addend))
+                    .and_then(|addend| perf_best_symbol_at(base_symbols, user_eligible, addend))
                     .map(|symbol| format!("{}@plt", symbol.name))
             })
             .unwrap_or_else(|| format!("offset_{plt_file_offset:#x}@plt"));
@@ -6020,16 +6081,19 @@ fn perf_x86_64_plt_relocation_from_rela<'data>(
     }
 }
 
-fn perf_best_symbol_at(
-    symbols: &[PerfSymbolCandidate],
+fn perf_best_symbol_at<'a>(
+    symbols: &'a [PerfSymbolCandidate],
+    user_eligible: &[bool],
     address: u64,
-) -> Option<&PerfSymbolCandidate> {
+) -> Option<&'a PerfSymbolCandidate> {
     symbols
         .iter()
-        .filter(|symbol| symbol.address == address)
+        .zip(user_eligible)
+        .filter_map(|(symbol, &eligible)| (eligible && symbol.address == address).then_some(symbol))
         .reduce(perf_best_duplicate_symbol)
 }
 
+#[cfg(test)]
 fn perf_symbol_candidate_from_object_symbol(
     object: &object::File<'_>,
     symbol: &object::Symbol<'_, '_>,
@@ -7648,6 +7712,7 @@ fn perf_kallsyms_type_is_kept(symbol_type: char) -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod label_eligibility;
     #[path = "plt_regressions.rs"]
     mod plt_regressions;
 
@@ -12133,7 +12198,7 @@ mod tests {
     }
 
     #[test]
-    fn object_symbol_index_only_accepts_notype_labels_in_text_or_data_sections_like_perf() {
+    fn object_user_projection_only_accepts_notype_labels_in_text_or_data_sections_like_perf() {
         // perf util/symbol-elf.c:elf_sec__filter matches section names containing
         // "text" or "data"; this extra restriction applies only to labels.
         for (section, symbol_type, accepted) in [
@@ -12150,13 +12215,14 @@ mod tests {
                 section,
                 elf::SHF_ALLOC,
             );
+            let index = PerfObjectSymbolIndex::from_object_bytes(&bytes);
+            assert_eq!(index.candidates.len(), 1);
             assert_eq!(
-                !PerfObjectSymbolIndex::from_object_bytes(&bytes)
-                    .candidates
-                    .is_empty(),
+                index.user_candidate_count > 0,
                 accepted,
                 "section {section:?}, type {symbol_type}"
             );
+            assert_eq!(index.symbol_name(0x1008), accepted.then_some("label"));
         }
     }
 

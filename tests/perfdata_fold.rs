@@ -32,6 +32,10 @@ mod memory_sources;
 #[path = "support/native_module_lookup.rs"]
 mod native_module_lookup;
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "support/native_label_eligibility.rs"]
+mod native_label_eligibility;
+
 #[cfg(target_os = "linux")]
 use std::io::Write as _;
 #[cfg(target_os = "linux")]

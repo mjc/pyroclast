@@ -4,7 +4,7 @@ use object::{Object, ObjectSection, ObjectSegment, build, elf};
 
 use super::{PerfObjectSymbolIndex, SymbolLookup, elf_with_text_symbol_fixtures};
 
-fn elf_with_allocated_plt(
+pub(super) fn elf_with_allocated_plt(
     symbols: &[(&'static [u8], u64, u64, u8, u8)],
     plt_address: u64,
     plt_size: usize,
@@ -97,7 +97,7 @@ fn elf_with_allocated_plt(
     bytes
 }
 
-fn elf_with_mixed_plt_relocations() -> Vec<u8> {
+pub(super) fn elf_with_mixed_plt_relocations() -> Vec<u8> {
     let base = elf_with_text_symbol_fixtures(
         elf::EM_X86_64,
         &[(
