@@ -723,7 +723,7 @@ struct ObjectAddressMetadata {
     text_offset: u64,
     build_id: Option<String>,
     kernel_symbols_usable: OnceLock<bool>,
-    kernel_reference_symbols: FxHashMap<Box<str>, Option<u64>>,
+    kernel_reference_symbols: FxHashMap<Box<str>, KernelReferenceLookup>,
 }
 
 struct ObjectSegmentRange {
@@ -735,16 +735,42 @@ struct ObjectSegmentRange {
 struct ObjectSectionRange {
     virtual_address: u64,
     size: u64,
+    regular_present: bool,
+    dynamic_present: bool,
+    is_text: bool,
 }
 
 struct KernelElfMapMetadata {
     sections: Vec<ObjectSectionRange>,
-    has_text_section: bool,
+    regular_has_text_section: bool,
+    dynamic_has_text_section: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct KernelReferenceLookup {
+    regular_address: Option<u64>,
+    dynamic_address: Option<u64>,
+}
+
+impl KernelReferenceLookup {
+    fn effective_address(self) -> Option<u64> {
+        self.regular_address
+            .filter(|address| *address != 0)
+            .or(self.dynamic_address)
+            .or(self.regular_address)
+    }
 }
 
 enum KernelObjectRequest {
     Mapped(SymbolRequest),
     Unmapped,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KernelElfAddressDecision {
+    Mapped { base: u64, inline: u64 },
+    Unmapped,
+    Preserve,
 }
 
 struct PerfDwarfNameResolver<'a> {
@@ -3311,26 +3337,26 @@ where
         // perf v7.2.9 map.c:529-559 converts the runtime RIP by subtracting
         // the kernel map relocation; symbol-elf.c:1593-1606 supplies that
         // relocation from recorded reference minus the selected ELF st_value.
+        let reference_lookup = request.kernel_relocation.as_ref().and_then(|relocation| {
+            object_kernel_reference_lookup(path, &relocation.reference_symbol, address_cache)
+        });
         let relative_address = match request
             .kernel_relocation
             .as_ref()
             .filter(|relocation| relocation.recorded_reference_address != 0)
         {
-            Some(relocation) => object_kernel_reference_symbol_address(
-                path,
-                &relocation.reference_symbol,
-                address_cache,
-            )
-            .filter(|address| *address != 0)
-            .map_or(request.relative_address, |symbol_address| {
-                let relocation_delta = relocation
-                    .recorded_reference_address
-                    .wrapping_sub(symbol_address);
-                request.relative_address.wrapping_sub(relocation_delta)
-            }),
+            Some(_) => reference_lookup
+                .and_then(KernelReferenceLookup::effective_address)
+                .map_or(request.relative_address, |symbol_address| {
+                    let relocation = request.kernel_relocation.as_ref().unwrap();
+                    let relocation_delta = relocation
+                        .recorded_reference_address
+                        .wrapping_sub(symbol_address);
+                    request.relative_address.wrapping_sub(relocation_delta)
+                }),
             None => request.relative_address,
         };
-        let object_request = SymbolRequest {
+        let mut object_request = SymbolRequest {
             path: path.clone(),
             relative_address,
             addr2line_address: None,
@@ -3340,10 +3366,30 @@ where
             file_identity: None,
             kernel_relocation: None,
         };
-        if Self::kernel_elf_address_is_unmapped(request, &object_request, address_cache) {
-            Some(KernelObjectRequest::Unmapped)
-        } else {
-            Some(KernelObjectRequest::Mapped(object_request))
+        let decision = object_address_metadata(path, address_cache).and_then(|metadata| {
+            metadata
+                .kernel_map_metadata
+                .get_or_init(|| read_kernel_elf_map_metadata(path))
+                .as_ref()
+                .map(|map_metadata| {
+                    Self::kernel_elf_address_decision(
+                        request,
+                        request.relative_address,
+                        map_metadata,
+                        reference_lookup,
+                    )
+                })
+        });
+        match decision {
+            Some(KernelElfAddressDecision::Mapped { base, inline }) => {
+                object_request.relative_address = base;
+                object_request.addr2line_address = Some(inline);
+                Some(KernelObjectRequest::Mapped(object_request))
+            }
+            Some(KernelElfAddressDecision::Unmapped) => Some(KernelObjectRequest::Unmapped),
+            Some(KernelElfAddressDecision::Preserve) | None => {
+                Some(KernelObjectRequest::Mapped(object_request))
+            }
         }
     }
 
@@ -3550,31 +3596,67 @@ where
             })
     }
 
-    fn kernel_elf_address_is_unmapped(
+    fn kernel_elf_address_decision(
         request: &SymbolRequest,
-        object_request: &SymbolRequest,
-        address_cache: &mut ObjectAddressCache,
-    ) -> bool {
-        let Some(metadata) = object_address_metadata(&object_request.path, address_cache) else {
-            return false;
-        };
-        let map_metadata = metadata
-            .kernel_map_metadata
-            .get_or_init(|| read_kernel_elf_map_metadata(&object_request.path));
-        let Some(map_metadata) = map_metadata.as_ref() else {
-            return false;
-        };
-        if !map_metadata.has_text_section {
-            return false;
+        runtime_address: u64,
+        metadata: &KernelElfMapMetadata,
+        lookup: Option<KernelReferenceLookup>,
+    ) -> KernelElfAddressDecision {
+        if !metadata.regular_has_text_section && !metadata.dynamic_has_text_section {
+            return KernelElfAddressDecision::Preserve;
         }
-        let relocation = request
-            .relative_address
-            .wrapping_sub(object_request.relative_address);
-        !map_metadata.sections.iter().any(|section| {
-            let start = section.virtual_address.wrapping_add(relocation);
-            let end = start.wrapping_add(section.size);
-            start <= request.relative_address && request.relative_address < end
-        })
+        let recorded = request
+            .kernel_relocation
+            .as_ref()
+            .map_or(0, |relocation| relocation.recorded_reference_address);
+        let regular_delta = lookup
+            .and_then(|lookup| lookup.regular_address)
+            .filter(|address| *address != 0)
+            .filter(|_| recorded != 0)
+            .map_or(0, |address| recorded.wrapping_sub(address));
+        let selected_reference = lookup.and_then(KernelReferenceLookup::effective_address);
+        let final_delta = selected_reference
+            .filter(|_| recorded != 0)
+            .map_or(0, |address| recorded.wrapping_sub(address));
+        let dynamic_delta = lookup
+            .and_then(|lookup| {
+                if lookup.regular_address.is_some_and(|address| address != 0) {
+                    lookup.regular_address
+                } else {
+                    lookup.dynamic_address
+                }
+            })
+            .filter(|address| *address != 0)
+            .filter(|_| recorded != 0)
+            .map_or(0, |address| recorded.wrapping_sub(address));
+
+        metadata
+            .sections
+            .iter()
+            .find_map(|section| {
+                let (delta, inline_delta) = if section.is_text {
+                    if section.dynamic_present {
+                        (dynamic_delta, final_delta)
+                    } else if section.regular_present {
+                        (regular_delta, final_delta)
+                    } else {
+                        (final_delta, final_delta)
+                    }
+                } else if section.regular_present {
+                    (regular_delta, 0)
+                } else {
+                    (dynamic_delta, 0)
+                };
+                let start = section.virtual_address.wrapping_add(delta);
+                let end = start.wrapping_add(section.size);
+                (start <= runtime_address && runtime_address < end).then(|| {
+                    KernelElfAddressDecision::Mapped {
+                        base: runtime_address.wrapping_sub(delta),
+                        inline: runtime_address.wrapping_sub(inline_delta),
+                    }
+                })
+            })
+            .unwrap_or(KernelElfAddressDecision::Unmapped)
     }
 
     // None means no source loaded; an empty frame result is a selected-source miss.
@@ -3738,32 +3820,57 @@ fn object_address_metadata<'a>(
     object_address_metadata_mut(path, address_cache).map(|metadata| &*metadata)
 }
 
+#[cfg(test)]
 fn object_kernel_reference_symbol_address(
     path: &Path,
     reference_symbol: &str,
     address_cache: &mut ObjectAddressCache,
 ) -> Option<u64> {
-    let metadata = object_address_metadata_mut(path, address_cache)?;
-    if let Some(address) = metadata.kernel_reference_symbols.get(reference_symbol) {
-        return *address;
-    }
-    let address = read_regular_symbol_address(path, reference_symbol);
-    metadata
-        .kernel_reference_symbols
-        .insert(reference_symbol.into(), address);
-    address
+    object_kernel_reference_lookup(path, reference_symbol, address_cache)?.effective_address()
 }
 
-fn read_regular_symbol_address(path: &Path, name: &str) -> Option<u64> {
+fn object_kernel_reference_lookup(
+    path: &Path,
+    reference_symbol: &str,
+    address_cache: &mut ObjectAddressCache,
+) -> Option<KernelReferenceLookup> {
+    let metadata = object_address_metadata_mut(path, address_cache)?;
+    if let Some(lookup) = metadata.kernel_reference_symbols.get(reference_symbol) {
+        return Some(*lookup);
+    }
+    let lookup = read_kernel_reference_lookup(path, reference_symbol);
+    metadata
+        .kernel_reference_symbols
+        .insert(reference_symbol.into(), lookup);
+    Some(lookup)
+}
+
+fn read_kernel_reference_lookup(path: &Path, name: &str) -> KernelReferenceLookup {
     // perf v7.2.9 symbol-elf.c:1593-1606 (local 1548-1558) stops at the first
     // exact regular-SYMTAB name, before candidate/type filtering.
-    let file = open_regular_object(path)?;
-    let len = file.metadata().ok()?.len();
+    let Some(file) = open_regular_object(path) else {
+        return KernelReferenceLookup::default();
+    };
+    let Ok(metadata) = file.metadata() else {
+        return KernelReferenceLookup::default();
+    };
+    let len = metadata.len();
     let cache = object::read::ReadCache::new(file);
-    let object = object::File::parse(cache.range(0, len)).ok()?;
-    object
+    let Ok(object) = object::File::parse(cache.range(0, len)) else {
+        return KernelReferenceLookup::default();
+    };
+    let regular_address = object
         .symbols()
-        .find_map(|symbol| (symbol.name().ok() == Some(name)).then(|| symbol.address()))
+        .find(|symbol| symbol.name().ok() == Some(name))
+        .map(|symbol| symbol.address());
+    let dynamic_address = object
+        .dynamic_symbols()
+        .find(|symbol| symbol.name().ok() == Some(name))
+        .map(|symbol| symbol.address());
+    KernelReferenceLookup {
+        regular_address,
+        dynamic_address,
+    }
 }
 
 fn object_build_id_matches(
@@ -3862,14 +3969,23 @@ fn read_kernel_elf_map_metadata(path: &Path) -> Option<KernelElfMapMetadata> {
     if object.format() != object::BinaryFormat::Elf {
         return None;
     }
-    let accepted_sections = object
+    let regular_sections = object
         .symbols()
-        .chain(object.dynamic_symbols())
         .filter(|symbol| perf_kernel_symbol_is_candidate(&object, symbol))
         .filter_map(|symbol| symbol.section_index())
         .collect::<FxHashSet<_>>();
+    let dynamic_sections = object
+        .dynamic_symbols()
+        .filter(|symbol| perf_kernel_symbol_is_candidate(&object, symbol))
+        .filter_map(|symbol| symbol.section_index())
+        .collect::<FxHashSet<_>>();
+    let accepted_sections = regular_sections
+        .union(&dynamic_sections)
+        .copied()
+        .collect::<FxHashSet<_>>();
     let mut sections = Vec::with_capacity(accepted_sections.len());
-    let mut has_text_section = false;
+    let mut regular_has_text_section = false;
+    let mut dynamic_has_text_section = false;
     for section in object.sections() {
         if !accepted_sections.contains(&section.index()) {
             continue;
@@ -3880,17 +3996,24 @@ fn read_kernel_elf_map_metadata(path: &Path) -> Option<KernelElfMapMetadata> {
         if sh_flags & u64::from(object::elf::SHF_ALLOC) == 0 {
             continue;
         }
-        has_text_section |= section.name().ok() == Some(".text");
+        if section.name().ok() == Some(".text") {
+            regular_has_text_section |= regular_sections.contains(&section.index());
+            dynamic_has_text_section |= dynamic_sections.contains(&section.index());
+        }
         if section.size() > 0 {
             sections.push(ObjectSectionRange {
                 virtual_address: section.address(),
                 size: section.size(),
+                regular_present: regular_sections.contains(&section.index()),
+                dynamic_present: dynamic_sections.contains(&section.index()),
+                is_text: section.name().ok() == Some(".text"),
             });
         }
     }
     Some(KernelElfMapMetadata {
         sections,
-        has_text_section,
+        regular_has_text_section,
+        dynamic_has_text_section,
     })
 }
 
@@ -7934,7 +8057,7 @@ mod tests {
     }
 
     #[test]
-    fn kernel_reference_lookup_caches_first_symtab_match_and_requested_misses() {
+    fn kernel_reference_lookup_caches_first_exact_row_and_requested_outcomes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kernel.elf");
         std::fs::write(
@@ -7981,11 +8104,94 @@ mod tests {
         assert_eq!(metadata.kernel_reference_symbols.len(), 2);
         assert_eq!(
             metadata.kernel_reference_symbols.get("_stext"),
-            Some(&Some(0))
+            Some(&super::KernelReferenceLookup {
+                regular_address: Some(0),
+                dynamic_address: None,
+            })
         );
         assert_eq!(
             metadata.kernel_reference_symbols.get("missing"),
-            Some(&None)
+            Some(&super::KernelReferenceLookup::default())
+        );
+    }
+
+    #[test]
+    fn kernel_reference_lookup_prefers_nonzero_regular_symbol_over_dynsym() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kernel.elf");
+        std::fs::write(
+            &path,
+            elf_with_dynamic_reference_fixture(
+                &[(b"_stext", 0x1000, 0, elf::STB_GLOBAL, elf::STT_NOTYPE)],
+                0x9000,
+            ),
+        )
+        .unwrap();
+        let mut cache = super::ObjectAddressCache::default();
+
+        assert_eq!(
+            super::object_kernel_reference_symbol_address(&path, "_stext", &mut cache),
+            Some(0x1000)
+        );
+    }
+
+    #[test]
+    fn kernel_reference_lookup_retries_dynsym_after_missing_regular_symbol() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kernel.elf");
+        std::fs::write(
+            &path,
+            elf_with_dynamic_reference_fixture(
+                &[(b"other", 0x1000, 0, elf::STB_GLOBAL, elf::STT_NOTYPE)],
+                0x9000,
+            ),
+        )
+        .unwrap();
+        let mut cache = super::ObjectAddressCache::default();
+
+        assert_eq!(
+            super::object_kernel_reference_symbol_address(&path, "_stext", &mut cache),
+            Some(0x9000)
+        );
+    }
+
+    #[test]
+    fn kernel_reference_lookup_retries_dynsym_after_zero_regular_symbol() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kernel.elf");
+        std::fs::write(
+            &path,
+            elf_with_dynamic_reference_fixture(
+                &[(b"_stext", 0, 0, elf::STB_GLOBAL, elf::STT_NOTYPE)],
+                0x9000,
+            ),
+        )
+        .unwrap();
+        let mut cache = super::ObjectAddressCache::default();
+
+        assert_eq!(
+            super::object_kernel_reference_symbol_address(&path, "_stext", &mut cache),
+            Some(0x9000)
+        );
+    }
+
+    #[test]
+    fn kernel_reference_lookup_preserves_zero_from_dynsym() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kernel.elf");
+        std::fs::write(
+            &path,
+            elf_with_dynamic_reference_fixture(
+                &[(b"other", 0x1000, 0, elf::STB_GLOBAL, elf::STT_NOTYPE)],
+                0,
+            ),
+        )
+        .unwrap();
+        let mut cache = super::ObjectAddressCache::default();
+
+        assert_eq!(
+            super::object_kernel_reference_symbol_address(&path, "_stext", &mut cache),
+            Some(0)
         );
     }
 
@@ -8001,33 +8207,32 @@ mod tests {
             ),
         )
         .unwrap();
-        let mut cache = super::ObjectAddressCache::default();
         let request = test_request("[kernel.kallsyms]", 0);
-        let object_request = test_request(path.to_str().unwrap(), 0x1000);
+        let map_metadata = super::read_kernel_elf_map_metadata(&path).unwrap();
 
         for address in [0x1000, 0x103f] {
             let mut runtime_request = request.clone();
             runtime_request.relative_address = address;
-            let mut elf_request = object_request.clone();
-            elf_request.relative_address = address;
-            assert!(
-                !super::PerfSymbolResolver::<RustAddr2lineResolver>::kernel_elf_address_is_unmapped(
+            assert!(matches!(
+                super::PerfSymbolResolver::<RustAddr2lineResolver>::kernel_elf_address_decision(
                     &runtime_request,
-                    &elf_request,
-                    &mut cache,
-                )
-            );
+                    address,
+                    &map_metadata,
+                    None,
+                ),
+                super::KernelElfAddressDecision::Mapped { .. }
+            ));
         }
         let mut runtime_request = request;
         runtime_request.relative_address = 0x1040;
-        let mut elf_request = object_request;
-        elf_request.relative_address = 0x1040;
-        assert!(
-            super::PerfSymbolResolver::<RustAddr2lineResolver>::kernel_elf_address_is_unmapped(
+        assert_eq!(
+            super::PerfSymbolResolver::<RustAddr2lineResolver>::kernel_elf_address_decision(
                 &runtime_request,
-                &elf_request,
-                &mut cache,
-            )
+                0x1040,
+                &map_metadata,
+                None,
+            ),
+            super::KernelElfAddressDecision::Unmapped
         );
     }
 
@@ -8078,22 +8283,22 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
         let mut cache = super::ObjectAddressCache::default();
         let request = test_request("[kernel.kallsyms]", 0x2000);
-        let object_request = test_request(path.to_str().unwrap(), 0x2000);
-        assert!(
-            !super::PerfSymbolResolver::<RustAddr2lineResolver>::kernel_elf_address_is_unmapped(
+        assert_eq!(
+            super::PerfSymbolResolver::<RustAddr2lineResolver>::kernel_elf_address_decision(
                 &request,
-                &object_request,
-                &mut cache,
-            )
+                0x2000,
+                &super::read_kernel_elf_map_metadata(&path).unwrap(),
+                None,
+            ),
+            super::KernelElfAddressDecision::Preserve
         );
-        let maps = super::object_address_metadata(path.as_path(), &mut cache)
+        let maps = super::object_address_metadata_mut(path.as_path(), &mut cache)
             .unwrap()
             .kernel_map_metadata
-            .get()
-            .unwrap()
+            .get_or_init(|| super::read_kernel_elf_map_metadata(path.as_path()))
             .as_ref()
             .unwrap();
-        assert!(!maps.has_text_section);
+        assert!(!maps.regular_has_text_section && !maps.dynamic_has_text_section);
         assert_eq!(maps.sections.len(), 1);
         assert_eq!(maps.sections[0].virtual_address, 0x3000);
     }
@@ -8122,7 +8327,7 @@ mod tests {
             .as_ref()
             .unwrap();
         assert!(
-            !maps.has_text_section,
+            !maps.regular_has_text_section && !maps.dynamic_has_text_section,
             "kernel-only labels must not create an ELF .text map"
         );
         assert!(maps.sections.is_empty());
@@ -8186,7 +8391,7 @@ mod tests {
             .get_or_init(|| super::read_kernel_elf_map_metadata(path.as_path()))
             .as_ref()
             .unwrap();
-        assert!(maps.has_text_section);
+        assert!(maps.regular_has_text_section);
         assert_eq!(
             maps.sections
                 .iter()
@@ -8195,13 +8400,75 @@ mod tests {
             [(0x1000, 64), (0x3000, 32)]
         );
         let request = test_request("[kernel.kallsyms]", 0x3000);
-        let object_request = test_request(path.to_str().unwrap(), 0x3000);
-        assert!(
-            !super::PerfSymbolResolver::<RustAddr2lineResolver>::kernel_elf_address_is_unmapped(
+        assert!(matches!(
+            super::PerfSymbolResolver::<RustAddr2lineResolver>::kernel_elf_address_decision(
+                &request, 0x3000, maps, None,
+            ),
+            super::KernelElfAddressDecision::Mapped {
+                base: 0x3000,
+                inline: 0x3000
+            }
+        ));
+    }
+
+    #[test]
+    fn kernel_elf_section_addresses_keep_base_and_inline_map_biases_separate() {
+        let mut request = test_request("[kernel.kallsyms]", 0x1010);
+        request.kernel_relocation = Some(super::KernelRelocation {
+            reference_symbol: "_stext".into(),
+            recorded_reference_address: 0x3000,
+        });
+        let metadata = super::KernelElfMapMetadata {
+            sections: vec![super::ObjectSectionRange {
+                virtual_address: 0x1000,
+                size: 0x100,
+                regular_present: true,
+                dynamic_present: false,
+                is_text: true,
+            }],
+            regular_has_text_section: true,
+            dynamic_has_text_section: false,
+        };
+        let lookup = super::KernelReferenceLookup {
+            regular_address: Some(0),
+            dynamic_address: Some(0x1000),
+        };
+
+        assert_eq!(
+            super::PerfSymbolResolver::<RustAddr2lineResolver>::kernel_elf_address_decision(
                 &request,
-                &object_request,
-                &mut cache,
-            )
+                0x1010,
+                &metadata,
+                Some(lookup),
+            ),
+            super::KernelElfAddressDecision::Mapped {
+                base: 0x1010,
+                inline: 0xffff_ffff_ffff_f010,
+            }
+        );
+
+        let additional = super::KernelElfMapMetadata {
+            sections: vec![super::ObjectSectionRange {
+                virtual_address: 0x2000,
+                size: 0x100,
+                regular_present: true,
+                dynamic_present: false,
+                is_text: false,
+            }],
+            regular_has_text_section: true,
+            dynamic_has_text_section: false,
+        };
+        assert_eq!(
+            super::PerfSymbolResolver::<RustAddr2lineResolver>::kernel_elf_address_decision(
+                &request,
+                0x2010,
+                &additional,
+                Some(lookup),
+            ),
+            super::KernelElfAddressDecision::Mapped {
+                base: 0x2010,
+                inline: 0x2010,
+            }
         );
     }
 
@@ -8817,6 +9084,61 @@ mod tests {
         symbols: &[(&'static [u8], u64, u64, u8, u8)],
     ) -> Vec<u8> {
         elf_with_text_symbol_fixtures_for_class(machine, machine != elf::EM_ARM, symbols)
+    }
+
+    fn elf_with_dynamic_reference_fixture(
+        regular_symbols: &[(&'static [u8], u64, u64, u8, u8)],
+        dynamic_reference: u64,
+    ) -> Vec<u8> {
+        let regular = elf_with_text_symbol_fixtures(elf::EM_X86_64, regular_symbols);
+        let mut builder =
+            build::elf::Builder::read(regular.as_slice()).expect("read regular-symbol fixture ELF");
+        builder.header.e_phoff = 0x40;
+        let dynsym = builder.sections.add();
+        dynsym.name = b".dynsym"[..].into();
+        dynsym.sh_type = elf::SHT_DYNSYM;
+        dynsym.sh_flags = u64::from(elf::SHF_ALLOC);
+        dynsym.sh_addralign = 8;
+        dynsym.data = build::elf::SectionData::DynamicSymbol;
+        let dynstr = builder.sections.add();
+        dynstr.name = b".dynstr"[..].into();
+        dynstr.sh_type = elf::SHT_STRTAB;
+        dynstr.sh_flags = u64::from(elf::SHF_ALLOC);
+        dynstr.sh_addralign = 1;
+        dynstr.data = build::elf::SectionData::DynamicString;
+        let reference = builder.dynamic_symbols.add();
+        reference.name = b"_stext"[..].into();
+        reference.st_value = dynamic_reference;
+        reference.set_st_info(elf::STB_GLOBAL, elf::STT_NOTYPE);
+        reference.st_shndx = elf::SHN_ABS;
+        builder.set_section_sizes();
+        let segment = builder.segments.add();
+        segment.p_type = elf::PT_LOAD;
+        segment.p_flags = elf::PF_R | elf::PF_X;
+        segment.p_vaddr = 0;
+        segment.p_paddr = 0;
+        segment.p_filesz = 0x1000;
+        segment.p_memsz = 0x1000;
+        segment.p_align = 16;
+        for section in &mut builder.sections {
+            if section.sh_flags & u64::from(elf::SHF_ALLOC) != 0 {
+                segment.append_section(section);
+            }
+        }
+        builder.set_section_sizes();
+
+        let mut bytes = Vec::new();
+        builder
+            .write(&mut bytes)
+            .expect("write regular and dynamic symbol fixture ELF");
+        let object = object::File::parse(bytes.as_slice()).expect("parse fixture ELF");
+        assert!(object.symbols().next().is_some());
+        assert!(
+            object.dynamic_symbols().any(
+                |symbol| symbol.name() == Ok("_stext") && symbol.address() == dynamic_reference
+            )
+        );
+        bytes
     }
 
     fn elf_with_text_symbol_fixtures_for_class(

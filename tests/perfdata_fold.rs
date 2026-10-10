@@ -5678,6 +5678,70 @@ fn rewrite_native_cached_kernel_elf_fixture_mapping(
 }
 
 #[cfg(target_os = "linux")]
+fn rewrite_native_cached_kernel_elf_recorded_reference(
+    root: &std::path::Path,
+    original: &[u8],
+    recorded_reference: u64,
+) {
+    let header = pyroclast::perfdata::header::parse_header(original).unwrap();
+    let mut bytes = original.to_vec();
+    let mapping = pyroclast::perfdata::records::iter_records(original, header)
+        .unwrap()
+        .into_iter()
+        .find(|record| {
+            record.header.record_type == pyroclast::perfdata::records::PERF_RECORD_MMAP
+                && matches!(
+                    pyroclast::perfdata::records::parse_mmap_record(record.payload),
+                    Ok(ref mmap) if mmap.path == "[kernel.kallsyms]_stext"
+                )
+        })
+        .expect("kernel reference mapping");
+    let parsed = pyroclast::perfdata::records::parse_mmap_record(mapping.payload).unwrap();
+    assert_eq!(parsed.start, 0xffff_ffff_8100_0000);
+    put_u64(&mut bytes, mapping.offset + 8 + 24, recorded_reference);
+    assert_eq!(
+        pyroclast::perfdata::records::parse_mmap_record(
+            &bytes[mapping.offset + 8..mapping.offset + usize::from(mapping.header.size)]
+        )
+        .unwrap()
+        .pgoff,
+        recorded_reference
+    );
+    std::fs::write(root.join("perf.data"), &bytes).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn add_native_cached_kernel_elf_init_text(elf: &std::path::Path) {
+    use object::ObjectSection as _;
+
+    let original = std::fs::read(elf).unwrap();
+    let mut builder = object::build::elf::Builder::read(original.as_slice()).unwrap();
+    let section = builder.sections.add();
+    section.name = b".init.text"[..].into();
+    section.sh_type = object::elf::SHT_PROGBITS;
+    section.sh_flags = u64::from(object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR);
+    section.sh_addr = 0xffff_ffff_8100_0200;
+    section.sh_addralign = 16;
+    section.data = object::build::elf::SectionData::Data(vec![0x90; 0x100].into());
+    let section_id = section.id();
+    let symbol = builder.symbols.add();
+    symbol.name = b"elf_init_entry"[..].into();
+    symbol.st_value = 0xffff_ffff_8100_0210;
+    symbol.st_size = 32;
+    symbol.set_st_info(object::elf::STB_GLOBAL, object::elf::STT_FUNC);
+    symbol.section = Some(section_id);
+    builder.set_section_sizes();
+    let mut bytes = Vec::new();
+    builder.write(&mut bytes).unwrap();
+    let parsed = object::File::parse(bytes.as_slice()).unwrap();
+    assert_eq!(
+        parsed.section_by_name(".init.text").unwrap().address(),
+        0xffff_ffff_8100_0200
+    );
+    std::fs::write(elf, bytes).unwrap();
+}
+
+#[cfg(target_os = "linux")]
 fn rewrite_native_cached_kernel_elf_with_ignored_text_symbols(elf: &std::path::Path) {
     let original = std::fs::read(elf).unwrap();
     let mut builder = object::build::elf::Builder::read(original.as_slice()).unwrap();
@@ -5769,6 +5833,124 @@ fn rewrite_native_cached_kernel_elf_reference(elf: &std::path::Path, zero_first:
     }
     let mut bytes = Vec::new();
     builder.write(&mut bytes).unwrap();
+    std::fs::write(elf, bytes).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn zero_native_cached_kernel_elf_reference(elf: &std::path::Path) {
+    let original = std::fs::read(elf).unwrap();
+    let mut builder = object::build::elf::Builder::read(original.as_slice()).unwrap();
+    let reference = builder
+        .symbols
+        .iter_mut()
+        .find(|symbol| symbol.section.is_some() && symbol.name.as_slice() == b"_stext")
+        .unwrap();
+    reference.st_value = 0;
+    let mut bytes = Vec::new();
+    builder.write(&mut bytes).unwrap();
+    std::fs::write(elf, bytes).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn add_native_cached_kernel_elf_dynamic_symbols(
+    elf: &std::path::Path,
+    reference_address: u64,
+    dynamic_text: bool,
+) {
+    use object::ObjectSection as _;
+
+    let original = std::fs::read(elf).unwrap();
+    let mut builder = object::build::elf::Builder::read(original.as_slice()).unwrap();
+    builder.header.e_phoff = 0x40;
+    let text_id = builder
+        .sections
+        .iter()
+        .find(|section| section.name.as_slice() == b".text")
+        .unwrap()
+        .id();
+    let text = builder
+        .sections
+        .iter_mut()
+        .find(|section| section.name.as_slice() == b".text")
+        .unwrap();
+    text.data = object::build::elf::SectionData::Data(vec![0x90; 0x200].into());
+    text.sh_size = 0x200;
+    let dynsym = builder.sections.add();
+    dynsym.name = b".dynsym"[..].into();
+    dynsym.sh_type = object::elf::SHT_DYNSYM;
+    dynsym.sh_flags = u64::from(object::elf::SHF_ALLOC);
+    dynsym.sh_addralign = 8;
+    dynsym.data = object::build::elf::SectionData::DynamicSymbol;
+    let dynstr = builder.sections.add();
+    dynstr.name = b".dynstr"[..].into();
+    dynstr.sh_type = object::elf::SHT_STRTAB;
+    dynstr.sh_flags = u64::from(object::elf::SHF_ALLOC);
+    dynstr.sh_addralign = 1;
+    dynstr.data = object::build::elf::SectionData::DynamicString;
+
+    let reference = builder.dynamic_symbols.add();
+    reference.name = b"_stext"[..].into();
+    reference.st_value = reference_address;
+    reference.set_st_info(object::elf::STB_GLOBAL, object::elf::STT_NOTYPE);
+    if dynamic_text {
+        reference.section = Some(text_id);
+        let entry = builder.dynamic_symbols.add();
+        entry.name = b"elf_dyn_kernel_entry"[..].into();
+        entry.st_value = 0xffff_ffff_8100_0070;
+        entry.st_size = 32;
+        entry.set_st_info(object::elf::STB_GLOBAL, object::elf::STT_FUNC);
+        entry.section = Some(text_id);
+    } else {
+        reference.st_shndx = object::elf::SHN_ABS;
+    }
+    let text = builder
+        .sections
+        .iter()
+        .find(|section| section.name.as_slice() == b".text")
+        .unwrap();
+    assert_eq!(text.sh_addr, 0xffff_ffff_8100_0000);
+    assert_eq!(text.sh_size, 0x200);
+
+    builder.set_section_sizes();
+    let segment = builder.segments.add();
+    segment.p_type = object::elf::PT_LOAD;
+    segment.p_flags = object::elf::PF_R | object::elf::PF_X;
+    segment.p_vaddr = 0xffff_ffff_80ff_f000;
+    segment.p_paddr = segment.p_vaddr;
+    segment.p_filesz = 0x1000;
+    segment.p_memsz = 0x1000;
+    segment.p_align = 16;
+    for section in &mut builder.sections {
+        if section.sh_flags & u64::from(object::elf::SHF_ALLOC) != 0 {
+            segment.append_section(section);
+        }
+    }
+    builder.set_section_sizes();
+    let mut bytes = Vec::new();
+    builder.write(&mut bytes).unwrap();
+    let parsed = object::File::parse(bytes.as_slice()).unwrap();
+    let text = parsed.section_by_name(".text").unwrap();
+    assert_eq!(text.address(), 0xffff_ffff_8100_0000);
+    assert_eq!(text.size(), 0x200);
+    assert!(
+        parsed.symbols().any(|symbol| symbol.name() == Ok("_stext"))
+            || parsed
+                .symbols()
+                .any(|symbol| symbol.name() == Ok("not_stext"))
+    );
+    assert!(
+        parsed
+            .dynamic_symbols()
+            .any(|symbol| symbol.name() == Ok("_stext"))
+    );
+    if dynamic_text {
+        assert!(parsed.dynamic_symbols().any(|symbol| {
+            symbol.name() == Ok("elf_dyn_kernel_entry")
+                && symbol.address() == 0xffff_ffff_8100_0070
+                && symbol.section_index() == Some(text.index())
+        }));
+    }
+    assert_eq!(parsed.build_id().unwrap(), Some(&[0xa5; 20][..]));
     std::fs::write(elf, bytes).unwrap();
 }
 
@@ -6054,6 +6236,154 @@ fn automatic_kernel_elf_zero_reference_stops_at_first_physical_alias_like_native
     let (script, stderr, native) = query_native_automatic_kernel_cache(root.path());
     assert_native_cached_kernel_elf_selected(root.path(), &elf, &script, &stderr);
     assert!(script.contains(" [unknown] ("), "{script}\n{stderr}");
+    assert_automatic_kernel_routes(root.path(), &bytes, &native);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn automatic_kernel_elf_missing_regular_reference_retries_dynsym_like_native_perf() {
+    let (root, original, elf) = write_native_cached_kernel_elf_fixture(Some(&[0xa5; 20]), true);
+    rewrite_native_cached_kernel_elf_reference(&elf, false);
+    add_native_cached_kernel_elf_dynamic_symbols(&elf, 0xffff_ffff_8100_0000, true);
+    let bytes = rewrite_native_cached_kernel_elf_fixture_mapping(
+        root.path(),
+        &original,
+        0x20_0000,
+        false,
+        0x70,
+    );
+    let (script, stderr, native) = query_native_automatic_kernel_cache(root.path());
+    assert_native_cached_kernel_elf_selected(root.path(), &elf, &script, &stderr);
+    assert!(
+        script.contains("elf_dyn_kernel_entry+0x0 ("),
+        "{script}\n{stderr}"
+    );
+    assert_eq!(native, b"worker;elf_dyn_kernel_entry 1\n");
+    assert_automatic_kernel_routes(root.path(), &bytes, &native);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn automatic_kernel_elf_zero_regular_reference_retries_dynsym_like_native_perf() {
+    let (root, original, elf) = write_native_cached_kernel_elf_fixture(Some(&[0xa5; 20]), true);
+    zero_native_cached_kernel_elf_reference(&elf);
+    add_native_cached_kernel_elf_dynamic_symbols(&elf, 0xffff_ffff_8100_0000, true);
+    let bytes = rewrite_native_cached_kernel_elf_fixture_mapping(
+        root.path(),
+        &original,
+        0x20_0000,
+        false,
+        0x70,
+    );
+    let (script, stderr, native) = query_native_automatic_kernel_cache(root.path());
+    assert_native_cached_kernel_elf_selected(root.path(), &elf, &script, &stderr);
+    assert!(
+        script.contains("elf_dyn_kernel_entry+0x0 ("),
+        "{script}\n{stderr}"
+    );
+    assert_eq!(native, b"worker;elf_dyn_kernel_entry 1\n");
+    assert_automatic_kernel_routes(root.path(), &bytes, &native);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn automatic_kernel_elf_regular_reference_precedes_competing_dynsym_at_entry_like_native_perf() {
+    let (root, original, elf) = write_native_cached_kernel_elf_fixture(Some(&[0xa5; 20]), true);
+    add_native_cached_kernel_elf_dynamic_symbols(&elf, 0xffff_ffff_8100_0100, true);
+    let bytes = rewrite_native_cached_kernel_elf_fixture_mapping(
+        root.path(),
+        &original,
+        0x20_0000,
+        false,
+        0x10,
+    );
+    let (script, stderr, native) = query_native_automatic_kernel_cache(root.path());
+    assert_native_cached_kernel_elf_selected(root.path(), &elf, &script, &stderr);
+    assert!(
+        script.contains("ffffffff81200010 elf_kernel_entry+0x0 ("),
+        "native perf did not resolve the regular-table entry: {script}\n{stderr}"
+    );
+    assert_eq!(native, b"worker;elf_kernel_entry 1\n");
+    assert_automatic_kernel_routes(root.path(), &bytes, &native);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn automatic_kernel_elf_dynsym_reference_without_text_preserves_unmapped_result_like_native_perf() {
+    let (root, original, elf) = write_native_cached_kernel_elf_fixture(Some(&[0xa5; 20]), true);
+    rewrite_native_cached_kernel_elf_reference(&elf, false);
+    add_native_cached_kernel_elf_dynamic_symbols(&elf, 0xffff_ffff_8100_0000, false);
+    let bytes = rewrite_native_cached_kernel_elf_fixture_mapping(
+        root.path(),
+        &original,
+        0x20_0000,
+        false,
+        0x70,
+    );
+    let (script, stderr, native) = query_native_automatic_kernel_cache(root.path());
+    assert_native_cached_kernel_elf_selected(root.path(), &elf, &script, &stderr);
+    assert!(script.contains(" [unknown] ("), "{script}\n{stderr}");
+    assert_eq!(native, b"worker;[unknown] 1\n");
+    assert_automatic_kernel_routes(root.path(), &bytes, &native);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn automatic_kernel_elf_dynamic_reference_without_text_keeps_original_text_map() {
+    let (root, original, elf) = write_native_cached_kernel_elf_fixture(Some(&[0xa5; 20]), true);
+    rewrite_native_cached_kernel_elf_reference(&elf, false);
+    add_native_cached_kernel_elf_dynamic_symbols(&elf, 0xffff_ffff_8100_0000, false);
+    let bytes =
+        rewrite_native_cached_kernel_elf_fixture_mapping(root.path(), &original, 0, false, 0x10);
+    rewrite_native_cached_kernel_elf_recorded_reference(root.path(), &bytes, 0xffff_ffff_8120_0000);
+    let bytes = std::fs::read(root.path().join("perf.data")).unwrap();
+    let (script, stderr, native) = query_native_automatic_kernel_cache(root.path());
+    assert_native_cached_kernel_elf_selected(root.path(), &elf, &script, &stderr);
+    assert!(
+        script.contains("ffffffff81000010 elf_kernel_entry+0x0 ("),
+        "{script}\n{stderr}"
+    );
+    assert_eq!(native, b"worker;elf_kernel_entry 1\n");
+    assert_automatic_kernel_routes(root.path(), &bytes, &native);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn automatic_kernel_elf_zero_regular_reference_keeps_unshifted_text_map() {
+    let (root, original, elf) = write_native_cached_kernel_elf_fixture(Some(&[0xa5; 20]), true);
+    zero_native_cached_kernel_elf_reference(&elf);
+    let bytes =
+        rewrite_native_cached_kernel_elf_fixture_mapping(root.path(), &original, 0, false, 0x10);
+    rewrite_native_cached_kernel_elf_recorded_reference(root.path(), &bytes, 0xffff_ffff_8120_0000);
+    let bytes = std::fs::read(root.path().join("perf.data")).unwrap();
+    let (script, stderr, native) = query_native_automatic_kernel_cache(root.path());
+    assert_native_cached_kernel_elf_selected(root.path(), &elf, &script, &stderr);
+    assert!(
+        script.contains("ffffffff81000010 elf_kernel_entry+0x0 ("),
+        "{script}\n{stderr}"
+    );
+    assert_eq!(native, b"worker;elf_kernel_entry 1\n");
+    assert_automatic_kernel_routes(root.path(), &bytes, &native);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn automatic_kernel_elf_regular_additional_map_keeps_first_pass_delta() {
+    let (root, original, elf) = write_native_cached_kernel_elf_fixture(Some(&[0xa5; 20]), true);
+    add_native_cached_kernel_elf_init_text(&elf);
+    rewrite_native_cached_kernel_elf_reference(&elf, false);
+    add_native_cached_kernel_elf_dynamic_symbols(&elf, 0xffff_ffff_8100_0000, true);
+    let bytes =
+        rewrite_native_cached_kernel_elf_fixture_mapping(root.path(), &original, 0, false, 0x210);
+    rewrite_native_cached_kernel_elf_recorded_reference(root.path(), &bytes, 0xffff_ffff_8120_0000);
+    let bytes = std::fs::read(root.path().join("perf.data")).unwrap();
+    let (script, stderr, native) = query_native_automatic_kernel_cache(root.path());
+    assert_native_cached_kernel_elf_selected(root.path(), &elf, &script, &stderr);
+    assert!(
+        script.contains("ffffffff81000210 elf_init_entry+0x0 ("),
+        "{script}\n{stderr}"
+    );
+    assert_eq!(native, b"worker;elf_init_entry 1\n");
     assert_automatic_kernel_routes(root.path(), &bytes, &native);
 }
 
