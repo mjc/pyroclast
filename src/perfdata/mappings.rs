@@ -21,6 +21,21 @@ thread_local! {
     static FRAME_MAPPING_TRANSLATION_CLASSIFICATIONS: Cell<usize> = const { Cell::new(0) };
     static FRAME_MAPPING_USER_CLASSIFICATIONS: Cell<usize> = const { Cell::new(0) };
     static FRAME_MAPPING_HINT_LOADS: Cell<usize> = const { Cell::new(0) };
+    static LOADED_MODULE_HASH_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct LoadedModuleHasher;
+
+#[cfg(test)]
+impl std::hash::BuildHasher for LoadedModuleHasher {
+    type Hasher = <FxBuildHasher as std::hash::BuildHasher>::Hasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        LOADED_MODULE_HASH_CALLS.with(|calls| calls.set(calls.get() + 1));
+        std::hash::BuildHasher::build_hasher(&FxBuildHasher)
+    }
 }
 
 #[cfg(test)]
@@ -47,7 +62,6 @@ pub struct MmapTable {
     has_global_mappings: bool,
     has_global_executable_mappings: bool,
     generation: u64,
-    loaded_modules: HashSet<usize, FxBuildHasher>,
     #[cfg(test)]
     index_searches: std::cell::Cell<usize>,
     #[cfg(test)]
@@ -468,6 +482,7 @@ struct NativeDso {
     symbol_build_id: OnceCell<Option<Vec<u8>>>,
     file_identity: Option<FileIdentity>,
     is_kernel_core: bool,
+    loaded: bool,
 }
 
 impl NativeDso {
@@ -654,6 +669,7 @@ impl NativeDsoRegistry {
             symbol_build_id: OnceCell::new(),
             file_identity,
             is_kernel_core: false,
+            loaded: false,
         };
         if !self.sorted {
             self.entries.push(dso);
@@ -1564,7 +1580,7 @@ impl MmapTable {
     }
 
     pub(crate) fn kernel_cursor(&self, frame: MappedFrame<'_>) -> Option<KernelMapCursor> {
-        (frame.is_kernel() && !self.loaded_modules.contains(&frame.mapping.native_dso_id))
+        (frame.is_kernel() && !self.native_dsos.entries[frame.mapping.native_dso_id].loaded)
             .then(|| {
                 self.mappings.slots.iter().position(|slot| {
                     #[cfg(test)]
@@ -1586,7 +1602,7 @@ impl MmapTable {
         frame.mapping.cpumode == PERF_RECORD_MISC_CPUMODE_KERNEL
             && frame.mapping.module_display.is_some()
             && frame.mapping.kernel_module_lookup.is_none()
-            && !self.loaded_modules.contains(&frame.mapping.native_dso_id)
+            && !self.native_dsos.entries[frame.mapping.native_dso_id].loaded
     }
 
     pub(crate) fn publish_kernel_module(
@@ -1597,9 +1613,12 @@ impl MmapTable {
         let Some(parent) = self.mappings.get_cursor(cursor) else {
             return;
         };
-        if !self.loaded_modules.insert(parent.native_dso_id) {
+        let dso = &mut self.native_dsos.entries[parent.native_dso_id];
+        if dso.loaded {
             return;
         }
+        // symbol.c:dso__load sets loaded even on a failed/empty load.
+        dso.loaded = true;
         let parent = parent.clone();
         let index = cursor.slot;
         let metadata = &loaded.metadata;
@@ -1635,7 +1654,7 @@ impl MmapTable {
                         .add(&child.path, child_name.clone(), None, None);
                 // Native marks a new section DSO loaded even without a
                 // usable projection. Same-name reuse retains existing state.
-                self.loaded_modules.insert(child.native_dso_id);
+                self.native_dsos.entries[child.native_dso_id].loaded = true;
                 child.synthetic_module_child = true;
                 child.module_display = Some(Arc::from(child_name));
                 child.kernel_module_lookup = metadata
@@ -1733,7 +1752,7 @@ impl MmapTable {
     }
 
     pub(crate) fn finish_failed_module_attempt(&mut self, native_dso_id: usize) {
-        self.loaded_modules.insert(native_dso_id);
+        self.native_dsos.entries[native_dso_id].loaded = true;
     }
 
     pub(crate) fn host_kernel_mappings(&self) -> impl Iterator<Item = HostKernelMappingRef<'_>> {
@@ -2212,6 +2231,73 @@ mod tests {
     }
 
     #[test]
+    fn loaded_module_checks_do_not_hash_auxiliary_membership() {
+        let mut table = super::MmapTable::default();
+        test_module_mapping(&mut table);
+        let mut cache = super::MappingResolveCache::default();
+        let frame = table
+            .frame_context(7, &mut cache)
+            .resolve(0x1010, &mut cache)
+            .unwrap();
+        let id = frame.native_dso_id();
+        assert!(table.module_needs_publication(frame));
+        assert!(table.kernel_cursor(frame).is_some());
+        table.finish_failed_module_attempt(id);
+        let before = super::LOADED_MODULE_HASH_CALLS.with(std::cell::Cell::get);
+        for _ in 0..64 {
+            let frame = table
+                .frame_context(7, &mut cache)
+                .resolve(0x1010, &mut cache)
+                .unwrap();
+            assert!(!table.module_needs_publication(frame));
+            assert!(table.kernel_cursor(frame).is_none());
+        }
+        let calls = super::LOADED_MODULE_HASH_CALLS.with(std::cell::Cell::get) - before;
+        assert_eq!(
+            calls, 0,
+            "loaded DSO state must not require an auxiliary hash lookup"
+        );
+    }
+
+    #[test]
+    fn loaded_membership_hash_probe_counts_real_hash_construction() {
+        let mut set = super::HashSet::<usize, super::LoadedModuleHasher>::default();
+        set.insert(7);
+        let before = super::LOADED_MODULE_HASH_CALLS.with(std::cell::Cell::get);
+        assert!(set.contains(&7));
+        assert!(super::LOADED_MODULE_HASH_CALLS.with(std::cell::Cell::get) > before);
+    }
+
+    #[test]
+    fn native_dso_load_state_survives_order_growth_aliases_and_table_clones() {
+        let mut table = super::MmapTable::default();
+        test_module_mapping(&mut table);
+        let id = table.native_dsos.intern_module("/tmp/a.ko", None);
+        table.finish_failed_module_attempt(id);
+        table.native_dsos.sort();
+        for path in ["/tmp/z.ko", "/tmp/0.ko", "/tmp/m.ko"] {
+            let other = table.native_dsos.intern_module(path, None);
+            assert!(!table.native_dsos.entries[other].loaded);
+        }
+        assert_eq!(table.native_dsos.intern_module("/tmp/a.ko", None), id);
+        assert!(table.native_dsos.entries[id].loaded);
+        let mut cloned = table.clone();
+        assert!(cloned.native_dsos.entries[id].loaded);
+        let other = cloned.native_dsos.intern_module("/tmp/z.ko", None);
+        cloned.finish_failed_module_attempt(other);
+        assert!(!table.native_dsos.entries[other].loaded);
+        assert_eq!(table.native_dsos.entries[id].id, id);
+        assert!(
+            table
+                .native_dsos
+                .order
+                .iter()
+                .copied()
+                .any(|entry| entry == id)
+        );
+    }
+
+    #[test]
     fn accepted_zero_sized_module_section_keeps_nonzero_empty_end() {
         let mut table = super::MmapTable::default();
         test_module_mapping(&mut table);
@@ -2363,7 +2449,7 @@ mod tests {
             "loaded child must not discover a new ID"
         );
         assert_eq!(probe.initializations.get(), 0);
-        assert!(table.loaded_modules.contains(&child.native_dso_id()));
+        assert!(table.native_dsos.entries[child.native_dso_id()].loaded);
         assert!(!table.module_needs_publication(child));
         let parent = table.retained_kernel_frame(cursor, 0x1010).unwrap();
         table.symbol_mapping_ref(parent, Some(&probe));
@@ -2705,6 +2791,7 @@ mod tests {
             inode_generation: 0,
         };
         let dso = |inode: Option<u64>, byte| super::NativeDso {
+            loaded: false,
             id: 0,
             path: "/object".into(),
             short_name: "object".into(),
