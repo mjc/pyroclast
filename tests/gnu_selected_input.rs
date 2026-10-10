@@ -91,6 +91,7 @@ fn selected_request(path: &Path) -> SymbolRequest {
         addr2line_address: None,
         kernel_module_address: None,
         path: path.to_owned(),
+        symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
         relative_address: address,
         kernel_mapping_range: None,
         build_id: None,
@@ -365,6 +366,7 @@ fn gnu_sessions_preserve_distinct_objects_unknowns_and_batch_order() {
         ..request.clone()
     };
     let unknown = SymbolRequest {
+        symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
         relative_address: u64::MAX,
         ..request.clone()
     };

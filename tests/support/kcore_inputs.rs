@@ -353,6 +353,7 @@ mod module_inputs {
             addr2line_address: None,
             kernel_module_address: None,
             path: mapping.path.into(),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: mapping.relative_address,
             kernel_mapping_range: Some((mapping.start, mapping.end)),
             build_id: Some(build_id),

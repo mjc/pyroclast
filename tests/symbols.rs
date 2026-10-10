@@ -26,6 +26,7 @@ fn test_symbol_request(path_index: u8, relative_address: u16) -> SymbolRequest {
         kernel_module_address: None,
         path: PathBuf::from(format!("/bin/app{}", path_index % 4)),
         relative_address: u64::from(relative_address),
+        symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
         kernel_mapping_range: None,
         build_id: None,
         file_identity: None,
@@ -106,6 +107,7 @@ fn resolves_each_unique_symbol_address_once() {
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("/bin/app"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0x10,
             kernel_mapping_range: None,
             build_id: None,
@@ -121,6 +123,7 @@ fn resolves_each_unique_symbol_address_once() {
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("/bin/app"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0x10,
             kernel_mapping_range: None,
             build_id: None,
@@ -133,6 +136,7 @@ fn resolves_each_unique_symbol_address_once() {
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("/bin/app"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0x10,
             kernel_mapping_range: None,
             build_id: None,
@@ -149,6 +153,7 @@ fn resolves_each_unique_symbol_address_once() {
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("/bin/app"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0x10,
             kernel_mapping_range: None,
             build_id: None,
@@ -165,6 +170,7 @@ fn symbol_resolver_frame_batch_defaults_to_single_symbol_frames() {
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("/bin/app"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0x10,
             kernel_mapping_range: None,
             build_id: None,
@@ -179,6 +185,7 @@ fn symbol_resolver_frame_batch_defaults_to_single_symbol_frames() {
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("/bin/app"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0x10,
             kernel_mapping_range: None,
             build_id: None,
@@ -197,6 +204,7 @@ fn batches_only_uncached_symbol_addresses() {
         kernel_module_address: None,
         path: PathBuf::from("/bin/app"),
         relative_address,
+        symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
         kernel_mapping_range: None,
         build_id: None,
         file_identity: None,
@@ -327,6 +335,7 @@ fn addr2line_resolver_batches_requests_by_binary() {
                 addr2line_address: None,
                 kernel_module_address: None,
                 path: path.clone(),
+                symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
                 relative_address: 0x10,
                 kernel_mapping_range: None,
                 build_id: None,
@@ -337,6 +346,7 @@ fn addr2line_resolver_batches_requests_by_binary() {
                 addr2line_address: None,
                 kernel_module_address: None,
                 path,
+                symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
                 relative_address: 0x20,
                 kernel_mapping_range: None,
                 build_id: None,
@@ -367,6 +377,7 @@ fn addr2line_resolver_does_not_spawn_for_missing_objects() {
             addr2line_address: None,
             kernel_module_address: None,
             path: root.path().join("missing-object"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0x10,
             kernel_mapping_range: None,
             build_id: None,
@@ -439,6 +450,7 @@ fn scalar_dual_address_fixture() -> (tempfile::NamedTempFile, SymbolRequest) {
     );
     let request = SymbolRequest {
         path: file.path().into(),
+        symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
         relative_address: 0x1008,
         addr2line_address: Some(0x1018),
         ..test_symbol_request(0, 0)
@@ -499,6 +511,7 @@ fn addr2line_resolver_prefers_perf_object_alias_over_underscored_addr2line_name(
             addr2line_address: None,
             kernel_module_address: None,
             path: object_path,
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0x1008,
             kernel_mapping_range: None,
             build_id: None,
@@ -531,6 +544,7 @@ fn rust_addr2line_resolver_reads_symbol_table_names() {
             addr2line_address: None,
             kernel_module_address: None,
             path: current_exe,
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: symbol.address(),
             kernel_mapping_range: None,
             build_id: None,
@@ -570,6 +584,7 @@ fn rust_addr2line_resolver_preserves_qualified_symtab_name_like_perf() {
             addr2line_address: None,
             kernel_module_address: None,
             path: object_path,
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0x1180,
             kernel_mapping_range: None,
             build_id: None,
@@ -615,6 +630,7 @@ fn symbolizer_selector_can_use_rust_addr2line_without_process_runner() {
             addr2line_address: None,
             kernel_module_address: None,
             path: current_exe,
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: symbol.address(),
             kernel_mapping_range: None,
             build_id: None,
@@ -846,6 +862,7 @@ fn symbol_parity_source_lined_function_keeps_symtab_alias_without_inline_childre
         addr2line_address: None,
         kernel_module_address: None,
         path: binary,
+        symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
         relative_address: address,
         kernel_mapping_range: None,
         build_id: None,
@@ -898,6 +915,7 @@ fn rust_addr2line_resolver_keeps_perf_symtab_alias_without_debug_line() {
             addr2line_address: None,
             kernel_module_address: None,
             path: binary,
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: address,
             kernel_mapping_range: None,
             build_id: None,
@@ -987,6 +1005,7 @@ fn rust_addr2line_bfd_fallback_uses_raw_zero_sized_alias_extent_like_binutils() 
             addr2line_address: None,
             kernel_module_address: None,
             path: binary,
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: address,
             kernel_mapping_range: None,
             build_id: None,
@@ -1079,6 +1098,7 @@ fn bfd_fallback_without_file_symbols_preserves_debug_line_and_matches_native() {
         addr2line_address: None,
         kernel_module_address: None,
         path: binary,
+        symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
         relative_address: address,
         kernel_mapping_range: None,
         build_id: None,
@@ -1230,6 +1250,7 @@ fn bfd_fallback_preserves_native_function_cache_across_address_order() {
         addr2line_address: None,
         kernel_module_address: None,
         path: binary.clone(),
+        symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
         relative_address: address,
         kernel_mapping_range: None,
         build_id: None,
@@ -1288,6 +1309,7 @@ fn assert_bfd_fallback_assembly_matches_native(
             addr2line_address: None,
             kernel_module_address: None,
             path: binary,
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: address,
             kernel_mapping_range: None,
             build_id: None,
@@ -1316,6 +1338,7 @@ fn rust_addr2line_resolver_keeps_elf_outer_name_for_cargo_read_to_end() {
         // PERF_RECORD_MMAP2 maps cargo at 0x6231444cf000 with file offset
         // 0x6fc000. perf's `map__dso_map_ip` first forms 0x1763636, then
         // `map__rip_2objdump` adds the user-DSO text offset 0x1000.
+        symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
         relative_address: 0x0176_4636,
         kernel_mapping_range: None,
         build_id: None,
@@ -1371,6 +1394,7 @@ fn rust_addr2line_resolver_uses_addr2line_realfunc_record_for_rust_object_alias_
                 addr2line_address: None,
                 kernel_module_address: None,
                 path: cargo,
+                symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
                 relative_address: 0x0106_d883,
                 kernel_mapping_range: None,
                 build_id: None,
@@ -1397,6 +1421,7 @@ fn rust_addr2line_resolver_uses_perf_dwarf_names_for_inline_frames() {
             addr2line_address: None,
             kernel_module_address: None,
             path: profiling_binary.clone(),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: address,
             kernel_mapping_range: None,
             build_id: None,
@@ -1429,6 +1454,7 @@ fn addr2line_resolver_uses_perf_dwarf_names_for_inline_frames() {
             addr2line_address: None,
             kernel_module_address: None,
             path: profiling_binary.clone(),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: address,
             kernel_mapping_range: None,
             build_id: None,
@@ -1455,6 +1481,7 @@ fn addr2line_inline_resolver_requires_a_perf_base_symbol() {
         addr2line_address: None,
         kernel_module_address: None,
         path: object.path().to_path_buf(),
+        symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
         relative_address: 0x1000,
         kernel_mapping_range: None,
         build_id: None,
@@ -1487,6 +1514,7 @@ fn rust_addr2line_resolver_uses_object_symbol_for_non_inline_frames_like_perf_sc
             addr2line_address: None,
             kernel_module_address: None,
             path: profiling_binary.clone(),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: address,
             kernel_mapping_range: None,
             build_id: None,
@@ -1517,6 +1545,7 @@ fn rust_addr2line_resolver_synthesizes_x86_64_plt_symbols_like_perf_script() {
             addr2line_address: None,
             kernel_module_address: None,
             path: libc,
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0x287a4,
             kernel_mapping_range: None,
             build_id: None,
@@ -1595,6 +1624,7 @@ fn rust_addr2line_resolver_replaces_base_symbol_when_perf_inline_name_differs() 
             addr2line_address: None,
             kernel_module_address: None,
             path: profiling_binary,
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: address,
             kernel_mapping_range: None,
             build_id: None,
@@ -1734,6 +1764,7 @@ fn symbol_requests(profiling_binary: &Path, addresses: &[u64]) -> Vec<SymbolRequ
             addr2line_address: None,
             kernel_module_address: None,
             path: profiling_binary.to_path_buf(),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: *address,
             kernel_mapping_range: None,
             build_id: None,
@@ -1824,6 +1855,7 @@ fn addr2line_resolver_treats_failed_batches_without_object_aliases_as_unresolved
                 addr2line_address: None,
                 kernel_module_address: None,
                 path: path.clone(),
+                symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
                 relative_address: 0x10,
                 kernel_mapping_range: None,
                 build_id: None,
@@ -1834,6 +1866,7 @@ fn addr2line_resolver_treats_failed_batches_without_object_aliases_as_unresolved
                 addr2line_address: None,
                 kernel_module_address: None,
                 path,
+                symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
                 relative_address: 0x20,
                 kernel_mapping_range: None,
                 build_id: None,
@@ -2146,6 +2179,7 @@ ffffffff88000080 t asm_exc_page_fault
                 addr2line_address: None,
                 kernel_module_address: None,
                 path: PathBuf::from("[kernel.kallsyms]"),
+                symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
                 relative_address: 0xffff_ffff_8800_008f,
                 kernel_mapping_range: None,
                 build_id: None,
@@ -2156,6 +2190,7 @@ ffffffff88000080 t asm_exc_page_fault
                 addr2line_address: None,
                 kernel_module_address: None,
                 path,
+                symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
                 relative_address: 0x10,
                 kernel_mapping_range: None,
                 build_id: None,
@@ -2192,6 +2227,7 @@ fn load_module_test_core(resolver: &impl SymbolResolver) {
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0xffff_ffff_8469_97a0,
             kernel_mapping_range: None,
             build_id: None,
@@ -2241,6 +2277,7 @@ ffffffffc0e66200 t zpl_iter_read_next [zfs]
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("[zfs]"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0xffff_ffff_c0e6_61e9,
             kernel_mapping_range: None,
             build_id: None,
@@ -2258,6 +2295,7 @@ ffffffffc0e66200 t zpl_iter_read_next [zfs]
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("[zfs]"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0xffff_ffff_c0e6_61ea,
             kernel_mapping_range: None,
             build_id: None,
@@ -2279,6 +2317,7 @@ fn perf_symbol_resolver_module_gap_uses_one_backend_lookup_and_preserves_user_mo
         fixture_resolver
             .resolve_batch(&[SymbolRequest {
                 path: path.clone(),
+                symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
                 relative_address: 0x1010,
                 addr2line_address: None,
                 kernel_module_address: None,
@@ -2299,6 +2338,7 @@ fn perf_symbol_resolver_module_gap_uses_one_backend_lookup_and_preserves_user_mo
     load_module_test_core(&resolver);
     let request = SymbolRequest {
         path,
+        symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
         relative_address: 0x10,
         addr2line_address: None,
         kernel_module_address: Some(0xffff_ffff_c100_0010),
@@ -2310,11 +2350,13 @@ fn perf_symbol_resolver_module_gap_uses_one_backend_lookup_and_preserves_user_mo
     let requests = [
         request.clone(),
         SymbolRequest {
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0x80,
             kernel_module_address: Some(0xffff_ffff_c100_0080),
             ..request.clone()
         },
         SymbolRequest {
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0x1010,
             kernel_module_address: None,
             kernel_mapping_range: None,
@@ -2353,6 +2395,7 @@ fn selected_kallsyms_core_misses_do_not_fall_through_to_other_sources() {
     let alternative = "ffffffff81000000 T alternative_core\n";
     let request = SymbolRequest {
         path: "[kernel.kallsyms]".into(),
+        symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
         relative_address: 0xffff_ffff_8100_0010,
         addr2line_address: None,
         kernel_module_address: None,
@@ -2430,6 +2473,7 @@ ffffffff82000000 T later_kernel_symbol
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]_text"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0xffff_ffff_8800_1280,
             kernel_mapping_range: None,
             build_id: None,
@@ -2467,6 +2511,7 @@ fn perf_symbol_resolver_loads_perfdata_kernel_build_id_cache() {
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0xffff_ffff_8800_008f,
             kernel_mapping_range: None,
             build_id: None,
@@ -2504,6 +2549,7 @@ fn perf_symbol_resolver_loads_kernel_build_id_cache_from_delivered_maps() {
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0xffff_ffff_8800_008f,
             kernel_mapping_range: None,
             build_id: None,
@@ -2540,6 +2586,7 @@ fn perf_symbol_resolver_loads_kernel_metadata_only_with_delivered_kernel_maps() 
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0xffff_ffff_8800_008f,
             kernel_mapping_range: None,
             build_id: None,
@@ -2666,6 +2713,7 @@ fn perf_symbol_resolver_constructor_uses_perfdata_cache_before_system_kallsyms()
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0xffff_ffff_8800_008f,
             kernel_mapping_range: None,
             build_id: None,
@@ -2707,6 +2755,7 @@ fn perf_symbol_resolver_does_not_use_system_map_for_recorded_kernel_build_id_wit
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0xffff_ffff_8800_008f,
             kernel_mapping_range: None,
             build_id: None,
@@ -2758,6 +2807,7 @@ fn check_live_module_build_id_without_cache(core_first: bool) {
         addr2line_address: None,
         kernel_module_address: None,
         path: PathBuf::from("[zfs]"),
+        symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
         relative_address: 0xffff_ffff_c0ed_5ffa,
         kernel_mapping_range: Some((0xffff_ffff_c0e0_0000, 0xffff_ffff_c10f_0000)),
         build_id: Some("25c900692553622cb73db68330349ea739893267".to_string()),
@@ -2830,6 +2880,7 @@ ffffffff914e8fa0 t mp_map_pin_to_irq
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0xffff_ffff_90ee_91f1,
             kernel_mapping_range: None,
             build_id: None,
@@ -2877,6 +2928,7 @@ fn perf_symbol_resolver_uses_perfdata_kallsyms_when_cached_kernel_elf_is_invalid
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0xffff_ffff_8800_008f,
             kernel_mapping_range: None,
             build_id: None,
@@ -2912,6 +2964,7 @@ fn perf_symbol_resolver_rejects_invalid_kernel_build_id_elf_when_kallsyms_is_mis
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0xffff_ffff_8800_008f,
             kernel_mapping_range: None,
             build_id: None,
@@ -2973,6 +3026,7 @@ fn check_kernel_build_id_elf_note(matching_note: bool) {
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0xffff_ffff_8800_008f,
             kernel_mapping_range: None,
             build_id: None,
@@ -3012,6 +3066,7 @@ ffffffff846997a0 T __pi_memcpy
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0xffff_ffff_8469_97ac,
             kernel_mapping_range: None,
             build_id: None,
@@ -3050,6 +3105,7 @@ ffffffff846997a0 T memcpy
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0xffff_ffff_8469_97ac,
             kernel_mapping_range: None,
             build_id: None,
@@ -3104,6 +3160,7 @@ ffffffffc0e17dae t zfs_read [zfs]
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("[zfs]"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0xffff_ffff_c0e1_7dae,
             kernel_mapping_range: None,
             build_id: None,
@@ -3124,6 +3181,7 @@ ffffffffc0e17dae t zfs_read [zfs]
                 addr2line_address: None,
                 kernel_module_address: None,
                 path: PathBuf::from("[zfs]"),
+                symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
                 relative_address: 0xffff_ffff_c0e1_7dae,
                 kernel_mapping_range: None,
                 build_id: None,
@@ -3168,6 +3226,7 @@ fn perf_symbol_resolver_core_first_rejects_live_symbols_from_other_modules() {
         addr2line_address: None,
         kernel_module_address: None,
         path: PathBuf::from("[alpha]"),
+        symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
         relative_address: 0xffff_ffff_c000_2008,
         kernel_mapping_range: None,
         build_id: None,
@@ -3178,11 +3237,13 @@ fn perf_symbol_resolver_core_first_rejects_live_symbols_from_other_modules() {
         .resolve_batch(&[
             request.clone(),
             SymbolRequest {
+                symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
                 relative_address: 0xffff_ffff_c000_3008,
                 ..request.clone()
             },
             SymbolRequest {
                 path: PathBuf::from("[missing]"),
+                symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
                 relative_address: 0xffff_ffff_c000_3008,
                 ..request
             },
@@ -3211,6 +3272,7 @@ fn shared_kernel_resolution_rejects_addresses_beyond_file_backed_core_map() {
         addr2line_address: None,
         kernel_module_address: None,
         path: "[kernel.kallsyms]".into(),
+        symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
         relative_address: address,
         kernel_mapping_range: Some((0xffff_ffff_8800_0000, 0xffff_ffff_8800_2000)),
         build_id: None,
@@ -3219,6 +3281,7 @@ fn shared_kernel_resolution_rejects_addresses_beyond_file_backed_core_map() {
     };
     let requests = [
         SymbolRequest {
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0xffff_ffff_8800_1010,
             ..request.clone()
         },
@@ -3239,6 +3302,73 @@ fn shared_kernel_resolution_rejects_addresses_beyond_file_backed_core_map() {
             pyroclast::symbols::SymbolDsoName::Unmapped
         );
     }
+}
+
+#[test]
+fn module_projection_metadata_is_scoped_to_its_resolver_owner() {
+    use pyroclast::symbols::SymbolLookup;
+
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("module.ko");
+    std::fs::write(&path, elf_with_static_text_symbol(b"entry", 0x1000, 64))
+        .expect("write module ELF");
+    let request = SymbolRequest {
+        path: path.clone(),
+        relative_address: 0x1010,
+        symbol_lookup: SymbolLookup::VirtualAddress,
+        addr2line_address: None,
+        kernel_module_address: Some(0xffff_ffff_c100_0010),
+        kernel_mapping_range: Some((0xffff_ffff_c100_0000, 0xffff_ffff_c100_1000)),
+        build_id: None,
+        file_identity: None,
+        kernel_relocation: None,
+    };
+
+    let resolver_a = RustAddr2lineResolver::new();
+    let metadata_a = resolver_a
+        .selected_object_module_metadata(&path, &request)
+        .expect("resolver A module metadata");
+    let projection_a = metadata_a
+        .lookup_projection
+        .expect("resolver A projection ID");
+    let (section, file_offset) = metadata_a.text_section.expect("module text layout");
+    let foreign_request = SymbolRequest {
+        symbol_lookup: SymbolLookup::KernelModuleSection {
+            projection: projection_a,
+            section,
+            offset: file_offset + 0x10,
+        },
+        ..request.clone()
+    };
+
+    let resolver_b = RustAddr2lineResolver::new();
+    let foreign = resolver_b
+        .resolve_base_frame_batch_with_metadata(std::slice::from_ref(&foreign_request))
+        .expect("foreign projection lookup is nonfatal");
+    assert!(foreign[0].frames.is_empty());
+    assert!(!foreign[0].has_base_symbol);
+
+    let metadata_b = resolver_b
+        .selected_object_module_metadata(&path, &request)
+        .expect("resolver B module metadata");
+    let projection_b = metadata_b
+        .lookup_projection
+        .expect("resolver B projection ID");
+    assert_ne!(projection_a, projection_b);
+    let (section, file_offset) = metadata_b.text_section.expect("module text layout");
+    let owned_request = SymbolRequest {
+        symbol_lookup: SymbolLookup::KernelModuleSection {
+            projection: projection_b,
+            section,
+            offset: file_offset + 0x10,
+        },
+        ..request
+    };
+    let owned = resolver_b
+        .resolve_base_frame_batch_with_metadata(&[owned_request])
+        .expect("resolver B own projection lookup");
+    assert_eq!(owned[0].frames, ["entry+0x10"]);
+    assert!(owned[0].has_base_symbol);
 }
 
 fn check_live_module_recorded_bounds(core_first: bool) {
@@ -3271,6 +3401,7 @@ ffffffffc1800000 T later_nf_tables_symbol [nf_tables]
         addr2line_address: None,
         kernel_module_address: None,
         path: PathBuf::from("[nf_tables]"),
+        symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
         relative_address: 0xffff_ffff_c11d_c2c0,
         kernel_mapping_range: None,
         build_id: None,
@@ -3351,6 +3482,7 @@ igb 4096 0 - Live 0xffffffffc1e17000
         addr2line_address: None,
         kernel_module_address: None,
         path: PathBuf::from("[zfs]"),
+        symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
         relative_address: 0xffff_ffff_c0e1_7dae,
         kernel_mapping_range: None,
         build_id: None,
@@ -3384,6 +3516,7 @@ ffffffffc2e17dae t unrelated_module_symbol [mlx5]
         addr2line_address: None,
         kernel_module_address: None,
         path: PathBuf::from("[igb]"),
+        symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
         relative_address: 0xffff_ffff_c1e1_7dae,
         kernel_mapping_range: None,
         build_id: None,
@@ -3442,6 +3575,7 @@ ffffffffc0e38940 t nvs_xdr_nvp_op [zfs]
         addr2line_address: None,
         kernel_module_address: None,
         path: PathBuf::from("[zfs]"),
+        symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
         relative_address: 0xffff_ffff_c0e3_8b71,
         kernel_mapping_range: None,
         build_id: Some(build_id.to_string()),
@@ -3499,6 +3633,7 @@ ffffffff846997a0 T memcpy
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0xffff_ffff_8469_97ac,
             kernel_mapping_range: None,
             build_id: None,
@@ -3544,6 +3679,7 @@ fn perf_symbol_resolver_note_only_module_elf_stays_unknown_without_bare_gnu_look
     let actual = resolver
         .resolve_batch(&[SymbolRequest {
             path: "[igb]".into(),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0x30,
             addr2line_address: None,
             kernel_module_address: None,
@@ -3602,6 +3738,7 @@ fn check_module_build_id_elf(has_symtab: bool) {
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("[igb]"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0x30,
             kernel_mapping_range: None,
             build_id: Some(build_id.to_string()),
@@ -3633,6 +3770,7 @@ fn perf_symbol_resolver_uses_vdso_build_id_cache_layout_like_perf_script() {
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("[vdso]"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0x970,
             kernel_mapping_range: None,
             build_id: Some(build_id.to_string()),
@@ -3665,6 +3803,7 @@ fn perf_symbol_resolver_uses_live_vdso_copy_without_build_id_like_perf_script() 
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("[vdso]"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0x129a,
             kernel_mapping_range: None,
             build_id: None,
@@ -3697,6 +3836,7 @@ fn perf_symbol_resolver_does_not_use_native_vdso_for_compat_requests() {
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from(path),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0x100,
             kernel_mapping_range: None,
             build_id: None,
@@ -3729,6 +3869,7 @@ fn perf_symbol_resolver_accepts_pluggable_object_resolver() {
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("/bin/app"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0x10,
             kernel_mapping_range: None,
             build_id: None,
@@ -3744,6 +3885,7 @@ fn perf_symbol_resolver_accepts_pluggable_object_resolver() {
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("/bin/app"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0x10,
             kernel_mapping_range: None,
             build_id: None,
@@ -3759,6 +3901,7 @@ fn perf_symbol_resolver_accepts_pluggable_object_resolver() {
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("/bin/app"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0x10,
             kernel_mapping_range: None,
             build_id: None,
@@ -3790,6 +3933,7 @@ fn perf_symbol_resolver_translates_live_object_file_offsets_to_virtual_addresses
             addr2line_address: None,
             kernel_module_address: None,
             path: path.clone(),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: virtual_address,
             kernel_mapping_range: None,
             build_id: None,
@@ -3805,6 +3949,7 @@ fn perf_symbol_resolver_translates_live_object_file_offsets_to_virtual_addresses
             addr2line_address: None,
             kernel_module_address: None,
             path: path.clone(),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: file_offset,
             kernel_mapping_range: None,
             build_id: None,
@@ -3820,6 +3965,7 @@ fn perf_symbol_resolver_translates_live_object_file_offsets_to_virtual_addresses
             addr2line_address: None,
             kernel_module_address: None,
             path,
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: virtual_address,
             kernel_mapping_range: None,
             build_id: None,
@@ -3836,6 +3982,7 @@ fn perf_symbol_resolver_preserves_pluggable_object_frame_lists() {
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("/bin/app"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0x10,
             kernel_mapping_range: None,
             build_id: None,
@@ -3851,6 +3998,7 @@ fn perf_symbol_resolver_preserves_pluggable_object_frame_lists() {
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("/bin/app"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0x10,
             kernel_mapping_range: None,
             build_id: None,
@@ -3873,6 +4021,7 @@ fn perf_symbol_resolver_uses_live_user_object_despite_recorded_identity_mismatch
             addr2line_address: None,
             kernel_module_address: None,
             path: object_path.path().to_path_buf(),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0x10,
             kernel_mapping_range: None,
             build_id: None,
@@ -3888,6 +4037,7 @@ fn perf_symbol_resolver_uses_live_user_object_despite_recorded_identity_mismatch
             addr2line_address: None,
             kernel_module_address: None,
             path: object_path.path().to_path_buf(),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0x10,
             kernel_mapping_range: None,
             build_id: None,
@@ -3908,6 +4058,7 @@ fn perf_symbol_resolver_uses_live_user_object_despite_recorded_identity_mismatch
             addr2line_address: None,
             kernel_module_address: None,
             path: object_path.path().to_path_buf(),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0x10,
             kernel_mapping_range: None,
             build_id: None,
@@ -3935,6 +4086,7 @@ fn perf_symbol_resolver_uses_system_map_candidates_when_cache_is_missing() {
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("[kernel.kallsyms]_text"),
+            symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
             relative_address: 0xffff_ffff_8100_1280,
             kernel_mapping_range: None,
             build_id: None,
@@ -3979,6 +4131,7 @@ fn perf_symbol_resolver_keeps_live_kallsyms_for_modules_when_system_map_exists()
                 addr2line_address: None,
                 kernel_module_address: None,
                 path: PathBuf::from("[kernel.kallsyms]_text"),
+                symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
                 relative_address: 0xffff_ffff_8100_1280,
                 kernel_mapping_range: None,
                 build_id: None,
@@ -3989,6 +4142,7 @@ fn perf_symbol_resolver_keeps_live_kallsyms_for_modules_when_system_map_exists()
                 addr2line_address: None,
                 kernel_module_address: None,
                 path: PathBuf::from("[zfs]"),
+                symbol_lookup: pyroclast::symbols::SymbolLookup::VirtualAddress,
                 relative_address: 0xffff_ffff_c0e1_7dae,
                 kernel_mapping_range: None,
                 build_id: None,

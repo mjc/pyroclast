@@ -1,6 +1,8 @@
 #[cfg(unix)]
 mod gnu;
 pub(crate) mod kcore;
+mod perf_lookup;
+mod perf_tree;
 
 use std::borrow::{Borrow, Cow};
 use std::cell::Cell;
@@ -15,6 +17,7 @@ use std::io::{Seek, SeekFrom, Write as IoWrite};
 use std::num::NonZeroU64;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use clap::ValueEnum;
@@ -57,6 +60,9 @@ pub struct KernelRelocation {
 pub struct SymbolRequest {
     pub path: PathBuf,
     pub relative_address: u64,
+    /// Native coordinate used by perf's ELF symbol table. Production mapping
+    /// requests preserve file offsets or the selected kernel section domain.
+    pub symbol_lookup: SymbolLookup,
     /// Optional perf objdump address for DWARF/inline lookup. The base-symbol
     /// VMA can differ when the mapping and .text have different ELF biases.
     pub addr2line_address: Option<u64>,
@@ -66,6 +72,21 @@ pub struct SymbolRequest {
     pub build_id: Option<String>,
     pub file_identity: Option<FileIdentity>,
     pub kernel_relocation: Option<KernelRelocation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum SymbolLookup {
+    VirtualAddress,
+    UserFileOffset(u64),
+    KernelSection {
+        section: u32,
+        offset: u64,
+    },
+    KernelModuleSection {
+        projection: u64,
+        section: u32,
+        offset: u64,
+    },
 }
 
 impl SymbolRequest {
@@ -90,6 +111,7 @@ impl SymbolRequest {
 impl PartialEq for SymbolRequest {
     fn eq(&self, other: &Self) -> bool {
         self.relative_address == other.relative_address
+            && self.symbol_lookup == other.symbol_lookup
             && self.inline_address() == other.inline_address()
             && self.kernel_module_address == other.kernel_module_address
             && self.kernel_mapping_range == other.kernel_mapping_range
@@ -106,6 +128,7 @@ impl Hash for SymbolRequest {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.path.as_os_str().hash(state);
         self.relative_address.hash(state);
+        self.symbol_lookup.hash(state);
         self.inline_address().hash(state);
         self.kernel_module_address.hash(state);
         self.kernel_mapping_range.hash(state);
@@ -127,6 +150,7 @@ impl Ord for SymbolRequest {
             .as_os_str()
             .cmp(other.path.as_os_str())
             .then_with(|| self.relative_address.cmp(&other.relative_address))
+            .then_with(|| self.symbol_lookup.cmp(&other.symbol_lookup))
             .then_with(|| self.inline_address().cmp(&other.inline_address()))
             .then_with(|| self.kernel_module_address.cmp(&other.kernel_module_address))
             .then_with(|| self.kernel_mapping_range.cmp(&other.kernel_mapping_range))
@@ -150,8 +174,28 @@ pub struct KernelModuleSectionMap {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct KernelModuleObjectMetadata {
     pub text_address: Option<u64>,
+    pub text_section: Option<(u32, u64)>,
     pub maps: Vec<KernelModuleSectionMap>,
+    pub lookup_projection: Option<u64>,
 }
+
+#[derive(Clone, Debug)]
+struct KernelModuleSectionLayout {
+    index: u32,
+    virtual_address: u64,
+    file_offset: u64,
+    executable: bool,
+    text: bool,
+}
+
+#[derive(Clone, Debug)]
+struct KernelModuleSymbolProjection {
+    sections: Vec<KernelModuleSectionLayout>,
+    core_sections: Vec<u32>,
+    relocatable: bool,
+}
+
+static NEXT_KERNEL_MODULE_PROJECTION: AtomicU64 = AtomicU64::new(1);
 
 pub trait SymbolResolver {
     /// Supplies the currently delivered host kernel maps before symbol loading.
@@ -730,10 +774,13 @@ struct ObjectSegmentRange {
     file_offset: u64,
     file_end: u64,
     virtual_address: u64,
+    virtual_end: u64,
 }
 
 struct ObjectSectionRange {
+    index: u32,
     virtual_address: u64,
+    file_offset: u64,
     size: u64,
     regular_present: bool,
     dynamic_present: bool,
@@ -768,7 +815,11 @@ enum KernelObjectRequest {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum KernelElfAddressDecision {
-    Mapped { base: u64, inline: u64 },
+    Mapped {
+        base: u64,
+        inline: u64,
+        symbol_lookup: SymbolLookup,
+    },
     Unmapped,
     Preserve,
 }
@@ -942,12 +993,25 @@ struct PerfObjectSymbolNames<'a> {
 
 #[derive(Default)]
 struct PerfObjectSymbolIndex {
-    symbols: Vec<PerfSymbolCandidate>,
-    max_end_by_index: Vec<u64>,
+    candidates: Vec<PerfSymbolCandidate>,
+    sections_by_candidate: Vec<Option<u32>>,
+    kernel_base_eligible: Vec<bool>,
+    regular_count: usize,
+    table_candidate_count: usize,
+    plt_header_phase: Option<PerfPltHeaderPhase>,
+    load_segments: Vec<ObjectSegmentRange>,
+    elf_sections: Vec<ObjectSectionRange>,
+    relocatable: bool,
+    user_file_offsets: PerfSymbolLookupIndex,
+    kernel_sections: Mutex<FxHashMap<u32, PerfSymbolLookupIndex>>,
+    kernel_module_projections: Mutex<FxHashMap<u64, Arc<KernelModuleSymbolProjection>>>,
+    kernel_module_sections: Mutex<FxHashMap<(u64, u32), PerfSymbolLookupIndex>>,
     bfd_only_symbols: Vec<PerfSymbolCandidate>,
     bfd_sections: Vec<BfdSymbolSection>,
     bfd_function_cache: Mutex<Option<BfdFunctionRecordCache>>,
 }
+
+use perf_lookup::{PerfPltHeaderPhase, PerfSymbolLookupIndex, PerfSymbolLookupRecord};
 
 #[derive(Clone, Copy)]
 enum BfdSymbolIndex {
@@ -967,6 +1031,14 @@ struct BfdFunctionRecordCache {
     symbol: BfdSymbolIndex,
     offset: u64,
     size: u64,
+}
+
+struct ObjectSymbolCandidates {
+    candidates: Vec<PerfSymbolCandidate>,
+    bfd_only_symbols: Vec<PerfSymbolCandidate>,
+    regular_count: usize,
+    sections_by_candidate: Vec<Option<u32>>,
+    kernel_base_eligible: Vec<bool>,
 }
 
 pub struct PerfSymbolResolver<O> {
@@ -3359,6 +3431,7 @@ where
         let mut object_request = SymbolRequest {
             path: path.clone(),
             relative_address,
+            symbol_lookup: SymbolLookup::VirtualAddress,
             addr2line_address: None,
             kernel_module_address: None,
             kernel_mapping_range: None,
@@ -3381,8 +3454,13 @@ where
                 })
         });
         match decision {
-            Some(KernelElfAddressDecision::Mapped { base, inline }) => {
+            Some(KernelElfAddressDecision::Mapped {
+                base,
+                inline,
+                symbol_lookup,
+            }) => {
                 object_request.relative_address = base;
+                object_request.symbol_lookup = symbol_lookup;
                 object_request.addr2line_address = Some(inline);
                 Some(KernelObjectRequest::Mapped(object_request))
             }
@@ -3427,16 +3505,31 @@ where
                 .kernel_module_address
                 .unwrap_or(request.relative_address)
                 .checked_sub(start)
-            && let Some(text_address) = self
+            && let Some(metadata) = self
                 .object_resolver
                 .selected_object_module_metadata(&selected.path, request)
-                .and_then(|metadata| metadata.text_address)
+            && let Some(text_address) = metadata.text_address
             && let Some(address) = text_address.checked_add(offset)
         {
             // symbol-elf.c:dso__process_kernel_symbol remaps .text's pgoff;
             // adjusted symbol file offsets map back to this retained text VMA.
             // Recorded module pgoff is not the post-load text-section offset.
             selected.relative_address = address;
+            if let Some((section, file_offset)) = metadata.text_section
+                && let Some(section_offset) = file_offset.checked_add(offset)
+            {
+                selected.symbol_lookup = metadata.lookup_projection.map_or(
+                    SymbolLookup::KernelSection {
+                        section,
+                        offset: section_offset,
+                    },
+                    |projection| SymbolLookup::KernelModuleSection {
+                        projection,
+                        section,
+                        offset: section_offset,
+                    },
+                );
+            }
         }
         Some(selected)
     }
@@ -3453,6 +3546,7 @@ where
             clean_object_symbol_request_with_cache(
                 elf,
                 request.relative_address,
+                request.symbol_lookup,
                 address_cache,
                 is_kernel_symbol_request(request),
             )
@@ -3468,6 +3562,7 @@ where
         clean_object_symbol_request_with_cache(
             request.path.clone(),
             request.relative_address,
+            request.symbol_lookup,
             address_cache,
             is_kernel_symbol_request(request),
         )
@@ -3496,6 +3591,7 @@ where
         Some(clean_object_symbol_request_with_cache(
             live_vdso.path.clone(),
             request.relative_address,
+            request.symbol_lookup,
             address_cache,
             false,
         ))
@@ -3653,6 +3749,14 @@ where
                     KernelElfAddressDecision::Mapped {
                         base: runtime_address.wrapping_sub(delta),
                         inline: runtime_address.wrapping_sub(inline_delta),
+                        symbol_lookup: SymbolLookup::KernelSection {
+                            section: section.index,
+                            offset: section.file_offset.wrapping_add(
+                                runtime_address
+                                    .wrapping_sub(delta)
+                                    .wrapping_sub(section.virtual_address),
+                            ),
+                        },
                     }
                 })
             })
@@ -3759,12 +3863,19 @@ where
 #[cfg(test)]
 fn clean_object_symbol_request(path: PathBuf, relative_address: u64) -> SymbolRequest {
     let mut address_cache = ObjectAddressCache::default();
-    clean_object_symbol_request_with_cache(path, relative_address, &mut address_cache, false)
+    clean_object_symbol_request_with_cache(
+        path,
+        relative_address,
+        SymbolLookup::VirtualAddress,
+        &mut address_cache,
+        false,
+    )
 }
 
 fn clean_object_symbol_request_with_cache(
     path: PathBuf,
     relative_address: u64,
+    symbol_lookup: SymbolLookup,
     address_cache: &mut ObjectAddressCache,
     kernel: bool,
 ) -> SymbolRequest {
@@ -3788,6 +3899,7 @@ fn clean_object_symbol_request_with_cache(
         kernel_module_address: None,
         path,
         relative_address,
+        symbol_lookup,
         kernel_mapping_range: None,
         build_id: None,
         file_identity: None,
@@ -3948,6 +4060,9 @@ fn object_load_segment_ranges(path: &Path) -> Option<ObjectAddressMetadata> {
                 file_offset,
                 file_end: file_offset.checked_add(file_size)?,
                 virtual_address: segment.address(),
+                virtual_end: segment
+                    .address()
+                    .checked_add(segment.size().max(file_size))?,
             })
         })
         .collect::<Vec<_>>();
@@ -4002,7 +4117,9 @@ fn read_kernel_elf_map_metadata(path: &Path) -> Option<KernelElfMapMetadata> {
         }
         if section.size() > 0 {
             sections.push(ObjectSectionRange {
+                index: u32::try_from(section.index().0).ok()?,
                 virtual_address: section.address(),
+                file_offset: elf_section_layout(&object, section.index())?.1,
                 size: section.size(),
                 regular_present: regular_sections.contains(&section.index()),
                 dynamic_present: dynamic_sections.contains(&section.index()),
@@ -4155,7 +4272,7 @@ where
                 let object_symbol = selected
                     .metadata
                     .object_metadata
-                    .object_symbol(request.relative_address);
+                    .object_symbol(request.symbol_lookup, request.relative_address);
                 let symbol = perf_name_with_object_alias(symbol, object_symbol);
                 resolved[index] = symbol;
             }
@@ -4358,7 +4475,7 @@ impl SymbolResolver for RustAddr2lineResolver {
                 let request = &requests[index];
                 let object_symbol = object_metadata
                     .object_metadata
-                    .object_symbol(request.relative_address);
+                    .object_symbol(request.symbol_lookup, request.relative_address);
                 let symbol = loader
                     .find_symbol(request.relative_address)
                     .map(demangle_addr2line_name_qualified)
@@ -4480,7 +4597,13 @@ impl SymbolResolver for RustAddr2lineResolver {
 }
 
 fn object_source_state(metadata: Option<&CachedObjectMetadata>) -> SymbolSourceState {
-    if metadata.is_none_or(|metadata| metadata.object_metadata.object_symbols.symbols.is_empty()) {
+    if metadata.is_none_or(|metadata| {
+        metadata
+            .object_metadata
+            .object_symbols
+            .candidates
+            .is_empty()
+    }) {
         SymbolSourceState::Unavailable
     } else {
         SymbolSourceState::AddressDependent
@@ -4495,9 +4618,10 @@ fn prepare_inline_object_symbols<'a>(
     let symbols: SmallVec<[PerfObjectSymbolNames<'a>; 16]> = indexes
         .iter()
         .map(|&index| {
-            metadata
-                .object_metadata
-                .object_symbol_names(requests[index].relative_address)
+            metadata.object_metadata.object_symbol_names(
+                requests[index].symbol_lookup,
+                requests[index].relative_address,
+            )
         })
         .collect();
     // perf machine.c:append_inlines never calls libdw/addr2line for symbol gaps.
@@ -4528,8 +4652,11 @@ fn resolve_base_frames_from_object_metadata(
         }
         for index in indexes {
             let request = &requests[index];
-            let object_symbols =
-                object_symbols_for_frame(metadata.as_ref(), request.relative_address);
+            let object_symbols = object_symbols_for_frame(
+                metadata.as_ref(),
+                request.symbol_lookup,
+                request.relative_address,
+            );
             let Some(object_symbol) = object_symbols.bare else {
                 continue;
             };
@@ -4613,10 +4740,13 @@ fn perf_frames_with_object_alias_and_offset(
 
 fn object_symbols_for_frame(
     metadata: Option<&Arc<CachedObjectMetadata>>,
+    lookup: SymbolLookup,
     address: u64,
 ) -> PerfObjectSymbolNames<'_> {
     metadata.map_or_else(PerfObjectSymbolNames::default, |metadata| {
-        metadata.object_metadata.object_symbol_names(address)
+        metadata
+            .object_metadata
+            .object_symbol_names(lookup, address)
     })
 }
 
@@ -4731,8 +4861,8 @@ fn perf_symbol_is_allocated_candidate<'data, R: object::read::ReadRef<'data>>(
     sh_flags & u64::from(object::elf::SHF_ALLOC) != 0
 }
 
-fn elf_section_layout(
-    object: &object::File<'_>,
+fn elf_section_layout<'data, R: object::read::ReadRef<'data>>(
+    object: &object::File<'data, R>,
     index: object::SectionIndex,
 ) -> Option<(u32, u64)> {
     use object::read::elf::SectionHeader as _;
@@ -4805,12 +4935,18 @@ fn kernel_module_max_text_offset(runtime: &object::File<'_>) -> u64 {
     max_text_offset
 }
 
-fn kernel_module_object_metadata(bytes: &[u8], runtime_bytes: &[u8]) -> KernelModuleObjectMetadata {
+fn kernel_module_object_metadata(
+    bytes: &[u8],
+    runtime_bytes: &[u8],
+) -> (
+    KernelModuleObjectMetadata,
+    Option<Arc<KernelModuleSymbolProjection>>,
+) {
     let Ok(object) = object::File::parse(bytes) else {
-        return KernelModuleObjectMetadata::default();
+        return (KernelModuleObjectMetadata::default(), None);
     };
     let Ok(runtime) = object::File::parse(runtime_bytes) else {
-        return KernelModuleObjectMetadata::default();
+        return (KernelModuleObjectMetadata::default(), None);
     };
     // symbol-elf.c:dso__load_sym requires a kernel symtab before dynsym,
     // and elf__needs_adjust_symbols accepts all three ordinary ELF kinds.
@@ -4823,17 +4959,26 @@ fn kernel_module_object_metadata(bytes: &[u8], runtime_bytes: &[u8]) -> KernelMo
                 | object::ObjectKind::Relocatable
         )
     {
-        return KernelModuleObjectMetadata::default();
+        return (KernelModuleObjectMetadata::default(), None);
     }
     let max_text_offset = kernel_module_max_text_offset(&runtime);
+    let projection = Arc::new(kernel_module_symbol_projection(
+        &object,
+        &runtime,
+        max_text_offset,
+    ));
+    let projection_id = NEXT_KERNEL_MODULE_PROJECTION.fetch_add(1, AtomicOrdering::Relaxed);
     let mut maps = Vec::new();
     let mut seen = FxHashSet::default();
     let mut text_address = None;
+    let mut text_section = None;
     for table in [object.symbols(), object.dynamic_symbols()] {
         // dso__load_sym_internal resets remap_kernel for each table pass.
         let mut text_remapped = false;
         for symbol in table {
-            if !perf_symbol_is_allocated_candidate(&object, &symbol) {
+            if !symbol.name().is_ok_and(kernel_elf_name_is_eligible)
+                || !perf_symbol_is_allocated_candidate(&object, &symbol)
+            {
                 continue;
             }
             let Some(index) = symbol.section_index() else {
@@ -4869,6 +5014,12 @@ fn kernel_module_object_metadata(bytes: &[u8], runtime_bytes: &[u8]) -> KernelMo
                     } else {
                         section.address()
                     });
+                    text_section =
+                        elf_section_layout(section_owner, index).and_then(|(_, file_offset)| {
+                            u32::try_from(index.0)
+                                .ok()
+                                .map(|section| (section, file_offset))
+                        });
                     text_remapped = true;
                 }
                 continue;
@@ -4888,22 +5039,72 @@ fn kernel_module_object_metadata(bytes: &[u8], runtime_bytes: &[u8]) -> KernelMo
             });
         }
     }
-    KernelModuleObjectMetadata { text_address, maps }
+    (
+        KernelModuleObjectMetadata {
+            text_address,
+            text_section,
+            maps,
+            lookup_projection: Some(projection_id),
+        },
+        Some(projection),
+    )
 }
 
-fn perf_symbol_candidate_search_end(candidate: &PerfSymbolCandidate) -> u64 {
-    candidate.address.saturating_add(if candidate.size == 0 {
-        1
-    } else {
-        candidate.size
-    })
-}
-
-fn perf_symbol_candidate_contains_address(candidate: &PerfSymbolCandidate, address: u64) -> bool {
-    if candidate.size == 0 {
-        candidate.address == address
-    } else {
-        address >= candidate.address && address < candidate.address.saturating_add(candidate.size)
+fn kernel_module_symbol_projection(
+    object: &object::File<'_>,
+    runtime: &object::File<'_>,
+    max_text_offset: u64,
+) -> KernelModuleSymbolProjection {
+    let mut sections = Vec::new();
+    for source_section in object.sections() {
+        if !matches!(source_section.flags(), object::SectionFlags::Elf { sh_flags }
+            if sh_flags & u64::from(object::elf::SHF_ALLOC) != 0)
+        {
+            continue;
+        }
+        let Some((source_type, _)) = elf_section_layout(object, source_section.index()) else {
+            continue;
+        };
+        let section_owner = if source_type == object::elf::SHT_NOBITS {
+            runtime
+        } else {
+            object
+        };
+        let Ok(section) = section_owner.section_by_index(source_section.index()) else {
+            continue;
+        };
+        let Some((_, file_offset)) = elf_section_layout(section_owner, source_section.index())
+        else {
+            continue;
+        };
+        let executable = matches!(section.flags(), object::SectionFlags::Elf { sh_flags }
+            if sh_flags & u64::from(object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR)
+                == u64::from(object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR));
+        let Ok(index) = u32::try_from(source_section.index().0) else {
+            continue;
+        };
+        sections.push(KernelModuleSectionLayout {
+            index,
+            virtual_address: section.address(),
+            file_offset,
+            executable,
+            text: section.name().ok() == Some(".text"),
+        });
+    }
+    let core_sections = sections
+        .iter()
+        .filter(|section| {
+            section.text
+                || (max_text_offset != 0
+                    && section.executable
+                    && section.file_offset <= max_text_offset)
+        })
+        .map(|section| section.index)
+        .collect();
+    KernelModuleSymbolProjection {
+        sections,
+        core_sections,
+        relocatable: object.kind() == object::ObjectKind::Relocatable,
     }
 }
 
@@ -4911,8 +5112,8 @@ fn perf_best_duplicate_symbol<'a>(
     current: &'a PerfSymbolCandidate,
     candidate: &'a PerfSymbolCandidate,
 ) -> &'a PerfSymbolCandidate {
-    // tools/perf/util/symbol.c choose_best_symbol(): size, typed, non-weak,
-    // global, fewer leading underscores, then longest name.
+    // tools/perf/util/symbol.c:158 orders size, type, binding and scope;
+    // its default architecture hook retains the earlier canonical symbol.
     if current.size == 0 && candidate.size > 0 {
         return candidate;
     }
@@ -4974,17 +5175,19 @@ impl PreparedObjectMetadata {
         }
     }
 
-    fn object_symbol(&self, address: u64) -> Option<&str> {
-        self.object_symbols.symbol_name(address)
+    fn object_symbol(&self, lookup: SymbolLookup, address: u64) -> Option<&str> {
+        self.object_symbols
+            .candidate_for_lookup(lookup, address)
+            .map(|(candidate, _, _)| candidate.name.as_str())
     }
 
-    fn object_symbol_names(&self, address: u64) -> PerfObjectSymbolNames<'_> {
+    fn object_symbol_names(&self, lookup: SymbolLookup, address: u64) -> PerfObjectSymbolNames<'_> {
         self.object_symbols
-            .symbol(address)
-            .map_or_else(PerfObjectSymbolNames::default, |symbol| {
+            .candidate_for_lookup(lookup, address)
+            .map_or_else(PerfObjectSymbolNames::default, |(symbol, start, query)| {
                 PerfObjectSymbolNames {
                     bare: Some(&symbol.name),
-                    offset: Some(address.saturating_sub(symbol.address)),
+                    offset: Some(query.saturating_sub(start)),
                 }
             })
     }
@@ -4997,45 +5200,136 @@ impl PreparedObjectMetadata {
 }
 
 impl PerfObjectSymbolIndex {
+    #[cfg(test)]
+    fn from_test_candidates(candidates: Vec<PerfSymbolCandidate>) -> Self {
+        let count = candidates.len();
+        let records = (0..count)
+            .map(|candidate| PerfSymbolLookupRecord {
+                candidate,
+                start: candidates[candidate].address,
+                end: candidates[candidate]
+                    .address
+                    .saturating_add(candidates[candidate].size),
+            })
+            .collect();
+        let user_file_offsets = PerfSymbolLookupIndex::from_elf_tables(
+            records,
+            std::slice::from_ref(&(0..count)),
+            count..count,
+            &candidates,
+            true,
+        );
+        Self {
+            candidates,
+            sections_by_candidate: vec![None; count],
+            kernel_base_eligible: vec![true; count],
+            regular_count: count,
+            table_candidate_count: count,
+            user_file_offsets,
+            kernel_sections: Mutex::default(),
+            ..Self::default()
+        }
+    }
+
     fn from_object_bytes(object_bytes: &[u8]) -> Self {
         let Ok(object) = object::File::parse(object_bytes) else {
             return Self::default();
         };
         let mut bfd_sections = bfd_symbol_sections(&object);
-        let (mut symbols, bfd_only_symbols) = object_symbol_candidates(&object, &mut bfd_sections);
-        symbols.extend(perf_synthesized_plt_symbols(&object, &symbols));
-        // Remap BFD's references after perf sorting without sorting BFD's
-        // canonical per-section order or duplicating candidate metadata.
-        let mut sorted_symbols: Vec<_> = symbols.into_iter().enumerate().collect();
-        sorted_symbols.sort_by_key(|(_, symbol)| symbol.address);
-        let mut sorted_indexes = vec![0; sorted_symbols.len()];
-        let mut symbols: Vec<_> = sorted_symbols
-            .into_iter()
-            .enumerate()
-            .map(|(sorted, (original, symbol))| {
-                sorted_indexes[original] = sorted;
-                symbol
+        let ObjectSymbolCandidates {
+            mut candidates,
+            bfd_only_symbols,
+            regular_count,
+            mut sections_by_candidate,
+            mut kernel_base_eligible,
+        } = object_symbol_candidates(&object, &mut bfd_sections);
+        let table_candidate_count = candidates.len();
+        let load_segments = object
+            .segments()
+            .filter_map(|segment| {
+                let (file_offset, file_size) = segment.file_range();
+                Some(ObjectSegmentRange {
+                    file_offset,
+                    file_end: file_offset.checked_add(file_size)?,
+                    virtual_address: segment.address(),
+                    virtual_end: segment
+                        .address()
+                        .checked_add(segment.size().max(file_size))?,
+                })
             })
             .collect();
-        for section in &mut bfd_sections {
-            for index in &mut section.symbols {
-                if let BfdSymbolIndex::Perf(index) = index {
-                    *index = sorted_indexes[*index];
-                }
+        let elf_sections = object
+            .sections()
+            .filter_map(|section| {
+                let object::SectionFlags::Elf { sh_flags } = section.flags() else {
+                    return None;
+                };
+                (sh_flags & u64::from(object::elf::SHF_ALLOC) != 0).then_some(())?;
+                let (_, file_offset) = elf_section_layout(&object, section.index())?;
+                Some(ObjectSectionRange {
+                    index: u32::try_from(section.index().0).ok()?,
+                    virtual_address: section.address(),
+                    file_offset,
+                    size: section.size(),
+                    regular_present: false,
+                    dynamic_present: false,
+                    is_text: section.name().ok() == Some(".text"),
+                })
+            })
+            .collect();
+        let relocatable = object.kind() == object::ObjectKind::Relocatable;
+        let (synthesized, remove_plt_header, synthetic_sections) = if table_candidate_count == 0 {
+            (Vec::new(), None, Vec::new())
+        } else {
+            perf_synthesized_plt_symbols(&object, &candidates)
+        };
+        let plt_header_phase = remove_plt_header.map(|remove_before_entries| PerfPltHeaderPhase {
+            candidate: table_candidate_count,
+            remove_before_entries,
+        });
+        sections_by_candidate.extend(synthetic_sections);
+        kernel_base_eligible.extend(std::iter::repeat_n(true, synthesized.len()));
+        candidates.extend(synthesized);
+        let table_ranges = [0..regular_count, regular_count..table_candidate_count];
+        let user_records = candidate_records(&candidates, 0..candidates.len(), |index| {
+            if index >= table_candidate_count {
+                normalize_section_symbol_address(
+                    &object,
+                    &candidates[index],
+                    sections_by_candidate[index],
+                )
+            } else {
+                normalize_user_symbol_address(
+                    &object,
+                    &candidates[index],
+                    sections_by_candidate[index],
+                )
             }
-        }
-        fixup_object_symbol_ends_like_perf(&mut symbols);
-        let mut max_end = 0_u64;
-        let max_end_by_index = symbols
-            .iter()
-            .map(|symbol| {
-                max_end = max_end.max(perf_symbol_candidate_search_end(symbol));
-                max_end
-            })
-            .collect();
+        });
+        // tools/perf/util/symbol-elf.c:1790 fixes and prunes each native
+        // symbol table before inserting later-table and synthetic rows.
+        let user_file_offsets = PerfSymbolLookupIndex::from_elf_tables_with_plt_header(
+            user_records,
+            &table_ranges,
+            table_candidate_count..candidates.len(),
+            &candidates,
+            true,
+            plt_header_phase,
+        );
         Self {
-            symbols,
-            max_end_by_index,
+            candidates,
+            sections_by_candidate,
+            kernel_base_eligible,
+            regular_count,
+            table_candidate_count,
+            plt_header_phase,
+            load_segments,
+            elf_sections,
+            relocatable,
+            user_file_offsets,
+            kernel_sections: Mutex::default(),
+            kernel_module_projections: Mutex::default(),
+            kernel_module_sections: Mutex::default(),
             bfd_only_symbols,
             bfd_sections,
             bfd_function_cache: Mutex::default(),
@@ -5057,39 +5351,202 @@ impl PerfObjectSymbolIndex {
 
     #[cfg(test)]
     fn symbol_name_with_offset(&self, address: u64) -> Option<String> {
-        let candidate = self.symbol(address)?;
-        let offset = address.saturating_sub(candidate.address);
+        let (candidate, start, query) =
+            self.candidate_for_lookup(SymbolLookup::VirtualAddress, address)?;
+        let offset = query.saturating_sub(start);
         Some(format!("{}+0x{offset:x}", candidate.name))
     }
 
     fn symbol(&self, address: u64) -> Option<&PerfSymbolCandidate> {
-        let mut index = self
-            .symbols
-            .partition_point(|candidate| candidate.address <= address);
-        let mut best = None::<&PerfSymbolCandidate>;
-        while index > 0 {
-            index -= 1;
-            if self.max_end_by_index[index] <= address {
-                break;
+        self.candidate_for_lookup(SymbolLookup::VirtualAddress, address)
+            .map(|(candidate, _, _)| candidate)
+    }
+
+    fn candidate_for_lookup(
+        &self,
+        lookup: SymbolLookup,
+        virtual_address: u64,
+    ) -> Option<(&PerfSymbolCandidate, u64, u64)> {
+        // tools/perf/util/symbol.c:437 stops at the first containing RB node;
+        // keep its native start for rendering the base-symbol offset.
+        let (index, address) = match lookup {
+            SymbolLookup::VirtualAddress => (
+                &self.user_file_offsets,
+                self.virtual_to_file_offset(virtual_address)?,
+            ),
+            SymbolLookup::UserFileOffset(offset) => (&self.user_file_offsets, offset),
+            SymbolLookup::KernelSection { section, offset } => {
+                let mut indexes = self.kernel_sections.lock().expect("kernel section indexes");
+                let index = indexes
+                    .entry(section)
+                    .or_insert_with(|| self.build_kernel_section_index(section));
+                return index
+                    .record_at(offset)
+                    .map(|record| (&self.candidates[record.candidate], record.start, offset));
             }
-            let mut candidate = &self.symbols[index];
-            // perf symbol.c:symbols__fixup_duplicate selects the winner
-            // before address lookup, not only among aliases covering the IP.
-            // Keep the raw candidates for BFD's independent function lookup.
-            while index > 0 && self.symbols[index - 1].address == candidate.address {
-                index -= 1;
-                // In-order perf insertion prefers the earlier alias on ties.
-                candidate = perf_best_duplicate_symbol(&self.symbols[index], candidate);
+            SymbolLookup::KernelModuleSection {
+                projection,
+                section,
+                offset,
+            } => {
+                let projection_context = self
+                    .kernel_module_projections
+                    .lock()
+                    .expect("kernel module projections")
+                    .get(&projection)
+                    .cloned()?;
+                let mut indexes = self
+                    .kernel_module_sections
+                    .lock()
+                    .expect("kernel module section indexes");
+                let key = (projection, section);
+                let index = indexes.entry(key).or_insert_with(|| {
+                    self.build_kernel_module_section_index(&projection_context, section)
+                });
+                return index
+                    .record_at(offset)
+                    .map(|record| (&self.candidates[record.candidate], record.start, offset));
             }
-            if !perf_symbol_candidate_contains_address(candidate, address) {
-                continue;
+        };
+        index
+            .record_at(address)
+            .map(|record| (&self.candidates[record.candidate], record.start, address))
+    }
+
+    fn build_kernel_section_index(&self, section: u32) -> PerfSymbolLookupIndex {
+        let section_header = self
+            .elf_sections
+            .iter()
+            .find(|entry| entry.index == section);
+        let records = self
+            .candidates
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| self.sections_by_candidate[*index] == Some(section))
+            .filter(|(index, _)| self.kernel_base_eligible[*index])
+            .filter_map(|(candidate, symbol)| {
+                let header = section_header?;
+                let start = if self.relocatable {
+                    symbol.address.checked_add(header.file_offset)?
+                } else {
+                    symbol
+                        .address
+                        .checked_sub(header.virtual_address)?
+                        .checked_add(header.file_offset)?
+                };
+                Some(PerfSymbolLookupRecord {
+                    candidate,
+                    start,
+                    end: start.saturating_add(symbol.size),
+                })
+            })
+            .collect();
+        let synthetic = self.table_candidate_count..self.candidates.len();
+        let plt_header = self
+            .plt_header_phase
+            .filter(|phase| self.sections_by_candidate[phase.candidate] == Some(section));
+        PerfSymbolLookupIndex::from_elf_tables_with_plt_header(
+            records,
+            &[
+                0..self.regular_count,
+                self.regular_count..self.table_candidate_count,
+            ],
+            synthetic,
+            &self.candidates,
+            section_header.is_some_and(|entry| entry.is_text),
+            plt_header,
+        )
+    }
+
+    fn register_kernel_module_projection(
+        &self,
+        id: u64,
+        projection: Arc<KernelModuleSymbolProjection>,
+    ) {
+        self.kernel_module_projections
+            .lock()
+            .expect("kernel module projections")
+            .insert(id, projection);
+    }
+
+    fn build_kernel_module_section_index(
+        &self,
+        projection: &KernelModuleSymbolProjection,
+        section: u32,
+    ) -> PerfSymbolLookupIndex {
+        let is_core = projection.core_sections.contains(&section);
+        let included_sections = if is_core {
+            projection.core_sections.as_slice()
+        } else {
+            std::slice::from_ref(&section)
+        };
+        let records = self
+            .candidates
+            .iter()
+            .enumerate()
+            .filter_map(|(candidate, symbol)| {
+                if !self.kernel_base_eligible[candidate] {
+                    return None;
+                }
+                let candidate_section = self.sections_by_candidate[candidate]?;
+                if !included_sections.contains(&candidate_section) {
+                    return None;
+                }
+                let layout = projection
+                    .sections
+                    .iter()
+                    .find(|layout| layout.index == candidate_section)?;
+                let start = if projection.relocatable {
+                    symbol.address.checked_add(layout.file_offset)?
+                } else {
+                    symbol
+                        .address
+                        .checked_sub(layout.virtual_address)?
+                        .checked_add(layout.file_offset)?
+                };
+                Some(PerfSymbolLookupRecord {
+                    candidate,
+                    start,
+                    end: start.saturating_add(symbol.size),
+                })
+            })
+            .collect();
+        let synthetic = self.table_candidate_count..self.candidates.len();
+        let plt_header = self.plt_header_phase.filter(|phase| {
+            self.sections_by_candidate[phase.candidate]
+                .is_some_and(|candidate_section| included_sections.contains(&candidate_section))
+        });
+        PerfSymbolLookupIndex::from_elf_tables_with_plt_header(
+            records,
+            &[
+                0..self.regular_count,
+                self.regular_count..self.table_candidate_count,
+            ],
+            synthetic,
+            &self.candidates,
+            is_core,
+            plt_header,
+        )
+    }
+
+    fn virtual_to_file_offset(&self, address: u64) -> Option<u64> {
+        for segment in &self.load_segments {
+            if address >= segment.virtual_address && address < segment.virtual_end {
+                return segment
+                    .file_offset
+                    .checked_add(address.checked_sub(segment.virtual_address)?);
             }
-            best = Some(match best {
-                Some(current) if current.address > candidate.address => current,
-                _ => candidate,
-            });
         }
-        best
+        for section in &self.elf_sections {
+            let end = section.virtual_address.checked_add(section.size)?;
+            if address >= section.virtual_address && address < end {
+                return section
+                    .file_offset
+                    .checked_add(address.checked_sub(section.virtual_address)?);
+            }
+        }
+        // Direct candidate fixtures intentionally exercise the raw-VMA API.
+        (self.load_segments.is_empty() && self.elf_sections.is_empty()).then_some(address)
     }
 
     fn bfd_function_record_symbol(&self, address: u64) -> Option<&PerfSymbolCandidate> {
@@ -5151,7 +5608,7 @@ impl PerfObjectSymbolIndex {
 
     fn bfd_symbol(&self, index: BfdSymbolIndex) -> &PerfSymbolCandidate {
         match index {
-            BfdSymbolIndex::Perf(index) => &self.symbols[index],
+            BfdSymbolIndex::Perf(index) => &self.candidates[index],
             BfdSymbolIndex::BfdOnly(index) => &self.bfd_only_symbols[index],
         }
     }
@@ -5183,10 +5640,12 @@ fn bfd_symbol_sections(object: &object::File<'_>) -> Vec<BfdSymbolSection> {
 fn object_symbol_candidates(
     object: &object::File<'_>,
     bfd_sections: &mut [BfdSymbolSection],
-) -> (Vec<PerfSymbolCandidate>, Vec<PerfSymbolCandidate>) {
+) -> ObjectSymbolCandidates {
     let mut symbols =
         Vec::with_capacity(object.symbols().count() + object.dynamic_symbols().count());
     let mut bfd_only_symbols = Vec::new();
+    let mut candidate_sections = Vec::new();
+    let mut kernel_base_eligible = Vec::new();
     let bfd_section_by_index: FxHashMap<_, _> = bfd_sections
         .iter()
         .enumerate()
@@ -5195,8 +5654,12 @@ fn object_symbol_candidates(
     // addr2line.c:slurp_symtab selects dynsym only when canonical symtab
     // has no entries, not when its entries fail candidate filtering.
     let bfd_dynamic = object.symbols().next().is_none();
+    let mut regular_count = 0;
     for (dynamic, table) in [(false, object.symbols()), (true, object.dynamic_symbols())] {
         for symbol in table {
+            // symbol-elf.c:1659 filters ignored kernel ELF names before
+            // dso__demangle_sym(), so retain this bit beside the raw row.
+            let keep_kernel_base = symbol.name().is_ok_and(kernel_elf_name_is_eligible);
             let perf_candidate = perf_symbol_candidate_from_object_symbol(object, &symbol);
             let bfd_function_like = perf_candidate.as_ref().map_or_else(
                 || bfd_symbol_is_function_like(object.architecture(), &symbol),
@@ -5219,6 +5682,12 @@ fn object_symbol_candidates(
             let index = if is_perf_candidate {
                 let index = BfdSymbolIndex::Perf(symbols.len());
                 symbols.push(candidate);
+                candidate_sections.push(
+                    symbol
+                        .section_index()
+                        .and_then(|section| u32::try_from(section.0).ok()),
+                );
+                kernel_base_eligible.push(keep_kernel_base);
                 index
             } else {
                 let index = BfdSymbolIndex::BfdOnly(bfd_only_symbols.len());
@@ -5229,8 +5698,69 @@ fn object_symbol_candidates(
                 bfd_sections[section].symbols.push(index);
             }
         }
+        if !dynamic {
+            regular_count = symbols.len();
+        }
     }
-    (symbols, bfd_only_symbols)
+    ObjectSymbolCandidates {
+        candidates: symbols,
+        bfd_only_symbols,
+        regular_count,
+        sections_by_candidate: candidate_sections,
+        kernel_base_eligible,
+    }
+}
+
+fn kernel_elf_name_is_eligible(raw_name: &str) -> bool {
+    !raw_name.starts_with('$') && !raw_name.starts_with("L0") && !raw_name.starts_with(".L")
+}
+
+fn candidate_records(
+    candidates: &[PerfSymbolCandidate],
+    range: Range<usize>,
+    mut start_at: impl FnMut(usize) -> Option<u64>,
+) -> Vec<PerfSymbolLookupRecord> {
+    range
+        .filter_map(|candidate| {
+            let start = start_at(candidate)?;
+            Some(PerfSymbolLookupRecord {
+                candidate,
+                start,
+                end: start.saturating_add(candidates[candidate].size),
+            })
+        })
+        .collect()
+}
+
+fn normalize_user_symbol_address<'data, R: object::read::ReadRef<'data>>(
+    object: &object::File<'data, R>,
+    candidate: &PerfSymbolCandidate,
+    section_index: Option<u32>,
+) -> Option<u64> {
+    for segment in object.segments() {
+        let start = segment.address();
+        let end = start.checked_add(segment.size().max(segment.file_range().1))?;
+        if candidate.address >= start && candidate.address < end {
+            let (file_offset, _) = segment.file_range();
+            return file_offset.checked_add(candidate.address - start);
+        }
+    }
+    normalize_section_symbol_address(object, candidate, section_index)
+}
+
+fn normalize_section_symbol_address<'data, R: object::read::ReadRef<'data>>(
+    object: &object::File<'data, R>,
+    candidate: &PerfSymbolCandidate,
+    section_index: Option<u32>,
+) -> Option<u64> {
+    let section = object
+        .section_by_index(object::SectionIndex(section_index? as usize))
+        .ok()?;
+    let (_, file_offset) = elf_section_layout(object, section.index())?;
+    candidate
+        .address
+        .checked_sub(section.address())?
+        .checked_add(file_offset)
 }
 
 fn bfd_function_record_size(candidate: &PerfSymbolCandidate) -> u64 {
@@ -5286,44 +5816,23 @@ fn bfd_function_record_better_fit(
     candidate_size < current_size
 }
 
-fn fixup_object_symbol_ends_like_perf(symbols: &mut [PerfSymbolCandidate]) {
-    // tools/perf/util/symbol-elf.c dso__load_sym_internal() and libbfd.c
-    // bfd2elf__load_symbols() call symbols__fixup_end(..., false) before
-    // duplicate cleanup, extending zero-sized ASM labels to the next symbol.
-    for index in 1..symbols.len() {
-        let current_address = symbols[index].address;
-        let previous = &mut symbols[index - 1];
-        if previous.size == 0 {
-            previous.size = current_address.saturating_sub(previous.address);
-        }
-    }
-    if let Some(last) = symbols.last_mut()
-        && last.size == 0
-    {
-        last.size = round_up_to_page(last.address)
-            .saturating_add(4096)
-            .saturating_sub(last.address);
-    }
-}
-
 fn perf_synthesized_plt_symbols(
     object: &object::File<'_>,
     base_symbols: &[PerfSymbolCandidate],
-) -> Vec<PerfSymbolCandidate> {
+) -> (Vec<PerfSymbolCandidate>, Option<bool>, Vec<Option<u32>>) {
     if object.architecture() != object::Architecture::X86_64 {
-        return Vec::new();
+        return (Vec::new(), None, Vec::new());
     }
     let Some(plt) = object.section_by_name(".plt") else {
-        return Vec::new();
+        return (Vec::new(), None, Vec::new());
     };
+    let relocation_table = perf_x86_64_plt_relocations(object);
     let Some((plt_sec_offset, lazy_plt)) = object
         .section_by_name(".plt.sec")
         .map(|section| (section.address(), false))
         .or_else(|| {
-            let size = plt.size();
-            let has_header = perf_x86_64_plt_relocations(object).is_none_or(|relocations| {
-                u64::try_from(relocations.len())
-                    .map_or(true, |len| len * X86_64_PLT_ENTRY_SIZE != size)
+            let has_header = relocation_table.as_ref().is_none_or(|(_, count)| {
+                u64::try_from(*count).map_or(true, |len| len * X86_64_PLT_ENTRY_SIZE != plt.size())
             });
             Some((
                 plt.address()
@@ -5332,31 +5841,60 @@ fn perf_synthesized_plt_symbols(
             ))
         })
     else {
-        return Vec::new();
+        return (Vec::new(), None, Vec::new());
+    };
+    let plt_sec = object.section_by_name(".plt.sec");
+    let entry_section = plt_sec.as_ref().unwrap_or(&plt);
+    let Some((_, entry_section_file_offset)) = elf_section_layout(object, entry_section.index())
+    else {
+        return (Vec::new(), None, Vec::new());
+    };
+    let (Ok(header_section), Ok(entry_section_index)) = (
+        u32::try_from(plt.index().0),
+        u32::try_from(entry_section.index().0),
+    ) else {
+        return (Vec::new(), None, Vec::new());
+    };
+    let Some(mut plt_file_offset) = plt_sec_offset
+        .checked_sub(entry_section.address())
+        .and_then(|offset| entry_section_file_offset.checked_add(offset))
+    else {
+        return (Vec::new(), None, Vec::new());
     };
 
-    let Some(mut relocations) = perf_x86_64_plt_relocations(object) else {
-        return Vec::new();
-    };
+    let no_lazy_header = lazy_plt
+        && relocation_table.as_ref().is_some_and(|(_, count)| {
+            u64::try_from(*count).is_ok_and(|len| len * X86_64_PLT_ENTRY_SIZE == plt.size())
+        });
+    let mut relocations = relocation_table.map_or_else(Vec::new, |(relocations, _)| relocations);
     relocations.sort_by_key(|relocation| relocation.offset);
 
     let mut plt_offset = plt_sec_offset;
-    let mut symbols = Vec::with_capacity(relocations.len() + usize::from(lazy_plt));
-    if lazy_plt {
-        symbols.push(PerfSymbolCandidate {
-            name: ".plt".to_string(),
-            address: plt.address(),
-            size: X86_64_PLT_ENTRY_SIZE,
-            bfd_size: 0,
-            elf_type: Some(object::elf::STT_FUNC),
-            scope: PerfSymbolScope::Global,
-            binding: PerfSymbolBinding::Global,
-            bfd_function_like: true,
-            bfd_function: true,
-        });
-    }
+    // symbol-elf.c:631-729 inserts the header before relocation entries,
+    // then may remove it only after the raw relocation-table count is known.
+    let mut symbols = Vec::with_capacity(relocations.len() + 1);
+    let mut sections = Vec::with_capacity(relocations.len() + 1);
+    symbols.push(PerfSymbolCandidate {
+        name: ".plt".to_string(),
+        address: plt.address(),
+        size: if lazy_plt {
+            X86_64_PLT_ENTRY_SIZE
+        } else {
+            plt.size()
+        },
+        bfd_size: 0,
+        elf_type: Some(object::elf::STT_FUNC),
+        scope: PerfSymbolScope::Global,
+        binding: PerfSymbolBinding::Global,
+        bfd_function_like: true,
+        bfd_function: true,
+    });
+    sections.push(Some(header_section));
     for relocation in relocations {
         let Some(next_offset) = plt_offset.checked_add(X86_64_PLT_ENTRY_SIZE) else {
+            break;
+        };
+        let Some(next_file_offset) = plt_file_offset.checked_add(X86_64_PLT_ENTRY_SIZE) else {
             break;
         };
         let name = relocation
@@ -5369,7 +5907,7 @@ fn perf_synthesized_plt_symbols(
                     .and_then(|addend| perf_best_symbol_at(base_symbols, addend))
                     .map(|symbol| format!("{}@plt", symbol.name))
             })
-            .unwrap_or_else(|| format!("offset_{plt_offset:#x}@plt"));
+            .unwrap_or_else(|| format!("offset_{plt_file_offset:#x}@plt"));
         symbols.push(PerfSymbolCandidate {
             name,
             address: plt_offset,
@@ -5381,28 +5919,65 @@ fn perf_synthesized_plt_symbols(
             bfd_function_like: true,
             bfd_function: true,
         });
+        sections.push(Some(entry_section_index));
         plt_offset = next_offset;
+        plt_file_offset = next_file_offset;
     }
-    symbols
+    (symbols, Some(no_lazy_header), sections)
 }
 
+#[derive(Clone)]
 struct PerfPltRelocation {
     offset: u64,
     symbol_name: Option<String>,
     ifunc_addend: Option<u64>,
 }
 
-fn perf_x86_64_plt_relocations(object: &object::File<'_>) -> Option<Vec<PerfPltRelocation>> {
-    let dynamic_symbols = object.dynamic_symbol_table()?;
-    let rela_plt = object.section_by_name(".rela.plt")?.data().ok()?;
-    let relocations = rela_plt
-        .as_chunks::<ELF64_RELA_ENTRY_SIZE>()
-        .0
+fn perf_x86_64_plt_relocations(
+    object: &object::File<'_>,
+) -> Option<(Vec<PerfPltRelocation>, usize)> {
+    use object::read::elf::SectionHeader as _;
+
+    let object::File::Elf64(elf) = object else {
+        return None;
+    };
+    let rela = elf.section_by_name(".rela.plt")?;
+    let header = rela.elf_section_header();
+    let link = object::SectionIndex(header.sh_link(elf.endian()) as usize);
+    // symbol-elf.c:664-720 validates the selected table before counting
+    // relocations or deleting the already inserted PLT header.
+    if header.sh_type(elf.endian()) != object::elf::SHT_RELA || link.0 == 0 {
+        return None;
+    }
+    let symbols = if link == elf.elf_dynamic_symbol_table().section() {
+        elf.dynamic_symbol_table()?
+    } else if link == elf.elf_symbol_table().section() {
+        elf.symbol_table()?
+    } else {
+        return None;
+    };
+    let string_section = elf
+        .section_by_index(link)
+        .ok()?
+        .elf_section_header()
+        .sh_link(elf.endian());
+    if elf
+        .section_by_index(object::SectionIndex(usize::try_from(string_section).ok()?))
+        .ok()?
+        .data()
+        .ok()?
+        .is_empty()
+    {
+        return None;
+    }
+    let rela_plt = rela.data().ok()?;
+    let entries = rela_plt.as_chunks::<ELF64_RELA_ENTRY_SIZE>().0;
+    let relocations = entries
         .iter()
         .filter_map(parse_elf64_rela_entry)
-        .filter_map(|rela| perf_x86_64_plt_relocation_from_rela(&dynamic_symbols, rela))
+        .map(|rela| perf_x86_64_plt_relocation_from_rela(&symbols, rela))
         .collect::<Vec<_>>();
-    (!relocations.is_empty()).then_some(relocations)
+    Some((relocations, entries.len()))
 }
 
 #[derive(Clone, Copy)]
@@ -5428,30 +6003,20 @@ fn parse_elf64_rela_entry(entry: &[u8; ELF64_RELA_ENTRY_SIZE]) -> Option<Elf64Re
 fn perf_x86_64_plt_relocation_from_rela<'data>(
     dynamic_symbols: &impl ObjectSymbolTable<'data>,
     rela: Elf64RelaEntry,
-) -> Option<PerfPltRelocation> {
-    match rela.relocation_type {
-        object::elf::R_X86_64_JUMP_SLOT => dynamic_symbols
-            .symbol_by_index(SymbolIndex(rela.symbol_index))
-            .ok()
-            .and_then(|symbol| symbol.name().ok())
-            .map(|name| PerfPltRelocation {
-                offset: rela.offset,
-                symbol_name: Some(perf_symbol_name(&addr2line::demangle_auto(
-                    Cow::Borrowed(name),
-                    None,
-                ))),
-                ifunc_addend: None,
-            }),
-        object::elf::R_X86_64_IRELATIVE => {
-            u64::try_from(rela.addend)
-                .ok()
-                .map(|addend| PerfPltRelocation {
-                    offset: rela.offset,
-                    symbol_name: None,
-                    ifunc_addend: Some(addend),
-                })
-        }
-        _ => None,
+) -> PerfPltRelocation {
+    // symbol-elf.c:742-765 uses the linked name for every relocation type.
+    let symbol_name = dynamic_symbols
+        .symbol_by_index(SymbolIndex(rela.symbol_index))
+        .ok()
+        .and_then(|symbol| symbol.name().ok())
+        .map(|name| perf_symbol_name(&addr2line::demangle_auto(Cow::Borrowed(name), None)));
+    let ifunc_addend = (rela.relocation_type == object::elf::R_X86_64_IRELATIVE)
+        .then(|| u64::try_from(rela.addend).ok())
+        .flatten();
+    PerfPltRelocation {
+        offset: rela.offset,
+        symbol_name,
+        ifunc_addend,
     }
 }
 
@@ -5743,10 +6308,14 @@ impl CachedObjectMetadata {
                     .map_or(self.object_bytes.as_slice(), |runtime| {
                         runtime.object_bytes.as_slice()
                     });
-                let metadata = Arc::new(kernel_module_object_metadata(
-                    &self.object_bytes,
-                    runtime_bytes,
-                ));
+                let (metadata, projection) =
+                    kernel_module_object_metadata(&self.object_bytes, runtime_bytes);
+                if let (Some(id), Some(projection)) = (metadata.lookup_projection, projection) {
+                    self.object_metadata
+                        .object_symbols
+                        .register_kernel_module_projection(id, projection);
+                }
+                let metadata = Arc::new(metadata);
                 entry.insert(candidate.to_owned(), Arc::clone(&metadata));
                 metadata
             }
@@ -6739,6 +7308,7 @@ fn symbol_request_from_mapping_ref(mapping: &ResolvedMappingRef<'_>) -> SymbolRe
         addr2line_address: None,
         kernel_module_address: None,
         path: PathBuf::new(),
+        symbol_lookup: SymbolLookup::VirtualAddress,
         relative_address: 0,
         kernel_mapping_range: None,
         build_id: None,
@@ -6762,6 +7332,11 @@ fn update_symbol_request_from_mapping_ref(
         },
     );
     request.relative_address = mapping.relative_address;
+    request.symbol_lookup = if is_kernel_mapping_ref(mapping) {
+        SymbolLookup::VirtualAddress
+    } else {
+        SymbolLookup::UserFileOffset(mapping.relative_address)
+    };
     request.kernel_module_address = mapping.kernel_module_address;
     request.kernel_mapping_range = kernel_mapping_range_from_ref(mapping);
     if let Some(build_id) = mapping
@@ -7073,6 +7648,10 @@ fn perf_kallsyms_type_is_kept(symbol_type: char) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[path = "plt_regressions.rs"]
+    mod plt_regressions;
+
+    use std::borrow::Cow;
     use std::cell::Cell;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -7083,11 +7662,11 @@ mod tests {
         CachedObjectMetadata, Kallsyms, PerfAddressRange, PerfDwarfFrameNames, PerfDwarfIndexCache,
         PerfDwarfNameInterner, PerfObjectSymbolIndex, PerfSymbolBinding, PerfSymbolCandidate,
         PerfSymbolScope, PreparedObjectMetadata, ResolvedMappingRef, ResolvedSymbolFrames,
-        RustAddr2lineResolver, SymbolDsoName, SymbolFrameCache, SymbolRequest, SymbolResolver,
-        clean_object_symbol_request, demangle_addr2line_name_qualified,
-        fixup_object_symbol_ends_like_perf, gnu_build_id_from_notes, perf_best_duplicate_symbol,
+        RustAddr2lineResolver, SymbolDsoName, SymbolFrameCache, SymbolLookup, SymbolRequest,
+        SymbolResolver, clean_object_symbol_request, demangle_addr2line_name_qualified,
+        gnu_build_id_from_notes, kernel_elf_name_is_eligible, perf_best_duplicate_symbol,
         perf_dwarf_frame_names_from_index, perf_frames_with_object_alias,
-        perf_symbol_candidate_search_end, resolve_base_frames_from_object_metadata,
+        resolve_base_frames_from_object_metadata,
     };
 
     fn regression_elf_with_build_id() -> Vec<u8> {
@@ -7263,7 +7842,9 @@ mod tests {
         let mut selected = Vec::new();
         builder.write(&mut selected).unwrap();
         assert_eq!(
-            super::kernel_module_object_metadata(&selected, &selected).text_address,
+            super::kernel_module_object_metadata(&selected, &selected)
+                .0
+                .text_address,
             Some(first)
         );
     }
@@ -7300,9 +7881,9 @@ mod tests {
         let mut selected = Vec::new();
         builder.write(&mut selected).unwrap();
         let metadata = super::kernel_module_object_metadata(&selected, &selected);
-        assert_eq!(metadata.text_address, None);
-        assert_eq!(metadata.maps.len(), 1);
-        assert_eq!(metadata.maps[0].section, ".init.text");
+        assert_eq!(metadata.0.text_address, None);
+        assert_eq!(metadata.0.maps.len(), 1);
+        assert_eq!(metadata.0.maps[0].section, ".init.text");
     }
 
     #[test]
@@ -7396,7 +7977,7 @@ mod tests {
         let mut bytes = Vec::new();
         builder.write(&mut bytes).unwrap();
         assert_eq!(
-            super::kernel_module_object_metadata(&bytes, &bytes).maps,
+            super::kernel_module_object_metadata(&bytes, &bytes).0.maps,
             [super::KernelModuleSectionMap {
                 section: ".data".into(),
                 start: 0x2000,
@@ -8406,8 +8987,12 @@ mod tests {
             ),
             super::KernelElfAddressDecision::Mapped {
                 base: 0x3000,
-                inline: 0x3000
-            }
+                inline: 0x3000,
+                symbol_lookup: super::SymbolLookup::KernelSection {
+                    section,
+                    offset,
+                },
+            } if section == maps.sections[1].index && offset == maps.sections[1].file_offset
         ));
     }
 
@@ -8420,7 +9005,9 @@ mod tests {
         });
         let metadata = super::KernelElfMapMetadata {
             sections: vec![super::ObjectSectionRange {
+                index: 1,
                 virtual_address: 0x1000,
+                file_offset: 0x1000,
                 size: 0x100,
                 regular_present: true,
                 dynamic_present: false,
@@ -8444,12 +9031,18 @@ mod tests {
             super::KernelElfAddressDecision::Mapped {
                 base: 0x1010,
                 inline: 0xffff_ffff_ffff_f010,
+                symbol_lookup: super::SymbolLookup::KernelSection {
+                    section: 1,
+                    offset: 0x1010,
+                },
             }
         );
 
         let additional = super::KernelElfMapMetadata {
             sections: vec![super::ObjectSectionRange {
+                index: 2,
                 virtual_address: 0x2000,
+                file_offset: 0x2000,
                 size: 0x100,
                 regular_present: true,
                 dynamic_present: false,
@@ -8468,6 +9061,10 @@ mod tests {
             super::KernelElfAddressDecision::Mapped {
                 base: 0x2010,
                 inline: 0x2010,
+                symbol_lookup: super::SymbolLookup::KernelSection {
+                    section: 2,
+                    offset: 0x2010,
+                },
             }
         );
     }
@@ -8712,6 +9309,7 @@ mod tests {
             addr2line_address: None,
             kernel_module_address: None,
             path: PathBuf::from("/usr/lib/libc.so.6"),
+            symbol_lookup: SymbolLookup::VirtualAddress,
             relative_address: 0x1234,
             kernel_mapping_range: None,
             build_id: Some("aabbccdd".to_string()),
@@ -8904,6 +9502,7 @@ mod tests {
         let request = super::clean_object_symbol_request_with_cache(
             file.path().to_path_buf(),
             data.file_range().unwrap().0 + 15,
+            super::SymbolLookup::VirtualAddress,
             &mut cache,
             true,
         );
@@ -8981,6 +9580,100 @@ mod tests {
         assert_ne!(direct, translated);
         assert_ne!(direct.cmp(&translated), std::cmp::Ordering::Equal);
         assert_ne!(hash(&direct), hash(&translated));
+        let module_a = super::SymbolRequest {
+            symbol_lookup: super::SymbolLookup::KernelModuleSection {
+                projection: 7,
+                section: 4,
+                offset: 0x1208,
+            },
+            ..direct.clone()
+        };
+        let module_b = super::SymbolRequest {
+            symbol_lookup: super::SymbolLookup::KernelModuleSection {
+                projection: 8,
+                section: 4,
+                offset: 0x1208,
+            },
+            ..module_a.clone()
+        };
+        assert_ne!(module_a, module_b);
+        assert_ne!(module_a.cmp(&module_b), std::cmp::Ordering::Equal);
+        assert_ne!(hash(&module_a), hash(&module_b));
+    }
+
+    #[test]
+    fn synthetic_plt_header_uses_section_offset_over_overlapping_load_translation() {
+        let base = elf_with_text_symbol_fixtures(
+            elf::EM_X86_64,
+            &[(
+                b"regular_function",
+                0x1000,
+                16,
+                elf::STB_GLOBAL,
+                elf::STT_FUNC,
+            )],
+        );
+        let mut builder = build::elf::Builder::read(base.as_slice()).expect("read symbol fixture");
+        builder.header.e_phoff = 0x40;
+        let text_id = builder
+            .sections
+            .iter()
+            .find(|section| section.name.as_slice() == b".text")
+            .expect("text section")
+            .id();
+        let text = builder
+            .sections
+            .iter_mut()
+            .find(|section| section.id() == text_id)
+            .expect("text section by ID");
+        text.sh_offset = 0x100;
+        let plt_offset = text.sh_offset + text.sh_size;
+
+        let plt = builder.sections.add();
+        plt.name = b".plt"[..].into();
+        plt.sh_type = elf::SHT_PROGBITS;
+        plt.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_EXECINSTR);
+        plt.sh_addr = 0x9000;
+        plt.sh_offset = plt_offset;
+        plt.sh_addralign = 16;
+        plt.data = build::elf::SectionData::Data(vec![0; 16].into());
+
+        let segment = builder.segments.add();
+        segment.p_type = elf::PT_LOAD;
+        segment.p_flags = elf::PF_R | elf::PF_X;
+        segment.p_offset = plt_offset + 0x100;
+        segment.p_vaddr = 0x8fe0;
+        segment.p_paddr = segment.p_vaddr;
+        segment.p_filesz = 0x80;
+        segment.p_memsz = 0x80;
+        segment.p_align = 16;
+        builder.set_section_sizes();
+        let mut bytes = Vec::new();
+        builder
+            .write(&mut bytes)
+            .expect("write offset mismatch fixture");
+
+        let object = object::File::parse(bytes.as_slice()).expect("parse fixture");
+        let plt = object.section_by_name(".plt").expect("PLT section");
+        let load = object.segments().next().expect("overlapping load segment");
+        let (load_offset, _) = load.file_range();
+        let translated = load_offset + (plt.address() - load.address());
+        let section_offset = plt.file_range().expect("PLT file range").0;
+        assert_ne!(translated, section_offset);
+
+        let index = PerfObjectSymbolIndex::from_object_bytes(&bytes);
+        assert_eq!(
+            index
+                .candidate_for_lookup(SymbolLookup::UserFileOffset(section_offset), 0)
+                .map(|(candidate, _, _)| candidate.name.as_str()),
+            Some(".plt")
+        );
+        assert_ne!(
+            index
+                .candidate_for_lookup(SymbolLookup::UserFileOffset(translated), 0)
+                .map(|(candidate, _, _)| candidate.name.as_str()),
+            Some(".plt")
+        );
     }
 
     #[test]
@@ -9742,35 +10435,31 @@ mod tests {
     }
 
     #[test]
-    fn object_symbol_index_keeps_earlier_overlapping_symbol_candidates() {
-        let symbols = PerfObjectSymbolIndex {
-            symbols: vec![
-                PerfSymbolCandidate {
-                    name: "large".to_string(),
-                    address: 0x1000,
-                    size: 0x1000,
-                    bfd_size: 0x1000,
-                    elf_type: Some(object::elf::STT_FUNC),
-                    scope: PerfSymbolScope::Global,
-                    binding: PerfSymbolBinding::Global,
-                    bfd_function_like: true,
-                    bfd_function: true,
-                },
-                PerfSymbolCandidate {
-                    name: "small".to_string(),
-                    address: 0x1800,
-                    size: 0x10,
-                    bfd_size: 0x10,
-                    elf_type: Some(object::elf::STT_FUNC),
-                    scope: PerfSymbolScope::Global,
-                    binding: PerfSymbolBinding::Global,
-                    bfd_function_like: true,
-                    bfd_function: true,
-                },
-            ],
-            max_end_by_index: vec![0x2000, 0x2000],
-            ..PerfObjectSymbolIndex::default()
-        };
+    fn object_symbol_index_uses_first_containing_perf_tree_node_for_overlaps() {
+        let symbols = PerfObjectSymbolIndex::from_test_candidates(vec![
+            PerfSymbolCandidate {
+                name: "large".to_string(),
+                address: 0x1000,
+                size: 0x1000,
+                bfd_size: 0x1000,
+                elf_type: Some(object::elf::STT_FUNC),
+                scope: PerfSymbolScope::Global,
+                binding: PerfSymbolBinding::Global,
+                bfd_function_like: true,
+                bfd_function: true,
+            },
+            PerfSymbolCandidate {
+                name: "small".to_string(),
+                address: 0x1800,
+                size: 0x10,
+                bfd_size: 0x10,
+                elf_type: Some(object::elf::STT_FUNC),
+                scope: PerfSymbolScope::Global,
+                binding: PerfSymbolBinding::Global,
+                bfd_function_like: true,
+                bfd_function: true,
+            },
+        ]);
 
         assert_eq!(symbols.symbol_name(0x1810), Some("large"));
         let metadata = super::PreparedObjectMetadata {
@@ -9780,14 +10469,231 @@ mod tests {
         for (address, expected_name, expected_offset) in [
             (0xfff, None, None),
             (0x1000, Some("large"), Some(0)),
-            (0x1800, Some("small"), Some(0)),
+            (0x1800, Some("large"), Some(0x800)),
             (0x1810, Some("large"), Some(0x810)),
             (0x2000, None, None),
         ] {
-            let selected = metadata.object_symbol_names(address);
+            let selected = metadata.object_symbol_names(SymbolLookup::VirtualAddress, address);
             assert_eq!(selected.bare, expected_name);
             assert_eq!(selected.offset, expected_offset);
         }
+    }
+
+    #[test]
+    fn kernel_raw_name_filter_does_not_filter_demangled_cpp_prefixes() {
+        let raw_name = "_Z7L0thingv";
+        let display_name = addr2line::demangle_auto(Cow::Borrowed(raw_name), None);
+        assert_eq!(display_name, "L0thing()");
+        assert!(kernel_elf_name_is_eligible(raw_name));
+        assert!(!kernel_elf_name_is_eligible("L0marker"));
+        assert!(!kernel_elf_name_is_eligible(".Lkernel_marker"));
+    }
+
+    #[test]
+    fn kernel_raw_name_filter_rejects_dollar_names_but_user_symbols_keep_them() {
+        assert!(!kernel_elf_name_is_eligible("$ordinary"));
+        let bytes = elf_with_dynamic_text_symbol(b"$keep", 0x1000, 16);
+        let user_symbols = PerfObjectSymbolIndex::from_object_bytes(&bytes);
+        assert_eq!(user_symbols.symbol_name(0x1008), Some("$keep"));
+    }
+
+    #[test]
+    fn kernel_section_filters_raw_dollar_name_before_demangling() {
+        let bytes = elf_with_text_symbol_fixtures(
+            elf::EM_X86_64,
+            &[
+                (
+                    b"$kernel_marker",
+                    0x1000,
+                    16,
+                    elf::STB_GLOBAL,
+                    elf::STT_FUNC,
+                ),
+                (b"_Z7L0thingv", 0x1000, 16, elf::STB_GLOBAL, elf::STT_FUNC),
+            ],
+        );
+        let object = object::File::parse(bytes.as_slice()).expect("parse symbol fixture");
+        let text = object.section_by_name(".text").expect("text section");
+        let (_, file_offset) =
+            super::elf_section_layout(&object, text.index()).expect("text section file offset");
+        let symbols = PerfObjectSymbolIndex::from_object_bytes(&bytes);
+
+        let (candidate, _, _) = symbols
+            .candidate_for_lookup(
+                SymbolLookup::KernelSection {
+                    section: u32::try_from(text.index().0).expect("fixture text section index"),
+                    offset: file_offset + 8,
+                },
+                0,
+            )
+            .expect("eligible raw C++ symbol is retained in kernel base tree");
+        assert_eq!(candidate.name, "L0thing()");
+    }
+
+    #[test]
+    fn module_metadata_rejects_raw_kernel_labels_before_text_remap() {
+        let bytes = elf_with_text_symbol_fixtures(
+            elf::EM_X86_64,
+            &[(
+                b"$ignored_module_text",
+                0x1000,
+                16,
+                elf::STB_GLOBAL,
+                elf::STT_FUNC,
+            )],
+        );
+        let (metadata, _) = super::kernel_module_object_metadata(&bytes, &bytes);
+        assert_eq!(metadata.text_address, None);
+        assert_eq!(metadata.text_section, None);
+        assert!(metadata.maps.is_empty());
+    }
+
+    #[test]
+    fn module_projection_filters_raw_kernel_labels_before_duplicate_choice() {
+        let bytes = elf_with_text_symbol_fixtures(
+            elf::EM_X86_64,
+            &[
+                (
+                    b"$module_marker_with_a_long_name",
+                    0x1000,
+                    16,
+                    elf::STB_GLOBAL,
+                    elf::STT_FUNC,
+                ),
+                (
+                    b"module_function",
+                    0x1000,
+                    16,
+                    elf::STB_GLOBAL,
+                    elf::STT_FUNC,
+                ),
+            ],
+        );
+        let object = object::File::parse(bytes.as_slice()).expect("parse module fixture");
+        let text = object.section_by_name(".text").expect("text section");
+        let (_, file_offset) =
+            super::elf_section_layout(&object, text.index()).expect("text layout");
+        let index = PerfObjectSymbolIndex::from_object_bytes(&bytes);
+        index.register_kernel_module_projection(
+            1,
+            Arc::new(super::kernel_module_symbol_projection(
+                &object,
+                &object,
+                super::kernel_module_max_text_offset(&object),
+            )),
+        );
+
+        let (candidate, _, _) = index
+            .candidate_for_lookup(
+                SymbolLookup::KernelModuleSection {
+                    projection: 1,
+                    section: u32::try_from(text.index().0).expect("fixture text section index"),
+                    offset: file_offset + 8,
+                },
+                0,
+            )
+            .expect("module candidate");
+        assert_eq!(candidate.name, "module_function");
+    }
+
+    #[test]
+    fn module_projection_retains_allocated_symbols_in_runtime_nobits_sections() {
+        let base = elf_with_text_symbol_fixtures(
+            elf::EM_X86_64,
+            &[(b"text_function", 0x1000, 16, elf::STB_GLOBAL, elf::STT_FUNC)],
+        );
+        let mut builder = build::elf::Builder::read(base.as_slice()).expect("read module fixture");
+        let bss = builder.sections.add();
+        bss.name = b".bss"[..].into();
+        bss.sh_type = elf::SHT_NOBITS;
+        bss.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_WRITE);
+        bss.sh_addr = 0x2000;
+        bss.sh_addralign = 8;
+        bss.data = build::elf::SectionData::UninitializedData(8);
+        let bss_id = bss.id();
+        let symbol = builder.symbols.add();
+        symbol.name = b"module_object"[..].into();
+        symbol.section = Some(bss_id);
+        symbol.set_st_info(elf::STB_GLOBAL, elf::STT_OBJECT);
+        symbol.st_value = 0x2000;
+        symbol.st_size = 8;
+        builder.set_section_sizes();
+        let mut bytes = Vec::new();
+        builder.write(&mut bytes).expect("write NOBITS fixture");
+
+        let object = object::File::parse(bytes.as_slice()).expect("parse NOBITS fixture");
+        let bss = object.section_by_name(".bss").expect("BSS section");
+        let (_, file_offset) = super::elf_section_layout(&object, bss.index()).expect("BSS layout");
+        let index = PerfObjectSymbolIndex::from_object_bytes(&bytes);
+        index.register_kernel_module_projection(
+            2,
+            Arc::new(super::kernel_module_symbol_projection(
+                &object,
+                &object,
+                super::kernel_module_max_text_offset(&object),
+            )),
+        );
+
+        let (candidate, _, _) = index
+            .candidate_for_lookup(
+                SymbolLookup::KernelModuleSection {
+                    projection: 2,
+                    section: u32::try_from(bss.index().0).expect("fixture bss section index"),
+                    offset: file_offset,
+                },
+                0,
+            )
+            .expect("allocated BSS candidate remains projectable");
+        assert_eq!(candidate.name, "module_object");
+    }
+
+    #[test]
+    fn user_section_fallback_retains_allocated_nobits_function() {
+        let base = elf_with_text_symbol_fixtures(
+            elf::EM_X86_64,
+            &[(
+                b"nobits_function",
+                0x1000,
+                16,
+                elf::STB_GLOBAL,
+                elf::STT_FUNC,
+            )],
+        );
+        let mut builder = build::elf::Builder::read(base.as_slice()).expect("read ELF fixture");
+        let text = builder
+            .sections
+            .iter_mut()
+            .find(|section| section.name.as_slice() == b".text")
+            .expect("text section");
+        text.sh_type = elf::SHT_NOBITS;
+        text.data = build::elf::SectionData::UninitializedData(text.sh_size);
+        builder.set_section_sizes();
+        let mut bytes = Vec::new();
+        builder.write(&mut bytes).expect("write NOBITS ELF");
+
+        let object = object::File::parse(bytes.as_slice()).expect("parse NOBITS ELF");
+        assert_eq!(object.segments().count(), 0);
+        let text = object.section_by_name(".text").expect("NOBITS text");
+        let (kind, file_offset) =
+            super::elf_section_layout(&object, text.index()).expect("text SHDR layout");
+        assert_eq!(kind, elf::SHT_NOBITS);
+        assert!(
+            matches!(text.flags(), object::SectionFlags::Elf { sh_flags }
+            if sh_flags & u64::from(elf::SHF_ALLOC) != 0)
+        );
+        let index = PerfObjectSymbolIndex::from_object_bytes(&bytes);
+        assert!(
+            index
+                .candidates
+                .iter()
+                .any(|candidate| candidate.name == "nobits_function")
+        );
+        let (candidate, start, query) = index
+            .candidate_for_lookup(SymbolLookup::UserFileOffset(file_offset + 8), 0)
+            .expect("allocated NOBITS function has a user lookup record");
+        assert_eq!(candidate.name, "nobits_function");
+        assert_eq!(start, file_offset);
+        assert_eq!(query - start, 8);
     }
 
     #[test]
@@ -9803,18 +10709,14 @@ mod tests {
             bfd_function_like: true,
             bfd_function: true,
         };
-        let symbols = PerfObjectSymbolIndex {
-            symbols: vec![
-                candidate("pthread_create@GLIBC_2.2.5", 0x1000),
-                candidate("pthread_create@@GLIBC_2.34", 0x1000),
-                candidate("__libc_start_main@@GLIBC_2.34", 0x2000),
-                candidate("__libc_start_main@GLIBC_2.2.5", 0x2000),
-                candidate("clock_gettime@@GLIBC_2.17", 0x3000),
-                candidate("clock_gettime@GLIBC_2.2.5", 0x3000),
-            ],
-            max_end_by_index: vec![0x1100, 0x1100, 0x2100, 0x2100, 0x3100, 0x3100],
-            ..PerfObjectSymbolIndex::default()
-        };
+        let symbols = PerfObjectSymbolIndex::from_test_candidates(vec![
+            candidate("pthread_create@GLIBC_2.2.5", 0x1000),
+            candidate("pthread_create@@GLIBC_2.34", 0x1000),
+            candidate("__libc_start_main@@GLIBC_2.34", 0x2000),
+            candidate("__libc_start_main@GLIBC_2.2.5", 0x2000),
+            candidate("clock_gettime@@GLIBC_2.17", 0x3000),
+            candidate("clock_gettime@GLIBC_2.2.5", 0x3000),
+        ]);
 
         assert_eq!(
             symbols.symbol_name_with_offset(0x1098),
@@ -9834,56 +10736,52 @@ mod tests {
     fn object_symbol_index_prefers_non_weak_glibc_symtab_aliases_over_weak_exports_like_perf() {
         // tools/perf/util/symbol.c symbols__fixup_duplicate() uses
         // choose_best_symbol(), whose weak check precedes the global check.
-        let symbols = PerfObjectSymbolIndex {
-            symbols: vec![
-                PerfSymbolCandidate {
-                    name: "recv".to_string(),
-                    address: 0x1000,
-                    size: 47,
-                    bfd_size: 47,
-                    elf_type: Some(object::elf::STT_FUNC),
-                    scope: PerfSymbolScope::Global,
-                    binding: PerfSymbolBinding::Weak,
-                    bfd_function_like: true,
-                    bfd_function: true,
-                },
-                PerfSymbolCandidate {
-                    name: "__libc_recv".to_string(),
-                    address: 0x1000,
-                    size: 47,
-                    bfd_size: 47,
-                    elf_type: Some(object::elf::STT_FUNC),
-                    scope: PerfSymbolScope::Local,
-                    binding: PerfSymbolBinding::Global,
-                    bfd_function_like: true,
-                    bfd_function: true,
-                },
-                PerfSymbolCandidate {
-                    name: "write".to_string(),
-                    address: 0x2000,
-                    size: 46,
-                    bfd_size: 46,
-                    elf_type: Some(object::elf::STT_FUNC),
-                    scope: PerfSymbolScope::Global,
-                    binding: PerfSymbolBinding::Weak,
-                    bfd_function_like: true,
-                    bfd_function: true,
-                },
-                PerfSymbolCandidate {
-                    name: "__GI___libc_write".to_string(),
-                    address: 0x2000,
-                    size: 46,
-                    bfd_size: 46,
-                    elf_type: Some(object::elf::STT_FUNC),
-                    scope: PerfSymbolScope::Local,
-                    binding: PerfSymbolBinding::Global,
-                    bfd_function_like: true,
-                    bfd_function: true,
-                },
-            ],
-            max_end_by_index: vec![0x102f, 0x102f, 0x202e, 0x202e],
-            ..PerfObjectSymbolIndex::default()
-        };
+        let symbols = PerfObjectSymbolIndex::from_test_candidates(vec![
+            PerfSymbolCandidate {
+                name: "recv".to_string(),
+                address: 0x1000,
+                size: 47,
+                bfd_size: 47,
+                elf_type: Some(object::elf::STT_FUNC),
+                scope: PerfSymbolScope::Global,
+                binding: PerfSymbolBinding::Weak,
+                bfd_function_like: true,
+                bfd_function: true,
+            },
+            PerfSymbolCandidate {
+                name: "__libc_recv".to_string(),
+                address: 0x1000,
+                size: 47,
+                bfd_size: 47,
+                elf_type: Some(object::elf::STT_FUNC),
+                scope: PerfSymbolScope::Local,
+                binding: PerfSymbolBinding::Global,
+                bfd_function_like: true,
+                bfd_function: true,
+            },
+            PerfSymbolCandidate {
+                name: "write".to_string(),
+                address: 0x2000,
+                size: 46,
+                bfd_size: 46,
+                elf_type: Some(object::elf::STT_FUNC),
+                scope: PerfSymbolScope::Global,
+                binding: PerfSymbolBinding::Weak,
+                bfd_function_like: true,
+                bfd_function: true,
+            },
+            PerfSymbolCandidate {
+                name: "__GI___libc_write".to_string(),
+                address: 0x2000,
+                size: 46,
+                bfd_size: 46,
+                elf_type: Some(object::elf::STT_FUNC),
+                scope: PerfSymbolScope::Local,
+                binding: PerfSymbolBinding::Global,
+                bfd_function_like: true,
+                bfd_function: true,
+            },
+        ]);
 
         assert_eq!(
             symbols.symbol_name_with_offset(0x101f),
@@ -9901,6 +10799,121 @@ mod tests {
         let symbols = super::PerfObjectSymbolIndex::from_object_bytes(&object_bytes);
 
         assert_eq!(symbols.symbol_name(0x1008), Some("read"));
+    }
+
+    #[test]
+    fn object_symbol_index_uses_native_strong_longer_alias_after_table_fixup() {
+        let object_bytes = elf_with_regular_and_dynamic_zero_aliases(
+            b"r",
+            elf::STB_GLOBAL,
+            b"dynamic_alias_longer",
+            elf::STB_GLOBAL,
+        );
+        let symbols = PerfObjectSymbolIndex::from_object_bytes(&object_bytes);
+        assert!(
+            symbols
+                .candidates
+                .iter()
+                .any(|candidate| candidate.name == "dynamic_alias_longer")
+        );
+        assert!(
+            symbols
+                .user_file_offsets
+                .records
+                .iter()
+                .any(|record| symbols.candidates[record.candidate].name == "dynamic_alias_longer")
+        );
+        assert_eq!(symbols.symbol_name(0x1008), Some("dynamic_alias_longer"));
+    }
+
+    #[test]
+    fn object_symbol_index_fixes_weak_alias_extents_per_table_before_pruning() {
+        let object_bytes = elf_with_regular_and_dynamic_zero_aliases(
+            b"weak_regular_name_longer",
+            elf::STB_WEAK,
+            b"weak_dyn",
+            elf::STB_WEAK,
+        );
+        let symbols = PerfObjectSymbolIndex::from_object_bytes(&object_bytes);
+        let record = symbols
+            .user_file_offsets
+            .records
+            .iter()
+            .find(|record| symbols.candidates[record.candidate].name == "weak_regular_name_longer")
+            .expect("the native longer-name weak alias survives duplicate pruning");
+
+        assert_eq!(record.end - record.start, 0x100);
+    }
+
+    fn elf_with_regular_and_dynamic_zero_aliases(
+        regular_name: &'static [u8],
+        regular_binding: u8,
+        dynamic_name: &'static [u8],
+        dynamic_binding: u8,
+    ) -> Vec<u8> {
+        let regular = elf_with_text_symbol_fixtures(
+            elf::EM_X86_64,
+            &[
+                (regular_name, 0x1000, 0, regular_binding, elf::STT_FUNC),
+                (b"regular_next", 0x1100, 16, elf::STB_GLOBAL, elf::STT_FUNC),
+            ],
+        );
+        let mut builder =
+            build::elf::Builder::read(regular.as_slice()).expect("read regular-symbol fixture ELF");
+        builder.header.e_phoff = 0x40;
+        let text_id = builder
+            .sections
+            .iter()
+            .find(|section| section.name.as_slice() == b".text")
+            .expect("text section")
+            .id();
+        let dynstr_id = {
+            let dynstr = builder.sections.add();
+            dynstr.name = b".dynstr"[..].into();
+            dynstr.sh_type = elf::SHT_STRTAB;
+            dynstr.sh_flags = u64::from(elf::SHF_ALLOC);
+            dynstr.sh_addralign = 1;
+            dynstr.data = build::elf::SectionData::DynamicString;
+            dynstr.id()
+        };
+        let dynsym = builder.sections.add();
+        dynsym.name = b".dynsym"[..].into();
+        dynsym.sh_type = elf::SHT_DYNSYM;
+        dynsym.sh_flags = u64::from(elf::SHF_ALLOC);
+        dynsym.sh_addralign = 8;
+        dynsym.data = build::elf::SectionData::DynamicSymbol;
+        dynsym.sh_link_section = Some(dynstr_id);
+        for (name, address, size, binding) in [
+            (dynamic_name, 0x1000, 0, dynamic_binding),
+            (b"weak_dyn_next", 0x1010, 16, elf::STB_GLOBAL),
+        ] {
+            let symbol = builder.dynamic_symbols.add();
+            symbol.name = name.into();
+            symbol.st_value = address;
+            symbol.st_size = size;
+            symbol.set_st_info(binding, elf::STT_FUNC);
+            symbol.section = Some(text_id);
+        }
+        builder.set_section_sizes();
+        let segment = builder.segments.add();
+        segment.p_type = elf::PT_LOAD;
+        segment.p_flags = elf::PF_R | elf::PF_X;
+        segment.p_vaddr = 0;
+        segment.p_paddr = 0;
+        segment.p_filesz = 0x1000;
+        segment.p_memsz = 0x1000;
+        segment.p_align = 16;
+        for section in &mut builder.sections {
+            if section.sh_flags & u64::from(elf::SHF_ALLOC) != 0 {
+                segment.append_section(section);
+            }
+        }
+        builder.set_section_sizes();
+        let mut object_bytes = Vec::new();
+        builder
+            .write(&mut object_bytes)
+            .expect("write regular and dynamic symbol fixture ELF");
+        object_bytes
     }
 
     #[test]
@@ -9947,6 +10960,7 @@ mod tests {
                 addr2line_address: None,
                 kernel_module_address: None,
                 path: PathBuf::from("/tmp/pyroclast-generic-symbol"),
+                symbol_lookup: SymbolLookup::VirtualAddress,
                 relative_address: 0x1180,
                 kernel_mapping_range: None,
                 build_id: None,
@@ -9977,7 +10991,7 @@ mod tests {
         // tools/perf/util/symbol-elf.c dso__load_sym_internal() calls
         // symbols__fixup_end(..., false), so a zero-sized label like glibc's
         // __syscall_cancel_arch_start covers IPs until the next symbol.
-        let mut symbols = vec![
+        let symbols = vec![
             PerfSymbolCandidate {
                 name: "__syscall_cancel_arch".to_string(),
                 address: 0xa68f0,
@@ -10012,20 +11026,7 @@ mod tests {
                 bfd_function: true,
             },
         ];
-        fixup_object_symbol_ends_like_perf(&mut symbols);
-        let mut max_end = 0_u64;
-        let max_end_by_index = symbols
-            .iter()
-            .map(|symbol| {
-                max_end = max_end.max(perf_symbol_candidate_search_end(symbol));
-                max_end
-            })
-            .collect();
-        let symbols = PerfObjectSymbolIndex {
-            symbols,
-            max_end_by_index,
-            ..PerfObjectSymbolIndex::default()
-        };
+        let symbols = PerfObjectSymbolIndex::from_test_candidates(symbols);
 
         assert_eq!(
             symbols.symbol_name_with_offset(0xa691b),
@@ -11049,7 +12050,7 @@ mod tests {
                 elf_with_dynamic_symbol(b"label", 0x1000, 16, (elf::STT_NOTYPE, visibility, false));
             assert!(
                 PerfObjectSymbolIndex::from_object_bytes(&bytes)
-                    .symbols
+                    .candidates
                     .is_empty(),
                 "visibility {visibility}"
             );
@@ -11069,7 +12070,7 @@ mod tests {
             );
             assert!(
                 PerfObjectSymbolIndex::from_object_bytes(&bytes)
-                    .symbols
+                    .candidates
                     .is_empty(),
                 "type {symbol_type}"
             );
@@ -11088,7 +12089,7 @@ mod tests {
         );
         assert!(
             PerfObjectSymbolIndex::from_object_bytes(&bytes)
-                .symbols
+                .candidates
                 .is_empty()
         );
     }
@@ -11105,7 +12106,7 @@ mod tests {
             let bytes = elf_with_dynamic_symbol(b"allowed", 0x1000, 16, attributes);
             assert_eq!(
                 PerfObjectSymbolIndex::from_object_bytes(&bytes)
-                    .symbols
+                    .candidates
                     .len(),
                 1,
                 "attributes {attributes:?}"
@@ -11126,7 +12127,7 @@ mod tests {
         );
         assert!(
             PerfObjectSymbolIndex::from_object_bytes(&bytes)
-                .symbols
+                .candidates
                 .is_empty()
         );
     }
@@ -11151,7 +12152,7 @@ mod tests {
             );
             assert_eq!(
                 !PerfObjectSymbolIndex::from_object_bytes(&bytes)
-                    .symbols
+                    .candidates
                     .is_empty(),
                 accepted,
                 "section {section:?}, type {symbol_type}"
@@ -13923,6 +14924,7 @@ mod tests {
                 addr2line_address: None,
                 kernel_module_address: None,
                 path: path.clone(),
+                symbol_lookup: SymbolLookup::VirtualAddress,
                 relative_address: addresses[0],
                 kernel_mapping_range: None,
                 build_id: None,
@@ -13937,6 +14939,7 @@ mod tests {
                 addr2line_address: None,
                 kernel_module_address: None,
                 path,
+                symbol_lookup: SymbolLookup::VirtualAddress,
                 relative_address: addresses[1],
                 kernel_mapping_range: None,
                 build_id: None,
@@ -15212,6 +16215,7 @@ mod tests {
                     addr2line_address: None,
                     kernel_module_address: None,
                     path: PathBuf::from(path),
+                    symbol_lookup: SymbolLookup::VirtualAddress,
                     relative_address: i as u64,
                     kernel_mapping_range: None,
                     build_id: None,
@@ -15374,6 +16378,7 @@ mod tests {
 
     fn test_request(path: &str, relative_address: u64) -> SymbolRequest {
         SymbolRequest {
+            symbol_lookup: super::SymbolLookup::VirtualAddress,
             addr2line_address: None,
             kernel_module_address: None,
             path: path.into(),
