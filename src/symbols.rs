@@ -7049,7 +7049,7 @@ impl<'a> PerfDwarfNameResolver<'a> {
                     unit,
                     &directory,
                     &mut names,
-                    &source_line_ranges,
+                    source_line_ranges,
                 ),
             });
         }
@@ -7203,8 +7203,10 @@ impl CachedObjectMetadata {
                     .as_ref()
                     .is_none_or(|ranges| perf_dwarf_ranges_contain(ranges, address))
                     && unit
-                        .source_line_ranges
-                        .as_deref()
+                        .frame_index
+                        .as_ref()
+                        .map(|index| index.source_line_ranges.as_slice())
+                        .or(unit.source_line_ranges.as_deref())
                         .is_some_and(|ranges| perf_dwarf_ranges_contain(ranges, address))
             })
         })
@@ -7258,13 +7260,14 @@ fn build_dwarf_index_cache_for_addresses<'a>(
         {
             let source_line_ranges = cached_unit
                 .source_line_ranges
-                .get_or_insert_with(|| perf_dwarf_source_line_ranges(unit));
+                .take()
+                .unwrap_or_else(|| perf_dwarf_source_line_ranges(unit));
             cached_unit.frame_index = Some(perf_dwarf_unit_frame_index(
                 &dwarf,
                 unit,
                 &directory,
                 &mut cache.names,
-                source_line_ranges.as_slice(),
+                source_line_ranges,
             ));
         }
     }
@@ -7323,27 +7326,27 @@ fn perf_dwarf_unit_frame_index<R>(
     unit: &gimli::Unit<R>,
     directory: &PerfDwarfUnitDirectory<R>,
     names: &mut PerfDwarfNameInterner<'_>,
-    source_line_ranges: &[PerfAddressRange],
+    source_line_ranges: Vec<PerfAddressRange>,
 ) -> PerfDwarfFrameIndex
 where
     R: gimli::Reader,
 {
+    let mut index = PerfDwarfFrameIndex {
+        source_line_ranges,
+        ..PerfDwarfFrameIndex::default()
+    };
     let mut entries = unit.entries();
     let Ok(true) = entries.next_entry() else {
-        return PerfDwarfFrameIndex::default();
+        return index;
     };
     let Some(root) = entries.current() else {
-        return PerfDwarfFrameIndex::default();
+        return index;
     };
     let root_depth = root.depth();
     let c_unit = perf_dwarf_is_c_unit(unit, directory, root);
     let compile_unit = root.tag() == gimli::DW_TAG_compile_unit;
     let mut scopes = Vec::<(isize, usize)>::new();
     let mut root_pruned_depth = None;
-    let mut index = PerfDwarfFrameIndex {
-        source_line_ranges: source_line_ranges.to_vec(),
-        ..PerfDwarfFrameIndex::default()
-    };
     while let Ok(Some(_)) = entries.next_dfs() {
         let entry = entries
             .current()
@@ -14480,7 +14483,13 @@ mod tests {
         .unwrap();
         let directory = super::PerfDwarfUnitDirectory::new(&dwarf);
         let unit = directory.units[0].unit.as_ref().unwrap();
-        super::perf_dwarf_unit_frame_index(&dwarf, unit, &directory, names, source_line_ranges)
+        super::perf_dwarf_unit_frame_index(
+            &dwarf,
+            unit,
+            &directory,
+            names,
+            source_line_ranges.to_vec(),
+        )
     }
 
     #[test]
@@ -15357,6 +15366,84 @@ mod tests {
                 .frames,
                 ["read_at", "read_at", "read_at", "base_symbol"]
             );
+        }
+    }
+
+    #[test]
+    fn cached_dwarf_source_rows_transfer_once_and_stay_stable_when_warm() {
+        let bytes = cross_cu_inline_fixture(CrossCuInlineName::Direct);
+        let file = cross_cu_reference_file(&bytes);
+        let resolver = RustAddr2lineResolver::new();
+        let metadata = resolver.object_metadata(file.path()).unwrap();
+        metadata.prepare_dwarf_frames_for_addresses(&[0x9000]);
+        let original = {
+            let cache = metadata.dwarf_index.lock().unwrap();
+            let units = cache.units.as_ref().unwrap();
+            assert_eq!(units.len(), 2);
+            units
+                .iter()
+                .map(|unit| {
+                    assert!(unit.frame_index.is_none());
+                    let rows = unit.source_line_ranges.as_ref().unwrap();
+                    assert!(!rows.is_empty());
+                    (rows.as_ptr(), rows.len(), rows.capacity())
+                })
+                .collect::<Vec<_>>()
+        };
+        // perf 7.2.9 libdw.c:193-195 gates selection on source lines;
+        // elfutils 0.195 dwfl_module_getsrc.c rejects end_sequence addresses.
+        for _ in 0..2 {
+            assert!(metadata.dwarf_has_source_line_for_address(0x1018));
+            assert!(!metadata.dwarf_has_source_line_for_address(0x1040));
+            assert!(!metadata.dwarf_has_source_line_for_address(0x2018));
+            metadata.prepare_dwarf_frames_for_addresses(&[0x1018]);
+            let cache = metadata.dwarf_index.lock().unwrap();
+            let units = cache.units.as_ref().unwrap();
+            assert!(
+                units[0].source_line_ranges.is_none(),
+                "prepared CU must not retain a duplicate source-row buffer"
+            );
+            let rows = &units[0].frame_index.as_ref().unwrap().source_line_ranges;
+            assert_eq!((rows.as_ptr(), rows.len(), rows.capacity()), original[0]);
+            assert!(units[1].frame_index.is_none());
+            let deferred = units[1].source_line_ranges.as_ref().unwrap();
+            assert_eq!(
+                (deferred.as_ptr(), deferred.len(), deferred.capacity()),
+                original[1]
+            );
+        }
+        let index_pointer = {
+            let cache = metadata.dwarf_index.lock().unwrap();
+            std::ptr::from_ref(
+                cache.units.as_ref().unwrap()[0]
+                    .frame_index
+                    .as_ref()
+                    .unwrap(),
+            )
+        };
+        std::fs::remove_file(file.path()).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                metadata
+                    .dwarf_frame_names_for_base_symbol(0x1018, Some("base_symbol"))
+                    .unwrap()
+                    .frames,
+                ["read_at", "read_at", "read_at", "base_symbol"]
+            );
+            metadata.prepare_dwarf_frames_for_addresses(&[0x2018]);
+            assert!(metadata.dwarf_has_source_line_for_address(0x1018));
+            assert!(!metadata.dwarf_has_source_line_for_address(0x2018));
+            let cache = metadata.dwarf_index.lock().unwrap();
+            let units = cache.units.as_ref().unwrap();
+            assert_eq!(
+                std::ptr::from_ref(units[0].frame_index.as_ref().unwrap()),
+                index_pointer
+            );
+            for (unit, allocation) in units.iter().zip(&original) {
+                assert!(unit.source_line_ranges.is_none());
+                let rows = &unit.frame_index.as_ref().unwrap().source_line_ranges;
+                assert_eq!((rows.as_ptr(), rows.len(), rows.capacity()), *allocation);
+            }
         }
     }
 
@@ -16420,7 +16507,7 @@ mod tests {
                     unit,
                     &directory,
                     &mut names,
-                    &[test_range(0x1000, 0x1040)],
+                    vec![test_range(0x1000, 0x1040)],
                 );
                 assert_eq!(index.nodes.len(), depth + 1);
                 assert_eq!(index.segments.len(), depth + 1);
