@@ -1067,6 +1067,169 @@ fn bounded_file_profile_matches_retained_summary_for_unordered_and_untimed_sampl
 
 #[cfg(target_os = "linux")]
 #[test]
+fn inline_die_name_without_linkage_is_demangled_like_native_perf_libdw() {
+    // Linux v7.2.9 tools/perf/util/libdw.c:90-114 selects linkage/name; srcline.c:94-108
+    // new_inline_sym demangles either spelling while retaining the ELF outer.
+    use inferno::collapse::Collapse as _;
+
+    let root = tempfile::tempdir().expect("fixture directory");
+    let source = root.path().join("inline-name.c");
+    let binary = root.path().join("inline-name");
+    std::fs::write(
+        &source,
+        "static inline __attribute__((always_inline)) int _ZN2ns5innerEi(int value) { return value + 1; }\n\
+         __attribute__((noinline)) int outer(int value) { return _ZN2ns5innerEi(value); }\n\
+         int main(void) { return outer(1); }\n",
+    )
+    .expect("write C fixture");
+    let compile = Command::new("cc")
+        .args(["-g", "-O1", "-fno-pie", "-no-pie"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .expect("compile inline-name ELF");
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let bytes = inline_die_name_without_linkage_perfdata(&binary);
+    let input = root.path().join("inline-name.perf.data");
+    let mut bytes = bytes;
+    put_u64(&mut bytes, 16, 144);
+    std::fs::write(&input, &bytes).expect("write perf fixture");
+    let config = root.path().join("perfconfig");
+    std::fs::write(&config, "[addr2line]\nstyle = libdw\n").expect("write native perf config");
+
+    let native = Command::new("perf")
+        .args(["script", "--force", "--inline", "-i"])
+        .arg(&input)
+        .env("PERF_CONFIG", &config)
+        .output()
+        .expect("run native perf inline-name oracle");
+    assert!(
+        native.status.success(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    let native_script = String::from_utf8(native.stdout).expect("native script UTF-8");
+    assert!(
+        native_script.contains("ns::inner(int)+0x0 (inlined)"),
+        "native perf/libdw did not demangle the inline DW_AT_name: {native_script}"
+    );
+    let mut native_folded = Vec::new();
+    inferno::collapse::perf::Folder::default()
+        .collapse(
+            std::io::Cursor::new(native_script.as_bytes()),
+            &mut native_folded,
+        )
+        .expect("fold native perf script");
+    let native_folded = String::from_utf8(native_folded).expect("native folded UTF-8");
+
+    let resolver = pyroclast::symbols::PerfSymbolResolver::from_object_resolver(
+        pyroclast::symbols::RustAddr2lineResolver::new(),
+    );
+    let actual = pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(
+        &input,
+        FoldOptions {
+            count_periods: false,
+            inline: true,
+        },
+        &resolver,
+    )
+    .expect("fold Pyroclast perf fixture");
+    assert_eq!(actual, native_folded);
+}
+
+#[cfg(target_os = "linux")]
+fn inline_die_name_without_linkage_perfdata(binary: &std::path::Path) -> Vec<u8> {
+    use object::Object as _;
+    use object::ObjectSection as _;
+    use object::ObjectSegment as _;
+    use object::ObjectSymbol as _;
+
+    let elf_bytes = std::fs::read(binary).expect("read inline-name ELF");
+    let object = object::File::parse(elf_bytes.as_slice()).expect("parse inline-name ELF");
+    let endian = if object.is_little_endian() {
+        gimli::RunTimeEndian::Little
+    } else {
+        gimli::RunTimeEndian::Big
+    };
+    let dwarf = gimli::Dwarf::load(|section| {
+        let data = object
+            .section_by_name(section.name())
+            .map_or(Ok(&[][..]), |section| section.data())
+            .expect("read DWARF section");
+        Ok::<_, gimli::Error>(gimli::EndianSlice::new(data, endian))
+    })
+    .expect("parse fixture DWARF");
+    let mut units = dwarf.units();
+    let mut found_name_without_linkage = false;
+    while let Some(header) = units.next().expect("read DWARF unit header") {
+        let unit = dwarf.unit(header).expect("read DWARF unit");
+        let mut entries = unit.entries();
+        while let Some(die) = entries.next_dfs().expect("read DWARF DIE") {
+            let Some(name) = die.attr(gimli::DW_AT_name) else {
+                continue;
+            };
+            if dwarf
+                .attr_string(&unit, name.value())
+                .expect("resolve DW_AT_name")
+                .to_string_lossy()
+                == "_ZN2ns5innerEi"
+            {
+                assert!(
+                    die.attr(gimli::DW_AT_linkage_name).is_none(),
+                    "fixture unexpectedly has DW_AT_linkage_name"
+                );
+                found_name_without_linkage = true;
+            }
+        }
+    }
+    assert!(
+        found_name_without_linkage,
+        "fixture has no mangled DW_AT_name without DW_AT_linkage_name"
+    );
+    let outer = object
+        .symbols()
+        .find(|symbol| symbol.name().is_ok_and(|name| name == "outer"))
+        .expect("outer ELF symbol");
+    let ip = outer.address();
+    let segment = object
+        .segments()
+        .find(|segment| segment.address() <= ip && ip - segment.address() < segment.size())
+        .expect("load segment containing outer");
+    let (pgoff, _) = segment.file_range();
+    let attr = file_attr_bytes(
+        PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_CALLCHAIN,
+        0,
+        0,
+    );
+    let mut mmap = mmap_payload(
+        11,
+        12,
+        segment.address(),
+        segment.size(),
+        pgoff,
+        binary.to_str().unwrap(),
+    );
+    mmap.resize(mmap.len().next_multiple_of(8), 0);
+    perfdata_with_records_and_attrs(
+        [attr],
+        [
+            record_bytes_with_misc(1, PERF_RECORD_MISC_CPUMODE_USER, &mmap),
+            record_bytes_with_misc(
+                PERF_RECORD_SAMPLE,
+                PERF_RECORD_MISC_CPUMODE_USER,
+                &sample_payload(ip, 11, 12, [ip]),
+            ),
+        ],
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn bounded_file_profile_storage_does_not_grow_with_repeated_samples() {
     use std::io::Write;
     if let Some(path) = std::env::var_os("PYROCLAST_SUMMARY_MEMORY_FIXTURE") {
