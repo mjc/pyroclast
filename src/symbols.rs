@@ -185,6 +185,13 @@ pub trait SymbolResolver {
     /// before resolving any callchain nodes (`event.c:machine__resolve`).
     fn preprocess_sample_ip(&self, _mapping: &ResolvedMappingRef<'_>) {}
 
+    /// Resolves an explicitly kernel-space frame that has no perf mapping.
+    /// Implementations must validate the recorded kernel identity and symbol
+    /// range before returning a name.
+    fn resolve_unmapped_kernel_frame(&self, _address: u64) -> Option<String> {
+        None
+    }
+
     /// Resolves a batch of object-relative addresses.
     ///
     /// # Errors
@@ -2788,6 +2795,28 @@ impl<O> SymbolResolver for PerfSymbolResolver<O>
 where
     O: SymbolResolver,
 {
+    fn resolve_unmapped_kernel_frame(&self, address: u64) -> Option<String> {
+        let request = SymbolRequest {
+            path: PathBuf::from("[kernel.kallsyms]"),
+            relative_address: address,
+            addr2line_address: None,
+            kernel_module_address: None,
+            kernel_mapping_range: None,
+            build_id: self.recorded_kernel_build_id_ref().map(str::to_owned),
+            file_identity: None,
+            kernel_relocation: None,
+        };
+        self.kallsyms_ref()
+            .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, &request))
+            .or_else(|| {
+                (self.recorded_kernel_build_id_ref().is_none()
+                    || self.live_kernel_matches_recorded())
+                .then(|| self.live_kallsyms_ref())
+                .flatten()
+                .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, &request))
+            })
+    }
+
     fn initialize_kernel_maps(&self, table: &MmapTable) {
         // A module without a delivered core map cannot load that core DSO yet.
         if self.kcore_symbols.get().is_some() {
