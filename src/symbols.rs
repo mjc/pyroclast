@@ -2915,6 +2915,8 @@ where
         let mut kernel_elf_indexes = Vec::new();
         let mut user_requests = Vec::new();
         let mut user_indexes = Vec::new();
+        let mut module_requests = Vec::new();
+        let mut module_indexes = Vec::new();
         let mut old_module_objects = Vec::new();
         let mut address_cache = self
             .address_cache
@@ -2936,8 +2938,8 @@ where
                         self.module_object_symbol_request(request, &mut address_cache)
                 {
                     old_module_objects.push(index);
-                    user_indexes.push(index);
-                    user_requests.push(object_request);
+                    module_indexes.push(index);
+                    module_requests.push(object_request);
                 } else if symbols.activate(module) {
                     resolved[index] = symbols.resolve(kernel_address);
                 }
@@ -2946,17 +2948,16 @@ where
                 if let Some(object_request) =
                     self.module_object_symbol_request(request, &mut address_cache)
                 {
-                    user_indexes.push(index);
-                    user_requests.push(object_request);
+                    module_indexes.push(index);
+                    module_requests.push(object_request);
                 } else {
-                    resolved[index] = self.resolve_kernel_symbol(request);
+                    resolved[index] = self
+                        .resolve_kernel_source(request)
+                        .and_then(|frames| frames.frames.into_iter().next());
                 }
             } else if is_kernel_symbol_path(&request.path) {
-                let symbol = self.resolve_kernel_symbol(request);
-                if self.ordinary_kernel_address_is_unmapped(request) {
-                    resolved[index] = None;
-                } else if let Some(symbol) = symbol {
-                    resolved[index] = Some(symbol);
+                if let Some(frames) = self.resolve_kernel_frames(request) {
+                    resolved[index] = frames.frames.into_iter().next();
                 } else if let Some(kernel_elf) = self.kernel_elf_ref() {
                     if !object_build_id_matches(kernel_elf, request, &mut address_cache) {
                         continue;
@@ -2987,25 +2988,25 @@ where
             }
         }
 
+        if !module_requests.is_empty() {
+            let module_frames = self.resolve_object_frame_batch(&module_requests, false)?;
+            for ((index, frames), object_request) in module_indexes
+                .into_iter()
+                .zip(module_frames)
+                .zip(&module_requests)
+            {
+                resolved[index] = self.finish_module_symbol(
+                    frames,
+                    &requests[index],
+                    &object_request.path,
+                    old_module_objects.contains(&index),
+                );
+            }
+        }
         if !user_requests.is_empty() {
             let user_symbols = self.object_resolver.resolve_batch(&user_requests)?;
-            for ((index, symbol), object_request) in user_indexes
-                .into_iter()
-                .zip(user_symbols)
-                .zip(&user_requests)
-            {
-                if old_module_objects.contains(&index) {
-                    // Loading a module also initializes the core maps, but this
-                    // cursor keeps its original module source.
-                    self.finish_module_object_load(&requests[index], &object_request.path);
-                    resolved[index] = symbol;
-                } else {
-                    resolved[index] = symbol.or_else(|| {
-                        is_kernel_module_request(&requests[index])
-                            .then(|| self.resolve_kernel_symbol(&requests[index]))
-                            .flatten()
-                    });
-                }
+            for (index, symbol) in user_indexes.into_iter().zip(user_symbols) {
+                resolved[index] = symbol;
             }
         }
         Ok(resolved)
@@ -3123,8 +3124,8 @@ where
                 {
                     user_indexes.push(index);
                     user_requests.push(object_request);
-                } else if let Some(symbol) = self.resolve_kernel_symbol(request) {
-                    resolved[index] = ResolvedSymbolFrames::from_frames(vec![symbol]);
+                } else if let Some(frames) = self.resolve_kernel_source(request) {
+                    resolved[index] = frames;
                 }
             } else if is_kernel_symbol_path(&request.path) {
                 if let Some(frames) = self.resolve_kernel_frames(request) {
@@ -3180,6 +3181,30 @@ where
         Ok(resolved)
     }
 
+    fn finish_module_symbol(
+        &self,
+        mut frames: ResolvedSymbolFrames,
+        request: &SymbolRequest,
+        path: &Path,
+        old_module: bool,
+    ) -> Option<String> {
+        // Base metadata includes symbol_fprintf's offset; the bare API returns
+        // the name only. Remove only its recorded offset, before kallsyms
+        // fallback (whose bare API retains offsets).
+        if let Some(offset) = frames.base_offset
+            && let Some(name) = frames.frames.first_mut()
+            && let Some((base, suffix)) = name.rsplit_once("+0x")
+            && u64::from_str_radix(suffix, 16) == Ok(offset)
+        {
+            let end = base.len();
+            name.truncate(end);
+        }
+        self.finish_module_frame(frames, request, path, old_module)
+            .frames
+            .into_iter()
+            .next()
+    }
+
     fn finish_module_frame(
         &self,
         frames: ResolvedSymbolFrames,
@@ -3188,13 +3213,14 @@ where
         old_module: bool,
     ) -> ResolvedSymbolFrames {
         let module = is_kernel_module_request(request);
-        let mut frames = if frames.frames.is_empty() && module && !old_module {
-            self.resolve_kernel_symbol(request)
-                .map(|symbol| ResolvedSymbolFrames::from_frames(vec![symbol]))
-                .unwrap_or(frames)
-        } else {
-            frames
-        };
+        // perf v7.2.9 symbol.c:1830-1833/2000-2005 retains a loaded ELF
+        // on a symbol gap; only an unavailable object can use another source.
+        let mut frames =
+            if frames.source_state == SymbolSourceState::Unavailable && module && !old_module {
+                self.resolve_kernel_source(request).unwrap_or(frames)
+            } else {
+                frames
+            };
         // A missing module ELF does not rule out its kallsyms source.
         if module {
             frames.source_state = SymbolSourceState::AddressDependent;
@@ -3418,14 +3444,14 @@ where
     }
 
     fn resolve_kernel_frames(&self, request: &SymbolRequest) -> Option<ResolvedSymbolFrames> {
-        let symbol = self.resolve_kernel_symbol(request);
+        let frames = self.resolve_kernel_source(request);
         if self.ordinary_kernel_address_is_unmapped(request) {
             return Some(ResolvedSymbolFrames {
                 kernel_dso: SymbolDsoName::Unmapped,
                 ..ResolvedSymbolFrames::default()
             });
         }
-        symbol.map(|symbol| ResolvedSymbolFrames::from_frames(vec![symbol]))
+        frames
     }
 
     fn ordinary_kernel_address_is_unmapped(&self, request: &SymbolRequest) -> bool {
@@ -3443,8 +3469,9 @@ where
             })
     }
 
-    fn resolve_kernel_symbol(&self, request: &SymbolRequest) -> Option<String> {
-        if is_kernel_module_request(request) {
+    // None means no source loaded; an empty frame result is a selected-source miss.
+    fn resolve_kernel_source(&self, request: &SymbolRequest) -> Option<ResolvedSymbolFrames> {
+        let symbol = if is_kernel_module_request(request) {
             let module_name = kcore::module_dso_short_name(request.path.to_str()?);
             {
                 // perf symbol.c:dso__load sets loaded even on failure (1866).
@@ -3465,7 +3492,7 @@ where
                 }
             }
             self.kallsyms_ref()
-                .and_then(|kallsyms| resolve_module_kallsyms(kallsyms, request))
+                .map(|kallsyms| resolve_module_kallsyms(kallsyms, request))
                 .or_else(|| {
                     // tools/perf/util/symbol.c dso__find_kallsyms() does not
                     // reject /proc/kallsyms for kernel/module maps merely
@@ -3473,11 +3500,11 @@ where
                     // attempts it falls through to machine->root_dir/proc/kallsyms.
                     self.live_kallsyms
                         .as_ref()
-                        .and_then(|kallsyms| resolve_module_kallsyms(kallsyms, request))
+                        .map(|kallsyms| resolve_module_kallsyms(kallsyms, request))
                 })
                 .or_else(|| {
                     self.live_module_kallsyms_for_name(&module_name)
-                        .and_then(|kallsyms| resolve_module_kallsyms(kallsyms.as_ref(), request))
+                        .map(|kallsyms| resolve_module_kallsyms(kallsyms.as_ref(), request))
                 })
         } else {
             self.ordinary_kernel_load
@@ -3485,14 +3512,17 @@ where
                 .expect("kernel DSO load lock")
                 .core_loaded = true;
             self.kallsyms_ref()
-                .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
+                .map(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
                 .or_else(|| {
                     // tools/perf/util/symbol.c dso__find_kallsyms() tries the
                     // host/root /proc/kallsyms path before the final cached
                     // kallsyms fallback for host kernel maps.
-                    match self.live_kallsyms.as_ref() {
-                        Some(kallsyms) => resolve_kernel_kallsyms(kallsyms, request),
-                        None => self.live_kallsyms_snapshot()?.resolve_core(request),
+                    if let Some(kallsyms) = self.live_kallsyms.as_ref() {
+                        Some(resolve_kernel_kallsyms(kallsyms, request))
+                    } else {
+                        let snapshot = self.live_kallsyms_snapshot()?;
+                        snapshot.core.as_ref()?;
+                        Some(snapshot.resolve_core(request))
                     }
                 })
                 .or_else(|| {
@@ -3500,9 +3530,10 @@ where
                         return None;
                     }
                     self.system_map_kallsyms_ref()
-                        .and_then(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
+                        .map(|kallsyms| resolve_kernel_kallsyms(kallsyms, request))
                 })
-        }
+        };
+        symbol.map(|symbol| ResolvedSymbolFrames::from_frames(symbol.into_iter().collect()))
     }
 
     fn record_ordinary_module_load(&self, request: &SymbolRequest) {
@@ -14585,48 +14616,50 @@ mod tests {
         );
     }
 
-    #[test]
-    fn routed_frame_batches_preserve_mode_and_order_before_and_after_inline_storage_spills() {
-        struct ModeResolver;
-        impl SymbolResolver for ModeResolver {
-            fn resolve_batch(&self, _: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
-                Err("frame routing must preserve metadata".into())
-            }
-            fn resolve_frame_batch_with_metadata(
-                &self,
-                requests: &[SymbolRequest],
-            ) -> Result<Vec<ResolvedSymbolFrames>, String> {
-                Ok(requests
-                    .iter()
-                    .map(|request| {
-                        ResolvedSymbolFrames::from_frames(vec![format!(
-                            "inline:{}:{:x}",
-                            request.path.display(),
-                            request.relative_address
-                        )])
-                    })
-                    .collect())
-            }
-            fn resolve_base_frame_batch_with_metadata(
-                &self,
-                requests: &[SymbolRequest],
-            ) -> Result<Vec<ResolvedSymbolFrames>, String> {
-                Ok(requests
-                    .iter()
-                    .map(|request| {
-                        ResolvedSymbolFrames::from_frames(vec![format!(
-                            "base:{}:{:x}",
-                            request.path.display(),
-                            request.relative_address
-                        )])
-                    })
-                    .collect())
-            }
+    struct RoutedModeResolver;
+    impl SymbolResolver for RoutedModeResolver {
+        fn resolve_batch(&self, _: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
+            Err("frame routing must preserve metadata".into())
         }
+        fn resolve_frame_batch_with_metadata(
+            &self,
+            requests: &[SymbolRequest],
+        ) -> Result<Vec<ResolvedSymbolFrames>, String> {
+            Ok(requests
+                .iter()
+                .map(|request| {
+                    ResolvedSymbolFrames::from_frames(vec![format!(
+                        "inline:{}:{:x}",
+                        request.path.display(),
+                        request.relative_address
+                    )])
+                })
+                .collect())
+        }
+        fn resolve_base_frame_batch_with_metadata(
+            &self,
+            requests: &[SymbolRequest],
+        ) -> Result<Vec<ResolvedSymbolFrames>, String> {
+            Ok(requests
+                .iter()
+                .map(|request| {
+                    ResolvedSymbolFrames::from_frames(vec![format!(
+                        "base:{}:{:x}",
+                        request.path.display(),
+                        request.relative_address
+                    )])
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn routed_frame_batches_keep_selected_source_misses_and_preserve_mode_order_and_spills() {
+        // perf v7.2.9 symbol.c:2199-2216 retains a selected source on misses.
         let root = tempfile::tempdir().unwrap();
         let user = root.path().join("missing-user-object");
         let kernel = root.path().join("missing-kernel-object");
-        let resolver = super::PerfSymbolResolver::from_object_resolver(ModeResolver)
+        let resolver = super::PerfSymbolResolver::from_object_resolver(RoutedModeResolver)
             .with_kernel_elf(kernel.clone())
             .with_kallsyms(super::Kallsyms::parse("0000000000001000 T known\n").unwrap());
         for size in [0_usize, 1, 16, 17, 65] {
@@ -14648,19 +14681,14 @@ mod tests {
                 assert_eq!(results.len(), requests.len());
                 for (request, frames) in requests.iter().zip(results) {
                     let expected = match request.path.to_str().unwrap() {
-                        "[demo]" => Vec::new(),
                         "[kernel.kallsyms]" if request.relative_address == 0x1001 => {
                             vec!["known+0x1".into()]
                         }
+                        "[demo]" | "[kernel.kallsyms]" => Vec::new(),
                         _ => vec![format!(
                             "{}:{}:{:x}",
                             if inline { "inline" } else { "base" },
-                            if request.path == std::path::Path::new("[kernel.kallsyms]") {
-                                &kernel
-                            } else {
-                                &user
-                            }
-                            .display(),
+                            user.display(),
                             request.relative_address
                         )],
                     };
@@ -14670,6 +14698,43 @@ mod tests {
                         super::SymbolSourceState::AddressDependent
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn routed_frame_batches_use_kernel_elf_without_a_selected_kallsyms_source() {
+        let root = tempfile::tempdir().unwrap();
+        let kernel = root.path().join("missing-kernel-object");
+        let user = root.path().join("missing-user-object");
+        let resolver = super::PerfSymbolResolver::from_object_resolver(RoutedModeResolver)
+            .with_kernel_elf(kernel.clone());
+        let requests = [
+            test_request(user.to_str().unwrap(), 0x10),
+            test_request("[kernel.kallsyms]", 0x50),
+            test_request(user.to_str().unwrap(), 0x20),
+        ];
+        for inline in [true, false] {
+            let results = if inline {
+                resolver.resolve_frame_batch_with_metadata(&requests)
+            } else {
+                resolver.resolve_base_frame_batch_with_metadata(&requests)
+            }
+            .unwrap();
+            let mode = if inline { "inline" } else { "base" };
+            assert_eq!(results.len(), requests.len());
+            for ((path, address), frames) in [(&user, 0x10), (&kernel, 0x50), (&user, 0x20)]
+                .into_iter()
+                .zip(results)
+            {
+                assert_eq!(
+                    frames.frames,
+                    [format!("{mode}:{}:{address:x}", path.display())]
+                );
+                assert_eq!(
+                    frames.source_state,
+                    super::SymbolSourceState::AddressDependent
+                );
             }
         }
     }

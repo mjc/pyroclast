@@ -2205,16 +2205,18 @@ fn load_module_test_core(resolver: &impl SymbolResolver) {
 }
 
 #[test]
-fn perf_symbol_resolver_module_first_does_not_use_bounded_live_kallsyms() {
-    check_bounded_live_module_kallsyms(false);
+fn perf_symbol_resolver_module_first_does_not_mix_selected_kallsyms_with_live_modules() {
+    check_selected_core_only_kallsyms_with_live_modules(false);
 }
 
 #[test]
-fn perf_symbol_resolver_core_first_uses_bounded_live_module_kallsyms() {
-    check_bounded_live_module_kallsyms(true);
+fn perf_symbol_resolver_core_first_does_not_mix_selected_kallsyms_with_live_modules() {
+    check_selected_core_only_kallsyms_with_live_modules(true);
 }
 
-fn check_bounded_live_module_kallsyms(core_first: bool) {
+fn check_selected_core_only_kallsyms_with_live_modules(core_first: bool) {
+    // perf v7.2.9 symbol.c:2199-2216 keeps a selected file's misses;
+    // the native-first selected-source fixture in perfdata_fold covers this.
     let cached = Kallsyms::parse(
         "ffffffff846997a0 T __pi_memcpy\nffffffff8501cd2c R xen_elfnote_phys32_entry\n",
     )
@@ -2249,11 +2251,7 @@ ffffffffc0e66200 t zpl_iter_read_next [zfs]
         }])
         .expect("symbols");
 
-    // perf-script kernel frames carry the +0x<off> offset (symbol_fprintf.c).
-    assert_eq!(
-        symbols,
-        vec![core_first.then(|| "zpl_iter_read+0xe9".to_string())]
-    );
+    assert_eq!(symbols, vec![None]);
     if !core_first {
         load_module_test_core(&resolver);
     }
@@ -2269,11 +2267,134 @@ ffffffffc0e66200 t zpl_iter_read_next [zfs]
             kernel_relocation: None,
         }])
         .expect("another module address after core loading");
-    assert_eq!(
-        symbols,
-        vec![core_first.then(|| "zpl_iter_read+0xea".to_string())]
-    );
+    assert_eq!(symbols, vec![None]);
     assert!(runner.commands().is_empty());
+}
+
+#[test]
+fn perf_symbol_resolver_module_gap_uses_one_backend_lookup_and_preserves_user_mode() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("module.ko");
+    std::fs::write(&path, elf_with_dynamic_text_symbol(b"entry", 0x1000, 64)).unwrap();
+    let object = ObservedRustResolver {
+        inner: RustAddr2lineResolver::new(),
+        calls: RefCell::new(Vec::new()),
+    };
+    let resolver = pyroclast::symbols::PerfSymbolResolver::from_object_resolver(&object)
+        .with_kallsyms(Kallsyms::parse("ffffffff846997a0 T __pi_memcpy\n").unwrap());
+    load_module_test_core(&resolver);
+    let request = SymbolRequest {
+        path,
+        relative_address: 0x10,
+        addr2line_address: None,
+        kernel_module_address: Some(0xffff_ffff_c100_0010),
+        kernel_mapping_range: Some((0xffff_ffff_c100_0000, 0xffff_ffff_c100_1000)),
+        build_id: None,
+        file_identity: None,
+        kernel_relocation: None,
+    };
+    let requests = [
+        request.clone(),
+        SymbolRequest {
+            relative_address: 0x80,
+            kernel_module_address: Some(0xffff_ffff_c100_0080),
+            ..request.clone()
+        },
+        SymbolRequest {
+            kernel_module_address: None,
+            kernel_mapping_range: None,
+            ..request
+        },
+    ];
+    let symbols = resolver.resolve_batch(&requests).unwrap();
+    assert_eq!(symbols, [Some("entry".into()), None, Some("entry".into())]);
+    assert_eq!(*object.calls.borrow(), [("base", 2), ("bare", 1)]);
+    object.calls.borrow_mut().clear();
+    let base = resolver
+        .resolve_base_frame_batch_with_metadata(&requests)
+        .unwrap();
+    assert_eq!(
+        base.into_iter()
+            .map(|frames| frames.frames.into_iter().next())
+            .collect::<Vec<_>>(),
+        [Some("entry+0x10".into()), None, Some("entry+0x10".into())]
+    );
+    assert_eq!(*object.calls.borrow(), [("base", 3)]);
+}
+
+#[test]
+fn selected_kallsyms_core_misses_do_not_fall_through_to_other_sources() {
+    let root = tempfile::tempdir().unwrap();
+    let elf = root.path().join("vmlinux");
+    std::fs::write(
+        &elf,
+        elf_with_dynamic_text_symbol(b"alternative_core", 0xffff_ffff_8100_0000, 64),
+    )
+    .unwrap();
+    let selected = || {
+        pyroclast::symbols::PerfSymbolResolver::from_object_resolver(RustAddr2lineResolver::new())
+            .with_kallsyms(Kallsyms::parse("ffffffff82000000 T selected_core\n").unwrap())
+    };
+    let alternative = "ffffffff81000000 T alternative_core\n";
+    let request = SymbolRequest {
+        path: "[kernel.kallsyms]".into(),
+        relative_address: 0xffff_ffff_8100_0010,
+        addr2line_address: None,
+        kernel_module_address: None,
+        kernel_mapping_range: None,
+        build_id: None,
+        file_identity: None,
+        kernel_relocation: None,
+    };
+    let mut actual = Vec::new();
+    let mut source_states = Vec::new();
+    for (source, resolver) in [
+        (
+            "live",
+            selected().with_live_kallsyms(Kallsyms::parse(alternative).unwrap()),
+        ),
+        (
+            "system-map",
+            selected().with_system_map_kallsyms(Kallsyms::parse(alternative).unwrap()),
+        ),
+        ("elf", selected().with_kernel_elf(elf)),
+    ] {
+        let symbols = resolver
+            .resolve_batch(std::slice::from_ref(&request))
+            .unwrap();
+        let base = resolver
+            .resolve_base_frame_batch_with_metadata(std::slice::from_ref(&request))
+            .unwrap();
+        let inline = resolver
+            .resolve_frame_batch_with_metadata(std::slice::from_ref(&request))
+            .unwrap();
+        source_states.extend(base.iter().chain(&inline).map(|frames| frames.source_state));
+        actual.push((
+            source,
+            symbols,
+            base.into_iter()
+                .map(|frames| frames.frames)
+                .collect::<Vec<_>>(),
+            inline
+                .into_iter()
+                .map(|frames| frames.frames)
+                .collect::<Vec<_>>(),
+        ));
+    }
+    assert_eq!(
+        actual,
+        ["live", "system-map", "elf"].map(|source| (
+            source,
+            vec![None],
+            vec![Vec::<String>::new()],
+            vec![Vec::<String>::new()]
+        ))
+    );
+    assert!(
+        source_states
+            .iter()
+            .all(|state| *state == pyroclast::symbols::SymbolSourceState::AddressDependent)
+    );
 }
 
 #[test]
@@ -3359,15 +3480,72 @@ ffffffff846997a0 T memcpy
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn perf_symbol_resolver_note_only_module_elf_stays_unknown_without_bare_gnu_lookup() {
+    let home = tempfile::tempdir().expect("home");
+    let build_id = "d6ed2003b20b59c61cdc649124d920215521fc00";
+    let module_elf =
+        pyroclast::symbols::perf_build_id_elf_path(&perf_debug_dir(home.path()), build_id);
+    std::fs::create_dir_all(module_elf.parent().unwrap()).unwrap();
+    let bytes = elf_with_recorded_build_id(build_id);
+    let object = object::File::parse(bytes.as_slice()).unwrap();
+    assert_eq!(object.symbols().count(), 0);
+    assert_eq!(object.dynamic_symbols().count(), 0);
+    std::fs::write(&module_elf, bytes).unwrap();
+    let native = Command::new("addr2line")
+        .args(["-f", "-C", "-e"])
+        .arg(&module_elf)
+        .arg("0x30")
+        .output()
+        .expect("native GNU addr2line");
+    assert!(native.status.success(), "{native:?}");
+    assert_eq!(native.stdout, b"??\n??:0\n");
+
+    // Keep the former canned response to detect an unsupported bare lookup.
+    // perf v7.2.9 map.c:383-388 requires a symbol in the selected DSO.
+    let runner = Addr2lineRunner::new(b"igb_clean_rx_irq\n??:0\n");
+    let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
+        .with_debug_dir(perf_debug_dir(home.path()));
+    let actual = resolver
+        .resolve_batch(&[SymbolRequest {
+            path: "[igb]".into(),
+            relative_address: 0x30,
+            addr2line_address: None,
+            kernel_module_address: None,
+            kernel_mapping_range: None,
+            build_id: Some(build_id.into()),
+            file_identity: None,
+            kernel_relocation: None,
+        }])
+        .unwrap();
+    assert_eq!(actual, [None]);
+    assert!(runner.commands().is_empty());
+}
+
+#[test]
 fn perf_symbol_resolver_uses_module_build_id_elf() {
     let home = tempfile::tempdir().expect("home");
     let build_id = "d6ed2003b20b59c61cdc649124d920215521fc00";
     let module_elf =
         pyroclast::symbols::perf_build_id_elf_path(&perf_debug_dir(home.path()), build_id);
     std::fs::create_dir_all(module_elf.parent().expect("module elf parent")).expect("cache dir");
-    std::fs::write(&module_elf, elf_with_recorded_build_id(build_id)).expect("module elf");
+    let image = elf_with_dynamic_text_symbol(b"igb_clean_rx_irq", 0, 64);
+    let mut builder = build::elf::Builder::read(image.as_slice()).unwrap();
+    let note_image = elf_with_recorded_build_id(build_id);
+    let note_object = object::File::parse(note_image.as_slice()).unwrap();
+    let note_section = note_object.section_by_name(".note.gnu.build-id").unwrap();
+    let section = builder.sections.add();
+    section.name = b".note.gnu.build-id"[..].into();
+    section.sh_type = elf::SHT_NOTE;
+    section.sh_addralign = 4;
+    section.data =
+        build::elf::SectionData::Data(object::ObjectSection::data(&note_section).unwrap().into());
+    builder.set_section_sizes();
+    let mut bytes = Vec::new();
+    builder.write(&mut bytes).unwrap();
+    std::fs::write(&module_elf, bytes).expect("module elf");
 
-    let runner = Addr2lineRunner::new(b"igb_clean_rx_irq\n??:0\n");
+    let runner = Addr2lineRunner::new(b"");
     let resolver = pyroclast::symbols::PerfSymbolResolver::new(&runner)
         .with_debug_dir(perf_debug_dir(home.path()));
 
@@ -3385,16 +3563,8 @@ fn perf_symbol_resolver_uses_module_build_id_elf() {
         .expect("symbols");
 
     assert_eq!(symbols, vec![Some("igb_clean_rx_irq".to_string())]);
-    assert_eq!(runner.commands()[0].stdin.as_deref(), Some(&b"0x30\n"[..]));
-    assert_eq!(
-        runner.commands()[0].args,
-        vec![
-            "-f".to_string(),
-            "-C".to_string(),
-            "-e".to_string(),
-            module_elf.display().to_string(),
-        ]
-    );
+    // The selected ELF owns the base symbol; no addr2line query is necessary.
+    assert!(runner.commands().is_empty());
 }
 
 #[test]
@@ -3795,6 +3965,34 @@ struct RecordingResolver {
     symbols: BTreeMap<SymbolRequest, String>,
     frames: BTreeMap<SymbolRequest, Vec<String>>,
     calls: RefCell<Vec<Vec<SymbolRequest>>>,
+}
+
+struct ObservedRustResolver {
+    inner: RustAddr2lineResolver,
+    calls: RefCell<Vec<(&'static str, usize)>>,
+}
+
+impl SymbolResolver for &ObservedRustResolver {
+    fn selected_object_module_metadata(
+        &self,
+        path: &Path,
+        module: &SymbolRequest,
+    ) -> Option<std::sync::Arc<pyroclast::symbols::KernelModuleObjectMetadata>> {
+        self.inner.selected_object_module_metadata(path, module)
+    }
+
+    fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
+        self.calls.borrow_mut().push(("bare", requests.len()));
+        self.inner.resolve_batch(requests)
+    }
+
+    fn resolve_base_frame_batch_with_metadata(
+        &self,
+        requests: &[SymbolRequest],
+    ) -> Result<Vec<pyroclast::symbols::ResolvedSymbolFrames>, String> {
+        self.calls.borrow_mut().push(("base", requests.len()));
+        self.inner.resolve_base_frame_batch_with_metadata(requests)
+    }
 }
 
 fn perfdata_with_kernel_build_id() -> Vec<u8> {

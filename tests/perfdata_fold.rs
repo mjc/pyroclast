@@ -6452,22 +6452,98 @@ fn absolute_module_kallsyms_fallback_matches_native_with_missing_or_rejected_kco
 
 #[cfg(target_os = "linux")]
 #[test]
+fn selected_kallsyms_source_does_not_mix_live_module_rows_like_native_perf() {
+    // perf v7.2.9 symbol.c:2199-2216 selects an explicit kallsyms file only.
+    // with_kallsyms installs that selected table; this does not model which
+    // file automatic cache discovery should choose before source selection.
+    let selected = "ffffffff81000000 T _stext\nffffffff81000100 T _etext\n";
+    let (root, bytes) = write_native_module_kallsyms_fixture(
+        selected,
+        &[0xffff_ffff_c100_0010],
+        false,
+        ["[a]", "[b]"],
+    );
+    let live = root.path().join("symfs/proc/kallsyms");
+    std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+    std::fs::write(
+        &live,
+        "ffffffff81000000 T _stext\nffffffff81000100 T _etext\n\
+         ffffffffc1000000 T live_module_entry\t[a]\n\
+         ffffffffc1000200 T live_module_next\t[a]\n",
+    )
+    .unwrap();
+    let (script, stderr, native) = query_native_module_kallsyms(root.path(), &[]);
+    assert!(
+        stderr.contains(&format!(
+            "Using {} for symbols",
+            root.path().join("kallsyms").display()
+        )),
+        "{script}\n{stderr}"
+    );
+    assert!(script.contains("_stext+0x10"), "{script}\n{stderr}");
+    assert!(script.contains("[unknown] ([a])"), "{script}\n{stderr}");
+    assert_eq!(native, b"worker;[[a]] 1\nworker;_stext 1\n");
+
+    let resolver = pyroclast::symbols::PerfSymbolResolver::from_object_resolver(
+        pyroclast::symbols::RustAddr2lineResolver::new(),
+    )
+    .with_kallsyms(pyroclast::symbols::Kallsyms::parse(selected).unwrap())
+    .with_system_kallsyms_from_path(&live);
+    let actual = fold_perfdata_callchains_with_symbols(
+        &bytes,
+        FoldOptions {
+            inline: false,
+            count_periods: true,
+        },
+        &resolver,
+    )
+    .unwrap();
+    assert_eq!(
+        actual.as_bytes(),
+        native,
+        "native script={script}\nstderr={stderr}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn absolute_kernel_module_elf_precedes_kallsyms_when_kcore_is_missing() {
-    assert_native_module_object_queries(&[0xffff_ffff_8100_0010, 0xffff_ffff_c100_0010]);
+    assert_native_module_object_queries(
+        &[0xffff_ffff_8100_0010, 0xffff_ffff_c100_0010],
+        "worker;_stext 1\nworker;loaded_module_function 1\n",
+    );
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn module_object_loaded_before_core_does_not_gain_kallsyms_at_uncovered_addresses() {
-    assert_native_module_object_queries(&[
-        0xffff_ffff_c100_0010,
-        0xffff_ffff_8100_0010,
-        0xffff_ffff_c100_0040,
-    ]);
+    assert_native_module_object_queries(
+        &[
+            0xffff_ffff_c100_0010,
+            0xffff_ffff_8100_0010,
+            0xffff_ffff_c100_0040,
+        ],
+        "worker;[[a]] 1\nworker;_stext 1\nworker;loaded_module_function 1\n",
+    );
 }
 
 #[cfg(target_os = "linux")]
-fn assert_native_module_object_queries(sampled_ips: &[u64]) {
+#[test]
+fn module_object_loaded_after_core_does_not_gain_kallsyms_at_uncovered_addresses() {
+    // perf v7.2.9 symbol.c:1981-2005 loads a module ELF once, not per address.
+    // Establish that native perf actually selects the ELF before comparing.
+    assert_native_module_object_queries(
+        &[
+            0xffff_ffff_8100_0010,
+            0xffff_ffff_c100_0010,
+            0xffff_ffff_c100_0040,
+        ],
+        "worker;[[a]] 1\nworker;_stext 1\nworker;loaded_module_function 1\n",
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn assert_native_module_object_queries(sampled_ips: &[u64], expected_native: &str) {
     use object::{Architecture, BinaryFormat, Endianness, SectionKind, SymbolKind, SymbolScope};
     let parent =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/native-kallsyms-fixtures");
@@ -6498,12 +6574,62 @@ fn assert_native_module_object_queries(sampled_ips: &[u64]) {
     std::fs::create_dir_all(native_module.parent().unwrap()).unwrap();
     std::fs::write(native_module, elf).unwrap();
     std::fs::remove_file(root.path().join("kcore")).unwrap();
-    let (script, _, native) = query_native_module_kallsyms(root.path(), &[]);
+    let (script, stderr, native) = query_native_module_kallsyms(root.path(), &[]);
     assert!(
         script.contains("loaded_module_function+0x10 ([a])"),
         "{script}"
     );
+    assert_eq!(
+        native,
+        expected_native.as_bytes(),
+        "native module source/extent guard failed\n{script}\n{stderr}"
+    );
+    assert_module_object_bare_queries(root.path(), &module, sampled_ips);
     assert_module_symbol_routes_match_native(root.path(), &bytes, &script, &native);
+}
+
+#[cfg(target_os = "linux")]
+fn assert_module_object_bare_queries(
+    root: &std::path::Path,
+    module: &std::path::Path,
+    ips: &[u64],
+) {
+    let resolver = pyroclast::symbols::PerfSymbolResolver::from_object_resolver(
+        pyroclast::symbols::RustAddr2lineResolver::new(),
+    )
+    .with_system_kallsyms_from_path(&root.join("kallsyms"));
+    for &ip in ips {
+        let is_module = ip >= 0xffff_ffff_c100_0000;
+        let request = SymbolRequest {
+            path: if is_module {
+                module.into()
+            } else {
+                "[kernel.kallsyms]_stext".into()
+            },
+            relative_address: if is_module {
+                ip - 0xffff_ffff_c100_0000
+            } else {
+                ip
+            },
+            kernel_module_address: is_module.then_some(ip),
+            kernel_mapping_range: is_module
+                .then_some((0xffff_ffff_c100_0000, 0xffff_ffff_c100_4000)),
+            addr2line_address: None,
+            build_id: None,
+            file_identity: None,
+            kernel_relocation: None,
+        };
+        let expected = match ip {
+            0xffff_ffff_8100_0010 => Some("_stext+0x10".into()),
+            0xffff_ffff_c100_0010 => Some("loaded_module_function".into()),
+            _ => None,
+        };
+        assert_eq!(
+            resolver.resolve_batch(&[request]).unwrap(),
+            [expected],
+            "bare query {ip:#x}"
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
