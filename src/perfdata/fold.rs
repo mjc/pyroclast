@@ -41,9 +41,10 @@ use crate::perfdata::records::{
 use crate::perfdata::samples::{
     PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_ID,
     PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_STREAM_ID, PERF_SAMPLE_TID,
-    PERF_SAMPLE_TIME, SampleLayout, is_kernel_space_frame, is_perf_context_marker,
-    parse_sample_record_callchain, parse_sample_record_metadata,
+    PERF_SAMPLE_TIME, SampleLayout, parse_sample_record_callchain, parse_sample_record_metadata,
 };
+#[cfg(not(test))]
+use crate::perfdata::samples::{is_kernel_space_frame, is_perf_context_marker};
 use crate::perfdata::source::{
     FileSource, QueuedPerfRecord, RecordSource, SliceSource, WindowStore,
 };
@@ -165,14 +166,41 @@ thread_local! {
     static PROJECTION_BULK_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FOLD_FRAME_ADDRESS_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PROJECTION_SPAN_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RAW_CALLCHAIN_CLASSIFICATION_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CALLCHAIN_KERNEL_PREDICATE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CALLCHAIN_MARKER_PREDICATE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[derive(Default)]
-struct FoldCounts {
+#[cfg(test)]
+fn is_kernel_space_frame(frame: u64) -> bool {
+    CALLCHAIN_KERNEL_PREDICATE_CALLS.with(|calls| calls.set(calls.get() + 1));
+    crate::perfdata::samples::is_kernel_space_frame(frame)
+}
+
+#[cfg(test)]
+fn is_perf_context_marker(frame: u64) -> bool {
+    CALLCHAIN_MARKER_PREDICATE_CALLS.with(|calls| calls.set(calls.get() + 1));
+    crate::perfdata::samples::is_perf_context_marker(frame)
+}
+
+struct FoldCounts<S = FxBuildHasher> {
     names: Vec<Arc<str>>,
     by_name: HashMap<Arc<str>, LabelId, FxBuildHasher>,
-    stacks: HashMap<Box<[LabelId]>, u64, FxBuildHasher>,
+    stacks: HashMap<Arc<[LabelId]>, u64, S>,
     scratch_stack: Vec<LabelId>,
+    last_stack: Option<(u64, Arc<[LabelId]>)>,
+}
+
+impl Default for FoldCounts {
+    fn default() -> Self {
+        Self {
+            names: Vec::new(),
+            by_name: HashMap::default(),
+            stacks: HashMap::default(),
+            scratch_stack: Vec::new(),
+            last_stack: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -570,7 +598,7 @@ impl PerfSummary {
     }
 }
 
-impl FoldCounts {
+impl<S: std::hash::BuildHasher> FoldCounts<S> {
     fn intern(&mut self, label: &str) -> LabelId {
         if let Some(&id) = self.by_name.get(label) {
             return id;
@@ -592,14 +620,33 @@ impl FoldCounts {
     }
 
     fn add_prepared(&mut self, _: &mut String, count: u64) {
-        add_stack_count(&mut self.stacks, self.scratch_stack.as_slice(), count);
+        self.add_current_stack(count);
     }
 
     fn add_stack(&mut self, stack: &str, count: u64) {
         let labels = self.append_serialized_labels(stack);
         self.scratch_stack.clear();
         self.scratch_stack.extend_from_slice(&labels);
-        add_stack_count(&mut self.stacks, self.scratch_stack.as_slice(), count);
+        self.add_current_stack(count);
+    }
+
+    fn add_current_stack(&mut self, count: u64) {
+        if let Some((hash, last)) = &self.last_stack
+            && self.scratch_stack.as_slice() == last.as_ref()
+            && let hashbrown::hash_map::RawEntryMut::Occupied(entry) = self
+                .stacks
+                .raw_entry_mut()
+                .from_hash(*hash, |resident| Arc::ptr_eq(resident, last))
+        {
+            // Full scratch equality above proves the key; pointer identity
+            // selects only its immutable resident allocation, even on collision.
+            let total = entry.into_mut();
+            *total = total.saturating_add(count);
+            return;
+        }
+        let (hash, resident) =
+            add_stack_count(&mut self.stacks, self.scratch_stack.as_slice(), count);
+        self.last_stack = Some((hash, Arc::clone(resident)));
     }
 
     #[cfg(test)]
@@ -619,24 +666,30 @@ impl FoldCounts {
     }
 }
 
-fn add_stack_count<K, Q, S>(stacks: &mut HashMap<K, u64, S>, key: &Q, count: u64)
+fn add_stack_count<'a, K, Q, S>(
+    stacks: &'a mut HashMap<K, u64, S>,
+    key: &Q,
+    count: u64,
+) -> (u64, &'a K)
 where
-    K: std::hash::Hash + Eq + std::borrow::Borrow<Q> + for<'a> From<&'a Q>,
+    K: std::hash::Hash + Eq + std::borrow::Borrow<Q> + for<'b> From<&'b Q>,
     Q: std::hash::Hash + Eq + ?Sized,
     S: std::hash::BuildHasher,
 {
     let hash = stacks.hasher().hash_one(key);
-    match stacks.raw_entry_mut().from_key_hashed_nocheck(hash, key) {
+    let (resident, _) = match stacks.raw_entry_mut().from_key_hashed_nocheck(hash, key) {
         hashbrown::hash_map::RawEntryMut::Occupied(entry) => {
-            let total = entry.into_mut();
+            let (resident, total) = entry.into_key_value();
             *total = total.saturating_add(count);
+            (resident, total)
         }
         hashbrown::hash_map::RawEntryMut::Vacant(entry) => {
             // Borrow<Q> requires owned and borrowed keys to hash and compare
             // identically. Keep full equality checks even when hashes collide.
-            entry.insert_hashed_nocheck(hash, K::from(key), count);
+            entry.insert_hashed_nocheck(hash, K::from(key), count)
         }
-    }
+    };
+    (hash, resident)
 }
 
 /// Summarizes record counts and parsed sample callchains from `perf.data`.
@@ -3024,6 +3077,8 @@ struct FoldedRenderBuffers {
     #[cfg(test)]
     repeat_helper_entries: usize,
     #[cfg(test)]
+    projected_segment_copy_calls: usize,
+    #[cfg(test)]
     stack_len_reads: std::cell::Cell<usize>,
 }
 
@@ -3099,11 +3154,21 @@ impl FoldedRenderBuffers {
         }
         if self.projecting {
             let len = self.counts.scratch_stack.len() - start;
+            if len == 0 {
+                return;
+            }
             self.counts.scratch_stack.reserve(len * (repeats - 1));
-            for _ in 1..repeats {
+            let mut copied = 1;
+            while copied < repeats {
+                let batch = copied.min(repeats - copied);
+                #[cfg(test)]
+                {
+                    self.projected_segment_copy_calls += 1;
+                }
                 self.counts
                     .scratch_stack
-                    .extend_from_within(start..start + len);
+                    .extend_from_within(start..start + len * batch);
+                copied += batch;
             }
             return;
         }
@@ -4657,11 +4722,23 @@ fn sample_callchain_state(
     if is_kernel_sample && sample.frames.is_empty() {
         return SampleCallchainState::KernelWithoutCallchain;
     }
-    let has_recorded_user_frame = sample.frames.clone().any(is_recorded_user_callchain_frame);
-    let has_recorded_kernel_frame = sample
-        .frames
-        .clone()
-        .any(is_recorded_kernel_callchain_frame);
+    let mut has_recorded_user_frame = false;
+    let mut has_recorded_kernel_frame = false;
+    for frame in sample.frames.clone() {
+        #[cfg(test)]
+        RAW_CALLCHAIN_CLASSIFICATION_VISITS.with(|visits| visits.set(visits.get() + 1));
+        if is_perf_context_marker(frame) {
+            continue;
+        }
+        if is_kernel_space_frame(frame) {
+            has_recorded_kernel_frame = true;
+        } else {
+            has_recorded_user_frame = true;
+        }
+        if has_recorded_user_frame && has_recorded_kernel_frame {
+            break;
+        }
+    }
     if has_recorded_kernel_frame && has_recorded_user_frame {
         return SampleCallchainState::KernelWithUserFrame;
     }
@@ -5155,14 +5232,6 @@ fn sample_fold_count(period: Option<u64>, default_period: u64, options: FoldOpti
     }
 }
 
-fn is_recorded_user_callchain_frame(frame: u64) -> bool {
-    !is_perf_context_marker(frame) && !is_kernel_space_frame(frame)
-}
-
-fn is_recorded_kernel_callchain_frame(frame: u64) -> bool {
-    !is_perf_context_marker(frame) && is_kernel_space_frame(frame)
-}
-
 fn merge_deferred_sample_payload(
     sample: &mut DeferredFoldSample,
     ips: &[u64],
@@ -5493,6 +5562,143 @@ mod tests {
     use crate::symbols::{ResolvedSymbolFrames, SymbolFrameCache, SymbolRequest, SymbolResolver};
 
     #[test]
+    fn raw_callchain_classification_visits_each_needed_frame_once() {
+        use super::SampleCallchainState as State;
+        const KERNEL: u64 = 0xffff_8000_0000_0000;
+        const USER_CONTEXT: u64 = 0xffff_ffff_ffff_fe00;
+        let cases: &[(&[u64], bool, usize)] = &[
+            (&[], false, 0),
+            (&[0, 1, 0x7fff_ffff_ffff_ffff], false, 3),
+            (&[KERNEL, KERNEL + 1], false, 2),
+            (&[u64::MAX, USER_CONTEXT], false, 2),
+            (&[0, KERNEL, 1, KERNEL + 1], true, 2),
+            (&[KERNEL, 0, KERNEL + 1, 1], true, 2),
+            (&[u64::MAX, USER_CONTEXT, 0, KERNEL, 1], true, 4),
+            (&[USER_CONTEXT, KERNEL, KERNEL + 1, 0, 1], true, 4),
+        ];
+        let layout = crate::perfdata::samples::SampleLayout {
+            sample_type: super::PERF_SAMPLE_CALLCHAIN,
+            read_format: 0,
+            branch_sample_type: 0,
+            sample_regs_user: 0,
+            sample_regs_intr: 0,
+            sample_id_all: false,
+        };
+        let mut failures = Vec::new();
+        for &(frames, mixed, budget) in cases {
+            let mut payload = (frames.len() as u64).to_le_bytes().to_vec();
+            for frame in frames {
+                payload.extend(frame.to_le_bytes());
+            }
+            let sample = super::parse_sample_record_callchain(&payload, layout)
+                .unwrap()
+                .unwrap();
+            assert_eq!(sample.frames.clone().collect::<Vec<_>>(), frames);
+            for misc in [
+                super::PERF_RECORD_MISC_CPUMODE_KERNEL,
+                super::PERF_RECORD_MISC_CPUMODE_USER,
+                0,
+            ] {
+                for has_frames in [false, true] {
+                    for has_callchain in [false, true] {
+                        let mut event = super::SampleEventLayout::new(layout, "cpu-clock", 1);
+                        if !has_callchain {
+                            event.layout.sample_type = 0;
+                        }
+                        let expected = if misc == super::PERF_RECORD_MISC_CPUMODE_KERNEL
+                            && frames.is_empty()
+                        {
+                            State::KernelWithoutCallchain
+                        } else if mixed {
+                            State::KernelWithUserFrame
+                        } else if misc == super::PERF_RECORD_MISC_CPUMODE_KERNEL {
+                            State::KernelWithCallchain
+                        } else {
+                            State::Other {
+                                has_callchain,
+                                has_frames,
+                            }
+                        };
+                        let before =
+                            super::RAW_CALLCHAIN_CLASSIFICATION_VISITS.with(std::cell::Cell::get);
+                        assert_eq!(
+                            super::sample_callchain_state(misc, &event, &sample, has_frames),
+                            expected
+                        );
+                        let visits = super::RAW_CALLCHAIN_CLASSIFICATION_VISITS
+                            .with(std::cell::Cell::get)
+                            - before;
+                        if visits > budget {
+                            failures.push((frames, misc, visits, budget));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "duplicate raw iterator visits: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn raw_callchain_classification_evaluates_each_predicate_once_per_row() {
+        const KERNEL: u64 = 0xffff_8000_0000_0000;
+        let layout = crate::perfdata::samples::SampleLayout {
+            sample_type: super::PERF_SAMPLE_CALLCHAIN,
+            read_format: 0,
+            branch_sample_type: 0,
+            sample_regs_user: 0,
+            sample_regs_intr: 0,
+            sample_id_all: false,
+        };
+        let event = super::SampleEventLayout::new(layout, "cpu-clock", 1);
+        let mut failures = Vec::new();
+        for (frames, marker_budget, kernel_budget, mixed) in [
+            (vec![0; 257], 257, 257, false),
+            (vec![KERNEL; 257], 257, 257, false),
+            (vec![u64::MAX; 257], 257, 0, false),
+            (vec![0, KERNEL, 1], 2, 2, true),
+            (vec![KERNEL, 0, KERNEL + 1], 2, 2, true),
+            (vec![u64::MAX, 0, 1, KERNEL, 2], 4, 3, true),
+        ] {
+            let mut payload = (frames.len() as u64).to_le_bytes().to_vec();
+            for frame in &frames {
+                payload.extend(frame.to_le_bytes());
+            }
+            let sample = super::parse_sample_record_callchain(&payload, layout)
+                .unwrap()
+                .unwrap();
+            let before_marker = super::CALLCHAIN_MARKER_PREDICATE_CALLS.with(std::cell::Cell::get);
+            let before_kernel = super::CALLCHAIN_KERNEL_PREDICATE_CALLS.with(std::cell::Cell::get);
+            assert_eq!(
+                super::sample_callchain_state(
+                    super::PERF_RECORD_MISC_CPUMODE_KERNEL,
+                    &event,
+                    &sample,
+                    true
+                ),
+                if mixed {
+                    super::SampleCallchainState::KernelWithUserFrame
+                } else {
+                    super::SampleCallchainState::KernelWithCallchain
+                },
+            );
+            let marker =
+                super::CALLCHAIN_MARKER_PREDICATE_CALLS.with(std::cell::Cell::get) - before_marker;
+            let kernel =
+                super::CALLCHAIN_KERNEL_PREDICATE_CALLS.with(std::cell::Cell::get) - before_kernel;
+            if marker > marker_budget || kernel > kernel_budget {
+                failures.push((frames.len(), marker, marker_budget, kernel, kernel_budget));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "duplicate real predicate calls: {failures:?}"
+        );
+    }
+
+    #[test]
     fn sample_ip_text_cursor_is_event_local_at_same_address() {
         use super::SampleOutput as _;
         use crate::symbols::{PerfSymbolResolver, SelectedObjectResolver, SymbolizerKind};
@@ -5643,6 +5849,168 @@ mod tests {
         }
 
         fn write(&mut self, _: &[u8]) {}
+    }
+
+    #[test]
+    fn repeated_projected_stack_hashes_only_on_first_resident_selection() {
+        let mut failures = Vec::new();
+        for text in [
+            None,
+            Some(""),
+            Some("comm;\u{e9};outer;inner_[i]"),
+            Some("dup;dup"),
+            Some("a;;b"),
+        ] {
+            let hashes = std::rc::Rc::new(std::cell::Cell::new(0));
+            let mut counts = super::FoldCounts {
+                names: Vec::new(),
+                by_name: super::HashMap::default(),
+                stacks: super::HashMap::with_capacity_and_hasher(
+                    32,
+                    CountingCollisionHasher(hashes.clone()),
+                ),
+                scratch_stack: Vec::new(),
+                last_stack: None,
+            };
+            if let Some(text) = text {
+                counts.scratch_stack = counts.append_serialized_labels(text).into_vec();
+            }
+            let mut rendered = text.unwrap_or_default().to_owned();
+            let pointer = rendered.as_ptr();
+            let before = hashes.get();
+            for _ in 0..513 {
+                counts.add_prepared(&mut rendered, 2);
+            }
+            let calls = hashes.get() - before;
+            assert_eq!(counts.stacks.len(), 1);
+            assert_eq!(
+                counts.stacks.get(counts.scratch_stack.as_slice()),
+                Some(&1026)
+            );
+            assert_eq!(rendered, text.unwrap_or_default());
+            assert_eq!(rendered.as_ptr(), pointer);
+            if calls != 1 {
+                failures.push((text, calls));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "repeated resident stack hashing: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn resident_stack_cache_preserves_collisions_nonconsecutive_keys_and_saturation() {
+        let hashes = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut counts = super::FoldCounts {
+            names: Vec::new(),
+            by_name: super::HashMap::default(),
+            stacks: super::HashMap::with_capacity_and_hasher(32, CountingCollisionHasher(hashes)),
+            scratch_stack: Vec::new(),
+            last_stack: None,
+        };
+        for (text, weight) in [
+            ("root;\u{e9};dup;dup", 1),
+            ("root;\u{e9};dup;dup", 2),
+            ("root;\u{e9};dup", 4),
+            ("", 8),
+            (";", 16),
+            ("root;;leaf", 32),
+            ("root;\u{e9};dup;dup", u64::MAX),
+            ("root;\u{e9};dup;dup", 1),
+            ("root;zero", 0),
+        ] {
+            counts.add_rendered(text, weight);
+        }
+        for (text, total) in [
+            ("root;\u{e9};dup;dup", u64::MAX),
+            ("root;\u{e9};dup", 4),
+            ("", 8),
+            (";", 16),
+            ("root;;leaf", 32),
+            ("root;zero", 0),
+        ] {
+            assert_eq!(counts.count_for_rendered(text), Some(total));
+        }
+        assert_eq!(counts.stacks.len(), 6);
+        counts.add_rendered(&["root", "\u{e9}", "dup", "dup"].join(";"), 0);
+        let labels = counts.append_serialized_labels("root;\u{e9};dup;dup");
+        let resident = counts.stacks.get_key_value(labels.as_slice()).unwrap().0;
+        assert!(std::sync::Arc::ptr_eq(
+            resident,
+            &counts.last_stack.as_ref().unwrap().1
+        ));
+        assert_eq!(
+            std::sync::Arc::strong_count(resident),
+            2,
+            "map and one last-key alias only"
+        );
+    }
+
+    #[test]
+    fn resident_stack_cache_survives_rehash_replacement_removal_and_lost_hint() {
+        let hashes = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut counts = super::FoldCounts {
+            names: Vec::new(),
+            by_name: super::HashMap::default(),
+            stacks: super::HashMap::with_capacity_and_hasher(
+                1,
+                CountingCollisionHasher(hashes.clone()),
+            ),
+            scratch_stack: Vec::new(),
+            last_stack: None,
+        };
+        counts.add_rendered("root;\u{e9}", 2);
+        let labels = counts.append_serialized_labels("root;\u{e9}");
+        let original = counts.last_stack.as_ref().unwrap().1.clone();
+        for index in 0..64 {
+            let id = counts.intern(&format!("unique-{index}"));
+            super::add_stack_count(&mut counts.stacks, [id].as_slice(), 3);
+        }
+        let before = hashes.get();
+        counts.add_rendered("root;\u{e9}", 3);
+        assert_eq!(
+            hashes.get(),
+            before,
+            "resident allocation survives table rehash"
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            &original,
+            &counts.last_stack.as_ref().unwrap().1
+        ));
+        assert_eq!(counts.count_for_rendered("root;\u{e9}"), Some(5));
+
+        assert_eq!(counts.stacks.remove(labels.as_slice()), Some(5));
+        let replacement: std::sync::Arc<[super::LabelId]> = labels.as_slice().into();
+        assert!(!std::sync::Arc::ptr_eq(&original, &replacement));
+        counts.stacks.insert(replacement.clone(), 7);
+        let before = hashes.get();
+        counts.add_rendered("root;\u{e9}", 1);
+        assert_eq!(
+            hashes.get(),
+            before + 1,
+            "stale resident pointer must use full-key fallback"
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            &replacement,
+            &counts.last_stack.as_ref().unwrap().1
+        ));
+        assert_eq!(counts.count_for_rendered("root;\u{e9}"), Some(8));
+
+        counts.last_stack = None;
+        let before = hashes.get();
+        counts.add_rendered("root;\u{e9}", 1);
+        assert_eq!(hashes.get(), before + 1);
+        assert_eq!(counts.count_for_rendered("root;\u{e9}"), Some(9));
+        assert_eq!(counts.stacks.remove(labels.as_slice()), Some(9));
+        let before = hashes.get();
+        counts.add_rendered("root;\u{e9}", 1);
+        assert_eq!(hashes.get(), before + 1);
+        assert_eq!(counts.count_for_rendered("root;\u{e9}"), Some(1));
+        assert!(!std::sync::Arc::ptr_eq(
+            &replacement,
+            &counts.last_stack.as_ref().unwrap().1
+        ));
     }
 
     #[test]
@@ -8474,6 +8842,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn projected_repeat_segments_use_geometric_copy_calls_without_changing_labels() {
+        let mut failures = Vec::new();
+        for repeats in [0_usize, 1, 2, 3, 5, 511, 513, 4097] {
+            for segment in ["", ";", ";unicode_\u{e9}", ";outer;inner_[i]"] {
+                let mut buffers = super::FoldedRenderBuffers {
+                    projecting: true,
+                    ..super::FoldedRenderBuffers::default()
+                };
+                buffers
+                    .start_stack(Some(super::SampleComm::Name("comm;\u{e9}")))
+                    .unwrap();
+                let start = buffers.counts.scratch_stack.len();
+                if let Some(labels) = segment.strip_prefix(';') {
+                    let labels = buffers.counts.append_serialized_labels(labels);
+                    buffers.counts.scratch_stack.extend_from_slice(&labels);
+                }
+                buffers.repeat_segment(start, repeats);
+                assert_eq!(
+                    buffers.rendered(),
+                    format!("comm;\u{e9}{}", segment.repeat(repeats.max(1)))
+                );
+                let budget = if segment.is_empty() {
+                    0
+                } else {
+                    (usize::BITS - repeats.saturating_sub(1).leading_zeros()) as usize
+                };
+                if buffers.projected_segment_copy_calls != budget {
+                    failures.push((
+                        repeats,
+                        segment,
+                        buffers.projected_segment_copy_calls,
+                        budget,
+                    ));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "actual projected copy calls exceed geometric budget: {failures:?}"
+        );
     }
 
     #[test]
