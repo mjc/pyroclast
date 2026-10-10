@@ -135,11 +135,10 @@ fn read_identity(path: &Path) -> Option<ProcessIdentity> {
 }
 
 fn launch(root: &Path, stubborn: bool) -> (Probe, PathBuf) {
-    let tools = root.join("bin");
-    std::fs::create_dir(&tools).unwrap();
-    executable(
-        &tools.join("bpftrace"),
-        r#"#!/bin/sh
+    launch_with_flush(root, stubborn, None)
+}
+
+const CANCELLATION_RECORDER_SCRIPT: &str = r#"#!/bin/sh
 if [ "$1" = --version ]; then echo 'bpftrace v0.26.0'; exit 0; fi
 while [ $# -gt 0 ]; do
     case "$1" in -c) shift; workload=$1;; -o) shift; data=$1;; esac
@@ -152,15 +151,41 @@ finish() {
     printf '@offcpu[\n    1 wait+0 ([kernel.kallsyms])\n]: 200\n' > "$data"
     exit 0
 }
-if [ "$PYROCLAST_TEST_STUBBORN" = yes ]; then trap '' INT TERM; else trap finish INT TERM; fi
+flush() {
+    printf started > "$PYROCLAST_TEST_FLUSH_STARTED"
+    printf '%s' "$data" > "$PYROCLAST_TEST_FLUSH_DATA_PATH"
+    if [ "$PYROCLAST_TEST_FLUSH_SIGNAL" = TERM ]; then trap '' INT TERM; fi
+    if [ "$PYROCLAST_TEST_CLOSE_PIPES" = yes ]; then
+        exec >/dev/null 2>&1
+        printf closed > "$PYROCLAST_TEST_PIPES_CLOSED"
+    fi
+    while [ ! -e "$PYROCLAST_TEST_FLUSH_RELEASE" ]; do sleep 0.01; done
+    printf '@offcpu[\n    1 wait+0 ([kernel.kallsyms])\n]: 200\n' > "$data"
+    printf complete > "$PYROCLAST_TEST_FLUSH_COMPLETE"
+    exit 0
+}
+if [ "$PYROCLAST_TEST_STUBBORN" = yes ]; then
+    trap 'printf received > "$PYROCLAST_TEST_FIRST_SIGNAL"; trap "" INT TERM' INT TERM
+elif [ -n "$PYROCLAST_TEST_FLUSH_SIGNAL" ]; then
+    trap flush "$PYROCLAST_TEST_FLUSH_SIGNAL"
+else
+    trap finish INT TERM
+fi
 /bin/sh -c "$workload" &
 supervisor=$!
 printf '%s\n' "$$" > "$PYROCLAST_TEST_RECORDER_PID"
 printf '%s\n' "$supervisor" > "$PYROCLAST_TEST_SUPERVISOR_PID"
 wait "$supervisor"
+if [ "$PYROCLAST_TEST_STUBBORN" = yes ]; then
+    while :; do sleep 30; done
+fi
 finish
-"#,
-    );
+"#;
+
+fn launch_with_flush(root: &Path, stubborn: bool, flush_signal: Option<&str>) -> (Probe, PathBuf) {
+    let tools = root.join("bin");
+    std::fs::create_dir(&tools).unwrap();
+    executable(&tools.join("bpftrace"), CANCELLATION_RECORDER_SCRIPT);
     let out = root.join("run");
     let child = Command::new(env!("CARGO_BIN_EXE_pyroclast"))
         .args(["offcpu", "--offcpu-method", "bpftrace", "--json", "--out"])
@@ -178,6 +203,24 @@ finish
             "PYROCLAST_TEST_STUBBORN",
             if stubborn { "yes" } else { "no" },
         )
+        .env("PYROCLAST_TEST_FLUSH_SIGNAL", flush_signal.unwrap_or(""))
+        .env("PYROCLAST_TEST_FLUSH_STARTED", root.join("flush-started"))
+        .env("PYROCLAST_TEST_FLUSH_COMPLETE", root.join("flush-complete"))
+        .env("PYROCLAST_TEST_FLUSH_RELEASE", root.join("flush-release"))
+        .env(
+            "PYROCLAST_TEST_FLUSH_DATA_PATH",
+            root.join("flush-data-path"),
+        )
+        .env(
+            "PYROCLAST_TEST_CLOSE_PIPES",
+            if flush_signal == Some("TERM") {
+                "yes"
+            } else {
+                "no"
+            },
+        )
+        .env("PYROCLAST_TEST_PIPES_CLOSED", root.join("pipes-closed"))
+        .env("PYROCLAST_TEST_FIRST_SIGNAL", root.join("first-signal"))
         .stdout(Stdio::from(
             std::fs::File::create(root.join("stdout")).unwrap(),
         ))
@@ -206,6 +249,83 @@ finish
     assert_eq!(ready.start, probe.leader.start);
     probe.leader = ready;
     (probe, out)
+}
+
+fn check_recording_flush_cancellation(signal: i32, flush_signal: &str) {
+    let root = tempfile::tempdir().unwrap();
+    let (probe, out) = launch_with_flush(root.path(), false, Some(flush_signal));
+    assert!(
+        probe.leader.signal(signal),
+        "verified CLI PID must receive the cancellation signal"
+    );
+    let started = root.path().join("flush-started");
+    assert!(
+        wait_until(|| started.exists(), Duration::from_secs(3)),
+        "recorder never entered flush; stderr={}",
+        std::fs::read_to_string(root.path().join("stderr")).unwrap()
+    );
+    if flush_signal == "TERM" {
+        assert!(wait_until(
+            || root.path().join("pipes-closed").exists(),
+            Duration::from_secs(3)
+        ));
+    }
+    // Model tools/perf/builtin-record.c:record__finish_output: pipes may close before it returns.
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(
+        probe.owned[0].alive(),
+        "recorder was forcibly stopped before flush completed; exit={:?}, stderr={}",
+        probe.exit_code(),
+        std::fs::read_to_string(root.path().join("stderr")).unwrap()
+    );
+    assert!(
+        probe.leader.alive(),
+        "CLI exited while recorder leader was flushing"
+    );
+    assert!(
+        !root.path().join("flush-complete").exists(),
+        "flush probe did not exceed the runner's stop deadline"
+    );
+    std::fs::write(root.path().join("flush-release"), b"finish").unwrap();
+    assert!(
+        wait_until(
+            || root.path().join("flush-complete").exists(),
+            Duration::from_secs(3)
+        ),
+        "recorder did not publish the completed data; stderr={}",
+        std::fs::read_to_string(root.path().join("stderr")).unwrap()
+    );
+    let data_path =
+        PathBuf::from(std::fs::read_to_string(root.path().join("flush-data-path")).unwrap());
+    assert_eq!(
+        std::fs::read_to_string(data_path).unwrap(),
+        "@offcpu[\n    1 wait+0 ([kernel.kallsyms])\n]: 200\n"
+    );
+    assert!(wait_until(|| probe.exited(), Duration::from_secs(3)));
+    assert!(
+        probe.owned.iter().all(|process| !process.alive()),
+        "CLI exited without stopping every owned process"
+    );
+    assert_eq!(probe.exit_code(), Some(128 + signal));
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("run.json")).unwrap()).unwrap();
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("summary.json")).unwrap()).unwrap();
+    assert!(manifest["exit_status"].is_null());
+    assert_eq!(summary["cancellation_signal"], signal);
+    assert_eq!(summary["recorder_status"], 0);
+    assert_eq!(summary["workload_outcome"], "interrupted");
+    assert_eq!(summary["total_offcpu_ns"], 200);
+}
+
+#[test]
+fn sigint_recorder_flush_is_not_escalated_to_default_sigterm() {
+    check_recording_flush_cancellation(libc::SIGINT, "INT");
+}
+
+#[test]
+fn sigterm_recorder_flush_is_not_escalated_to_sigkill() {
+    check_recording_flush_cancellation(libc::SIGTERM, "TERM");
 }
 
 fn check_direct_cancellation(signal: i32, stubborn: bool) {
@@ -244,6 +364,34 @@ fn check_direct_cancellation(signal: i32, stubborn: bool) {
     }
 }
 
+fn check_repeated_recording_cancellation(signal: i32) {
+    let root = tempfile::tempdir().unwrap();
+    let (probe, _) = launch(root.path(), true);
+    assert!(probe.leader.signal(signal));
+    let first_signal = root.path().join("first-signal");
+    assert!(wait_until(|| first_signal.exists(), Duration::from_secs(3)));
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(probe.leader.alive(), "CLI escalated the first cancellation");
+    assert!(
+        probe.owned[0].alive(),
+        "recorder did not survive first cancellation"
+    );
+
+    assert!(
+        probe.leader.signal(signal),
+        "second cancellation was not delivered"
+    );
+    assert!(
+        wait_until(|| probe.exited(), Duration::from_secs(4)),
+        "CLI ignored repeated signal {signal}"
+    );
+    assert!(
+        probe.owned.iter().all(|process| !process.alive()),
+        "CLI exited without stopping every owned process"
+    );
+    assert_eq!(probe.exit_code(), Some(128 + signal));
+}
+
 #[test]
 fn direct_cli_sigint_stops_and_reaps_owned_recorder_and_workload() {
     check_direct_cancellation(libc::SIGINT, false);
@@ -255,13 +403,13 @@ fn direct_cli_sigterm_stops_and_reaps_owned_recorder_and_workload() {
 }
 
 #[test]
-fn direct_cli_sigint_escalates_when_recorder_ignores_signals() {
-    check_direct_cancellation(libc::SIGINT, true);
+fn repeated_sigint_forcibly_stops_stubborn_recording_processes() {
+    check_repeated_recording_cancellation(libc::SIGINT);
 }
 
 #[test]
-fn direct_cli_sigterm_escalates_when_recorder_ignores_signals() {
-    check_direct_cancellation(libc::SIGTERM, true);
+fn repeated_sigterm_forcibly_stops_stubborn_recording_processes() {
+    check_repeated_recording_cancellation(libc::SIGTERM);
 }
 
 fn launch_fixture(root: &Path, script: &str) -> Probe {

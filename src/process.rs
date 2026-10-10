@@ -660,7 +660,11 @@ fn run_owned_process(
             owned.signal(signal);
             owned.signal(libc::SIGCONT);
             forwarded = true;
-            stopping = Some(now + Duration::from_millis(350));
+            // perf's tools/perf/builtin-record.c:record__finish_output can outlive this deadline.
+            // A repeated stop still takes the immediate SIGKILL path below.
+            if command.purpose != CommandPurpose::Recording {
+                stopping = Some(now + Duration::from_millis(350));
+            }
             stdin = None;
         }
         if !leader_completed {
