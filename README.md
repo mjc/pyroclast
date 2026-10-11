@@ -321,10 +321,29 @@ ELF fixtures. `tests/perfdata_fold.rs` covers public byte/file/text routes and
 the portable nops-only regression. The corrected regression was observed
 failing on both Linux and macOS before the shared evaluator fixed it.
 
-Fresh exact native comparisons have covered perf 7.2.5 with libdw unwinding,
-the 373 MiB recording, generated C DWARF/frame-pointer recordings and paired
-ELF identity/source-selection fixtures. These are workload/version-specific
-proofs, not a claim that every recording, architecture or perf backend matches.
+Fresh exact native comparisons have covered perf 7.2.5 with libdw unwinding
+and perf 7.2.9 with elfutils 0.195, the 373 MiB recording, generated C
+DWARF/frame-pointer recordings and paired ELF identity/source-selection
+fixtures. These are workload/version-specific proofs, not universal guarantees
+for malformed DWARF, indexed ranges, other recordings, architectures or perf
+backends.
+
+For the covered perf 7.2.9/libdw 0.195 path, defining-function discovery
+[substitutes referenced non-compile-unit children](https://sourceware.org/git/?p=elfutils.git;a=blob;f=libdw/libdw_visit_scopes.c;hb=elfutils-0.195#l117)
+at the import position, before the next local sibling; imported compile-unit
+targets are skipped. CU and source-line admission remain tied to the host CU.
+The selected function's separate
+[physical inline walk](https://github.com/gregkh/linux/blob/v7.2.9/tools/perf/util/dwarf-aux.c#L560-L584)
+does not expand import references.
+
+Valid low/high PC takes priority over a present direct range attribute. In the
+covered DWARF 3/5 direct-pointer cases, invalid forms and missing or
+out-of-section range pointers produce
+[native range-read faults](https://sourceware.org/git/?p=elfutils.git;a=blob;f=libdw/dwarf_ranges.c;hb=elfutils-0.195#l504).
+The selector preserves their nonzero predicate result under the existing
+CU, source-line and defining-function gates. Absent range attributes are not
+faults; unrelated initialization failures and indexed forms retain their
+separate handling.
 
 Kernel parity validates bracketed and absolute module mappings against host
 kcore by perf's canonical DSO name, including `.ko.gz` and `.ko.xz` paths.

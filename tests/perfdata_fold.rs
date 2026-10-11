@@ -12633,6 +12633,264 @@ fn native_dwarf_source_routes(
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeImportedRoot {
+    Partial,
+    NoImport,
+    Compile,
+}
+
+#[cfg(target_os = "linux")]
+fn native_imported_root_elf(case: NativeImportedRoot) -> Vec<u8> {
+    // elfutils 0.195 libdw_visit_scopes.c:117-164 expands partial-unit
+    // children at DW_AT_import, but skips an imported compile unit.
+    let abbrev = vec![
+        1,
+        0x11,
+        1,
+        3,
+        8,
+        0x10,
+        0x17,
+        0x11,
+        1,
+        0x12,
+        6,
+        0,
+        0,
+        2,
+        0x2e,
+        1,
+        3,
+        8,
+        0x11,
+        1,
+        0x12,
+        6,
+        0,
+        0,
+        3,
+        0x1d,
+        0,
+        3,
+        8,
+        0x11,
+        1,
+        0x12,
+        6,
+        0,
+        0,
+        4,
+        if case == NativeImportedRoot::Compile {
+            0x11
+        } else {
+            0x3c
+        },
+        1,
+        3,
+        8,
+        0,
+        0,
+        5,
+        0x3d,
+        0,
+        0x18,
+        0x10,
+        0,
+        0,
+        0,
+    ];
+    let mut host = native_dwarf_unit_header(4);
+    host.extend_from_slice(b"\x01bias.c\0");
+    host.extend_from_slice(&0_u32.to_le_bytes());
+    host.extend_from_slice(&0x0040_1000_u64.to_le_bytes());
+    host.extend_from_slice(&32_u32.to_le_bytes());
+    let import_offset = if case == NativeImportedRoot::NoImport {
+        None
+    } else {
+        host.push(5);
+        let offset = host.len();
+        host.extend_from_slice(&0_u32.to_le_bytes());
+        Some(offset)
+    };
+    push_inline_traversal_die(&mut host, 2, "local_root", Some((0x0040_1000, 32)));
+    push_inline_traversal_die(&mut host, 3, "local_leaf", Some((0x0040_1004, 4)));
+    host.extend_from_slice(&[0, 0]);
+    if let Some(offset) = import_offset {
+        let target = u32::try_from(host.len() + 11).unwrap();
+        host[offset..offset + 4].copy_from_slice(&target.to_le_bytes());
+    }
+    let mut partial = native_dwarf_unit_header(4);
+    partial.extend_from_slice(b"\x04partial.c\0");
+    push_inline_traversal_die(&mut partial, 2, "imported_root", Some((0x0040_1000, 32)));
+    push_inline_traversal_die(&mut partial, 3, "imported_leaf", Some((0x0040_1004, 4)));
+    partial.extend_from_slice(&[0, 0]);
+    for unit in [&mut host, &mut partial] {
+        let length = u32::try_from(unit.len() - 4).unwrap();
+        unit[..4].copy_from_slice(&length.to_le_bytes());
+    }
+    host.extend_from_slice(&partial);
+    let bytes = native_dwarf_source_elf(abbrev, host, None);
+    assert_native_imported_root_layout(&bytes, case);
+    bytes
+}
+
+#[cfg(target_os = "linux")]
+fn assert_native_imported_root_layout(bytes: &[u8], case: NativeImportedRoot) {
+    let dwarf = native_dwarf_source_layout(bytes);
+    let mut headers = dwarf.units();
+    let host = dwarf.unit(headers.next().unwrap().unwrap()).unwrap();
+    let target = dwarf.unit(headers.next().unwrap().unwrap()).unwrap();
+    assert!(headers.next().unwrap().is_none());
+    let target_root = target.entry(gimli::UnitOffset(11)).unwrap();
+    assert_eq!(
+        target_root.tag(),
+        if case == NativeImportedRoot::Compile {
+            gimli::DW_TAG_compile_unit
+        } else {
+            gimli::DW_TAG_partial_unit
+        }
+    );
+    let target_offset = target.header.debug_info_offset().unwrap().0 + target_root.offset().0;
+    let mut entries = host.entries();
+    let mut imports = 0;
+    while let Some(die) = entries.next_dfs().unwrap() {
+        if die.tag() == gimli::DW_TAG_imported_unit {
+            assert_eq!(
+                die.attr_value(gimli::DW_AT_import),
+                Some(gimli::AttributeValue::DebugInfoRef(gimli::DebugInfoOffset(
+                    target_offset
+                )))
+            );
+            imports += 1;
+        }
+    }
+    assert_eq!(imports, usize::from(case != NativeImportedRoot::NoImport));
+    for unit in [&host, &target] {
+        let mut entries = unit.entries();
+        while let Some(die) = entries.next_dfs().unwrap() {
+            if matches!(
+                die.tag(),
+                gimli::DW_TAG_subprogram | gimli::DW_TAG_inlined_subroutine
+            ) {
+                assert!(die.attr(gimli::DW_AT_declaration).is_none());
+                let range = dwarf
+                    .die_ranges(unit, die)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap();
+                let expected = if die.tag() == gimli::DW_TAG_subprogram {
+                    (0x0040_1000, 0x0040_1020)
+                } else {
+                    (0x0040_1004, 0x0040_1008)
+                };
+                assert_eq!((range.begin, range.end), expected);
+            }
+        }
+    }
+    eprintln!(
+        "{case:?}: target DIE {target_offset:#x} tag={:?}, import count={imports}",
+        target_root.tag()
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn assert_native_imported_root_parity(case: NativeImportedRoot) {
+    use object::ObjectSection as _;
+    let root = tempfile::tempdir().unwrap();
+    let binary = root.path().join("imported.elf");
+    let input = root.path().join("perf.data");
+    std::fs::write(
+        root.path().join("perfconfig"),
+        "[addr2line]\nstyle = libdw\n",
+    )
+    .unwrap();
+    let imported = native_imported_root_elf(NativeImportedRoot::Partial);
+    let no_import = native_imported_root_elf(NativeImportedRoot::NoImport);
+    let partial_bytes = |bytes: &[u8]| {
+        let elf = object::File::parse(bytes).unwrap();
+        let info = elf.section_by_name(".debug_info").unwrap().data().unwrap();
+        let host_len =
+            usize::try_from(u32::from_le_bytes(info[..4].try_into().unwrap())).unwrap() + 4;
+        info[host_len..].to_vec()
+    };
+    assert_eq!(
+        partial_bytes(&imported),
+        partial_bytes(&no_import),
+        "identical partial-unit bytes in no-import control"
+    );
+    std::fs::write(&input, inline_range_tail_perfdata(&binary, 0x0040_1006)).unwrap();
+    for (bytes, leaf) in [(&no_import, "local_leaf"), (&imported, "imported_leaf")] {
+        std::fs::write(&binary, bytes).unwrap();
+        let (healthy, _) = native_inline_range_tail(root.path(), &input, true);
+        assert!(
+            healthy.contains(&format!("{leaf}+0x")),
+            "independent root prerequisite: {healthy}"
+        );
+        eprintln!("{case:?} prerequisite {leaf}:\n{healthy}");
+    }
+    std::fs::write(&binary, native_imported_root_elf(case)).unwrap();
+    let mut outcomes = Vec::new();
+    for ip in [0x0040_1006, 0x0040_100c] {
+        let bytes = inline_range_tail_perfdata(&binary, ip);
+        std::fs::write(&input, &bytes).unwrap();
+        let native = [
+            native_inline_range_tail(root.path(), &input, false),
+            native_inline_range_tail(root.path(), &input, true),
+        ];
+        let leaf = if case == NativeImportedRoot::Partial {
+            "imported_leaf"
+        } else {
+            "local_leaf"
+        };
+        for (inline, (script, folded)) in [false, true].into_iter().zip(&native) {
+            assert_eq!(
+                script.contains(&format!("{leaf}+0x")),
+                inline && ip == 0x0040_1006,
+                "root selection guard: {script}"
+            );
+            assert!(!script.contains(if leaf == "imported_leaf" {
+                "local_leaf+0x"
+            } else {
+                "imported_leaf+0x"
+            }));
+            eprintln!(
+                "{case:?} ip={ip:#x} inline={inline}\nNATIVE SCRIPT:\n{script}NATIVE FOLDED:\n{folded}"
+            );
+        }
+        outcomes.extend(native_dwarf_source_routes(&input, &bytes, &native));
+    }
+    assert_eq!(outcomes.len(), 16);
+    let mismatches: Vec<_> = outcomes
+        .iter()
+        .filter(|(actual, expected)| actual.as_ref() != Ok(expected))
+        .collect();
+    assert!(
+        mismatches.is_empty(),
+        "{case:?}: all16 outcomes collected before assertion: {mismatches:?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_imported_partial_root_precedes_overlapping_local_root() {
+    assert_native_imported_root_parity(NativeImportedRoot::Partial);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_imported_partial_bytes_without_import_select_local_root() {
+    assert_native_imported_root_parity(NativeImportedRoot::NoImport);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_imported_compile_unit_is_skipped_before_local_root() {
+    assert_native_imported_root_parity(NativeImportedRoot::Compile);
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeVersionedRange {
     Healthy,
     MissingSection,

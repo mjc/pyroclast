@@ -940,6 +940,7 @@ struct PerfDwarfFrameIndex {
 struct PerfDwarfFrameNode {
     name: Option<PerfDwarfNameId>,
     subtree_end: usize,
+    physical_tree: usize,
     ranges: std::ops::Range<usize>,
     kind: PerfDwarfDieKind,
     defining_root: bool,
@@ -7347,10 +7348,65 @@ where
     perf_dwarf_merge_ranges(ranges)
 }
 
-fn perf_dwarf_unit_frame_index<R>(
+struct PerfDwarfTraversal<'a, R: gimli::Reader> {
+    unit: &'a gimli::Unit<R>,
+    entries: gimli::EntriesCursor<'a, R>,
+    root_depth: isize,
+    scopes: Vec<(isize, usize)>,
+    root_pruned_depth: Option<isize>,
+    physical_tree: usize,
+    import: Option<gimli::DebugInfoOffset<R::Offset>>,
+}
+
+impl<'a, R: gimli::Reader> PerfDwarfTraversal<'a, R> {
+    fn new(
+        unit: &'a gimli::Unit<R>,
+        mut entries: gimli::EntriesCursor<'a, R>,
+        physical_tree: usize,
+        import: Option<gimli::DebugInfoOffset<R::Offset>>,
+    ) -> Option<Self> {
+        entries.next_entry().ok().filter(|&present| present)?;
+        let root_depth = entries.current()?.depth();
+        Some(Self {
+            unit,
+            entries,
+            root_depth,
+            scopes: Vec::new(),
+            root_pruned_depth: None,
+            physical_tree,
+            import,
+        })
+    }
+
+    fn next(&mut self, index: &mut PerfDwarfFrameIndex) -> Result<bool, gimli::Error> {
+        let Some(_) = self.entries.next_dfs()? else {
+            return Ok(false);
+        };
+        let depth = self.entries.current().expect("cursor advanced").depth();
+        if depth <= self.root_depth {
+            return Ok(false);
+        }
+        while self.scopes.last().is_some_and(|&(level, _)| level >= depth) {
+            let (_, node) = self.scopes.pop().expect("live scope");
+            index.nodes[node].subtree_end = index.nodes.len();
+        }
+        if self.root_pruned_depth.is_some_and(|level| depth <= level) {
+            self.root_pruned_depth = None;
+        }
+        Ok(true)
+    }
+
+    fn finish(self, index: &mut PerfDwarfFrameIndex) {
+        for (_, node) in self.scopes {
+            index.nodes[node].subtree_end = index.nodes.len();
+        }
+    }
+}
+
+fn perf_dwarf_unit_frame_index<'a, R>(
     dwarf: &gimli::Dwarf<R>,
-    unit: &gimli::Unit<R>,
-    directory: &PerfDwarfUnitDirectory<R>,
+    unit: &'a gimli::Unit<R>,
+    directory: &'a PerfDwarfUnitDirectory<R>,
     names: &mut PerfDwarfNameInterner<'_>,
     source_line_ranges: Vec<PerfAddressRange>,
 ) -> PerfDwarfFrameIndex
@@ -7361,78 +7417,126 @@ where
         source_line_ranges,
         ..PerfDwarfFrameIndex::default()
     };
-    let mut entries = unit.entries();
-    let Ok(true) = entries.next_entry() else {
+    let Some(mut current) = PerfDwarfTraversal::new(unit, unit.entries(), 0, None) else {
         return index;
     };
-    let Some(root) = entries.current() else {
-        return index;
-    };
-    let root_depth = root.depth();
+    let root = current.entries.current().expect("unit root");
     let c_unit = perf_dwarf_is_c_unit(unit, directory, root);
     let compile_unit = root.tag() == gimli::DW_TAG_compile_unit;
-    let mut scopes = Vec::<(isize, usize)>::new();
-    let mut root_pruned_depth = None;
-    while let Ok(Some(_)) = entries.next_dfs() {
-        let entry = entries
-            .current()
-            .expect("cursor advanced to a non-null DIE");
-        let depth = entry.depth();
-        if depth <= root_depth {
-            break;
+    let mut pending = Vec::<PerfDwarfTraversal<'a, R>>::new();
+    let mut next_tree = 1;
+    let mut discover_roots = compile_unit;
+    loop {
+        let advanced = current.next(&mut index);
+        if advanced != Ok(true) {
+            discover_roots &= advanced.is_ok();
+            current.finish(&mut index);
+            let Some(parent) = pending.pop() else {
+                break;
+            };
+            current = parent;
+            continue;
         }
-        while scopes.last().is_some_and(|&(level, _)| level >= depth) {
-            let (_, node) = scopes.pop().expect("live scope");
-            index.nodes[node].subtree_end = index.nodes.len();
-        }
-        if root_pruned_depth.is_some_and(|level| depth <= level) {
-            root_pruned_depth = None;
+        let entry = current.entries.current().expect("cursor advanced");
+        // elfutils0.195 libdw_visit_scopes.c:117-164 substitutes a referenced
+        // non-compile target's CHILDREN at this position. The path-local chain
+        // permits repeated imports after returning, but terminates cycles.
+        if entry.tag() == gimli::DW_TAG_imported_unit
+            && discover_roots
+            && current.root_pruned_depth.is_none()
+        {
+            let import = entry.offset().to_debug_info_offset(&current.unit.header);
+            if import.is_some()
+                && (current.import == import
+                    || pending.iter().any(|parent| parent.import == import))
+            {
+                discover_roots = false;
+                continue;
+            }
+            if let Some((owner, offset)) = perf_dwarf_import_target(current.unit, directory, entry)
+                && let Ok(entries) = owner.entries_at_offset(offset)
+                && let Some(imported) = PerfDwarfTraversal::new(owner, entries, next_tree, import)
+            {
+                next_tree += 1;
+                pending.push(std::mem::replace(&mut current, imported));
+            }
+            continue;
         }
         // elfutils 0.195 dwarf_getfuncs.c:68-93 prunes C root discovery,
         // not perf's independent inline child search (dwarf-aux.c:560-584).
-        if root_pruned_depth.is_none() && !perf_dwarf_root_descends(entry.tag(), c_unit) {
-            root_pruned_depth = Some(depth);
+        if current.root_pruned_depth.is_none() && !perf_dwarf_root_descends(entry.tag(), c_unit) {
+            current.root_pruned_depth = Some(entry.depth());
         }
-        let kind = match entry.tag() {
-            gimli::DW_TAG_subprogram => PerfDwarfDieKind::Subprogram,
-            gimli::DW_TAG_inlined_subroutine => PerfDwarfDieKind::Inline,
-            _ => continue,
-        };
-        let node = index.nodes.len();
-        let start = index.segments.len();
-        let frame = std::num::NonZeroUsize::new(node + 1).expect("one-based frame");
-        let range_status =
-            perf_dwarf_append_node_ranges(dwarf, unit, entry, frame, &mut index.segments);
-        if range_status == PerfDwarfRangeStatus::ReadError {
-            index.range_errors.push(node);
-        }
-        let name = perf_dwarf_die_frame_name(dwarf, unit, directory, entry)
-            .and_then(|name| names.intern(&name));
-        index.nodes.push(PerfDwarfFrameNode {
-            name,
-            subtree_end: node + 1,
-            ranges: start..index.segments.len(),
-            kind,
-            defining_root: compile_unit
-                && kind == PerfDwarfDieKind::Subprogram
-                && root_pruned_depth.is_none()
-                && entry.attr(gimli::DW_AT_declaration).is_none(),
-            range_status,
-        });
-        scopes.push((depth, node));
-        #[cfg(test)]
-        PERF_DWARF_TEMPORARY_STORAGE.with(|storage| {
-            let mut observed = storage.get();
-            observed.scopes += 1;
-            observed.max_live_scopes = observed.max_live_scopes.max(scopes.len());
-            storage.set(observed);
-        });
-    }
-    for (_, node) in scopes {
-        index.nodes[node].subtree_end = index.nodes.len();
+        perf_dwarf_append_frame_node(
+            &mut index,
+            dwarf,
+            &mut current,
+            directory,
+            names,
+            discover_roots,
+        );
     }
     perf_dwarf_prepare_point_index(&mut index);
     index
+}
+
+fn perf_dwarf_import_target<'a, R: gimli::Reader>(
+    unit: &'a gimli::Unit<R>,
+    directory: &'a PerfDwarfUnitDirectory<R>,
+    entry: &gimli::DebuggingInformationEntry<R>,
+) -> Option<(&'a gimli::Unit<R>, gimli::UnitOffset<R::Offset>)> {
+    let (owner, offset) = match entry.attr_value(gimli::DW_AT_import)? {
+        gimli::AttributeValue::UnitRef(offset) => (unit, offset),
+        gimli::AttributeValue::DebugInfoRef(offset) => directory.resolve_reference(offset)?,
+        _ => return None,
+    };
+    (owner.entry(offset).ok()?.tag() != gimli::DW_TAG_compile_unit).then_some((owner, offset))
+}
+
+fn perf_dwarf_append_frame_node<R: gimli::Reader>(
+    index: &mut PerfDwarfFrameIndex,
+    dwarf: &gimli::Dwarf<R>,
+    current: &mut PerfDwarfTraversal<'_, R>,
+    directory: &PerfDwarfUnitDirectory<R>,
+    names: &mut PerfDwarfNameInterner<'_>,
+    discover_roots: bool,
+) {
+    let entry = current.entries.current().expect("cursor advanced");
+    let kind = match entry.tag() {
+        gimli::DW_TAG_subprogram => PerfDwarfDieKind::Subprogram,
+        gimli::DW_TAG_inlined_subroutine => PerfDwarfDieKind::Inline,
+        _ => return,
+    };
+    let node = index.nodes.len();
+    let start = index.segments.len();
+    let frame = std::num::NonZeroUsize::new(node + 1).expect("one-based frame");
+    let range_status =
+        perf_dwarf_append_node_ranges(dwarf, current.unit, entry, frame, &mut index.segments);
+    if range_status == PerfDwarfRangeStatus::ReadError {
+        index.range_errors.push(node);
+    }
+    let name = perf_dwarf_die_frame_name(dwarf, current.unit, directory, entry)
+        .and_then(|name| names.intern(&name));
+    index.nodes.push(PerfDwarfFrameNode {
+        name,
+        subtree_end: node + 1,
+        physical_tree: current.physical_tree,
+        ranges: start..index.segments.len(),
+        kind,
+        defining_root: discover_roots
+            && kind == PerfDwarfDieKind::Subprogram
+            && current.root_pruned_depth.is_none()
+            && entry.attr(gimli::DW_AT_declaration).is_none(),
+        range_status,
+    });
+    current.scopes.push((entry.depth(), node));
+    #[cfg(test)]
+    PERF_DWARF_TEMPORARY_STORAGE.with(|storage| {
+        let mut observed = storage.get();
+        observed.scopes += 1;
+        observed.max_live_scopes = observed.max_live_scopes.max(current.scopes.len());
+        storage.set(observed);
+    });
 }
 
 fn perf_dwarf_root_descends(tag: gimli::DwTag, c_unit: bool) -> bool {
@@ -7767,12 +7871,17 @@ fn perf_dwarf_selected_frames(index: &PerfDwarfFrameIndex, address: u64) -> Smal
         return SmallVec::new();
     };
     let mut selected = smallvec::smallvec![matches[root_position]];
+    let physical_tree = index.nodes[matches[root_position]].physical_tree;
     let mut limit = index.nodes[matches[root_position]].subtree_end;
     for &node in &matches[root_position + 1..] {
         if node >= limit {
             break;
         }
-        if index.nodes[node].kind == PerfDwarfDieKind::Inline {
+        // Root discovery follows imports; perf's die_find_child traverses
+        // only the selected DIE's physical descendants (7.2.9:560-584).
+        if index.nodes[node].kind == PerfDwarfDieKind::Inline
+            && index.nodes[node].physical_tree == physical_tree
+        {
             selected.push(node);
             limit = index.nodes[node].subtree_end;
         }
@@ -14615,6 +14724,146 @@ mod tests {
         )
     }
 
+    enum TestDwarfImport {
+        InsideOuter,
+        Repeated,
+        Cycle,
+    }
+
+    fn test_dwarf_import_sections(case: &TestDwarfImport) -> (Vec<u8>, Vec<u8>) {
+        fn named_pc(info: &mut Vec<u8>, code: u8, name: &[u8]) {
+            info.push(code);
+            info.extend_from_slice(name);
+            info.push(0);
+            info.extend_from_slice(&0_u64.to_le_bytes());
+            info.extend_from_slice(&100_u32.to_le_bytes());
+        }
+        let abbrev = vec![
+            1, 0x11, 1, 0x13, 0x0b, 0, 0, 2, 0x2e, 1, 3, 8, 0x11, 1, 0x12, 6, 0, 0, 3, 0x1d, 0, 3,
+            8, 0x11, 1, 0x12, 6, 0, 0, 4, 0x3c, 1, 3, 8, 0, 0, 5, 0x3d, 0, 0x18, 0x10, 0, 0, 0,
+        ];
+        let header = [0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 8];
+        let mut host = header.to_vec();
+        host.extend_from_slice(&[1, u8::try_from(gimli::DW_LANG_C.0).unwrap()]);
+        if matches!(case, TestDwarfImport::InsideOuter) {
+            named_pc(&mut host, 2, b"outer");
+        }
+        let mut imports = Vec::new();
+        for _ in 0..if matches!(case, TestDwarfImport::Repeated) {
+            2
+        } else {
+            1
+        } {
+            host.push(5);
+            imports.push(host.len());
+            host.extend_from_slice(&0_u32.to_le_bytes());
+        }
+        if !matches!(case, TestDwarfImport::InsideOuter) {
+            named_pc(&mut host, 2, b"local_root");
+        }
+        named_pc(&mut host, 3, b"local_inline");
+        host.extend_from_slice(&[0, 0]);
+        let target = u32::try_from(host.len() + header.len()).unwrap();
+        for offset in imports {
+            host[offset..offset + 4].copy_from_slice(&target.to_le_bytes());
+        }
+        let mut partial = header.to_vec();
+        partial.extend_from_slice(b"\x04partial\0");
+        if matches!(case, TestDwarfImport::Cycle) {
+            partial.push(5);
+            partial.extend_from_slice(&target.to_le_bytes());
+        }
+        named_pc(&mut partial, 2, b"imported_root");
+        named_pc(&mut partial, 3, b"imported_inline");
+        partial.extend_from_slice(&[0, 0]);
+        for unit in [&mut host, &mut partial] {
+            let length = u32::try_from(unit.len() - 4).unwrap();
+            unit[..4].copy_from_slice(&length.to_le_bytes());
+        }
+        host.extend_from_slice(&partial);
+        (abbrev, host)
+    }
+
+    #[test]
+    fn dwarf_imported_roots_do_not_change_selected_physical_inline_descendants() {
+        // Exact perf7.2.9 dwarf-aux.c:560-584 does not expand imports in
+        // die_find_child, unlike elfutils0.195 root discovery. Characterization
+        // of that separate physical walk, not an additional native oracle.
+        let (abbrev, info) = test_dwarf_import_sections(&TestDwarfImport::InsideOuter);
+        let mut names = PerfDwarfNameInterner::default();
+        let index = test_dwarf_frame_index_from_sections(
+            &abbrev,
+            &info,
+            &[],
+            &[test_range(0, 100)],
+            &mut names,
+        );
+        assert_eq!(index.nodes.len(), 4);
+        assert_eq!(frame_names(&names, &index, 15), ["outer", "local_inline"]);
+        assert_eq!(index.nodes[0].physical_tree, index.nodes[3].physical_tree);
+        assert_ne!(index.nodes[0].physical_tree, index.nodes[2].physical_tree);
+    }
+
+    #[test]
+    fn dwarf_repeated_imports_are_path_local_and_partial_units_are_not_independent_roots() {
+        let (abbrev, info) = test_dwarf_import_sections(&TestDwarfImport::Repeated);
+        let mut names = PerfDwarfNameInterner::default();
+        let index = test_dwarf_frame_index_from_sections(
+            &abbrev,
+            &info,
+            &[],
+            &[test_range(0, 100)],
+            &mut names,
+        );
+        assert_eq!(index.nodes.len(), 6);
+        assert_eq!(
+            frame_names(&names, &index, 15),
+            ["imported_root", "imported_inline"]
+        );
+        assert_ne!(index.nodes[0].physical_tree, index.nodes[2].physical_tree);
+        assert_eq!(index.nodes[0].name, index.nodes[2].name);
+        assert_eq!(index.nodes[1].name, index.nodes[3].name);
+        let dwarf = gimli::Dwarf::load(|id| {
+            Ok::<_, gimli::Error>(gimli::EndianSlice::new(
+                match id {
+                    gimli::SectionId::DebugInfo => &info,
+                    gimli::SectionId::DebugAbbrev => &abbrev,
+                    _ => &[],
+                },
+                gimli::LittleEndian,
+            ))
+        })
+        .unwrap();
+        let directory = super::PerfDwarfUnitDirectory::new(&dwarf);
+        let partial = directory.units[1].unit.as_ref().unwrap();
+        let isolated = super::perf_dwarf_unit_frame_index(
+            &dwarf,
+            partial,
+            &directory,
+            &mut names,
+            vec![test_range(0, 100)],
+        );
+        assert!(frame_names(&names, &isolated, 15).is_empty());
+    }
+
+    #[test]
+    fn dwarf_import_cycle_stops_later_root_discovery_with_finite_physical_storage() {
+        // libdw_visit_scopes.c:143-147 returns an error for a repeated
+        // importing DIE on the active chain, not a global visited target set.
+        let (abbrev, info) = test_dwarf_import_sections(&TestDwarfImport::Cycle);
+        let mut names = PerfDwarfNameInterner::default();
+        let index = test_dwarf_frame_index_from_sections(
+            &abbrev,
+            &info,
+            &[],
+            &[test_range(0, 100)],
+            &mut names,
+        );
+        assert!(!index.nodes.is_empty());
+        assert!(index.nodes.iter().all(|node| !node.defining_root));
+        assert!(frame_names(&names, &index, 15).is_empty());
+    }
+
     #[test]
     fn inline_function_names_stay_raw_until_lookup_and_keep_the_outer_elf_symbol_like_perf() {
         // Linux v7.2.9 tools/perf/util/libdw.c:85-108: the subprogram uses
@@ -19713,6 +19962,7 @@ mod tests {
             index.nodes.push(super::PerfDwarfFrameNode {
                 name: None,
                 subtree_end: 2,
+                physical_tree: 0,
                 ranges: begin..index.segments.len(),
                 kind: if node == 0 {
                     super::PerfDwarfDieKind::Subprogram
