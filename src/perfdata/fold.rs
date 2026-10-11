@@ -767,51 +767,48 @@ fn summarize_perfdata_source(
     arch: PerfArch,
     mut header_build_ids: BTreeMap<String, RecordedBuildId>,
 ) -> Result<PerfSummary, String> {
-    let mut offset = usize::try_from(header.data_offset)
-        .map_err(|_| "perf data section offset exceeds usize".to_string())?;
-    let end = offset
-        .checked_add(
-            usize::try_from(header.data_size)
-                .map_err(|_| "perf data section size exceeds usize".to_string())?,
-        )
-        .ok_or_else(|| "perf data section range overflows usize".to_string())?;
     let mut summary = PerfSummary::default();
     summary.mmap_table.initialize_native_dso_headers(
         header_build_ids
             .iter()
             .map(|(path, id)| (path.as_str(), id.bytes.as_slice(), id.misc)),
     );
-
-    while offset < end {
-        let record = source.record_at(offset, end)?;
-        offset += usize::from(record.header.size);
-        summary.total_records += 1;
-        *summary
-            .record_counts
-            .entry(record.header.record_type)
-            .or_insert(0) += 1;
-        if record.header.record_type == crate::perfdata::records::PERF_RECORD_HEADER_BUILD_ID {
-            let event = parse_build_id_record(record.header.misc, record.payload)?;
-            apply_recorded_build_id(&mut summary.mmap_table, &mut header_build_ids, event);
-            continue;
-        }
-        let source_misc = record.header.misc;
-        let parsed_record = parse_record_with_context(record)?;
-        summarize_record(
-            &mut summary,
-            parsed_record,
-            source_misc,
-            sample_layouts,
-            arch,
-            &header_build_ids,
-        )
-        .map_err(|error| {
-            format!(
-                "failed to parse record type {} at offset {}: {error}",
-                record.header.record_type, record.offset
+    let mut total_records = 0;
+    let mut record_counts = BTreeMap::new();
+    visit_ordered_records(
+        source,
+        header,
+        sample_layouts,
+        |record_type| {
+            total_records += 1;
+            *record_counts.entry(record_type).or_insert(0) += 1;
+        },
+        |record, offset| {
+            if record.header.record_type == crate::perfdata::records::PERF_RECORD_HEADER_BUILD_ID {
+                let event = parse_build_id_record(record.header.misc, record.payload)?;
+                apply_recorded_build_id(&mut summary.mmap_table, &mut header_build_ids, event);
+                return Ok(());
+            }
+            let source_misc = record.header.misc;
+            let parsed_record = parse_record_with_context(record)?;
+            summarize_record(
+                &mut summary,
+                parsed_record,
+                source_misc,
+                sample_layouts,
+                arch,
+                &header_build_ids,
             )
-        })?;
-    }
+            .map_err(|error| {
+                format!(
+                    "failed to parse record type {} at offset {}: {error}",
+                    record.header.record_type, offset
+                )
+            })
+        },
+    )?;
+    summary.total_records = total_records;
+    summary.record_counts = record_counts;
 
     Ok(summary)
 }
@@ -1266,6 +1263,23 @@ fn replay_records<O: SampleOutput>(
     options: FoldOptions,
     sink: &mut SampleSink<O>,
 ) -> Result<(), String> {
+    visit_ordered_records(
+        source,
+        header,
+        layouts,
+        |_| {},
+        |record, offset| deliver_record(record, offset, layouts, options, sink),
+    )?;
+    sink.flush_deferred_samples()
+}
+
+fn visit_ordered_records(
+    source: &mut impl RecordSource,
+    header: PerfHeader,
+    layouts: &SampleLayouts,
+    mut observe_record: impl FnMut(u32),
+    mut apply_record: impl FnMut(PerfRecord<'_>, usize) -> Result<(), String>,
+) -> Result<(), String> {
     let mut offset = usize::try_from(header.data_offset)
         .map_err(|_| "perf data section offset exceeds usize".to_string())?;
     let size = usize::try_from(header.data_size)
@@ -1277,8 +1291,10 @@ fn replay_records<O: SampleOutput>(
         return Err("perf data section extends past end of file".to_string());
     }
     let mut ordered = OrderedRecordQueue::default();
-    // builtin-script.c sets ordering_requires_timestamps; session.c disables
-    // ordered_events without evlist__sample_id_all (the first event's flag).
+    // Linux v7.2.9 tools/perf/builtin-report.c:1514,1622 enables timestamp
+    // ordering; tools/perf/util/session.c:225-228 disables it without
+    // sample_id_all, while evsel.c:3808-3849 extracts times and session.c:2934-2949
+    // queues or directly delivers.
     let ordered_events = layouts
         .fallback
         .as_ref()
@@ -1287,6 +1303,7 @@ fn replay_records<O: SampleOutput>(
         let (record_type, header, next, queue_time) = {
             let record = source.record_at(offset, end)?;
             let record_type = record.header.record_type;
+            observe_record(record_type);
             let header = record.header;
             let next = offset + usize::from(record.header.size);
             let queue_time = if ordered_events && record_type != PERF_RECORD_FINISHED_ROUND {
@@ -1295,26 +1312,22 @@ fn replay_records<O: SampleOutput>(
                 None
             };
             if record_type != PERF_RECORD_FINISHED_ROUND && queue_time.is_none() {
-                sink.apply_fold_record(parse_fold_record(record)?, layouts, options)?;
+                apply_record(record, offset)?;
             }
             (record_type, header, next, queue_time)
         };
         if record_type == PERF_RECORD_FINISHED_ROUND {
-            ordered.flush_round_with(|record, offset| {
-                deliver_record(record, offset, layouts, options, sink)
-            })?;
+            ordered.flush_round_with(&mut apply_record)?;
         } else if let Some(time) = queue_time {
-            // ordered-events.c rejects zero/~0ULL with -ETIME; session.c then
-            // delivers directly. Ties retain input order (file offset).
+            // Linux v7.2.9 tools/perf/util/ordered-events.c:199-200 rejects
+            // zero/~0ULL with -ETIME; session.c:2944-2949 delivers directly.
+            // Ties retain input order (ordered-events.c:40-60).
             let record = source.queue_record(offset, end, header, &mut ordered.windows)?;
             ordered.queue(record, time);
         }
         offset = next;
     }
-    ordered.flush_final_with(|record, offset| {
-        deliver_record(record, offset, layouts, options, sink)
-    })?;
-    sink.flush_deferred_samples()
+    ordered.flush_final_with(apply_record)
 }
 
 fn deliver_record<O: SampleOutput>(

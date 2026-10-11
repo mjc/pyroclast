@@ -5,12 +5,16 @@ use pyroclast::perfdata::analysis::{
     PerfdataEdgeCount, PerfdataIpCount, PerfdataSampleMode, PerfdataThread, analyze_perfdata,
     analyze_perfdata_file,
 };
+use pyroclast::perfdata::fold::summarize_perfdata;
+use pyroclast::perfdata::fold::summarize_perfdata_file;
 use pyroclast::perfdata::records::{
-    PERF_RECORD_MISC_CPUMODE_KERNEL, PERF_RECORD_MISC_CPUMODE_USER,
+    PERF_RECORD_COMM, PERF_RECORD_FORK, PERF_RECORD_LOST, PERF_RECORD_MISC_COMM_EXEC,
+    PERF_RECORD_MISC_CPUMODE_KERNEL, PERF_RECORD_MISC_CPUMODE_USER, PERF_RECORD_MMAP,
+    PERF_RECORD_SAMPLE,
 };
 use pyroclast::perfdata::samples::{
     PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_REGS_USER,
-    PERF_SAMPLE_STACK_USER, PERF_SAMPLE_TID,
+    PERF_SAMPLE_STACK_USER, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
 };
 
 #[test]
@@ -145,6 +149,376 @@ fn analyzes_perfdata_from_file_without_requiring_a_byte_vec() {
     assert_eq!(report.total_samples, 1);
     assert_eq!(report.weighted_samples, 7);
     assert_eq!(report.top_leaf_ips[0].ip, "0x0000000000001000");
+}
+
+#[test]
+fn summary_orders_generic_child_exec_after_older_fork_like_perf_report() {
+    // Linux v7.2.9 tools/perf/builtin-report.c:1514,1622 enables ordering;
+    // tools/perf/util/session.c:225-228 disables it without sample_id_all, and
+    // session.c:2934-2949 queues timestamped records or dispatches them directly.
+    let bytes = child_exec_order_fixture(
+        PERF_SAMPLE_IP
+            | PERF_SAMPLE_TID
+            | PERF_SAMPLE_TIME
+            | PERF_SAMPLE_PERIOD
+            | PERF_SAMPLE_CALLCHAIN,
+        true,
+        Some([30, 10, 20]),
+    );
+
+    let summary = summarize_perfdata(&bytes).expect("summary");
+    assert_eq!(summary.total_records, 9);
+    assert_eq!(summary.record_count(PERF_RECORD_COMM), 2);
+    assert_eq!(summary.record_count(PERF_RECORD_FORK), 1);
+    assert_eq!(summary.record_count(PERF_RECORD_LOST), 1);
+    assert_eq!(summary.record_count(68), 2);
+    assert_eq!(summary.record_count(PERF_RECORD_SAMPLE), 3);
+    assert_eq!(summary.lost_records, 4);
+    assert_eq!(summary.sample_stacks.len(), 3);
+    assert_eq!(
+        summary
+            .sample_stacks
+            .iter()
+            .map(|sample| sample.period.unwrap())
+            .sum::<u64>(),
+        12
+    );
+    assert!(
+        summary
+            .sample_stacks
+            .iter()
+            .all(|sample| sample.tid == Some(201))
+    );
+    assert!(
+        summary
+            .sample_stacks
+            .iter()
+            .all(|sample| sample.callchain == [0x1000, 0x2000])
+    );
+
+    let report = analyze_perfdata(&bytes, 10).expect("analysis");
+    assert_eq!(report.total_records, 9);
+    assert_eq!(report.total_samples, 3);
+    assert_eq!(report.weighted_samples, 12);
+    assert_eq!(report.lost_records, 4);
+    assert_eq!(report.profile.unassigned_samples, 0);
+    assert_eq!(report.threads[0].tid, 201);
+    assert_eq!(report.threads[0].samples, 3);
+    assert_eq!(report.threads[0].weighted_samples, 12);
+    assert_eq!(report.top_leaf_ips[0].ip, "0x0000000000001000");
+    assert_eq!(report.top_leaf_ips[0].weighted_samples, 12);
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("perf.data");
+    std::fs::write(&path, &bytes).expect("write fixture");
+    let file_summary = summarize_perfdata_file(&path).expect("file summary");
+    assert_eq!(file_summary.total_records, 9);
+    assert_eq!(file_summary.lost_records, 4);
+    let file_report = analyze_perfdata_file(&path, 10).expect("file analysis");
+    assert_eq!(file_report.weighted_samples, 12);
+    assert_eq!(file_report.lost_records, 4);
+    assert_eq!(summary.comms_by_pid[&200], "child-exec");
+    assert_eq!(summary.comms_by_tid[&201], "child-exec");
+    assert_eq!(report.threads[0].comm, "child-exec");
+    assert_eq!(file_summary.comms_by_tid[&201], "child-exec");
+    assert_eq!(file_report.threads[0].comm, "child-exec");
+}
+
+#[test]
+fn summary_keeps_physical_order_without_timestamps_or_sample_id_all() {
+    let no_time = child_exec_order_fixture(
+        PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN,
+        true,
+        Some([30, 10, 20]),
+    );
+    let report = analyze_perfdata(&no_time, 10).expect("untimed analysis");
+    assert_eq!(report.threads[0].comm, "parent");
+    assert_eq!(report.total_records, 9);
+    assert_eq!(report.total_samples, 3);
+    assert_eq!(report.weighted_samples, 12);
+
+    let without_sample_id_all = child_exec_order_fixture(
+        PERF_SAMPLE_IP
+            | PERF_SAMPLE_TID
+            | PERF_SAMPLE_TIME
+            | PERF_SAMPLE_PERIOD
+            | PERF_SAMPLE_CALLCHAIN,
+        false,
+        Some([30, 10, 20]),
+    );
+    let report = analyze_perfdata(&without_sample_id_all, 10).expect("unordered analysis");
+    assert_eq!(report.threads[0].comm, "parent");
+    assert_eq!(report.total_records, 9);
+    assert_eq!(report.total_samples, 3);
+    assert_eq!(report.weighted_samples, 12);
+}
+
+#[test]
+fn summary_keeps_source_order_for_tied_timestamps() {
+    let bytes = child_exec_order_fixture(
+        PERF_SAMPLE_IP
+            | PERF_SAMPLE_TID
+            | PERF_SAMPLE_TIME
+            | PERF_SAMPLE_PERIOD
+            | PERF_SAMPLE_CALLCHAIN,
+        true,
+        Some([20, 10, 20]),
+    );
+
+    let summary = summarize_perfdata(&bytes).expect("summary");
+    assert_eq!(summary.comms_by_tid[&201], "parent");
+    assert_eq!(summary.sample_stacks.len(), 3);
+    assert_eq!(
+        summary
+            .sample_stacks
+            .iter()
+            .map(|sample| sample.period.unwrap())
+            .sum::<u64>(),
+        12
+    );
+}
+
+#[test]
+fn summary_delivers_max_timestamp_events_immediately() {
+    let bytes = child_exec_order_fixture(
+        PERF_SAMPLE_IP
+            | PERF_SAMPLE_TID
+            | PERF_SAMPLE_TIME
+            | PERF_SAMPLE_PERIOD
+            | PERF_SAMPLE_CALLCHAIN,
+        true,
+        Some([u64::MAX, 10, 20]),
+    );
+
+    let summary = summarize_perfdata(&bytes).expect("summary");
+    assert_eq!(summary.comms_by_tid[&201], "parent");
+    assert_eq!(summary.sample_stacks.len(), 3);
+    assert_eq!(
+        summary
+            .sample_stacks
+            .iter()
+            .map(|sample| sample.period.unwrap())
+            .sum::<u64>(),
+        12
+    );
+}
+
+#[test]
+fn summary_delivers_zero_timestamp_events_immediately() {
+    // Linux v7.2.9 tools/perf/util/ordered-events.c:199-200 rejects zero and
+    // ~0ULL with -ETIME; session.c:2944-2949 dispatches both immediately.
+    let sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_TIME;
+    let mut attr = file_attr_bytes(sample_type, 0, 0);
+    put_u64(&mut attr, 40, 1 << 18);
+    let bytes = perfdata_with_records_and_attrs(
+        [attr],
+        [
+            comm_record(200, 200, "zero-time", false, true, sample_type, 0),
+            comm_record(200, 200, "max-time", false, true, sample_type, u64::MAX),
+        ],
+    );
+
+    let summary = summarize_perfdata(&bytes).expect("summary");
+    assert_eq!(summary.total_records, 2);
+    assert_eq!(summary.comms_by_tid[&200], "max-time");
+}
+
+#[test]
+fn summary_orders_parent_mapping_before_child_fork_inheritance() {
+    // Linux v7.2.9 tools/perf/util/session.c:2937-2949 applies the earlier
+    // timestamped MMAP before FORK; child map inheritance follows that order.
+    let sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_TIME;
+    let mut attr = file_attr_bytes(sample_type, 0, 0);
+    put_u64(&mut attr, 40, 1 << 18);
+    let bytes = perfdata_with_records_and_attrs(
+        [attr],
+        [
+            fork_record(100, 101, 200, 201, true, sample_type, 20),
+            mmap_record(100, 101, 10, sample_type),
+        ],
+    );
+
+    let summary = summarize_perfdata(&bytes).expect("summary");
+    assert_eq!(
+        summary.mmap_table.mapping_path(200, 0x4100),
+        Some("parent.so")
+    );
+    assert_eq!(
+        summary.mmap_table.mapping_path(100, 0x4100),
+        Some("parent.so")
+    );
+}
+
+fn child_exec_order_fixture(
+    sample_type: u64,
+    sample_id_all: bool,
+    times: Option<[u64; 3]>,
+) -> Vec<u8> {
+    let mut attr = file_attr_bytes(sample_type, 0, 0);
+    if sample_id_all {
+        put_u64(&mut attr, 40, 1 << 18);
+    }
+
+    let [exec_time, parent_time, fork_time] = times.unwrap_or([0, 0, 0]);
+    let mut records = vec![
+        comm_record(
+            200,
+            201,
+            "child-exec",
+            true,
+            sample_id_all,
+            sample_type,
+            exec_time,
+        ),
+        comm_record(
+            100,
+            101,
+            "parent",
+            false,
+            sample_id_all,
+            sample_type,
+            parent_time,
+        ),
+        fork_record(100, 101, 200, 201, sample_id_all, sample_type, fork_time),
+    ];
+    records.push(lost_record(sample_id_all, sample_type));
+    records.push(record_bytes(68, &[]));
+    records.push(record_bytes(68, &[]));
+    for period in [2, 3, 7] {
+        records.push(record_bytes(
+            PERF_RECORD_SAMPLE,
+            &timed_sample_payload(
+                sample_type,
+                0x1000,
+                200,
+                201,
+                period + 30,
+                period,
+                &[0x1000, 0x2000],
+            ),
+        ));
+    }
+    perfdata_with_records_and_attrs([attr], records)
+}
+
+fn mmap_record(pid: u32, tid: u32, time: u64, sample_type: u64) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(pid.to_le_bytes());
+    payload.extend(tid.to_le_bytes());
+    payload.extend(0x4000_u64.to_le_bytes());
+    payload.extend(0x1000_u64.to_le_bytes());
+    payload.extend(0_u64.to_le_bytes());
+    payload.extend(b"parent.so\0");
+    payload.resize(payload.len().next_multiple_of(8), 0);
+    append_sample_id(&mut payload, true, sample_type, pid, tid, time);
+    record_bytes(PERF_RECORD_MMAP, &payload)
+}
+
+fn lost_record(sample_id_all: bool, sample_type: u64) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(1_u64.to_le_bytes());
+    payload.extend(4_u64.to_le_bytes());
+    append_sample_id(&mut payload, sample_id_all, sample_type, 200, 201, 25);
+    record_bytes(PERF_RECORD_LOST, &payload)
+}
+
+fn comm_record(
+    pid: u32,
+    tid: u32,
+    comm: &str,
+    is_exec: bool,
+    sample_id_all: bool,
+    sample_type: u64,
+    time: u64,
+) -> Vec<u8> {
+    let mut payload = comm_payload(pid, tid, comm);
+    payload.resize(payload.len().next_multiple_of(8), 0);
+    append_sample_id(&mut payload, sample_id_all, sample_type, pid, tid, time);
+    record_bytes_with_misc(
+        PERF_RECORD_COMM,
+        if is_exec {
+            PERF_RECORD_MISC_COMM_EXEC
+        } else {
+            0
+        },
+        &payload,
+    )
+}
+
+fn fork_record(
+    parent_process: u32,
+    parent_thread: u32,
+    child_process: u32,
+    child_thread: u32,
+    sample_id_all: bool,
+    sample_type: u64,
+    time: u64,
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(child_process.to_le_bytes());
+    payload.extend(parent_process.to_le_bytes());
+    payload.extend(child_thread.to_le_bytes());
+    payload.extend(parent_thread.to_le_bytes());
+    payload.extend(time.to_le_bytes());
+    append_sample_id(
+        &mut payload,
+        sample_id_all,
+        sample_type,
+        child_process,
+        child_thread,
+        time,
+    );
+    record_bytes(PERF_RECORD_FORK, &payload)
+}
+
+fn append_sample_id(
+    payload: &mut Vec<u8>,
+    sample_id_all: bool,
+    sample_type: u64,
+    pid: u32,
+    tid: u32,
+    time: u64,
+) {
+    // Linux v7.2.9 tools/perf/util/evsel.c:3240-3263,
+    // perf_evsel__parse_id_sample: TID and TIME are independent trailer fields.
+    if !sample_id_all {
+        return;
+    }
+    if sample_type & PERF_SAMPLE_TID != 0 {
+        payload.extend(pid.to_le_bytes());
+        payload.extend(tid.to_le_bytes());
+    }
+    if sample_type & PERF_SAMPLE_TIME != 0 {
+        payload.extend(time.to_le_bytes());
+    }
+}
+
+fn timed_sample_payload(
+    sample_type: u64,
+    ip: u64,
+    pid: u32,
+    tid: u32,
+    time: u64,
+    period: u64,
+    callchain: &[u64],
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(ip.to_le_bytes());
+    payload.extend(pid.to_le_bytes());
+    payload.extend(tid.to_le_bytes());
+    if sample_type & PERF_SAMPLE_TIME != 0 {
+        payload.extend(time.to_le_bytes());
+    }
+    payload.extend(period.to_le_bytes());
+    payload.extend(
+        u64::try_from(callchain.len())
+            .expect("callchain size")
+            .to_le_bytes(),
+    );
+    for frame in callchain {
+        payload.extend(frame.to_le_bytes());
+    }
+    payload
 }
 
 proptest! {
