@@ -7546,25 +7546,20 @@ fn perf_dwarf_append_node_ranges<R: gimli::Reader>(
     {
         return PerfDwarfRangeStatus::Absent;
     }
-    if unit.encoding().version < 5
-        && let Some(attribute) = entry.attr(gimli::DW_AT_ranges)
+    if let Some(attribute) = entry.attr(gimli::DW_AT_ranges)
+        && attribute.form() != gimli::DW_FORM_rnglistx
     {
-        // elfutils0.195 dwarf_formudata.c:102-103 permits only sec_offset
-        // after DWARF3. Attribute presence matters: absent ranges is not an
-        // initialization fault, and valid low/high above still takes priority.
-        if unit.encoding().version == 4 && attribute.form() != gimli::DW_FORM_sec_offset {
-            return PerfDwarfRangeStatus::ReadError;
-        }
-        if let value @ gimli::AttributeValue::RangeListsRef(_) = attribute.value() {
-            let Ok(Some(offset)) = dwarf.attr_ranges_offset(unit, value) else {
-                return PerfDwarfRangeStatus::InitializationError;
-            };
+        let offset = match perf_dwarf_direct_range_offset(dwarf, unit, attribute) {
+            Ok(offset) => offset,
+            Err(status) => return status,
+        };
+        if unit.encoding().version < 5 {
             return perf_dwarf_append_legacy_ranges(dwarf, unit, offset, frame, segments);
         }
     }
     let Ok(mut ranges) = dwarf.die_ranges(unit, entry) else {
-        // DWARF5 and unsupported attribute initialization errors are not
-        // covered by the legacy-list oracle. Keep their existing policy.
+        // Indexed forms and unrelated PC initialization failures keep their
+        // separate policy; only the direct present-pointer path above is proven.
         return PerfDwarfRangeStatus::InitializationError;
     };
     loop {
@@ -7583,6 +7578,37 @@ fn perf_dwarf_append_node_ranges<R: gimli::Reader>(
             Err(_) => return PerfDwarfRangeStatus::ReadError,
         }
     }
+}
+
+fn perf_dwarf_direct_range_offset<R: gimli::Reader>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    attribute: &gimli::Attribute<R>,
+) -> Result<gimli::RangeListsOffset<R::Offset>, PerfDwarfRangeStatus> {
+    use gimli::{ReaderOffset as _, Section as _};
+
+    // elfutils0.195 dwarf_formudata.c:102-119 and dwarf_ranges.c:450-456:
+    // direct pointers require sec_offset after D3; earlier numeric forms
+    // are accepted. This is not a classifier for every initialization error.
+    if unit.encoding().version > 3 && attribute.form() != gimli::DW_FORM_sec_offset {
+        return Err(PerfDwarfRangeStatus::ReadError);
+    }
+    let raw = match attribute.value() {
+        gimli::AttributeValue::RangeListsRef(offset) => offset,
+        gimli::AttributeValue::DebugAddrIndex(index) => gimli::RawRangeListsOffset(index.0),
+        value => {
+            let value = value.udata_value().ok_or(PerfDwarfRangeStatus::ReadError)?;
+            let offset = R::Offset::from_u64(value).map_err(|_| PerfDwarfRangeStatus::ReadError)?;
+            gimli::RawRangeListsOffset(offset)
+        }
+    };
+    let offset = dwarf.ranges_offset_from_raw(unit, raw);
+    if unit.encoding().version >= 5 && offset.0 >= dwarf.ranges.debug_rnglists().reader().len() {
+        // __libdw_formptr rejects absent sections and pointers at/past EOF,
+        // before decoding. No second range-list traversal is needed.
+        return Err(PerfDwarfRangeStatus::ReadError);
+    }
+    Ok(offset)
 }
 
 fn perf_dwarf_append_legacy_ranges<R: gimli::Reader>(
@@ -19112,6 +19138,54 @@ mod tests {
             .flat_map(u64::to_le_bytes)
             .collect();
         assert_dwarf_legacy_offset_fault(&ranges, 0);
+    }
+
+    #[test]
+    fn dwarf3_direct_ranges_keep_native_numeric_offset_forms() {
+        // elfutils0.195 dwarf_formudata.c:102-119/293-310 accepts pre-D4
+        // numeric offsets. This is a source-backed form contract; the native
+        // serialized D3 oracle separately exercises data4 and invalid string.
+        for (form, offset) in [
+            (gimli::DW_FORM_data1, vec![0]),
+            (gimli::DW_FORM_data2, vec![0; 2]),
+            (gimli::DW_FORM_data4, vec![0; 4]),
+            (gimli::DW_FORM_data8, vec![0; 8]),
+            (gimli::DW_FORM_udata, vec![0]),
+        ] {
+            let mut abbrev = vec![
+                1, 0x11, 1, 0, 0, 2, 0x2e, 1, 3, 8, 0x11, 1, 0x12, 1, 0, 0, 3, 0x1d, 0, 3, 8, 0x55,
+            ];
+            abbrev.push(u8::try_from(form.0).unwrap());
+            abbrev.extend_from_slice(&[0, 0, 0]);
+            let mut info = vec![0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 8, 1];
+            info.extend_from_slice(b"\x02outer\0");
+            info.extend_from_slice(&0_u64.to_le_bytes());
+            info.extend_from_slice(&100_u64.to_le_bytes());
+            info.extend_from_slice(b"\x03inline\0");
+            info.extend_from_slice(&offset);
+            info.extend_from_slice(&[0, 0]);
+            let length = u32::try_from(info.len() - 4).unwrap();
+            info[..4].copy_from_slice(&length.to_le_bytes());
+            let ranges: Vec<_> = [10_u64, 20, 0, 0]
+                .into_iter()
+                .flat_map(u64::to_le_bytes)
+                .collect();
+            let mut names = PerfDwarfNameInterner::default();
+            let index = test_dwarf_frame_index_from_sections(
+                &abbrev,
+                &info,
+                &ranges,
+                &[test_range(0, 100)],
+                &mut names,
+            );
+            assert_eq!(
+                frame_names(&names, &index, 15),
+                ["outer", "inline"],
+                "{form:?}"
+            );
+            assert_eq!(frame_names(&names, &index, 20), ["outer"], "{form:?}");
+            assert!(index.range_errors.is_empty());
+        }
     }
 
     #[test]

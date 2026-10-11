@@ -12512,6 +12512,413 @@ fn native_inline_range_boundary_invalid_base_escape() {
 }
 
 #[cfg(target_os = "linux")]
+fn native_dwarf_unit_header(version: u16) -> Vec<u8> {
+    let mut info = vec![0; 4];
+    info.extend_from_slice(&version.to_le_bytes());
+    if version == 5 {
+        info.extend_from_slice(&[1, 8]); // DW_UT_compile, address size.
+        info.extend_from_slice(&0_u32.to_le_bytes());
+    } else {
+        info.extend_from_slice(&0_u32.to_le_bytes());
+        info.push(8);
+    }
+    info
+}
+
+#[cfg(target_os = "linux")]
+fn native_dwarf_source_elf(
+    abbrev: Vec<u8>,
+    info: Vec<u8>,
+    ranges: Option<(&[u8], Vec<u8>)>,
+) -> Vec<u8> {
+    let original = elf_with_distinct_text_and_data_biases();
+    let mut builder = object::build::elf::Builder::read(original.as_slice()).unwrap();
+    for (name, data) in [
+        (b".debug_abbrev".as_slice(), abbrev),
+        (b".debug_info", info),
+    ] {
+        builder
+            .sections
+            .iter_mut()
+            .find(|section| section.name.as_slice() == name)
+            .unwrap()
+            .data = object::build::elf::SectionData::Data(data.into());
+    }
+    if let Some((name, data)) = ranges {
+        let section = builder.sections.add();
+        section.name = name.into();
+        section.sh_type = object::elf::SHT_PROGBITS;
+        section.sh_addralign = 1;
+        section.data = object::build::elf::SectionData::Data(data.into());
+    }
+    builder.set_section_sizes();
+    let mut bytes = Vec::new();
+    builder.write(&mut bytes).unwrap();
+    bytes
+}
+
+#[cfg(target_os = "linux")]
+fn native_dwarf_source_layout(
+    bytes: &[u8],
+) -> gimli::Dwarf<gimli::EndianSlice<'_, gimli::LittleEndian>> {
+    use object::ObjectSection as _;
+    let elf = object::File::parse(bytes).unwrap();
+    let text = elf.section_by_name(".text").unwrap();
+    assert_eq!(
+        (text.address(), text.file_range()),
+        (0x0040_1000, Some((0x1000, 32)))
+    );
+    assert!(elf.segments().any(|segment| segment.address() == 0x0040_1000 && segment.file_range() == (0x1000, 32)));
+    let symbol = elf
+        .symbols()
+        .find(|symbol| symbol.name() == Ok("text_entry"))
+        .unwrap();
+    assert_eq!((symbol.address(), symbol.size()), (0x0040_1000, 16));
+    let dwarf = gimli::Dwarf::load(|section| {
+        let data = elf
+            .section_by_name(section.name())
+            .map_or(&[][..], |section| section.data().unwrap());
+        Ok::<_, gimli::Error>(gimli::EndianSlice::new(data, gimli::LittleEndian))
+    })
+    .unwrap();
+    let host = dwarf.unit(dwarf.units().next().unwrap().unwrap()).unwrap();
+    let program = host.line_program.clone().unwrap();
+    let (_, sequences) = program.clone().sequences().unwrap();
+    assert_eq!(sequences.len(), 1);
+    assert_eq!(
+        (sequences[0].start, sequences[0].end),
+        (0x0040_1000, 0x0040_1020)
+    );
+    let mut rows = program.rows();
+    let (_, first) = rows.next_row().unwrap().unwrap();
+    assert_eq!(first.address(), 0x0040_1000);
+    assert!(first.line().is_some() && !first.end_sequence());
+    dwarf
+}
+
+#[cfg(target_os = "linux")]
+fn native_dwarf_source_routes(
+    input: &std::path::Path,
+    bytes: &[u8],
+    native: &[(String, String); 2],
+) -> Vec<(Result<String, String>, String)> {
+    use pyroclast::symbols::{PerfSymbolResolver, SelectedObjectResolver, SymbolizerKind};
+    let runner = pyroclast::process::RealCommandRunner::default();
+    let mut outcomes = Vec::new();
+    for symbolizer in [SymbolizerKind::RustAddr2line, SymbolizerKind::Addr2line] {
+        for (inline, (_, expected)) in [false, true].into_iter().zip(native) {
+            for from_file in [false, true] {
+                let resolver = PerfSymbolResolver::from_object_resolver(
+                    SelectedObjectResolver::new(&runner, symbolizer),
+                );
+                let options = FoldOptions {
+                    count_periods: false,
+                    inline,
+                };
+                let actual = if from_file {
+                    pyroclast::perfdata::fold::fold_perfdata_file_with_symbols(
+                        input, options, &resolver,
+                    )
+                } else {
+                    fold_perfdata_callchains_with_symbols(bytes, options, &resolver)
+                };
+                eprintln!("{symbolizer:?} inline={inline} from_file={from_file}: {actual:?}");
+                outcomes.push((actual, expected.clone()));
+            }
+        }
+    }
+    assert_eq!(outcomes.len(), 8);
+    outcomes
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeVersionedRange {
+    Healthy,
+    MissingSection,
+    BeyondSection,
+    InvalidForm,
+}
+
+#[cfg(target_os = "linux")]
+fn native_versioned_range_elf(version: u16, case: NativeVersionedRange) -> Vec<u8> {
+    let high_form = if version == 3 { 1 } else { 6 };
+    let offset_form = if version == 3 { 6 } else { 0x17 };
+    let range_form = if case == NativeVersionedRange::InvalidForm {
+        8
+    } else {
+        offset_form
+    };
+    let abbrev = vec![
+        1,
+        0x11,
+        1,
+        3,
+        8,
+        0x10,
+        offset_form,
+        0x11,
+        1,
+        0x12,
+        high_form,
+        0,
+        0,
+        2,
+        0x2e,
+        1,
+        3,
+        8,
+        0x11,
+        1,
+        0x12,
+        high_form,
+        0,
+        0,
+        3,
+        0x1d,
+        0,
+        3,
+        8,
+        0x55,
+        range_form,
+        0,
+        0,
+        0,
+    ];
+    let mut info = native_dwarf_unit_header(version);
+    info.extend_from_slice(b"\x01bias.c\0");
+    info.extend_from_slice(&0_u32.to_le_bytes());
+    for name in [None, Some(b"\x02text_entry\0".as_slice())] {
+        if let Some(name) = name {
+            info.extend_from_slice(name);
+        }
+        info.extend_from_slice(&0x0040_1000_u64.to_le_bytes());
+        if version == 3 {
+            info.extend_from_slice(&0x0040_1020_u64.to_le_bytes());
+        } else {
+            info.extend_from_slice(&32_u32.to_le_bytes());
+        }
+    }
+    info.extend_from_slice(b"\x03malformed_inline\0");
+    let offset: u32 = if case == NativeVersionedRange::BeyondSection {
+        0x40
+    } else if version == 5 {
+        12
+    } else {
+        0
+    };
+    if case == NativeVersionedRange::InvalidForm {
+        info.extend_from_slice(b"bad\0");
+    } else {
+        info.extend_from_slice(&offset.to_le_bytes());
+    }
+    info.extend_from_slice(&[0, 0]);
+    let length = u32::try_from(info.len() - 4).unwrap();
+    info[..4].copy_from_slice(&length.to_le_bytes());
+    let mut ranges = Vec::new();
+    if version == 5 {
+        // Real DWARF5 rnglists header, no indexed offsets; direct list at12.
+        ranges.extend_from_slice(&26_u32.to_le_bytes());
+        ranges.extend_from_slice(&[5, 0, 8, 0]);
+        ranges.extend_from_slice(&0_u32.to_le_bytes());
+        ranges.push(gimli::DW_RLE_start_end.0);
+        ranges.extend_from_slice(&0x0040_1004_u64.to_le_bytes());
+        ranges.extend_from_slice(&0x0040_1008_u64.to_le_bytes());
+        ranges.push(gimli::DW_RLE_end_of_list.0);
+    } else {
+        for word in [4_u64, 8, 0, 0] {
+            ranges.extend_from_slice(&word.to_le_bytes());
+        }
+    }
+    let section = if version == 5 {
+        b".debug_rnglists".as_slice()
+    } else {
+        b".debug_ranges".as_slice()
+    };
+    let bytes = native_dwarf_source_elf(
+        abbrev,
+        info,
+        (case != NativeVersionedRange::MissingSection).then_some((section, ranges)),
+    );
+    assert_native_versioned_range_layout(&bytes, version, case, high_form, range_form, offset);
+    bytes
+}
+
+#[cfg(target_os = "linux")]
+fn assert_native_versioned_range_layout(
+    bytes: &[u8],
+    version: u16,
+    case: NativeVersionedRange,
+    high_form: u8,
+    range_form: u8,
+    offset: u32,
+) {
+    use object::ObjectSection as _;
+    let dwarf = native_dwarf_source_layout(bytes);
+    let unit = dwarf.unit(dwarf.units().next().unwrap().unwrap()).unwrap();
+    assert_eq!(
+        (unit.header.version(), unit.header.address_size()),
+        (version, 8)
+    );
+    assert_eq!(unit.header.type_(), gimli::UnitType::Compilation);
+    let mut entries = unit.entries();
+    while let Some(die) = entries.next_dfs().unwrap() {
+        if die.tag() == gimli::DW_TAG_inlined_subroutine {
+            assert_eq!(
+                die.attr(gimli::DW_AT_ranges).unwrap().form(),
+                gimli::DwForm(u16::from(range_form))
+            );
+            if case == NativeVersionedRange::Healthy {
+                let mut list = dwarf.die_ranges(&unit, die).unwrap();
+                let range = list.next().unwrap().unwrap();
+                assert_eq!((range.begin, range.end), (0x0040_1004, 0x0040_1008));
+                assert!(list.next().unwrap().is_none());
+            } else if case == NativeVersionedRange::InvalidForm {
+                assert_eq!(
+                    dwarf
+                        .attr_string(&unit, die.attr_value(gimli::DW_AT_ranges).unwrap())
+                        .unwrap()
+                        .to_string_lossy(),
+                    "bad"
+                );
+            } else {
+                assert_eq!(
+                    die.attr_value(gimli::DW_AT_ranges),
+                    Some(gimli::AttributeValue::RangeListsRef(
+                        gimli::RawRangeListsOffset(usize::try_from(offset).unwrap())
+                    ))
+                );
+                assert!(
+                    dwarf.die_ranges(&unit, die).is_err(),
+                    "nonzero present pointer reaches Gimli initialization failure"
+                );
+            }
+        } else {
+            assert!(die.attr(gimli::DW_AT_declaration).is_none());
+            assert_eq!(
+                die.attr(gimli::DW_AT_high_pc).unwrap().form(),
+                gimli::DwForm(u16::from(high_form))
+            );
+            let range = dwarf
+                .die_ranges(&unit, die)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap();
+            assert_eq!((range.begin, range.end), (0x0040_1000, 0x0040_1020));
+        }
+    }
+    let elf = object::File::parse(bytes).unwrap();
+    if case == NativeVersionedRange::MissingSection {
+        assert!(elf.section_by_name(".debug_rnglists").is_none());
+    } else if version == 5 {
+        let list = elf
+            .section_by_name(".debug_rnglists")
+            .unwrap()
+            .data()
+            .unwrap();
+        assert_eq!(list.len(), 30);
+        assert_eq!(&list[..12], &[26, 0, 0, 0, 5, 0, 8, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            (list[12], list[29]),
+            (gimli::DW_RLE_start_end.0, gimli::DW_RLE_end_of_list.0)
+        );
+        if case == NativeVersionedRange::BeyondSection {
+            assert!(usize::try_from(offset).unwrap() > list.len());
+        }
+    }
+    eprintln!(
+        "DWARF{version} {case:?}: root/CU/source cover both IPs; ranges form={range_form:#x}, offset={offset}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn assert_native_versioned_range_parity(version: u16, case: NativeVersionedRange) {
+    // elfutils 0.195 dwarf_ranges.c:504-527 obtains the direct attribute;
+    // dwarf_haspc.c:47-52 returns -1 on its fault. perf7.2.9
+    // dwarf-aux.c:673-677 applies that predicate only under an admitted root.
+    let root = tempfile::tempdir().unwrap();
+    let binary = root.path().join("versioned.elf");
+    let input = root.path().join("perf.data");
+    std::fs::write(
+        root.path().join("perfconfig"),
+        "[addr2line]\nstyle = libdw\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &binary,
+        native_versioned_range_elf(version, NativeVersionedRange::Healthy),
+    )
+    .unwrap();
+    for ip in [0x0040_1006, 0x0040_100c] {
+        std::fs::write(&input, inline_range_tail_perfdata(&binary, ip)).unwrap();
+        for inline in [false, true] {
+            let (script, _) = native_inline_range_tail(root.path(), &input, inline);
+            assert_eq!(
+                script.contains("malformed_inline+0x"),
+                inline && ip == 0x0040_1006,
+                "version-specific healthy prerequisite: {script}"
+            );
+            eprintln!("DWARF{version} healthy prerequisite ip={ip:#x} inline={inline}:\n{script}");
+        }
+    }
+    std::fs::write(&binary, native_versioned_range_elf(version, case)).unwrap();
+    let mut outcomes = Vec::new();
+    for ip in [0x0040_1006, 0x0040_100c] {
+        let bytes = inline_range_tail_perfdata(&binary, ip);
+        std::fs::write(&input, &bytes).unwrap();
+        let native = [
+            native_inline_range_tail(root.path(), &input, false),
+            native_inline_range_tail(root.path(), &input, true),
+        ];
+        for (inline, (script, folded)) in [false, true].into_iter().zip(&native) {
+            assert_eq!(
+                script.contains("malformed_inline+0x"),
+                inline && (case != NativeVersionedRange::Healthy || ip == 0x0040_1006),
+                "native range predicate guard: {script}"
+            );
+            eprintln!(
+                "DWARF{version} {case:?} ip={ip:#x} inline={inline}\nNATIVE SCRIPT:\n{script}NATIVE FOLDED:\n{folded}"
+            );
+        }
+        outcomes.extend(native_dwarf_source_routes(&input, &bytes, &native));
+    }
+    assert_eq!(outcomes.len(), 16);
+    let mismatches: Vec<_> = outcomes
+        .iter()
+        .filter(|(actual, expected)| actual.as_ref() != Ok(expected))
+        .collect();
+    assert!(
+        mismatches.is_empty(),
+        "DWARF{version} {case:?}: all16 outcomes collected before assertion: {mismatches:?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_versioned_range_dwarf5_direct_list_has_terminated_miss() {
+    assert_native_versioned_range_parity(5, NativeVersionedRange::Healthy);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_versioned_range_dwarf5_missing_section_with_nonzero_pointer() {
+    assert_native_versioned_range_parity(5, NativeVersionedRange::MissingSection);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_versioned_range_dwarf5_pointer_beyond_section() {
+    assert_native_versioned_range_parity(5, NativeVersionedRange::BeyondSection);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_versioned_range_dwarf3_present_string_after_healthy_data4_list() {
+    assert_native_versioned_range_parity(3, NativeVersionedRange::InvalidForm);
+}
+
+#[cfg(target_os = "linux")]
 fn assert_data_symbol_routes_match_native(
     input: &std::path::Path,
     root: &std::path::Path,
