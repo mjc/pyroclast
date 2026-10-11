@@ -373,10 +373,9 @@ finishes. Timestamp-ordered records retain read windows until delivery, avoiding
 per-record payload copies and backward rereads. Metadata preparation can make
 separate passes. Input is not protected against concurrent writes or truncation.
 
-Folded per-stack counts saturate at `u64::MAX` on overflow in both direct and
-Inferno folding; representable counts and continuous-stream parser state are
-unchanged. Saturation is an explicit overflow policy, not native Inferno parity
-for sums beyond the representable range.
+Folded per-stack counts wrap modulo 2^64 on overflow in both direct and
+Inferno-backed folding, matching Inferno's unsigned count arithmetic. Profile
+summary totals retain their separate saturating policy.
 
 ## License
 
