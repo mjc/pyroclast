@@ -69,10 +69,9 @@ fn callchain_unwind_case() -> impl Strategy<Value = CallchainUnwindCase> {
         0_u64..=0xffff,
         any::<u64>(),
         prop::collection::vec(any::<u8>(), 0..31),
-        any::<u64>(),
     )
         .prop_flat_map(
-            |(pid, tid, time, period, frames, regs_mask, abi, user_stack, dynamic_size)| {
+            |(pid, tid, time, period, frames, regs_mask, abi, user_stack)| {
                 let reg_count = if abi == 0 {
                     0
                 } else {
@@ -87,8 +86,8 @@ fn callchain_unwind_case() -> impl Strategy<Value = CallchainUnwindCase> {
                     Just(regs_mask),
                     Just(abi),
                     prop::collection::vec(any::<u64>(), reg_count),
+                    0..=user_stack.len() as u64,
                     Just(user_stack),
-                    Just(dynamic_size),
                 )
             },
         )
@@ -102,8 +101,8 @@ fn callchain_unwind_case() -> impl Strategy<Value = CallchainUnwindCase> {
                 regs_mask,
                 abi,
                 regs_values,
-                user_stack,
                 dynamic_size,
+                user_stack,
             )| CallchainUnwindCase {
                 pid,
                 tid,
@@ -532,7 +531,7 @@ fn parses_borrowed_callchain_without_dropping_the_independent_event_ip() {
 }
 
 #[test]
-fn callchain_parser_keeps_sample_ip_without_callchain_even_with_unwind_payload_like_perf_script() {
+fn callchain_parser_keeps_sample_ip_with_unpadded_unwind_payload_without_callchain() {
     let mut payload = Vec::new();
     payload.extend(0x1000u64.to_le_bytes());
     payload.extend(123u32.to_le_bytes());
@@ -542,7 +541,6 @@ fn callchain_parser_keeps_sample_ip_without_callchain_even_with_unwind_payload_l
     payload.extend(0xaaaa_u64.to_le_bytes());
     payload.extend(3u64.to_le_bytes());
     payload.extend([1, 2, 3]);
-    payload.extend([0; 5]);
     payload.extend(3u64.to_le_bytes());
 
     let sample = parse_sample_record_callchain(
@@ -569,7 +567,9 @@ fn callchain_parser_keeps_sample_ip_without_callchain_even_with_unwind_payload_l
 }
 
 #[test]
-fn callchain_parser_preserves_user_regs_and_stack_for_dwarf_unwinding() {
+fn callchain_parser_preserves_unpadded_user_regs_and_stack_for_dwarf_unwinding() {
+    // Installed perf 7.2.9 evsel.c:3703-3720 reads dynamic size immediately
+    // after the captured bytes; this is parser fidelity, not a typical dump size.
     let mut payload = Vec::new();
     payload.extend(0x1000u64.to_le_bytes());
     payload.extend(123u32.to_le_bytes());
@@ -581,7 +581,6 @@ fn callchain_parser_preserves_user_regs_and_stack_for_dwarf_unwinding() {
     payload.extend(0xaaaa_u64.to_le_bytes());
     payload.extend(3u64.to_le_bytes());
     payload.extend([1, 2, 3]);
-    payload.extend([0; 5]);
     payload.extend(3u64.to_le_bytes());
 
     let sample = parse_sample_record_callchain(
@@ -629,6 +628,152 @@ fn callchain_parser_accepts_empty_user_stack_without_dynamic_size() {
     let stack = sample.user_stack.as_ref().expect("stack");
     assert!(stack.bytes.is_empty());
     assert_eq!(stack.dynamic_size, 0);
+}
+
+fn captured_stack_payload(
+    stack: &[u8],
+    dynamic_size: u64,
+    callchain: bool,
+) -> (Vec<u8>, SampleLayout) {
+    let mut payload = 0x1000_u64.to_le_bytes().to_vec();
+    let mut flags = PERF_SAMPLE_IP | PERF_SAMPLE_STACK_USER;
+    if callchain {
+        flags |= PERF_SAMPLE_CALLCHAIN;
+        payload.extend(1_u64.to_le_bytes());
+        payload.extend(0x2000_u64.to_le_bytes());
+    }
+    payload.extend((stack.len() as u64).to_le_bytes());
+    payload.extend(stack);
+    if !stack.is_empty() {
+        payload.extend(dynamic_size.to_le_bytes());
+    }
+    (payload, layout(flags))
+}
+
+fn assert_unpadded_stack_parsers(size: usize) {
+    let stack = vec![0xa5; size];
+    let mut failures = Vec::new();
+    for dynamic_size in [0, size.saturating_sub(1) as u64, size as u64] {
+        for callchain in [false, true] {
+            let (payload, sample_layout) = captured_stack_payload(&stack, dynamic_size, callchain);
+            let owned = parse_sample_record(&payload, sample_layout);
+            if !owned.as_ref().is_ok_and(|sample| {
+                sample.ip == Some(0x1000)
+                    && sample.callchain == if callchain { vec![0x2000] } else { vec![] }
+            }) {
+                failures.push(format!(
+                    "owned size={size} dynamic={dynamic_size}: {owned:?}"
+                ));
+            }
+            let borrowed = parse_sample_record_callchain(&payload, sample_layout);
+            let correct = borrowed.as_ref().is_ok_and(|sample| {
+                sample.as_ref().is_some_and(|sample| {
+                    sample.frames.clone().collect::<Vec<_>>()
+                        == if callchain {
+                            vec![0x2000]
+                        } else {
+                            vec![0x1000]
+                        }
+                        && if callchain {
+                            sample.user_stack.as_ref().is_some_and(|parsed| {
+                                parsed.bytes == stack
+                                    && parsed.dynamic_size == dynamic_size
+                                    && (stack.is_empty()
+                                        || parsed.bytes.as_ptr() == payload[32..].as_ptr())
+                            })
+                        } else {
+                            sample.user_stack.is_none()
+                        }
+                })
+            });
+            if !correct {
+                failures.push(format!("borrowed callchain={callchain} size={size} dynamic={dynamic_size}: {borrowed:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+// Native parser source admits exact captured extents, including unaligned data.
+// The kernel normally aligns requested dump sizes before serializing them.
+macro_rules! unpadded_stack_case {
+    ($name:ident, $size:expr) => {
+        #[test]
+        fn $name() {
+            assert_unpadded_stack_parsers($size);
+        }
+    };
+}
+
+unpadded_stack_case!(user_stack_unpadded_extent_1, 1);
+unpadded_stack_case!(user_stack_unpadded_extent_2, 2);
+unpadded_stack_case!(user_stack_unpadded_extent_3, 3);
+unpadded_stack_case!(user_stack_unpadded_extent_4, 4);
+unpadded_stack_case!(user_stack_unpadded_extent_5, 5);
+unpadded_stack_case!(user_stack_unpadded_extent_6, 6);
+unpadded_stack_case!(user_stack_unpadded_extent_7, 7);
+unpadded_stack_case!(user_stack_unpadded_extent_9, 9);
+unpadded_stack_case!(user_stack_unpadded_extent_15, 15);
+unpadded_stack_case!(user_stack_unpadded_extent_17, 17);
+unpadded_stack_case!(user_stack_aligned_extent_0, 0);
+unpadded_stack_case!(user_stack_aligned_extent_8, 8);
+unpadded_stack_case!(user_stack_aligned_extent_16, 16);
+
+#[test]
+fn user_stack_rejects_dynamic_extent_larger_than_capture_in_all_public_parsers() {
+    let mut accepted = Vec::new();
+    for size in [8, 16] {
+        for dynamic_size in [size as u64 + 1, u64::MAX] {
+            for callchain in [false, true] {
+                let (payload, sample_layout) =
+                    captured_stack_payload(&vec![0xa5; size], dynamic_size, callchain);
+                if parse_sample_record(&payload, sample_layout).is_ok() {
+                    accepted.push(("owned", size, dynamic_size, callchain));
+                }
+                if parse_sample_record_callchain(&payload, sample_layout).is_ok() {
+                    accepted.push(("borrowed", size, dynamic_size, callchain));
+                }
+            }
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "invalid extents accepted: {accepted:?}"
+    );
+}
+
+#[test]
+fn user_stack_owned_parser_reads_following_weight_without_a_padding_gap() {
+    for size in [1, 3, 7, 9] {
+        let (mut payload, mut sample_layout) = captured_stack_payload(&vec![0xa5; size], 0, true);
+        sample_layout.sample_type |= PERF_SAMPLE_WEIGHT;
+        // Seven following bytes are not enough for WEIGHT. An imagined gap
+        // must not consume part of this field or require more than eight bytes.
+        payload.extend([0xc3; 7]);
+        assert!(parse_sample_record(&payload, sample_layout).is_err());
+        payload.push(0xc3);
+        let parsed = parse_sample_record(&payload, sample_layout).expect("complete weight");
+        assert_eq!(parsed.callchain, [0x2000]);
+    }
+}
+
+#[test]
+fn user_stack_parsers_reject_every_truncated_static_or_dynamic_extent() {
+    for size in [1, 3, 8, 9, 16] {
+        for callchain in [false, true] {
+            let (payload, sample_layout) = captured_stack_payload(&vec![0xa5; size], 0, callchain);
+            for end in 0..payload.len() {
+                assert!(
+                    parse_sample_record(&payload[..end], sample_layout).is_err(),
+                    "owned size={size} callchain={callchain} end={end}"
+                );
+                assert!(
+                    parse_sample_record_callchain(&payload[..end], sample_layout).is_err(),
+                    "borrowed size={size} callchain={callchain} end={end}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -681,7 +826,7 @@ proptest! {
     }
 
     #[test]
-    fn property_callchain_parser_preserves_generated_unwind_metadata(
+    fn property_callchain_parser_preserves_valid_unpadded_unwind_metadata(
         case in callchain_unwind_case(),
     ) {
         let mut payload = Vec::new();
@@ -699,15 +844,11 @@ proptest! {
         }
         payload.extend((case.user_stack.len() as u64).to_le_bytes());
         payload.extend(&case.user_stack);
-        let padding = case.user_stack.len().next_multiple_of(8) - case.user_stack.len();
-        payload.extend(std::iter::repeat_n(0, padding));
         if !case.user_stack.is_empty() {
             payload.extend(case.dynamic_size.to_le_bytes());
         }
 
-        let sample = parse_sample_record_callchain(
-            &payload,
-            SampleLayout {
+        let sample_layout = SampleLayout {
                 sample_type: PERF_SAMPLE_TID
                     | PERF_SAMPLE_TIME
                     | PERF_SAMPLE_PERIOD
@@ -716,8 +857,13 @@ proptest! {
                     | PERF_SAMPLE_STACK_USER,
                 sample_regs_user: case.regs_mask,
                 ..layout(0)
-            },
-        )
+            };
+        let owned = parse_sample_record(&payload, sample_layout).expect("owned sample");
+        prop_assert_eq!(&owned.callchain, &case.frames);
+        prop_assert_eq!(owned.pid, Some(case.pid));
+        prop_assert_eq!(owned.tid, Some(case.tid));
+        prop_assert_eq!(owned.period, Some(case.period));
+        let sample = parse_sample_record_callchain(&payload, sample_layout)
         .expect("sample")
         .expect("callchain");
 
@@ -742,6 +888,21 @@ proptest! {
                 case.dynamic_size
             }
         );
+    }
+
+    #[test]
+    fn property_user_stack_parsers_reject_generated_oversized_dynamic_extents(
+        stack in prop::collection::vec(any::<u8>(), 1..32),
+        dynamic_size in any::<u64>(),
+        callchain in any::<bool>(),
+    ) {
+        prop_assume!(dynamic_size > stack.len() as u64);
+        let (payload, sample_layout) = captured_stack_payload(&stack, dynamic_size, callchain);
+        let owned = parse_sample_record(&payload, sample_layout);
+        let borrowed = parse_sample_record_callchain(&payload, sample_layout);
+        prop_assert!(owned.is_err() && borrowed.is_err(),
+            "oversized dynamic={} captured={} owned={:?} borrowed={:?}",
+            dynamic_size, stack.len(), owned, borrowed);
     }
 
     #[test]

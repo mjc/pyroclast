@@ -67,7 +67,7 @@ fn ignores_perf_context_markers_when_ranking_leaf_ips() {
 }
 
 #[test]
-fn analyzes_sample_modes_and_user_stack_payloads() {
+fn analyzes_sample_modes_and_unpadded_user_stack_payloads() {
     let perfdata = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -307,8 +307,10 @@ fn sample_payload_with_user_stack<const R: usize, const S: usize>(
     }
     payload.extend((stack.len() as u64).to_le_bytes());
     payload.extend(stack);
-    payload.extend(vec![0; stack.len().next_multiple_of(8) - stack.len()]);
-    payload.extend((S as u64).to_le_bytes());
+    // Installed perf 7.2.9 evsel.c:3703-3720: exact data[size], then dyn_size.
+    if S != 0 {
+        payload.extend((S as u64).to_le_bytes());
+    }
     payload
 }
 

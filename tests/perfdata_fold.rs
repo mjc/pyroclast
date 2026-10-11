@@ -1555,7 +1555,7 @@ fn summarizes_sample_callchain_counts_using_file_attr_layout() {
 }
 
 #[test]
-fn summarizes_dwarf_user_stack_payloads() {
+fn summarizes_unpadded_dwarf_user_stack_payloads() {
     let bytes = perfdata_with_records_and_attrs(
         [file_attr_bytes_with_regs(
             PERF_SAMPLE_IP
@@ -15863,8 +15863,10 @@ fn append_user_stack_payload<const R: usize, const S: usize>(
     }
     payload.extend((stack.len() as u64).to_le_bytes());
     payload.extend(stack);
-    payload.extend(vec![0; stack.len().next_multiple_of(8) - stack.len()]);
-    payload.extend(dynamic_size.to_le_bytes());
+    // Installed perf 7.2.9 evsel.c:3703-3720: exact data[size], then dyn_size.
+    if S != 0 {
+        payload.extend(dynamic_size.to_le_bytes());
+    }
 }
 
 #[cfg(target_os = "linux")]

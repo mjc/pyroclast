@@ -12942,7 +12942,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_merge_preserves_registers_and_stack_bytes_after_the_callchain() {
+    fn deferred_merge_preserves_registers_and_unpadded_stack_bytes_after_the_callchain() {
         use crate::perfdata::samples::{PERF_SAMPLE_REGS_USER, PERF_SAMPLE_STACK_USER};
 
         let mut queued = queued_deferred_sample(u64::MAX, 21, 100, 0x2000);
@@ -12952,7 +12952,8 @@ mod tests {
         let mut tail = 2_u64.to_le_bytes().to_vec();
         tail.extend(0xabcd_u64.to_le_bytes());
         tail.extend(3_u64.to_le_bytes());
-        tail.extend([1, 2, 3, 0, 0, 0, 0, 0]);
+        // Installed perf 7.2.9 evsel.c:3703-3720 has no captured-stack gap.
+        tail.extend([1, 2, 3]);
         tail.extend(3_u64.to_le_bytes());
         queued.payload.extend_from_slice(&tail);
 

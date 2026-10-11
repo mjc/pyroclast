@@ -565,10 +565,13 @@ impl<'a> SampleCursor<'a> {
                 dynamic_size: 0,
             });
         }
+        // perf 7.2.9 evsel.c:3703-3720 reads data[size] without padding,
+        // then rejects a dynamic extent larger than the captured size.
         let bytes = self.read_bytes(size)?;
-        let padding = size.next_multiple_of(8) - size;
-        self.read_bytes(padding)?;
         let dynamic_size = self.read_u64()?;
+        if dynamic_size > size as u64 {
+            return Err("perf sample user stack dynamic size exceeds captured size".to_string());
+        }
         Ok(SampleUserStack {
             bytes,
             dynamic_size,
@@ -618,5 +621,96 @@ impl<'a> SampleCursor<'a> {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod stack_extent_tests {
+    use super::{
+        PERF_SAMPLE_IP, PERF_SAMPLE_STACK_USER, SampleLayout, parse_sample_record_metadata,
+    };
+
+    fn metadata_stack_payload(size: usize, dynamic_size: u64) -> (Vec<u8>, SampleLayout) {
+        let mut payload = 0x1000_u64.to_le_bytes().to_vec();
+        payload.extend((size as u64).to_le_bytes());
+        payload.extend(std::iter::repeat_n(0xa5, size));
+        if size != 0 {
+            payload.extend(dynamic_size.to_le_bytes());
+        }
+        let layout = SampleLayout {
+            sample_type: PERF_SAMPLE_IP | PERF_SAMPLE_STACK_USER,
+            read_format: 0,
+            branch_sample_type: 0,
+            sample_regs_user: 0,
+            sample_regs_intr: 0,
+            sample_id_all: false,
+        };
+        (payload, layout)
+    }
+
+    fn assert_metadata_extents(sizes: &[usize]) {
+        let mut failures = Vec::new();
+        for &size in sizes {
+            for dynamic_size in [0, size.saturating_sub(1) as u64, size as u64] {
+                let (payload, layout) = metadata_stack_payload(size, dynamic_size);
+                let parsed = parse_sample_record_metadata(&payload, layout);
+                let correct = parsed.as_ref().is_ok_and(|sample| {
+                    sample.as_ref().is_some_and(|sample| {
+                        sample.sample_ip == Some(0x1000)
+                            && sample.frames.clone().collect::<Vec<_>>() == [0x1000]
+                            && sample.user_stack.as_ref().is_some_and(|stack| {
+                                stack.bytes == vec![0xa5; size]
+                                    && stack.dynamic_size == dynamic_size
+                            })
+                    })
+                });
+                if !correct {
+                    failures.push(format!("size={size} dynamic={dynamic_size}: {parsed:?}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn summary_metadata_preserves_unpadded_captured_stack_extents() {
+        // Native parser format (installed perf 7.2.9 evsel.c:3703-3720), not
+        // a claim that typical kernel-requested dump sizes are unaligned.
+        assert_metadata_extents(&[1, 2, 3, 4, 5, 6, 7, 9, 15, 17]);
+    }
+
+    #[test]
+    fn summary_metadata_preserves_aligned_zero_equal_and_below_stack_extents() {
+        assert_metadata_extents(&[0, 8, 16]);
+    }
+
+    #[test]
+    fn summary_metadata_rejects_dynamic_extent_larger_than_capture() {
+        let mut accepted = Vec::new();
+        for size in [8, 16] {
+            for dynamic_size in [size as u64 + 1, u64::MAX] {
+                let (payload, layout) = metadata_stack_payload(size, dynamic_size);
+                if parse_sample_record_metadata(&payload, layout).is_ok() {
+                    accepted.push((size, dynamic_size));
+                }
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "invalid extents accepted: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn summary_metadata_rejects_truncated_static_and_dynamic_stack_extents() {
+        for size in [1, 8, 9] {
+            let (payload, layout) = metadata_stack_payload(size, 0);
+            for end in 0..payload.len() {
+                assert!(
+                    parse_sample_record_metadata(&payload[..end], layout).is_err(),
+                    "size={size} end={end}"
+                );
+            }
+        }
     }
 }
