@@ -6244,23 +6244,116 @@ mod tests {
         offset: usize,
         queue: &mut super::OrderedRecordQueue,
     ) -> super::QueuedPerfRecord {
+        ordered_record_with_backing(offset, queue).0
+    }
+
+    fn ordered_record_with_backing(
+        offset: usize,
+        queue: &mut super::OrderedRecordQueue,
+    ) -> (super::QueuedPerfRecord, std::sync::Weak<Vec<u8>>) {
+        let mut backing = std::sync::Weak::new();
         let window = queue.windows.retain_with(offset, || {
             let mut bytes = crate::perfdata::records::PERF_RECORD_SAMPLE
                 .to_le_bytes()
                 .to_vec();
             bytes.extend(0_u16.to_le_bytes());
             bytes.extend(8_u16.to_le_bytes());
-            std::sync::Arc::new(bytes)
+            let bytes = std::sync::Arc::new(bytes);
+            backing = std::sync::Arc::downgrade(&bytes);
+            bytes
         });
-        super::QueuedPerfRecord {
-            offset,
-            window,
-            header: crate::perfdata::records::PerfRecordHeader {
-                record_type: crate::perfdata::records::PERF_RECORD_SAMPLE,
-                misc: 0,
-                size: 8,
+        (
+            super::QueuedPerfRecord {
+                offset,
+                window,
+                header: crate::perfdata::records::PerfRecordHeader {
+                    record_type: crate::perfdata::records::PERF_RECORD_SAMPLE,
+                    misc: 0,
+                    size: 8,
+                },
             },
+            backing,
+        )
+    }
+
+    #[test]
+    fn ordered_queue_disorder_ties_retained_suffix_and_refill_preserve_backing_lifetimes() {
+        let mut queue = super::OrderedRecordQueue::default();
+        let mut backings = Vec::new();
+        for (offset, time) in [(24, 10), (8, 10), (16, 20), (32, 30)] {
+            let (record, backing) = ordered_record_with_backing(offset, &mut queue);
+            backings.push(backing);
+            queue.queue(record, time);
         }
+        let mut delivered = Vec::new();
+        queue
+            .flush_through_with(Some(10), |_, offset| {
+                delivered.push(offset);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(delivered, [8, 24]);
+        let (record, backing) = ordered_record_with_backing(40, &mut queue);
+        backings.push(backing);
+        queue.queue(record, 15);
+        queue
+            .flush_final_with(|_, offset| {
+                delivered.push(offset);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(delivered, [8, 24, 40, 16, 32]);
+        assert!(queue.pending_records.is_empty());
+        assert!(
+            backings[..4]
+                .iter()
+                .all(|backing| backing.strong_count() == 0)
+        );
+        assert_eq!(backings[4].strong_count(), 1);
+        let record = ordered_record(48, &mut queue);
+        queue.queue(record, 0);
+        assert_eq!(queue.max_timestamp, Some(0));
+        queue
+            .flush_final_with(|_, offset| {
+                delivered.push(offset);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(delivered, [8, 24, 40, 16, 32, 48]);
+        assert_eq!(backings[4].strong_count(), 0);
+    }
+
+    #[test]
+    fn ordered_queue_abort_releases_ready_backing_without_retrying() {
+        // replay_records aborts on delivery failure. This checks our cleanup,
+        // not local perf 7.1 ordered-events.c:224-265 do_flush retry behavior
+        // (which retains failed events); it is not a native retry contract.
+        let mut queue = super::OrderedRecordQueue::default();
+        let mut backings = Vec::new();
+        for index in 0..4 {
+            let (record, backing) = ordered_record_with_backing(index * 8, &mut queue);
+            backings.push(backing);
+            queue.queue(record, u64::try_from(index).unwrap());
+        }
+        let mut calls = 0;
+        assert_eq!(
+            queue.flush_through_with(Some(2), |_, offset| {
+                calls += 1;
+                assert_eq!(offset, 0);
+                Err("deliberate delivery failure".into())
+            }),
+            Err("deliberate delivery failure".into())
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(queue.pending_records.len(), 1);
+        assert!(
+            backings[..3]
+                .iter()
+                .all(|backing| backing.strong_count() == 0)
+        );
+        assert_eq!(backings[3].strong_count(), 1);
+        drop(queue);
+        assert!(backings.iter().all(|backing| backing.strong_count() == 0));
     }
 
     #[test]
@@ -6556,6 +6649,7 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingFrameResolver {
+        kernel_initializations: std::cell::Cell<usize>,
         full_requests: RefCell<Vec<u64>>,
         base_requests: RefCell<Vec<u64>>,
         full_batch_sizes: RefCell<Vec<usize>>,
@@ -6580,6 +6674,15 @@ mod tests {
     }
 
     impl SymbolResolver for RecordingFrameResolver {
+        fn initialize_kernel_mapping(
+            &self,
+            _: &super::MmapTable,
+            _: &crate::perfdata::mappings::ResolvedMappingRef<'_>,
+        ) {
+            self.kernel_initializations
+                .set(self.kernel_initializations.get() + 1);
+        }
+
         fn resolve_batch(&self, requests: &[SymbolRequest]) -> Result<Vec<Option<String>>, String> {
             Ok(vec![None; requests.len()])
         }
@@ -10886,6 +10989,169 @@ mod tests {
             String::from_utf8(written).expect("utf-8"),
             "\tffffffff81000010 [unknown] ([unknown])\n"
         );
+    }
+
+    #[test]
+    fn prefilled_user_frames_initialize_and_freeze_native_dso_identity() {
+        struct IdentityProbe {
+            id: std::cell::RefCell<Option<Vec<u8>>>,
+            calls: std::cell::Cell<usize>,
+            requests: std::cell::Cell<usize>,
+        }
+        impl SymbolResolver for IdentityProbe {
+            fn object_build_id(&self, _path: &std::path::Path) -> Option<Vec<u8>> {
+                self.calls.set(self.calls.get() + 1);
+                self.id.borrow().clone()
+            }
+
+            fn resolve_batch(
+                &self,
+                requests: &[SymbolRequest],
+            ) -> Result<Vec<Option<String>>, String> {
+                self.requests.set(self.requests.get() + requests.len());
+                Ok(requests
+                    .iter()
+                    .map(|request| Some(format!("symbol_{:x}", request.relative_address)))
+                    .collect())
+            }
+        }
+
+        // Installed perf 7.2.9 symbol.c:1868-1877 discovers an undefined live
+        // build ID; :2001 freezes the DSO load even on failure. Public frame
+        // prefill does not initialize that separate native DSO identity.
+        let mut observations = Vec::new();
+        for inline in [false, true] {
+            for id in [None, Some(vec![0x11; 20])] {
+                let mut table = super::MmapTable::default();
+                insert_test_mapping(&mut table, 7, 0x1000, 0x100, "/object");
+                let resolver = IdentityProbe {
+                    id: std::cell::RefCell::new(id.clone()),
+                    calls: std::cell::Cell::new(0),
+                    requests: std::cell::Cell::new(0),
+                };
+                let mut cache = SymbolFrameCache::new(&resolver);
+                let mut mapping_cache = super::MappingResolveCache::default();
+                let mapping = table
+                    .resolve_user_frame_cached(7, 0x1010, &mut mapping_cache)
+                    .unwrap();
+                let reference = mapping.resolved_ref();
+                if inline {
+                    cache.prefetch_mapping_refs(&[reference]).unwrap();
+                } else {
+                    cache.prefetch_base_mapping_refs(&[reference]).unwrap();
+                }
+                assert_eq!(resolver.calls.get(), 0);
+                assert_eq!(resolver.requests.get(), 1);
+                let (_, frames) = cache
+                    .cached_mapping_frames_with_identity(&mapping, inline)
+                    .unwrap();
+                assert_eq!(frames.frames, ["symbol_10"]);
+
+                let decisions = [(
+                    super::FoldFrame::UserCallchain(0x1010),
+                    super::FrameMappingDecision::Mapped(mapping),
+                    1,
+                )];
+                for _ in 0..2 {
+                    super::prefetch_sample_symbols(&table, &decisions, &mut cache, inline).unwrap();
+                }
+                assert_eq!(
+                    resolver.requests.get(),
+                    1,
+                    "keep the cached positive result"
+                );
+                let calls = resolver.calls.get();
+                *resolver.id.borrow_mut() = Some(vec![0x22; 20]);
+                let frozen_id = table
+                    .symbol_mapping_ref(mapping, Some(&resolver))
+                    .build_id
+                    .map(<[u8]>::to_vec);
+                observations.push((inline, id, calls, frozen_id));
+            }
+        }
+        assert!(
+            observations
+                .iter()
+                .all(|(_, expected, calls, frozen)| *calls == 1 && frozen == expected),
+            "prefilled frames bypassed DSO identity initialization: {observations:?}"
+        );
+    }
+
+    #[test]
+    fn kernel_cpumode_prefetch_initializes_warm_refs_independent_of_numeric_class() {
+        for (pid, start, path, expected_kernel) in [
+            (7, 0x1000, "[vdso]", false),
+            (u32::MAX, 0xffff_ffff_8100_0000, "[kernel.kallsyms]", true),
+        ] {
+            let mut table = super::MmapTable::default();
+            table.insert_mmap_with_misc(
+                crate::perfdata::records::MmapRecord {
+                    pid,
+                    tid: pid,
+                    start,
+                    len: 0x100,
+                    pgoff: 0,
+                    path: path.into(),
+                },
+                super::PERF_RECORD_MISC_CPUMODE_KERNEL,
+            );
+            let resolver = RecordingFrameResolver::default();
+            let mut cache = SymbolFrameCache::new(&resolver);
+            let mut mapping_cache = super::MappingResolveCache::default();
+            let mapping = table
+                .resolve_frame_cached(7, start + 0x10, &mut mapping_cache)
+                .unwrap();
+            assert_eq!(mapping.is_kernel(), expected_kernel);
+            let decisions = [(
+                super::FoldFrame::Callchain(start + 0x10),
+                super::FrameMappingDecision::Mapped(mapping),
+                1,
+            )];
+            for expected in [1, 2] {
+                super::prefetch_sample_symbols(&table, &decisions, &mut cache, true).unwrap();
+                assert_eq!(
+                    resolver.kernel_initializations.get(),
+                    expected,
+                    "CPU mode, not numeric kernel class, controls initialization"
+                );
+                assert!(cache.cached_mapping_frames(&mapping, true).is_some());
+            }
+            assert_eq!(resolver.full_requests.borrow().len(), 1);
+        }
+    }
+
+    #[test]
+    fn user_cpumode_prefetch_does_not_initialize_kernel_for_high_relative_bracketed_map() {
+        let mut table = super::MmapTable::default();
+        table.insert_mmap(crate::perfdata::records::MmapRecord {
+            pid: 7,
+            tid: 7,
+            start: 0x1000,
+            len: 0x100,
+            pgoff: 0xffff_8000_0000_0000,
+            path: "[vdso]".into(),
+        });
+        let resolver = RecordingFrameResolver::default();
+        let mut cache = SymbolFrameCache::new(&resolver);
+        let mut mapping_cache = super::MappingResolveCache::default();
+        let mapping = table
+            .resolve_frame_cached(7, 0x1010, &mut mapping_cache)
+            .unwrap();
+        assert!(mapping.is_kernel());
+        let decisions = [(
+            super::FoldFrame::UserCallchain(0x1010),
+            super::FrameMappingDecision::Mapped(mapping),
+            1,
+        )];
+        for _ in 0..2 {
+            super::prefetch_sample_symbols(&table, &decisions, &mut cache, true).unwrap();
+        }
+        let (_, frames) = cache
+            .cached_mapping_frames_with_identity(&mapping, true)
+            .unwrap();
+        assert_eq!(frames.frames, ["symbol_ffff800000000010"]);
+        assert_eq!(resolver.kernel_initializations.get(), 0);
+        assert_eq!(resolver.full_requests.borrow().len(), 1);
     }
 
     #[test]

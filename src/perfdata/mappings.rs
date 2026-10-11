@@ -4124,6 +4124,79 @@ mod tests {
     }
 
     #[test]
+    fn mapped_frame_constructors_preserve_address_dependent_metadata_and_borrowed_paths() {
+        let kernel = 0xffff_8000_0000_0000;
+        for (pid, start, pgoff, path, misc) in [
+            (
+                7,
+                0x1000,
+                kernel - 0x20,
+                "[vdso]",
+                super::PERF_RECORD_MISC_CPUMODE_USER,
+            ),
+            (
+                7,
+                0x1000,
+                kernel - 0x20,
+                "/user",
+                super::PERF_RECORD_MISC_CPUMODE_USER,
+            ),
+            (
+                u32::MAX,
+                kernel,
+                0,
+                "[kernel.kallsyms]",
+                super::PERF_RECORD_MISC_CPUMODE_KERNEL,
+            ),
+            (
+                7,
+                0,
+                0,
+                "/module.ko",
+                super::PERF_RECORD_MISC_CPUMODE_KERNEL,
+            ),
+        ] {
+            let mut table = super::MmapTable::default();
+            table.insert_mmap_with_misc(
+                super::MmapRecord {
+                    pid,
+                    tid: pid,
+                    start,
+                    len: 0x100,
+                    pgoff,
+                    path: path.into(),
+                },
+                misc,
+            );
+            let mut cache = super::MappingResolveCache::default();
+            let mut context_cache = super::MappingResolveCache::default();
+            let context = table.frame_context(7, &mut context_cache);
+            for offset in [0, 0x20, 0x40] {
+                let ip = start + offset;
+                let relative = if pid == u32::MAX { ip } else { pgoff + offset };
+                let module = (path == "/module.ko").then_some(ip);
+                let expected_kernel =
+                    module.is_some() || (path.starts_with('[') && relative >= kernel);
+                let direct = super::MappedFrame::new(&table.mappings[0], ip);
+                let cached = table.resolve_frame_cached(7, ip, &mut cache).unwrap();
+                let hinted = context.resolve(ip, &mut context_cache).unwrap();
+                let repeated = context.resolve(ip, &mut context_cache).unwrap();
+                for frame in [direct, cached, hinted, repeated] {
+                    assert_eq!(frame.relative_address, relative);
+                    assert_eq!(frame.is_kernel(), expected_kernel);
+                    assert_eq!(
+                        frame.kernel_range(),
+                        expected_kernel.then_some((start, start + 0x100))
+                    );
+                    assert_eq!(frame.resolved_ref().kernel_module_address, module);
+                    assert_eq!(frame.resolved_ref(), direct.resolved_ref());
+                    assert_eq!(frame.path().as_ptr(), direct.path().as_ptr());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn mapped_frame_unbracketed_paths_skip_numeric_kernel_classification() {
         for path in ["", "/usr/bin/demo", "/tmp/[kernel]", "demo.so", " /[vdso]"] {
             for relative_address in [
