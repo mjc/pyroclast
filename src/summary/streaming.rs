@@ -15,15 +15,27 @@ pub(super) fn summarize_file(
         return Err("timeline bucket width must be greater than zero".to_string());
     }
     // The input need not be timestamp ordered. A first pass establishes the
-    // exact origin and final thread names; a second creates sparse buckets.
+    // exact origin; a second creates sparse buckets and final thread names.
     let mut first = None::<u64>;
-    let metadata = visit_perfdata_file_metadata(path, |sample| {
+    visit_perfdata_file_metadata(path, |sample| {
         if let Some(time) = sample.time {
             first = Some(first.map_or(time, |first| first.min(time)));
         }
     })?;
+    summarize_file_with_origin(path, bucket_width_ns, limit, first)
+}
+
+pub(super) fn summarize_file_with_origin(
+    path: &Path,
+    bucket_width_ns: u64,
+    limit: usize,
+    first: Option<u64>,
+) -> Result<PerfProfileSummary, String> {
+    if bucket_width_ns == 0 {
+        return Err("timeline bucket width must be greater than zero".to_string());
+    }
     let mut aggregate = ProfileAggregate::default();
-    visit_perfdata_file_metadata(path, |sample| {
+    let metadata = visit_perfdata_file_metadata(path, |sample| {
         aggregate.record(sample, first, bucket_width_ns);
     })?;
     Ok(aggregate.finish(

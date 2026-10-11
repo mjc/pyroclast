@@ -963,6 +963,25 @@ pub fn fold_perfdata_file_with_options(
     String::from_utf8(folded).map_err(|error| format!("folded output is not utf-8: {error}"))
 }
 
+pub(crate) fn fold_perfdata_file_with_options_and_origin(
+    path: &Path,
+    options: FoldOptions,
+) -> Result<(String, Option<u64>), String> {
+    let file = File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
+    let mut folded = Vec::new();
+    let first_sample_time = write_folded_perfdata_from_file_with_origin::<NoopSymbolResolver, _>(
+        &file,
+        options,
+        None,
+        &mut folded,
+    )?;
+    Ok((
+        String::from_utf8(folded)
+            .map_err(|error| format!("folded output is not utf-8: {error}"))?,
+        first_sample_time,
+    ))
+}
+
 /// Collapses parsed perf sample callchains, symbolizing mapped frames through
 /// the provided resolver.
 ///
@@ -1005,6 +1024,30 @@ where
     let mut folded = Vec::new();
     write_folded_perfdata_from_file(&file, options, Some(&mut symbol_cache), &mut folded)?;
     String::from_utf8(folded).map_err(|error| format!("folded output is not utf-8: {error}"))
+}
+
+pub(crate) fn fold_perfdata_file_with_symbols_and_origin<R>(
+    path: &Path,
+    options: FoldOptions,
+    symbol_resolver: &R,
+) -> Result<(String, Option<u64>), String>
+where
+    R: SymbolResolver,
+{
+    let file = File::open(path).map_err(|error| format!("failed to open perf.data: {error}"))?;
+    let mut symbol_cache = SymbolFrameCache::new(symbol_resolver);
+    let mut folded = Vec::new();
+    let first_sample_time = write_folded_perfdata_from_file_with_origin(
+        &file,
+        options,
+        Some(&mut symbol_cache),
+        &mut folded,
+    )?;
+    Ok((
+        String::from_utf8(folded)
+            .map_err(|error| format!("folded output is not utf-8: {error}"))?,
+        first_sample_time,
+    ))
 }
 
 pub(crate) fn write_folded_perfdata_file_with_options<W>(
@@ -1152,13 +1195,66 @@ fn collect_fold_counts_from_source<R: SymbolResolver>(
     options: FoldOptions,
     symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
 ) -> Result<FoldCounts, String> {
+    Ok(collect_fold_counts_from_source_inner(
+        source,
+        header,
+        layouts,
+        state,
+        options,
+        symbol_cache,
+        false,
+    )?
+    .0)
+}
+
+fn collect_fold_counts_and_origin_from_source<R: SymbolResolver>(
+    source: &mut impl RecordSource,
+    header: PerfHeader,
+    layouts: &SampleLayouts,
+    state: SessionState,
+    options: FoldOptions,
+    symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+) -> Result<(FoldCounts, Option<u64>), String> {
+    collect_fold_counts_from_source_inner(
+        source,
+        header,
+        layouts,
+        state,
+        options,
+        symbol_cache,
+        true,
+    )
+}
+
+fn collect_fold_counts_from_source_inner<R: SymbolResolver>(
+    source: &mut impl RecordSource,
+    header: PerfHeader,
+    layouts: &SampleLayouts,
+    state: SessionState,
+    options: FoldOptions,
+    symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+    collect_origin: bool,
+) -> Result<(FoldCounts, Option<u64>), String> {
     if layouts_require_stream_parser(layouts) {
-        return collect_stream_fold_counts(source, header, layouts, state, options, symbol_cache);
+        return if collect_origin {
+            collect_stream_fold_counts_and_origin(
+                source,
+                header,
+                layouts,
+                state,
+                options,
+                symbol_cache,
+            )
+        } else {
+            collect_stream_fold_counts(source, header, layouts, state, options, symbol_cache)
+                .map(|counts| (counts, None))
+        };
     }
     let mut sink = SampleSink::new(
         state,
         FoldedOutput::new(symbol_cache, options, layouts.event_name_width),
     );
+    sink.collect_origin = collect_origin;
     replay_records(source, header, layouts, options, &mut sink)?;
     if sink.output.requires_stream_parser {
         // No counts have been emitted yet. Replay with fresh metadata and one
@@ -1171,9 +1267,14 @@ fn collect_fold_counts_from_source<R: SymbolResolver>(
             state
         };
         drop(sink.output);
-        return collect_stream_fold_counts(source, header, layouts, state, options, cache);
+        return if collect_origin {
+            collect_stream_fold_counts_and_origin(source, header, layouts, state, options, cache)
+        } else {
+            collect_stream_fold_counts(source, header, layouts, state, options, cache)
+                .map(|counts| (counts, None))
+        };
     }
-    Ok(sink.output.buffers.counts)
+    Ok((sink.output.buffers.counts, sink.first_sample_time))
 }
 
 fn layouts_require_stream_parser(layouts: &SampleLayouts) -> bool {
@@ -1208,6 +1309,38 @@ fn collect_stream_fold_counts<R: SymbolResolver>(
     options: FoldOptions,
     symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
 ) -> Result<FoldCounts, String> {
+    Ok(collect_stream_fold_counts_inner(
+        source,
+        header,
+        layouts,
+        state,
+        options,
+        symbol_cache,
+        false,
+    )?
+    .0)
+}
+
+fn collect_stream_fold_counts_and_origin<R: SymbolResolver>(
+    source: &mut impl RecordSource,
+    header: PerfHeader,
+    layouts: &SampleLayouts,
+    state: SessionState,
+    options: FoldOptions,
+    symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+) -> Result<(FoldCounts, Option<u64>), String> {
+    collect_stream_fold_counts_inner(source, header, layouts, state, options, symbol_cache, true)
+}
+
+fn collect_stream_fold_counts_inner<R: SymbolResolver>(
+    source: &mut impl RecordSource,
+    header: PerfHeader,
+    layouts: &SampleLayouts,
+    state: SessionState,
+    options: FoldOptions,
+    symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+    collect_origin: bool,
+) -> Result<(FoldCounts, Option<u64>), String> {
     use inferno::collapse::Collapse as _;
     // Inferno process_single_stack can stay in_event after an event-line IP
     // (missing TIME/frames or embedded DSO newlines). Subsequent sample headers
@@ -1216,6 +1349,7 @@ fn collect_stream_fold_counts<R: SymbolResolver>(
     // Without TID (builtin-script.c:evsel__check_attr), Inferno can instead
     // recognize the period as the numeric header word and change the comm.
     let mut script = tempfile::tempfile().map_err(|error| error.to_string())?;
+    let first_sample_time;
     {
         let mut writer = std::io::BufWriter::new(&mut script);
         let mut sink = SampleSink::new(
@@ -1227,7 +1361,9 @@ fn collect_stream_fold_counts<R: SymbolResolver>(
                 inline: options.inline,
             },
         );
+        sink.collect_origin = collect_origin;
         replay_records(source, header, layouts, options, &mut sink)?;
+        first_sample_time = sink.first_sample_time;
         writer.flush().map_err(|error| error.to_string())?;
     }
     script
@@ -1241,7 +1377,7 @@ fn collect_stream_fold_counts<R: SymbolResolver>(
         .map_err(|error| format!("failed to fold perf text: {error}"))?;
     let mut counts = FoldCounts::default();
     add_inferno_counts(&mut counts, &folded)?;
-    Ok(counts)
+    Ok((counts, first_sample_time))
 }
 
 fn add_inferno_counts(counts: &mut FoldCounts, folded: &[u8]) -> Result<(), String> {
@@ -1448,6 +1584,29 @@ where
         symbol_cache,
     )?;
     write_fold_counts(counts, writer)
+}
+
+fn write_folded_perfdata_from_file_with_origin<R, W>(
+    file: &File,
+    options: FoldOptions,
+    symbol_cache: Option<&mut SymbolFrameCache<'_, R>>,
+    writer: &mut W,
+) -> Result<Option<u64>, String>
+where
+    R: SymbolResolver,
+    W: IoWrite + ?Sized,
+{
+    let (header, layouts, state) = file_replay_state(file)?;
+    let (counts, first_sample_time) = collect_fold_counts_and_origin_from_source(
+        &mut FileSource::new(file)?,
+        header,
+        &layouts,
+        state,
+        options,
+        symbol_cache,
+    )?;
+    write_fold_counts(counts, writer)?;
+    Ok(first_sample_time)
 }
 
 fn write_inferno_perf_script_from_file<R, W>(
@@ -1726,6 +1885,8 @@ struct SampleSink<O> {
     accumulator: SessionState,
     output: O,
     sample_frames: FoldFrameStack,
+    collect_origin: bool,
+    first_sample_time: Option<u64>,
 }
 
 struct PerfScriptOutput<'io, 'cache, R, W: ?Sized> {
@@ -1741,6 +1902,8 @@ impl<O: SampleOutput> SampleSink<O> {
             accumulator,
             output,
             sample_frames: FoldFrameStack::new(),
+            collect_origin: false,
+            first_sample_time: None,
         }
     }
 
@@ -1776,8 +1939,20 @@ impl<O: SampleOutput> SampleSink<O> {
             return Ok(());
         };
         let Some(sample) = parse_sample_record_callchain(payload, event.layout)? else {
+            if self.collect_origin
+                && let Some(offset) = event.offsets.time
+            {
+                // SampleOffsets::time mirrors evsel.c:3808-3854. This valid
+                // sample has metadata but no retained frames (the parser returns None).
+                self.observe_sample_time(read_u64(payload, offset)?);
+            }
             return Ok(());
         };
+        if self.collect_origin
+            && let Some(time) = sample.time
+        {
+            self.observe_sample_time(time);
+        }
         // perf evsel.c:3391 and session.c:1486 recognize and queue deferred
         // samples before callchain resolution, not after preparing frames.
         if let Some(cookie) = event
@@ -1806,6 +1981,10 @@ impl<O: SampleOutput> SampleSink<O> {
         );
         self.output
             .write_sample_event(&mut self.accumulator, &sample)
+    }
+
+    fn observe_sample_time(&mut self, time: u64) {
+        self.first_sample_time = Some(self.first_sample_time.map_or(time, |first| first.min(time)));
     }
 
     fn write_deferred_callchain(

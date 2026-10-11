@@ -9,4 +9,6 @@ mod memory;
 pub mod records;
 pub mod samples;
 mod source;
+#[cfg(test)]
+pub(crate) use source::count_file_record_at_calls;
 pub mod unwind;

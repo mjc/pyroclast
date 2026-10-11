@@ -9,14 +9,15 @@ use crate::flamegraph::{
 };
 use crate::manifest::{BackendName, RunManifest};
 use crate::perfdata::fold::{
-    FoldOptions, fold_perfdata_file_with_options, fold_perfdata_file_with_symbols,
+    FoldOptions, fold_perfdata_file_with_options_and_origin,
+    fold_perfdata_file_with_symbols_and_origin,
 };
 use crate::platform::{NativeThreadLister, ThreadLister};
 use crate::process::{CommandOutput, CommandRunner, CommandSpec, FinalizationScope};
 use crate::summary::threads::{
     FoldedStackSummary, render_folded_stack_summary_text, summarize_folded_stacks,
 };
-use crate::summary::{PerfProfileSummary, summarize_perfdata_profile_file};
+use crate::summary::{PerfProfileSummary, summarize_perfdata_profile_file_with_origin};
 use crate::symbols::{SymbolizerKind, perf_symbol_resolver_for_current_home_with_symbolizer};
 use crate::tools::{ADDR2LINE, PERF, ToolSpec, resolve_required_tools};
 
@@ -31,7 +32,13 @@ pub enum PerfRecordTarget {
 struct CpuProfileSummary<'a> {
     #[serde(flatten)]
     folded: &'a FoldedStackSummary,
-    profile: PerfProfileSummary,
+    profile: &'a PerfProfileSummary,
+}
+
+impl<'a> CpuProfileSummary<'a> {
+    fn new(folded: &'a FoldedStackSummary, profile: &'a PerfProfileSummary) -> Self {
+        Self { folded, profile }
+    }
 }
 
 pub fn build_perf_record_command(
@@ -157,8 +164,14 @@ where
         let output = self.runner.run(&command)?;
         check_perf_record_output(&output, &layout)?;
         let _finalization = FinalizationScope::enter();
-        let folded_stacks =
-            fold_linux_perfdata(&perf_data, request.symbols, request.symbolizer, self.runner)?;
+        let (folded_stacks, profile_summary) = fold_and_summarize_perfdata(
+            &perf_data,
+            request.symbols,
+            request.symbolizer,
+            self.runner,
+            1_000_000_000,
+            20,
+        )?;
         let folded_summary = summarize_folded_stacks(&folded_stacks);
         std::fs::write(layout.stacks_folded(), &folded_stacks)?;
         let flamegraph_output = match self.flamegraph_renderer.render(&FlamegraphRequest {
@@ -178,7 +191,7 @@ where
         stderr.extend(flamegraph_output.stderr);
         std::fs::write(layout.stderr_log(), &stderr)?;
         std::fs::write(layout.command_txt(), command_text(request, &target))?;
-        write_profile_summary(&layout, &perf_data, &folded_summary)?;
+        write_profile_summary(&layout, &profile_summary, &folded_summary)?;
         std::fs::write(layout.tool_errors_log(), "")?;
 
         let manifest = RunManifest {
@@ -241,15 +254,12 @@ fn check_perf_record_output(output: &CommandOutput, layout: &ArtifactLayout) -> 
 
 fn write_profile_summary(
     layout: &ArtifactLayout,
-    perf_data: &Path,
+    profile: &PerfProfileSummary,
     folded: &FoldedStackSummary,
 ) -> BackendResult<()> {
     use std::fmt::Write as _;
 
-    let summary = CpuProfileSummary {
-        folded,
-        profile: summarize_perfdata_profile_file(perf_data, 1_000_000_000, 20)?,
-    };
+    let summary = CpuProfileSummary::new(folded, profile);
     let mut text = render_folded_stack_summary_text(folded);
     if let Some(span) = summary.profile.timeline.duration_ns {
         writeln!(text, "recorded sample span: {span} ns")?;
@@ -269,6 +279,34 @@ fn write_profile_summary(
         format!("{}\n", serde_json::to_string_pretty(&summary)?),
     )?;
     Ok(())
+}
+
+fn fold_and_summarize_perfdata<R: CommandRunner>(
+    perf_data: &Path,
+    symbols: bool,
+    symbolizer: SymbolizerKind,
+    runner: &R,
+    bucket_width_ns: u64,
+    limit: usize,
+) -> BackendResult<(String, PerfProfileSummary)> {
+    let options = FoldOptions {
+        count_periods: true,
+        inline: true,
+    };
+    let (folded, first_sample_ns) = if symbols {
+        let resolver =
+            perf_symbol_resolver_for_current_home_with_symbolizer(runner, perf_data, symbolizer);
+        fold_perfdata_file_with_symbols_and_origin(perf_data, options, &resolver)?
+    } else {
+        fold_perfdata_file_with_options_and_origin(perf_data, options)?
+    };
+    let summary = summarize_perfdata_profile_file_with_origin(
+        perf_data,
+        bucket_width_ns,
+        limit,
+        first_sample_ns,
+    )?;
+    Ok((folded, summary))
 }
 
 impl<R, T, F> LinuxPerfBackend<'_, R, T, F>
@@ -364,38 +402,644 @@ pub(crate) fn linux_perf_fold_tools(symbols: bool, symbolizer: SymbolizerKind) -
     tools
 }
 
-pub(crate) fn fold_linux_perfdata<R>(
-    perf_data: &Path,
-    symbols: bool,
-    symbolizer: SymbolizerKind,
-    runner: &R,
-) -> BackendResult<String>
-where
-    R: CommandRunner,
-{
-    // Keep the inline-capable renderer on, matching the plumbing parity paths:
-    // fp data naturally stays one frame per callchain entry, while DWARF data
-    // can emit the inline rows that real `perf script` prints.
-    let options = FoldOptions {
-        count_periods: true,
-        inline: true,
-    };
-    if symbols {
-        let symbol_resolver =
-            perf_symbol_resolver_for_current_home_with_symbolizer(runner, perf_data, symbolizer);
-        Ok(fold_perfdata_file_with_symbols(
-            perf_data,
-            options,
-            &symbol_resolver,
-        )?)
-    } else {
-        Ok(fold_perfdata_file_with_options(perf_data, options)?)
-    }
-}
-
 fn unix_ms_now() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::perfdata::count_file_record_at_calls;
+    use crate::perfdata::fold::fold_perfdata_file_with_options;
+    use crate::process::CommandOutput;
+    use crate::summary::summarize_perfdata_profile_file;
+
+    struct TestRunner;
+
+    impl CommandRunner for TestRunner {
+        fn run(&self, _: &CommandSpec) -> std::io::Result<CommandOutput> {
+            Ok(CommandOutput {
+                status_code: Some(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    struct FixtureRunner(Vec<u8>);
+
+    impl CommandRunner for FixtureRunner {
+        fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
+            if let Some([_, output]) = command.args.windows(2).find(|args| args[0] == "-o") {
+                std::fs::write(output, &self.0)?;
+            }
+            TestRunner.run(command)
+        }
+    }
+
+    #[test]
+    fn public_backend_profile_preserves_outputs_and_traversal_counts() {
+        use crate::cli::{PerfCallGraph, ProfileKind};
+
+        for (bytes, records, fold_passes, first_sample_ns) in [
+            (mixed_sample_perfdata(), 4, 1, 32),
+            (dynamic_stream_fallback_perfdata(), 3, 2, 9),
+        ] {
+            let input = tempfile::NamedTempFile::new().expect("fixture file");
+            std::fs::write(input.path(), &bytes).expect("write fixture");
+            let expected_folded = fold_perfdata_file_with_options(
+                input.path(),
+                FoldOptions {
+                    count_periods: true,
+                    inline: true,
+                },
+            )
+            .expect("standalone fold");
+            let (expected_profile, standalone_visits) = count_file_record_at_calls(|| {
+                summarize_perfdata_profile_file(input.path(), 1_000_000_000, 20)
+                    .expect("standalone two-pass summary")
+            });
+            let out = tempfile::tempdir().expect("artifact directory");
+            let request = ProfileRequest {
+                kind: ProfileKind::Cpu,
+                command: vec!["true".into()],
+                out_dir: out.path().join("cpu"),
+                name: None,
+                json: false,
+                symbols: false,
+                symbolizer: SymbolizerKind::Addr2line,
+                frequency: 99,
+                event: PerfEvent::CpuClock,
+                call_graph: PerfCallGraph::Fp,
+                pid: None,
+                tids: Vec::new(),
+                threads_of_pid: None,
+                duration_secs: 1,
+                offcpu_method: None,
+            };
+            let runner = FixtureRunner(bytes);
+            let backend = LinuxPerfBackend::new(&runner);
+            let (result, visits) = count_file_record_at_calls(|| {
+                backend.profile(&request).expect("public backend profile")
+            });
+            let folded =
+                std::fs::read_to_string(result.layout.stacks_folded()).expect("read folded output");
+            let summary: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(result.layout.summary_json()).expect("read summary JSON"),
+            )
+            .expect("parse summary JSON");
+
+            assert_eq!(folded, expected_folded);
+            assert_eq!(
+                summary["profile"],
+                serde_json::to_value(&expected_profile).unwrap()
+            );
+            assert_eq!(
+                expected_profile.timeline.first_sample_ns,
+                Some(first_sample_ns)
+            );
+            assert_eq!(standalone_visits, 2 * records);
+            assert_eq!(visits, (fold_passes + 1) * records);
+        }
+    }
+
+    #[test]
+    fn profile_serialization_wrapper_reuses_owned_profile_storage() {
+        let file = tempfile::NamedTempFile::new().expect("fixture file");
+        std::fs::write(file.path(), mixed_sample_perfdata()).expect("write fixture");
+        let mut profile = summarize_perfdata_profile_file(file.path(), 3, 20)
+            .expect("standalone profile summary");
+        profile.threads[0].cpus = vec![0, 2];
+        let folded = summarize_folded_stacks("sample;frame 11\n");
+        assert!(!profile.threads.is_empty());
+        assert!(!profile.threads[0].comm.is_empty());
+        assert!(!profile.threads[0].cpus.is_empty());
+        assert!(!profile.timeline.buckets.is_empty());
+
+        let summary = CpuProfileSummary::new(&folded, &profile);
+        let mut expected = serde_json::to_value(&folded).expect("folded JSON");
+        expected.as_object_mut().unwrap().insert(
+            "profile".into(),
+            serde_json::to_value(&profile).expect("profile JSON"),
+        );
+        assert_eq!(serde_json::to_value(&summary).unwrap(), expected);
+        let out = tempfile::tempdir().expect("artifact directory");
+        let layout = ArtifactLayout::new(out.path().to_path_buf());
+        write_profile_summary(&layout, &profile, &folded).expect("write profile summary");
+        let actual: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(layout.summary_json()).expect("read summary JSON"),
+        )
+        .expect("parse summary JSON");
+        assert_eq!(actual, expected);
+
+        assert!(
+            std::ptr::eq(summary.profile.threads.as_ptr(), profile.threads.as_ptr()),
+            "serialization wrapper must reuse the thread allocation"
+        );
+        assert!(std::ptr::eq(
+            summary.profile.threads[0].comm.as_ptr(),
+            profile.threads[0].comm.as_ptr()
+        ));
+        assert!(std::ptr::eq(
+            summary.profile.threads[0].cpus.as_ptr(),
+            profile.threads[0].cpus.as_ptr()
+        ));
+        assert!(std::ptr::eq(
+            summary.profile.timeline.buckets.as_ptr(),
+            profile.timeline.buckets.as_ptr()
+        ));
+    }
+
+    #[test]
+    fn combined_backend_summary_reuses_the_fold_record_traversal() {
+        let file = tempfile::NamedTempFile::new().expect("fixture file");
+        let fixture = tiny_timed_perfdata();
+        std::fs::write(file.path(), &fixture).expect("write fixture");
+        if let Some(path) = std::env::var_os("PYROC31_RED_FIXTURE") {
+            std::fs::write(path, &fixture).expect("save RED fixture");
+        }
+
+        let runner = TestRunner;
+        let expected_folded = fold_perfdata_file_with_options(
+            file.path(),
+            FoldOptions {
+                count_periods: true,
+                inline: true,
+            },
+        )
+        .expect("legacy fold");
+        let expected_profile = summarize_perfdata_profile_file(file.path(), 1_000_000_000, 20)
+            .expect("legacy two-pass summary");
+
+        let (actual, record_traversals) = count_file_record_at_calls(|| {
+            fold_and_summarize_perfdata(
+                file.path(),
+                false,
+                SymbolizerKind::Addr2line,
+                &runner,
+                1_000_000_000,
+                20,
+            )
+            .expect("combined backend output")
+        });
+
+        assert_eq!(actual.0, expected_folded);
+        assert_eq!(actual.1, expected_profile);
+        assert_eq!(record_traversals, 2, "one fold plus one summary traversal");
+    }
+
+    #[test]
+    fn combined_backend_traverses_each_mixed_sample_record_twice() {
+        let bytes = mixed_sample_perfdata();
+        let file = tempfile::NamedTempFile::new().expect("fixture file");
+        std::fs::write(file.path(), &bytes).expect("write fixture");
+        let runner = TestRunner;
+
+        let expected_folded = fold_perfdata_file_with_options(
+            file.path(),
+            FoldOptions {
+                count_periods: true,
+                inline: true,
+            },
+        )
+        .expect("legacy fold");
+        let expected_profile =
+            summarize_perfdata_profile_file(file.path(), 3, 20).expect("legacy two-pass summary");
+        let (actual, record_traversals) = count_file_record_at_calls(|| {
+            fold_and_summarize_perfdata(
+                file.path(),
+                false,
+                SymbolizerKind::Addr2line,
+                &runner,
+                3,
+                20,
+            )
+            .expect("combined backend output")
+        });
+
+        assert_eq!(actual.0, expected_folded);
+        assert_eq!(actual.1, expected_profile);
+        assert_eq!(actual.1.timeline.first_sample_ns, Some(32));
+        assert_eq!(actual.1.timeline.bucket_width_ns, 3);
+        assert_eq!(
+            actual
+                .1
+                .timeline
+                .buckets
+                .iter()
+                .map(|bucket| (bucket.start_offset_ns, bucket.samples))
+                .collect::<Vec<_>>(),
+            [(0, 3), (3, 1)]
+        );
+        assert_eq!(record_traversals, 2 * 4);
+    }
+
+    #[test]
+    fn origin_fold_does_not_reparse_samples_for_metadata() {
+        let bytes = mixed_sample_perfdata();
+        let file = tempfile::NamedTempFile::new().expect("fixture file");
+        std::fs::write(file.path(), &bytes).expect("write fixture");
+        if let Some(path) = std::env::var_os("PYROC31_PARSER_RED_FIXTURE") {
+            std::fs::write(path, &bytes).expect("save parser RED fixture");
+        }
+
+        let options = FoldOptions {
+            count_periods: true,
+            inline: true,
+        };
+        let expected_folded =
+            fold_perfdata_file_with_options(file.path(), options).expect("standalone fold");
+        let expected_profile =
+            summarize_perfdata_profile_file(file.path(), 3, 20).expect("legacy summary");
+
+        let ((folded, origin), metadata_parser_calls) =
+            crate::perfdata::samples::count_sample_metadata_parser_calls(|| {
+                fold_perfdata_file_with_options_and_origin(file.path(), options)
+                    .expect("fold and collect origin")
+            });
+        let actual_profile =
+            summarize_perfdata_profile_file_with_origin(file.path(), 3, 20, origin)
+                .expect("summary seeded from fold");
+
+        assert_eq!(folded, expected_folded);
+        assert_eq!(actual_profile, expected_profile);
+        assert_eq!(
+            metadata_parser_calls, 0,
+            "fold origin must not parse samples again"
+        );
+    }
+
+    #[test]
+    fn combined_backend_collects_origin_before_deferred_sample_delivery() {
+        use crate::perfdata::samples::{
+            PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
+        };
+
+        let mut attr = [0_u8; 144];
+        attr[4..8].copy_from_slice(&128_u32.to_le_bytes());
+        attr[16..24].copy_from_slice(&1_u64.to_le_bytes());
+        attr[24..32].copy_from_slice(
+            &(PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CALLCHAIN)
+                .to_le_bytes(),
+        );
+        // perf evsel.c:3391 marks deferred callchains before queueing delivery.
+        attr[40..48].copy_from_slice(&(1_u64 << 38).to_le_bytes());
+
+        let mut payload = Vec::new();
+        payload.extend(0x1000_u64.to_le_bytes());
+        payload.extend(1_u32.to_le_bytes());
+        payload.extend(2_u32.to_le_bytes());
+        payload.extend(12_u64.to_le_bytes());
+        payload.extend(3_u64.to_le_bytes());
+        payload.extend(0x1000_u64.to_le_bytes());
+        payload.extend(0xffff_ffff_ffff_fd80_u64.to_le_bytes());
+        payload.extend(0x1040_u64.to_le_bytes());
+        let bytes = perfdata(attr, vec![record(9, &payload)]);
+        let file = tempfile::NamedTempFile::new().expect("fixture file");
+        std::fs::write(file.path(), &bytes).expect("write fixture");
+        let runner = TestRunner;
+
+        let expected_folded = fold_perfdata_file_with_options(
+            file.path(),
+            FoldOptions {
+                count_periods: true,
+                inline: true,
+            },
+        )
+        .expect("standalone fold");
+        let expected_profile = summarize_perfdata_profile_file(file.path(), 3, 20)
+            .expect("standalone two-pass summary");
+        let (actual, record_traversals) = count_file_record_at_calls(|| {
+            fold_and_summarize_perfdata(
+                file.path(),
+                false,
+                SymbolizerKind::Addr2line,
+                &runner,
+                3,
+                20,
+            )
+            .expect("combined backend output")
+        });
+
+        assert_eq!(actual.0, expected_folded);
+        assert_eq!(actual.1, expected_profile);
+        assert_eq!(actual.1.timeline.first_sample_ns, Some(12));
+        assert_eq!(record_traversals, 2);
+    }
+
+    #[test]
+    fn combined_backend_stream_parser_preserves_fold_origin() {
+        use crate::perfdata::samples::{PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_TIME};
+
+        let mut attr = [0_u8; 144];
+        attr[4..8].copy_from_slice(&128_u32.to_le_bytes());
+        attr[16..24].copy_from_slice(&3_u64.to_le_bytes());
+        // Without TID, folding uses the whole-stream Inferno parser.
+        attr[24..32].copy_from_slice(
+            &(PERF_SAMPLE_IP | PERF_SAMPLE_TIME | PERF_SAMPLE_CALLCHAIN).to_le_bytes(),
+        );
+        let mut payload = Vec::new();
+        payload.extend(0x1000_u64.to_le_bytes());
+        payload.extend(21_u64.to_le_bytes());
+        payload.extend(1_u64.to_le_bytes());
+        payload.extend(0x1000_u64.to_le_bytes());
+        let bytes = perfdata(attr, vec![record(9, &payload)]);
+        let file = tempfile::NamedTempFile::new().expect("fixture file");
+        std::fs::write(file.path(), &bytes).expect("write fixture");
+        let runner = TestRunner;
+
+        let expected_folded = fold_perfdata_file_with_options(
+            file.path(),
+            FoldOptions {
+                count_periods: true,
+                inline: true,
+            },
+        )
+        .expect("standalone fold");
+        let expected_profile = summarize_perfdata_profile_file(file.path(), 3, 20)
+            .expect("standalone two-pass summary");
+        let (actual, record_traversals) = count_file_record_at_calls(|| {
+            fold_and_summarize_perfdata(
+                file.path(),
+                false,
+                SymbolizerKind::Addr2line,
+                &runner,
+                3,
+                20,
+            )
+            .expect("combined backend output")
+        });
+
+        assert_eq!(actual.0, expected_folded);
+        assert_eq!(actual.1, expected_profile);
+        assert_eq!(actual.1.timeline.first_sample_ns, Some(21));
+        assert_eq!(record_traversals, 2);
+    }
+
+    #[test]
+    fn folded_origin_matches_metadata_only_samples_and_native_time_sentinels() {
+        use crate::perfdata::samples::{PERF_SAMPLE_TID, PERF_SAMPLE_TIME};
+
+        // The earlier timestamp is physically later; zero and ~0ULL bypass
+        // ordered-events queuing per ordered-events.c:199-200 but remain metadata.
+        for times in [[20, 10], [u64::MAX, 0]] {
+            let bytes = metadata_only_perfdata(PERF_SAMPLE_TID | PERF_SAMPLE_TIME, 7, true, &times);
+            let file = tempfile::NamedTempFile::new().expect("fixture file");
+            std::fs::write(file.path(), &bytes).expect("write fixture");
+
+            let (folded, origin) = fold_perfdata_file_with_options_and_origin(
+                file.path(),
+                FoldOptions {
+                    count_periods: true,
+                    inline: true,
+                },
+            )
+            .expect("fold plus origin");
+            let expected_folded = fold_perfdata_file_with_options(
+                file.path(),
+                FoldOptions {
+                    count_periods: true,
+                    inline: true,
+                },
+            )
+            .expect("standalone fold");
+            let expected_profile = summarize_perfdata_profile_file(file.path(), 3, 20)
+                .expect("standalone two-pass summary");
+            let actual_profile =
+                summarize_perfdata_profile_file_with_origin(file.path(), 3, 20, origin)
+                    .expect("one-pass summary with fold origin");
+
+            assert_eq!(folded, expected_folded);
+            assert_eq!(actual_profile, expected_profile);
+            assert_eq!(actual_profile.weighted_samples, 14);
+            assert_eq!(
+                actual_profile.timeline.first_sample_ns,
+                Some(times.into_iter().min().unwrap())
+            );
+            assert_eq!(
+                actual_profile
+                    .timeline
+                    .buckets
+                    .iter()
+                    .map(|bucket| bucket.start_offset_ns)
+                    .collect::<Vec<_>>(),
+                if times == [20, 10] {
+                    vec![0, 9]
+                } else {
+                    vec![0, u64::MAX / 3 * 3]
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn folded_origin_stays_absent_for_untimed_samples_and_preserves_lost_counts() {
+        use crate::perfdata::samples::PERF_SAMPLE_TID;
+
+        let bytes = metadata_only_perfdata(PERF_SAMPLE_TID, 9, false, &[0]);
+        let mut bytes = bytes;
+        let lost = record(2, &[4_u64.to_le_bytes(), 5_u64.to_le_bytes()].concat());
+        let data_size = u64::from_le_bytes(bytes[48..56].try_into().unwrap()) + lost.len() as u64;
+        bytes.extend(lost);
+        bytes[48..56].copy_from_slice(&data_size.to_le_bytes());
+        let file = tempfile::NamedTempFile::new().expect("fixture file");
+        std::fs::write(file.path(), &bytes).expect("write fixture");
+
+        let (_, origin) = fold_perfdata_file_with_options_and_origin(
+            file.path(),
+            FoldOptions {
+                count_periods: true,
+                inline: true,
+            },
+        )
+        .expect("fold plus origin");
+        let expected = summarize_perfdata_profile_file(file.path(), 3, 20)
+            .expect("standalone two-pass summary");
+        let actual = summarize_perfdata_profile_file_with_origin(file.path(), 3, 20, origin)
+            .expect("one-pass summary with fold origin");
+
+        assert_eq!(origin, None);
+        assert_eq!(actual, expected);
+        assert_eq!(actual.weighted_samples, 9);
+        assert_eq!(actual.lost_records, 5);
+        assert_eq!(actual.timeline.untimed_samples, 1);
+    }
+
+    fn tiny_timed_perfdata() -> Vec<u8> {
+        use crate::perfdata::samples::{
+            PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
+        };
+
+        let mut attr = [0_u8; 144];
+        attr[4..8].copy_from_slice(&128_u32.to_le_bytes());
+        attr[16..24].copy_from_slice(&1_u64.to_le_bytes());
+        attr[24..32].copy_from_slice(
+            &(PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CALLCHAIN)
+                .to_le_bytes(),
+        );
+        let mut payload = Vec::new();
+        payload.extend(0x1000_u64.to_le_bytes());
+        payload.extend(1_u32.to_le_bytes());
+        payload.extend(2_u32.to_le_bytes());
+        payload.extend(12_u64.to_le_bytes());
+        payload.extend(1_u64.to_le_bytes());
+        payload.extend(0x1000_u64.to_le_bytes());
+        let mut record = Vec::new();
+        record.extend(9_u32.to_le_bytes());
+        record.extend(0_u16.to_le_bytes());
+        record.extend(u16::try_from(payload.len() + 8).unwrap().to_le_bytes());
+        record.extend(payload);
+
+        let mut bytes = vec![0; 104];
+        bytes[..8].copy_from_slice(b"PERFILE2");
+        bytes[8..16].copy_from_slice(&104_u64.to_le_bytes());
+        bytes[24..32].copy_from_slice(&104_u64.to_le_bytes());
+        bytes[32..40].copy_from_slice(&144_u64.to_le_bytes());
+        bytes[40..48].copy_from_slice(&248_u64.to_le_bytes());
+        bytes[48..56].copy_from_slice(&(record.len() as u64).to_le_bytes());
+        bytes.extend(attr);
+        bytes.extend(record);
+        bytes
+    }
+
+    fn dynamic_stream_fallback_perfdata() -> Vec<u8> {
+        let mut bytes = tiny_timed_perfdata();
+        let mut late_sample = bytes[248..].to_vec();
+        late_sample[24..32].copy_from_slice(&9_u64.to_le_bytes());
+        let mut comm = Vec::new();
+        comm.extend(1_u32.to_le_bytes());
+        comm.extend(2_u32.to_le_bytes());
+        // Inferno perf.rs:process_single_stack skips # headers; this COMM
+        // requests stream replay only after the first normal sample was folded.
+        comm.extend(b"#comment\0");
+        bytes.extend(record(3, &comm));
+        bytes.extend(late_sample);
+        let data_size = bytes.len() as u64 - 248;
+        bytes[48..56].copy_from_slice(&data_size.to_le_bytes());
+        bytes
+    }
+
+    fn metadata_only_perfdata(
+        sample_type: u64,
+        default_period: u64,
+        sample_id_all: bool,
+        times: &[u64],
+    ) -> Vec<u8> {
+        let mut attr = [0_u8; 144];
+        attr[4..8].copy_from_slice(&128_u32.to_le_bytes());
+        // evsel.c:evsel__parse_sample initializes omitted PERIOD from attr.sample_period.
+        attr[16..24].copy_from_slice(&default_period.to_le_bytes());
+        attr[24..32].copy_from_slice(&sample_type.to_le_bytes());
+        if sample_id_all {
+            attr[40..48].copy_from_slice(&(1_u64 << 18).to_le_bytes());
+        }
+        let records = times
+            .iter()
+            .map(|time| {
+                let mut payload = Vec::new();
+                if sample_type & crate::perfdata::samples::PERF_SAMPLE_TID != 0 {
+                    payload.extend(1_u32.to_le_bytes());
+                    payload.extend(2_u32.to_le_bytes());
+                }
+                if sample_type & crate::perfdata::samples::PERF_SAMPLE_TIME != 0 {
+                    payload.extend(time.to_le_bytes());
+                }
+                record(9, &payload)
+            })
+            .collect::<Vec<_>>();
+        perfdata(attr, records)
+    }
+
+    fn mixed_sample_perfdata() -> Vec<u8> {
+        use crate::perfdata::samples::{
+            PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP, PERF_SAMPLE_TID,
+            PERF_SAMPLE_TIME,
+        };
+
+        let metadata_type = PERF_SAMPLE_IDENTIFIER | PERF_SAMPLE_TID | PERF_SAMPLE_TIME;
+        let rendered_type = metadata_type | PERF_SAMPLE_IP | PERF_SAMPLE_CALLCHAIN;
+        let ids_offset: u64 = 104 + 2 * 144;
+        let attrs = [
+            mixed_attr(metadata_type, 5, ids_offset),
+            mixed_attr(rendered_type, 2, ids_offset + 8),
+        ];
+        let records = [
+            mixed_sample(22, Some(0x1000), 37),
+            mixed_sample(11, None, 32),
+            mixed_sample(22, Some(0x1000), 34),
+            mixed_sample(22, Some(0x1000), 34),
+        ];
+        let data_offset = ids_offset + 16;
+        let data_size = records.iter().map(Vec::len).sum::<usize>();
+        let mut bytes = vec![0; 104];
+        bytes[..8].copy_from_slice(b"PERFILE2");
+        bytes[8..16].copy_from_slice(&104_u64.to_le_bytes());
+        bytes[24..32].copy_from_slice(&104_u64.to_le_bytes());
+        bytes[32..40].copy_from_slice(&288_u64.to_le_bytes());
+        bytes[40..48].copy_from_slice(&data_offset.to_le_bytes());
+        bytes[48..56].copy_from_slice(&(data_size as u64).to_le_bytes());
+        bytes.extend(attrs.into_iter().flatten());
+        bytes.extend(11_u64.to_le_bytes());
+        bytes.extend(22_u64.to_le_bytes());
+        for record in records {
+            bytes.extend(record);
+        }
+        bytes
+    }
+
+    fn mixed_attr(sample_type: u64, default_period: u64, ids_offset: u64) -> Vec<u8> {
+        let mut attr = vec![0; 144];
+        attr[4..8].copy_from_slice(&128_u32.to_le_bytes());
+        attr[16..24].copy_from_slice(&default_period.to_le_bytes());
+        attr[24..32].copy_from_slice(&sample_type.to_le_bytes());
+        attr[40..48].copy_from_slice(&(1_u64 << 18).to_le_bytes());
+        attr[128..136].copy_from_slice(&ids_offset.to_le_bytes());
+        attr[136..144].copy_from_slice(&8_u64.to_le_bytes());
+        attr
+    }
+
+    fn mixed_sample(id: u64, ip: Option<u64>, time: u64) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend(id.to_le_bytes());
+        if let Some(ip) = ip {
+            payload.extend(ip.to_le_bytes());
+        }
+        payload.extend(1_u32.to_le_bytes());
+        payload.extend(2_u32.to_le_bytes());
+        payload.extend(time.to_le_bytes());
+        if let Some(ip) = ip {
+            payload.extend(1_u64.to_le_bytes());
+            payload.extend(ip.to_le_bytes());
+        }
+        record(9, &payload)
+    }
+
+    fn perfdata(attr: [u8; 144], records: Vec<Vec<u8>>) -> Vec<u8> {
+        let data_offset = 248_u64;
+        let data_size = records.iter().map(Vec::len).sum::<usize>();
+        let mut bytes = vec![0; 104];
+        bytes[..8].copy_from_slice(b"PERFILE2");
+        bytes[8..16].copy_from_slice(&104_u64.to_le_bytes());
+        bytes[24..32].copy_from_slice(&104_u64.to_le_bytes());
+        bytes[32..40].copy_from_slice(&144_u64.to_le_bytes());
+        bytes[40..48].copy_from_slice(&data_offset.to_le_bytes());
+        bytes[48..56].copy_from_slice(&(data_size as u64).to_le_bytes());
+        bytes.extend(attr);
+        for record in records {
+            bytes.extend(record);
+        }
+        bytes
+    }
+
+    fn record(record_type: u32, payload: &[u8]) -> Vec<u8> {
+        let mut record = Vec::with_capacity(payload.len() + 8);
+        record.extend(record_type.to_le_bytes());
+        record.extend(0_u16.to_le_bytes());
+        record.extend(u16::try_from(payload.len() + 8).unwrap().to_le_bytes());
+        record.extend(payload);
+        record
+    }
 }

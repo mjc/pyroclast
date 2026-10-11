@@ -67,3 +67,12 @@ pub fn summarize_perfdata_profile_file(
 ) -> Result<PerfProfileSummary, String> {
     streaming::summarize_file(path, bucket_width_ns, limit)
 }
+
+pub(crate) fn summarize_perfdata_profile_file_with_origin(
+    path: &std::path::Path,
+    bucket_width_ns: u64,
+    limit: usize,
+    first_sample_ns: Option<u64>,
+) -> Result<PerfProfileSummary, String> {
+    streaming::summarize_file_with_origin(path, bucket_width_ns, limit, first_sample_ns)
+}

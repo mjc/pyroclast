@@ -1,5 +1,29 @@
 use crate::perfdata::endian::{read_u32, read_u64};
 
+#[cfg(test)]
+thread_local! {
+    static SAMPLE_METADATA_PARSER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn count_sample_metadata_parser_calls<T>(run: impl FnOnce() -> T) -> (T, usize) {
+    struct Restore(usize);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SAMPLE_METADATA_PARSER_CALLS.with(|calls| calls.set(self.0));
+        }
+    }
+
+    let previous = SAMPLE_METADATA_PARSER_CALLS.get();
+    SAMPLE_METADATA_PARSER_CALLS.set(0);
+    let restore = Restore(previous);
+    let result = run();
+    let calls = SAMPLE_METADATA_PARSER_CALLS.get();
+    drop(restore);
+    (result, calls)
+}
+
 pub const PERF_SAMPLE_IP: u64 = 1 << 0;
 pub const PERF_SAMPLE_TID: u64 = 1 << 1;
 pub const PERF_SAMPLE_TIME: u64 = 1 << 2;
@@ -239,6 +263,8 @@ pub(super) fn parse_sample_record_metadata(
     payload: &[u8],
     layout: SampleLayout,
 ) -> Result<Option<SampleCallchain<'_>>, String> {
+    #[cfg(test)]
+    SAMPLE_METADATA_PARSER_CALLS.with(|calls| calls.set(calls.get() + 1));
     parse_sample_callchain(payload, layout, true)
 }
 

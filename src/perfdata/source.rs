@@ -10,6 +10,26 @@ use super::records::{PerfRecord, PerfRecordHeader, parse_record_header};
 #[cfg(test)]
 thread_local! {
     static HEADER_DECODE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FILE_RECORD_AT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn count_file_record_at_calls<T>(run: impl FnOnce() -> T) -> (T, usize) {
+    struct Restore(usize);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FILE_RECORD_AT_CALLS.with(|calls| calls.set(self.0));
+        }
+    }
+
+    let previous = FILE_RECORD_AT_CALLS.get();
+    FILE_RECORD_AT_CALLS.set(0);
+    let restore = Restore(previous);
+    let result = run();
+    let calls = FILE_RECORD_AT_CALLS.get();
+    drop(restore);
+    (result, calls)
 }
 
 #[inline]
@@ -352,6 +372,8 @@ impl RecordSource for FileSource<'_> {
     }
 
     fn record_at(&mut self, offset: usize, end: usize) -> Result<PerfRecord<'_>, String> {
+        #[cfg(test)]
+        FILE_RECORD_AT_CALLS.with(|calls| calls.set(calls.get() + 1));
         record_from_window(self, offset, end)
     }
 
