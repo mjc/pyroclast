@@ -32,6 +32,10 @@ pyroclast plumbing summarize ARTIFACT_DIR
 
 Use direct folding/rendering instead of `perf script | inferno-collapse-perf | inferno-flamegraph`; export text only when needed. Symbols and inline frames default on (`--no-symbols`, `--no-inline` disable them). Keep recordings unchanged during processing.
 
+Perf summaries expose `PERF_RECORD_LOST`, non-BPF `PERF_RECORD_LOST_SAMPLES`,
+and BPF dropped-sample payloads separately. These counters may overlap; never
+sum or deduplicate them as unique physical loss without source evidence.
+
 ## Analyze Without Loading SVG
 
 Start with `pyroclast analyze FILE.svg` for inclusive/self hotspots, exclusive categories and syscalls. Counts use exact Inferno ranges; self means deepest visible frames.

@@ -60,6 +60,11 @@ pyroclast plumbing parse flamegraph syscalls <flamegraph.svg>
 pyroclast plumbing parse flamegraph diff <before.svg> <after.svg>
 ```
 
+Perf summaries report `PERF_RECORD_LOST` payloads, non-BPF
+`PERF_RECORD_LOST_SAMPLES` payloads, and BPF dropped-sample payloads as three
+separate counters. These channels can overlap; do not add or deduplicate them
+as an estimate of unique physical losses.
+
 ## Flamegraph Analysis
 
 ```sh
