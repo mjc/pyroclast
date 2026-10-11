@@ -10542,7 +10542,9 @@ fn overflowing_period_fixture() -> Vec<u8> {
 fn period_accumulation_fixture(periods: [u64; 2], comm: Option<&str>) -> Vec<u8> {
     let mut records = Vec::new();
     if let Some(comm) = comm {
-        records.push(record_bytes(3, &comm_payload(11, 12, comm)));
+        let mut payload = comm_payload(11, 12, comm);
+        payload.resize(payload.len().next_multiple_of(8), 0);
+        records.push(record_bytes(3, &payload));
     }
     records.extend(periods.map(|period| {
         record_bytes_with_misc(
@@ -10569,7 +10571,7 @@ fn period_accumulation_fixture(periods: [u64; 2], comm: Option<&str>) -> Vec<u8>
 }
 
 #[test]
-fn period_overflow_saturates_byte_folding_like_profile_summaries() {
+fn period_overflow_wraps_byte_folding_while_profile_summaries_saturate() {
     let bytes = overflowing_period_fixture();
     let folded = fold_perfdata_callchains_with_options(
         &bytes,
@@ -10579,7 +10581,7 @@ fn period_overflow_saturates_byte_folding_like_profile_summaries() {
         },
     )
     .unwrap();
-    assert_eq!(folded, format!(":12;[unknown] {}\n", u64::MAX));
+    assert_eq!(folded, ":12;[unknown] 0\n");
     let summary =
         pyroclast::summary::summarize_perfdata_profile(&bytes, 1_000_000_000, 10).unwrap();
     assert_eq!(summary.weighted_samples, u64::MAX);
@@ -10587,7 +10589,7 @@ fn period_overflow_saturates_byte_folding_like_profile_summaries() {
 }
 
 #[test]
-fn period_overflow_saturates_file_folding_like_streamed_profile_summaries() {
+fn period_overflow_wraps_file_folding_while_profile_summaries_saturate() {
     let file = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(file.path(), overflowing_period_fixture()).unwrap();
     let folded = fold_perfdata_file_with_options(
@@ -10598,7 +10600,7 @@ fn period_overflow_saturates_file_folding_like_streamed_profile_summaries() {
         },
     )
     .unwrap();
-    assert_eq!(folded, format!(":12;[unknown] {}\n", u64::MAX));
+    assert_eq!(folded, ":12;[unknown] 0\n");
     let summary =
         pyroclast::summary::summarize_perfdata_profile_file(file.path(), 1_000_000_000, 10)
             .unwrap();
@@ -10607,15 +10609,14 @@ fn period_overflow_saturates_file_folding_like_streamed_profile_summaries() {
 }
 
 #[test]
-fn whole_stream_period_overflow_saturates_byte_folding_like_direct_folding() {
-    // A COMM newline requires one continuous Inferno parser. Its perf.rs
-    // after_event (574-597) reaches common.rs insert_or_add (410-416): the
-    // same documented saturation policy must apply there, not just directly.
+fn whole_stream_period_overflow_wraps_byte_folding_like_inferno() {
+    // A COMM newline requires one continuous Inferno parser; exercise its
+    // whole-script occurrence aggregation as well as direct byte folding.
     let options = FoldOptions {
         count_periods: true,
         inline: false,
     };
-    for (periods, total) in [([7, 3], 10), ([u64::MAX, 1], u64::MAX)] {
+    for (periods, total) in [([7, 3], 10), ([u64::MAX, 1], 0)] {
         let bytes = period_accumulation_fixture(periods, Some("worker\ntask"));
         assert_eq!(
             fold_perfdata_callchains_with_options(&bytes, options).unwrap(),
@@ -10625,13 +10626,13 @@ fn whole_stream_period_overflow_saturates_byte_folding_like_direct_folding() {
 }
 
 #[test]
-fn whole_stream_period_overflow_saturates_file_folding_like_direct_folding() {
+fn whole_stream_period_overflow_wraps_file_folding_like_inferno() {
     let file = tempfile::NamedTempFile::new().unwrap();
     let options = FoldOptions {
         count_periods: true,
         inline: false,
     };
-    for (periods, total) in [([7, 3], 10), ([u64::MAX, 1], u64::MAX)] {
+    for (periods, total) in [([7, 3], 10), ([u64::MAX, 1], 0)] {
         std::fs::write(
             file.path(),
             period_accumulation_fixture(periods, Some("worker\ntask")),
@@ -14363,6 +14364,66 @@ fn file_and_slice_replay_apply_timestamp_order_across_distant_input_ranges() {
 }
 
 #[test]
+fn byte_fold_period_weight_wraps_at_u64_like_inferno_0128() {
+    let bytes = period_weight_wraparound_perfdata();
+    let folded = fold_perfdata_callchains_with_options(
+        &bytes,
+        FoldOptions {
+            count_periods: true,
+            inline: false,
+        },
+    )
+    .expect("folded");
+
+    assert_eq!(folded, ":12;[unknown] 0\n");
+}
+
+#[test]
+fn file_fold_period_weight_wraps_at_u64_like_inferno_0128() {
+    // Inferno 0.12.8 collapse/perf.rs::after_event forwards the recorded period
+    // to common.rs::Occurrences::insert_or_add, which uses ordinary u64 +=.
+    // Its release CLI folds MAX followed by 1 for one stack to a count of 0.
+    let bytes = period_weight_wraparound_perfdata();
+    let perfdata = tempfile::NamedTempFile::new().expect("perfdata file");
+    std::fs::write(perfdata.path(), bytes).expect("write perfdata");
+
+    let folded = fold_perfdata_file_with_options(
+        perfdata.path(),
+        FoldOptions {
+            count_periods: true,
+            inline: false,
+        },
+    )
+    .expect("folded");
+
+    assert_eq!(folded, ":12;[unknown] 0\n");
+}
+
+fn period_weight_wraparound_perfdata() -> Vec<u8> {
+    perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_TIME
+                | PERF_SAMPLE_CALLCHAIN
+                | PERF_SAMPLE_PERIOD,
+            0,
+            0,
+        )],
+        [
+            record_bytes(
+                PERF_RECORD_SAMPLE,
+                &sample_payload_with_time_and_period(0x1000, 11, 12, 1_000_000, u64::MAX, [0x2000]),
+            ),
+            record_bytes(
+                PERF_RECORD_SAMPLE,
+                &sample_payload_with_time_and_period(0x1000, 11, 12, 1_000_001, 1, [0x2000]),
+            ),
+        ],
+    )
+}
+
+#[test]
 fn folds_file_samples_from_multiple_attrs_when_generated_perf_script_event_name_matches_inferno_filter()
  {
     let root = tempfile::tempdir().expect("tempdir");
@@ -15680,6 +15741,27 @@ fn sample_payload_with_time(
     payload.extend(pid.to_le_bytes());
     payload.extend(tid.to_le_bytes());
     payload.extend(time.to_le_bytes());
+    payload.extend((callchain.len() as u64).to_le_bytes());
+    for frame in callchain {
+        payload.extend(frame.to_le_bytes());
+    }
+    payload
+}
+
+fn sample_payload_with_time_and_period<const N: usize>(
+    ip: u64,
+    pid: u32,
+    tid: u32,
+    time: u64,
+    period: u64,
+    callchain: [u64; N],
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend(ip.to_le_bytes());
+    payload.extend(pid.to_le_bytes());
+    payload.extend(tid.to_le_bytes());
+    payload.extend(time.to_le_bytes());
+    payload.extend(period.to_le_bytes());
     payload.extend((callchain.len() as u64).to_le_bytes());
     for frame in callchain {
         payload.extend(frame.to_le_bytes());

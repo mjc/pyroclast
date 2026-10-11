@@ -595,8 +595,7 @@ impl SampleEventLayout {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FoldOptions {
-    /// Weight stacks by periods. Stack aggregation saturates at
-    /// `u64::MAX`, consistently with thread and timeline summaries.
+    /// Weight stacks by periods. Folded stack totals use wrapping `u64` addition.
     pub count_periods: bool,
     /// Internal renderer switch for tests and specialized callers. The CLI
     /// parity paths keep this on: real `perf script` emits DWARF inline frames
@@ -655,7 +654,7 @@ impl<S: std::hash::BuildHasher> FoldCounts<S> {
             // Full scratch equality above proves the key; pointer identity
             // selects only its immutable resident allocation, even on collision.
             let total = entry.into_mut();
-            *total = total.saturating_add(count);
+            *total = total.wrapping_add(count);
             return;
         }
         let (hash, resident) =
@@ -694,7 +693,7 @@ where
     let (resident, _) = match stacks.raw_entry_mut().from_key_hashed_nocheck(hash, key) {
         hashbrown::hash_map::RawEntryMut::Occupied(entry) => {
             let (resident, total) = entry.into_key_value();
-            *total = total.saturating_add(count);
+            *total = total.wrapping_add(count);
             (resident, total)
         }
         hashbrown::hash_map::RawEntryMut::Vacant(entry) => {
@@ -6121,7 +6120,7 @@ mod tests {
     }
 
     #[test]
-    fn resident_stack_cache_preserves_collisions_nonconsecutive_keys_and_saturation() {
+    fn resident_stack_cache_preserves_collisions_nonconsecutive_keys_and_wraparound() {
         let hashes = std::rc::Rc::new(std::cell::Cell::new(0));
         let mut counts = super::FoldCounts {
             names: Vec::new(),
@@ -6144,7 +6143,7 @@ mod tests {
             counts.add_rendered(text, weight);
         }
         for (text, total) in [
-            ("root;\u{e9};dup;dup", u64::MAX),
+            ("root;\u{e9};dup;dup", 3),
             ("root;\u{e9};dup", 4),
             ("", 8),
             (";", 16),

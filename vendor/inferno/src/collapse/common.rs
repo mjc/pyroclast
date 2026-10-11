@@ -406,18 +406,18 @@ impl Occurrences {
 
     /// Inserts a key-count pair into the map if the key does not already exist.
     /// If the key does already exist, adds count to the current value of the
-    /// existing key, saturating at `u64::MAX`.
+    /// existing key, wrapping on `u64` overflow.
     pub(crate) fn insert_or_add(&mut self, key: String, count: u64) {
         use self::Occurrences::*;
         match self {
             SingleThreaded(map) => {
                 let value = map.entry(key).or_insert(0);
-                *value = value.saturating_add(count);
+                *value = value.wrapping_add(count);
             }
             #[cfg(feature = "multithreaded")]
             MultiThreaded(arc) => {
                 let mut value = arc.entry(key).or_insert(0);
-                *value = value.saturating_add(count);
+                *value = value.wrapping_add(count);
             }
         }
     }
@@ -820,7 +820,7 @@ mod tests {
             format!(
                 "root;distinct 3\nroot;exact_limit {}\nroot;overflow {}\nroot;representable 18\n",
                 u64::MAX,
-                u64::MAX,
+                17,
             )
         );
         let mut empty = Vec::new();
@@ -829,19 +829,19 @@ mod tests {
     }
 
     #[test]
-    fn single_threaded_occurrences_saturate_without_changing_other_counts() {
+    fn single_threaded_occurrences_wrap_without_changing_other_counts() {
         assert_occurrence_count_policy(super::Occurrences::new_single_threaded());
     }
 
     #[cfg(feature = "multithreaded")]
     #[test]
-    fn multi_threaded_occurrences_saturate_without_changing_other_counts() {
+    fn multi_threaded_occurrences_wrap_without_changing_other_counts() {
         assert_occurrence_count_policy(super::Occurrences::new_multi_threaded());
     }
 
     #[cfg(feature = "multithreaded")]
     #[test]
-    fn concurrent_occurrence_updates_saturate_without_losing_representable_counts() {
+    fn concurrent_occurrence_updates_wrap_without_losing_representable_counts() {
         let mut occurrences = super::Occurrences::new_multi_threaded();
         occurrences.insert_or_add("root;overflow".to_owned(), u64::MAX - 1);
         std::thread::scope(|scope| {
@@ -857,7 +857,7 @@ mod tests {
         occurrences.write_and_clear(&mut output).unwrap();
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            format!("root;overflow {}\nroot;representable 14\n", u64::MAX)
+            "root;overflow 0\nroot;representable 14\n"
         );
     }
 
