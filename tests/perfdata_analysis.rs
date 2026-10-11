@@ -16,6 +16,9 @@ use pyroclast::perfdata::samples::{
     PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_REGS_USER,
     PERF_SAMPLE_STACK_USER, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
 };
+use pyroclast::summary::{
+    PerfProfileSummary, summarize_perfdata_profile, summarize_perfdata_profile_file,
+};
 
 #[test]
 fn analyzes_threads_leaf_ips_and_edges() {
@@ -222,6 +225,270 @@ fn summary_orders_generic_child_exec_after_older_fork_like_perf_report() {
     assert_eq!(report.threads[0].comm, "child-exec");
     assert_eq!(file_summary.comms_by_tid[&201], "child-exec");
     assert_eq!(file_report.threads[0].comm, "child-exec");
+}
+
+#[test]
+fn streamed_profile_orders_child_exec_after_older_fork_like_perf_report() {
+    // Linux v7.2.9 tools/perf/builtin-report.c:1514,1622 enables ordering;
+    // tools/perf/util/session.c:2937-2949 queues records by the timestamps
+    // parsed by evsel__parse_sample_timestamp (evsel.c:3808-3849).
+    let bytes = child_exec_order_fixture(
+        PERF_SAMPLE_IP
+            | PERF_SAMPLE_TID
+            | PERF_SAMPLE_TIME
+            | PERF_SAMPLE_PERIOD
+            | PERF_SAMPLE_CALLCHAIN,
+        true,
+        Some([30, 10, 20]),
+    );
+    let file = tempfile::NamedTempFile::new().expect("fixture file");
+    std::fs::write(file.path(), &bytes).expect("write fixture");
+    let reference = analyze_perfdata(&bytes, 10).expect("analysis").profile;
+    let profile = summarize_perfdata_profile_file(file.path(), 10, 10).expect("streamed profile");
+
+    assert_eq!(profile.total_samples, 3);
+    assert_eq!(profile.total_samples, reference.total_samples);
+    assert_eq!(profile.weighted_samples, 12);
+    assert_eq!(profile.weighted_samples, reference.weighted_samples);
+    assert_eq!(profile.lost_records, 4);
+    assert_eq!(profile.lost_records, reference.lost_records);
+    assert_eq!(profile.unassigned_samples, 0);
+    assert_eq!(profile.timeline.bucket_width_ns, 10);
+    assert_eq!(profile.timeline.first_sample_ns, Some(32));
+    assert_eq!(profile.timeline.last_sample_ns, Some(37));
+    assert_eq!(profile.timeline.duration_ns, Some(5));
+    assert_eq!(profile.timeline.untimed_samples, 0);
+    assert_eq!(profile.timeline.buckets.len(), 1);
+    assert_eq!(profile.timeline.buckets[0].start_offset_ns, 0);
+    assert_eq!(profile.timeline.buckets[0].samples, 3);
+    assert_eq!(profile.timeline.buckets[0].weighted_samples, 12);
+    assert_eq!(profile.threads.len(), 1);
+    assert_eq!(profile.threads[0].pid, Some(200));
+    assert_eq!(profile.threads[0].tid, 201);
+    assert_eq!(profile.threads[0].samples, 3);
+    assert_eq!(profile.threads[0].weighted_samples, 12);
+    assert_eq!(profile.threads[0].first_sample_ns, Some(32));
+    assert_eq!(profile.threads[0].last_sample_ns, Some(37));
+    assert!(profile.threads[0].cpus.is_empty());
+    assert_eq!(profile.threads[0].comm, "child-exec");
+    assert_eq!(profile.threads, reference.threads);
+}
+
+#[test]
+fn streamed_profile_keeps_perf_ordering_fallbacks_ties_and_max_timestamp_delivery() {
+    // Linux v7.2.9 tools/perf/util/evsel.c:3814-3826 requires TIME and SID;
+    // ordered-events.c:40-60 keeps ties stable and :199-200 rejects ~0ULL.
+    let untimed = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN;
+    let timed = untimed | PERF_SAMPLE_TIME;
+    for (sample_type, sample_id_all, times) in [
+        (untimed, true, [30, 10, 20]),
+        (timed, false, [30, 10, 20]),
+        (timed, true, [20, 10, 20]),
+        (timed, true, [u64::MAX, 10, 20]),
+    ] {
+        let bytes = child_exec_order_fixture(sample_type, sample_id_all, Some(times));
+        for width in [3, 10] {
+            let profile = streamed_profile_fixture(&bytes, width);
+            assert_eq!(profile.total_samples, 3);
+            assert_eq!(profile.weighted_samples, 12);
+            assert_eq!(profile.lost_records, 4);
+            assert_eq!(profile.unassigned_samples, 0);
+            assert_eq!(profile.threads.len(), 1);
+            assert_eq!(profile.threads[0].pid, Some(200));
+            assert_eq!(profile.threads[0].tid, 201);
+            if sample_type & PERF_SAMPLE_TIME == 0 {
+                assert_eq!(profile.timeline.untimed_samples, 3);
+                assert_eq!(profile.timeline.first_sample_ns, None);
+                assert_eq!(profile.timeline.last_sample_ns, None);
+                assert_eq!(profile.timeline.duration_ns, None);
+                assert!(profile.timeline.buckets.is_empty());
+            } else {
+                assert_eq!(profile.timeline.untimed_samples, 0);
+                assert_eq!(profile.timeline.first_sample_ns, Some(32));
+                assert_eq!(profile.timeline.last_sample_ns, Some(37));
+                assert_eq!(profile.timeline.duration_ns, Some(5));
+            }
+            assert_eq!(profile.threads[0].comm, "parent");
+            assert_eq!(
+                profile,
+                summarize_perfdata_profile(&bytes, width, 10).expect("retained profile")
+            );
+        }
+    }
+}
+
+#[test]
+fn streamed_profile_without_sample_time_does_not_queue_fork_body_time() {
+    // Linux v7.2.9 tools/perf/util/evsel.c:3808-3816,
+    // evsel__parse_sample_timestamp requires PERF_SAMPLE_TIME independently
+    // of FORK's body time. Queueing only FORK would overwrite the later EXEC.
+    let sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN;
+    let mut attr = file_attr_bytes(sample_type, 0, 0);
+    put_u64(&mut attr, 40, 1 << 18);
+    let bytes = perfdata_with_records_and_attrs(
+        [attr],
+        [
+            comm_record(100, 101, "parent", false, true, sample_type, 10),
+            fork_record(100, 101, 200, 201, true, sample_type, 20),
+            comm_record(200, 201, "child-exec", true, true, sample_type, 30),
+            record_bytes(
+                PERF_RECORD_SAMPLE,
+                &timed_sample_payload(sample_type, 0x1000, 200, 201, 40, 7, &[0x1000]),
+            ),
+        ],
+    );
+    let profile = streamed_profile_fixture(&bytes, 10);
+    assert_eq!(profile.total_samples, 1);
+    assert_eq!(profile.weighted_samples, 7);
+    assert_eq!(profile.lost_records, 0);
+    assert_eq!(profile.unassigned_samples, 0);
+    assert_eq!(profile.timeline.untimed_samples, 1);
+    assert_eq!(profile.timeline.first_sample_ns, None);
+    assert_eq!(profile.timeline.last_sample_ns, None);
+    assert_eq!(profile.timeline.duration_ns, None);
+    assert!(profile.timeline.buckets.is_empty());
+    assert_eq!(profile.threads.len(), 1);
+    assert_eq!(profile.threads[0].pid, Some(200));
+    assert_eq!(profile.threads[0].tid, 201);
+    assert_eq!(profile.threads[0].samples, 1);
+    assert_eq!(profile.threads[0].weighted_samples, 7);
+    assert_eq!(profile.threads[0].first_sample_ns, None);
+    assert_eq!(profile.threads[0].last_sample_ns, None);
+    assert_eq!(profile.threads[0].comm, "child-exec");
+    assert_eq!(
+        profile,
+        summarize_perfdata_profile(&bytes, 10, 10).expect("retained profile")
+    );
+}
+
+#[test]
+fn streamed_profile_delivers_zero_timestamp_comm_before_max_timestamp_comm() {
+    // Linux v7.2.9 tools/perf/util/ordered-events.c:199-200 returns -ETIME for
+    // both sentinels; session.c:2944-2949 delivers them immediately. Queueing
+    // zero would overwrite the later immediate MAX COMM at the final flush.
+    let sample_type = PERF_SAMPLE_IP
+        | PERF_SAMPLE_TID
+        | PERF_SAMPLE_TIME
+        | PERF_SAMPLE_PERIOD
+        | PERF_SAMPLE_CALLCHAIN;
+    let mut attr = file_attr_bytes(sample_type, 0, 0);
+    put_u64(&mut attr, 40, 1 << 18);
+    let bytes = perfdata_with_records_and_attrs(
+        [attr],
+        [
+            comm_record(200, 201, "zero-time", false, true, sample_type, 0),
+            comm_record(200, 201, "max-time", false, true, sample_type, u64::MAX),
+            record_bytes(
+                PERF_RECORD_SAMPLE,
+                &timed_sample_payload(sample_type, 0x1000, 200, 201, 37, 7, &[0x1000]),
+            ),
+        ],
+    );
+    let profile = streamed_profile_fixture(&bytes, 3);
+    assert_eq!(profile.total_samples, 1);
+    assert_eq!(profile.weighted_samples, 7);
+    assert_eq!(profile.lost_records, 0);
+    assert_eq!(profile.unassigned_samples, 0);
+    assert_eq!(profile.timeline.first_sample_ns, Some(37));
+    assert_eq!(profile.timeline.last_sample_ns, Some(37));
+    assert_eq!(profile.threads[0].pid, Some(200));
+    assert_eq!(profile.threads[0].tid, 201);
+    assert_eq!(profile.threads[0].comm, "max-time");
+    assert_eq!(
+        profile,
+        summarize_perfdata_profile(&bytes, 3, 10).expect("retained profile")
+    );
+}
+
+#[test]
+fn streamed_profile_keeps_exact_sparse_timeline_origin_for_unassigned_samples() {
+    let sample_type =
+        PERF_SAMPLE_IP | PERF_SAMPLE_TIME | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN;
+    let mut attr = file_attr_bytes(sample_type, 0, 0);
+    put_u64(&mut attr, 40, 1 << 18);
+    let mut records = Vec::new();
+    for (time, period) in [(37_u64, 7_u64), (32, 2), (33, 3)] {
+        // PERF_SAMPLE_TID is absent, so the payload has no PID/TID field.
+        let payload = [0x1000_u64, time, period, 1, 0x1000]
+            .into_iter()
+            .flat_map(u64::to_le_bytes)
+            .collect::<Vec<_>>();
+        records.push(record_bytes(PERF_RECORD_SAMPLE, &payload));
+    }
+    records.push(lost_record(true, sample_type));
+    let bytes = perfdata_with_records_and_attrs([attr], records);
+    let profile = streamed_profile_fixture(&bytes, 3);
+    assert_eq!(profile.total_samples, 3);
+    assert_eq!(profile.weighted_samples, 12);
+    assert_eq!(profile.lost_records, 4);
+    assert_eq!(profile.unassigned_samples, 3);
+    assert!(profile.threads.is_empty());
+    assert_eq!(profile.timeline.bucket_width_ns, 3);
+    assert_eq!(profile.timeline.first_sample_ns, Some(32));
+    assert_eq!(profile.timeline.last_sample_ns, Some(37));
+    assert_eq!(profile.timeline.duration_ns, Some(5));
+    assert_eq!(profile.timeline.untimed_samples, 0);
+    assert_eq!(profile.timeline.buckets.len(), 2);
+    assert_eq!(profile.timeline.buckets[0].start_offset_ns, 0);
+    assert_eq!(profile.timeline.buckets[0].samples, 2);
+    assert_eq!(profile.timeline.buckets[0].weighted_samples, 5);
+    assert_eq!(profile.timeline.buckets[1].start_offset_ns, 3);
+    assert_eq!(profile.timeline.buckets[1].samples, 1);
+    assert_eq!(profile.timeline.buckets[1].weighted_samples, 7);
+    assert_eq!(
+        profile,
+        summarize_perfdata_profile(&bytes, 3, 10).expect("retained profile")
+    );
+}
+
+#[test]
+fn streamed_profile_metadata_errors_keep_the_original_record_offset() {
+    let sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_TIME;
+    let mut attr = file_attr_bytes(sample_type, 0, 0);
+    put_u64(&mut attr, 40, 1 << 18);
+    let prefix = comm_record(100, 101, "parent", false, true, sample_type, 30);
+    let offset = 104 + 144 + prefix.len();
+    let mut payload = Vec::new();
+    append_sample_id(&mut payload, true, sample_type, 200, 201, 10);
+    let bytes =
+        perfdata_with_records_and_attrs([attr], [prefix, record_bytes(PERF_RECORD_FORK, &payload)]);
+    let file = tempfile::NamedTempFile::new().expect("fixture file");
+    std::fs::write(file.path(), bytes).expect("write fixture");
+    let error = summarize_perfdata_profile_file(file.path(), 10, 10)
+        .expect_err("FORK body is missing despite a complete SID trailer");
+    assert!(error.contains(&format!("record type 7 at offset {offset}")));
+    assert!(error.ends_with("PERF_RECORD_FORK payload is shorter than 24 bytes"));
+}
+
+#[test]
+fn streamed_profile_truncated_timestamp_errors_keep_the_original_record_offset() {
+    let sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_TIME;
+    let mut attr = file_attr_bytes(sample_type, 0, 0);
+    put_u64(&mut attr, 40, 1 << 18);
+    let prefix = comm_record(100, 101, "parent", false, true, sample_type, 30);
+    let offset = 104 + 144 + prefix.len();
+    let payload = [200_u32, 201]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let bytes = perfdata_with_records_and_attrs(
+        [attr],
+        [prefix, record_bytes(PERF_RECORD_SAMPLE, &payload)],
+    );
+    let file = tempfile::NamedTempFile::new().expect("fixture file");
+    std::fs::write(file.path(), bytes).expect("write fixture");
+    let error = summarize_perfdata_profile_file(file.path(), 10, 10)
+        .expect_err("sample timestamp is truncated");
+    assert!(
+        error.contains(&format!("record type 9 at offset {offset}")),
+        "missing original sample location: {error}"
+    );
+}
+
+fn streamed_profile_fixture(bytes: &[u8], width: u64) -> PerfProfileSummary {
+    let file = tempfile::NamedTempFile::new().expect("fixture file");
+    std::fs::write(file.path(), bytes).expect("write fixture");
+    summarize_perfdata_profile_file(file.path(), width, 10).expect("streamed profile")
 }
 
 #[test]

@@ -5,7 +5,7 @@ use std::path::Path;
 use super::{
     FileSource, ParsedRecord, RecordSource, SampleLayouts, header_arch_from_file,
     parse_record_with_context, parse_sample_record_metadata, perfdata_header_from_file,
-    sample_layouts_from_file, validate_perfdata_sections,
+    sample_layouts_from_file, validate_perfdata_sections, visit_ordered_records,
 };
 use crate::perfdata::records::PERF_RECORD_SAMPLE;
 
@@ -38,29 +38,29 @@ pub(crate) fn visit_perfdata_file_metadata(
     // Validate the same architecture feature as the retained summary API, even
     // though thread/time metadata does not need architecture-specific registers.
     header_arch_from_file(&file, header, &bytes)?;
-    let mut offset = usize::try_from(header.data_offset)
-        .map_err(|_| "perf data section offset exceeds usize".to_string())?;
-    let size = usize::try_from(header.data_size)
-        .map_err(|_| "perf data section size exceeds usize".to_string())?;
-    let end = offset
-        .checked_add(size)
-        .ok_or_else(|| "perf data section range overflows usize".to_string())?;
     let mut metadata = PerfMetadata::default();
-    while offset < end {
-        let record = source.record_at(offset, end)?;
-        offset += usize::from(record.header.size);
-        let result = if record.header.record_type == PERF_RECORD_SAMPLE {
-            visit_sample(record.payload, &layouts, &mut visit)
-        } else {
-            parse_record_with_context(record).map(|record| metadata.record(record))
-        };
-        result.map_err(|error| {
-            format!(
-                "failed to parse record type {} at offset {}: {error}",
-                record.header.record_type, record.offset
-            )
-        })?;
-    }
+    // Linux v7.2.9 tools/perf/builtin-report.c:1514,1622 enables ordering;
+    // tools/perf/util/session.c:2937-2949 delivers queued events chronologically.
+    // Reuse the borrowed visitor while parsing only sample metadata.
+    visit_ordered_records(
+        &mut source,
+        header,
+        &layouts,
+        |_| {},
+        |record, offset| {
+            let result = if record.header.record_type == PERF_RECORD_SAMPLE {
+                visit_sample(record.payload, &layouts, &mut visit)
+            } else {
+                parse_record_with_context(record).map(|record| metadata.record(record))
+            };
+            result.map_err(|error| {
+                format!(
+                    "failed to parse record type {} at offset {}: {error}",
+                    record.header.record_type, offset
+                )
+            })
+        },
+    )?;
     Ok(metadata)
 }
 

@@ -1307,7 +1307,13 @@ fn visit_ordered_records(
             let header = record.header;
             let next = offset + usize::from(record.header.size);
             let queue_time = if ordered_events && record_type != PERF_RECORD_FINISHED_ROUND {
-                record_time(record, layouts)?.filter(|time| *time != 0 && *time != u64::MAX)
+                record_time(record, layouts)
+                    .map_err(|error| {
+                        format!(
+                            "failed to parse record type {record_type} at offset {offset}: {error}"
+                        )
+                    })?
+                    .filter(|time| *time != 0 && *time != u64::MAX)
             } else {
                 None
             };
