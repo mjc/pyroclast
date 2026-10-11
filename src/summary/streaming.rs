@@ -4,7 +4,7 @@ use std::path::Path;
 use super::PerfProfileSummary;
 use super::threads::ThreadProfileSummary;
 use super::timeline::{TimelineBucket, TimelineSummary};
-use crate::perfdata::fold::{PerfSampleMetadata, visit_perfdata_file_metadata};
+use crate::perfdata::fold::{PerfMetadata, PerfSampleMetadata, visit_perfdata_file_metadata};
 
 pub(super) fn summarize_file(
     path: &Path,
@@ -38,13 +38,7 @@ pub(super) fn summarize_file_with_origin(
     let metadata = visit_perfdata_file_metadata(path, |sample| {
         aggregate.record(sample, first, bucket_width_ns);
     })?;
-    Ok(aggregate.finish(
-        &metadata.comms_by_tid,
-        metadata.lost_records,
-        first,
-        bucket_width_ns,
-        limit,
-    ))
+    Ok(aggregate.finish(&metadata, first, bucket_width_ns, limit))
 }
 
 #[derive(Default)]
@@ -100,15 +94,15 @@ impl ProfileAggregate {
 
     fn finish(
         self,
-        comms: &BTreeMap<u32, String>,
-        lost_records: u64,
+        metadata: &PerfMetadata,
         first: Option<u64>,
         bucket_width_ns: u64,
         limit: usize,
     ) -> PerfProfileSummary {
         let mut threads = self.threads.into_values().collect::<Vec<_>>();
         for thread in &mut threads {
-            thread.comm = comms
+            thread.comm = metadata
+                .comms_by_tid
                 .get(&thread.tid)
                 .cloned()
                 .unwrap_or_else(|| format!("tid {}", thread.tid));
@@ -125,7 +119,9 @@ impl ProfileAggregate {
         PerfProfileSummary {
             total_samples: self.total_samples,
             weighted_samples: self.weighted_samples,
-            lost_records,
+            lost_records: metadata.lost_records,
+            lost_samples: metadata.lost_samples,
+            dropped_samples: metadata.dropped_samples,
             unassigned_samples: self.unassigned_samples,
             threads,
             timeline: TimelineSummary {

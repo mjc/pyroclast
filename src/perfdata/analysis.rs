@@ -12,7 +12,15 @@ pub struct PerfdataAnalysis {
     pub total_records: usize,
     pub total_samples: usize,
     pub weighted_samples: u64,
+    /// Native unsigned wrapping sum of `PERF_RECORD_LOST` payloads.
+    /// May overlap other loss counters; not a unique physical-loss estimate.
     pub lost_records: u64,
+    /// Native unsigned wrapping sum of non-BPF `PERF_RECORD_LOST_SAMPLES` payloads.
+    /// May overlap other loss counters; not a unique physical-loss estimate.
+    pub lost_samples: u64,
+    /// Native unsigned wrapping sum of BPF `PERF_RECORD_LOST_SAMPLES` payloads.
+    /// May overlap other loss counters; not a unique physical-loss estimate.
+    pub dropped_samples: u64,
     pub user_stack_samples: usize,
     pub user_stack_bytes: usize,
     pub user_stack_dynamic_bytes: u64,
@@ -136,6 +144,8 @@ fn analyze_summary(summary: &PerfSummary, limit: usize) -> Result<PerfdataAnalys
         total_samples: summary.sample_stacks.len(),
         weighted_samples,
         lost_records: summary.lost_records,
+        lost_samples: summary.lost_samples,
+        dropped_samples: summary.dropped_samples,
         user_stack_samples,
         user_stack_bytes,
         user_stack_dynamic_bytes,

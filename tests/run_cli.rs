@@ -1,5 +1,7 @@
 use object::{Object, ObjectSegment, ObjectSymbol};
-use pyroclast::perfdata::records::PERF_RECORD_FORK;
+use pyroclast::perfdata::records::{
+    PERF_RECORD_FORK, PERF_RECORD_LOST, PERF_RECORD_LOST_SAMPLES, PERF_RECORD_MISC_LOST_SAMPLES_BPF,
+};
 use pyroclast::perfdata::samples::{
     PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_IDENTIFIER, PERF_SAMPLE_IP,
     PERF_SAMPLE_PERIOD, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
@@ -1556,7 +1558,7 @@ fn analyze_flamegraph_command_emits_text_diff() {
 fn analyze_perfdata_command_emits_json_report() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
-    std::fs::write(&perfdata, tiny_period_perfdata()).expect("perfdata");
+    std::fs::write(&perfdata, tiny_period_perfdata_with_loss_counters()).expect("perfdata");
 
     let output = pyroclast::run_cli([
         "pyroclast",
@@ -1572,6 +1574,9 @@ fn analyze_perfdata_command_emits_json_report() {
     let json: serde_json::Value = serde_json::from_str(&output.stdout).expect("json");
     assert_eq!(json["total_samples"], 1);
     assert_eq!(json["weighted_samples"], 144);
+    assert_eq!(json["lost_records"], 9);
+    assert_eq!(json["lost_samples"], 7);
+    assert_eq!(json["dropped_samples"], 11);
     assert_eq!(json["threads"][0]["tid"], 2);
     assert_eq!(json["profile"]["threads"][0]["pid"], 1);
     assert_eq!(json["profile"]["timeline"]["untimed_samples"], 1);
@@ -1582,7 +1587,7 @@ fn analyze_perfdata_command_emits_json_report() {
 fn analyze_perfdata_command_emits_text_report() {
     let root = tempfile::tempdir().expect("tempdir");
     let perfdata = root.path().join("perf.data");
-    std::fs::write(&perfdata, tiny_period_perfdata()).expect("perfdata");
+    std::fs::write(&perfdata, tiny_period_perfdata_with_loss_counters()).expect("perfdata");
 
     let output = pyroclast::run_cli([
         "pyroclast",
@@ -1596,6 +1601,18 @@ fn analyze_perfdata_command_emits_text_report() {
 
     assert!(output.stdout.contains("samples: 1"));
     assert!(output.stdout.contains("weighted samples: 144"));
+    assert!(
+        output
+            .stdout
+            .contains("PERF_RECORD_LOST reported losses (sum of payload values): 9")
+    );
+    assert!(output.stdout.contains("non-BPF LOST_SAMPLES counter: 7"));
+    assert!(
+        output
+            .stdout
+            .contains("BPF LOST_SAMPLES dropped-sample counter: 11")
+    );
+    assert!(output.stdout.contains("not unique physical-loss totals"));
     assert!(output.stdout.contains("0x0000000000002000"));
 }
 
@@ -2134,6 +2151,29 @@ fn tiny_period_perfdata() -> Vec<u8> {
     )
 }
 
+fn tiny_period_perfdata_with_loss_counters() -> Vec<u8> {
+    let mut lost_payload = Vec::new();
+    lost_payload.extend(7_u64.to_le_bytes());
+    lost_payload.extend(9_u64.to_le_bytes());
+    perfdata_with_records_and_attrs(
+        [file_attr_bytes(
+            PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD | PERF_SAMPLE_CALLCHAIN,
+            0,
+            0,
+        )],
+        [
+            record_bytes(9, &sample_payload_with_period(0x1000, 1, 2, 144, [0x2000])),
+            record_bytes(PERF_RECORD_LOST, &lost_payload),
+            record_bytes(PERF_RECORD_LOST_SAMPLES, &7_u64.to_le_bytes()),
+            record_bytes_with_misc(
+                PERF_RECORD_LOST_SAMPLES,
+                PERF_RECORD_MISC_LOST_SAMPLES_BPF,
+                &11_u64.to_le_bytes(),
+            ),
+        ],
+    )
+}
+
 fn perfdata_with_records_and_attrs<const A: usize, const R: usize>(
     attrs: [[u8; 144]; A],
     records: [Vec<u8>; R],
@@ -2208,10 +2248,14 @@ fn file_attr_bytes_with_type_config(
 }
 
 fn record_bytes(record_type: u32, payload: &[u8]) -> Vec<u8> {
+    record_bytes_with_misc(record_type, 0, payload)
+}
+
+fn record_bytes_with_misc(record_type: u32, misc: u16, payload: &[u8]) -> Vec<u8> {
     let size = 8 + payload.len();
     let mut bytes = Vec::with_capacity(size);
     bytes.extend(record_type.to_le_bytes());
-    bytes.extend(0u16.to_le_bytes());
+    bytes.extend(misc.to_le_bytes());
     bytes.extend(
         u16::try_from(size)
             .expect("record fits in u16")

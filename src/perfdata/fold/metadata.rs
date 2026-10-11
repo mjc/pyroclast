@@ -7,7 +7,9 @@ use super::{
     parse_record_with_context, parse_sample_record_metadata, perfdata_header_from_file,
     sample_layouts_from_file, validate_perfdata_sections, visit_ordered_records,
 };
-use crate::perfdata::records::PERF_RECORD_SAMPLE;
+use crate::perfdata::records::{
+    PERF_RECORD_MISC_LOST_SAMPLES_BPF, PERF_RECORD_SAMPLE, has_misc_flag,
+};
 
 #[derive(Clone, Copy)]
 pub(crate) struct PerfSampleMetadata {
@@ -22,6 +24,8 @@ pub(crate) struct PerfSampleMetadata {
 pub(crate) struct PerfMetadata {
     pub comms_by_tid: BTreeMap<u32, String>,
     pub lost_records: u64,
+    pub lost_samples: u64,
+    pub dropped_samples: u64,
 }
 
 /// Visits sample metadata without retaining samples or copying their callchains.
@@ -51,7 +55,8 @@ pub(crate) fn visit_perfdata_file_metadata(
             let result = if record.header.record_type == PERF_RECORD_SAMPLE {
                 visit_sample(record.payload, &layouts, &mut visit)
             } else {
-                parse_record_with_context(record).map(|record| metadata.record(record))
+                parse_record_with_context(record)
+                    .map(|parsed| metadata.record(parsed, record.header.misc))
             };
             result.map_err(|error| {
                 format!(
@@ -84,7 +89,7 @@ fn visit_sample(
 }
 
 impl PerfMetadata {
-    fn record(&mut self, record: ParsedRecord) {
+    fn record(&mut self, record: ParsedRecord, misc: u16) {
         match record {
             ParsedRecord::Comm(record) => {
                 self.comms_by_tid
@@ -96,10 +101,15 @@ impl PerfMetadata {
                 }
             }
             ParsedRecord::Lost(record) => {
-                self.lost_records = self.lost_records.saturating_add(record.lost);
+                self.lost_records = self.lost_records.wrapping_add(record.lost);
             }
             ParsedRecord::LostSamples(record) => {
-                self.lost_records = self.lost_records.saturating_add(record.lost);
+                let counter = if has_misc_flag(misc, PERF_RECORD_MISC_LOST_SAMPLES_BPF) {
+                    &mut self.dropped_samples
+                } else {
+                    &mut self.lost_samples
+                };
+                *counter = counter.wrapping_add(record.lost);
             }
             _ => {}
         }

@@ -1525,13 +1525,46 @@ fn summarizes_lost_record_counts() {
 }
 
 #[test]
-fn summarizes_lost_sample_record_counts() {
+fn summarizes_lost_sample_counters_separately() {
     let bytes = perfdata_with_records_and_attrs([], [record_bytes(13, &42u64.to_le_bytes())]);
 
     let summary = summarize_perfdata(&bytes).expect("summary");
 
     assert_eq!(summary.record_count(13), 1);
-    assert_eq!(summary.lost_records, 42);
+    assert_eq!(summary.lost_records, 0);
+    assert_eq!(summary.lost_samples, 42);
+    assert_eq!(summary.dropped_samples, 0);
+}
+
+#[test]
+fn loss_counters_wrap_independently_like_native_perf() {
+    // Linux perf v7.2.9 tools/perf/util/session.c:2052,2056,2058 uses +=.
+    // Local Linux v7.1 tools/perf/util/events_stats.h:40-42 defines u64 totals.
+    let bytes = perfdata_with_records_and_attrs(
+        [],
+        [
+            record_bytes(2, &lost_payload(1, u64::MAX)),
+            record_bytes(2, &lost_payload(2, 1)),
+            record_bytes(13, &u64::MAX.to_le_bytes()),
+            record_bytes(13, &1_u64.to_le_bytes()),
+            record_bytes_with_misc(
+                13,
+                pyroclast::perfdata::records::PERF_RECORD_MISC_LOST_SAMPLES_BPF,
+                &u64::MAX.to_le_bytes(),
+            ),
+            record_bytes_with_misc(
+                13,
+                pyroclast::perfdata::records::PERF_RECORD_MISC_LOST_SAMPLES_BPF,
+                &1_u64.to_le_bytes(),
+            ),
+        ],
+    );
+
+    let summary = summarize_perfdata(&bytes).expect("summary");
+
+    assert_eq!(summary.lost_records, 0);
+    assert_eq!(summary.lost_samples, 0);
+    assert_eq!(summary.dropped_samples, 0);
 }
 
 #[test]
@@ -14401,7 +14434,7 @@ fn folds_file_samples_from_multiple_attrs_when_generated_perf_script_event_name_
 
 proptest! {
     #[test]
-    fn property_summarizes_generated_lost_record_totals(
+    fn property_summarizes_generated_loss_counters_with_native_wrapping(
         entries in prop::collection::vec((any::<bool>(), any::<u64>()), 0..32),
     ) {
         let records = entries
@@ -14420,14 +14453,21 @@ proptest! {
         let summary = summarize_perfdata(&bytes).expect("summary");
         let expected_lost = entries
             .iter()
-            .fold(0_u64, |total, (_, lost)| total.saturating_add(*lost));
+            .filter(|(is_lost_samples, _)| !is_lost_samples)
+            .fold(0_u64, |total, (_, lost)| total.wrapping_add(*lost));
+        let expected_lost_samples = entries
+            .iter()
+            .filter(|(is_lost_samples, _)| *is_lost_samples)
+            .fold(0_u64, |total, (_, lost)| total.wrapping_add(*lost));
         let expected_lost_records = entries.iter().filter(|(is_lost_samples, _)| !is_lost_samples).count();
-        let expected_lost_samples = entries.iter().filter(|(is_lost_samples, _)| *is_lost_samples).count();
+        let expected_lost_sample_records = entries.iter().filter(|(is_lost_samples, _)| *is_lost_samples).count();
 
         prop_assert_eq!(summary.total_records, entries.len());
         prop_assert_eq!(summary.record_count(2), expected_lost_records);
-        prop_assert_eq!(summary.record_count(13), expected_lost_samples);
+        prop_assert_eq!(summary.record_count(13), expected_lost_sample_records);
         prop_assert_eq!(summary.lost_records, expected_lost);
+        prop_assert_eq!(summary.lost_samples, expected_lost_samples);
+        prop_assert_eq!(summary.dropped_samples, 0);
     }
 
     #[test]

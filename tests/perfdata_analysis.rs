@@ -155,6 +155,110 @@ fn analyzes_perfdata_from_file_without_requiring_a_byte_vec() {
 }
 
 #[test]
+fn lost_record_counter_excludes_lost_samples_for_retained_file_and_stream_paths() {
+    let mut lost_payload = Vec::new();
+    lost_payload.extend(7_u64.to_le_bytes());
+    lost_payload.extend(9_u64.to_le_bytes());
+    let bytes = perfdata_with_records_and_attrs(
+        [],
+        [
+            record_bytes_with_misc(
+                PERF_RECORD_LOST,
+                pyroclast::perfdata::records::PERF_RECORD_MISC_LOST_SAMPLES_BPF,
+                &lost_payload,
+            ),
+            record_bytes(13, &7_u64.to_le_bytes()),
+            record_bytes_with_misc(
+                13,
+                pyroclast::perfdata::records::PERF_RECORD_MISC_LOST_SAMPLES_BPF,
+                &11_u64.to_le_bytes(),
+            ),
+        ],
+    );
+
+    let summary = summarize_perfdata(&bytes).expect("retained summary");
+    assert_eq!(summary.record_count(PERF_RECORD_LOST), 1);
+    assert_eq!(summary.record_count(13), 2);
+    let report = analyze_perfdata(&bytes, 10).expect("retained analysis");
+    let file = tempfile::NamedTempFile::new().expect("perf.data file");
+    std::fs::write(file.path(), &bytes).expect("write perf.data");
+    let file_summary = summarize_perfdata_file(file.path()).expect("file summary");
+    let file_analysis = analyze_perfdata_file(file.path(), 10).expect("file analysis");
+    let streamed = summarize_perfdata_profile_file(file.path(), 1, 10).expect("streamed profile");
+
+    assert_eq!(
+        [
+            summary.lost_records,
+            summary.lost_samples,
+            summary.dropped_samples,
+            report.lost_records,
+            report.lost_samples,
+            report.dropped_samples,
+            report.profile.lost_records,
+            report.profile.lost_samples,
+            report.profile.dropped_samples,
+            file_summary.lost_records,
+            file_summary.lost_samples,
+            file_summary.dropped_samples,
+            file_analysis.lost_records,
+            file_analysis.lost_samples,
+            file_analysis.dropped_samples,
+            streamed.lost_records,
+            streamed.lost_samples,
+            streamed.dropped_samples,
+        ],
+        [9, 7, 11, 9, 7, 11, 9, 7, 11, 9, 7, 11, 9, 7, 11, 9, 7, 11]
+    );
+}
+
+#[test]
+fn loss_counters_wrap_independently_in_retained_and_stream_paths() {
+    // Linux perf v7.2.9 tools/perf/util/session.c:2052,2056,2058 uses +=.
+    // Local Linux v7.1 tools/perf/util/events_stats.h:40-42 defines u64 totals.
+    let bytes = perfdata_with_records_and_attrs(
+        [],
+        [
+            record_bytes(PERF_RECORD_LOST, &lost_payload_for_analysis(u64::MAX)),
+            record_bytes(PERF_RECORD_LOST, &lost_payload_for_analysis(1)),
+            record_bytes(13, &u64::MAX.to_le_bytes()),
+            record_bytes(13, &1_u64.to_le_bytes()),
+            record_bytes_with_misc(
+                13,
+                pyroclast::perfdata::records::PERF_RECORD_MISC_LOST_SAMPLES_BPF,
+                &u64::MAX.to_le_bytes(),
+            ),
+            record_bytes_with_misc(
+                13,
+                pyroclast::perfdata::records::PERF_RECORD_MISC_LOST_SAMPLES_BPF,
+                &1_u64.to_le_bytes(),
+            ),
+        ],
+    );
+    let summary = summarize_perfdata(&bytes).expect("retained summary");
+    let file = tempfile::NamedTempFile::new().expect("perf.data file");
+    std::fs::write(file.path(), &bytes).expect("write perf.data");
+    let streamed = summarize_perfdata_profile_file(file.path(), 1, 10).expect("streamed profile");
+
+    assert_eq!(
+        [
+            summary.lost_records,
+            summary.lost_samples,
+            summary.dropped_samples,
+            streamed.lost_records,
+            streamed.lost_samples,
+            streamed.dropped_samples,
+        ],
+        [0; 6]
+    );
+}
+
+fn lost_payload_for_analysis(lost: u64) -> Vec<u8> {
+    let mut payload = 0_u64.to_le_bytes().to_vec();
+    payload.extend(lost.to_le_bytes());
+    payload
+}
+
+#[test]
 fn summary_orders_generic_child_exec_after_older_fork_like_perf_report() {
     // Linux v7.2.9 tools/perf/builtin-report.c:1514,1622 enables ordering;
     // tools/perf/util/session.c:225-228 disables it without sample_id_all, and

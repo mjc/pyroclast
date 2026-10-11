@@ -6,12 +6,45 @@ pub mod timeline;
 
 use crate::perfdata::fold::{PerfSummary, summarize_perfdata};
 use serde::Serialize;
+use std::fmt;
+
+/// Writes the separate unsigned wrapping counters from Linux perf v7.2.9
+/// `tools/perf/util/session.c:2050-2059`. Local Linux v7.1
+/// `kernel/events/ring_buffer.c:264-265` increments both loss channels on one failure.
+pub(crate) fn write_perf_loss_counters(
+    output: &mut impl fmt::Write,
+    lost_records: u64,
+    lost_samples: u64,
+    dropped_samples: u64,
+) -> fmt::Result {
+    writeln!(
+        output,
+        "PERF_RECORD_LOST reported losses (sum of payload values): {lost_records}"
+    )?;
+    writeln!(output, "non-BPF LOST_SAMPLES counter: {lost_samples}")?;
+    writeln!(
+        output,
+        "BPF LOST_SAMPLES dropped-sample counter: {dropped_samples}"
+    )?;
+    writeln!(
+        output,
+        "loss counters may overlap; they are not unique physical-loss totals"
+    )
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PerfProfileSummary {
     pub total_samples: usize,
     pub weighted_samples: u64,
+    /// Native unsigned wrapping sum of `PERF_RECORD_LOST` payloads.
+    /// May overlap other loss counters; not a unique physical-loss estimate.
     pub lost_records: u64,
+    /// Native unsigned wrapping sum of non-BPF `PERF_RECORD_LOST_SAMPLES` payloads.
+    /// May overlap other loss counters; not a unique physical-loss estimate.
+    pub lost_samples: u64,
+    /// Native unsigned wrapping sum of BPF `PERF_RECORD_LOST_SAMPLES` payloads.
+    /// May overlap other loss counters; not a unique physical-loss estimate.
+    pub dropped_samples: u64,
     pub unassigned_samples: usize,
     pub threads: Vec<threads::ThreadProfileSummary>,
     pub timeline: timeline::TimelineSummary,
@@ -32,6 +65,8 @@ pub fn summarize_perf_summary(
             total.saturating_add(sample.period.unwrap_or(1))
         }),
         lost_records: input.lost_records,
+        lost_samples: input.lost_samples,
+        dropped_samples: input.dropped_samples,
         unassigned_samples: input
             .sample_stacks
             .iter()

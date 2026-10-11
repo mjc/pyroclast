@@ -17,7 +17,9 @@ use crate::process::{CommandOutput, CommandRunner, CommandSpec, FinalizationScop
 use crate::summary::threads::{
     FoldedStackSummary, render_folded_stack_summary_text, summarize_folded_stacks,
 };
-use crate::summary::{PerfProfileSummary, summarize_perfdata_profile_file_with_origin};
+use crate::summary::{
+    PerfProfileSummary, summarize_perfdata_profile_file_with_origin, write_perf_loss_counters,
+};
 use crate::symbols::{SymbolizerKind, perf_symbol_resolver_for_current_home_with_symbolizer};
 use crate::tools::{ADDR2LINE, PERF, ToolSpec, resolve_required_tools};
 
@@ -261,6 +263,12 @@ fn write_profile_summary(
 
     let summary = CpuProfileSummary::new(folded, profile);
     let mut text = render_folded_stack_summary_text(folded);
+    write_perf_loss_counters(
+        &mut text,
+        profile.lost_records,
+        profile.lost_samples,
+        profile.dropped_samples,
+    )?;
     if let Some(span) = summary.profile.timeline.duration_ns {
         writeln!(text, "recorded sample span: {span} ns")?;
     } else {
@@ -503,6 +511,90 @@ mod tests {
             );
             assert_eq!(standalone_visits, 2 * records);
             assert_eq!(visits, (fold_passes + 1) * records);
+        }
+    }
+
+    #[test]
+    fn public_backend_artifacts_report_loss_channels_and_summarize_replays_them() {
+        use crate::cli::{PerfCallGraph, ProfileKind};
+        use crate::perfdata::records::{
+            PERF_RECORD_LOST, PERF_RECORD_LOST_SAMPLES, PERF_RECORD_MISC_LOST_SAMPLES_BPF,
+        };
+
+        // Linux perf v7.2.9 tools/perf/util/session.c:2050-2059 reports separate
+        // counters. Linux v7.1 tools/lib/perf/include/perf/event.h:73 marks BPF drops.
+        for (lost_records, lost_samples, dropped_samples) in [(9_u64, 7_u64, 11_u64), (0, 0, 0)] {
+            let mut bytes = tiny_timed_perfdata();
+            if lost_records != 0 {
+                bytes.extend(record(
+                    PERF_RECORD_LOST,
+                    &[1_u64.to_le_bytes(), lost_records.to_le_bytes()].concat(),
+                ));
+                bytes.extend(record(
+                    PERF_RECORD_LOST_SAMPLES,
+                    &lost_samples.to_le_bytes(),
+                ));
+                bytes.extend(record_with_misc(
+                    PERF_RECORD_LOST_SAMPLES,
+                    PERF_RECORD_MISC_LOST_SAMPLES_BPF,
+                    &dropped_samples.to_le_bytes(),
+                ));
+                let data_size = bytes.len() as u64 - 248;
+                bytes[48..56].copy_from_slice(&data_size.to_le_bytes());
+            }
+            let out = tempfile::tempdir().expect("artifact directory");
+            let request = ProfileRequest {
+                kind: ProfileKind::Cpu,
+                command: vec!["true".into()],
+                out_dir: out.path().join("cpu"),
+                name: None,
+                json: false,
+                symbols: false,
+                symbolizer: SymbolizerKind::Addr2line,
+                frequency: 99,
+                event: PerfEvent::CpuClock,
+                call_graph: PerfCallGraph::Fp,
+                pid: None,
+                tids: Vec::new(),
+                threads_of_pid: None,
+                duration_secs: 1,
+                offcpu_method: None,
+            };
+            let runner = FixtureRunner(bytes);
+            let result = LinuxPerfBackend::new(&runner)
+                .profile(&request)
+                .expect("public backend profile");
+            let json_text =
+                std::fs::read_to_string(result.layout.summary_json()).expect("read summary JSON");
+            let json: serde_json::Value = serde_json::from_str(&json_text).expect("summary JSON");
+            assert_eq!(json["profile"]["lost_records"], lost_records);
+            assert_eq!(json["profile"]["lost_samples"], lost_samples);
+            assert_eq!(json["profile"]["dropped_samples"], dropped_samples);
+
+            let text =
+                std::fs::read_to_string(result.layout.summary_txt()).expect("read summary text");
+            for expected in [
+                format!("PERF_RECORD_LOST reported losses (sum of payload values): {lost_records}"),
+                format!("non-BPF LOST_SAMPLES counter: {lost_samples}"),
+                format!("BPF LOST_SAMPLES dropped-sample counter: {dropped_samples}"),
+                "loss counters may overlap; they are not unique physical-loss totals".into(),
+            ] {
+                assert!(
+                    text.lines().any(|line| line == expected),
+                    "missing {expected:?} in {text:?}"
+                );
+            }
+            assert!(!text.contains("lossless"));
+            assert!(!text.contains("no losses"));
+
+            let artifact_dir = request.out_dir.to_str().expect("artifact path");
+            let replay = crate::run_cli(["pyroclast", "plumbing", "summarize", artifact_dir])
+                .expect("summarize artifact text");
+            assert_eq!(replay.stdout, text);
+            let replay =
+                crate::run_cli(["pyroclast", "plumbing", "summarize", "--json", artifact_dir])
+                    .expect("summarize artifact JSON");
+            assert_eq!(replay.stdout, json_text);
         }
     }
 
@@ -1035,9 +1127,13 @@ mod tests {
     }
 
     fn record(record_type: u32, payload: &[u8]) -> Vec<u8> {
+        record_with_misc(record_type, 0, payload)
+    }
+
+    fn record_with_misc(record_type: u32, misc: u16, payload: &[u8]) -> Vec<u8> {
         let mut record = Vec::with_capacity(payload.len() + 8);
         record.extend(record_type.to_le_bytes());
-        record.extend(0_u16.to_le_bytes());
+        record.extend(misc.to_le_bytes());
         record.extend(u16::try_from(payload.len() + 8).unwrap().to_le_bytes());
         record.extend(payload);
         record

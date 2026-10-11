@@ -34,6 +34,8 @@ pub const PERF_RECORD_FINISHED_ROUND: u32 = 68;
 pub const PERF_RECORD_MISC_COMM_EXEC: u16 = 1 << 13;
 pub const PERF_RECORD_MISC_FORK_EXEC: u16 = PERF_RECORD_MISC_COMM_EXEC;
 pub const PERF_RECORD_MISC_MMAP_BUILD_ID: u16 = 1 << 14;
+/// Linux v7.1 `tools/lib/perf/include/perf/event.h:73`: BPF lost-sample marker.
+pub const PERF_RECORD_MISC_LOST_SAMPLES_BPF: u16 = 1 << 15;
 pub const PERF_RECORD_MISC_CPUMODE_MASK: u16 = 7;
 pub const PERF_RECORD_MISC_CPUMODE_KERNEL: u16 = 1;
 pub const PERF_RECORD_MISC_CPUMODE_USER: u16 = 2;
@@ -1078,7 +1080,7 @@ fn parse_c_string_with_remainder(bytes: &[u8]) -> (String, Vec<u8>) {
     )
 }
 
-fn has_misc_flag(misc: u16, flag: u16) -> bool {
+pub(crate) const fn has_misc_flag(misc: u16, flag: u16) -> bool {
     misc & flag != 0
 }
 

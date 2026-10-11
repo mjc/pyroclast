@@ -742,7 +742,12 @@ fn render_perfdata_analysis(
     writeln!(output, "records: {}", analysis.total_records)?;
     writeln!(output, "samples: {}", analysis.total_samples)?;
     writeln!(output, "weighted samples: {}", analysis.weighted_samples)?;
-    writeln!(output, "lost records: {}", analysis.lost_records)?;
+    summary::write_perf_loss_counters(
+        &mut output,
+        analysis.lost_records,
+        analysis.lost_samples,
+        analysis.dropped_samples,
+    )?;
     if let Some(duration) = analysis.profile.timeline.duration_ns {
         writeln!(output, "sample span (ns): {duration}")?;
     }

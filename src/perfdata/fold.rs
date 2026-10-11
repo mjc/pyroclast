@@ -1,6 +1,8 @@
 mod metadata;
 mod threads;
-pub(crate) use metadata::{PerfSampleMetadata, perfdata_file_arch, visit_perfdata_file_metadata};
+pub(crate) use metadata::{
+    PerfMetadata, PerfSampleMetadata, perfdata_file_arch, visit_perfdata_file_metadata,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
@@ -34,9 +36,10 @@ use crate::perfdata::memory::{DsoMemorySources, MappedMemory};
 use crate::perfdata::records::{
     PERF_RECORD_FINISHED_ROUND, PERF_RECORD_MISC_COMM_EXEC, PERF_RECORD_MISC_CPUMODE_KERNEL,
     PERF_RECORD_MISC_CPUMODE_MASK, PERF_RECORD_MISC_CPUMODE_USER, PERF_RECORD_MISC_FORK_EXEC,
-    PERF_RECORD_MISC_MMAP_BUILD_ID, ParsedRecord, PerfRecord, parse_callchain_deferred_record,
-    parse_comm_record, parse_exit_record, parse_fork_record, parse_mmap_record,
-    parse_mmap2_build_id_record, parse_mmap2_record, parse_record,
+    PERF_RECORD_MISC_LOST_SAMPLES_BPF, PERF_RECORD_MISC_MMAP_BUILD_ID, ParsedRecord, PerfRecord,
+    has_misc_flag, parse_callchain_deferred_record, parse_comm_record, parse_exit_record,
+    parse_fork_record, parse_mmap_record, parse_mmap2_build_id_record, parse_mmap2_record,
+    parse_record,
 };
 use crate::perfdata::samples::{
     PERF_SAMPLE_ADDR, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_ID,
@@ -203,6 +206,9 @@ impl Default for FoldCounts {
     }
 }
 
+/// Loss sums wrap modulo 2^64, matching Linux perf v7.2.9
+/// `tools/perf/util/session.c:2052,2056,2058` and the `u64` fields in local
+/// Linux v7.1 `tools/perf/util/events_stats.h:40-42`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PerfSummary {
     pub total_records: usize,
@@ -211,7 +217,15 @@ pub struct PerfSummary {
     pub comms_by_pid: BTreeMap<u32, String>,
     pub comms_by_tid: BTreeMap<u32, String>,
     pub mmaps: Vec<String>,
+    /// Native unsigned wrapping sum of `PERF_RECORD_LOST` payloads.
+    /// May overlap other loss counters; not a unique physical-loss estimate.
     pub lost_records: u64,
+    /// Native unsigned wrapping sum of non-BPF `PERF_RECORD_LOST_SAMPLES` payloads.
+    /// May overlap other loss counters; not a unique physical-loss estimate.
+    pub lost_samples: u64,
+    /// Native unsigned wrapping sum of BPF `PERF_RECORD_LOST_SAMPLES` payloads.
+    /// May overlap other loss counters; not a unique physical-loss estimate.
+    pub dropped_samples: u64,
     pub mmap_table: MmapTable,
     pub sample_stacks: Vec<PerfSampleStack>,
 }
@@ -833,11 +847,20 @@ fn summarize_record(
             Ok(())
         }
         ParsedRecord::Lost(record) => {
-            summary.lost_records = summary.lost_records.saturating_add(record.lost);
+            summary.lost_records = summary.lost_records.wrapping_add(record.lost);
             Ok(())
         }
         ParsedRecord::LostSamples(record) => {
-            summary.lost_records = summary.lost_records.saturating_add(record.lost);
+            // Linux v7.2.9 tools/perf/util/session.c:2050-2059 keeps total_lost,
+            // total_lost_samples, and total_dropped_samples separate. Linux v7.1
+            // kernel/events/ring_buffer.c:264-265 can increment both first counters
+            // for one failure, so these channels are not unique physical-loss totals.
+            let counter = if has_misc_flag(source_misc, PERF_RECORD_MISC_LOST_SAMPLES_BPF) {
+                &mut summary.dropped_samples
+            } else {
+                &mut summary.lost_samples
+            };
+            *counter = counter.wrapping_add(record.lost);
             Ok(())
         }
         ParsedRecord::Mmap(record) => {
