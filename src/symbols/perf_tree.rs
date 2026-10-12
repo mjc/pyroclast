@@ -28,6 +28,9 @@ struct Node {
 pub(super) struct PerfSymbolTree {
     nodes: Vec<Option<Node>>,
     root: Option<usize>,
+    rightmost: Option<usize>,
+    #[cfg(test)]
+    search_node_visits: usize,
 }
 
 impl PerfSymbolTree {
@@ -35,6 +38,9 @@ impl PerfSymbolTree {
         Self {
             nodes: vec![None; candidate_count],
             root: None,
+            rightmost: None,
+            #[cfg(test)]
+            search_node_visits: 0,
         }
     }
 
@@ -47,16 +53,35 @@ impl PerfSymbolTree {
             return false;
         }
 
-        let mut parent = None;
-        let mut cursor = self.root;
-        while let Some(index) = cursor {
-            parent = Some(index);
-            let node = self.node(index);
-            cursor = if start < node.start {
-                node.left
-            } else {
-                node.right
-            };
+        let extends_rightmost = if let Some(rightmost) = self.rightmost {
+            #[cfg(test)]
+            {
+                self.search_node_visits += 1;
+            }
+            start >= self.node(rightmost).start
+        } else {
+            true
+        };
+        let mut parent = if extends_rightmost {
+            self.rightmost
+        } else {
+            None
+        };
+        if parent.is_none() && self.root.is_some() {
+            let mut cursor = self.root;
+            while let Some(index) = cursor {
+                #[cfg(test)]
+                {
+                    self.search_node_visits += 1;
+                }
+                parent = Some(index);
+                let node = self.node(index);
+                cursor = if start < node.start {
+                    node.left
+                } else {
+                    node.right
+                };
+            }
         }
 
         self.nodes[symbol_index] = Some(Node {
@@ -77,6 +102,9 @@ impl PerfSymbolTree {
         }
 
         self.insert_fixup(symbol_index);
+        if extends_rightmost {
+            self.rightmost = Some(symbol_index);
+        }
         true
     }
 
@@ -87,6 +115,7 @@ impl PerfSymbolTree {
         }
 
         let mut removed_color = self.node(symbol_index).color;
+        let removed_rightmost = self.rightmost == Some(symbol_index);
         let replacement;
         let replacement_parent;
         let node = self.node(symbol_index);
@@ -131,11 +160,19 @@ impl PerfSymbolTree {
         if removed_color == Color::Black {
             self.erase_fixup(replacement, replacement_parent);
         }
+        if removed_rightmost {
+            self.rightmost = self.root.map(|root| self.maximum(root));
+        }
         true
     }
 
     pub(super) fn root_index(&self) -> Option<usize> {
         self.root
+    }
+
+    #[cfg(test)]
+    fn take_search_node_visits(&mut self) -> usize {
+        std::mem::take(&mut self.search_node_visits)
     }
 
     #[cfg(test)]
@@ -219,6 +256,13 @@ impl PerfSymbolTree {
     fn minimum(&self, mut index: usize) -> usize {
         while let Some(left) = self.node(index).left {
             index = left;
+        }
+        index
+    }
+
+    fn maximum(&self, mut index: usize) -> usize {
+        while let Some(right) = self.node(index).right {
+            index = right;
         }
         index
     }
@@ -493,6 +537,146 @@ mod tests {
                 .windows(2)
                 .all(|pair| tree.node(pair[0]).start <= tree.node(pair[1]).start)
         );
+        assert_eq!(tree.rightmost, ordered.last().copied());
+    }
+
+    #[test]
+    fn ascending_and_equal_appends_visit_at_most_one_search_node() {
+        let mut tree = PerfSymbolTree::new(128);
+        for (index, start) in (0..64).map(|index| (index, index as u64 / 2)) {
+            assert!(tree.insert(index, start));
+            assert!(
+                tree.take_search_node_visits() <= 1,
+                "append {index} at {start} visited more than one search node"
+            );
+        }
+    }
+
+    #[test]
+    fn counts_failed_rightmost_guard_before_lower_key_root_walk() {
+        let mut tree = PerfSymbolTree::new(4);
+        for (index, start) in [(0, 10), (1, 20), (2, 30)] {
+            assert!(tree.insert(index, start));
+        }
+        assert_invariants(&tree, &[true, true, true, false]);
+        assert_eq!(tree.shape(), "1B(0R(.,.),2R(.,.))");
+        assert_eq!(tree.rightmost, Some(2));
+
+        let start = 0;
+        assert!(start < tree.node(2).start);
+        let mut root_walk = Vec::new();
+        let mut cursor = tree.root;
+        while let Some(index) = cursor {
+            root_walk.push(index);
+            let node = tree.node(index);
+            cursor = if start < node.start {
+                node.left
+            } else {
+                node.right
+            };
+        }
+        assert_eq!(root_walk, [1, 0]);
+        let expected_visits = 1 + root_walk.len();
+        assert_eq!(expected_visits, 3);
+        tree.take_search_node_visits();
+
+        assert!(tree.insert(3, start));
+        assert_eq!(tree.take_search_node_visits(), expected_visits);
+        assert_invariants(&tree, &[true; 4]);
+        assert_eq!(tree.shape(), "1B(0B(3R(.,.),.),2B(.,.))");
+        assert_eq!(tree.indices_in_order(), [3, 0, 1, 2]);
+        assert_eq!(tree.lookup(0, |index| [20, 30, 40, 10][index]), Some(3));
+    }
+
+    #[test]
+    fn reuses_removed_rightmost_id_for_immediate_append_in_nonempty_tree() {
+        let mut tree = PerfSymbolTree::new(3);
+        for (index, start) in [(0, 10), (1, 20), (2, 30)] {
+            assert!(tree.insert(index, start));
+        }
+        assert_invariants(&tree, &[true; 3]);
+        assert_eq!(tree.shape(), "1B(0R(.,.),2R(.,.))");
+        assert_eq!(tree.rightmost, Some(2));
+        tree.take_search_node_visits();
+
+        assert!(tree.remove(2));
+        assert_invariants(&tree, &[true, true, false]);
+        assert_eq!(tree.rightmost, Some(1));
+        assert_eq!(tree.shape(), "1B(0R(.,.),.)");
+        assert_eq!(tree.indices_in_order(), [0, 1]);
+
+        assert!(tree.insert(2, 40));
+        assert_eq!(tree.take_search_node_visits(), 1);
+        assert_invariants(&tree, &[true; 3]);
+        assert_eq!(tree.rightmost, Some(2));
+        assert_eq!(tree.shape(), "1B(0R(.,.),2R(.,.))");
+        assert_eq!(tree.indices_in_order(), [0, 1, 2]);
+        assert_eq!(tree.lookup(40, |index| [20, 30, 50][index]), Some(2));
+        assert_eq!(tree.lookup(30, |index| [20, 30, 50][index]), None);
+        assert_eq!(tree.lookup(45, |_| 100), Some(1));
+    }
+
+    #[test]
+    fn rightmost_cache_tracks_boundary_keys_and_mutations() {
+        let mut tree = PerfSymbolTree::new(8);
+        let mut active = vec![false; 8];
+        for (index, start) in [
+            (4, u64::MAX),
+            (2, 0),
+            (6, u64::MAX),
+            (1, 0),
+            (7, u64::MAX),
+            (3, 1),
+            (5, u64::MAX - 1),
+            (0, u64::MAX),
+        ] {
+            let uses_rightmost_guard = tree
+                .rightmost
+                .is_some_and(|rightmost| start >= tree.node(rightmost).start);
+            assert!(tree.insert(index, start));
+            active[index] = true;
+            assert_invariants(&tree, &active);
+            let visits = tree.take_search_node_visits();
+            if uses_rightmost_guard {
+                assert!(visits <= 1);
+            }
+        }
+        assert_eq!(
+            tree.shape(),
+            "4B(1R(2B(.,.),3B(.,5R(.,.))),7B(6R(.,.),0R(.,.)))"
+        );
+
+        let shape = tree.shape();
+        assert!(!tree.insert(0, 9));
+        assert!(!tree.insert(usize::MAX, 0));
+        assert!(!tree.remove(usize::MAX));
+        assert_eq!(tree.shape(), shape);
+        assert_invariants(&tree, &active);
+
+        assert!(tree.remove(0));
+        active[0] = false;
+        assert_invariants(&tree, &active);
+        let shape = tree.shape();
+        assert!(!tree.remove(0));
+        assert_eq!(tree.shape(), shape);
+        assert_invariants(&tree, &active);
+        assert!(tree.remove(2));
+        active[2] = false;
+        assert_invariants(&tree, &active);
+
+        let lookup = |tree: &PerfSymbolTree| tree.lookup(u64::MAX, |_| u64::MAX);
+        let hit = lookup(&tree);
+        assert_eq!(hit, Some(4));
+
+        for index in [1, 3, 4, 5, 6, 7] {
+            assert!(tree.remove(index));
+            active[index] = false;
+            assert_invariants(&tree, &active);
+        }
+        assert_eq!(tree.rightmost, None);
+        assert!(tree.insert(0, u64::MAX));
+        active[0] = true;
+        assert_invariants(&tree, &active);
     }
 
     #[test]
