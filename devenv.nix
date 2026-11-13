@@ -1,4 +1,4 @@
-{ pkgs, lib, ... }:
+{ pkgs, lib, inputs, ... }:
 let
   gnuProvider = pkgs.callPackage ./nix/binutils-provider.nix { };
 in
@@ -13,6 +13,50 @@ in
       "rustc"
       "rustfmt"
     ];
+    # Darwin rustup components ship lib as a symlink. lndir keeps that
+    # symlink, so rust-overlay's librustc_driver copy hits the same file
+    # and rust-std is never merged in. Rebuild lib from every component.
+    toolchainPackage = lib.mkIf pkgs.stdenv.hostPlatform.isDarwin (lib.mkForce (
+      ((pkgs.extend (import inputs.rust-overlay)).rust-bin.stable.latest.default.override {
+        extensions = [ "rust-analyzer" ];
+      }).overrideAttrs (old: {
+        buildCommand =
+          let
+            anchor = "shopt nullglob";
+            patched = lib.replaceStrings [ anchor ] [
+              ''
+                if [ -L "$out/lib" ]; then
+                  rm "$out/lib"
+                  mkdir "$out/lib"
+                  merge_tree() {
+                    local src="$1" dest="$2" entry name
+                    mkdir -p "$dest"
+                    for entry in "$src"/*; do
+                      [ -e "$entry" ] || [ -L "$entry" ] || continue
+                      name="''${entry##*/}"
+                      if [ -d "$entry" ] && [ ! -L "$entry" ]; then
+                        merge_tree "$entry" "$dest/$name"
+                      elif [ ! -e "$dest/$name" ] && [ ! -L "$dest/$name" ]; then
+                        ln -s "$entry" "$dest/$name"
+                      fi
+                    done
+                  }
+                  for component in "''${paths[@]}"; do
+                    if [ -e "$component/lib" ] || [ -L "$component/lib" ]; then
+                      merge_tree "$(realpath -e "$component/lib")" "$out/lib"
+                    fi
+                  done
+                fi
+                shopt nullglob
+              ''
+            ] old.buildCommand;
+          in
+          if patched == old.buildCommand then
+            throw "rust-overlay Darwin join no longer contains '${anchor}'"
+          else
+            patched;
+      })
+    ));
   };
 
   packages =
