@@ -39,7 +39,7 @@ check() {
         cat "$HOOK_LOG" >&2
         return 1
     }
-    for call in 'cargo fmt --check' 'cargo clippy --all-targets -- -D warnings -W clippy::pedantic' \
+    for call in 'cargo fmt --check' 'cargo clippy --all-targets -- -D warnings -W clippy::pedantic -A clippy::map_unwrap_or -A clippy::manual_bit_width -A clippy::assert_is_empty' \
         'cargo nextest run' 'cargo build --quiet --release --bin pyroclast' \
         parity 'nix flake check --no-build'; do
         [ "$(grep -Fxc -- "$call" "$HOOK_LOG")" = 1 ] || return 1

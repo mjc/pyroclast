@@ -11,7 +11,9 @@ fi
 echo "pre-commit: rustfmt" >&2
 cargo fmt --check
 echo "pre-commit: clippy pedantic" >&2
-cargo clippy --all-targets -- -D warnings -W clippy::pedantic
+# Keep older compiler compatibility and concise empty-collection assertions.
+cargo clippy --all-targets -- -D warnings -W clippy::pedantic \
+  -A clippy::map_unwrap_or -A clippy::manual_bit_width -A clippy::assert_is_empty
 echo "pre-commit: nextest" >&2
 cargo nextest run
 echo "pre-commit: independent native platform parity" >&2
