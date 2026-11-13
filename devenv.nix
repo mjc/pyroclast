@@ -5,9 +5,7 @@ in
 {
   languages.rust = {
     enable = true;
-    # The Darwin rust-overlay aggregate currently aliases lib directories,
-    # causing its union builder to copy librustc_driver onto itself.
-    channel = if pkgs.stdenv.hostPlatform.isDarwin then "nixpkgs" else "stable";
+    channel = "stable";
     components = [
       "cargo"
       "clippy"

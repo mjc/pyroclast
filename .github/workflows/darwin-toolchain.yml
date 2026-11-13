@@ -1,0 +1,15 @@
+name: Darwin toolchain
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  toolchain:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: cachix/install-nix-action@d698718aa798980d17dd749f03beae0b51183399 # v31
+      - name: Verify Rust toolchain
+        run: nix run github:cachix/devenv/v2.4.0 -- shell -- sh -c 'rustc --version | grep "^rustc 1.100.0 "'
