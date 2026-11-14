@@ -282,7 +282,7 @@ fn user_plt_ifunc_fallback_does_not_admit_kernel_only_label() {
     let cold = builder.sections.add();
     cold.name = b".cold".as_slice().into();
     cold.sh_type = elf::SHT_NOBITS;
-    cold.sh_flags = u64::from(elf::SHF_ALLOC);
+    cold.sh_flags = elf::SHF_ALLOC;
     cold.sh_addr = 0x1000;
     cold.sh_addralign = 16;
     cold.data = build::elf::SectionData::UninitializedData(16);

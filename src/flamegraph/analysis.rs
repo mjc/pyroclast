@@ -369,10 +369,9 @@ fn read_frames(svg: &str) -> io::Result<(Vec<Frame>, Option<u64>)> {
     let mut total = None;
     loop {
         match reader.read_event().map_err(invalid_data)? {
-            Event::Start(element) if element.name().as_ref() == b"title" => {
+            Event::Start(element) if element.name().as_ref() == "title" => {
                 let text = reader.read_text(element.name()).map_err(invalid_data)?;
-                let text = text.decode().map_err(invalid_data)?;
-                let text = quick_xml::escape::unescape(&text).map_err(invalid_data)?;
+                let text = quick_xml::escape::unescape(text.as_ref()).map_err(invalid_data)?;
                 if let Some(container) = containers.last_mut().filter(|container| container.frame)
                     && let Some((name, metadata)) = text.rsplit_once(" (")
                     && !name.is_empty()
@@ -388,26 +387,26 @@ fn read_frames(svg: &str) -> io::Result<(Vec<Frame>, Option<u64>)> {
                 let (Event::Start(element) | Event::Empty(element)) = event else {
                     unreachable!()
                 };
-                if element.name().as_ref() == b"svg"
-                    && let Some(value) = attribute(&element, b"total_samples")?
+                if element.name().as_ref() == "svg"
+                    && let Some(value) = attribute(&element, "total_samples")?
                 {
                     let value = value.parse().map_err(invalid_data)?;
                     if total.replace(value).is_some() {
                         return Err(invalid_data("multiple flamegraphs in one SVG"));
                     }
                 }
-                if element.name().as_ref() == b"rect"
+                if element.name().as_ref() == "rect"
                     && let Some(name) = containers
                         .last_mut()
                         .and_then(|container| container.title.take())
                 {
-                    let start = required_attribute(&element, b"fg:x")?
+                    let start = required_attribute(&element, "fg:x")?
                         .parse::<u64>()
                         .map_err(invalid_data)?;
-                    let width = required_attribute(&element, b"fg:w")?
+                    let width = required_attribute(&element, "fg:w")?
                         .parse::<u64>()
                         .map_err(invalid_data)?;
-                    let y = required_attribute(&element, b"y")?
+                    let y = required_attribute(&element, "y")?
                         .parse::<f64>()
                         .map_err(invalid_data)?;
                     if !y.is_finite() {
@@ -426,7 +425,7 @@ fn read_frames(svg: &str) -> io::Result<(Vec<Frame>, Option<u64>)> {
                 // Empty elements have no corresponding End event.
                 if !empty {
                     containers.push(Container {
-                        frame: matches!(element.name().as_ref(), b"g" | b"a"),
+                        frame: matches!(element.name().as_ref(), "g" | "a"),
                         title: None,
                     });
                 }
@@ -475,7 +474,7 @@ fn validate_title_metadata(metadata: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn attribute(element: &BytesStart<'_>, name: &[u8]) -> io::Result<Option<String>> {
+fn attribute(element: &BytesStart<'_>, name: &str) -> io::Result<Option<String>> {
     element
         .try_get_attribute(name)
         .map_err(invalid_data)?
@@ -488,11 +487,10 @@ fn attribute(element: &BytesStart<'_>, name: &[u8]) -> io::Result<Option<String>
         .transpose()
 }
 
-fn required_attribute(element: &BytesStart<'_>, name: &[u8]) -> io::Result<String> {
+fn required_attribute(element: &BytesStart<'_>, name: &str) -> io::Result<String> {
     attribute(element, name)?.ok_or_else(|| {
         invalid_data(format!(
-            "missing {}: exact Inferno sample ranges are required",
-            String::from_utf8_lossy(name)
+            "missing {name}: exact Inferno sample ranges are required"
         ))
     })
 }

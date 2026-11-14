@@ -5840,7 +5840,7 @@ fn write_native_cached_kernel_elf_fixture(
         let mut bytes = Vec::new();
         bytes.extend(4_u32.to_le_bytes());
         bytes.extend(u32::try_from(id.len()).unwrap().to_le_bytes());
-        bytes.extend(object::elf::NT_GNU_BUILD_ID.to_le_bytes());
+        bytes.extend(object::elf::NT_GNU_BUILD_ID.0.to_le_bytes());
         bytes.extend(b"GNU\0");
         bytes.extend(id);
         bytes.resize(bytes.len().next_multiple_of(4), 0);
@@ -5989,7 +5989,7 @@ fn add_native_cached_kernel_elf_init_text(elf: &std::path::Path) {
     let section = builder.sections.add();
     section.name = b".init.text"[..].into();
     section.sh_type = object::elf::SHT_PROGBITS;
-    section.sh_flags = u64::from(object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR);
+    section.sh_flags = object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR;
     section.sh_addr = 0xffff_ffff_8100_0200;
     section.sh_addralign = 16;
     section.data = object::build::elf::SectionData::Data(vec![0x90; 0x100].into());
@@ -6038,8 +6038,9 @@ fn rewrite_native_cached_kernel_elf_with_ignored_text_symbols(elf: &std::path::P
     let data = builder.sections.add();
     data.name = b".data"[..].into();
     data.sh_type = object::elf::SHT_PROGBITS;
-    data.sh_flags = u64::from(object::elf::SHF_ALLOC | object::elf::SHF_WRITE);
+    data.sh_flags = object::elf::SHF_ALLOC | object::elf::SHF_WRITE;
     data.sh_addr = 0xffff_ffff_8100_1000;
+    data.sh_addralign = 1;
     data.data = object::build::elf::SectionData::Data(vec![0; 16].into());
     let data_id = data.id();
     let symbol = builder.symbols.add();
@@ -6147,13 +6148,13 @@ fn add_native_cached_kernel_elf_dynamic_symbols(
     let dynsym = builder.sections.add();
     dynsym.name = b".dynsym"[..].into();
     dynsym.sh_type = object::elf::SHT_DYNSYM;
-    dynsym.sh_flags = u64::from(object::elf::SHF_ALLOC);
+    dynsym.sh_flags = object::elf::SHF_ALLOC;
     dynsym.sh_addralign = 8;
     dynsym.data = object::build::elf::SectionData::DynamicSymbol;
     let dynstr = builder.sections.add();
     dynstr.name = b".dynstr"[..].into();
     dynstr.sh_type = object::elf::SHT_STRTAB;
-    dynstr.sh_flags = u64::from(object::elf::SHF_ALLOC);
+    dynstr.sh_flags = object::elf::SHF_ALLOC;
     dynstr.sh_addralign = 1;
     dynstr.data = object::build::elf::SectionData::DynamicString;
 
@@ -6190,7 +6191,7 @@ fn add_native_cached_kernel_elf_dynamic_symbols(
     segment.p_memsz = 0x1000;
     segment.p_align = 16;
     for section in &mut builder.sections {
-        if section.sh_flags & u64::from(object::elf::SHF_ALLOC) != 0 {
+        if section.sh_flags.intersects(object::elf::SHF_ALLOC) {
             segment.append_section(section);
         }
     }
@@ -6383,11 +6384,11 @@ fn automatic_matching_dynsym_only_kernel_elf_is_rejected_like_native_perf() {
         if section.name.as_slice() == b".symtab" {
             section.name = b".dynsym"[..].into();
             section.sh_type = object::elf::SHT_DYNSYM;
-            section.sh_flags |= u64::from(object::elf::SHF_ALLOC);
+            section.sh_flags |= object::elf::SHF_ALLOC;
             section.data = object::build::elf::SectionData::DynamicSymbol;
         } else if section.name.as_slice() == b".strtab" {
             section.name = b".dynstr"[..].into();
-            section.sh_flags |= u64::from(object::elf::SHF_ALLOC);
+            section.sh_flags |= object::elf::SHF_ALLOC;
             section.data = object::build::elf::SectionData::DynamicString;
         }
     }
@@ -6401,7 +6402,7 @@ fn automatic_matching_dynsym_only_kernel_elf_is_rejected_like_native_perf() {
     segment.p_memsz = 0x1000;
     segment.p_align = 16;
     for section in &mut builder.sections {
-        if section.sh_flags & u64::from(object::elf::SHF_ALLOC) != 0 {
+        if section.sh_flags.intersects(object::elf::SHF_ALLOC) {
             segment.append_section(section);
         }
     }
@@ -6673,7 +6674,7 @@ fn user_local_marker_elf() -> Vec<u8> {
     let text = builder.sections.add();
     text.name = b".text"[..].into();
     text.sh_type = elf::SHT_PROGBITS;
-    text.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_EXECINSTR);
+    text.sh_flags = elf::SHF_ALLOC | elf::SHF_EXECINSTR;
     text.sh_addr = 0x0040_1000;
     text.sh_offset = 0x1000;
     text.sh_addralign = 0x1000;
@@ -10014,7 +10015,7 @@ fn kcore_module_routing_elf(has_symtab: bool) -> Vec<u8> {
         let text = builder.sections.add();
         text.name = b".text"[..].into();
         text.sh_type = object::elf::SHT_PROGBITS;
-        text.sh_flags = u64::from(object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR);
+        text.sh_flags = object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR;
         text.sh_addralign = 16;
         text.data = object::build::elf::SectionData::Data(vec![0x90; 64].into());
         let text_id = text.id();
@@ -10841,7 +10842,7 @@ fn elf_with_distinct_text_and_data_biases() -> Vec<u8> {
         let section = builder.sections.add();
         section.name = name.into();
         section.sh_type = elf::SHT_PROGBITS;
-        section.sh_flags = u64::from(flags);
+        section.sh_flags = flags;
         section.sh_addr = address;
         section.sh_offset = offset;
         section.sh_addralign = 16;
@@ -10943,7 +10944,7 @@ fn cross_section_perf_tree_elf() -> Vec<u8> {
     let text = builder.sections.add();
     text.name = b".text"[..].into();
     text.sh_type = elf::SHT_PROGBITS;
-    text.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_EXECINSTR);
+    text.sh_flags = elf::SHF_ALLOC | elf::SHF_EXECINSTR;
     text.sh_addr = 0x0040_1000;
     text.sh_offset = 0x1000;
     text.sh_addralign = 0x1000;
@@ -10953,7 +10954,7 @@ fn cross_section_perf_tree_elf() -> Vec<u8> {
     let data = builder.sections.add();
     data.name = b".data"[..].into();
     data.sh_type = elf::SHT_PROGBITS;
-    data.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_WRITE);
+    data.sh_flags = elf::SHF_ALLOC | elf::SHF_WRITE;
     data.sh_addr = 0x0040_3000;
     data.sh_offset = 0x2000;
     data.sh_addralign = 0x1000;
@@ -10963,7 +10964,7 @@ fn cross_section_perf_tree_elf() -> Vec<u8> {
     let dynsym = builder.sections.add();
     dynsym.name = b".dynsym"[..].into();
     dynsym.sh_type = elf::SHT_DYNSYM;
-    dynsym.sh_flags = u64::from(elf::SHF_ALLOC);
+    dynsym.sh_flags = elf::SHF_ALLOC;
     dynsym.sh_addralign = 8;
     dynsym.sh_addr = 0x0040_4000;
     dynsym.sh_offset = 0x3000;
@@ -10972,7 +10973,7 @@ fn cross_section_perf_tree_elf() -> Vec<u8> {
     let dynstr = builder.sections.add();
     dynstr.name = b".dynstr"[..].into();
     dynstr.sh_type = elf::SHT_STRTAB;
-    dynstr.sh_flags = u64::from(elf::SHF_ALLOC);
+    dynstr.sh_flags = elf::SHF_ALLOC;
     dynstr.sh_addralign = 1;
     dynstr.sh_addr = 0x0040_4100;
     dynstr.sh_offset = 0x3100;
@@ -17067,7 +17068,7 @@ fn native_split_debug_module_runtime_requires_matching_id_and_runtime_sections()
                 let mut contents = Vec::new();
                 contents.extend(4_u32.to_le_bytes());
                 contents.extend(20_u32.to_le_bytes());
-                contents.extend(object::elf::NT_GNU_BUILD_ID.to_le_bytes());
+                contents.extend(object::elf::NT_GNU_BUILD_ID.0.to_le_bytes());
                 contents.extend(b"GNU\0");
                 contents.extend(&id);
                 note.data = object::build::elf::SectionData::Data(contents.into());
@@ -17191,7 +17192,7 @@ fn assert_native_split_debug_label_uses_runtime_name(runtime_text: bool) {
         }
         for symbol in &mut builder.symbols {
             if symbol.name.as_slice() == b"separate_module_text" {
-                symbol.st_info = (symbol.st_info & !0xf) | object::elf::STT_NOTYPE;
+                symbol.st_info = symbol.st_info.st_bind() | object::elf::STT_NOTYPE;
             }
         }
         let mut rewritten = Vec::new();
@@ -17203,7 +17204,7 @@ fn assert_native_split_debug_label_uses_runtime_name(runtime_text: bool) {
             .unwrap();
         assert!(
             matches!(label.flags(), object::SymbolFlags::Elf { st_info, .. }
-            if st_info & 0xf == object::elf::STT_NOTYPE)
+            if st_info.st_type() == object::elf::STT_NOTYPE)
         );
         let section = elf
             .section_by_index(label.section_index().unwrap())
