@@ -397,7 +397,7 @@ fn scalar_dual_address_fixture() -> (tempfile::NamedTempFile, SymbolRequest) {
     let section = builder.sections.add();
     section.name = b".text"[..].into();
     section.sh_type = elf::SHT_PROGBITS;
-    section.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_EXECINSTR);
+    section.sh_flags = elf::SHF_ALLOC | elf::SHF_EXECINSTR;
     section.sh_addr = 0x1000;
     section.sh_offset = 0x1000;
     section.sh_addralign = 16;
@@ -4593,7 +4593,7 @@ fn elf_with_recorded_build_id(build_id: &str) -> Vec<u8> {
     let mut note = Vec::new();
     note.extend_from_slice(&4_u32.to_le_bytes());
     note.extend_from_slice(&u32::try_from(id.len()).unwrap().to_le_bytes());
-    note.extend_from_slice(&elf::NT_GNU_BUILD_ID.to_le_bytes());
+    note.extend_from_slice(&elf::NT_GNU_BUILD_ID.0.to_le_bytes());
     note.extend_from_slice(b"GNU\0");
     note.extend_from_slice(&id);
     note.resize(note.len().next_multiple_of(4), 0);
@@ -4681,7 +4681,7 @@ fn elf_with_dynamic_text_symbol(name: &'static [u8], address: u64, size: usize) 
     let section = builder.sections.add();
     section.name = b".text"[..].into();
     section.sh_type = elf::SHT_PROGBITS;
-    section.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_EXECINSTR);
+    section.sh_flags = elf::SHF_ALLOC | elf::SHF_EXECINSTR;
     section.sh_addr = address;
     section.sh_addralign = 16;
     section.data = build::elf::SectionData::Data(vec![0xcc; size].into());
@@ -4690,7 +4690,7 @@ fn elf_with_dynamic_text_symbol(name: &'static [u8], address: u64, size: usize) 
     let section = builder.sections.add();
     section.name = b".dynsym"[..].into();
     section.sh_type = elf::SHT_DYNSYM;
-    section.sh_flags = u64::from(elf::SHF_ALLOC);
+    section.sh_flags = elf::SHF_ALLOC;
     section.sh_addralign = 8;
     section.data = build::elf::SectionData::DynamicSymbol;
     let dynsym_id = section.id();
@@ -4698,7 +4698,7 @@ fn elf_with_dynamic_text_symbol(name: &'static [u8], address: u64, size: usize) 
     let section = builder.sections.add();
     section.name = b".dynstr"[..].into();
     section.sh_type = elf::SHT_STRTAB;
-    section.sh_flags = u64::from(elf::SHF_ALLOC);
+    section.sh_flags = elf::SHF_ALLOC;
     section.sh_addralign = 1;
     section.data = build::elf::SectionData::DynamicString;
     let dynstr_id = section.id();

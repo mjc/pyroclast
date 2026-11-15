@@ -5,7 +5,7 @@ use object::{Object, ObjectSection, ObjectSegment, build, elf};
 use super::{PerfObjectSymbolIndex, SymbolLookup, elf_with_text_symbol_fixtures};
 
 pub(super) fn elf_with_allocated_plt(
-    symbols: &[(&'static [u8], u64, u64, u8, u8)],
+    symbols: &[(&'static [u8], u64, u64, elf::SymbolBind, elf::SymbolType)],
     plt_address: u64,
     plt_size: usize,
 ) -> Vec<u8> {
@@ -21,7 +21,7 @@ pub(super) fn elf_with_allocated_plt(
     let plt = builder.sections.add();
     plt.name = b".plt"[..].into();
     plt.sh_type = elf::SHT_PROGBITS;
-    plt.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_EXECINSTR);
+    plt.sh_flags = elf::SHF_ALLOC | elf::SHF_EXECINSTR;
     plt.sh_addr = plt_address;
     plt.sh_addralign = 16;
     plt.data = build::elf::SectionData::Data(vec![0; plt_size].into());
@@ -85,8 +85,8 @@ pub(super) fn elf_with_allocated_plt(
     assert_eq!(plt.size(), plt_size as u64);
     assert!(matches!(
         plt.flags(),
-        object::SectionFlags::Elf { sh_flags }
-            if sh_flags & u64::from(elf::SHF_ALLOC) != 0
+        object::SectionFlags::Elf { sh_flags, .. }
+            if sh_flags.intersects(elf::SHF_ALLOC)
     ));
     assert!(
         object
@@ -120,7 +120,7 @@ pub(super) fn elf_with_mixed_plt_relocations() -> Vec<u8> {
     let plt = builder.sections.add();
     plt.name = b".plt"[..].into();
     plt.sh_type = elf::SHT_PROGBITS;
-    plt.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_EXECINSTR);
+    plt.sh_flags = elf::SHF_ALLOC | elf::SHF_EXECINSTR;
     plt.sh_addr = 0x9000;
     plt.sh_addralign = 16;
     plt.data = build::elf::SectionData::Data(vec![0; 16].into());
@@ -129,7 +129,7 @@ pub(super) fn elf_with_mixed_plt_relocations() -> Vec<u8> {
     let dynstr = builder.sections.add();
     dynstr.name = b".dynstr"[..].into();
     dynstr.sh_type = elf::SHT_STRTAB;
-    dynstr.sh_flags = u64::from(elf::SHF_ALLOC);
+    dynstr.sh_flags = elf::SHF_ALLOC;
     dynstr.sh_addralign = 1;
     dynstr.data = build::elf::SectionData::DynamicString;
     let dynstr_id = dynstr.id();
@@ -137,7 +137,7 @@ pub(super) fn elf_with_mixed_plt_relocations() -> Vec<u8> {
     let dynsym = builder.sections.add();
     dynsym.name = b".dynsym"[..].into();
     dynsym.sh_type = elf::SHT_DYNSYM;
-    dynsym.sh_flags = u64::from(elf::SHF_ALLOC);
+    dynsym.sh_flags = elf::SHF_ALLOC;
     dynsym.sh_addralign = 8;
     dynsym.data = build::elf::SectionData::DynamicSymbol;
     dynsym.sh_link_section = Some(dynstr_id);
@@ -154,7 +154,7 @@ pub(super) fn elf_with_mixed_plt_relocations() -> Vec<u8> {
     let rela = builder.sections.add();
     rela.name = b".rela.plt"[..].into();
     rela.sh_type = elf::SHT_RELA;
-    rela.sh_flags = u64::from(elf::SHF_ALLOC);
+    rela.sh_flags = elf::SHF_ALLOC;
     rela.sh_addralign = 8;
     rela.sh_entsize = 24;
     rela.sh_link_section = Some(dynsym_id);
@@ -436,12 +436,12 @@ fn plt_header_uses_raw_relocation_count_with_unsupported_entry() {
         .collect::<Vec<_>>();
     assert_eq!(
         relocation_types,
-        [elf::R_X86_64_JUMP_SLOT, elf::R_X86_64_NONE]
+        [elf::R_X86_64_JUMP_SLOT.0, elf::R_X86_64_NONE.0]
     );
     assert_eq!(
         relocation_types
             .iter()
-            .filter(|&&kind| kind == elf::R_X86_64_JUMP_SLOT)
+            .filter(|&&kind| kind == elf::R_X86_64_JUMP_SLOT.0)
             .count(),
         1
     );
@@ -500,7 +500,7 @@ fn plt_unsupported_relocation_retains_its_linked_symbol_name() {
     let entries = raw.as_chunks::<24>().0;
     assert_eq!(
         u32::from_le_bytes(entries[1][8..12].try_into().unwrap()),
-        elf::R_X86_64_NONE
+        elf::R_X86_64_NONE.0
     );
     let symbol_index = u32::from_le_bytes(entries[1][12..16].try_into().unwrap());
     assert_ne!(symbol_index, 0);
@@ -533,7 +533,7 @@ fn plt_unsupported_relocation_retains_its_linked_symbol_name() {
     );
 }
 
-fn assert_unusable_plt_relocations_retain_header(section_type: u32, clear_link: bool) {
+fn assert_unusable_plt_relocations_retain_header(section_type: elf::SectionType, clear_link: bool) {
     use object::read::elf::SectionHeader as _;
 
     let original = elf_with_mixed_plt_relocations();
@@ -639,8 +639,10 @@ fn nobits_plt_without_relocations_retains_header() {
     assert_eq!(kind, elf::SHT_NOBITS);
     assert_eq!(plt.size(), 16);
     assert_eq!(plt.file_range(), None);
-    assert!(matches!(plt.flags(), object::SectionFlags::Elf { sh_flags }
-        if sh_flags & u64::from(elf::SHF_ALLOC) != 0));
+    assert!(
+        matches!(plt.flags(), object::SectionFlags::Elf { sh_flags, .. }
+        if sh_flags.intersects(elf::SHF_ALLOC))
+    );
     assert!(object.section_by_name(".rela.plt").is_none());
     assert!(object.section_by_name(".rel.plt").is_none());
     assert!(

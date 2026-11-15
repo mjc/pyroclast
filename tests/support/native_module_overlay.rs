@@ -80,16 +80,17 @@ fn assert_label_source_pair(runtime: &[u8], debug: &[u8], runtime_eligible: bool
         assert_eq!(label.size(), 0x10);
         assert!(
             matches!(label.flags(), object::SymbolFlags::Elf { st_info, .. }
-            if st_info & 0xf == object::elf::STT_NOTYPE)
+            if st_info.st_type() == object::elf::STT_NOTYPE)
         );
         let section = elf
             .section_by_index(label.section_index().unwrap())
             .unwrap();
         let header = section.elf_section_header();
         assert_eq!(header.sh_type(elf.endian()), kind);
-        assert_ne!(
-            header.sh_flags(elf.endian()) & u64::from(object::elf::SHF_ALLOC),
-            0
+        assert!(
+            header
+                .sh_flags(elf.endian())
+                .intersects(object::elf::SHF_ALLOC)
         );
         assert_eq!(
             section.name().unwrap(),

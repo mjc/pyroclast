@@ -1,7 +1,7 @@
 use super::*;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn section_type(bytes: &[u8], name: &str) -> u32 {
+fn section_type(bytes: &[u8], name: &str) -> object::elf::SectionType {
     use object::Object as _;
     use object::read::elf::SectionHeader as _;
 
@@ -91,10 +91,10 @@ fn native_contiguous_sibling_section_lookup_matches_perf() {
     assert_eq!((text.address(), text.size()), (MAP, 0x20));
     assert_eq!((sibling.address(), sibling.size()), (MAP + 0x20, 0x20));
     assert!(
-        matches!(text.flags(), object::SectionFlags::Elf { sh_flags } if sh_flags & u64::from(object::elf::SHF_EXECINSTR) != 0)
+        matches!(text.flags(), object::SectionFlags::Elf { sh_flags, .. } if sh_flags.intersects(object::elf::SHF_EXECINSTR))
     );
     assert!(
-        matches!(sibling.flags(), object::SectionFlags::Elf { sh_flags } if sh_flags & u64::from(object::elf::SHF_EXECINSTR) != 0)
+        matches!(sibling.flags(), object::SectionFlags::Elf { sh_flags, .. } if sh_flags.intersects(object::elf::SHF_EXECINSTR))
     );
     assert_eq!(sibling_offset, text_offset + text.size());
     assert!(elf.symbols().any(|symbol| {
@@ -252,10 +252,10 @@ fn native_split_debug_zero_size_tail_lookup_matches_perf() {
         .find(|section| section.name.as_slice() == b".text")
         .expect("debug text section");
     assert_eq!(debug_text_section.sh_type, object::elf::SHT_NOBITS);
-    assert_eq!(
-        debug_text_section.sh_flags
-            & u64::from(object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR),
-        u64::from(object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR)
+    assert!(
+        debug_text_section
+            .sh_flags
+            .contains(object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR)
     );
     // Model split-debug source geometry explicitly: NOBITS has no file bytes,
     // so moving only sh_offset preserves its index, type, VMA, and build ID.

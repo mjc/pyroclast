@@ -384,9 +384,9 @@ fn macho(uuid: [u8; 16], sections: &[(&str, &[u8])], symbols: &[(&str, u8, u64)]
     let mut bytes = Vec::new();
     for value in [
         object::macho::MH_MAGIC_64,
-        object::macho::CPU_TYPE_X86_64,
+        object::macho::CPU_TYPE_X86_64.0,
         3,
-        object::macho::MH_OBJECT,
+        object::macho::MH_OBJECT.0,
         2 + u32::from(!sections.is_empty()),
         u32::try_from(command_size).unwrap(),
         0,
@@ -395,7 +395,7 @@ fn macho(uuid: [u8; 16], sections: &[(&str, &[u8])], symbols: &[(&str, u8, u64)]
         word(&mut bytes, value);
     }
     if !sections.is_empty() {
-        word(&mut bytes, object::macho::LC_SEGMENT_64);
+        word(&mut bytes, object::macho::LC_SEGMENT_64.0);
         word(&mut bytes, u32::try_from(segment_size).unwrap());
         fixed_name(&mut bytes, "__DWARF");
         quad(&mut bytes, 0);
@@ -416,7 +416,7 @@ fn macho(uuid: [u8; 16], sections: &[(&str, &[u8])], symbols: &[(&str, u8, u64)]
                 0,
                 0,
                 0,
-                object::macho::S_ATTR_DEBUG,
+                object::macho::S_ATTR_DEBUG.0,
                 0,
                 0,
                 0,
@@ -426,11 +426,11 @@ fn macho(uuid: [u8; 16], sections: &[(&str, &[u8])], symbols: &[(&str, u8, u64)]
             offset += data.len();
         }
     }
-    word(&mut bytes, object::macho::LC_UUID);
+    word(&mut bytes, object::macho::LC_UUID.0);
     word(&mut bytes, 24);
     bytes.extend_from_slice(&uuid);
     for value in [
-        object::macho::LC_SYMTAB,
+        object::macho::LC_SYMTAB.0,
         24,
         u32::try_from(sym_offset).unwrap(),
         u32::try_from(symbols.len()).unwrap(),
@@ -623,9 +623,9 @@ fn pyroc48_loader_lazy_macho_object_and_archive_member_relocations() {
             [7; 16],
             &[],
             &[
-                (oso, object::macho::N_OSO, 0),
-                ("_linked", object::macho::N_FUN, BASE),
-                ("", object::macho::N_FUN, 16),
+                (oso, object::macho::N_OSO.0, 0),
+                ("_linked", object::macho::N_FUN.0, BASE),
+                ("", object::macho::N_FUN.0, 16),
             ],
         );
         let parsed = object::File::parse(main.as_slice()).unwrap();

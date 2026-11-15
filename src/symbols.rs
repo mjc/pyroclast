@@ -38,8 +38,8 @@ type FxHashSet<T> = HashSet<T, FxBuildHasher>;
 
 const X86_64_PLT_ENTRY_SIZE: u64 = 16;
 const ELF64_RELA_ENTRY_SIZE: usize = 24;
-const ELF_STT_RELC: u8 = 8;
-const ELF_STT_SRELC: u8 = 9;
+const ELF_STT_RELC: object::elf::SymbolType = object::elf::SymbolType(8);
+const ELF_STT_SRELC: object::elf::SymbolType = object::elf::SymbolType(9);
 
 #[cfg(test)]
 thread_local! {
@@ -4899,10 +4899,10 @@ fn read_kernel_elf_map_metadata(path: &Path) -> Option<KernelElfMapMetadata> {
         if !accepted_sections.contains(&section.index()) {
             continue;
         }
-        let object::SectionFlags::Elf { sh_flags } = section.flags() else {
+        let object::SectionFlags::Elf { sh_flags, .. } = section.flags() else {
             continue;
         };
-        if sh_flags & u64::from(object::elf::SHF_ALLOC) == 0 {
+        if !sh_flags.intersects(object::elf::SHF_ALLOC) {
             continue;
         }
         if section.name().ok() == Some(".text") {
@@ -5564,7 +5564,7 @@ struct PerfSymbolCandidate {
     address: u64,
     size: u64,
     bfd_size: u64,
-    elf_type: Option<u8>,
+    elf_type: Option<object::elf::SymbolType>,
     scope: PerfSymbolScope,
     binding: PerfSymbolBinding,
     bfd_function_like: bool,
@@ -5604,7 +5604,7 @@ fn elf_symbol_is_label<'data, R: object::read::ReadRef<'data>>(
     symbol: &object::Symbol<'data, '_, R>,
 ) -> bool {
     matches!(symbol.flags(), object::SymbolFlags::Elf { st_info, .. }
-        if st_info & 0xf == object::elf::STT_NOTYPE)
+        if st_info.st_type() == object::elf::STT_NOTYPE)
 }
 
 fn perf_symbol_is_allocated_candidate<'data, R: object::read::ReadRef<'data>>(
@@ -5643,12 +5643,12 @@ fn perf_symbol_is_allocated_candidate<'data, R: object::read::ReadRef<'data>>(
     // FUNC/IFUNC/OBJECT may be hidden, but NOTYPE labels may not. All require
     // an allocated original section. Label section-name filtering follows
     // any NOBITS runtime-header substitution in the module loader.
-    let symbol_type = st_info & 0xf;
+    let symbol_type = st_info.st_type();
     match symbol_type {
         object::elf::STT_FUNC | object::elf::STT_GNU_IFUNC | object::elf::STT_OBJECT => {}
         object::elf::STT_NOTYPE
             if !matches!(
-                st_other & 3,
+                st_other.visibility(),
                 object::elf::STV_HIDDEN | object::elf::STV_INTERNAL
             ) => {}
         _ => return false,
@@ -5659,16 +5659,16 @@ fn perf_symbol_is_allocated_candidate<'data, R: object::read::ReadRef<'data>>(
     else {
         return false;
     };
-    let object::SectionFlags::Elf { sh_flags } = section.flags() else {
+    let object::SectionFlags::Elf { sh_flags, .. } = section.flags() else {
         return false;
     };
-    sh_flags & u64::from(object::elf::SHF_ALLOC) != 0
+    sh_flags.intersects(object::elf::SHF_ALLOC)
 }
 
 fn elf_section_layout<'data, R: object::read::ReadRef<'data>>(
     object: &object::File<'data, R>,
     index: object::SectionIndex,
-) -> Option<(u32, u64)> {
+) -> Option<(object::elf::SectionType, u64)> {
     use object::read::elf::SectionHeader as _;
     match object {
         object::File::Elf32(elf) => {
@@ -5703,9 +5703,8 @@ fn elf_possibly_runtime(object: &object::File<'_>) -> bool {
 }
 
 fn elf_section_is_executable(section: &object::Section<'_, '_>) -> bool {
-    matches!(section.flags(), object::SectionFlags::Elf { sh_flags }
-        if sh_flags & u64::from(object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR)
-            == u64::from(object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR))
+    matches!(section.flags(), object::SectionFlags::Elf { sh_flags, .. }
+        if sh_flags.contains(object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR))
 }
 
 fn kernel_module_max_text_offset(runtime: &object::File<'_>) -> u64 {
@@ -5879,8 +5878,8 @@ fn kernel_module_symbol_projection(
 ) -> KernelModuleSymbolProjection {
     let mut sections = Vec::new();
     for source_section in object.sections() {
-        if !matches!(source_section.flags(), object::SectionFlags::Elf { sh_flags }
-            if sh_flags & u64::from(object::elf::SHF_ALLOC) != 0)
+        if !matches!(source_section.flags(), object::SectionFlags::Elf { sh_flags, .. }
+            if sh_flags.intersects(object::elf::SHF_ALLOC))
         {
             continue;
         }
@@ -5889,9 +5888,8 @@ fn kernel_module_symbol_projection(
         else {
             continue;
         };
-        let executable = matches!(section.flags(), object::SectionFlags::Elf { sh_flags }
-            if sh_flags & u64::from(object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR)
-                == u64::from(object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR));
+        let executable = matches!(section.flags(), object::SectionFlags::Elf { sh_flags, .. }
+            if sh_flags.contains(object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR));
         let Ok(index) = u32::try_from(source_section.index().0) else {
             continue;
         };
@@ -6082,10 +6080,10 @@ impl PerfObjectSymbolIndex {
         let elf_sections = object
             .sections()
             .filter_map(|section| {
-                let object::SectionFlags::Elf { sh_flags } = section.flags() else {
+                let object::SectionFlags::Elf { sh_flags, .. } = section.flags() else {
                     return None;
                 };
-                (sh_flags & u64::from(object::elf::SHF_ALLOC) != 0).then_some(())?;
+                (sh_flags.intersects(object::elf::SHF_ALLOC)).then_some(())?;
                 let (_, file_offset) = elf_section_layout(&object, section.index())?;
                 Some(ObjectSectionRange {
                     index: u32::try_from(section.index().0).ok()?,
@@ -6446,8 +6444,8 @@ fn bfd_symbol_sections(object: &object::File<'_>) -> Vec<BfdSymbolSection> {
     object
         .sections()
         .filter(|section| {
-            matches!(section.flags(), object::SectionFlags::Elf { sh_flags }
-                if sh_flags & u64::from(object::elf::SHF_ALLOC) != 0)
+            matches!(section.flags(), object::SectionFlags::Elf { sh_flags, .. }
+                if sh_flags.intersects(object::elf::SHF_ALLOC))
         })
         .map(|section| BfdSymbolSection {
             index: section.index(),
@@ -6844,7 +6842,7 @@ fn perf_x86_64_plt_relocation_from_rela<'data>(
         .ok()
         .and_then(|symbol| symbol.name().ok())
         .map(|name| perf_symbol_name(&addr2line::demangle_auto(Cow::Borrowed(name), None)));
-    let ifunc_addend = (rela.relocation_type == object::elf::R_X86_64_IRELATIVE)
+    let ifunc_addend = (rela.relocation_type == object::elf::R_X86_64_IRELATIVE.0)
         .then(|| u64::try_from(rela.addend).ok())
         .flatten();
     PerfPltRelocation {
@@ -6882,7 +6880,7 @@ fn bfd_symbol_is_function_like(
     let object::SymbolFlags::Elf { st_info, st_other } = symbol.flags() else {
         return false;
     };
-    let symbol_type = st_info & 0xf;
+    let symbol_type = st_info.st_type();
     // elfcode.h assigns the flags excluded by elf.c:maybe_function_sym for
     // these types. Generic ELF accepts IFUNC without BSF_FUNCTION; target
     // hooks below may reject it entirely.
@@ -6898,11 +6896,11 @@ fn bfd_symbol_is_function_like(
     ) {
         return false;
     }
-    let local = st_info >> 4 == object::elf::STB_LOCAL;
+    let local = st_info.st_bind() == object::elf::STB_LOCAL;
     if symbol.size() == 0
         && local
         && symbol_type == object::elf::STT_NOTYPE
-        && st_other & 3 == object::elf::STV_HIDDEN
+        && st_other.visibility() == object::elf::STV_HIDDEN
     {
         return false;
     }
@@ -6964,7 +6962,7 @@ fn symbol_candidate_from_object_symbol(
     symbol: &object::Symbol<'_, '_>,
 ) -> PerfSymbolCandidate {
     let elf_type = match symbol.flags() {
-        object::SymbolFlags::Elf { st_info, .. } => Some(st_info & 0xf),
+        object::SymbolFlags::Elf { st_info, .. } => Some(st_info.st_type()),
         _ => None,
     };
     // perf util/symbol-elf.c:dso__load_sym_internal and BFD
@@ -8940,7 +8938,7 @@ mod tests {
         let text = section.id();
         if separate_map {
             section.name = b".data"[..].into();
-            section.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_WRITE);
+            section.sh_flags = elf::SHF_ALLOC | elf::SHF_WRITE;
         }
         let section = builder.sections.add();
         section.name = b".symtab"[..].into();
@@ -9063,7 +9061,7 @@ mod tests {
         let section = builder.sections.add();
         section.name = b".text"[..].into();
         section.sh_type = elf::SHT_NOBITS;
-        section.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_EXECINSTR);
+        section.sh_flags = elf::SHF_ALLOC | elf::SHF_EXECINSTR;
         section.sh_addr = first + 0x4000;
         section.sh_addralign = 16;
         section.data = build::elf::SectionData::UninitializedData(16);
@@ -9127,7 +9125,7 @@ mod tests {
                 .unwrap();
             section.name = name.as_bytes().into();
             section.sh_offset = offset;
-            section.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_WRITE);
+            section.sh_flags = elf::SHF_ALLOC | elf::SHF_WRITE;
             let opd = runtime.sections.add();
             opd.name = b".opd"[..].into();
             opd.sh_type = elf::SHT_PROGBITS;
@@ -9281,7 +9279,7 @@ mod tests {
         let section = builder.sections.add();
         section.name = b".text"[..].into();
         section.sh_type = elf::SHT_PROGBITS;
-        section.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_EXECINSTR);
+        section.sh_flags = elf::SHF_ALLOC | elf::SHF_EXECINSTR;
         section.sh_addr = 0x2000;
         section.sh_addralign = 16;
         section.data = build::elf::SectionData::Data(Vec::new().into());
@@ -9480,7 +9478,7 @@ mod tests {
             let section = builder.sections.add();
             section.name = b".data"[..].into();
             section.sh_type = elf::SHT_PROGBITS;
-            section.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_WRITE);
+            section.sh_flags = elf::SHF_ALLOC | elf::SHF_WRITE;
             section.sh_addr = address;
             section.sh_addralign = 8;
             section.data = build::elf::SectionData::Data(vec![0; 8].into());
@@ -10355,14 +10353,16 @@ mod tests {
         let text = builder.sections.add();
         text.name = b".text"[..].into();
         text.sh_type = elf::SHT_PROGBITS;
-        text.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_EXECINSTR);
+        text.sh_flags = elf::SHF_ALLOC | elf::SHF_EXECINSTR;
         text.sh_addr = 0x1000;
+        text.sh_addralign = 1;
         text.data = build::elf::SectionData::Data(vec![0; 64].into());
         let data = builder.sections.add();
         data.name = b".data"[..].into();
         data.sh_type = elf::SHT_PROGBITS;
-        data.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_WRITE);
+        data.sh_flags = elf::SHF_ALLOC | elf::SHF_WRITE;
         data.sh_addr = 0x3000;
+        data.sh_addralign = 1;
         data.data = build::elf::SectionData::Data(vec![0; 32].into());
         let data_id = data.id();
         let section = builder.sections.add();
@@ -10452,15 +10452,17 @@ mod tests {
         let text = builder.sections.add();
         text.name = b".text"[..].into();
         text.sh_type = elf::SHT_PROGBITS;
-        text.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_EXECINSTR);
+        text.sh_flags = elf::SHF_ALLOC | elf::SHF_EXECINSTR;
         text.sh_addr = 0x1000;
+        text.sh_addralign = 1;
         text.data = build::elf::SectionData::Data(vec![0; 64].into());
         let text_id = text.id();
         let data = builder.sections.add();
         data.name = b".data"[..].into();
         data.sh_type = elf::SHT_PROGBITS;
-        data.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_WRITE);
+        data.sh_flags = elf::SHF_ALLOC | elf::SHF_WRITE;
         data.sh_addr = 0x3000;
+        data.sh_addralign = 1;
         data.data = build::elf::SectionData::Data(vec![0; 32].into());
         let data_id = data.id();
         let section = builder.sections.add();
@@ -10937,7 +10939,7 @@ mod tests {
             let section = builder.sections.add();
             section.name = name.into();
             section.sh_type = elf::SHT_PROGBITS;
-            section.sh_flags = u64::from(flags);
+            section.sh_flags = flags;
             section.sh_addr = address;
             section.sh_addralign = 16;
             section.data = build::elf::SectionData::Data(vec![0; 64].into());
@@ -10948,10 +10950,10 @@ mod tests {
             let segment = builder.segments.add();
             segment.p_type = elf::PT_LOAD;
             segment.p_flags = elf::PF_R
-                | if flags & elf::SHF_EXECINSTR == 0 {
-                    elf::PF_W
-                } else {
+                | if flags.intersects(elf::SHF_EXECINSTR) {
                     elf::PF_X
+                } else {
+                    elf::PF_W
                 };
             segment.p_vaddr = address;
             segment.p_paddr = address;
@@ -11058,6 +11060,8 @@ mod tests {
                 let section = builder.sections.add();
                 section.name = b".text"[..].into();
                 section.sh_type = elf::SHT_NOBITS;
+                // object 0.41 emits sh_addr only when the section is allocated.
+                section.sh_flags = elf::SHF_ALLOC;
                 section.sh_addr = address;
                 section.sh_addralign = 1;
                 section.data = build::elf::SectionData::UninitializedData(64);
@@ -11157,7 +11161,7 @@ mod tests {
         let plt = builder.sections.add();
         plt.name = b".plt"[..].into();
         plt.sh_type = elf::SHT_PROGBITS;
-        plt.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_EXECINSTR);
+        plt.sh_flags = elf::SHF_ALLOC | elf::SHF_EXECINSTR;
         plt.sh_addr = 0x9000;
         plt.sh_offset = plt_offset;
         plt.sh_addralign = 16;
@@ -11298,14 +11302,14 @@ mod tests {
     }
 
     fn elf_with_text_symbol_fixtures(
-        machine: u16,
-        symbols: &[(&'static [u8], u64, u64, u8, u8)],
+        machine: elf::Machine,
+        symbols: &[(&'static [u8], u64, u64, elf::SymbolBind, elf::SymbolType)],
     ) -> Vec<u8> {
         elf_with_text_symbol_fixtures_for_class(machine, machine != elf::EM_ARM, symbols)
     }
 
     fn elf_with_dynamic_reference_fixture(
-        regular_symbols: &[(&'static [u8], u64, u64, u8, u8)],
+        regular_symbols: &[(&'static [u8], u64, u64, elf::SymbolBind, elf::SymbolType)],
         dynamic_reference: u64,
     ) -> Vec<u8> {
         let regular = elf_with_text_symbol_fixtures(elf::EM_X86_64, regular_symbols);
@@ -11315,13 +11319,13 @@ mod tests {
         let dynsym = builder.sections.add();
         dynsym.name = b".dynsym"[..].into();
         dynsym.sh_type = elf::SHT_DYNSYM;
-        dynsym.sh_flags = u64::from(elf::SHF_ALLOC);
+        dynsym.sh_flags = elf::SHF_ALLOC;
         dynsym.sh_addralign = 8;
         dynsym.data = build::elf::SectionData::DynamicSymbol;
         let dynstr = builder.sections.add();
         dynstr.name = b".dynstr"[..].into();
         dynstr.sh_type = elf::SHT_STRTAB;
-        dynstr.sh_flags = u64::from(elf::SHF_ALLOC);
+        dynstr.sh_flags = elf::SHF_ALLOC;
         dynstr.sh_addralign = 1;
         dynstr.data = build::elf::SectionData::DynamicString;
         let reference = builder.dynamic_symbols.add();
@@ -11339,7 +11343,7 @@ mod tests {
         segment.p_memsz = 0x1000;
         segment.p_align = 16;
         for section in &mut builder.sections {
-            if section.sh_flags & u64::from(elf::SHF_ALLOC) != 0 {
+            if section.sh_flags.intersects(elf::SHF_ALLOC) {
                 segment.append_section(section);
             }
         }
@@ -11360,9 +11364,9 @@ mod tests {
     }
 
     fn elf_with_text_symbol_fixtures_for_class(
-        machine: u16,
+        machine: elf::Machine,
         is_64: bool,
-        symbols: &[(&'static [u8], u64, u64, u8, u8)],
+        symbols: &[(&'static [u8], u64, u64, elf::SymbolBind, elf::SymbolType)],
     ) -> Vec<u8> {
         let mut builder = build::elf::Builder::new(object::Endianness::Little, is_64);
         builder.header.e_type = elf::ET_EXEC;
@@ -11374,7 +11378,7 @@ mod tests {
         let section = builder.sections.add();
         section.name = b".text"[..].into();
         section.sh_type = elf::SHT_PROGBITS;
-        section.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_EXECINSTR);
+        section.sh_flags = elf::SHF_ALLOC | elf::SHF_EXECINSTR;
         section.sh_addr = 0x1000;
         section.sh_addralign = 16;
         section.data = build::elf::SectionData::Data(vec![0; 64].into());
@@ -12146,7 +12150,7 @@ mod tests {
         let bss = builder.sections.add();
         bss.name = b".bss"[..].into();
         bss.sh_type = elf::SHT_NOBITS;
-        bss.sh_flags = u64::from(elf::SHF_ALLOC | elf::SHF_WRITE);
+        bss.sh_flags = elf::SHF_ALLOC | elf::SHF_WRITE;
         bss.sh_addr = 0x2000;
         bss.sh_addralign = 8;
         bss.data = build::elf::SectionData::UninitializedData(8);
@@ -12218,8 +12222,8 @@ mod tests {
             super::elf_section_layout(&object, text.index()).expect("text SHDR layout");
         assert_eq!(kind, elf::SHT_NOBITS);
         assert!(
-            matches!(text.flags(), object::SectionFlags::Elf { sh_flags }
-            if sh_flags & u64::from(elf::SHF_ALLOC) != 0)
+            matches!(text.flags(), object::SectionFlags::Elf { sh_flags, .. }
+            if sh_flags.intersects(elf::SHF_ALLOC))
         );
         let index = PerfObjectSymbolIndex::from_object_bytes(&bytes);
         assert!(
@@ -12387,9 +12391,9 @@ mod tests {
 
     fn elf_with_regular_and_dynamic_zero_aliases(
         regular_name: &'static [u8],
-        regular_binding: u8,
+        regular_binding: elf::SymbolBind,
         dynamic_name: &'static [u8],
-        dynamic_binding: u8,
+        dynamic_binding: elf::SymbolBind,
     ) -> Vec<u8> {
         let regular = elf_with_text_symbol_fixtures(
             elf::EM_X86_64,
@@ -12411,7 +12415,7 @@ mod tests {
             let dynstr = builder.sections.add();
             dynstr.name = b".dynstr"[..].into();
             dynstr.sh_type = elf::SHT_STRTAB;
-            dynstr.sh_flags = u64::from(elf::SHF_ALLOC);
+            dynstr.sh_flags = elf::SHF_ALLOC;
             dynstr.sh_addralign = 1;
             dynstr.data = build::elf::SectionData::DynamicString;
             dynstr.id()
@@ -12419,7 +12423,7 @@ mod tests {
         let dynsym = builder.sections.add();
         dynsym.name = b".dynsym"[..].into();
         dynsym.sh_type = elf::SHT_DYNSYM;
-        dynsym.sh_flags = u64::from(elf::SHF_ALLOC);
+        dynsym.sh_flags = elf::SHF_ALLOC;
         dynsym.sh_addralign = 8;
         dynsym.data = build::elf::SectionData::DynamicSymbol;
         dynsym.sh_link_section = Some(dynstr_id);
@@ -12444,7 +12448,7 @@ mod tests {
         segment.p_memsz = 0x1000;
         segment.p_align = 16;
         for section in &mut builder.sections {
-            if section.sh_flags & u64::from(elf::SHF_ALLOC) != 0 {
+            if section.sh_flags.intersects(elf::SHF_ALLOC) {
                 segment.append_section(section);
             }
         }
@@ -14398,7 +14402,7 @@ mod tests {
         name: &'static [u8],
         address: u64,
         size: usize,
-        attributes: (u8, u8, bool),
+        attributes: (elf::SymbolType, elf::SymbolVisibility, bool),
     ) -> Vec<u8> {
         elf_with_dynamic_symbol_in_section(
             name,
@@ -14414,9 +14418,9 @@ mod tests {
         name: &'static [u8],
         address: u64,
         size: usize,
-        attributes: (u8, u8, bool),
+        attributes: (elf::SymbolType, elf::SymbolVisibility, bool),
         section_name: &'static [u8],
-        section_flags: u32,
+        section_flags: elf::SectionFlags,
     ) -> Vec<u8> {
         let mut builder = build::elf::Builder::new(object::Endianness::Little, true);
         builder.header.e_type = elf::ET_DYN;
@@ -14431,7 +14435,7 @@ mod tests {
         let section = builder.sections.add();
         section.name = section_name.into();
         section.sh_type = elf::SHT_PROGBITS;
-        section.sh_flags = u64::from(section_flags);
+        section.sh_flags = section_flags;
         section.sh_addr = address;
         section.sh_addralign = 16;
         section.data = build::elf::SectionData::Data(vec![0xcc; size].into());
@@ -14440,7 +14444,7 @@ mod tests {
         let section = builder.sections.add();
         section.name = b".dynsym"[..].into();
         section.sh_type = elf::SHT_DYNSYM;
-        section.sh_flags = u64::from(elf::SHF_ALLOC);
+        section.sh_flags = elf::SHF_ALLOC;
         section.sh_addralign = 8;
         section.data = build::elf::SectionData::DynamicSymbol;
         let dynsym_id = section.id();
@@ -14448,7 +14452,7 @@ mod tests {
         let section = builder.sections.add();
         section.name = b".dynstr"[..].into();
         section.sh_type = elf::SHT_STRTAB;
-        section.sh_flags = u64::from(elf::SHF_ALLOC);
+        section.sh_flags = elf::SHF_ALLOC;
         section.sh_addralign = 1;
         section.data = build::elf::SectionData::DynamicString;
         let dynstr_id = section.id();
@@ -14458,7 +14462,7 @@ mod tests {
         symbol.st_value = address;
         symbol.st_size = u64::try_from(size).expect("fixture size fits in u64");
         symbol.set_st_info(elf::STB_GLOBAL, attributes.0);
-        symbol.st_other = attributes.1;
+        symbol.st_other = elf::SymbolOther::from(attributes.1);
         if attributes.2 {
             symbol.st_shndx = elf::SHN_ABS;
         } else {
@@ -14528,7 +14532,7 @@ mod tests {
             b"other",
             0x1000,
             16,
-            (elf::STT_LOOS + 1, elf::STV_DEFAULT, false),
+            (elf::SymbolType(elf::STT_LOOS + 1), elf::STV_DEFAULT, false),
         );
         assert!(
             PerfObjectSymbolIndex::from_object_bytes(&bytes)
@@ -14566,7 +14570,7 @@ mod tests {
             16,
             (elf::STT_FUNC, elf::STV_DEFAULT, false),
             b".gnu.warning",
-            0,
+            elf::SectionFlags(0),
         );
         assert!(
             PerfObjectSymbolIndex::from_object_bytes(&bytes)
@@ -15348,7 +15352,7 @@ mod tests {
         let text = builder
             .sections
             .iter()
-            .find(|section| section.sh_flags & u64::from(elf::SHF_EXECINSTR) != 0)
+            .find(|section| section.sh_flags.intersects(elf::SHF_EXECINSTR))
             .unwrap()
             .id();
         let segment = builder.segments.add();

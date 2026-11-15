@@ -16,7 +16,7 @@ fn assert_parsed_label_pair(source: &[u8], runtime: &[u8], source_name: &str, ru
     assert_eq!(labels.len(), 1);
     assert!(
         matches!(labels[0].flags(), object::SymbolFlags::Elf { st_info, .. }
-        if st_info & 0xf == object::elf::STT_NOTYPE && st_info >> 4 == object::elf::STB_GLOBAL)
+        if st_info.st_type() == object::elf::STT_NOTYPE && st_info.st_bind() == object::elf::STB_GLOBAL)
     );
     let section = source
         .section_by_index(labels[0].section_index().unwrap())
@@ -32,9 +32,11 @@ fn assert_parsed_label_pair(source: &[u8], runtime: &[u8], source_name: &str, ru
         selected.elf_section_header().sh_type(runtime.endian()),
         object::elf::SHT_PROGBITS
     );
-    assert_ne!(
-        section.elf_section_header().sh_flags(source.endian()) & u64::from(object::elf::SHF_ALLOC),
-        0
+    assert!(
+        section
+            .elf_section_header()
+            .sh_flags(source.endian())
+            .intersects(object::elf::SHF_ALLOC)
     );
     assert_eq!(section.index(), selected.index());
     assert_eq!(section.address(), selected.address());
@@ -119,7 +121,7 @@ fn native_split_debug_label_only_source_uses_runtime_eligibility() {
     assert_eq!(labels[0].name(), Ok("selected_debug_only_label"));
     assert!(
         matches!(labels[0].flags(), object::SymbolFlags::Elf { st_info, .. }
-        if st_info & 0xf == object::elf::STT_NOTYPE)
+        if st_info.st_type() == object::elf::STT_NOTYPE)
     );
     let source = debug_elf
         .section_by_index(labels[0].section_index().unwrap())
@@ -129,8 +131,8 @@ fn native_split_debug_label_only_source_uses_runtime_eligibility() {
     assert_eq!(selected.name(), Ok(".text"));
     assert_eq!(source.address(), selected.address());
     assert!(
-        matches!(source.flags(), object::SectionFlags::Elf { sh_flags }
-        if sh_flags & u64::from(object::elf::SHF_ALLOC) != 0)
+        matches!(source.flags(), object::SectionFlags::Elf { sh_flags, .. }
+        if sh_flags.intersects(object::elf::SHF_ALLOC))
     );
     assert!(
         !runtime_elf

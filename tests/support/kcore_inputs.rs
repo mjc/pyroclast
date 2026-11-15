@@ -254,7 +254,7 @@ mod module_inputs {
                 } else {
                     object::elf::ET_DYN
                 };
-                bytes[16..18].copy_from_slice(&elf_type.to_le_bytes());
+                bytes[16..18].copy_from_slice(&elf_type.0.to_le_bytes());
                 std::fs::write(&destination, bytes).unwrap();
             }
             Replacement::BeforeLoadingOppositeElfType => {}
